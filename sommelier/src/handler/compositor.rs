@@ -1223,7 +1223,7 @@ mod tests {
         state.committed.enabled = true;
         state.committed.surrounding_text = Some(("한".to_string(), 3, 3));
         state.committed.content_type = (1, 1);
-        state.current_preedit = "한".to_string();
+        state.current_preedit = crate::state::ShownPreedit::at_end("한");
         state.set_guest_commits(1);
         state.pending_preedit_cursor = Some(1);
         state.pending_preedit_selection = Some((0, 1));
@@ -4020,7 +4020,7 @@ mod tests {
         );
         ctx.text_inputs.insert(text_input, {
             let mut state = crate::state::TextInputState::new(702, None, 1, Some(surface));
-            state.current_preedit = "한".to_string();
+            state.current_preedit = crate::state::ShownPreedit::at_end("한");
             state.host = crate::state::HostApplied::Active { content_type: None };
             state
         });
@@ -4134,7 +4134,7 @@ mod tests {
         assert_eq!(unaffected.active_surface, Some(live_surface));
         assert!(unaffected.committed.enabled);
         assert!(unaffected.host_is_active());
-        assert_eq!(unaffected.current_preedit, "한");
+        assert_eq!(unaffected.current_preedit.text, "한");
 
         assert_eq!(ctx.host_to_client_queue.len(), 2);
         for guest_text_input in [700, 710] {
@@ -4272,7 +4272,7 @@ mod tests {
         assert_eq!(repaired.active_surface, Some(replacement_surface));
         assert!(!repaired.committed.enabled);
         assert!(!repaired.host_is_active());
-        assert!(repaired.current_preedit.is_empty());
+        assert!(!repaired.current_preedit.has_text());
 
         let repaired_without_owner = &ctx.text_inputs[&stale_without_owner];
         assert_eq!(repaired_without_owner.active_surface, None);
@@ -4283,7 +4283,7 @@ mod tests {
         assert_eq!(healthy.active_surface, Some(replacement_surface));
         assert!(healthy.committed.enabled);
         assert!(healthy.host_is_active());
-        assert_eq!(healthy.current_preedit, "한");
+        assert_eq!(healthy.current_preedit.text, "한");
 
         assert_eq!(ctx.host_to_client_queue.len(), 3);
         assert!(ctx

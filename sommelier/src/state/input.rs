@@ -176,7 +176,7 @@ impl HostApplied {
         }
     }
 
-    /// The guest enabled or disabled the field, which resets it: what the
+    /// The guest started a new field ([`V3Commit::new_field`]): what the
     /// host applied belongs to the old field, so the new one is told its
     /// content type again, even an unchanged one. That is a no-op for Exo
     /// with a v8 extension, whose `SetTypeModeFlags` ignores an unchanged
@@ -256,6 +256,34 @@ pub fn reconcile(target: &HostTarget, applied: &HostApplied) -> HostSteps {
     }
 }
 
+/// The preedit the guest shows, as the proxy last sent it: empty text for
+/// none.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShownPreedit {
+    pub text: String,
+    /// The `cursor_begin` and `cursor_end` sent with `text`.
+    pub cursor: (i32, i32),
+}
+
+impl ShownPreedit {
+    /// Whether the guest shows a composition. Empty text is always sent
+    /// with the cursor `(0, 0)`, so the text alone decides.
+    pub fn has_text(&self) -> bool {
+        !self.text.is_empty()
+    }
+
+    /// `text` with the cursor at its end, as a preedit with no cursor of
+    /// its own is sent.
+    #[cfg(test)]
+    pub fn at_end(text: &str) -> Self {
+        let end = text.len() as i32;
+        Self {
+            text: text.to_string(),
+            cursor: (end, end),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextInputState {
     pub host_v1_id: u32,
@@ -266,7 +294,7 @@ pub struct TextInputState {
     pub pending: V3Pending,
     /// State the v3 commits applied.
     pub committed: V3Committed,
-    pub current_preedit: String,
+    pub current_preedit: ShownPreedit,
     /// Number of v3 commit requests received from this guest object.
     ///
     /// The v3 protocol requires every `done` event to use this counter as its
@@ -307,7 +335,9 @@ pub struct TextInputState {
 /// What a v3 commit asks of the host beyond its committed state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct V3Commit {
-    /// The commit enabled or disabled the field, which resets it.
+    /// The commit enabled a disabled field, disabled an enabled one, or
+    /// had its enable ignored, which resets the field and ends its
+    /// composition. An enable of an enabled field does not.
     pub new_field: bool,
     pub cursor_rect: Option<CursorRect>,
 }
@@ -323,6 +353,15 @@ pub(crate) struct HostPreeditPlan {
 
 /// A host `commit_string` or `delete_surrounding_text`, either of which
 /// ends the composition.
+/// What came with a host preedit besides its text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostPreeditContext {
+    /// The host's `preedit_string` carried a non-empty reset commit.
+    pub has_reset_commit: bool,
+    /// The seat's keyboard holds Backspace.
+    pub backspace_held: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostCommitPlan {
     pub guest_seat: u32,
@@ -362,7 +401,7 @@ impl TextInputState {
             active_surface,
             pending: V3Pending::default(),
             committed: V3Committed::default(),
-            current_preedit: String::new(),
+            current_preedit: ShownPreedit::default(),
             guest_commit_serial: 0,
             pending_preedit_cursor: None,
             pending_preedit_selection: None,
@@ -441,12 +480,21 @@ impl TextInputState {
             content_type,
             cursor_rect,
         } = std::mem::take(&mut self.pending);
+        let mut new_field = false;
         if let Some(enabled) = enabled {
+            // An enable of an enabled field, which GTK3 sends on every
+            // click, keeps the field: the host's composition runs on, so
+            // the guest keeps the preedit it shows, and the host keeps the
+            // content type, which before the v8 extension a resend would
+            // reset that composition with.
+            new_field = enable_conflict || enabled != self.committed.enabled;
             if !enable_conflict {
                 self.committed.enabled = enabled;
             }
-            self.clear_host_composition();
-            self.host.new_field();
+            if new_field {
+                self.clear_host_composition();
+                self.host.new_field();
+            }
         }
         if let Some(surrounding_text) = surrounding_text {
             self.committed.surrounding_text = surrounding_text;
@@ -456,7 +504,7 @@ impl TextInputState {
             self.committed.content_type = content_type;
         }
         V3Commit {
-            new_field: enabled.is_some(),
+            new_field,
             cursor_rect,
         }
     }
@@ -491,7 +539,7 @@ impl TextInputState {
         self.host_is_active().then_some(HostPreeditPlan {
             guest_seat: self.guest_seat,
             done_serial: self.guest_commit_serial,
-            had_preedit: !self.current_preedit.is_empty(),
+            had_preedit: self.current_preedit.has_text(),
             selection: self.pending_preedit_selection,
             cursor: self.pending_preedit_cursor,
         })
@@ -501,19 +549,25 @@ impl TextInputState {
         &mut self,
         plan: HostPreeditPlan,
         text: String,
-        reset_commit_is_empty: bool,
-        backspace_held: bool,
+        cursor: (i32, i32),
+        HostPreeditContext {
+            has_reset_commit,
+            backspace_held,
+        }: HostPreeditContext,
     ) -> bool {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
         debug_assert_eq!(plan.selection, self.pending_preedit_selection);
         debug_assert_eq!(plan.cursor, self.pending_preedit_cursor);
-        debug_assert_eq!(plan.had_preedit, !self.current_preedit.is_empty());
+        debug_assert_eq!(plan.had_preedit, self.current_preedit.has_text());
 
         self.pending_preedit_selection = None;
         self.pending_preedit_cursor = None;
-        let arm_backspace_repeat =
-            text.is_empty() && plan.had_preedit && reset_commit_is_empty && backspace_held;
-        self.current_preedit = text;
+        let cleared = text.is_empty() && plan.had_preedit;
+        let arm_backspace_repeat = cleared && !has_reset_commit && backspace_held;
+        // A cleared preedit with a reset commit reaches the guest as that
+        // commit, an edit the guest has yet to report.
+        self.unreported_host_edit |= cleared && has_reset_commit;
+        self.current_preedit = ShownPreedit { text, cursor };
         arm_backspace_repeat
     }
 
@@ -521,7 +575,7 @@ impl TextInputState {
         self.host_is_active().then_some(HostCommitPlan {
             guest_seat: self.guest_seat,
             done_serial: self.guest_commit_serial,
-            had_preedit: !self.current_preedit.is_empty(),
+            had_preedit: self.current_preedit.has_text(),
             cursor_position: self.pending_cursor_position,
         })
     }
@@ -531,7 +585,7 @@ impl TextInputState {
     pub(crate) fn finish_host_commit(&mut self, plan: HostCommitPlan, edited: bool) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
         debug_assert_eq!(plan.cursor_position, self.pending_cursor_position);
-        debug_assert_eq!(plan.had_preedit, !self.current_preedit.is_empty());
+        debug_assert_eq!(plan.had_preedit, self.current_preedit.has_text());
         self.clear_host_composition();
         self.unreported_host_edit |= edited;
     }
@@ -551,13 +605,21 @@ impl TextInputState {
         })
     }
 
-    pub(crate) fn finish_preedit_region(&mut self, plan: PreeditRegionPlan, preedit_text: String) {
+    pub(crate) fn finish_preedit_region(
+        &mut self,
+        plan: PreeditRegionPlan,
+        preedit_text: String,
+        cursor: (i32, i32),
+    ) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
         debug_assert_eq!(plan.selection, self.pending_preedit_selection);
         debug_assert_eq!(plan.cursor, self.pending_preedit_cursor);
         self.pending_preedit_selection = None;
         self.pending_preedit_cursor = None;
-        self.current_preedit = preedit_text;
+        self.current_preedit = ShownPreedit {
+            text: preedit_text,
+            cursor,
+        };
         self.unreported_host_edit = true;
     }
 
@@ -565,16 +627,22 @@ impl TextInputState {
         self.host_is_active().then(|| ConfirmPreeditPlan {
             guest_seat: self.guest_seat,
             done_serial: self.guest_commit_serial,
-            preedit_text: self.current_preedit.clone(),
+            preedit_text: self.current_preedit.text.clone(),
         })
+    }
+
+    /// The guest was not shown the preedit the proxy repeated, which it
+    /// therefore no longer shows.
+    pub(crate) fn forget_shown_preedit(&mut self) {
+        self.current_preedit = ShownPreedit::default();
     }
 
     /// Close a host composition transaction after its complete guest message
     /// sequence has been encoded.
     pub(crate) fn finish_confirm_preedit(&mut self, plan: ConfirmPreeditPlan) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
-        debug_assert_eq!(plan.preedit_text, self.current_preedit);
-        self.current_preedit.clear();
+        debug_assert_eq!(plan.preedit_text, self.current_preedit.text);
+        self.current_preedit = ShownPreedit::default();
         self.pending_preedit_cursor = None;
         self.pending_preedit_selection = None;
         self.unreported_host_edit = true;
@@ -592,13 +660,13 @@ impl TextInputState {
         if !self.host.end_without_barrier() {
             return None;
         }
-        let had_preedit = !self.current_preedit.is_empty();
+        let had_preedit = self.current_preedit.has_text();
         self.clear_host_composition();
         Some(had_preedit)
     }
 
     fn clear_host_composition(&mut self) {
-        self.current_preedit.clear();
+        self.current_preedit = ShownPreedit::default();
         self.pending_preedit_cursor = None;
         self.pending_preedit_selection = None;
         self.pending_cursor_position = None;
@@ -1993,7 +2061,7 @@ mod tests {
     fn composing() -> TextInputState {
         let mut state = text_input(ACTIVE);
         state.set_guest_commits(7);
-        state.current_preedit = "가".to_string();
+        state.current_preedit = ShownPreedit::at_end("가");
         state.record_preedit_selection(0, 3);
         state.record_preedit_cursor(3);
         state.record_cursor_position(1, 1);
@@ -2297,6 +2365,36 @@ mod tests {
         assert_eq!(reconcile(&target, &state.host), HostSteps::default());
     }
 
+    /// A commit that enables a disabled field, or disables an enabled one,
+    /// starts a new field: it closes the composition with its pending
+    /// metadata, and the host is told its content type again. One that
+    /// enables an enabled field again keeps the field: the composition,
+    /// its metadata and the content type the host applied.
+    #[test]
+    fn only_an_enable_that_changes_the_field_closes_its_composition() {
+        let mut state = composing();
+        state.committed.enabled = true;
+        let applied = HostContentType {
+            content_type: (0, 0),
+            surrounding_text_support: Some(false),
+        };
+        state.host.apply_content_type(applied);
+        let before = state.clone();
+        state.pending = V3Pending::reset(true);
+        assert!(!state.commit(false).new_field);
+        let mut expected = before;
+        expected.committed = state.committed.clone();
+        assert_eq!(state, expected, "an enable of an enabled field");
+
+        state.pending = V3Pending::reset(false);
+        assert!(state.commit(false).new_field);
+        let mut expected = text_input(ACTIVE);
+        expected.set_guest_commits(7);
+        expected.committed = state.committed.clone();
+        assert!(!expected.committed.enabled);
+        assert_eq!(state, expected, "a disable");
+    }
+
     #[test]
     fn rejected_enable_closes_composition_but_stays_disabled() {
         let known = HostApplied::Active {
@@ -2354,9 +2452,16 @@ mod tests {
             }
         );
 
-        state.finish_host_preedit(plan, "각".to_string(), true, true);
+        let context = HostPreeditContext {
+            has_reset_commit: false,
+            backspace_held: true,
+        };
+        state.finish_host_preedit(plan, "각".to_string(), (0, 3), context);
         let mut expected = before;
-        expected.current_preedit = "각".to_string();
+        expected.current_preedit = ShownPreedit {
+            text: "각".to_string(),
+            cursor: (0, 3),
+        };
         expected.pending_preedit_selection = None;
         expected.pending_preedit_cursor = None;
         assert_eq!(state, expected);
@@ -2406,7 +2511,7 @@ mod tests {
         state.finish_confirm_preedit(plan);
         // The cursor position stays for the next commit string.
         let mut expected = before;
-        expected.current_preedit.clear();
+        expected.current_preedit = ShownPreedit::default();
         expected.pending_preedit_selection = None;
         expected.pending_preedit_cursor = None;
         expected.unreported_host_edit = true;
@@ -2512,7 +2617,7 @@ mod tests {
                         assert_eq!(next.guest_commit_serial(), previous_serial.wrapping_add(1));
                         assert_eq!(next.pending, V3Pending::default());
                         if new_field {
-                            assert!(next.current_preedit.is_empty());
+                            assert!(!next.current_preedit.has_text());
                             assert_eq!(next.pending_cursor_position, None);
                         }
                     }

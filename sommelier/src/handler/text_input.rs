@@ -26,7 +26,8 @@ use crate::protocols::wayland::{wl_keyboard, wl_seat};
 use crate::state::GuestKeyOwner;
 use crate::state::{
     reconcile, ActivationStep, Context, CursorRect, GuestKeyDelivery, GuestKeyEvent, HostApplied,
-    HostContentType, HostId, HostTarget, InternalCallback, Link, SeatFocusChange, TextInputState,
+    HostContentType, HostId, HostPreeditContext, HostTarget, InternalCallback, Link,
+    SeatFocusChange, TextInputState,
 };
 use crate::wire::{queue_or_drop, Action, IndexedString, Outgoing};
 
@@ -689,8 +690,11 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         let arm_backspace_repeat = state.finish_host_preedit(
             plan,
             text.clone(),
-            commit.is_empty(),
-            repeat_keyboard.is_some(),
+            (cursor_begin, cursor_end),
+            HostPreeditContext {
+                has_reset_commit: !commit.is_empty(),
+                backspace_held: repeat_keyboard.is_some(),
+            },
         );
         if arm_backspace_repeat {
             let host_keyboard_id = repeat_keyboard.expect("held Backspace was checked above");
@@ -1195,7 +1199,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             .get_mut(&guest_id)
             .expect("active text input disappeared while installing preedit region");
         let guest_seat = plan.guest_seat;
-        state.finish_preedit_region(plan, preedit_text);
+        state.finish_preedit_region(plan, preedit_text, (cursor_begin, cursor_end));
         end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         ctx.host_to_client_queue.extend(transaction);
 
@@ -1871,6 +1875,41 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
     }
 }
 
+/// Answer the guest's latest commit on text input `guest_id` with a
+/// `done`, if the commit left the field enabled, as mutter and KWin do. The
+/// protocol numbers each `done` by the commits so far, and a client may
+/// hold its surrounding text and cursor rectangle until a `done` names its
+/// latest commit, as Chromium does. A `done` applies the preedit sent since
+/// the previous one, or none, so this one repeats the preedit the guest
+/// shows. Unlike mutter and KWin, the proxy cannot end the host's
+/// composition when the guest resets its own (see HANDOVER).
+fn answer_guest_commit(ctx: &mut Context, guest_id: u32) {
+    let Some(state) = ctx
+        .text_inputs
+        .get(&guest_id)
+        .filter(|state| state.committed.enabled)
+    else {
+        return;
+    };
+    let mut transaction = Vec::new();
+    let serial = state.guest_commit_serial();
+    let preedit = &state.current_preedit;
+    // The preedit reached the guest once, so it fits a message. Should it
+    // not, the `done` alone clears it, so the proxy forgets it too; the
+    // `done` goes regardless, or Chromium would hold its state.
+    if preedit.has_text() {
+        let (cursor_begin, cursor_end) = preedit.cursor;
+        let text = &preedit.text;
+        if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
+            if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+                state.forget_shown_preedit();
+            }
+        }
+    }
+    transaction.push(zwp_text_input_v3::evt::done(guest_id, serial));
+    ctx.host_to_client_queue.extend(transaction);
+}
+
 pub struct TextInputV3Handler;
 impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
@@ -2059,6 +2098,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 ),
                 format_args!("the surrounding text of text input {guest_id}"),
             ) {
+                answer_guest_commit(ctx, guest_id);
                 return Action::Drop;
             }
         }
@@ -2085,6 +2125,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 cursor_rect: commit.cursor_rect,
             }),
         );
+        answer_guest_commit(ctx, guest_id);
         Action::Drop
     }
 }
@@ -2273,6 +2314,7 @@ mod tests {
             let mut f = Self::disabled().await;
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
             assert_eq!(f.s.host_received(), f.enable_requests(1));
+            f.answered(1);
             f
         }
 
@@ -2290,6 +2332,7 @@ mod tests {
             expected.extend(f.content_type((0, 0), true));
             expected.push(f.commit_state(2));
             assert_eq!(f.s.host_received(), expected);
+            f.answered(2);
             f
         }
 
@@ -2328,6 +2371,7 @@ mod tests {
                 f.commit_state(1),
             ];
             assert_eq!(f.s.host_received(), expected);
+            f.answered(1);
             f
         }
 
@@ -2430,6 +2474,13 @@ mod tests {
                 .into_iter()
                 .map(|event| (self.ti, event.into()))
                 .collect()
+        }
+
+        /// The guest gets the `done` that answers its commit `serial`, and
+        /// nothing else.
+        fn answered(&mut self, serial: u32) {
+            let events = self.events([V3::Done { serial }]);
+            assert_eq!(self.s.guest_received(), events);
         }
 
         /// `request` of the host text input.
@@ -2865,6 +2916,7 @@ mod tests {
 
         f.s.guest([v3::commit(f.ti)]).await;
         assert_eq!(f.s.host_received(), f.enable_requests(1));
+        f.answered(1);
     }
 
     /// A focus change deactivates the host behind a drain barrier: the
@@ -2900,6 +2952,7 @@ mod tests {
                 f.commit_state(2),
             ]
         );
+        f.answered(2);
 
         // Then the activation, and the content type it resets.
         f.drain(callback).await;
@@ -2935,6 +2988,7 @@ mod tests {
         ])
         .await;
         assert_eq!(f.s.host_received(), f.reset(3, Reset::default()));
+        f.answered(3);
 
         f.drain(callback).await;
         let mut expected = vec![f.activate()];
@@ -2970,6 +3024,7 @@ mod tests {
                 }
             )
         );
+        f.answered(1);
         f.s.host([v1::enter(f.host, f.surface.host)]).await;
         f
     }
@@ -2986,6 +3041,7 @@ mod tests {
         ])
         .await;
         assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+        f.answered(2);
     }
 
     /// Exo detached on its own, as when its input method is destroyed, and
@@ -3078,6 +3134,7 @@ mod tests {
         ])
         .await;
         assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+        f.answered(2);
     }
 
     #[tokio::test]
@@ -3093,6 +3150,7 @@ mod tests {
         // The barrier still drains the generation: an enable waits for it.
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
         assert_eq!(f.s.host_received(), f.reset(3, Reset::default()));
+        f.answered(3);
         f.drain(callback).await;
         let mut expected = vec![f.activate()];
         expected.extend(f.content_type((0, 0), false));
@@ -3116,6 +3174,7 @@ mod tests {
         ])
         .await;
         assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
+        f.answered(1);
         // Only the log shows the warning, so read the flag that makes it
         // once.
         assert!(f.s.ctx().text_inputs[&f.ti].warned_seat_missing);
@@ -3146,6 +3205,7 @@ mod tests {
             f.keyboard_enter_new_surface().await;
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
             assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
+            f.answered(serial);
         }
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
         assert_eq!(f.s.host_received(), f.reset(5, Reset::default()));
@@ -3205,6 +3265,7 @@ mod tests {
             expected.push(f.commit_state(2));
             expected
         });
+        f.answered(2);
 
         f.s.guest([v3::disable(f.ti)]).await;
         assert_eq!(f.s.host_received(), []);
@@ -3213,54 +3274,42 @@ mod tests {
         assert_eq!(host, f.disable_requests(barrier(&host), 3));
     }
 
-    /// An enable starts a new field: it closes the composition the input
-    /// method left, with its pending preedit cursor, selection and cursor
-    /// position.
+    /// GTK3 enables an enabled field again on every click in it
+    /// (`imwayland.c`, `released_cb`). That keeps the field, as mutter and
+    /// KWin keep it: the host's composition runs on, with its content type,
+    /// which before the v8 extension a resend would reset it with, so the
+    /// `done` that answers the commit repeats the preedit, and the
+    /// composition goes on from it. The guest never hides a syllable the
+    /// input method still builds, and the host's reset commit still
+    /// replaces it.
     #[tokio::test]
-    async fn committed_enable_resets_previous_ime_event_transaction() {
-        for preedit_first in [true, false] {
-            let mut f = Field::enabled().await;
-            f.s.host([
-                f.preedit("이전", ""),
-                v1::preedit_styling(f.host, 0, 3, 6),
-                v1::preedit_cursor(f.host, 3),
-                v1::cursor_position(f.host, 1, 1),
-            ])
-            .await;
-            let expected = [preedit("이전"), V3::Done { serial: 1 }];
-            assert_eq!(f.s.guest_received(), f.events(expected));
-            // No v3 event carries the cursor position, so read it.
-            let cursor_position =
-                |f: &mut Field| f.s.ctx().text_inputs[&f.ti].pending_cursor_position;
-            assert_eq!(cursor_position(&mut f), Some((1, 1)));
+    async fn reenabling_an_enabled_field_keeps_its_composition() {
+        let mut f = Field::enabled().await;
+        f.s.host([
+            v1::preedit_cursor(f.host, 0),
+            f.preedit("가", "가"),
+            v1::cursor_position(f.host, 1, 1),
+        ])
+        .await;
+        let composing = || preedit_at("가", 0, 0);
+        let expected = [composing(), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
 
-            f.s.guest([v3::enable(f.ti)]).await;
-            f.s.guest([v3::commit(f.ti)]).await;
-            assert_eq!(cursor_position(&mut f), None);
-            let content_type = f.content_type((0, 0), false).into();
-            let expected = f.reset(
-                2,
-                Reset {
-                    content_type,
-                    ..Reset::default()
-                },
-            );
-            assert_eq!(f.s.host_received(), expected);
+        // The host keeps the field's content type, so none is sent.
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.reset(2, Reset::default()));
+        let expected = [composing(), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        // No v3 event carries the cursor position, so read it.
+        let cursor_position = f.s.ctx().text_inputs[&f.ti].pending_cursor_position;
+        assert_eq!(cursor_position, Some((1, 1)));
 
-            let done = V3::Done { serial: 2 };
-            if preedit_first {
-                // No cursor or selection for the next preedit.
-                f.s.host([f.preedit("가나", "")]).await;
-                assert_eq!(
-                    f.s.guest_received(),
-                    f.events([preedit_at("가나", 6, 6), done])
-                );
-            } else {
-                // No preedit to clear.
-                f.s.host([f.commit("새")]).await;
-                assert_eq!(f.s.guest_received(), f.events([commit("새"), done]));
-            }
-        }
+        let done = || V3::Done { serial: 2 };
+        f.s.host([f.preedit("간", "간")]).await;
+        assert_eq!(f.s.guest_received(), f.events([preedit("간"), done()]));
+        f.s.host([f.preedit("", "간")]).await;
+        let expected = [commit("간"), no_preedit(), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
     /// Each commit forwards the surrounding text it states; offsets that
@@ -3277,6 +3326,7 @@ mod tests {
         expected.extend(f.content_type((0, 0), true));
         expected.push(f.commit_state(2));
         assert_eq!(f.s.host_received(), expected);
+        f.answered(2);
 
         for (serial, (cursor, anchor)) in (3..).zip([(1, 1), (3, 7), (-1, 0)]) {
             f.s.guest([
@@ -3289,6 +3339,7 @@ mod tests {
                 [f.commit_state(serial)],
                 "{cursor}, {anchor}"
             );
+            f.answered(serial);
         }
     }
 
@@ -3311,6 +3362,7 @@ mod tests {
         expected.extend(f.content_type((0, 0), true));
         expected.push(f.commit_state(2));
         assert_eq!(f.s.host_received(), expected);
+        f.answered(2);
 
         let latin1 = v3::set_surrounding_text(f.ti, "Cafe", 3, 3).unwrap();
         f.s.guest([
@@ -3323,6 +3375,7 @@ mod tests {
             f.s.host_received(),
             [f.surrounding_text("", 0, 0), f.commit_state(3)]
         );
+        f.answered(3);
 
         f.s.guest([
             v3::set_surrounding_text(f.ti, "Café", 5, 5).unwrap(),
@@ -3333,6 +3386,7 @@ mod tests {
             f.s.host_received(),
             [f.surrounding_text("Café", 5, 5), f.commit_state(4)]
         );
+        f.answered(4);
     }
 
     /// The v3 content type maps to the host's, which is told with it that
@@ -3442,6 +3496,7 @@ mod tests {
                 f.commit_state(2),
             ]
         );
+        f.answered(2);
     }
 
     /// GTK resends the unchanged terminal content type after IME events.
@@ -3459,6 +3514,7 @@ mod tests {
             let mut expected = Vec::from(f.content_type((0, TERMINAL), false));
             expected.push(f.commit_state(2));
             assert_eq!(f.s.host_received(), expected);
+            f.answered(2);
 
             let mut requests = purposes
                 .iter()
@@ -3467,6 +3523,7 @@ mod tests {
             requests.push(v3::commit(f.ti));
             f.s.guest(requests).await;
             assert_eq!(f.s.host_received(), [f.commit_state(3)], "{purposes:?}");
+            f.answered(3);
         }
     }
 
@@ -3491,6 +3548,7 @@ mod tests {
         let mut expected = vec![f.surrounding_text("abc", 3, 3)];
         expected.extend(edits(&f, 2, true));
         assert_eq!(f.s.host_received(), expected);
+        f.answered(2);
 
         // While the support holds, the content type is not resent: before
         // v8 a resend changes Exo's type twice, which can reset its
@@ -3505,6 +3563,7 @@ mod tests {
             f.s.host_received(),
             [f.surrounding_text("abcd", 4, 4), f.commit_state(3)]
         );
+        f.answered(3);
 
         // A disable and enable reset the editor state: the content type is
         // replayed with the support of the field's new, empty state.
@@ -3526,6 +3585,7 @@ mod tests {
                 }
             )
         );
+        f.answered(4);
     }
 
     #[tokio::test]
@@ -3542,6 +3602,7 @@ mod tests {
             },
         );
         assert_eq!(f.s.host_received(), expected);
+        f.answered(1);
 
         // The host was told no support, so gaining surrounding text changes
         // nothing it knows.
@@ -3554,6 +3615,7 @@ mod tests {
             f.s.host_received(),
             [f.surrounding_text("abc", 3, 3), f.commit_state(2)]
         );
+        f.answered(2);
     }
 
     /// The host requests of a content type for each extension version.
@@ -3566,6 +3628,7 @@ mod tests {
             let mut f = Field::new(Some(version)).await;
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
             f.s.host_received();
+            f.answered(1);
             f.s.guest([v3::set_content_type(f.ti, 0, PIN), v3::commit(f.ti)])
                 .await;
             let set_content_type = f.v1(V1::SetContentType { hint, purpose });
@@ -3594,6 +3657,7 @@ mod tests {
             let mut expected = expected;
             expected.push(f.commit_state(2));
             assert_eq!(f.s.host_received(), expected, "version {version}");
+            f.answered(2);
         }
     }
 
@@ -3636,6 +3700,7 @@ mod tests {
         // the new text input's composition.
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
         assert_eq!(f.s.host_received(), f.enable_requests(1));
+        f.answered(1);
         f.s.host([f.preedit("나", ""), ext::confirm_preedit(old_host_ext, 0)])
             .await;
         let expected = [preedit("나"), V3::Done { serial: 1 }];
@@ -3696,6 +3761,7 @@ mod tests {
             f.s.guest([request, v3::commit(f.ti)]).await;
             assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
         }
+        f.answered(3);
         // The disable ended the host's generation: its events reach no one.
         f.s.host([f.commit("가")]).await;
         assert_eq!(f.s.guest_received(), []);
@@ -3717,6 +3783,7 @@ mod tests {
             },
         );
         assert_eq!(f.s.host_received(), expected);
+        f.answered(1);
     }
 
     /// A leave is a hard boundary: what the guest requests until the next
@@ -3762,6 +3829,7 @@ mod tests {
         // Focus enters again; the client enables and commits.
         f.keyboard_enter().await;
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        f.answered(3);
         f.drain(callback).await;
         f.s.host_received();
 
@@ -3771,6 +3839,214 @@ mod tests {
             f.s.guest_received(),
             f.events([commit("가"), V3::Done { serial: 3 }])
         );
+    }
+
+    /// A text-input-v3 client that, like Chromium's
+    /// (`ui/ozone/platform/wayland/host/zwp_text_input_v3.cc`), sends its
+    /// surrounding text and cursor rectangle only while the latest `done`
+    /// names its latest commit (`DoneSerialEqualsCommitCount`), and on each
+    /// `done` shows the preedit sent since the previous `done`, or none, as
+    /// the protocol says.
+    struct DoneCountingClient {
+        /// Its `commit` requests.
+        commits: u32,
+        /// The serial of the latest `done`.
+        done_serial: u32,
+        /// The `preedit_string` since the latest `done`.
+        pending_preedit: V3,
+        /// The preedit it shows.
+        preedit: V3,
+    }
+
+    impl DoneCountingClient {
+        fn new() -> Self {
+            Self {
+                commits: 0,
+                done_serial: 0,
+                pending_preedit: no_preedit(),
+                preedit: no_preedit(),
+            }
+        }
+
+        /// Its next `commit` of text input `ti`.
+        fn commit(&mut self, ti: u32) -> Outgoing {
+            self.commits += 1;
+            v3::commit(ti)
+        }
+
+        /// Apply `events` of its text input.
+        fn receive(&mut self, events: Vec<(u32, AnyEvent)>) {
+            for (_, event) in events {
+                match event {
+                    AnyEvent::ZwpTextInputV3(event @ V3::PreeditString { .. }) => {
+                        self.pending_preedit = event;
+                    }
+                    AnyEvent::ZwpTextInputV3(V3::Done { serial }) => {
+                        self.done_serial = serial;
+                        self.preedit = std::mem::replace(&mut self.pending_preedit, no_preedit());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        /// Whether it may send its state.
+        fn may_send(&self) -> bool {
+            self.done_serial == self.commits
+        }
+    }
+
+    /// Every commit that leaves the field enabled gets a `done`, as mutter
+    /// and KWin send, so a client that waits for one before it reports a
+    /// caret move or an edit, as Chromium does, reports each at once
+    /// rather than after the input method's next event. A commit that
+    /// disables the field gets none, as from mutter.
+    #[tokio::test]
+    async fn every_commit_of_an_enabled_field_gets_a_done() {
+        let mut f = Field::disabled().await;
+        let mut client = DoneCountingClient::new();
+        f.s.guest([v3::enable(f.ti), client.commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        let events = f.s.guest_received();
+        assert_eq!(events, f.events([V3::Done { serial: 1 }]));
+        client.receive(events);
+        assert!(client.may_send());
+
+        // The caret moves.
+        let rect = v3::set_cursor_rectangle(f.ti, 10, 20, 1, 16);
+        f.s.guest([rect, client.commit(f.ti)]).await;
+        let rect = f.v1(V1::SetCursorRectangle {
+            x: 10,
+            y: 20,
+            width: 1,
+            height: 16,
+        });
+        assert_eq!(f.s.host_received(), [rect, f.commit_state(2)]);
+        let events = f.s.guest_received();
+        assert_eq!(events, f.events([V3::Done { serial: 2 }]));
+        client.receive(events);
+        assert!(client.may_send());
+
+        f.s.guest([v3::disable(f.ti), client.commit(f.ti)]).await;
+        let host = f.s.host_received();
+        assert_eq!(host, f.disable_requests(barrier(&host), 3));
+        assert_eq!(f.s.guest_received(), []);
+    }
+
+    /// The `done` that answers a commit carries the preedit the guest
+    /// shows, with its cursor, as mutter's and KWin's do: a `done` applies
+    /// the preedit sent since the previous one, or none, so without it the
+    /// guest would drop its composition. Chromium commits after every
+    /// preedit it applies.
+    #[tokio::test]
+    async fn a_commit_during_composition_keeps_the_preedit() {
+        let mut f = Field::disabled().await;
+        let mut client = DoneCountingClient::new();
+        f.s.guest([v3::enable(f.ti), client.commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        client.receive(f.s.guest_received());
+
+        f.s.host([v1::preedit_cursor(f.host, 3), f.preedit("가나", "가나")])
+            .await;
+        let events = f.s.guest_received();
+        let composing = || preedit_at("가나", 3, 3);
+        let expected = [composing(), V3::Done { serial: 1 }];
+        assert_eq!(events, f.events(expected));
+        client.receive(events);
+        assert_eq!(client.preedit, composing());
+
+        let rect = v3::set_cursor_rectangle(f.ti, 10, 20, 1, 16);
+        f.s.guest([rect, client.commit(f.ti)]).await;
+        f.s.host_received();
+        let events = f.s.guest_received();
+        let expected = [composing(), V3::Done { serial: 2 }];
+        assert_eq!(events, f.events(expected));
+        client.receive(events);
+        assert!(client.may_send());
+        assert_eq!(client.preedit, composing());
+
+        // The composition goes on.
+        f.s.host([f.preedit("가낙", "가낙")]).await;
+        let expected = [preedit("가낙"), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// An input method that replaces text deletes, then commits, each a
+    /// transaction of its own. A client that waits for `done`, as Chromium
+    /// does, reports its text after the first, before it has applied the
+    /// second; the `done` that answers that report lets it report the text
+    /// after the second at once, rather than at the input method's next
+    /// event, so the next delete is measured against the text the guest
+    /// shows. A delete ends a preedit, and the `done` of the next commit
+    /// repeats none.
+    #[tokio::test]
+    async fn a_client_that_waits_for_done_reports_the_text_an_edit_leaves() {
+        let mut f = Field::disabled().await;
+        let mut client = DoneCountingClient::new();
+        f.s.guest([
+            v3::enable(f.ti),
+            v3::set_surrounding_text(f.ti, "see you tom", 11, 11).unwrap(),
+            client.commit(f.ti),
+        ])
+        .await;
+        f.s.host_received();
+        client.receive(f.s.guest_received());
+        assert!(client.may_send());
+        let report = |f: &Field, text: &str| {
+            let end = text.len() as i32;
+            v3::set_surrounding_text(f.ti, text, end, end).unwrap()
+        };
+        let done = |serial| V3::Done { serial };
+
+        // The user accepts the suggestion "tomorrow".
+        f.s.host([f.delete_range(8, 3), f.commit("tomorrow")]).await;
+        let mut events = f.s.guest_received();
+        let expected = [delete(3, 0), done(1), commit("tomorrow"), done(1)];
+        assert_eq!(events, f.events(expected));
+        let commit_transaction = events.split_off(2);
+        client.receive(events);
+        assert!(client.may_send());
+        f.s.guest([report(&f, "see you "), client.commit(f.ti)])
+            .await;
+        let expected = [f.surrounding_text("see you ", 8, 8), f.commit_state(2)];
+        assert_eq!(f.s.host_received(), expected);
+        client.receive(commit_transaction);
+        assert!(!client.may_send());
+        let events = f.s.guest_received();
+        assert_eq!(events, f.events([done(2)]));
+        client.receive(events);
+        assert!(client.may_send());
+        f.s.guest([report(&f, "see you tomorrow"), client.commit(f.ti)])
+            .await;
+        let expected = [
+            f.surrounding_text("see you tomorrow", 16, 16),
+            f.commit_state(3),
+        ];
+        assert_eq!(f.s.host_received(), expected);
+        f.answered(3);
+
+        // The input method composes, and the caret moves.
+        f.s.host([f.preedit("x", "x")]).await;
+        client.receive(f.s.guest_received());
+        let rect = v3::set_cursor_rectangle(f.ti, 10, 20, 1, 16);
+        f.s.guest([rect, client.commit(f.ti)]).await;
+        f.s.host_received();
+        let events = f.s.guest_received();
+        assert_eq!(events, f.events([preedit("x"), done(4)]));
+        client.receive(events);
+
+        // The input method takes the suggestion back, which is measured
+        // against the text reported last.
+        f.s.host([f.delete_range(8, 8)]).await;
+        let events = f.s.guest_received();
+        let expected = [no_preedit(), delete(8, 0), done(4)];
+        assert_eq!(events, f.events(expected));
+        client.receive(events);
+        assert!(client.may_send());
+        f.s.guest([report(&f, "see you "), client.commit(f.ti)])
+            .await;
+        f.s.host_received();
+        f.answered(5);
     }
 
     /// The `done` of the guest's first commit.
@@ -4257,6 +4533,7 @@ mod tests {
         .await;
         let expected = [f.surrounding_text("abcX", 4, 4), f.commit_state(3)];
         assert_eq!(f.s.host_received(), expected);
+        f.answered(3);
         f.s.host([f.delete_range(0, 1)]).await;
         assert_eq!(f.s.guest_received(), []);
         assert!(warned(&mut f));
@@ -4282,6 +4559,7 @@ mod tests {
             height: 4,
         });
         assert_eq!(f.s.host_received(), [rectangle, f.commit_state(3)]);
+        f.answered(3);
         f.s.host([f.delete_range(2, 2)]).await;
         assert_eq!(f.s.guest_received(), []);
 
@@ -4292,8 +4570,24 @@ mod tests {
         .await;
         let expected = [f.surrounding_text("abcXdef", 4, 4), f.commit_state(4)];
         assert_eq!(f.s.host_received(), expected);
+        f.answered(4);
         f.s.host([f.delete_range(2, 2)]).await;
         assert_eq!(f.s.guest_received(), f.events([delete(2, 0), done(4)]));
+    }
+
+    /// A preedit the host clears with a reset commit reaches the guest as
+    /// that commit, an edit like any other: deletes wait until the guest
+    /// reports it.
+    #[tokio::test]
+    async fn a_reset_commit_waits_for_the_guest_to_report_it() {
+        let mut f = Field::with_surrounding_text("abc", 3, 3).await;
+        f.s.host([f.preedit("가", "가"), f.preedit("", "가")]).await;
+        let done = || V3::Done { serial: 2 };
+        let expected = [preedit("가"), done(), commit("가"), no_preedit(), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([f.delete_range(2, 1)]).await;
+        assert_eq!(f.s.guest_received(), []);
     }
 
     /// A preedit region makes committed surrounding text around the cursor
@@ -4312,6 +4606,7 @@ mod tests {
         expected.extend(f.content_type((0, 0), true));
         expected.push(f.commit_state(2));
         assert_eq!(f.s.host_received(), expected);
+        f.answered(2);
         // A region apart from the cursor takes the pending cursor with it.
         f.s.host([
             v1::preedit_cursor(f.host, 0),
@@ -4344,6 +4639,13 @@ mod tests {
         .await;
         let expected = [delete(6, 0), preedit_at("가나", 0, 3), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // The `done` of the guest's next commit repeats the region's
+        // preedit ([`answer_guest_commit`]).
+        f.s.guest([v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.commit_state(3)]);
+        let expected = [preedit_at("가나", 0, 3), V3::Done { serial: 3 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
     /// Each commit_state carries the guest's commit count, which numbers
@@ -4354,6 +4656,7 @@ mod tests {
         let mut f = Field::enabled().await;
         f.s.guest([v3::commit(f.ti)]).await;
         assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+        f.answered(2);
 
         f.s.host([
             v1::preedit_string(f.host, 2942, "한", "").unwrap(),
@@ -4386,6 +4689,7 @@ mod tests {
         f.release_seat().await;
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
         assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
+        f.answered(1);
         f.s.host([
             f.preedit("가", ""),
             f.delete_range(0, 3),
@@ -4530,6 +4834,7 @@ mod tests {
         assert_eq!(f.repeat_owner(BACKSPACE), None);
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
         assert_eq!(f.s.host_received(), f.enable_requests(1));
+        f.answered(1);
 
         let release = Stroke {
             key: BACKSPACE,
@@ -4756,6 +5061,7 @@ mod tests {
                 f.commit_state(2)
             ]
         );
+        f.answered(2);
 
         f.s.host([
             f.preedit("오래된 조합", ""),
@@ -4797,6 +5103,7 @@ mod tests {
         assert_ne!(f.host, old_host);
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
         assert_eq!(f.s.host_received(), f.enable_requests(1));
+        f.answered(1);
 
         f.drain(callback).await;
         assert_eq!(f.s.host_received(), []);
@@ -5242,6 +5549,22 @@ mod tests {
         assert!(ime.ctx.client_to_host_queue.is_empty());
         expected.set_guest_commits(1);
         assert_eq!(ime.state(), &expected);
+        // The field stays enabled, so the commit gets its `done`.
+        assert_eq!(ime.events(), [(TI, V3::Done { serial: 1 }.into())]);
+    }
+
+    /// A shown preedit the answer to a commit cannot repeat leaves the
+    /// `done` to clear it, so the proxy forgets it too, and the guest and
+    /// the proxy agree that no composition shows. The proxy shows only
+    /// preedits it has sent, so no host event reaches this.
+    #[test]
+    fn an_answer_that_cannot_repeat_the_preedit_forgets_it() {
+        let mut ime = Ime::new();
+        ime.state().current_preedit = crate::state::ShownPreedit::at_end(&"x".repeat(4_084));
+        ime.ctx.last_sender_id = TI;
+        TextInputV3Handler.on_commit(&mut ime.ctx);
+        assert_eq!(ime.events(), [(TI, V3::Done { serial: 1 }.into())]);
+        assert!(!ime.state().current_preedit.has_text());
     }
 
     /// Host text too long for a message is dropped whole: the guest gets
@@ -5267,7 +5590,7 @@ mod tests {
             let mut ime = Ime::with_keyboard();
             let state = ime.state();
             state.committed.surrounding_text = Some((oversized.clone(), 4_084, 4_084));
-            state.current_preedit = oversized.clone();
+            state.current_preedit = crate::state::ShownPreedit::at_end(&oversized);
             state.record_preedit_cursor(1);
             state.record_preedit_selection(0, 1);
             state.record_cursor_position(1, 1);
@@ -5317,7 +5640,7 @@ mod tests {
             let mut ime = Ime::with_keyboard();
             let state = ime.state();
             state.committed.surrounding_text = Some(("가나다".to_string(), 9, 9));
-            state.current_preedit = "가".to_string();
+            state.current_preedit = crate::state::ShownPreedit::at_end("가");
             ime.lease_backspace_repeat(TI);
 
             event(&mut ime);
@@ -5490,7 +5813,7 @@ mod tests {
         assert!(ime
             .ctx
             .claim_guest_key(HOST_KEYBOARD, BACKSPACE, GuestKeyOwner::Physical));
-        ime.state().current_preedit = "가".to_string();
+        ime.state().current_preedit = crate::state::ShownPreedit::at_end("가");
         ime.state().committed.surrounding_text = Some(("A가".to_string(), 4, 4));
         ime.preedit("", "");
         assert!(ime.repeat_active());
