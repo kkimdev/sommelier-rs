@@ -80,7 +80,7 @@ pub(super) fn map_dmabuf(fd: BorrowedFd<'_>, layout: DmabufLayout) -> Option<Hos
             return None;
         }
     }
-    HostMapping::map_shared(fd, span - offset0, libc::off_t::try_from(offset0).ok()?).ok()
+    HostMapping::map_shared(fd, span - offset0, u64::try_from(offset0).ok()?).ok()
 }
 
 pub(super) fn allocate_virtwl_dmabuf(

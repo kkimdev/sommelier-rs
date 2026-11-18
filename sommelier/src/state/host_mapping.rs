@@ -48,8 +48,9 @@ unsafe impl Send for HostMapping {}
 unsafe impl Sync for HostMapping {}
 
 impl HostMapping {
-    /// Map `len` bytes of `fd` from `offset`, shared and read-write.
-    pub fn map_shared(fd: BorrowedFd<'_>, len: usize, offset: libc::off_t) -> io::Result<Self> {
+    /// Map `len` bytes of `fd` from `offset`, shared and read-write. An
+    /// empty mapping is refused with `EINVAL`.
+    pub fn map_shared(fd: BorrowedFd<'_>, len: usize, offset: u64) -> io::Result<Self> {
         Self::map(fd, len, offset, libc::PROT_READ | libc::PROT_WRITE)
     }
 
@@ -60,12 +61,11 @@ impl HostMapping {
         Self::map(fd, len, 0, libc::PROT_READ)
     }
 
-    fn map(
-        fd: BorrowedFd<'_>,
-        len: usize,
-        offset: libc::off_t,
-        prot: libc::c_int,
-    ) -> io::Result<Self> {
+    fn map(fd: BorrowedFd<'_>, len: usize, offset: u64, prot: libc::c_int) -> io::Result<Self> {
+        if len == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let offset = file_offset(offset)?;
         // SAFETY: a new mapping, at an address the kernel chooses, aliases
         // no memory the program already uses.
         let ptr = unsafe {
@@ -101,8 +101,7 @@ impl HostMapping {
         }
         let mut start = dst.start;
         while start < dst.end {
-            let file_offset = libc::off_t::try_from(offset)
-                .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            let file_offset = file_offset(offset)?;
             // SAFETY: `start..dst.end` lies inside the mapping, which lives
             // as long as `self`. Only the kernel writes through the pointer.
             let read = unsafe {
@@ -148,10 +147,16 @@ impl HostMapping {
 
 impl Drop for HostMapping {
     fn drop(&mut self) {
-        // SAFETY: the value owns the mapping, and nothing uses it after
-        // drop.
-        unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
+        // SAFETY: the value owns the mapping, of a nonzero `len`, and
+        // nothing uses it after drop.
+        let unmapped = unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
+        debug_assert_eq!(unmapped, 0, "munmap of an owned mapping failed");
     }
+}
+
+/// `offset` as a file offset for `mmap` and `pread`, or `EOVERFLOW`.
+fn file_offset(offset: u64) -> io::Result<libc::off_t> {
+    libc::off_t::try_from(offset).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
 }
 
 #[cfg(test)]
@@ -198,8 +203,9 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_mmap_is_an_error() {
+    fn a_zero_length_mapping_is_refused() {
         let file = shm_pool_file(&[0; 4]);
-        assert!(HostMapping::map_shared(file.as_fd(), 0, 0).is_err());
+        let error = HostMapping::map_shared(file.as_fd(), 0, 0).err().unwrap();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
     }
 }
