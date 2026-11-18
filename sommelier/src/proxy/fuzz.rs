@@ -1993,14 +1993,20 @@ struct Presses {
 impl Pointers {
     /// A request of `sender` created `id`, which `version` names if the
     /// request binds a global; a pointer or touch has its seat's.
+    ///
+    /// The ID may be one an earlier object had, which the compositor has
+    /// not yet been asked to prune ([`Self::presses`]), so the new object
+    /// starts with nothing of the old one's focus or version.
     fn created(&mut self, sender: u32, id: u32, interface: &str, version: Option<u32>) {
         let version = match interface {
             "wl_pointer" | "wl_touch" => self.versions.get(&sender).copied(),
             _ => version,
         };
-        if let Some(version) = version {
-            self.versions.insert(id, version);
-        }
+        self.focus.remove(&id);
+        match version {
+            Some(version) => self.versions.insert(id, version),
+            None => self.versions.remove(&id),
+        };
     }
 
     /// Events of a compositor presses on the focused surface, as a click or
@@ -2120,5 +2126,29 @@ fn receive(socket: &UnixStream, bytes: &mut Vec<u8>) -> io::Result<usize> {
         // The peer closed with requests of ours still unread.
         Err(error) if error.kind() == io::ErrorKind::ConnectionReset => Ok(0),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::Pointers;
+
+    /// An ID that a new pointer reuses carries nothing of the old one: not
+    /// its focus, which would give the new pointer a `button` with no
+    /// `enter`, and not its version, which decides whether it gets frames.
+    #[test]
+    fn a_reused_pointer_id_starts_fresh() {
+        let mut pointers = Pointers::default();
+        pointers.created(1, 1, "wl_seat", Some(7));
+        pointers.created(1, 5, "wl_pointer", None);
+        pointers.focus.insert(5, 9);
+        assert_eq!(pointers.versions.get(&5), Some(&7));
+
+        pointers.created(1, 5, "wl_pointer", None);
+        assert_eq!(pointers.focus.get(&5), None);
+        // The seat is gone, so the new object has no version to inherit.
+        pointers.versions.remove(&1);
+        pointers.created(1, 5, "wl_pointer", None);
+        assert_eq!(pointers.versions.get(&5), None);
     }
 }
