@@ -42,6 +42,7 @@ limitations under the License.
 //! C1 to C9, each cited to the client's source where it is implemented.
 
 pub(super) mod chromium;
+pub(super) mod gtk;
 
 use super::clock::Micros;
 use super::editor::{Target, TextModel};
@@ -83,6 +84,9 @@ pub(super) enum DropReason {
     /// Chromium: a preedit within 100 ms of a reset that ended a
     /// composition (C4).
     PreeditInGuard(String),
+    /// GTK: an event while no field has the keyboard focus, so that no
+    /// input method context is current.
+    NoFocusedField,
 }
 
 /// A `zwp_text_input_v3` client: one application with one text input on
