@@ -30,9 +30,9 @@ limitations under the License.
 //! destroys a destroyed surface's pending frame callbacks without `done`, and
 //! gives the keyboard focus to each surface the proxy commits, as a click on
 //! its window would, holds its answer to a text input's drain barrier, as a
-//! slow host would, and keeps the text-input state Exo would ([`exo`]). In some
-//! cases it also destroys live objects of one interface on its own
-//! ([`HOST_DESTROYED`]).
+//! slow host would, and keeps the text-input state Exo would
+//! ([`crate::sim::exo`]). In some cases it also destroys live objects of one
+//! interface on its own ([`HOST_DESTROYED`]).
 //!
 //! Every case must:
 //! - end within [`CASE_TIMEOUT`] without a panic;
@@ -75,7 +75,6 @@ limitations under the License.
 // which no encoder can do.
 #![allow(clippy::disallowed_methods)]
 
-mod exo;
 mod typing;
 
 use super::{Client, Direction};
@@ -86,10 +85,10 @@ use crate::protocols::wayland::{
     wl_callback, wl_data_device, wl_data_device_manager, wl_display, wl_fixes, wl_keyboard,
     wl_registry, wl_seat, wl_surface,
 };
+use crate::sim::exo::{self, Exo};
 use crate::state::Context;
 use crate::test_support::{frames, Rng};
 use crate::wire::{Framing, MessageBuilder, MessageHeader, WireMessage, WL_DISPLAY_ID};
-use exo::Exo;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IoSlice, Read, Write};

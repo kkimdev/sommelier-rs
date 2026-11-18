@@ -54,7 +54,7 @@ use std::collections::BTreeMap;
 
 /// What one Exo `TextInput` holds for its field.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Field {
+pub(crate) struct Field {
     /// Whether an input method is attached (`input_method_` is set).
     pub attached: bool,
     pub content_type: ContentType,
@@ -67,7 +67,7 @@ pub(super) struct Field {
 /// A content type as `SetTypeModeFlags` takes it, in the extension's wire
 /// values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ContentType {
+pub(crate) struct ContentType {
     pub input_type: u32,
     pub input_mode: u32,
     pub flags: u32,
@@ -78,7 +78,7 @@ pub(super) struct ContentType {
 /// The content type `text_input_set_content_type` makes of a v1 `hint`
 /// and `purpose`, with each `ui::` value written as the extension's value
 /// of the same name.
-pub(super) fn v1_content_type(hint: u32, purpose: u32) -> ContentType {
+pub(crate) fn v1_content_type(hint: u32, purpose: u32) -> ContentType {
     use zwp_text_input_v1 as v1;
     let hint_flags = [
         (
@@ -235,7 +235,7 @@ impl TextInput {
 
 /// Exo's seat and its text inputs, as far as the model goes.
 #[derive(Default)]
-pub(super) struct Exo {
+pub(crate) struct Exo {
     /// The seat's focused surface.
     focus: Option<u32>,
     /// By host `zwp_text_input_v1` ID.
@@ -245,14 +245,14 @@ pub(super) struct Exo {
 }
 
 impl Exo {
-    pub(super) fn focus(&self) -> Option<u32> {
+    pub(crate) fn focus(&self) -> Option<u32> {
         self.focus
     }
 
     /// Move the seat's focus. `TextInput::OnSurfaceFocused` attaches the
     /// text inputs of the surface that gains it and deactivates those of
     /// the surface that loses it.
-    pub(super) fn set_focus(&mut self, focus: Option<u32>) {
+    pub(crate) fn set_focus(&mut self, focus: Option<u32>) {
         let lost = std::mem::replace(&mut self.focus, focus);
         if lost == focus {
             return;
@@ -271,7 +271,7 @@ impl Exo {
     /// loses the focus, and `TextInput::OnSurfaceDestroying` deactivates
     /// its text inputs. An extension whose text input is gone has no
     /// delegate, and Exo ignores its requests.
-    pub(super) fn forget(&mut self, live: impl Fn(u32) -> bool) {
+    pub(crate) fn forget(&mut self, live: impl Fn(u32) -> bool) {
         if self.focus.is_some_and(|surface| !live(surface)) {
             self.set_focus(None);
         }
@@ -284,7 +284,7 @@ impl Exo {
     }
 
     /// Apply a request from the proxy that the compositor has accepted.
-    pub(super) fn request(&mut self, interface: &str, sender: u32, opcode: u16, payload: &[u8]) {
+    pub(crate) fn request(&mut self, interface: &str, sender: u32, opcode: u16, payload: &[u8]) {
         let mut message = WireMessage::new(sender, opcode, payload);
         let mut word = || message.read_u32().expect("an accepted request");
         match (interface, opcode) {
@@ -364,7 +364,7 @@ impl Exo {
     /// `TextInput::OnInputMethodDestroyed` deactivates each text input it
     /// was attached to, and nothing attaches it again until the next
     /// `activate`. Returns whether one was attached.
-    pub(super) fn destroy_input_method(&mut self) -> bool {
+    pub(crate) fn destroy_input_method(&mut self) -> bool {
         let mut detached = false;
         for text_input in self.text_inputs.values_mut() {
             if text_input.field.attached {
@@ -377,7 +377,7 @@ impl Exo {
 
     /// The `enter` (with its surface) and `leave` (`None`) events Exo sent
     /// since the last call, with the host text input of each.
-    pub(super) fn take_events(&mut self) -> Vec<(u32, Option<u32>)> {
+    pub(crate) fn take_events(&mut self) -> Vec<(u32, Option<u32>)> {
         self.text_inputs
             .iter_mut()
             .flat_map(|(&id, text_input)| {
@@ -389,7 +389,7 @@ impl Exo {
     }
 
     /// The fields of the text inputs active on the focused surface.
-    pub(super) fn focused_fields(&self) -> Vec<Field> {
+    pub(crate) fn focused_fields(&self) -> Vec<Field> {
         self.text_inputs
             .values()
             .filter(|text_input| self.focus.is_some() && text_input.surface == self.focus)
