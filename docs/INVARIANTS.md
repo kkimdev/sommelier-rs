@@ -644,6 +644,24 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   would otherwise abort every client.
   Tests: `on_keymap_ignores_a_keymap_over_the_size_limit`,
   `an_unusable_keymap_clears_the_loaded_one_and_is_forwarded`.
+- **A keymap ends no held key.** A keymap, whether the proxy can use it or
+  not, replaces only what was compiled from the one before it: the XKB
+  state and the keysym and repeat tables. The keys held and their
+  generations stay, so each key's release goes where its press went, and
+  so does the suppression of a held accelerator's key, which its press set
+  and only its release, an `enter` or the keyboard's end takes. Otherwise a
+  keymap that arrives while a key is held would send its release to the
+  host, and the guest, which got the press, would hold the key and repeat
+  it; and Exo, which switches the layout on Ctrl+Space while Space is
+  held, would let the IME hand Space to the guest as a keysym or a
+  recovered key. This holds for a release on the `wl_keyboard` channel: a
+  keysym release finds its key through the current keymap's table, so one
+  after a keymap may find none. Exo sends no keysym releases today.
+  Tests: `a_new_keymap_keeps_held_keys_and_modifiers`,
+  `a_rejected_keymap_keeps_held_keys`,
+  `an_unusable_keymap_clears_the_loaded_one_and_is_forwarded`,
+  `an_accelerator_held_across_a_keymap_is_not_recovered`,
+  `an_accelerator_held_across_a_keymap_takes_no_keysym`.
 - **IME state is scoped to its keyboard or seat.** Pressed-key sets, repeat
   flags and focus markers used to bridge ChromeOS IME events belong to the
   originating keyboard or seat, never to the process. Synthetic

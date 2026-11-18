@@ -393,10 +393,24 @@ impl Session {
         use crate::protocols::wayland::wl_keyboard;
         let keymap = default_keymap();
         let size = keymap.len() as u32;
+        self.keymap_of(keyboard, wl_keyboard::KEYMAP_FORMAT_XKB_V1, &keymap, size)
+            .await;
+    }
+
+    /// The host sends `keyboard` a keymap of `format` and `size` in a file
+    /// holding `bytes`, which the guest gets whether or not the proxy can
+    /// use it.
+    pub(crate) async fn keymap_of(
+        &mut self,
+        keyboard: Object,
+        format: u32,
+        bytes: &[u8],
+        size: u32,
+    ) {
+        use crate::protocols::wayland::wl_keyboard;
         // The memfd's offset stays at its end, as a host may leave it.
-        let file = crate::test_support::shm_pool_file(&keymap);
+        let file = crate::test_support::shm_pool_file(bytes);
         let fd = OwnedFd::from(file.try_clone().expect("duplicate the keymap file"));
-        let format = wl_keyboard::KEYMAP_FORMAT_XKB_V1;
         self.host([wl_keyboard::evt::keymap(keyboard.host, format, fd, size)])
             .await;
         let fd = OwnedFd::from(file);

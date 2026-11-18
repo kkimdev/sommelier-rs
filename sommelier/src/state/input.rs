@@ -722,8 +722,12 @@ struct KeyGeneration {
     id: u64,
     physical_state: PhysicalKeyState,
     peek: Option<PeekKeyProvenance>,
-    /// Serial of the generation's initial peek press. Retained after physical
-    /// release while another tombstone keeps the generation alive so the
+    /// Serial of the generation's latest peek press or repeat: its first
+    /// peek press sets it, and each repeat or legacy duplicate press
+    /// (`refresh_peek`) replaces it. `peek_key` promises that the
+    /// `wl_keyboard.key` after it has the same serial, so this names the
+    /// event the latest peek announced. Retained after physical release
+    /// while another tombstone keeps the generation alive so the
     /// corresponding delayed wl_keyboard press can still be recognized.
     peek_press_serial: Option<u32>,
     /// Serial of the first physical release observed from either the extended
@@ -902,6 +906,8 @@ impl KeyGenerationRegistry {
             .is_some_and(|generation| generation.physical_state == PhysicalKeyState::Released)
     }
 
+    /// The serial of the latest peek press or repeat of `key`'s generation
+    /// (see `KeyGeneration::peek_press_serial`).
     pub(crate) fn peek_press_serial(&self, keyboard: HostId, key: u32) -> Option<u32> {
         self.entries
             .get(&keyboard)
@@ -1404,22 +1410,6 @@ impl KeyGenerationRegistry {
             .get(&keyboard)
             .and_then(|keys| keys.get(&key))
             .is_some_and(|generation| generation.host_accelerator_suppressed)
-    }
-
-    pub(crate) fn clear_accelerator_suppressions(&mut self, keyboard: HostId) {
-        let keys = self
-            .entries
-            .get(&keyboard)
-            .map(|keys| keys.keys().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
-        if let Some(generations) = self.entries.get_mut(&keyboard) {
-            for generation in generations.values_mut() {
-                generation.host_accelerator_suppressed = false;
-            }
-        }
-        for key in keys {
-            self.prune_key(keyboard, key);
-        }
     }
 
     /// Route a `wl_keyboard` event to the channel that owns its generation.
