@@ -481,12 +481,6 @@ pub struct Context {
     /// What each host registry has advertised, by host registry ID (see
     /// [`RegistryRecord`]).
     pub(crate) registries: BTreeMap<u32, RegistryRecord>,
-    /// Names removed from each registry. A subsequent global event for a
-    /// removed name represents a new advertisement generation; a bind of a
-    /// removed name crossed its removal on the wire. Each name keeps the
-    /// version the guest saw if it can be bound inert (see
-    /// `INERT_BIND_INTERFACE`), and `None` otherwise.
-    pub registry_global_removed: BTreeMap<u32, BTreeMap<u32, Option<u32>>>,
     /// Whether each registry's current advertisement for a name was visible
     /// to the guest. This is kept per registry/generation so a delayed
     /// global_remove for an old hidden/visible generation cannot be classified
@@ -1068,7 +1062,6 @@ impl Context {
             singleton_candidates: BTreeMap::new(),
             hidden_host_globals: BTreeMap::new(),
             registries: BTreeMap::new(),
-            registry_global_removed: BTreeMap::new(),
             registry_global_visibility: BTreeMap::new(),
             global_generations: BTreeMap::new(),
             next_global_generation: 1,

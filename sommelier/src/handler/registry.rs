@@ -274,9 +274,9 @@ fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
     }
 
     let registry_removed = ctx
-        .registry_global_removed
+        .registries
         .get(&registry_id)
-        .is_some_and(|names| names.contains_key(&name));
+        .is_some_and(|record| record.is_removed(name));
     let generation = match (current_generation, registry_removed, previous_generation) {
         (None, _, _) => {
             let new_generation = next_global_generation(ctx);
@@ -298,9 +298,6 @@ fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
         .entry(registry_id)
         .or_default()
         .list(name, generation);
-    if let Some(names) = ctx.registry_global_removed.get_mut(&registry_id) {
-        names.remove(&name);
-    }
     true
 }
 
@@ -372,12 +369,10 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64)
         let is_current = ctx
             .registries
             .get(&pending.registry_host_id)
-            .and_then(|record| record.listed_generation(pending.name))
-            == Some(generation)
-            && !ctx
-                .registry_global_removed
-                .get(&pending.registry_host_id)
-                .is_some_and(|names| names.contains_key(&pending.name))
+            .is_some_and(|record| {
+                record.listed_generation(pending.name) == Some(generation)
+                    && !record.is_removed(pending.name)
+            })
             && ctx.global_generations.get(&pending.name) == Some(&generation);
         if !is_current {
             continue;
@@ -863,9 +858,9 @@ fn admit_guest_bind(
     // wl_global_remove. A host that destroyed it at once would answer the
     // bind with INVALID_OBJECT, as it would a native client's.
     if let Some(inert_bind_version) = ctx
-        .registry_global_removed
+        .registries
         .get(&registry_host_id)
-        .and_then(|names| names.get(&name))
+        .and_then(|record| record.removal(name))
     {
         let inert = interface == INERT_BIND_INTERFACE
             && inert_bind_version.is_some_and(|version| (1..=version).contains(&requested_version));
@@ -919,9 +914,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             .get(&registry_id)
             .and_then(|record| record.generation(name));
         let registry_removed = ctx
-            .registry_global_removed
+            .registries
             .get(&registry_id)
-            .is_some_and(|names| names.contains_key(&name));
+            .is_some_and(|record| record.is_removed(name));
         if version == 0 {
             log::warn!(
                 "Ignoring malformed Wayland global {}:{} with version 0",
@@ -1256,10 +1251,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     && global.interface == INERT_BIND_INTERFACE
             })
             .map(|global| global.version);
-        ctx.registry_global_removed
+        ctx.registries
             .entry(registry_id)
             .or_default()
-            .insert(name, inert_bind_version);
+            .record_removal(name, inert_bind_version);
         if removes_current_generation {
             if let Some(generation) = current_generation {
                 ctx.removed_global_generations.insert(name, generation);
@@ -1426,7 +1421,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 /// last one, it will never see the removal, so the global is retired now.
 pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
     let record = ctx.registries.remove(&registry_host_id).unwrap_or_default();
-    ctx.registry_global_removed.remove(&registry_host_id);
     ctx.registry_global_visibility.remove(&registry_host_id);
     ctx.pending_dmabuf_globals
         .retain(|pending| pending.registry_host_id != registry_host_id);

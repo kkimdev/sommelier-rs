@@ -386,7 +386,6 @@ impl Context {
         let registries = self
             .registries
             .keys()
-            .chain(self.registry_global_removed.keys())
             .chain(self.registry_global_visibility.keys())
             .chain(
                 self.pending_dmabuf_globals

@@ -35,6 +35,12 @@ pub(crate) struct RegistryRecord {
     /// The advertisement generation of each global the registry advertised,
     /// listed or since removed.
     generations: BTreeMap<u32, u64>,
+    /// The global names removed from the registry. A subsequent global
+    /// event for a removed name represents a new advertisement generation;
+    /// a bind of a removed name crossed its removal on the wire. Each name
+    /// keeps the version the guest saw if it can be bound inert (see
+    /// `INERT_BIND_INTERFACE`), and `None` otherwise.
+    removed: BTreeMap<u32, Option<u32>>,
 }
 
 impl RegistryRecord {
@@ -57,7 +63,27 @@ impl RegistryRecord {
     /// The registry lists global `name` at `generation`.
     pub(crate) fn list(&mut self, name: u32, generation: u64) {
         self.listed.insert(name);
+        self.removed.remove(&name);
         self.generations.insert(name, generation);
+    }
+
+    /// If the registry saw global `name` removed and has not listed it
+    /// since, the version at which a bind that crossed the removal may
+    /// create an inert object, if any.
+    pub(crate) fn removal(&self, name: u32) -> Option<Option<u32>> {
+        self.removed.get(&name).copied()
+    }
+
+    /// Whether the registry saw global `name` removed and has not listed it
+    /// since.
+    pub(crate) fn is_removed(&self, name: u32) -> bool {
+        self.removal(name).is_some()
+    }
+
+    /// The registry saw global `name` removed; a bind that crossed the
+    /// removal may create an inert object at up to `inert_bind_version`.
+    pub(crate) fn record_removal(&mut self, name: u32, inert_bind_version: Option<u32>) {
+        self.removed.insert(name, inert_bind_version);
     }
 
     /// The registry no longer lists global `name`.
