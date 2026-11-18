@@ -606,7 +606,7 @@ impl TextInputState {
     }
 
     /// Close a host commit or delete, which `edited` the text unless it
-    /// changed nothing (an empty commit with no preedit to replace).
+    /// changed nothing (an empty commit).
     pub(crate) fn finish_host_commit(&mut self, plan: HostCommitPlan, edited: bool) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
         debug_assert_eq!(plan.cursor_position, self.pending_cursor_position);

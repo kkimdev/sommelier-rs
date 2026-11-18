@@ -767,8 +767,9 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             .expect("active text input disappeared while encoding commit");
         let pending_cursor_position = plan.cursor_position;
         let guest_seat = plan.guest_seat;
-        // An empty commit with no preedit to replace changes no text.
-        let edited = plan.had_preedit || !text.is_empty();
+        // An empty commit changes no text: the guest gets at most the clear
+        // of its preedit, as from an empty preedit.
+        let edited = !text.is_empty();
         state.finish_host_commit(plan, edited);
         end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
 
@@ -1183,22 +1184,24 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         // goes last; an empty region deletes nothing and clears only a
         // shown preedit (docs/INVARIANTS.md, "A v3 transaction's events go
         // in one order").
-        let deletes = (before_length, after_length) != (0, 0);
+        // The region's preedit is the text it deletes.
+        let empty = preedit_text.is_empty();
+        debug_assert_eq!(empty, (before_length, after_length) == (0, 0));
         let mut transaction = Vec::new();
         if plan.had_preedit
-            && deletes
+            && !empty
             && !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0)
         {
             return drop_host_preedit(ctx, guest_id);
         }
-        if deletes {
+        if !empty {
             transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
                 guest_id,
                 before_length,
                 after_length,
             ));
         }
-        if (plan.had_preedit || !preedit_text.is_empty())
+        if (plan.had_preedit || !empty)
             && !push_preedit_string_to(
                 &mut transaction,
                 guest_id,
@@ -5068,6 +5071,40 @@ mod tests {
                 Some(("abc", 3, 3)),
                 |f| vec![f.commit(""), f.delete_range(2, 1)],
                 vec![DONE_2, delete(1, 0), DONE_2],
+            ),
+            (
+                // The guest gets only the preedit's clear, as from an empty
+                // preedit, so it has no edit to report.
+                "an empty commit over a preedit edits nothing",
+                Some(("abc", 3, 3)),
+                |f| vec![f.preedit("x", ""), f.commit(""), f.delete_range(2, 1)],
+                vec![
+                    preedit("x"),
+                    DONE_2,
+                    no_preedit(),
+                    DONE_2,
+                    delete(1, 0),
+                    DONE_2,
+                ],
+            ),
+            (
+                "an empty preedit region over a preedit edits nothing",
+                Some(("abc", 3, 3)),
+                |f| {
+                    vec![
+                        f.preedit("x", ""),
+                        ext::set_preedit_region(f.host_ext, 0, 0),
+                        f.delete_range(2, 1),
+                    ]
+                },
+                vec![
+                    preedit("x"),
+                    DONE_2,
+                    no_preedit(),
+                    DONE_2,
+                    delete(1, 0),
+                    DONE_2,
+                ],
             ),
             (
                 // The guest gets only a `done`, so it has no edit to report.
