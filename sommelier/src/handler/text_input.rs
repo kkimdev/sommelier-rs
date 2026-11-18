@@ -209,22 +209,6 @@ fn held_backspace_keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<Ho
 }
 
 #[cfg(test)]
-fn ime_repeat_active_for_seat(ctx: &Context, guest_seat: u32) -> bool {
-    ctx.keyboard_to_seat
-        .iter()
-        .filter(|(_, seat)| **seat == guest_seat)
-        .filter_map(|(&guest_keyboard_id, _)| {
-            ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId)
-        })
-        .any(|host_keyboard_id| {
-            ctx.key_generations.ime_repeat_active(
-                host_keyboard_id,
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            )
-        })
-}
-
-#[cfg(test)]
 pub(crate) fn backspace_pressed_for_seat(ctx: &Context, guest_seat: u32) -> bool {
     held_backspace_keyboard_for_seat(ctx, guest_seat).is_some()
 }
@@ -2004,7 +1988,6 @@ mod tests {
     use super::*;
     use crate::handler::callback::CallbackHandler;
     use crate::handler::keyboard::KeyboardHandler;
-    use crate::handler::seat::SeatHandler;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
@@ -2013,26 +1996,1876 @@ mod tests {
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
-    use crate::wire::WireMessage;
+    use crate::protocols::wayland::{wl_callback, wl_compositor, wl_registry, wl_seat};
+    use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::proxy::harness::{Object, Session};
+    use crate::test_support::decoded;
+    use crate::wire::WL_DISPLAY_ID;
+    use zcr_extended_text_input_v1::{evt as ext, Request as Ext};
+    use zcr_text_input_extension_v1::Request as ExtManager;
+    use zwp_text_input_manager_v1::Request as V1Manager;
+    use zwp_text_input_v1::{evt as v1, Request as V1};
+    use zwp_text_input_v3::{req as v3, Event as V3};
 
-    /// The opcode of the message at `idx` in a queue.
-    fn msg_opcode(queue: &[crate::wire::Outgoing], idx: usize) -> u16 {
-        crate::test_support::msg_opcode(&queue[idx].0)
+    /// A guest `zwp_text_input_v3` created for a seat whose keyboard has
+    /// given its focus to a surface, through a whole proxy [`Session`].
+    struct Field {
+        s: Session,
+        /// The guest text input.
+        ti: u32,
+        /// The host `zwp_text_input_v1` behind it.
+        host: u32,
+        /// The host `zcr_extended_text_input_v1` behind it, 0 without one.
+        host_ext: u32,
+        seat: Object,
+        keyboard: Object,
+        surface: Object,
+        /// The guest's `zwp_text_input_manager_v3`.
+        manager: u32,
     }
 
-    /// The sender of the message at `idx` in a queue.
-    fn msg_sender(queue: &[crate::wire::Outgoing], idx: usize) -> u32 {
-        crate::test_support::msg_sender(&queue[idx].0)
+    /// The text-input extension version the proxy binds.
+    const EXTENSION: Option<u32> = Some(zcr_text_input_extension_v1::VERSION);
+
+    /// A guest text input and the host objects behind it, which a
+    /// [`Field`] drives one at a time.
+    #[derive(Clone, Copy)]
+    struct TextInput {
+        ti: u32,
+        host: u32,
+        host_ext: u32,
     }
 
-    fn set_test_focus(
-        ctx: &mut Context,
-        host_keyboard: HostId,
-        guest_seat: u32,
-        guest_surface: u32,
-    ) {
-        ctx.keyboard_focus
-            .set_for_test(host_keyboard, guest_seat, guest_surface, guest_surface);
+    /// What a commit that enables or disables a field sends the host
+    /// besides its edits ([`Field::reset`]).
+    #[derive(Default)]
+    struct Reset {
+        /// The activation step, which goes first.
+        step: Vec<(u32, AnyRequest)>,
+        /// The content type the host lacks, after the surrounding text.
+        content_type: Vec<(u32, AnyRequest)>,
+    }
+
+    impl Field {
+        /// A disabled text input whose host has the text-input extension at
+        /// version `extension`, if any.
+        async fn new(extension: Option<u32>) -> Self {
+            let mut s = Session::new();
+            // Offset the guest's IDs from the host's, so that a request
+            // that names a guest object where its host object belongs
+            // fails.
+            for _ in 0..100 {
+                s.new_id();
+            }
+            let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+            let keyboard = s.new_id();
+            let keyboard = Object {
+                id: keyboard,
+                host: s
+                    .create(wl_seat::req::get_keyboard(seat.id, keyboard))
+                    .await,
+            };
+            let surface = s.surface().await;
+            let manager = s
+                .bind(
+                    "zwp_text_input_manager_v1",
+                    zwp_text_input_manager_v1::VERSION,
+                )
+                .await;
+            if let Some(version) = extension {
+                s.advertise("zcr_text_input_extension_v1", version).await;
+                // The proxy binds it for itself.
+                s.host_received();
+            }
+            let mut f = Self {
+                s,
+                ti: 0,
+                host: 0,
+                host_ext: 0,
+                seat,
+                keyboard,
+                surface,
+                manager,
+            };
+            assert_eq!(f.enter_surface().await, []);
+            let ti = f.s.new_id();
+            f.create_text_input(ti).await;
+            // The offset still keeps every guest ID above every host ID.
+            let host = [
+                f.seat.host,
+                f.keyboard.host,
+                f.surface.host,
+                f.host,
+                f.host_ext,
+            ];
+            let guest = [f.seat.id, f.keyboard.id, f.surface.id, f.manager, f.ti];
+            assert!(
+                host.iter().max() < guest.iter().min(),
+                "{host:?}, {guest:?}"
+            );
+            f
+        }
+
+        /// A disabled text input whose host has the newest extension.
+        async fn disabled() -> Self {
+            Self::new(EXTENSION).await
+        }
+
+        /// A text input the guest enabled, which the host activated.
+        async fn enabled() -> Self {
+            let mut f = Self::disabled().await;
+            f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+            assert_eq!(f.s.host_received(), f.enable_requests(1));
+            f
+        }
+
+        /// The guest creates text input `ti` for the seat, which the
+        /// keyboard focus enters at once.
+        async fn create_text_input(&mut self, ti: u32) {
+            self.ti = ti;
+            self.s
+                .guest([zwp_text_input_manager_v3::req::get_text_input(
+                    self.manager,
+                    self.ti,
+                    self.seat.id,
+                )])
+                .await;
+            let host = self.s.host_received();
+            let (_, AnyRequest::ZwpTextInputManagerV1(V1Manager::CreateTextInput { id })) = host[0]
+            else {
+                panic!("the host got no text input: {host:?}");
+            };
+            self.host = id;
+            self.host_ext = match host[1..] {
+                [] => 0,
+                [(
+                    _,
+                    AnyRequest::ZcrTextInputExtensionV1(ExtManager::GetExtendedTextInput {
+                        id,
+                        text_input,
+                    }),
+                )] if text_input == self.host => id,
+                _ => panic!("the host got no extended text input: {host:?}"),
+            };
+            assert_eq!(
+                self.s.guest_received(),
+                self.events([V3::Enter {
+                    surface: self.surface.id
+                }])
+            );
+        }
+
+        /// The text input the field drives.
+        fn text_input(&self) -> TextInput {
+            let Self {
+                ti, host, host_ext, ..
+            } = *self;
+            TextInput { ti, host, host_ext }
+        }
+
+        /// Drive `text_input` from now on.
+        fn select(&mut self, TextInput { ti, host, host_ext }: TextInput) {
+            (self.ti, self.host, self.host_ext) = (ti, host, host_ext);
+        }
+
+        /// `events` of the guest text input.
+        fn events(&self, events: impl IntoIterator<Item = V3>) -> Vec<(u32, AnyEvent)> {
+            events
+                .into_iter()
+                .map(|event| (self.ti, event.into()))
+                .collect()
+        }
+
+        /// `request` of the host text input.
+        fn v1(&self, request: V1) -> (u32, AnyRequest) {
+            (self.host, request.into())
+        }
+
+        /// `request` of the host extension.
+        fn ext(&self, request: Ext) -> (u32, AnyRequest) {
+            (self.host_ext, request.into())
+        }
+
+        fn activate(&self) -> (u32, AnyRequest) {
+            self.v1(V1::Activate {
+                seat: self.seat.host,
+                surface: self.surface.host,
+            })
+        }
+
+        fn deactivate(&self) -> (u32, AnyRequest) {
+            self.v1(V1::Deactivate {
+                seat: self.seat.host,
+            })
+        }
+
+        fn surrounding_text(&self, text: &str, cursor: u32, anchor: u32) -> (u32, AnyRequest) {
+            self.v1(V1::SetSurroundingText {
+                text: text.into(),
+                cursor,
+                anchor,
+            })
+        }
+
+        /// The unset cursor rectangle that enable and disable leave.
+        fn no_cursor_rectangle(&self) -> (u32, AnyRequest) {
+            self.v1(V1::SetCursorRectangle {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            })
+        }
+
+        fn commit_state(&self, serial: u32) -> (u32, AnyRequest) {
+            self.v1(V1::CommitState { serial })
+        }
+
+        /// The extension requests that set content type `(hint, purpose)`
+        /// with surrounding-text `support`.
+        fn content_type(
+            &self,
+            (hint, purpose): (u32, u32),
+            support: bool,
+        ) -> [(u32, AnyRequest); 2] {
+            let (_, _, input_type, input_mode, input_flags, learning_mode) =
+                map_v3_content_type(hint, purpose);
+            [
+                self.ext(Ext::SetSurroundingTextSupport {
+                    support: u32::from(support),
+                }),
+                self.ext(Ext::SetInputType {
+                    input_type,
+                    input_mode,
+                    input_flags,
+                    learning_mode,
+                    inline_composition_support:
+                        zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+                }),
+            ]
+        }
+
+        /// What the host gets for the guest's commit `serial` that enables
+        /// or disables the field: the activation step, the cleared
+        /// surrounding text, the content type the host lacks, the cleared
+        /// cursor rectangle and the commit.
+        fn reset(
+            &self,
+            serial: u32,
+            Reset { step, content_type }: Reset,
+        ) -> Vec<(u32, AnyRequest)> {
+            let mut requests = step;
+            requests.push(self.surrounding_text("", 0, 0));
+            requests.extend(content_type);
+            requests.extend([self.no_cursor_rectangle(), self.commit_state(serial)]);
+            requests
+        }
+
+        /// What the host gets when the guest's commit `serial` enables a
+        /// field with no content type and the host activates it.
+        fn enable_requests(&self, serial: u32) -> Vec<(u32, AnyRequest)> {
+            let content_type = self.content_type((0, 0), false);
+            let step = vec![self.activate()];
+            let content_type = content_type.into();
+            self.reset(serial, Reset { step, content_type })
+        }
+
+        /// What the host gets when the guest's commit `serial` disables an
+        /// active field, which the barrier `callback` drains.
+        fn disable_requests(&self, callback: u32, serial: u32) -> Vec<(u32, AnyRequest)> {
+            let step = vec![self.deactivate(), sync(callback)];
+            self.reset(
+                serial,
+                Reset {
+                    step,
+                    ..Reset::default()
+                },
+            )
+        }
+
+        fn password_content_type(&self) -> [(u32, AnyRequest); 2] {
+            self.content_type((0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD), false)
+        }
+
+        /// What the host gets when the proxy activates the password field
+        /// again after the guest's commit `serial`.
+        fn password_after_activate(&self, serial: u32) -> Vec<(u32, AnyRequest)> {
+            let mut requests = vec![self.activate()];
+            requests.extend(self.password_content_type());
+            requests.push(self.commit_state(serial));
+            requests
+        }
+
+        /// The guest releases its seat and the host deletes it.
+        async fn release_seat(&mut self) {
+            self.s.guest([wl_seat::req::release(self.seat.id)]).await;
+            assert_eq!(
+                self.s.host_received(),
+                [(self.seat.host, wl_seat::Request::Release {}.into())]
+            );
+            self.s
+                .host([wl_display::evt::delete_id(WL_DISPLAY_ID, self.seat.host)])
+                .await;
+            assert_eq!(
+                self.s.guest_received(),
+                [(
+                    WL_DISPLAY_ID,
+                    wl_display::Event::DeleteId { id: self.seat.id }.into()
+                )]
+            );
+        }
+
+        /// The guest binds a new `wl_seat` under the ID of its ended seat;
+        /// returns what the host received besides the bind.
+        async fn bind_seat_again(&mut self) -> Vec<(u32, AnyRequest)> {
+            let registry = self.s.registry().await;
+            let name = self.s.advertise("wl_seat", wl_seat::VERSION).await;
+            let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+                self.s.guest_received()[..]
+            else {
+                panic!("the guest was not advertised the seat");
+            };
+            let bind = wl_registry::req::bind(registry.id, name, "wl_seat", version, self.seat.id);
+            self.s.guest([bind.unwrap()]).await;
+            let mut host = self.s.host_received();
+            let (
+                _,
+                AnyRequest::WlRegistry(wl_registry::Request::Bind {
+                    id: (_, _, seat), ..
+                }),
+            ) = host.remove(0)
+            else {
+                panic!("the host got no bind: {host:?}");
+            };
+            self.seat.host = seat;
+            host
+        }
+
+        /// The host's keyboard focus leaves the surface.
+        async fn keyboard_leave(&mut self) {
+            let leave = wl_keyboard::evt::leave(self.keyboard.host, 2, self.surface.host);
+            self.s.host([leave]).await;
+            let surface = self.surface.id;
+            assert_eq!(
+                self.s.guest_received(),
+                [
+                    (
+                        self.keyboard.id,
+                        wl_keyboard::Event::Leave { serial: 2, surface }.into()
+                    ),
+                    (self.ti, V3::Leave { surface }.into()),
+                ]
+            );
+        }
+
+        /// The host gives the keyboard's focus to the surface; returns what
+        /// the guest got after the keyboard's `enter` and the modifiers the
+        /// proxy sends with it.
+        async fn enter_surface(&mut self) -> Vec<(u32, AnyEvent)> {
+            let enter = wl_keyboard::evt::enter(self.keyboard.host, 1, self.surface.host, &[]);
+            self.s.host([enter.unwrap()]).await;
+            let mut events = self.s.guest_received();
+            let keyboard_events = events.drain(..2.min(events.len())).collect::<Vec<_>>();
+            let enter = wl_keyboard::Event::Enter {
+                serial: 1,
+                surface: self.surface.id,
+                keys: Vec::new(),
+            };
+            let modifiers = wl_keyboard::Event::Modifiers {
+                serial: 1,
+                mods_depressed: 0,
+                mods_latched: 0,
+                mods_locked: 0,
+                group: 0,
+            };
+            assert_eq!(
+                keyboard_events,
+                [
+                    (self.keyboard.id, enter.into()),
+                    (self.keyboard.id, modifiers.into())
+                ]
+            );
+            events
+        }
+
+        /// The host's keyboard focus enters the surface again.
+        async fn keyboard_enter(&mut self) {
+            let surface = self.surface.id;
+            assert_eq!(
+                self.enter_surface().await,
+                self.events([V3::Enter { surface }])
+            );
+        }
+
+        /// The guest gets a keyboard of the seat, to which the host gives
+        /// the focus on the surface.
+        async fn focus_keyboard_of_seat(&mut self) {
+            let keyboard = self.s.new_id();
+            let host = self
+                .s
+                .create(wl_seat::req::get_keyboard(self.seat.id, keyboard))
+                .await;
+            self.keyboard = Object { id: keyboard, host };
+            assert_eq!(self.enter_surface().await, []);
+        }
+
+        /// The host completes the drain barrier `callback`.
+        async fn drain(&mut self, callback: u32) {
+            self.s.host([wl_callback::evt::done(callback, 0)]).await;
+        }
+
+        /// The host input method's `preedit_string`.
+        fn preedit(&self, text: &str, commit: &str) -> Outgoing {
+            v1::preedit_string(self.host, 0, text, commit).unwrap()
+        }
+
+        /// The host input method's `commit_string`.
+        fn commit(&self, text: &str) -> Outgoing {
+            v1::commit_string(self.host, 0, text).unwrap()
+        }
+    }
+
+    /// The `wl_display.sync` that creates drain barrier `callback`.
+    fn sync(callback: u32) -> (u32, AnyRequest) {
+        (WL_DISPLAY_ID, wl_display::Request::Sync { callback }.into())
+    }
+
+    /// The callback of the one drain barrier among `requests`.
+    fn barrier(requests: &[(u32, AnyRequest)]) -> u32 {
+        let callbacks = requests
+            .iter()
+            .filter_map(|request| match request {
+                (_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback })) => {
+                    Some(*callback)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [callback] = callbacks[..] else {
+            panic!("no one drain barrier in {requests:?}");
+        };
+        callback
+    }
+
+    /// The guest's `preedit_string` of `text`, with the cursor at its end.
+    fn preedit(text: &str) -> V3 {
+        let end = text.len() as i32;
+        preedit_at(text, end, end)
+    }
+
+    fn preedit_at(text: &str, cursor_begin: i32, cursor_end: i32) -> V3 {
+        V3::PreeditString {
+            text: Some(text.into()),
+            cursor_begin,
+            cursor_end,
+        }
+    }
+
+    /// The guest's `preedit_string` that clears its preedit.
+    fn no_preedit() -> V3 {
+        preedit_at("", 0, 0)
+    }
+
+    fn commit(text: &str) -> V3 {
+        V3::CommitString {
+            text: Some(text.into()),
+        }
+    }
+    #[tokio::test]
+    async fn enable_is_not_activated_until_commit() {
+        let mut f = Field::disabled().await;
+        f.s.guest([v3::enable(f.ti)]).await;
+        assert_eq!(f.s.host_received(), []);
+
+        f.s.guest([v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+    }
+
+    /// A focus change deactivates the host behind a drain barrier: the
+    /// host events sent before it reach no one, and the next activation,
+    /// which follows the guest's new state, waits for it.
+    #[tokio::test]
+    async fn focus_generation_barrier_drops_old_events_before_reactivation() {
+        let mut f = Field::enabled().await;
+        f.keyboard_leave().await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(callback)]);
+
+        // Events the host sent before the barrier.
+        f.s.host([f.preedit("old", ""), f.commit("old")]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        // The focus enters another surface, where the guest enables the
+        // field while the barrier drains: its state reaches the host first,
+        // without an activation.
+        f.surface = f.s.surface().await;
+        f.keyboard_enter().await;
+        f.s.guest([
+            v3::enable(f.ti),
+            v3::set_surrounding_text(f.ti, "new", 3, 3).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(
+            f.s.host_received(),
+            [
+                f.surrounding_text("new", 3, 3),
+                f.no_cursor_rectangle(),
+                f.commit_state(2),
+            ]
+        );
+
+        // Then the activation, and the content type it resets.
+        f.drain(callback).await;
+        let mut expected = vec![f.activate()];
+        expected.extend(f.content_type((0, 0), true));
+        expected.push(f.commit_state(2));
+        assert_eq!(f.s.host_received(), expected);
+
+        f.s.host([f.preedit("new", "")]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            f.events([preedit("new"), V3::Done { serial: 2 }])
+        );
+    }
+
+    /// Exo drops a content type sent while no input method is attached:
+    /// the disable sends none, neither does an enable while the
+    /// deactivation drains, and the activation the barrier releases sends
+    /// it once.
+    #[tokio::test]
+    async fn a_deferred_activation_replays_the_committed_content_type() {
+        use zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD as PASSWORD;
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, f.disable_requests(callback, 2));
+
+        f.s.guest([
+            v3::enable(f.ti),
+            v3::set_content_type(f.ti, 0, PASSWORD),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(f.s.host_received(), f.reset(3, Reset::default()));
+
+        f.drain(callback).await;
+        let mut expected = vec![f.activate()];
+        expected.extend(f.content_type((0, PASSWORD), false));
+        expected.push(f.commit_state(3));
+        assert_eq!(f.s.host_received(), expected);
+        let (_, _, input_type, _, _, learning_mode) = map_v3_content_type(0, PASSWORD);
+        assert_eq!(input_type, zcr_extended_text_input_v1::INPUT_TYPE_PASSWORD);
+        assert_eq!(
+            learning_mode,
+            zcr_extended_text_input_v1::LEARNING_MODE_DISABLED
+        );
+    }
+
+    /// A text input the guest enabled on a password field, which the host
+    /// activated and attached its input method to.
+    async fn attached_password_field() -> Field {
+        let mut f = Field::disabled().await;
+        f.s.guest([
+            v3::enable(f.ti),
+            v3::set_content_type(f.ti, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let content_type = f.password_content_type().into();
+        assert_eq!(
+            f.s.host_received(),
+            f.reset(
+                1,
+                Reset {
+                    step: vec![f.activate()],
+                    content_type
+                }
+            )
+        );
+        f.s.host([v1::enter(f.host, f.surface.host)]).await;
+        f
+    }
+
+    #[tokio::test]
+    async fn the_enter_answering_an_activate_resends_nothing() {
+        let mut f = attached_password_field().await;
+        assert_eq!(f.s.host_received(), []);
+
+        // The content type sent after the activate is the one Exo applied.
+        f.s.guest([
+            v3::set_content_type(f.ti, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+    }
+
+    /// Exo detached on its own, as when its input method is destroyed, and
+    /// has no surface left to attach to: the proxy activates again and
+    /// resends the content type the new attachment reset.
+    #[tokio::test]
+    async fn an_exo_detach_activates_again_with_the_content_type() {
+        let mut f = attached_password_field().await;
+        f.s.host([v1::leave(f.host)]).await;
+        assert_eq!(f.s.host_received(), f.password_after_activate(1));
+
+        // The enter answering that activate resends nothing.
+        f.s.host([v1::enter(f.host, f.surface.host)]).await;
+        assert_eq!(f.s.host_received(), []);
+        // The new generation takes host events.
+        f.s.host([f.commit("가")]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            f.events([commit("가"), V3::Done { serial: 1 }])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exo_detach_clears_the_guest_preedit() {
+        let mut f = attached_password_field().await;
+
+        // Without a preedit the guest is told nothing.
+        f.s.host([v1::leave(f.host), v1::enter(f.host, f.surface.host)])
+            .await;
+        assert_eq!(f.s.guest_received(), []);
+        assert_eq!(f.s.host_received(), f.password_after_activate(1));
+
+        // The input method's process restarts mid-composition.
+        f.s.host([f.preedit("가", "가")]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            f.events([preedit("가"), V3::Done { serial: 1 }])
+        );
+        f.s.host([v1::leave(f.host)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            f.events([no_preedit(), V3::Done { serial: 1 }])
+        );
+        assert_eq!(f.s.host_received(), f.password_after_activate(1));
+
+        // The composition went with it: a commit clears no preedit.
+        f.s.host([f.commit("나")]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            f.events([commit("나"), V3::Done { serial: 1 }])
+        );
+    }
+
+    /// Exo's text input hears of a focus change before the keyboard: its
+    /// `leave` arrives first, and the proxy activates again on the surface
+    /// Exo has just left, which Exo keeps without attaching.
+    #[tokio::test]
+    async fn an_exo_detach_before_the_keyboard_leave_activates_then_drains() {
+        let mut f = attached_password_field().await;
+        f.s.host([v1::leave(f.host)]).await;
+        assert_eq!(f.s.host_received(), f.password_after_activate(1));
+
+        // The keyboard leave then deactivates it behind a barrier.
+        f.keyboard_leave().await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(callback)]);
+
+        // Exo never attached, so it sends no leave, and the drain ends with
+        // nothing more to send.
+        f.drain(callback).await;
+        assert_eq!(f.s.host_received(), []);
+        // The host is inactive: it neither forwards nor takes its events.
+        f.s.host([f.commit("가")]).await;
+        assert_eq!(f.s.guest_received(), []);
+    }
+
+    /// Exo detached while the guest's seat cannot carry an `activate`:
+    /// nothing is sent, not even a changed content type, until it can.
+    #[tokio::test]
+    async fn a_content_type_waits_for_exo_to_attach_again() {
+        let mut f = attached_password_field().await;
+        f.release_seat().await;
+        f.s.host([v1::leave(f.host)]).await;
+        assert_eq!(f.s.host_received(), []);
+
+        f.s.guest([
+            v3::set_content_type(f.ti, 0, zwp_text_input_v3::CONTENT_PURPOSE_NORMAL),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+    }
+
+    #[tokio::test]
+    async fn the_leave_answering_a_deactivate_is_ignored() {
+        let mut f = attached_password_field().await;
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, f.disable_requests(callback, 2));
+
+        f.s.host([v1::leave(f.host)]).await;
+        assert_eq!(f.s.host_received(), []);
+        // The barrier still drains the generation: an enable waits for it.
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.reset(3, Reset::default()));
+        f.drain(callback).await;
+        let mut expected = vec![f.activate()];
+        expected.extend(f.content_type((0, 0), false));
+        expected.push(f.commit_state(3));
+        assert_eq!(f.s.host_received(), expected);
+    }
+
+    /// The text input's seat ends, and the guest binds a new `wl_seat`
+    /// under its ID, which gives the text input a host seat again.
+    #[tokio::test]
+    async fn an_activation_deferred_for_an_unmapped_seat_sends_the_content_type() {
+        let mut f = Field::disabled().await;
+        f.release_seat().await;
+
+        // The seat has no host object: nothing can activate, which the
+        // proxy warns of once.
+        f.s.guest([
+            v3::enable(f.ti),
+            v3::set_content_type(f.ti, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
+        // Only the log shows the warning, so read the flag that makes it
+        // once.
+        assert!(f.s.ctx().text_inputs[&f.ti].warned_seat_missing);
+
+        // Once it has one, the text input activates, and its content type
+        // follows the activation.
+        let host = f.bind_seat_again().await;
+        let mut expected = vec![f.activate()];
+        expected.extend(f.password_content_type());
+        expected.push(f.commit_state(1));
+        assert_eq!(host, expected);
+    }
+
+    /// One deactivation owns one barrier however the guest's state changes
+    /// while it drains, and a field disabled by then is not activated.
+    #[tokio::test]
+    async fn activation_barrier_coalesces_changes_and_honors_final_disabled_target() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, f.disable_requests(callback, 2));
+
+        // The guest enables the field on two other surfaces in turn, then
+        // disables it.
+        for serial in [3, 4] {
+            f.keyboard_leave().await;
+            f.surface = f.s.surface().await;
+            f.keyboard_enter().await;
+            f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+            assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
+        }
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.reset(5, Reset::default()));
+
+        f.drain(callback).await;
+        assert_eq!(f.s.host_received(), []);
+    }
+
+    /// Exo has one seat and gives its input method to the text input that
+    /// activated last, so a second text input, of the same or another
+    /// guest seat, cannot take it from an enabled one.
+    #[tokio::test]
+    async fn second_text_input_enable_on_the_connection_is_ignored() {
+        for other_seat in [false, true] {
+            let mut f = Field::enabled().await;
+            let first = f.text_input();
+            if other_seat {
+                f.seat = f.s.bind_paired("wl_seat", wl_seat::VERSION).await;
+                f.focus_keyboard_of_seat().await;
+            }
+            let id = f.s.new_id();
+            f.create_text_input(id).await;
+
+            // A rejected enable still counts: its commit is the first.
+            f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+            assert_eq!(
+                f.s.host_received(),
+                f.reset(1, Reset::default()),
+                "another seat: {other_seat}"
+            );
+
+            // Its disable takes nothing from the first, which Exo still
+            // gives its input method.
+            f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+            assert_eq!(f.s.host_received(), f.reset(2, Reset::default()));
+            f.select(first);
+            f.s.host([f.commit("가")]).await;
+            assert_eq!(
+                f.s.guest_received(),
+                f.events([commit("가"), V3::Done { serial: 1 }])
+            );
+        }
+    }
+    /// A disable invalidates the surrounding text, at the host too, and
+    /// deactivates it, but only at its commit.
+    #[tokio::test]
+    async fn disable_commit_invalidates_surrounding_text_and_deactivates() {
+        let mut f = Field::enabled().await;
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "가", 3, 3).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(f.s.host_received(), {
+            let mut expected = vec![f.surrounding_text("가", 3, 3)];
+            expected.extend(f.content_type((0, 0), true));
+            expected.push(f.commit_state(2));
+            expected
+        });
+
+        f.s.guest([v3::disable(f.ti)]).await;
+        assert_eq!(f.s.host_received(), []);
+        f.s.guest([v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        assert_eq!(host, f.disable_requests(barrier(&host), 3));
+    }
+
+    /// An enable starts a new field: it closes the composition the input
+    /// method left, with its pending preedit cursor, selection and edits.
+    #[tokio::test]
+    async fn committed_enable_resets_previous_ime_event_transaction() {
+        for preedit_first in [true, false] {
+            let mut f = Field::enabled().await;
+            f.s.host([
+                f.preedit("이전", ""),
+                v1::preedit_styling(f.host, 0, 3, 6),
+                v1::preedit_cursor(f.host, 3),
+                v1::delete_surrounding_text(f.host, -3, 3),
+                v1::cursor_position(f.host, 1, 1),
+            ])
+            .await;
+            let expected = [preedit("이전"), V3::Done { serial: 1 }];
+            assert_eq!(f.s.guest_received(), f.events(expected));
+            // No v3 event carries the cursor position, so read it.
+            let cursor_position =
+                |f: &mut Field| f.s.ctx().text_inputs[&f.ti].pending_cursor_position;
+            assert_eq!(cursor_position(&mut f), Some((1, 1)));
+
+            f.s.guest([v3::enable(f.ti)]).await;
+            f.s.guest([v3::commit(f.ti)]).await;
+            assert_eq!(cursor_position(&mut f), None);
+            let content_type = f.content_type((0, 0), false).into();
+            let expected = f.reset(
+                2,
+                Reset {
+                    content_type,
+                    ..Reset::default()
+                },
+            );
+            assert_eq!(f.s.host_received(), expected);
+
+            let done = V3::Done { serial: 2 };
+            if preedit_first {
+                // No cursor or selection for the next preedit.
+                f.s.host([f.preedit("가나", "")]).await;
+                assert_eq!(
+                    f.s.guest_received(),
+                    f.events([preedit_at("가나", 6, 6), done])
+                );
+            } else {
+                // No preedit to clear and no edit to apply.
+                f.s.host([f.commit("새")]).await;
+                assert_eq!(f.s.guest_received(), f.events([commit("새"), done]));
+            }
+        }
+    }
+
+    /// Each commit forwards the surrounding text it states; offsets that
+    /// are not character boundaries within the text state none.
+    #[tokio::test]
+    async fn invalid_utf8_surrounding_offsets_do_not_replace_pending_state() {
+        let mut f = Field::enabled().await;
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "가나", 3, 6).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let mut expected = vec![f.surrounding_text("가나", 3, 6)];
+        expected.extend(f.content_type((0, 0), true));
+        expected.push(f.commit_state(2));
+        assert_eq!(f.s.host_received(), expected);
+
+        for (serial, (cursor, anchor)) in (3..).zip([(1, 1), (3, 7), (-1, 0)]) {
+            f.s.guest([
+                v3::set_surrounding_text(f.ti, "가", cursor, anchor).unwrap(),
+                v3::commit(f.ti),
+            ])
+            .await;
+            assert_eq!(
+                f.s.host_received(),
+                [f.commit_state(serial)],
+                "{cursor}, {anchor}"
+            );
+        }
+    }
+
+    /// The v3 content type maps to the host's, which is told with it that
+    /// a v3 client supports inline composition, and whether the field has
+    /// surrounding text.
+    #[tokio::test]
+    async fn content_type_mapping_preserves_pin_privacy_and_inline_composition() {
+        use zcr_extended_text_input_v1::{
+            INPUT_FLAGS_HAS_BEEN_PASSWORD as SECRET, INPUT_FLAGS_SPELLCHECK_ON, INPUT_MODE_NUMERIC,
+            INPUT_TYPE_NUMBER, INPUT_TYPE_PASSWORD, INPUT_TYPE_TEXT_AREA, LEARNING_MODE_DISABLED,
+        };
+        use zwp_text_input_v1::{CONTENT_HINT_SENSITIVE_DATA, CONTENT_PURPOSE_DIGITS};
+        use zwp_text_input_v3::{
+            CONTENT_HINT_MULTILINE, CONTENT_HINT_SPELLCHECK, CONTENT_PURPOSE_PASSWORD,
+            CONTENT_PURPOSE_PIN,
+        };
+        // A text field, a terminal and a password field.
+        use zcr_extended_text_input_v1::{
+            INPUT_FLAGS_NONE, INPUT_MODE_DEFAULT, INPUT_TYPE_TEXT, LEARNING_MODE_ENABLED,
+        };
+        use zwp_text_input_v1 as v1_enum;
+        use zwp_text_input_v3::CONTENT_PURPOSE_TERMINAL;
+        let text = |v1_purpose| {
+            let flags = INPUT_FLAGS_NONE;
+            (
+                0,
+                v1_purpose,
+                INPUT_TYPE_TEXT,
+                INPUT_MODE_DEFAULT,
+                flags,
+                LEARNING_MODE_ENABLED,
+            )
+        };
+        assert_eq!(
+            map_v3_content_type(0, 0),
+            text(v1_enum::CONTENT_PURPOSE_NORMAL)
+        );
+        assert_eq!(
+            map_v3_content_type(0, CONTENT_PURPOSE_TERMINAL),
+            text(v1_enum::CONTENT_PURPOSE_TERMINAL)
+        );
+        let (mode, purpose) = (INPUT_MODE_DEFAULT, v1_enum::CONTENT_PURPOSE_PASSWORD);
+        assert_eq!(
+            map_v3_content_type(0, CONTENT_PURPOSE_PASSWORD),
+            (
+                0,
+                purpose,
+                INPUT_TYPE_PASSWORD,
+                mode,
+                SECRET,
+                LEARNING_MODE_DISABLED
+            )
+        );
+        // v1 has no PIN purpose: digits, sensitive and never learned.
+        assert_eq!(
+            map_v3_content_type(0, CONTENT_PURPOSE_PIN),
+            (
+                CONTENT_HINT_SENSITIVE_DATA,
+                CONTENT_PURPOSE_DIGITS,
+                INPUT_TYPE_NUMBER,
+                INPUT_MODE_NUMERIC,
+                SECRET,
+                LEARNING_MODE_DISABLED
+            )
+        );
+        assert_eq!(
+            map_v3_content_type(CONTENT_HINT_SENSITIVE_DATA, CONTENT_PURPOSE_PASSWORD),
+            (
+                0x80,
+                8,
+                INPUT_TYPE_PASSWORD,
+                0,
+                SECRET,
+                LEARNING_MODE_DISABLED
+            )
+        );
+        assert_eq!(
+            map_v3_content_type(CONTENT_HINT_MULTILINE, 0).2,
+            INPUT_TYPE_TEXT_AREA
+        );
+        assert_eq!(
+            map_v3_content_type(CONTENT_HINT_SPELLCHECK, 0).4,
+            INPUT_FLAGS_SPELLCHECK_ON,
+            "v3 spellcheck must map to Chrome spellcheck_on"
+        );
+
+        let mut f = Field::enabled().await;
+        f.s.guest([
+            v3::set_content_type(f.ti, 0, CONTENT_PURPOSE_PIN),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(
+            f.s.host_received(),
+            [
+                f.ext(Ext::SetSurroundingTextSupport {
+                    support: zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
+                }),
+                f.ext(Ext::SetInputType {
+                    input_type: INPUT_TYPE_NUMBER,
+                    input_mode: INPUT_MODE_NUMERIC,
+                    input_flags: SECRET,
+                    learning_mode: LEARNING_MODE_DISABLED,
+                    inline_composition_support:
+                        zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+                }),
+                f.commit_state(2),
+            ]
+        );
+    }
+
+    /// GTK resends the unchanged terminal content type after IME events.
+    /// Before v8, replaying `set_content_type` and
+    /// `deprecated_set_input_type` resets Exo's active Korean preedit before
+    /// the next key arrives, so a content type the host has, also one
+    /// changed and changed back before the commit, is not resent.
+    #[tokio::test]
+    async fn repeated_content_type_does_not_reset_active_host_composition() {
+        use zwp_text_input_v3::{CONTENT_PURPOSE_PIN as PIN, CONTENT_PURPOSE_TERMINAL as TERMINAL};
+        for purposes in [&[TERMINAL][..], &[PIN, TERMINAL]] {
+            let mut f = Field::enabled().await;
+            f.s.guest([v3::set_content_type(f.ti, 0, TERMINAL), v3::commit(f.ti)])
+                .await;
+            let mut expected = Vec::from(f.content_type((0, TERMINAL), false));
+            expected.push(f.commit_state(2));
+            assert_eq!(f.s.host_received(), expected);
+
+            let mut requests = purposes
+                .iter()
+                .map(|&purpose| v3::set_content_type(f.ti, 0, purpose))
+                .collect::<Vec<_>>();
+            requests.push(v3::commit(f.ti));
+            f.s.guest(requests).await;
+            assert_eq!(f.s.host_received(), [f.commit_state(3)], "{purposes:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn surrounding_text_support_follows_the_field_and_resends_only_on_change() {
+        let mut f = Field::enabled().await;
+        let edits = |f: &Field, serial, support| {
+            let mut requests = Vec::from(f.content_type((0, 0), support));
+            requests.push(f.commit_state(serial));
+            requests
+        };
+
+        // Chromium enables with a content type and no surrounding text,
+        // which the host is told unsupported ([`Field::enabled`]), and sends
+        // the text in a later commit, with no new content type. Exo learns
+        // the support only with a content type, so it is resent.
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "abc", 3, 3).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let mut expected = vec![f.surrounding_text("abc", 3, 3)];
+        expected.extend(edits(&f, 2, true));
+        assert_eq!(f.s.host_received(), expected);
+
+        // While the support holds, the content type is not resent: before
+        // v8 a resend changes Exo's type twice, which can reset its
+        // composition.
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "abcd", 4, 4).unwrap(),
+            v3::set_content_type(f.ti, 0, 0),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(
+            f.s.host_received(),
+            [f.surrounding_text("abcd", 4, 4), f.commit_state(3)]
+        );
+
+        // A disable and enable reset the editor state: the content type is
+        // replayed with the support of the field's new, empty state.
+        f.s.guest([
+            v3::disable(f.ti),
+            v3::enable(f.ti),
+            v3::set_content_type(f.ti, 0, 0),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let content_type = f.content_type((0, 0), false).into();
+        assert_eq!(
+            f.s.host_received(),
+            f.reset(
+                4,
+                Reset {
+                    content_type,
+                    ..Reset::default()
+                }
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_without_surrounding_text_support_gets_no_resend() {
+        // v8 has set_input_type but not set_surrounding_text_support.
+        let mut f = Field::new(Some(8)).await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        let [_, set_input_type] = f.content_type((0, 0), false);
+        let expected = f.reset(
+            1,
+            Reset {
+                step: vec![f.activate()],
+                content_type: vec![set_input_type],
+            },
+        );
+        assert_eq!(f.s.host_received(), expected);
+
+        // The host was told no support, so gaining surrounding text changes
+        // nothing it knows.
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "abc", 3, 3).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(
+            f.s.host_received(),
+            [f.surrounding_text("abc", 3, 3), f.commit_state(2)]
+        );
+    }
+
+    /// The host requests of a content type for each extension version.
+    #[tokio::test]
+    async fn content_type_takes_one_host_request_per_extension_version() {
+        use zwp_text_input_v3::CONTENT_PURPOSE_PIN as PIN;
+        let (hint, purpose, input_type, input_mode, input_flags, learning_mode) =
+            map_v3_content_type(0, PIN);
+        for version in [1, 7, 8, 9] {
+            let mut f = Field::new(Some(version)).await;
+            f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+            f.s.host_received();
+            f.s.guest([v3::set_content_type(f.ti, 0, PIN), v3::commit(f.ti)])
+                .await;
+            let set_content_type = f.v1(V1::SetContentType { hint, purpose });
+            let deprecated_set_input_type = f.ext(Ext::DeprecatedSetInputType {
+                input_type,
+                input_mode,
+                input_flags,
+                learning_mode,
+            });
+            let [support, set_input_type] = f.content_type((0, PIN), false);
+            let expected = match version {
+                // v1 has no extension input-type request.
+                1 => vec![set_content_type],
+                // v2-v7 refine the v1 content type with
+                // deprecated_set_input_type.
+                7 => vec![set_content_type, deprecated_set_input_type],
+                // v8's set_input_type is used in place of v1
+                // set_content_type.
+                8 => vec![set_input_type],
+                // Exo applies surrounding-text support to the next
+                // set_content_type or set_input_type and then resets it, so
+                // nothing may come between.
+                9 => vec![support, set_input_type],
+                version => panic!("uncovered version {version}"),
+            };
+            let mut expected = expected;
+            expected.push(f.commit_state(2));
+            assert_eq!(f.s.host_received(), expected, "version {version}");
+        }
+    }
+
+    #[tokio::test]
+    async fn destroy_drops_v3_request_and_cleans_host_extension_routing() {
+        let mut f = Field::enabled().await;
+        f.s.host([f.preedit("가", "")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.guest([v3::destroy(f.ti)]).await;
+        let host = f.s.host_received();
+        // The destroy is the final disable: the host extension goes after
+        // the generation's barrier.
+        let callback = barrier(&host);
+        assert_eq!(
+            host,
+            [f.deactivate(), sync(callback), f.ext(Ext::Destroy {})]
+        );
+        assert_eq!(
+            f.s.guest_received(),
+            [(
+                WL_DISPLAY_ID,
+                wl_display::Event::DeleteId { id: f.ti }.into()
+            )],
+            "the guest-local destruction is acknowledged by wl_display"
+        );
+
+        // The host keeps the v1 object, which has no destructor, and the
+        // extension's ID until its delete_id: a new text input takes
+        // neither.
+        let (old_host, old_host_ext) = (f.host, f.host_ext);
+        let ti = f.s.new_id();
+        f.create_text_input(ti).await;
+        assert!(![old_host, old_host_ext].contains(&f.host));
+        assert!(![old_host, old_host_ext].contains(&f.host_ext));
+        f.drain(callback).await;
+        assert_eq!(f.s.host_received(), []);
+
+        // A late confirm of the destroyed extension reaches no one, not even
+        // the new text input's composition.
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        f.s.host([f.preedit("나", ""), ext::confirm_preedit(old_host_ext, 0)])
+            .await;
+        let expected = [preedit("나"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // The host's delete_id frees the extension's ID, which the next
+        // host object takes.
+        f.s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, old_host_ext)])
+            .await;
+        let ti = f.s.new_id();
+        f.create_text_input(ti).await;
+        assert_eq!(f.host, old_host_ext);
+    }
+
+    /// A destroyed text input whose seat ended, or awaits its
+    /// `delete_id`, sends no `deactivate`: no seat can carry it.
+    #[tokio::test]
+    async fn destroy_after_seat_release_does_not_deactivate_destroyed_host_seat() {
+        for deleted in [false, true] {
+            let mut f = Field::enabled().await;
+            if deleted {
+                f.release_seat().await;
+            } else {
+                f.s.guest([wl_seat::req::release(f.seat.id)]).await;
+                let release = (f.seat.host, wl_seat::Request::Release {}.into());
+                assert_eq!(f.s.host_received(), [release]);
+            }
+
+            f.s.guest([v3::destroy(f.ti)]).await;
+            assert_eq!(
+                f.s.host_received(),
+                [f.ext(Ext::Destroy {})],
+                "deleted: {deleted}"
+            );
+            assert_eq!(
+                f.s.guest_received(),
+                [(
+                    WL_DISPLAY_ID,
+                    wl_display::Event::DeleteId { id: f.ti }.into()
+                )]
+            );
+        }
+    }
+
+    /// The active text input's seat ended, and the guest reused its ID for
+    /// a surface, which the host would reject as a seat.
+    #[tokio::test]
+    async fn a_seat_id_reused_for_another_object_is_not_sent_as_a_seat() {
+        let mut f = Field::enabled().await;
+        f.release_seat().await;
+        let compositor = f.s.bind("wl_compositor", wl_compositor::VERSION).await;
+        f.s.create(wl_compositor::req::create_surface(compositor, f.seat.id))
+            .await;
+
+        // Neither disabling the field nor enabling it again sends the ID:
+        // each commit sends only its edits.
+        for (serial, request) in [(2, v3::disable(f.ti)), (3, v3::enable(f.ti))] {
+            f.s.guest([request, v3::commit(f.ti)]).await;
+            assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
+        }
+        // The disable ended the host's generation: its events reach no one.
+        f.s.host([f.commit("가")]).await;
+        assert_eq!(f.s.guest_received(), []);
+    }
+
+    #[tokio::test]
+    async fn text_input_creation_works_without_optional_chromeos_extension() {
+        let mut f = Field::new(None).await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        let content_type = f.v1(V1::SetContentType {
+            hint: 0,
+            purpose: 0,
+        });
+        let expected = f.reset(
+            1,
+            Reset {
+                step: vec![f.activate()],
+                content_type: vec![content_type],
+            },
+        );
+        assert_eq!(f.s.host_received(), expected);
+    }
+
+    /// A leave is a hard boundary: what the guest requests until the next
+    /// enter does not reach the host. Its commits still count
+    /// (`v3_done_serial_counts_commits_made_while_unfocused`).
+    #[tokio::test]
+    async fn v3_requests_after_leave_are_ignored_until_next_enter() {
+        let mut f = Field::disabled().await;
+        f.keyboard_leave().await;
+        f.s.guest([
+            v3::enable(f.ti),
+            v3::set_surrounding_text(f.ti, "stale", 0, 0).unwrap(),
+            v3::set_text_change_cause(f.ti, 1),
+            v3::set_content_type(f.ti, 3, 4),
+            v3::set_cursor_rectangle(f.ti, 1, 2, 3, 4),
+            v3::disable(f.ti),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(f.s.host_received(), []);
+        // The next enter resets the pending state, so no peer can see it;
+        // read it to pin that the leave bounds what the requests change.
+        assert_eq!(
+            f.s.ctx().text_inputs[&f.ti].pending,
+            crate::state::V3Pending::default(),
+            "inactive v3 requests must not mutate double-buffered state"
+        );
+    }
+
+    /// text-input-v3 numbers `done` by every commit on the object, so the
+    /// commits a client makes while unfocused count as well.
+    #[tokio::test]
+    async fn v3_done_serial_counts_commits_made_while_unfocused() {
+        let mut f = Field::enabled().await;
+
+        // Focus leaves; the client disables and commits while unfocused.
+        f.keyboard_leave().await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), []);
+
+        // Focus enters again; the client enables and commits.
+        f.keyboard_enter().await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        f.drain(callback).await;
+        f.s.host_received();
+
+        // The IME commits text; `done` carries the client's commit count.
+        f.s.host([f.commit("가")]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            f.events([commit("가"), V3::Done { serial: 3 }])
+        );
+    }
+
+    /// The `done` of the guest's first commit.
+    const DONE: V3 = V3::Done { serial: 1 };
+
+    fn delete(before_length: u32, after_length: u32) -> V3 {
+        V3::DeleteSurroundingText {
+            before_length,
+            after_length,
+        }
+    }
+
+    /// The host input method's events reach the guest as text-input-v3
+    /// transactions, each closed by a `done` that numbers the guest's
+    /// commits, whatever serial the host sent.
+    #[tokio::test]
+    async fn host_ime_events_become_v3_transactions() {
+        type Events = fn(&Field) -> Vec<Outgoing>;
+        let korean: Events = |f| {
+            vec![
+                f.preedit("ㄱ", "ㄱ"),
+                f.preedit("가", "가"),
+                f.preedit("간", "간"),
+                f.commit("가"),
+                f.preedit("나", "나"),
+                f.preedit("낟", "낟"),
+                f.commit("나"),
+                f.preedit("다", "다"),
+            ]
+        };
+        let cases: Vec<(&str, Events, Vec<V3>)> = vec![
+            (
+                "a preedit",
+                |f| vec![v1::preedit_string(f.host, 42, "こんにちは", "").unwrap()],
+                vec![preedit("こんにちは"), DONE],
+            ),
+            (
+                "a live preedit keeps its fallback",
+                |f| vec![f.preedit("가", ""), f.preedit("간", "reset fallback")],
+                vec![preedit("가"), DONE, preedit("간"), DONE],
+            ),
+            (
+                "a preedit reset commits its fallback",
+                |f| vec![f.preedit("미완성", ""), f.preedit("", "확정")],
+                vec![preedit("미완성"), DONE, commit("확정"), no_preedit(), DONE],
+            ),
+            (
+                "a reset without a preedit commits nothing",
+                |f| vec![f.preedit("", "stale fallback")],
+                vec![no_preedit(), DONE],
+            ),
+            (
+                "a commit clears the preedit",
+                |f| vec![f.preedit("미완성", ""), f.commit("確定")],
+                vec![preedit("미완성"), DONE, no_preedit(), commit("確定"), DONE],
+            ),
+            (
+                "Korean composition commits each syllable once",
+                korean,
+                vec![
+                    preedit("ㄱ"),
+                    DONE,
+                    preedit("가"),
+                    DONE,
+                    preedit("간"),
+                    DONE,
+                    no_preedit(),
+                    commit("가"),
+                    DONE,
+                    preedit("나"),
+                    DONE,
+                    preedit("낟"),
+                    DONE,
+                    no_preedit(),
+                    commit("나"),
+                    DONE,
+                    preedit("다"),
+                    DONE,
+                ],
+            ),
+            (
+                "a delete waits for its commit",
+                |f| vec![v1::delete_surrounding_text(f.host, -3, 5)],
+                vec![],
+            ),
+            (
+                "a delete spans the cursor",
+                |f| vec![v1::delete_surrounding_text(f.host, -3, 5), f.commit("")],
+                vec![delete(3, 2), commit(""), DONE],
+            ),
+            (
+                "a delete apart from the cursor would delete the text between",
+                |f| vec![v1::delete_surrounding_text(f.host, -5, 3), f.commit("")],
+                vec![commit(""), DONE],
+            ),
+            (
+                "deletes accumulate until the commit",
+                |f| {
+                    vec![
+                        v1::delete_surrounding_text(f.host, -3, 3),
+                        v1::delete_surrounding_text(f.host, 0, 2),
+                        f.commit("한"),
+                    ]
+                },
+                vec![delete(3, 0), delete(0, 2), commit("한"), DONE],
+            ),
+            (
+                "a preedit cursor is a byte offset",
+                |f| vec![v1::preedit_cursor(f.host, 3), f.preedit("가나", "")],
+                vec![preedit_at("가나", 3, 3), DONE],
+            ),
+            (
+                "a selection is a byte range, which the cursor does not move",
+                |f| {
+                    vec![
+                        v1::preedit_styling(f.host, 0, 3, 6),
+                        v1::preedit_cursor(f.host, 6),
+                        f.preedit("가나", ""),
+                    ]
+                },
+                vec![preedit_at("가나", 0, 3), DONE],
+            ),
+            (
+                "a cursor inside a character falls back to the end",
+                |f| vec![v1::preedit_cursor(f.host, 1), f.preedit("가", "")],
+                vec![preedit("가"), DONE],
+            ),
+            (
+                "a selection inside a character falls back to the end",
+                |f| vec![v1::preedit_styling(f.host, 1, 1, 6), f.preedit("가", "")],
+                vec![preedit("가"), DONE],
+            ),
+            (
+                "a confirm without a preedit or a held key",
+                |f| vec![ext::confirm_preedit(f.host_ext, 1)],
+                vec![],
+            ),
+            (
+                "a confirm of an emptied preedit without a held key",
+                |f| {
+                    vec![
+                        f.preedit("가", ""),
+                        f.preedit("", ""),
+                        ext::confirm_preedit(f.host_ext, 0),
+                    ]
+                },
+                vec![preedit("가"), DONE, no_preedit(), DONE],
+            ),
+            (
+                // Its selection and cursor go with it, while the edits stay
+                // for the next commit.
+                "a confirm commits the preedit",
+                |f| {
+                    vec![
+                        f.preedit("나", ""),
+                        v1::preedit_styling(f.host, 0, 3, 6),
+                        v1::preedit_cursor(f.host, 3),
+                        v1::delete_surrounding_text(f.host, -3, 3),
+                        ext::confirm_preedit(f.host_ext, 0),
+                        f.preedit("다라", ""),
+                        f.commit("다"),
+                        f.commit("라"),
+                    ]
+                },
+                vec![
+                    preedit("나"),
+                    DONE,
+                    no_preedit(),
+                    commit("나"),
+                    DONE,
+                    preedit_at("다라", 6, 6),
+                    DONE,
+                    no_preedit(),
+                    delete(3, 0),
+                    commit("다"),
+                    DONE,
+                    commit("라"),
+                    DONE,
+                ],
+            ),
+        ];
+        for (case, events, expected) in cases {
+            let mut f = Field::enabled().await;
+            let events = events(&f);
+            f.s.host(events).await;
+            assert_eq!(f.s.guest_received(), f.events(expected), "{case}");
+        }
+    }
+
+    /// A preedit region makes committed surrounding text around the cursor
+    /// the preedit; text the guest has not committed, or a region apart
+    /// from the cursor, cannot be.
+    #[tokio::test]
+    async fn on_set_preedit_region_translates_correctly() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::set_surrounding_text(f.ti, "가나다", 6, 6).unwrap()])
+            .await;
+        f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.s.guest([v3::commit(f.ti)]).await;
+        let mut expected = vec![f.surrounding_text("가나다", 6, 6)];
+        expected.extend(f.content_type((0, 0), true));
+        expected.push(f.commit_state(2));
+        assert_eq!(f.s.host_received(), expected);
+        f.s.host([ext::set_preedit_region(f.host_ext, -6, 3)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
+        let done = || V3::Done { serial: 2 };
+        let expected = [delete(3, 0), preedit_at("나", 3, 3), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        // The region is the preedit now.
+        f.s.host([f.commit("나")]).await;
+        let expected = [no_preedit(), commit("나"), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // A pending preedit cursor, or selection, places the region's.
+        f.s.host([
+            v1::preedit_cursor(f.host, 0),
+            ext::set_preedit_region(f.host_ext, -3, 3),
+        ])
+        .await;
+        let expected = [delete(3, 0), preedit_at("나", 0, 0), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([
+            v1::preedit_styling(f.host, 0, 3, 6),
+            ext::set_preedit_region(f.host_ext, -6, 6),
+        ])
+        .await;
+        let expected = [delete(6, 0), preedit_at("가나", 0, 3), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// Each commit_state carries the guest's commit count, which numbers
+    /// every `done` until the next commit, however many host events with
+    /// whatever serials it answers.
+    #[tokio::test]
+    async fn guest_commit_count_is_sent_to_v1_and_used_by_v3_done() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+
+        f.s.host([
+            v1::preedit_string(f.host, 2942, "한", "").unwrap(),
+            v1::preedit_string(f.host, 2944, "한글", "").unwrap(),
+            v1::commit_string(f.host, 2945, "한글").unwrap(),
+        ])
+        .await;
+        let done = || V3::Done { serial: 2 };
+        assert_eq!(
+            f.s.guest_received(),
+            f.events([
+                preedit("한"),
+                done(),
+                preedit("한글"),
+                done(),
+                no_preedit(),
+                commit("한글"),
+                done(),
+            ])
+        );
+    }
+
+    /// Events of a host text input that is not active belong to no guest
+    /// generation: none reaches the guest or edits its next transaction.
+    #[tokio::test]
+    async fn inactive_host_ime_events_are_ignored() {
+        // The guest enabled the field, which its released seat cannot
+        // activate.
+        let mut f = Field::disabled().await;
+        f.release_seat().await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
+        f.s.host([
+            f.preedit("가", ""),
+            v1::delete_surrounding_text(f.host, -3, 3),
+            f.commit("가"),
+            v1::keysym(
+                f.host,
+                0,
+                0,
+                u32::from(b'a'),
+                wl_keyboard::KEY_STATE_PRESSED,
+                0,
+            ),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), []);
+
+        // A new seat activates it.
+        let host = f.bind_seat_again().await;
+        let mut expected = vec![f.activate()];
+        expected.extend(f.content_type((0, 0), false));
+        expected.push(f.commit_state(1));
+        assert_eq!(host, expected);
+        f.s.host([f.commit("나")]).await;
+        assert_eq!(f.s.guest_received(), f.events([commit("나"), DONE]));
+    }
+
+    /// The fixture's guest text input, its host text input and extension.
+    const TI: u32 = 20;
+    const HOST: u32 = 10;
+    const HOST_EXT: u32 = 30;
+    /// The fixture's guest seat and focused surface, and their host objects.
+    const SEAT: u32 = 5;
+    const SURFACE: u32 = 900;
+    const HOST_SEAT: u32 = 6;
+    const HOST_SURFACE: u32 = 901;
+    /// The guest keyboard [`Ime::with_keyboard`] adds, its host keyboard
+    /// and that keyboard's extended keyboard.
+    const KEYBOARD: u32 = 40;
+    const HOST_KEYBOARD: HostId = HostId(41);
+    const HOST_EXTENDED_KEYBOARD: u32 = 42;
+    const BACKSPACE: u32 = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
+    const PRESSED: u32 = wl_keyboard::KEY_STATE_PRESSED;
+    const RELEASED: u32 = wl_keyboard::KEY_STATE_RELEASED;
+    const REPEATED: u32 = wl_keyboard::KEY_STATE_REPEATED;
+
+    /// Handler tests of key and IME state that the peers of a [`Session`]
+    /// cannot set up exactly: the guest text input [`TI`] of seat [`SEAT`]
+    /// is enabled and its host active on surface [`SURFACE`].
+    struct Ime {
+        ctx: Context,
+    }
+
+    impl Ime {
+        fn new() -> Self {
+            Self::with_extension_version(Some(zcr_extended_text_input_v1::VERSION))
+        }
+
+        /// The fixture whose extension has `version` in the object table,
+        /// or none.
+        fn with_extension_version(version: Option<u32>) -> Self {
+            let mut ctx = Context::new_for_test(false, false, vec![]);
+            let table = &mut ctx.shadow_table;
+            table.insert_paired_for_test(SEAT, HOST_SEAT, "wl_seat");
+            table.insert_paired_for_test(SURFACE, HOST_SURFACE, "wl_surface");
+            ctx.shadow_table.insert_bridged_for_test(
+                TI,
+                HOST,
+                "zwp_text_input_v3",
+                "zwp_text_input_v1",
+            );
+            if let Some(version) = version {
+                let interface = "zcr_extended_text_input_v1";
+                ctx.shadow_table
+                    .insert_host_only_for_test(HOST_EXT, interface, version);
+            }
+            let mut state = TextInputState::new(HOST, Some(HOST_EXT), SEAT, Some(SURFACE));
+            state.committed.enabled = true;
+            state.host = HostApplied::Active { content_type: None };
+            ctx.text_inputs.insert(TI, state);
+            Self { ctx }
+        }
+
+        /// The fixture with guest keyboard [`KEYBOARD`] on the seat.
+        fn with_keyboard() -> Self {
+            let mut ime = Self::new();
+            ime.keyboard(KEYBOARD, HOST_KEYBOARD);
+            ime
+        }
+
+        /// Add guest keyboard `guest`, whose host keyboard is `host`, to the
+        /// seat.
+        fn keyboard(&mut self, guest: u32, host: HostId) {
+            self.ctx
+                .shadow_table
+                .insert_paired_for_test(guest, host.0, "wl_keyboard");
+            self.ctx.keyboard_to_seat.insert(guest, SEAT);
+        }
+
+        /// Give [`HOST_KEYBOARD`] its extended keyboard, which sends
+        /// `peek_key`.
+        fn with_extended_keyboard() -> Self {
+            let mut ime = Self::with_keyboard();
+            let extended = HostId(HOST_EXTENDED_KEYBOARD);
+            ime.ctx
+                .keyboard_to_extended_keyboard
+                .insert(HOST_KEYBOARD, extended);
+            ime.ctx
+                .extended_keyboard_to_keyboard
+                .insert(extended, HOST_KEYBOARD);
+            ime
+        }
+
+        /// Give the seat's keyboard focus on the surface to `keyboard`.
+        fn focus(&mut self, keyboard: HostId) {
+            self.ctx
+                .keyboard_focus
+                .set_for_test(keyboard, SEAT, SURFACE, HOST_SURFACE);
+        }
+
+        fn state(&mut self) -> &mut TextInputState {
+            self.ctx.text_inputs.get_mut(&TI).expect("the text input")
+        }
+
+        fn preedit(&mut self, text: &str, commit: &str) {
+            self.ctx.last_sender_id = HOST;
+            let (text, commit) = (text.to_string(), commit.to_string());
+            TextInputV1Handler.on_preedit_string(&mut self.ctx, 0, &text, &commit);
+        }
+
+        fn commit(&mut self, text: &str) {
+            self.ctx.last_sender_id = HOST;
+            TextInputV1Handler.on_commit_string(&mut self.ctx, 0, &text.to_string());
+        }
+
+        fn preedit_region(&mut self, index: i32, length: u32) {
+            self.ctx.last_sender_id = HOST_EXT;
+            ExtendedTextInputV1Handler.on_set_preedit_region(&mut self.ctx, index, length);
+        }
+
+        fn confirm(&mut self) {
+            self.ctx.last_sender_id = HOST_EXT;
+            ExtendedTextInputV1Handler.on_confirm_preedit(&mut self.ctx, 0);
+        }
+
+        /// The host's `keysym` of key `serial` at `time`, which Exo sends
+        /// in each other's arguments.
+        fn keysym(&mut self, sym: u32, state: u32, serial: u32, time: u32) {
+            self.ctx.last_sender_id = HOST;
+            TextInputV1Handler.on_keysym(&mut self.ctx, time, serial, sym, state, 0);
+        }
+
+        fn peek(&mut self, key: u32, state: u32, serial: u32, time: u32) {
+            self.ctx.last_sender_id = HOST_EXTENDED_KEYBOARD;
+            KeyboardHandler::new().on_peek_key(&mut self.ctx, serial, time, key, state);
+        }
+
+        /// The host keyboard's `key`; returns whether it reaches the guest.
+        fn key(&mut self, key: u32, state: u32, serial: u32, time: u32) -> Action {
+            self.ctx.last_sender_id = HOST_KEYBOARD.0;
+            KeyboardHandler::new().on_key(&mut self.ctx, serial, time, key, state)
+        }
+
+        /// Hold repeatable `key` on `keyboard`, whose press `peek_key`
+        /// reported with `serial` at `time`.
+        fn hold_peeked(&mut self, keyboard: HostId, key: u32, serial: u32, time: u32) {
+            self.ctx
+                .key_generations
+                .observe_peek_press(keyboard, key, serial, time, true);
+            self.ctx
+                .keyboard_repeatable_keys
+                .entry(keyboard)
+                .or_default()
+                .insert(key);
+        }
+
+        /// Hold Backspace on [`HOST_KEYBOARD`], with its IME repeat leased
+        /// to `text_input`.
+        fn lease_backspace_repeat(&mut self, text_input: u32) {
+            let generations = &mut self.ctx.key_generations;
+            generations.observe_physical_state(HOST_KEYBOARD, BACKSPACE, 1);
+            assert!(generations.arm_ime_repeat(HOST_KEYBOARD, BACKSPACE, text_input));
+        }
+
+        /// Hold `key` on [`HOST_KEYBOARD`], with its guest press owned by
+        /// `owner`.
+        fn hold_owned(&mut self, key: u32, owner: GuestKeyOwner) {
+            let generations = &mut self.ctx.key_generations;
+            generations.observe_physical_state(HOST_KEYBOARD, key, 1);
+            assert!(self.ctx.claim_guest_key(HOST_KEYBOARD, key, owner));
+        }
+
+        fn repeat_active(&self) -> bool {
+            backspace_repeat_active_for_keyboard(&self.ctx, HOST_KEYBOARD)
+        }
+
+        fn owner(&self, key: u32) -> Option<GuestKeyOwner> {
+            self.ctx.guest_key_owner(HOST_KEYBOARD, key)
+        }
+
+        /// The events queued for the guest since the last call.
+        fn events(&mut self) -> Vec<(u32, AnyEvent)> {
+            let queue = std::mem::take(&mut self.ctx.host_to_client_queue);
+            let table = &self.ctx.shadow_table;
+            queue
+                .iter()
+                .map(|(message, _)| {
+                    crate::test_support::decode(message, &mut Default::default(), |msg| {
+                        let interface = table.get_interface(msg.sender_id).expect("a sender");
+                        AnyEvent::from_wire(interface, msg)
+                    })
+                    .expect("a queued event decodes")
+                })
+                .collect()
+        }
+
+        /// The requests queued for the host since the last call.
+        fn requests(&mut self) -> Vec<(u32, AnyRequest)> {
+            let queue = std::mem::take(&mut self.ctx.client_to_host_queue);
+            let table = &self.ctx.shadow_table;
+            queue
+                .iter()
+                .map(|(message, _)| {
+                    crate::test_support::decode(message, &mut Default::default(), |msg| {
+                        let interface = match msg.sender_id {
+                            HOST_EXT => "zcr_extended_text_input_v1",
+                            host => table.get_host_interface(host).expect("a sender"),
+                        };
+                        AnyRequest::from_wire(interface, msg)
+                    })
+                    .expect("a queued request decodes")
+                })
+                .collect()
+        }
+    }
+
+    fn key(keyboard: u32, key: u32, state: u32, serial: u32, time: u32) -> (u32, AnyEvent) {
+        let event = wl_keyboard::Event::Key {
+            serial,
+            time,
+            key,
+            state,
+        };
+        (keyboard, event.into())
+    }
+
+    /// The fixture's `done`, before any guest commit.
+    fn uncommitted_done() -> (u32, AnyEvent) {
+        (TI, V3::Done { serial: 0 }.into())
     }
 
     #[test]
@@ -2042,2140 +3875,318 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    /// A commit whose surrounding text does not fit a message reaches the
+    /// host with nothing: it changes nothing but the commit count.
     #[test]
     fn oversized_surrounding_commit_does_not_partially_advance_state() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
+        let mut ime = Ime::new();
         let oversized = "x".repeat(4_084);
-        let mut handler = TextInputV3Handler;
+        let end = oversized.len() as i32;
+        ime.ctx.last_sender_id = TI;
+        TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &oversized, end, end);
+        TextInputV3Handler.on_set_content_type(&mut ime.ctx, 0, 13);
+        let mut expected = ime.state().clone();
+        TextInputV3Handler.on_commit(&mut ime.ctx);
 
-        assert_eq!(
-            handler.on_set_surrounding_text(
-                &mut ctx,
-                &oversized,
-                oversized.len() as i32,
-                oversized.len() as i32,
-            ),
-            Action::Drop
-        );
-        assert_eq!(handler.on_set_content_type(&mut ctx, 0, 13), Action::Drop);
-        let mut expected = ctx.text_inputs[&guest_id].clone();
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-
-        assert!(ctx.client_to_host_queue.is_empty());
-        let state = &ctx.text_inputs[&guest_id];
-        // The protocol counts the commit even though nothing reached the host.
+        assert!(ime.ctx.client_to_host_queue.is_empty());
         expected.set_guest_commits(1);
-        assert_eq!(state, &expected);
-        assert!(state.committed.surrounding_text.is_none());
-        assert!(state.pending.surrounding_text.is_some());
-        assert_eq!(state.committed.content_type, (0, 0));
-        assert_eq!(state.pending.content_type, Some((0, 13)));
+        assert_eq!(ime.state(), &expected);
     }
 
-    /// Helper: set up a context with a host→guest mapping for text input testing.
-    fn setup_v1_ctx() -> (Context, u32, u32) {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_v1_id = 10u32;
-        let guest_id = 20u32;
-        let host_ext_id = 30u32;
-        // Keep the fixture's historical guest seat ID (0), but provide the
-        // real host mapping that production activation requests require.
-        ctx.shadow_table.insert_paired_for_test(0, 2, "wl_seat");
-        // The focused surface the host text input is active on.
-        ctx.shadow_table
-            .insert_paired_for_test(900, 901, "wl_surface");
-        ctx.shadow_table.insert_bridged_for_test(
-            guest_id,
-            host_v1_id,
-            "zwp_text_input_v3",
-            "zwp_text_input_v1",
-        );
-        ctx.text_inputs.insert(guest_id, {
-            // Most unit tests exercise the v3 transaction bridge without
-            // modelling a keyboard enter. Use a stable synthetic focus
-            // by default; tests covering the protocol's pre-enter/after-
-            // leave behavior explicitly clear this field.
-            let mut state =
-                crate::state::TextInputState::new(host_v1_id, Some(host_ext_id), 0, Some(900));
-            state.committed.enabled = true;
-            state.host = HostApplied::Active { content_type: None };
-            state
-        });
-        (ctx, host_v1_id, guest_id)
-    }
+    /// Host text too long for a message is dropped whole: the guest gets
+    /// nothing, and the text input and its repeat lease stay as they were.
+    #[test]
+    fn oversized_host_text_does_not_partially_advance_state() {
+        let oversized = "x".repeat(4_084);
+        type Event = fn(&mut Ime, &str);
+        let cases: [(&str, Event); 4] = [
+            ("preedit", |ime, text| ime.preedit(text, "")),
+            ("commit", |ime, text| ime.commit(text)),
+            ("preedit region", |ime, _| ime.preedit_region(-4_084, 4_084)),
+            ("confirm", |ime, _| ime.confirm()),
+        ];
+        for (case, event) in cases {
+            let mut ime = Ime::with_keyboard();
+            let state = ime.state();
+            state.committed.surrounding_text = Some((oversized.clone(), 4_084, 4_084));
+            state.current_preedit = oversized.clone();
+            state.record_preedit_cursor(1);
+            state.record_preedit_selection(0, 1);
+            assert!(state.record_delete(3, 0));
+            state.record_cursor_position(1, 1);
+            ime.lease_backspace_repeat(TI);
+            let before = ime.state().clone();
 
-    fn msg_done_serial(queue: &[crate::wire::Outgoing], idx: usize) -> u32 {
-        let payload = &queue[idx].0[8..];
-        u32::from_ne_bytes(payload[0..4].try_into().unwrap())
-    }
-
-    fn wire_message(queue: &[crate::wire::Outgoing], idx: usize) -> WireMessage<'_> {
-        WireMessage::new(
-            msg_sender(queue, idx),
-            msg_opcode(queue, idx),
-            &queue[idx].0[8..],
-        )
-    }
-
-    fn hold_repeatable_peek_key(
-        ctx: &mut Context,
-        host_keyboard_id: HostId,
-        key: u32,
-        serial: u32,
-        time: u32,
-    ) {
-        ctx.key_generations
-            .observe_peek_press(host_keyboard_id, key, serial, time, true);
-        ctx.keyboard_repeatable_keys
-            .entry(host_keyboard_id)
-            .or_default()
-            .insert(key);
-    }
-
-    fn arm_backspace_repeat_for_test(
-        ctx: &mut Context,
-        guest_keyboard_id: u32,
-        host_keyboard_id: HostId,
-        guest_text_input: u32,
-    ) {
-        let backspace = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
-        ctx.shadow_table.insert_paired_for_test(
-            guest_keyboard_id,
-            host_keyboard_id.0,
-            "wl_keyboard",
-        );
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.key_generations
-            .observe_physical_state(host_keyboard_id, backspace, 1);
-        assert!(ctx
-            .key_generations
-            .arm_ime_repeat(host_keyboard_id, backspace, guest_text_input));
+            event(&mut ime, &oversized);
+            assert_eq!(ime.events(), [], "{case}");
+            assert_eq!(ime.state(), &before, "{case}");
+            assert!(ime.repeat_active(), "{case}");
+        }
     }
 
     #[test]
     fn ending_one_keyboard_repeat_does_not_cancel_another_held_keyboard() {
-        let (mut ctx, _, _) = setup_v1_ctx();
-        let backspace = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
-        for (guest_keyboard, host_keyboard) in [(40, 41), (42, 43)] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-            ctx.keyboard_to_seat.insert(guest_keyboard, 0);
-            ctx.key_generations
-                .observe_physical_state(HostId(host_keyboard), backspace, 1);
-        }
-        assert!(ctx
-            .key_generations
-            .arm_ime_repeat(HostId(41), backspace, 40));
+        let mut ime = Ime::with_keyboard();
+        let other = HostId(43);
+        ime.keyboard(44, other);
+        ime.lease_backspace_repeat(TI);
+        let generations = &mut ime.ctx.key_generations;
+        generations.observe_physical_state(other, BACKSPACE, 1);
 
-        end_backspace_repeat_for_seat(&mut ctx, 0);
+        end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
 
-        assert!(ctx
-            .key_generations
-            .backspace_repeat_cancelled(HostId(41), backspace));
-        assert!(!ctx
-            .key_generations
-            .backspace_repeat_cancelled(HostId(43), backspace));
-        assert!(ctx.key_generations.physically_held(HostId(43), backspace));
+        let generations = &ime.ctx.key_generations;
+        assert!(generations.backspace_repeat_cancelled(HOST_KEYBOARD, BACKSPACE));
+        assert!(!generations.backspace_repeat_cancelled(other, BACKSPACE));
+        assert!(generations.physically_held(other, BACKSPACE));
     }
 
-    /// A focused, active v3 text input after a commit that changes only its
-    /// content type, with a `zcr_extended_text_input_v1` of `version`
-    /// (unknown if `None`): only that commit's transaction is queued.
-    fn commit_content_type(version: Option<u32>) -> Context {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        if let Some(version) = version {
-            ctx.shadow_table
-                .insert_host_only_for_test(30, "zcr_extended_text_input_v1", version);
-        }
-        // Map the focused surface, so the commit keeps the host activation.
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-        handler.on_set_content_type(&mut ctx, 0, 9);
-        handler.on_commit(&mut ctx);
-        ctx
-    }
-
-    /// The host requests of [`commit_content_type`], as (sender, opcode).
-    fn content_type_requests_for_version(version: Option<u32>) -> Vec<(u32, u16)> {
-        let ctx = commit_content_type(version);
-        let queue = &ctx.client_to_host_queue;
-        (0..queue.len())
-            .map(|index| (msg_sender(queue, index), msg_opcode(queue, index)))
-            .collect()
-    }
-
+    /// An IME edit ends the held-Backspace fallback a confirmation leased.
     #[test]
-    fn on_preedit_string_sends_v3_preedit_and_done() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_guest_commits(42);
-        }
-
-        let mut handler = TextInputV1Handler;
-        let text = "こんにちは".to_string();
-        let action = handler.on_preedit_string(&mut ctx, 42, &text, &String::new());
-        assert_eq!(action, Action::Drop);
-
-        // Should produce exactly 2 messages: preedit_string (opcode 2) + done (opcode 5)
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 0), guest_id);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 2); // preedit_string
-
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 1), guest_id);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 5); // done
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 1), 42); // serial
-    }
-
-    #[test]
-    fn empty_preedit_applies_v1_reset_fallback() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .expect("test text input")
-            .current_preedit = "미완성".to_string();
-
-        let mut handler = TextInputV1Handler;
-        let action = handler.on_preedit_string(&mut ctx, 42, &"".to_string(), &"확정".to_string());
-        assert_eq!(action, Action::Drop);
-
-        // v3 commit_string removes the old composition; the empty preedit
-        // event then records the replacement state, followed by done.
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 3);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 2);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5);
-        let commit_payload = &ctx.host_to_client_queue[0].0[8..];
-        let commit_len =
-            u32::from_ne_bytes(commit_payload[0..4].try_into().expect("commit length")) as usize;
-        assert_eq!(&commit_payload[4..4 + commit_len - 1], "확정".as_bytes());
-        assert!(!ime_repeat_active_for_seat(&ctx, 0));
-    }
-
-    #[test]
-    fn live_preedit_does_not_commit_v1_reset_fallback() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        let action = handler.on_preedit_string(
-            &mut ctx,
-            42,
-            &"간".to_string(),
-            &"reset fallback".to_string(),
-        );
-        assert_eq!(action, Action::Drop);
-
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 2);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 5);
-        assert_eq!(ctx.text_inputs[&guest_id].current_preedit, "간");
-    }
-
-    #[test]
-    fn oversized_preedit_does_not_partially_advance_state() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.current_preedit = "old".to_string();
-            state.pending_preedit_cursor = Some(1);
-            state.pending_preedit_selection = Some((0, 1));
-        }
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
-
-        let oversized = "x".repeat(4_084);
-        assert_eq!(
-            TextInputV1Handler.on_preedit_string(&mut ctx, 0, &oversized, &String::new()),
-            Action::Drop
-        );
-
-        assert!(ctx.host_to_client_queue.is_empty());
-        let state = &ctx.text_inputs[&guest_id];
-        assert_eq!(state.current_preedit, "old");
-        assert_eq!(state.pending_preedit_cursor, Some(1));
-        assert_eq!(state.pending_preedit_selection, Some((0, 1)));
-        assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
-    }
-
-    #[test]
-    fn oversized_commit_does_not_partially_advance_state() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.current_preedit = "old".to_string();
-            state.pending_deletes.push((3, 0));
-            state.pending_cursor_position = Some((1, 1));
-            state.pending_preedit_cursor = Some(1);
-            state.pending_preedit_selection = Some((0, 1));
-        }
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
-
-        let oversized = "x".repeat(4_084);
-        assert_eq!(
-            TextInputV1Handler.on_commit_string(&mut ctx, 0, &oversized),
-            Action::Drop
-        );
-
-        assert!(ctx.host_to_client_queue.is_empty());
-        let state = &ctx.text_inputs[&guest_id];
-        assert_eq!(state.current_preedit, "old");
-        assert_eq!(state.pending_deletes, vec![(3, 0)]);
-        assert_eq!(state.pending_cursor_position, Some((1, 1)));
-        assert_eq!(state.pending_preedit_cursor, Some(1));
-        assert_eq!(state.pending_preedit_selection, Some((0, 1)));
-        assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
-    }
-
-    #[test]
-    fn korean_trace_commits_each_completed_syllable_once() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        for text in ["ㄱ", "가", "간"] {
-            handler.on_preedit_string(&mut ctx, 1, &text.to_string(), &text.to_string());
-        }
-        handler.on_commit_string(&mut ctx, 2, &"가".to_string());
-        handler.on_preedit_string(&mut ctx, 3, &"나".to_string(), &"나".to_string());
-        handler.on_preedit_string(&mut ctx, 4, &"낟".to_string(), &"낟".to_string());
-        handler.on_commit_string(&mut ctx, 5, &"나".to_string());
-        handler.on_preedit_string(&mut ctx, 6, &"다".to_string(), &"다".to_string());
-
-        let commits = ctx
-            .host_to_client_queue
-            .iter()
-            .filter(|message| msg_opcode(std::slice::from_ref(message), 0) == 3)
-            .map(|message| {
-                wire_message(std::slice::from_ref(message), 0)
-                    .read_string()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(commits, ["가", "나"]);
-        assert_eq!(ctx.text_inputs[&guest_id].current_preedit, "다");
-    }
-
-    #[test]
-    fn reset_fallback_without_previous_preedit_is_not_inserted() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        let action = TextInputV1Handler.on_preedit_string(
-            &mut ctx,
-            42,
-            &String::new(),
-            &"stale fallback".to_string(),
-        );
-
-        assert_eq!(action, Action::Drop);
-        assert_eq!(
-            ctx.host_to_client_queue
-                .iter()
-                .map(|message| msg_opcode(std::slice::from_ref(message), 0))
-                .collect::<Vec<_>>(),
-            vec![2, 5]
-        );
-        assert!(ctx.text_inputs[&guest_id].current_preedit.is_empty());
-    }
-
-    #[test]
-    fn on_commit_string_sends_preedit_clear_then_commit_then_done() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_guest_commits(42);
-            state.current_preedit = "미완성".to_string();
-        }
-
-        let mut handler = TextInputV1Handler;
-        let text = "確定".to_string();
-        let action = handler.on_commit_string(&mut ctx, 42, &text);
-        assert_eq!(action, Action::Drop);
-
-        // Should produce 3 messages: preedit_string("") + commit_string + done
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 2); // preedit_string (clear)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 3); // commit_string
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5); // done
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 2), 42); // serial
-
-        // All messages should target the guest_id
-        for i in 0..3 {
-            assert_eq!(msg_sender(&ctx.host_to_client_queue, i), guest_id);
-        }
-    }
-
-    #[test]
-    fn empty_commit_clears_stale_backspace_repeat_state() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
-
-        let mut handler = TextInputV1Handler;
-        assert_eq!(
-            handler.on_commit_string(&mut ctx, 1, &String::new()),
-            Action::Drop
-        );
-        assert!(!backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
-    }
-
-    #[test]
-    fn on_delete_surrounding_text_negative_index_spanning_cursor() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_guest_commits(42);
-        }
-
-        let mut handler = TextInputV1Handler;
-        let action = handler.on_delete_surrounding_text(&mut ctx, -3, 5);
-        assert_eq!(action, Action::Drop);
-
-        // v1 deletion is buffered until the following commit_string.
-        assert!(ctx.host_to_client_queue.is_empty());
-
-        let action = handler.on_commit_string(&mut ctx, 42, &String::new());
-        assert_eq!(action, Action::Drop);
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 0), guest_id);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 4);
-        let payload = &ctx.host_to_client_queue[0].0[8..];
-        let before_length = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
-        let after_length = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
-        assert_eq!(before_length, 3);
-        assert_eq!(after_length, 2);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 3);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5);
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 2), 42);
-    }
-
-    #[test]
-    fn non_adjacent_delete_is_ignored_instead_of_deleting_intervening_text() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        let action = handler.on_delete_surrounding_text(&mut ctx, -5, 3);
-        assert_eq!(action, Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
-        handler.on_commit_string(&mut ctx, 1, &String::new());
-
-        assert_eq!(
-            ctx.host_to_client_queue
-                .iter()
-                .map(|message| msg_opcode(std::slice::from_ref(message), 0))
-                .collect::<Vec<_>>(),
-            vec![3, 5]
-        );
-    }
-
-    #[test]
-    fn multiple_v1_deletes_are_preserved_until_commit_string() {
-        let (mut ctx, host_v1_id, _) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        handler.on_delete_surrounding_text(&mut ctx, -3, 3);
-        handler.on_delete_surrounding_text(&mut ctx, 0, 2);
-        assert!(ctx.host_to_client_queue.is_empty());
-        handler.on_commit_string(&mut ctx, 0, &"한".to_string());
-
-        assert_eq!(
-            ctx.host_to_client_queue
-                .iter()
-                .map(|message| msg_opcode(std::slice::from_ref(message), 0))
-                .collect::<Vec<_>>(),
-            vec![4, 4, 3, 5]
-        );
-        let mut first_delete = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(first_delete.read_u32().unwrap(), 3);
-        assert_eq!(first_delete.read_u32().unwrap(), 0);
-        let mut second_delete = wire_message(&ctx.host_to_client_queue, 1);
-        assert_eq!(second_delete.read_u32().unwrap(), 0);
-        assert_eq!(second_delete.read_u32().unwrap(), 2);
-    }
-
-    #[test]
-    fn on_set_preedit_region_translates_correctly() {
-        let (mut ctx, _host_v1_id, guest_id) = setup_v1_ctx();
-        let host_ext_id = 30u32;
-        ctx.last_sender_id = host_ext_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.committed.surrounding_text = Some(("가나다".to_string(), 6, 6));
-            state.set_guest_commits(42);
-        }
-
-        let mut handler = ExtendedTextInputV1Handler;
-        let action = handler.on_set_preedit_region(&mut ctx, -3, 3); // "나" (3 bytes)
-        assert_eq!(action, Action::Drop);
-
-        // Should produce 3 messages: delete_surrounding_text, preedit_string, done
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-
-        // 1. delete_surrounding_text (opcode 4)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 4);
-        let payload = &ctx.host_to_client_queue[0].0[8..];
-        let before_length = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
-        let after_length = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
-        assert_eq!(before_length, 3);
-        assert_eq!(after_length, 0);
-
-        // 2. preedit_string (opcode 2)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 2);
-        let payload = &ctx.host_to_client_queue[1].0[8..];
-        let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let preedit_str = String::from_utf8(payload[4..4 + str_len - 1].to_vec()).unwrap();
-        assert_eq!(preedit_str, "나");
-        let cursor_offset = 4 + ((str_len + 3) & !3);
-        let cursor_begin = i32::from_ne_bytes(
-            payload[cursor_offset..cursor_offset + 4]
-                .try_into()
-                .unwrap(),
-        );
-        let cursor_end = i32::from_ne_bytes(
-            payload[cursor_offset + 4..cursor_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
-        assert_eq!((cursor_begin, cursor_end), (3, 3));
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 1);
-        assert_eq!(
-            preedit.read_nullable_string().unwrap(),
-            Some("나".to_string())
-        );
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert!(
-            preedit.is_payload_consumed(),
-            "translated preedit must contain only its declared fields"
-        );
-
-        // 3. done (opcode 5)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5);
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 2), 42); // serial
-
-        // Cached preedit should be updated
-        if let Some(state) = ctx.text_inputs.get(&guest_id) {
-            assert_eq!(state.current_preedit, "나");
-        } else {
-            panic!("state not found");
-        }
-    }
-
-    #[test]
-    fn setting_preedit_region_clears_stale_backspace_repeat() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = 30;
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+    fn ime_edits_end_a_stale_backspace_repeat() {
+        type Event = fn(&mut Ime);
+        let cases: [(&str, Event); 3] = [
+            ("an empty commit", |ime| ime.commit("")),
+            ("a reset preedit", |ime| ime.preedit("", "확정")),
+            ("a preedit region", |ime| ime.preedit_region(-3, 3)),
+        ];
+        for (case, event) in cases {
+            let mut ime = Ime::with_keyboard();
+            let state = ime.state();
             state.committed.surrounding_text = Some(("가나다".to_string(), 9, 9));
+            state.current_preedit = "가".to_string();
+            ime.lease_backspace_repeat(TI);
+
+            event(&mut ime);
+            assert!(!ime.repeat_active(), "{case}");
         }
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
-
-        let mut handler = ExtendedTextInputV1Handler;
-        assert_eq!(handler.on_set_preedit_region(&mut ctx, -3, 3), Action::Drop);
-        assert!(!backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
-    }
-
-    #[test]
-    fn oversized_preedit_region_does_not_partially_advance_state() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = 30;
-        let oversized = "x".repeat(4_084);
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.surrounding_text = Some((oversized, 4_084, 4_084));
-            state.pending_preedit_cursor = Some(7);
-            state.pending_preedit_selection = Some((1, 2));
-            state.current_preedit = "old".to_string();
-        }
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
-
-        assert_eq!(
-            ExtendedTextInputV1Handler.on_set_preedit_region(&mut ctx, -4_084, 4_084),
-            Action::Drop
-        );
-
-        assert!(ctx.host_to_client_queue.is_empty());
-        let state = &ctx.text_inputs[&guest_id];
-        assert_eq!(state.pending_preedit_cursor, Some(7));
-        assert_eq!(state.pending_preedit_selection, Some((1, 2)));
-        assert_eq!(state.current_preedit, "old");
-        assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
-    }
-
-    #[test]
-    fn non_adjacent_preedit_region_is_ignored_instead_of_deleting_text_gap() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = 30;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .unwrap()
-            .committed
-            .surrounding_text = Some(("가나다".to_string(), 9, 9));
-        let mut handler = ExtendedTextInputV1Handler;
-
-        assert_eq!(handler.on_set_preedit_region(&mut ctx, -9, 3), Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert!(ctx.text_inputs[&guest_id].current_preedit.is_empty());
-    }
-
-    #[test]
-    fn on_confirm_preedit_commits_cached_preedit() {
-        let (mut ctx, _host_v1_id, guest_id) = setup_v1_ctx();
-        let host_ext_id = 30u32;
-        ctx.last_sender_id = host_ext_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.current_preedit = "나".to_string();
-            state.set_guest_commits(42);
-            state.record_preedit_selection(0, 3);
-            state.record_preedit_cursor(3);
-            assert!(state.record_delete(3, 0));
-            state.record_cursor_position(1, 1);
-        }
-
-        let mut handler = ExtendedTextInputV1Handler;
-        let action = handler.on_confirm_preedit(&mut ctx, 0);
-        assert_eq!(action, Action::Drop);
-
-        // Should produce 3 messages: preedit_string(""), commit_string, done
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-
-        // 0. preedit_string("") (opcode 2)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 2);
-
-        // 1. commit_string (opcode 3)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 3);
-        let payload = &ctx.host_to_client_queue[1].0[8..];
-        let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let commit_str = String::from_utf8(payload[4..4 + str_len - 1].to_vec()).unwrap();
-        assert_eq!(commit_str, "나");
-
-        // 2. done (opcode 5)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5);
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 2), 42); // serial
-
-        // Confirming commits only the preedit. v1 delete/cursor metadata
-        // belongs to the following commit_string transaction.
-        if let Some(state) = ctx.text_inputs.get(&guest_id) {
-            assert_eq!(state.current_preedit, "");
-            assert!(state.pending_preedit_selection.is_none());
-            assert!(state.pending_preedit_cursor.is_none());
-            assert_eq!(state.pending_deletes, vec![(3, 0)]);
-            assert_eq!(state.pending_cursor_position, Some((1, 1)));
-        } else {
-            panic!("state not found");
-        }
-
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = 10;
-        assert_eq!(
-            TextInputV1Handler.on_commit_string(&mut ctx, 42, &"다".to_string()),
-            Action::Drop
-        );
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 4);
-        assert!(ctx.text_inputs[&guest_id].pending_deletes.is_empty());
-        assert!(ctx.text_inputs[&guest_id].pending_cursor_position.is_none());
-    }
-
-    #[test]
-    fn oversized_confirm_preedit_does_not_partially_advance_state() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = 30;
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.current_preedit = "x".repeat(4_084);
-        }
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
-
-        assert_eq!(
-            ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 0),
-            Action::Drop
-        );
-
-        assert!(ctx.host_to_client_queue.is_empty());
-        let state = &ctx.text_inputs[&guest_id];
-        assert_eq!(state.current_preedit.len(), 4_084);
-        assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
-    }
-
-    #[test]
-    fn guest_commit_count_is_sent_to_v1_and_used_by_v3_done() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
-        let mut v3_handler = TextInputV3Handler;
-        v3_handler.on_commit(&mut ctx);
-        v3_handler.on_commit(&mut ctx);
-
-        let commit_serials: Vec<u32> = ctx
-            .client_to_host_queue
-            .iter()
-            .filter_map(|(msg, _)| {
-                let opcode = u32::from(crate::test_support::msg_opcode(msg));
-                (opcode == 9).then(|| u32::from_ne_bytes(msg[8..12].try_into().unwrap()))
-            })
-            .collect();
-        assert_eq!(commit_serials, vec![1, 2]);
-
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host =
-            HostApplied::Active { content_type: None };
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = host_v1_id;
-        let mut v1_handler = TextInputV1Handler;
-        v1_handler.on_preedit_string(&mut ctx, 2942, &"한".to_string(), &String::new());
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 1), 2);
-
-        // Multiple host events based on the same guest state must not advance
-        // the v3 serial, regardless of Exo's independent v1 event serials.
-        ctx.host_to_client_queue.clear();
-        v1_handler.on_preedit_string(&mut ctx, 2944, &"한글".to_string(), &String::new());
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 1), 2);
-
-        ctx.host_to_client_queue.clear();
-        v1_handler.on_commit_string(&mut ctx, 2945, &"한글".to_string());
-        let done_index = ctx.host_to_client_queue.len() - 1;
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, done_index), 5);
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, done_index), 2);
-    }
-
-    #[test]
-    fn confirm_preedit_without_preedit_has_no_effect() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = 30;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .unwrap()
-            .set_guest_commits(2);
-        let mut handler = ExtendedTextInputV1Handler;
-
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
     }
 
     #[test]
     fn input_mode_switch_boundary_clears_stale_repeat_before_empty_confirmation() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.keyboard_to_seat.insert(40, 0);
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.surrounding_text = Some(("english".to_string(), 7, 7));
-        }
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
-        end_backspace_repeat_for_seat(&mut ctx, 0);
-        ctx.last_sender_id = 30;
-        let mut handler = ExtendedTextInputV1Handler;
+        let mut ime = Ime::with_keyboard();
+        ime.state().committed.surrounding_text = Some(("english".to_string(), 7, 7));
+        ime.lease_backspace_repeat(TI);
+        end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
 
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
+        ime.confirm();
+        assert_eq!(
+            ime.events(),
+            [],
             "a routine empty confirmation must not become a synthetic Backspace"
         );
         assert_eq!(
-            ctx.text_inputs[&guest_id].committed.surrounding_text,
+            ime.state().committed.surrounding_text,
             Some(("english".to_string(), 7, 7))
         );
     }
 
+    /// Exo consumes a held Backspace over committed text and confirms an
+    /// empty preedit for each repeat: each becomes a key pair, each key
+    /// event with a serial of its own, and the repeat stays leased.
     #[test]
     fn held_backspace_repeats_over_committed_korean_without_preedit() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        let host_keyboard_id = 41;
-        ctx.shadow_table
-            .insert_paired_for_test(40, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(40, 0);
-        hold_repeatable_peek_key(
-            &mut ctx,
-            HostId(host_keyboard_id),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            700,
-            100,
-        );
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .unwrap()
-            .committed
-            .surrounding_text = Some(("가나다라".to_string(), 12, 12));
-        ctx.last_sender_id = 30;
-        let mut handler = ExtendedTextInputV1Handler;
+        let mut ime = Ime::with_keyboard();
+        ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 700, 100);
+        ime.state().committed.surrounding_text = Some(("가나다라".to_string(), 12, 12));
 
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert_eq!(ctx.host_to_client_queue.len(), 9);
-        assert!(backspace_repeat_active_for_keyboard(
-            &ctx,
-            HostId(host_keyboard_id)
-        ));
-        let mut key_serials = Vec::new();
-        let (transactions, remainder) = ctx.host_to_client_queue.as_chunks::<3>();
-        assert!(
-            remainder.is_empty(),
-            "synthetic key transactions must have three messages"
-        );
-        for messages in transactions {
-            assert_eq!(msg_sender(messages, 0), 40);
-            assert_eq!(msg_opcode(messages, 0), 3);
-            assert_eq!(msg_sender(&messages[1..], 0), 40);
-            assert_eq!(msg_opcode(&messages[1..], 0), 3);
-            assert_eq!(msg_sender(&messages[2..], 0), guest_id);
-            assert_eq!(msg_opcode(&messages[2..], 0), 5);
-            key_serials.push(wire_message(messages, 0).read_u32().unwrap());
-            key_serials.push(wire_message(&messages[1..], 0).read_u32().unwrap());
+        for serial in [1, 3, 5] {
+            ime.confirm();
+            assert_eq!(
+                ime.events(),
+                [
+                    key(KEYBOARD, BACKSPACE, PRESSED, serial, 100),
+                    key(KEYBOARD, BACKSPACE, RELEASED, serial + 1, 100),
+                    uncommitted_done(),
+                ]
+            );
         }
-        key_serials.sort_unstable();
-        key_serials.dedup();
-        assert_eq!(
-            key_serials.len(),
-            6,
-            "each synthetic key event must have a distinct serial"
-        );
+        assert!(ime.repeat_active());
     }
 
     #[test]
     fn empty_confirmation_recovers_any_repeatable_ime_consumed_key() {
-        for key in [
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            15, // Tab
-            28, // Enter
-            57, // Space
-        ] {
-            let (mut ctx, _, guest_id) = setup_v1_ctx();
-            let guest_keyboard_id = 40;
-            let host_keyboard_id = HostId(41);
-            ctx.shadow_table.insert_paired_for_test(
-                guest_keyboard_id,
-                host_keyboard_id.0,
-                "wl_keyboard",
-            );
-            ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-            hold_repeatable_peek_key(&mut ctx, host_keyboard_id, key, 700, 100);
-            ctx.last_sender_id = 30;
+        const TAB: u32 = 15;
+        const ENTER: u32 = 28;
+        const SPACE: u32 = 57;
+        for held in [BACKSPACE, TAB, ENTER, SPACE] {
+            let mut ime = Ime::with_keyboard();
+            ime.hold_peeked(HOST_KEYBOARD, held, 700, 100);
 
+            ime.confirm();
             assert_eq!(
-                ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
-                Action::Drop
+                ime.events(),
+                [
+                    key(KEYBOARD, held, PRESSED, 1, 100),
+                    key(KEYBOARD, held, RELEASED, 2, 100),
+                    uncommitted_done(),
+                ]
             );
-            assert_eq!(ctx.host_to_client_queue.len(), 3);
-            for (message, expected_state) in ctx.host_to_client_queue[..2].iter().zip([
-                wl_keyboard::KEY_STATE_PRESSED,
-                wl_keyboard::KEY_STATE_RELEASED,
-            ]) {
-                assert_eq!(
-                    msg_sender(std::slice::from_ref(message), 0),
-                    guest_keyboard_id
-                );
-                let mut event = wire_message(std::slice::from_ref(message), 0);
-                event.read_u32().unwrap();
-                assert_eq!(event.read_u32().unwrap(), 100);
-                assert_eq!(event.read_u32().unwrap(), key);
-                assert_eq!(event.read_u32().unwrap(), expected_state);
-            }
-            assert_eq!(msg_sender(&ctx.host_to_client_queue[2..], 0), guest_id);
-            assert_eq!(msg_opcode(&ctx.host_to_client_queue[2..], 0), 5);
         }
     }
 
     #[test]
     fn empty_confirmation_does_not_fall_back_from_newest_ineligible_key() {
-        let (mut ctx, _, _) = setup_v1_ctx();
-        let host_keyboard_id = HostId(41);
-        ctx.shadow_table
-            .insert_paired_for_test(40, host_keyboard_id.0, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(40, 0);
-        hold_repeatable_peek_key(&mut ctx, host_keyboard_id, 57, 700, 100);
+        const SHIFT: u32 = 42;
+        let mut ime = Ime::with_keyboard();
+        ime.hold_peeked(HOST_KEYBOARD, 57, 700, 100);
 
-        // Shift is newer but XKB does not mark it repeatable. The confirmation
-        // belongs to that newest generation or to no recoverable key; it must
-        // never synthesize the older held Space.
-        ctx.key_generations
-            .observe_peek_press(host_keyboard_id, 42, 701, 101, true);
-        ctx.last_sender_id = 30;
+        // Shift is newer but XKB does not mark it repeatable. The
+        // confirmation belongs to that newest generation or to no
+        // recoverable key; it must never synthesize the older held Space.
+        let generations = &mut ime.ctx.key_generations;
+        generations.observe_peek_press(HOST_KEYBOARD, SHIFT, 701, 101, true);
+        ime.confirm();
+        assert_eq!(ime.events(), []);
 
+        let generations = &mut ime.ctx.key_generations;
+        generations.observe_physical_state(HOST_KEYBOARD, SHIFT, 0);
+        ime.confirm();
         assert_eq!(
-            ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
-            Action::Drop
-        );
-        assert!(ctx.host_to_client_queue.is_empty());
-
-        ctx.key_generations
-            .observe_physical_state(host_keyboard_id, 42, 0);
-        assert_eq!(
-            ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
+            ime.events(),
+            [],
             "releasing the superseding key must not revive an older generation"
         );
     }
 
     #[test]
     fn empty_confirmation_prefers_the_keyboard_focused_on_the_current_surface() {
-        let (mut ctx, _, _) = setup_v1_ctx();
-        let focused_host_keyboard = HostId(41);
-        let stale_host_keyboard = HostId(51);
-        for (guest_keyboard, host_keyboard) in
-            [(40, focused_host_keyboard), (50, stale_host_keyboard)]
-        {
-            ctx.shadow_table
-                .insert_paired_for_test(guest_keyboard, host_keyboard.0, "wl_keyboard");
-            ctx.keyboard_to_seat.insert(guest_keyboard, 0);
-        }
-        set_test_focus(&mut ctx, focused_host_keyboard, 0, 900);
-        hold_repeatable_peek_key(&mut ctx, focused_host_keyboard, 57, 700, 100);
-        hold_repeatable_peek_key(&mut ctx, stale_host_keyboard, 28, 701, 101);
-        ctx.last_sender_id = 30;
+        let mut ime = Ime::with_keyboard();
+        let stale = HostId(51);
+        ime.keyboard(50, stale);
+        ime.focus(HOST_KEYBOARD);
+        ime.hold_peeked(HOST_KEYBOARD, 57, 700, 100);
+        ime.hold_peeked(stale, 28, 701, 101);
 
+        ime.confirm();
         assert_eq!(
-            ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
-            Action::Drop
+            ime.events(),
+            [
+                key(KEYBOARD, 57, PRESSED, 1, 100),
+                key(KEYBOARD, 57, RELEASED, 2, 100),
+                uncommitted_done(),
+            ]
         );
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 0), 40);
-        let mut press = wire_message(&ctx.host_to_client_queue, 0);
-        press.read_u32().unwrap();
-        press.read_u32().unwrap();
-        assert_eq!(press.read_u32().unwrap(), 57);
     }
 
     #[test]
     fn empty_confirmation_never_uses_a_stale_unfocused_keyboard() {
-        let (mut ctx, _, _) = setup_v1_ctx();
-        let stale_host_keyboard = HostId(41);
-        ctx.shadow_table
-            .insert_paired_for_test(40, stale_host_keyboard.0, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(40, 0);
-        set_test_focus(&mut ctx, HostId(99), 0, 900);
-        hold_repeatable_peek_key(&mut ctx, stale_host_keyboard, 57, 700, 100);
-        ctx.last_sender_id = 30;
+        let mut ime = Ime::with_keyboard();
+        ime.focus(HostId(99));
+        ime.hold_peeked(HOST_KEYBOARD, 57, 700, 100);
 
+        ime.confirm();
         assert_eq!(
-            ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
+            ime.events(),
+            [],
             "an active surface without a matching keyboard must not use stale focus"
         );
     }
 
+    /// Exo empties the preedit as Backspace deletes it, then confirms each
+    /// repeat over the committed text: each becomes a Backspace pair, until
+    /// the fallback ends.
     #[test]
     fn emptied_preedit_enables_held_backspace_fallback_for_committed_text() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 40;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, 41, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        hold_repeatable_peek_key(
-            &mut ctx,
-            HostId(41),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            701,
-            101,
-        );
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.set_guest_commits(2);
-            state.committed.surrounding_text = Some(("A가".to_string(), 4, 4));
-        }
-        ctx.last_sender_id = host_v1_id;
-        let mut v1_handler = TextInputV1Handler;
-        v1_handler.on_preedit_string(&mut ctx, 100, &"가".to_string(), &String::new());
-        v1_handler.on_preedit_string(&mut ctx, 101, &String::new(), &String::new());
-        ctx.host_to_client_queue.clear();
+        let mut ime = Ime::with_keyboard();
+        ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 701, 101);
+        ime.state().set_guest_commits(2);
+        ime.state().committed.surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.preedit("가", "");
+        ime.preedit("", "");
+        ime.events();
 
-        ctx.last_sender_id = 30;
-        let mut handler = ExtendedTextInputV1Handler;
-
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert_eq!(
-            ctx.host_to_client_queue
-                .iter()
-                .map(|message| msg_opcode(std::slice::from_ref(message), 0))
-                .collect::<Vec<_>>(),
-            vec![3, 3, 5]
-        );
-        for message in &ctx.host_to_client_queue[..2] {
+        for serial in [1, 3] {
+            ime.confirm();
             assert_eq!(
-                msg_sender(std::slice::from_ref(message), 0),
-                guest_keyboard_id
+                ime.events(),
+                [
+                    key(KEYBOARD, BACKSPACE, PRESSED, serial, 101),
+                    key(KEYBOARD, BACKSPACE, RELEASED, serial + 1, 101),
+                    (TI, V3::Done { serial: 2 }.into()),
+                ]
+            );
+            assert_eq!(
+                ime.state().committed.surrounding_text,
+                Some(("A가".to_string(), 4, 4))
             );
         }
-        let mut press = wire_message(&ctx.host_to_client_queue, 0);
-        let press_serial = press.read_u32().unwrap();
-        let press_time = press.read_u32().unwrap();
-        assert_eq!(press.read_u32().unwrap(), 14);
-        assert_eq!(press.read_u32().unwrap(), 1);
-        let mut release = wire_message(&ctx.host_to_client_queue, 1);
-        let release_serial = release.read_u32().unwrap();
-        assert_ne!(press_serial, release_serial);
-        assert_eq!(release.read_u32().unwrap(), press_time);
-        assert_eq!(release.read_u32().unwrap(), 14);
-        assert_eq!(release.read_u32().unwrap(), 0);
-        assert_eq!(
-            ctx.text_inputs[&guest_id].committed.surrounding_text,
-            Some(("A가".to_string(), 4, 4))
-        );
 
-        ctx.host_to_client_queue.clear();
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-
-        end_backspace_repeat_for_seat(&mut ctx, 0);
-        ctx.host_to_client_queue.clear();
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
+        end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
+        ime.confirm();
+        assert_eq!(ime.events(), []);
     }
 
+    /// A physical Backspace press the guest already got, then the host
+    /// clearing its preedit and confirming: the confirmation closes the
+    /// transaction without another pair.
     #[test]
     fn empty_confirmation_does_not_duplicate_forwarded_backspace() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 40;
-        let host_keyboard_id = 41;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        hold_repeatable_peek_key(
-            &mut ctx,
-            HostId(host_keyboard_id),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            1,
-            100,
-        );
-        assert!(ctx.claim_guest_key(
-            HostId(host_keyboard_id),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            GuestKeyOwner::Physical
-        ));
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.current_preedit = "가".to_string();
-            state.committed.surrounding_text = Some(("A가".to_string(), 4, 4));
-        }
+        let mut ime = Ime::with_keyboard();
+        ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 1, 100);
+        assert!(ime
+            .ctx
+            .claim_guest_key(HOST_KEYBOARD, BACKSPACE, GuestKeyOwner::Physical));
+        ime.state().current_preedit = "가".to_string();
+        ime.state().committed.surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.preedit("", "");
+        assert!(ime.repeat_active());
+        ime.events();
 
-        // Model a normal physical press that was already forwarded, followed
-        // by the host IME clearing its preedit and confirming the transaction.
-        ctx.last_sender_id = host_v1_id;
-        let mut v1_handler = TextInputV1Handler;
-        v1_handler.on_preedit_string(&mut ctx, 1, &String::new(), &String::new());
-        assert!(backspace_repeat_active_for_keyboard(
-            &ctx,
-            HostId(host_keyboard_id)
-        ));
-
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = 30;
-        let mut extended_handler = ExtendedTextInputV1Handler;
-        assert_eq!(
-            extended_handler.on_confirm_preedit(&mut ctx, 0),
-            Action::Drop
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 0), guest_id);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 5);
-        assert!(!backspace_repeat_active_for_keyboard(
-            &ctx,
-            HostId(host_keyboard_id)
-        ));
+        ime.confirm();
+        assert_eq!(ime.events(), [uncommitted_done()]);
+        assert!(!ime.repeat_active());
     }
 
     #[test]
-    fn held_backspace_fallback_requires_guest_keyboard_for_seat() {
-        let (mut ctx, _, _) = setup_v1_ctx();
-        ctx.last_sender_id = 30;
-        let mut handler = ExtendedTextInputV1Handler;
-
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
-    }
-
-    #[test]
-    fn preedit_cursor_and_selection_are_forwarded_as_byte_ranges() {
-        let (mut ctx, host_v1_id, _) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        handler.on_preedit_cursor(&mut ctx, 3);
-        handler.on_preedit_string(&mut ctx, 0, &"가나".to_string(), &String::new());
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(preedit.read_string().unwrap(), "가나");
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-
-        ctx.host_to_client_queue.clear();
-        handler.on_preedit_styling(&mut ctx, 0, 3, 6);
-        handler.on_preedit_cursor(&mut ctx, 6);
-        handler.on_preedit_string(&mut ctx, 0, &"가나".to_string(), &String::new());
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(preedit.read_string().unwrap(), "가나");
-        assert_eq!(preedit.read_i32().unwrap(), 0);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-    }
-
-    #[test]
-    fn invalid_preedit_utf8_ranges_fall_back_to_string_end() {
-        let (mut ctx, host_v1_id, _) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        handler.on_preedit_cursor(&mut ctx, 1);
-        handler.on_preedit_string(&mut ctx, 0, &"가".to_string(), &String::new());
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(preedit.read_string().unwrap(), "가");
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-
-        ctx.host_to_client_queue.clear();
-        handler.on_preedit_styling(&mut ctx, 1, 1, 6);
-        handler.on_preedit_string(&mut ctx, 0, &"가".to_string(), &String::new());
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(preedit.read_string().unwrap(), "가");
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-    }
-
-    #[test]
-    fn enable_is_not_activated_until_commit() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        let guest_surface = 40;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_surface, 41, "wl_surface");
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.active_surface = Some(guest_surface);
-            state.committed.enabled = false;
-            state.host = HostApplied::Inactive;
+    fn held_backspace_fallback_rejects_unmapped_guest_keyboard() {
+        let mut ime = Ime::new();
+        // A stale route can survive a malformed or reordered bind, but
+        // without a host keyboard there is no physical key or compositor
+        // time domain from which a synthetic pair may safely be generated,
+        // even while host keyboards, none of them its own, hold a key.
+        ime.ctx.keyboard_to_seat.insert(KEYBOARD, SEAT);
+        for keyboard in [HOST_KEYBOARD, HostId(KEYBOARD)] {
+            ime.hold_peeked(keyboard, BACKSPACE, 700, 100);
         }
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
 
-        assert_eq!(handler.on_enable(&mut ctx), Action::Drop);
-        assert!(!ctx.text_inputs[&guest_id].host_is_active());
-        assert!(ctx.client_to_host_queue.is_empty());
-
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert!(ctx.text_inputs[&guest_id].host_is_active());
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 10);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 0);
-    }
-
-    #[test]
-    fn focus_generation_barrier_drops_old_events_before_reactivation() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        let next_surface = 901;
-        ctx.shadow_table
-            .insert_paired_for_test(next_surface, 902, "wl_surface");
-
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.enabled = false;
-            state.active_surface = None;
-        }
-        reconcile_host(&mut ctx, guest_id, None);
-
-        assert!(!ctx.text_inputs[&guest_id].host_is_active());
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), host_v1_id);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 1);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 1), 1);
-        assert_eq!(
-            msg_opcode(&ctx.client_to_host_queue, 1),
-            wl_display::REQ_SYNC
-        );
-        let callback_id = ctx.text_inputs[&guest_id]
-            .draining_callback()
-            .expect("deactivation must open a barrier");
-
-        // Events already queued by the old surface are dispatched before
-        // callback.done and must not mutate or reach the next guest focus.
-        let mut v1 = TextInputV1Handler;
-        ctx.last_sender_id = host_v1_id;
-        assert_eq!(
-            v1.on_preedit_string(&mut ctx, 1, &"old".to_string(), &String::new()),
-            Action::Drop
-        );
-        assert_eq!(
-            v1.on_commit_string(&mut ctx, 1, &"old".to_string()),
-            Action::Drop
-        );
-        assert!(ctx.host_to_client_queue.is_empty());
-
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.enabled = true;
-            state.active_surface = Some(next_surface);
-        }
-        reconcile_host(&mut ctx, guest_id, None);
-        assert_eq!(
-            ctx.client_to_host_queue.len(),
-            2,
-            "activation must remain deferred while old events drain"
-        );
-
-        ctx.last_sender_id = callback_id.0;
-        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
-        assert!(ctx.text_inputs[&guest_id].host_is_active());
-        assert!(ctx.shadow_table.is_retired_host(callback_id.0));
-        // The activation, then the committed content type it reset.
-        assert_eq!(ctx.client_to_host_queue.len(), 6);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 2), host_v1_id);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 2), 0);
-        assert_eq!(
-            msg_opcode(&ctx.client_to_host_queue, 5),
-            zwp_text_input_v1::REQ_COMMIT_STATE
-        );
-
-        // Once the ordered barrier completes, events belong to the new focus
-        // generation and may be translated normally.
-        ctx.last_sender_id = host_v1_id;
-        assert_eq!(
-            v1.on_preedit_string(&mut ctx, 2, &"new".to_string(), &String::new()),
-            Action::Drop
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-    }
-
-    #[test]
-    fn activation_barrier_orders_new_editor_transaction_before_activate() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        let next_surface = 901;
-        ctx.shadow_table
-            .insert_paired_for_test(next_surface, 902, "wl_surface");
-
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.enabled = false;
-            state.active_surface = None;
-        }
-        reconcile_host(&mut ctx, guest_id, None);
-        let callback_id = ctx.text_inputs[&guest_id]
-            .draining_callback()
-            .expect("deactivation must open a barrier");
-
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.active_surface = Some(next_surface);
-        }
-        ctx.last_sender_id = guest_id;
-        let mut v3 = TextInputV3Handler;
-        assert_eq!(v3.on_enable(&mut ctx), Action::Drop);
-        assert_eq!(
-            v3.on_set_surrounding_text(&mut ctx, &"new".to_string(), 3, 3),
-            Action::Drop
-        );
-        assert_eq!(v3.on_commit(&mut ctx), Action::Drop);
-        assert!(!ctx.text_inputs[&guest_id].host_is_active());
+        ime.confirm();
         assert!(
-            ctx.client_to_host_queue.iter().all(|message| msg_sender(
-                std::slice::from_ref(message),
-                0
-            ) != host_v1_id
-                || msg_opcode(std::slice::from_ref(message), 0) != 0),
-            "activation must remain deferred while the old generation drains"
-        );
-        let commit_state_index = ctx
-            .client_to_host_queue
-            .iter()
-            .position(|message| {
-                msg_sender(std::slice::from_ref(message), 0) == host_v1_id
-                    && msg_opcode(std::slice::from_ref(message), 0) == 9
-            })
-            .expect("the new editor transaction must include commit_state");
-
-        ctx.last_sender_id = callback_id.0;
-        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
-        let activate_index = (0..ctx.client_to_host_queue.len())
-            .position(|index| {
-                (
-                    msg_sender(&ctx.client_to_host_queue, index),
-                    msg_opcode(&ctx.client_to_host_queue, index),
-                ) == (host_v1_id, zwp_text_input_v1::REQ_ACTIVATE)
-            })
-            .expect("the barrier activates the text input");
-        assert!(
-            commit_state_index < activate_index,
-            "the host must receive the new editor transaction before reactivation"
+            ime.ctx.host_to_client_queue.is_empty(),
+            "synthetic Backspace must require a mapped host keyboard"
         );
     }
 
+    /// A sibling text input's rejected enable, or its destroy, ends no
+    /// repeat lease of the enabled one.
     #[test]
-    fn a_deferred_activation_replays_the_committed_content_type() {
-        use zcr_extended_text_input_v1::{
-            REQ_SET_INPUT_TYPE, REQ_SET_SURROUNDING_TEXT_SUPPORT,
-            SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
-        };
-        use zwp_text_input_v1::{REQ_ACTIVATE, REQ_COMMIT_STATE};
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
-        let mut v3 = TextInputV3Handler;
+    fn a_sibling_text_input_keeps_the_active_repeat_lease() {
+        const SIBLING: u32 = 21;
+        for destroy in [false, true] {
+            let mut ime = Ime::with_keyboard();
+            ime.ctx
+                .shadow_table
+                .insert_paired_for_test(SIBLING, 11, "zwp_text_input_v3");
+            let sibling = TextInputState::new(11, None, SEAT, Some(SURFACE));
+            ime.ctx.text_inputs.insert(SIBLING, sibling);
+            ime.lease_backspace_repeat(TI);
 
-        // A field switch: the old field is disabled, and the new one, a
-        // password field, is enabled before the host's deactivation drains.
-        v3.on_disable(&mut ctx);
-        v3.on_commit(&mut ctx);
-        let callback_id = ctx.text_inputs[&guest_id]
-            .draining_callback()
-            .expect("deactivation opens a barrier");
-        v3.on_enable(&mut ctx);
-        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
-        v3.on_commit(&mut ctx);
-        assert!(!ctx.text_inputs[&guest_id].host_is_active());
-        ctx.client_to_host_queue.clear();
-
-        ctx.last_sender_id = callback_id.0;
-        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
-        // Exo dropped the content type sent while the text input was
-        // inactive, so it follows the activation again.
-        let queue = &ctx.client_to_host_queue;
-        let requests = (0..queue.len())
-            .map(|index| (msg_sender(queue, index), msg_opcode(queue, index)))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            requests,
-            [
-                (host_v1_id, REQ_ACTIVATE),
-                (30, REQ_SET_SURROUNDING_TEXT_SUPPORT),
-                (30, REQ_SET_INPUT_TYPE),
-                (host_v1_id, REQ_COMMIT_STATE),
-            ]
-        );
-        let mut support = wire_message(queue, 1);
-        assert_eq!(
-            support.read_u32().unwrap(),
-            SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
-        );
-        let (_, _, input_type, input_mode, input_flags, learning_mode) =
-            map_v3_content_type(0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
-        let mut set_input_type = wire_message(queue, 2);
-        let arguments = [(); 4].map(|()| set_input_type.read_u32().unwrap());
-        assert_eq!(
-            arguments,
-            [input_type, input_mode, input_flags, learning_mode]
-        );
-        assert_eq!(input_type, zcr_extended_text_input_v1::INPUT_TYPE_PASSWORD);
-        assert_eq!(
-            learning_mode,
-            zcr_extended_text_input_v1::LEARNING_MODE_DISABLED
-        );
-        let mut commit_state = wire_message(queue, 3);
-        assert_eq!(
-            commit_state.read_u32().unwrap(),
-            ctx.text_inputs[&guest_id].guest_commit_serial()
-        );
-    }
-
-    /// The host requests queued since the last call, as (sender, opcode).
-    fn take_requests(ctx: &mut Context) -> Vec<(u32, u16)> {
-        let queue = std::mem::take(&mut ctx.client_to_host_queue);
-        (0..queue.len())
-            .map(|index| (msg_sender(&queue, index), msg_opcode(&queue, index)))
-            .collect()
-    }
-
-    #[test]
-    fn a_content_type_waits_for_the_host_to_attach() {
-        use zcr_extended_text_input_v1::{REQ_SET_INPUT_TYPE, REQ_SET_SURROUNDING_TEXT_SUPPORT};
-        use zwp_text_input_v1::{
-            REQ_ACTIVATE, REQ_COMMIT_STATE, REQ_DEACTIVATE, REQ_SET_CURSOR_RECTANGLE,
-            REQ_SET_SURROUNDING_TEXT,
-        };
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
-        let mut v3 = TextInputV3Handler;
-
-        // Exo drops a content type after deactivate, so the disable sends
-        // none, and neither does an enable while the deactivation drains.
-        v3.on_disable(&mut ctx);
-        v3.on_commit(&mut ctx);
-        let callback_id = ctx.text_inputs[&guest_id]
-            .draining_callback()
-            .expect("deactivation opens a barrier");
-        v3.on_enable(&mut ctx);
-        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
-        v3.on_commit(&mut ctx);
-        let edits = [
-            (host_v1_id, REQ_SET_SURROUNDING_TEXT),
-            (host_v1_id, REQ_SET_CURSOR_RECTANGLE),
-            (host_v1_id, REQ_COMMIT_STATE),
-        ];
-        let mut expected = vec![(host_v1_id, REQ_DEACTIVATE), (1, wl_display::REQ_SYNC)];
-        expected.extend(edits);
-        expected.extend(edits);
-        assert_eq!(take_requests(&mut ctx), expected);
-
-        // Once it attaches, the host gets the content type once.
-        ctx.last_sender_id = callback_id.0;
-        CallbackHandler.on_done(&mut ctx, 0);
-        assert_eq!(
-            take_requests(&mut ctx),
-            [
-                (host_v1_id, REQ_ACTIVATE),
-                (30, REQ_SET_SURROUNDING_TEXT_SUPPORT),
-                (30, REQ_SET_INPUT_TYPE),
-                (host_v1_id, REQ_COMMIT_STATE),
-            ]
-        );
-    }
-
-    /// The requests that set the password content type on the fixture's
-    /// host after `activate`, ending with its `commit_state`.
-    const PASSWORD_AFTER_ACTIVATE: [(u32, u16); 4] = [
-        (10, zwp_text_input_v1::REQ_ACTIVATE),
-        (
-            30,
-            zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT,
-        ),
-        (30, zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE),
-        (10, zwp_text_input_v1::REQ_COMMIT_STATE),
-    ];
-
-    /// A fixture whose guest enabled a password field the host attached,
-    /// with every request so far taken.
-    fn attached_password_field() -> (Context, u32, u32) {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.enabled = false;
-            state.host = HostApplied::Inactive;
-        }
-        ctx.last_sender_id = guest_id;
-        let mut v3 = TextInputV3Handler;
-        v3.on_enable(&mut ctx);
-        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
-        v3.on_commit(&mut ctx);
-        let mut sent = take_requests(&mut ctx);
-        // Leave out the reset surrounding text and cursor rectangle.
-        sent.retain(|&(sender, opcode)| {
-            sender != host_v1_id
-                || ![
-                    zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT,
-                    zwp_text_input_v1::REQ_SET_CURSOR_RECTANGLE,
-                ]
-                .contains(&opcode)
-        });
-        assert_eq!(sent, PASSWORD_AFTER_ACTIVATE);
-        (ctx, host_v1_id, guest_id)
-    }
-
-    #[test]
-    fn the_enter_answering_an_activate_resends_nothing() {
-        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
-
-        ctx.last_sender_id = host_v1_id;
-        TextInputV1Handler.on_enter(&mut ctx, 901);
-        assert_eq!(take_requests(&mut ctx), []);
-
-        // The content type sent after the activate is the one Exo applied.
-        ctx.last_sender_id = guest_id;
-        let mut v3 = TextInputV3Handler;
-        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
-        v3.on_commit(&mut ctx);
-        assert_eq!(
-            take_requests(&mut ctx),
-            [(host_v1_id, zwp_text_input_v1::REQ_COMMIT_STATE)]
-        );
-    }
-
-    #[test]
-    fn an_exo_detach_activates_again_with_the_content_type() {
-        // Exo detached on its own, as when its input method is destroyed,
-        // and has no surface left to attach to: the proxy activates again
-        // and resends the content type the new attachment reset.
-        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
-        ctx.last_sender_id = host_v1_id;
-        TextInputV1Handler.on_enter(&mut ctx, 901);
-
-        TextInputV1Handler.on_leave(&mut ctx);
-        assert_eq!(take_requests(&mut ctx), PASSWORD_AFTER_ACTIVATE);
-        assert!(ctx.text_inputs[&guest_id].host_is_active());
-
-        // The enter answering that activate resends nothing.
-        TextInputV1Handler.on_enter(&mut ctx, 901);
-        assert_eq!(take_requests(&mut ctx), []);
-    }
-
-    #[test]
-    fn an_exo_detach_clears_the_guest_preedit() {
-        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
-        ctx.last_sender_id = host_v1_id;
-        TextInputV1Handler.on_enter(&mut ctx, 901);
-
-        // Without a preedit the guest is told nothing.
-        ctx.host_to_client_queue.clear();
-        TextInputV1Handler.on_leave(&mut ctx);
-        assert!(ctx.host_to_client_queue.is_empty());
-        TextInputV1Handler.on_enter(&mut ctx, 901);
-
-        // The input method's process restarts mid-composition.
-        TextInputV1Handler.on_preedit_string(&mut ctx, 1, &"가".to_string(), &"가".to_string());
-        ctx.host_to_client_queue.clear();
-        take_requests(&mut ctx);
-        TextInputV1Handler.on_leave(&mut ctx);
-
-        let events = std::mem::take(&mut ctx.host_to_client_queue);
-        assert_eq!(
-            (0..events.len())
-                .map(|index| (msg_sender(&events, index), msg_opcode(&events, index)))
-                .collect::<Vec<_>>(),
-            [
-                (guest_id, zwp_text_input_v3::EVT_PREEDIT_STRING),
-                (guest_id, zwp_text_input_v3::EVT_DONE),
-            ]
-        );
-        assert_eq!(
-            msg_done_serial(&events, 1),
-            ctx.text_inputs[&guest_id].guest_commit_serial()
-        );
-        assert!(ctx.text_inputs[&guest_id].current_preedit.is_empty());
-        assert_eq!(take_requests(&mut ctx), PASSWORD_AFTER_ACTIVATE);
-    }
-
-    #[test]
-    fn an_exo_detach_before_the_keyboard_leave_activates_then_drains() {
-        // Exo's text input hears of a focus change before the keyboard:
-        // its `leave` arrives first, and the proxy activates again on the
-        // surface Exo has just left, which Exo keeps without attaching.
-        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
-        ctx.last_sender_id = host_v1_id;
-        TextInputV1Handler.on_enter(&mut ctx, 901);
-        TextInputV1Handler.on_leave(&mut ctx);
-        assert_eq!(take_requests(&mut ctx), PASSWORD_AFTER_ACTIVATE);
-
-        // The keyboard leave then deactivates it behind a barrier.
-        apply_keyboard_focus_changes(
-            &mut ctx,
-            &[SeatFocusChange {
-                guest_seat: 0,
-                previous_surface: Some(900),
-                current_surface: None,
-            }],
-        );
-        assert_eq!(
-            take_requests(&mut ctx),
-            [
-                (host_v1_id, zwp_text_input_v1::REQ_DEACTIVATE),
-                (1, wl_display::REQ_SYNC),
-            ]
-        );
-        let callback = ctx.text_inputs[&guest_id]
-            .draining_callback()
-            .expect("the keyboard leave drains the activation");
-
-        // Exo never attached, so it sends no leave, and the drain ends
-        // with nothing more to send.
-        ctx.last_sender_id = callback.0;
-        CallbackHandler.on_done(&mut ctx, 0);
-        assert_eq!(ctx.text_inputs[&guest_id].host, HostApplied::Inactive);
-        assert_eq!(take_requests(&mut ctx), []);
-    }
-
-    #[test]
-    fn a_content_type_waits_for_exo_to_attach_again() {
-        // Exo detached while the guest's seat cannot carry an activate:
-        // nothing is sent, not even a changed content type, until it can.
-        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
-        // A seat with no host object.
-        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = 7;
-        ctx.last_sender_id = host_v1_id;
-        TextInputV1Handler.on_leave(&mut ctx);
-        assert!(!ctx.text_inputs[&guest_id].host_is_active());
-
-        ctx.last_sender_id = guest_id;
-        let mut v3 = TextInputV3Handler;
-        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_NORMAL);
-        v3.on_commit(&mut ctx);
-        assert!(!take_requests(&mut ctx).iter().any(|&(sender, opcode)| {
-            opcode == zwp_text_input_v1::REQ_ACTIVATE
-                || sender == 30
-                || opcode == zwp_text_input_v1::REQ_SET_CONTENT_TYPE
-        }));
-    }
-
-    #[test]
-    fn the_leave_answering_a_deactivate_is_ignored() {
-        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
-        ctx.last_sender_id = guest_id;
-        let mut v3 = TextInputV3Handler;
-        v3.on_disable(&mut ctx);
-        v3.on_commit(&mut ctx);
-        let callback = ctx.text_inputs[&guest_id].draining_callback();
-        assert!(callback.is_some());
-        take_requests(&mut ctx);
-
-        ctx.last_sender_id = host_v1_id;
-        TextInputV1Handler.on_leave(&mut ctx);
-        assert_eq!(take_requests(&mut ctx), []);
-        assert_eq!(ctx.text_inputs[&guest_id].draining_callback(), callback);
-    }
-
-    #[test]
-    fn an_activation_deferred_for_an_unmapped_seat_sends_the_content_type() {
-        use zcr_extended_text_input_v1::{REQ_SET_INPUT_TYPE, REQ_SET_SURROUNDING_TEXT_SUPPORT};
-        use zwp_text_input_v1::{REQ_ACTIVATE, REQ_COMMIT_STATE};
-        // The seat gains a host object through a bind, or a commit follows.
-        for through_bind in [true, false] {
-            let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-            {
-                let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-                state.guest_seat = 7;
-                state.committed.enabled = false;
-                state.host = HostApplied::Inactive;
-            }
-            ctx.last_sender_id = guest_id;
-            let mut v3 = TextInputV3Handler;
-
-            // The seat has no host object yet: nothing can activate, which
-            // the proxy warns of once.
-            v3.on_enable(&mut ctx);
-            v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
-            v3.on_commit(&mut ctx);
-            assert!(!ctx.text_inputs[&guest_id].host_is_active());
-            assert!(ctx.text_inputs[&guest_id].warned_seat_missing);
-            assert!(!take_requests(&mut ctx)
-                .iter()
-                .any(|&(_, opcode)| opcode == REQ_ACTIVATE));
-
-            // Once it has one, the text input activates, and its content
-            // type follows the activation.
-            let mut expected = Vec::new();
-            if through_bind {
-                // The guest binds a seat under the text input's seat ID.
-                use crate::protocols::wayland::wl_registry::{self, WlRegistryHandler};
-                ctx.shadow_table
-                    .insert_paired_for_test(50, 500, "wl_registry");
-                ctx.last_sender_id = 50;
-                let seat = "wl_seat".to_string();
-                crate::handler::registry::RegistryHandler.on_global(&mut ctx, 3, &seat, 5);
-                let bind = (seat, 5, 7);
-                crate::handler::registry::RegistryHandler.on_bind(&mut ctx, 3, &bind);
-                expected.push((500, wl_registry::REQ_BIND));
+            ime.ctx.last_sender_id = SIBLING;
+            if destroy {
+                TextInputV3Handler.on_destroy(&mut ime.ctx);
             } else {
-                ctx.shadow_table.insert_paired_for_test(7, 70, "wl_seat");
-                v3.on_commit(&mut ctx);
+                TextInputV3Handler.on_enable(&mut ime.ctx);
+                TextInputV3Handler.on_commit(&mut ime.ctx);
+                assert!(!ime.ctx.text_inputs[&SIBLING].committed.enabled);
             }
-            expected.extend([
-                (host_v1_id, REQ_ACTIVATE),
-                (30, REQ_SET_SURROUNDING_TEXT_SUPPORT),
-                (30, REQ_SET_INPUT_TYPE),
-                (host_v1_id, REQ_COMMIT_STATE),
-            ]);
             assert_eq!(
-                take_requests(&mut ctx),
-                expected,
-                "through a bind: {through_bind}"
+                ime.ctx
+                    .key_generations
+                    .ime_repeat_owner(HOST_KEYBOARD, BACKSPACE),
+                Some(TI),
+                "destroy: {destroy}"
             );
-            assert!(ctx.text_inputs[&guest_id].host_is_active());
         }
-    }
-
-    #[test]
-    fn activation_barrier_coalesces_changes_and_honors_final_disabled_target() {
-        let (mut ctx, _host_v1_id, guest_id) = setup_v1_ctx();
-        for (guest_surface, host_surface) in [(901, 902), (903, 904)] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest_surface, host_surface, "wl_surface");
-        }
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.enabled = false;
-            state.active_surface = None;
-        }
-        reconcile_host(&mut ctx, guest_id, None);
-        let callback_id = ctx.text_inputs[&guest_id].draining_callback().unwrap();
-
-        for (enabled, surface) in [(true, Some(901)), (true, Some(903)), (false, Some(903))] {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.enabled = enabled;
-            state.active_surface = surface;
-            reconcile_host(&mut ctx, guest_id, None);
-        }
-        assert_eq!(
-            ctx.client_to_host_queue.len(),
-            2,
-            "one deactivation generation must own exactly one sync barrier"
-        );
-
-        ctx.last_sender_id = callback_id.0;
-        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
-        assert!(!ctx.text_inputs[&guest_id].host_is_active());
-        assert_eq!(
-            ctx.client_to_host_queue.len(),
-            2,
-            "a final disabled target must not reactivate after callback.done"
-        );
-    }
-
-    #[test]
-    fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
-        let (mut ctx, _old_host_v1_id, guest_id) = setup_v1_ctx();
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.enabled = false;
-            state.active_surface = None;
-        }
-        reconcile_host(&mut ctx, guest_id, None);
-        let callback_id = ctx.text_inputs[&guest_id].draining_callback().unwrap();
-
-        let mut replacement = ctx.text_inputs.remove(&guest_id).unwrap();
-        replacement.host_v1_id = 11;
-        replacement.committed.enabled = true;
-        replacement.active_surface = Some(901);
-        replacement.host = HostApplied::Inactive;
-        ctx.shadow_table
-            .insert_paired_for_test(901, 902, "wl_surface");
-        ctx.text_inputs.insert(guest_id, replacement);
-        ctx.client_to_host_queue.clear();
-
-        ctx.last_sender_id = callback_id.0;
-        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
-        assert!(!ctx.text_inputs[&guest_id].host_is_active());
-        assert!(
-            ctx.client_to_host_queue.is_empty(),
-            "an old host generation callback must not activate the replacement object"
-        );
-    }
-
-    #[test]
-    fn second_text_input_enable_on_the_connection_is_ignored() {
-        // Exo has one seat, so a second guest seat is no different.
-        for second_seat in [0, 5] {
-            let (mut ctx, _, first_id) = setup_v1_ctx();
-            ctx.shadow_table.insert_paired_for_test(5, 6, "wl_seat");
-            let surface = 40;
-            ctx.shadow_table
-                .insert_paired_for_test(surface, 41, "wl_surface");
-            {
-                let state = ctx.text_inputs.get_mut(&first_id).unwrap();
-                state.active_surface = Some(surface);
-                state.committed.enabled = false;
-                state.host = HostApplied::Inactive;
-            }
-            let second_id = 21;
-            ctx.shadow_table
-                .insert_paired_for_test(second_id, 11, "zwp_text_input_v3");
-            ctx.text_inputs.insert(
-                second_id,
-                crate::state::TextInputState::new(11, None, second_seat, Some(surface)),
-            );
-            let mut handler = TextInputV3Handler;
-
-            ctx.last_sender_id = first_id;
-            handler.on_enable(&mut ctx);
-            handler.on_commit(&mut ctx);
-            arm_backspace_repeat_for_test(&mut ctx, 44, HostId(45), first_id);
-            ctx.client_to_host_queue.clear();
-            ctx.last_sender_id = second_id;
-            handler.on_enable(&mut ctx);
-            handler.on_commit(&mut ctx);
-
-            assert!(ctx.text_inputs[&first_id].committed.enabled);
-            assert!(ctx.text_inputs[&first_id].host_is_active());
-            assert!(!ctx.text_inputs[&second_id].committed.enabled);
-            assert!(!ctx.text_inputs[&second_id].host_is_active());
-            // A rejected enable still counts: its `done` numbers the commit.
-            assert_eq!(ctx.text_inputs[&second_id].guest_commit_serial(), 1);
-            assert_eq!(
-                ctx.key_generations
-                    .ime_repeat_owner(HostId(45), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
-                Some(first_id),
-                "a rejected sibling enable must not cancel the active input's repeat lease"
-            );
-            assert!(
-                !take_requests(&mut ctx)
-                    .iter()
-                    .any(|&(sender, opcode)| sender == 11
-                        && opcode == zwp_text_input_v1::REQ_ACTIVATE),
-                "seat {second_seat}"
-            );
-
-            // The second text input's disable takes nothing from the first,
-            // which Exo still gives its input method.
-            handler.on_disable(&mut ctx);
-            handler.on_commit(&mut ctx);
-            assert!(ctx.text_inputs[&first_id].host_is_active());
-            assert!(!take_requests(&mut ctx).iter().any(|&(sender, opcode)| {
-                sender == 11 && opcode == zwp_text_input_v1::REQ_DEACTIVATE || sender == 10
-            }));
-        }
-    }
-
-    #[test]
-    fn uncommitted_surrounding_text_is_hidden_from_host_extension() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
-        let mut v3_handler = TextInputV3Handler;
-        v3_handler.on_set_surrounding_text(&mut ctx, &"가나다".to_string(), 6, 6);
-
-        ctx.last_sender_id = 30;
-        let mut ext_handler = ExtendedTextInputV1Handler;
-        ext_handler.on_set_preedit_region(&mut ctx, -3, 3);
-        assert!(ctx.host_to_client_queue.is_empty());
-
-        ctx.last_sender_id = guest_id;
-        v3_handler.on_commit(&mut ctx);
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host =
-            HostApplied::Active { content_type: None };
-        ctx.last_sender_id = 30;
-        ext_handler.on_set_preedit_region(&mut ctx, -3, 3);
-        assert_eq!(
-            ctx.host_to_client_queue
-                .iter()
-                .map(|message| msg_opcode(std::slice::from_ref(message), 0))
-                .collect::<Vec<_>>(),
-            vec![4, 2, 5]
-        );
-    }
-
-    #[test]
-    fn disable_commit_invalidates_surrounding_text_and_deactivates() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
-        }
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-        handler.on_disable(&mut ctx);
-
-        assert!(ctx.text_inputs[&guest_id]
-            .committed
-            .surrounding_text
-            .is_some());
-        handler.on_commit(&mut ctx);
-
-        let state = &ctx.text_inputs[&guest_id];
-        assert!(!state.committed.enabled);
-        assert!(state.committed.surrounding_text.is_none());
-        assert!(!state.host_is_active());
-        let clear_message = ctx.client_to_host_queue.iter().find(|message| {
-            msg_sender(std::slice::from_ref(message), 0) == 10
-                && msg_opcode(std::slice::from_ref(message), 0) == 5
-        });
-        let clear_message = clear_message.expect("disable must clear v1 surrounding text");
-        let mut clear_wire = WireMessage::new(10, 5, &clear_message.0[8..]);
-        assert_eq!(clear_wire.read_string().unwrap(), "");
-        assert_eq!(clear_wire.read_u32().unwrap(), 0);
-        assert_eq!(clear_wire.read_u32().unwrap(), 0);
-    }
-
-    #[test]
-    fn committed_enable_resets_previous_ime_event_transaction() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.current_preedit = "이전".to_string();
-            state.pending_preedit_cursor = Some(3);
-            state.pending_preedit_selection = Some((0, 3));
-            state.pending_deletes.push((3, 0));
-            state.pending_cursor_position = Some((1, 1));
-        }
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-        handler.on_enable(&mut ctx);
-
-        assert_eq!(ctx.text_inputs[&guest_id].current_preedit, "이전");
-        handler.on_commit(&mut ctx);
-
-        let state = &ctx.text_inputs[&guest_id];
-        assert!(state.current_preedit.is_empty());
-        assert!(state.pending_preedit_cursor.is_none());
-        assert!(state.pending_preedit_selection.is_none());
-        assert!(state.pending_deletes.is_empty());
-        assert!(state.pending_cursor_position.is_none());
-    }
-
-    #[test]
-    fn keyboard_focus_transition_invalidates_editor_state_but_not_serial() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.set_guest_commits(17);
-            state.pending.surrounding_text = Some(Some(("pending".to_string(), 7, 7)));
-            state.committed.surrounding_text = Some(("current".to_string(), 7, 7));
-            state.pending.content_type = Some((0x200, 0));
-            state.pending.cursor_rect = Some((1, 2, 3, 4));
-            state.current_preedit = "한".to_string();
-            state.pending_deletes.push((3, 0));
-        }
-
-        let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-        let active_surface = state.active_surface;
-        assert_eq!(state.apply_focus(active_surface), active_surface);
-
-        assert_eq!(state.guest_commit_serial(), 17);
-        assert!(state.host_is_active());
-        assert_eq!(state.pending, crate::state::V3Pending::default());
-        assert!(!state.committed.enabled);
-        assert!(state.committed.surrounding_text.is_none());
-        assert!(state.current_preedit.is_empty());
-        assert!(state.pending_deletes.is_empty());
-    }
-
-    #[test]
-    fn invalid_utf8_surrounding_offsets_do_not_replace_pending_state() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-        handler.on_set_surrounding_text(&mut ctx, &"가".to_string(), 1, 1);
-
-        let state = &ctx.text_inputs[&guest_id];
-        assert!(state.pending.surrounding_text.is_none());
-    }
-
-    #[test]
-    fn content_type_mapping_preserves_pin_privacy_and_inline_composition() {
-        assert_eq!(map_v3_content_type(0, 9), (0x80, 2, 5, 6, 1 << 10, 0));
-        assert_eq!(map_v3_content_type(0x80, 8), (0x80, 8, 2, 0, 1 << 10, 0));
-        assert_eq!(map_v3_content_type(0x200, 0).2, 14);
-        assert_eq!(
-            map_v3_content_type(0x2, 0).4,
-            1 << 4,
-            "v3 spellcheck must map to Chrome spellcheck_on"
-        );
-
-        let ctx = commit_content_type(None);
-        // The transaction is set_surrounding_text_support, set_input_type and
-        // commit_state; `content_type_takes_one_host_request_per_extension_version`
-        // pins that order. Without surrounding text the guest field is
-        // reported unsupported.
-        let mut support = wire_message(&ctx.client_to_host_queue, 0);
-        assert_eq!(
-            support.read_u32().unwrap(),
-            zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
-        );
-        let mut set_input_type = wire_message(&ctx.client_to_host_queue, 1);
-        assert_eq!(set_input_type.read_u32().unwrap(), 5);
-        assert_eq!(set_input_type.read_u32().unwrap(), 6);
-        assert_eq!(set_input_type.read_u32().unwrap(), 1 << 10);
-        assert_eq!(set_input_type.read_u32().unwrap(), 0);
-        assert_eq!(set_input_type.read_u32().unwrap(), 1);
-    }
-
-    #[test]
-    fn repeated_content_type_does_not_reset_active_host_composition() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-
-        handler.on_set_content_type(&mut ctx, 0, 13);
-        handler.on_commit(&mut ctx);
-        // The focused, active host takes the first content type.
-        assert_eq!(
-            take_requests(&mut ctx),
-            [
-                (
-                    30,
-                    zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT
-                ),
-                (30, zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE),
-                (10, zwp_text_input_v1::REQ_COMMIT_STATE),
-            ]
-        );
-
-        // GTK resends the unchanged terminal content type after IME events.
-        // Before v8, replaying set_content_type/deprecated_set_input_type
-        // into Exo at that point resets its active Korean preedit before
-        // the next key arrives.
-        handler.on_set_content_type(&mut ctx, 0, 13);
-        handler.on_commit(&mut ctx);
-
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 10);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 9);
-    }
-
-    #[test]
-    fn content_type_change_reverted_before_commit_is_a_host_noop() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-
-        handler.on_set_content_type(&mut ctx, 0, 13);
-        handler.on_commit(&mut ctx);
-        // The focused, active host takes the first content type.
-        assert_eq!(
-            take_requests(&mut ctx),
-            [
-                (
-                    30,
-                    zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT
-                ),
-                (30, zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE),
-                (10, zwp_text_input_v1::REQ_COMMIT_STATE),
-            ]
-        );
-
-        handler.on_set_content_type(&mut ctx, 0, 9);
-        handler.on_set_content_type(&mut ctx, 0, 13);
-        handler.on_commit(&mut ctx);
-
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 10);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 9);
-        let state = &ctx.text_inputs[&guest_id];
-        assert_eq!(state.committed.content_type, (0, 13));
-        assert!(state.pending.content_type.is_none());
-    }
-
-    /// Take every queued host request; return the extension's, as
-    /// (opcode, first argument).
-    fn take_extension_requests(ctx: &mut Context) -> Vec<(u16, u32)> {
-        std::mem::take(&mut ctx.client_to_host_queue)
-            .iter()
-            .filter(|(message, _)| crate::test_support::msg_sender(message) == 30)
-            .map(|(message, _)| {
-                let argument = u32::from_ne_bytes(message[8..12].try_into().unwrap());
-                (crate::test_support::msg_opcode(message), argument)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn surrounding_text_support_follows_the_field_and_resends_only_on_change() {
-        use zcr_extended_text_input_v1::{
-            REQ_SET_INPUT_TYPE, REQ_SET_SURROUNDING_TEXT_SUPPORT,
-            SURROUNDING_TEXT_SUPPORT_SUPPORTED, SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
-        };
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        // Map the focused surface, so commits keep the host activation.
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-        let input_type = map_v3_content_type(0, 0).2;
-
-        // Chromium enables with a content type and no surrounding text...
-        handler.on_enable(&mut ctx);
-        handler.on_set_content_type(&mut ctx, 0, 0);
-        handler.on_commit(&mut ctx);
-        assert_eq!(
-            take_extension_requests(&mut ctx),
-            [
-                (
-                    REQ_SET_SURROUNDING_TEXT_SUPPORT,
-                    SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
-                ),
-                (REQ_SET_INPUT_TYPE, input_type),
-            ]
-        );
-
-        // ...and sends the text in a later commit, with no new content type.
-        // Exo learns the support only with a content type, so it is resent.
-        handler.on_set_surrounding_text(&mut ctx, &"abc".to_string(), 3, 3);
-        handler.on_commit(&mut ctx);
-        assert_eq!(
-            take_extension_requests(&mut ctx),
-            [
-                (
-                    REQ_SET_SURROUNDING_TEXT_SUPPORT,
-                    SURROUNDING_TEXT_SUPPORT_SUPPORTED
-                ),
-                (REQ_SET_INPUT_TYPE, input_type),
-            ]
-        );
-
-        // While the support holds, the content type is not resent: before
-        // v8 a resend changes Exo's type twice, which can reset its
-        // composition.
-        handler.on_set_surrounding_text(&mut ctx, &"abcd".to_string(), 4, 4);
-        handler.on_set_content_type(&mut ctx, 0, 0);
-        handler.on_commit(&mut ctx);
-        assert_eq!(take_extension_requests(&mut ctx), []);
-
-        // A disable and enable reset the editor state: the content type is
-        // replayed with the support of the field's new, empty state.
-        handler.on_disable(&mut ctx);
-        handler.on_enable(&mut ctx);
-        handler.on_set_content_type(&mut ctx, 0, 0);
-        handler.on_commit(&mut ctx);
-        assert_eq!(
-            take_extension_requests(&mut ctx),
-            [
-                (
-                    REQ_SET_SURROUNDING_TEXT_SUPPORT,
-                    SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
-                ),
-                (REQ_SET_INPUT_TYPE, input_type),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_host_without_surrounding_text_support_gets_no_resend() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        // v8 has set_input_type but not set_surrounding_text_support.
-        ctx.shadow_table
-            .insert_host_only_for_test(30, "zcr_extended_text_input_v1", 8);
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-
-        handler.on_enable(&mut ctx);
-        handler.on_set_content_type(&mut ctx, 0, 0);
-        handler.on_commit(&mut ctx);
-        assert_eq!(
-            take_extension_requests(&mut ctx),
-            [(
-                zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE,
-                map_v3_content_type(0, 0).2
-            )]
-        );
-
-        // The host was told no support, so gaining surrounding text changes
-        // nothing it knows.
-        handler.on_set_surrounding_text(&mut ctx, &"abc".to_string(), 3, 3);
-        handler.on_commit(&mut ctx);
-        assert_eq!(take_extension_requests(&mut ctx), []);
-    }
-
-    #[test]
-    fn content_type_takes_one_host_request_per_extension_version() {
-        use zcr_extended_text_input_v1::{
-            REQ_DEPRECATED_SET_INPUT_TYPE, REQ_SET_INPUT_TYPE, REQ_SET_SURROUNDING_TEXT_SUPPORT,
-        };
-        use zwp_text_input_v1::{REQ_COMMIT_STATE, REQ_SET_CONTENT_TYPE};
-        let (v1, ext) = (10, 30);
-        assert_eq!(
-            content_type_requests_for_version(Some(1)),
-            [(v1, REQ_SET_CONTENT_TYPE), (v1, REQ_COMMIT_STATE)],
-            "v1 has no extension input-type request"
-        );
-        assert_eq!(
-            content_type_requests_for_version(Some(7)),
-            [
-                (v1, REQ_SET_CONTENT_TYPE),
-                (ext, REQ_DEPRECATED_SET_INPUT_TYPE),
-                (v1, REQ_COMMIT_STATE)
-            ],
-            "v2-v7 refine the v1 content type with deprecated_set_input_type"
-        );
-        assert_eq!(
-            content_type_requests_for_version(Some(8)),
-            [(ext, REQ_SET_INPUT_TYPE), (v1, REQ_COMMIT_STATE)],
-            "v8's set_input_type is used in place of v1 set_content_type"
-        );
-        // Exo applies surrounding-text support to the next set_content_type
-        // or set_input_type and then resets it, so nothing may come between.
-        let with_support = [
-            (ext, REQ_SET_SURROUNDING_TEXT_SUPPORT),
-            (ext, REQ_SET_INPUT_TYPE),
-            (v1, REQ_COMMIT_STATE),
-        ];
-        assert_eq!(content_type_requests_for_version(Some(9)), with_support);
-        assert_eq!(
-            content_type_requests_for_version(None),
-            with_support,
-            "unversioned test fixtures remain permissive"
-        );
     }
 
     #[test]
@@ -4209,279 +4220,91 @@ mod tests {
         assert_eq!(ctx.shadow_table.guest_object_version(20), Some(5));
     }
 
+    /// A drain barrier completes only the generation it drains: the guest
+    /// destroyed the text input and reused its ID for one with another
+    /// host text input, enabled and not yet active, which the old barrier
+    /// must not activate.
     #[test]
-    fn inactive_host_ime_events_are_ignored() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host = HostApplied::Inactive;
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
+    fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
+        let mut ime = Ime::new();
+        let state = ime.state();
+        state.committed.enabled = false;
+        state.active_surface = None;
+        reconcile_host(&mut ime.ctx, TI, None);
+        let callback = ime.state().draining_callback().expect("a barrier");
+        let mut replacement = TextInputState::new(11, None, SEAT, Some(SURFACE));
+        replacement.committed.enabled = true;
+        ime.ctx.text_inputs.insert(TI, replacement);
+        ime.ctx.client_to_host_queue.clear();
 
-        handler.on_preedit_string(&mut ctx, 0, &"가".to_string(), &String::new());
-        handler.on_delete_surrounding_text(&mut ctx, -3, 3);
-        handler.on_commit_string(&mut ctx, 0, &"가".to_string());
-        handler.on_keysym(&mut ctx, 0, 0, u32::from(b'a'), 1, 0);
-
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert!(ctx.text_inputs[&guest_id].pending_deletes.is_empty());
+        ime.ctx.last_sender_id = callback.0;
+        CallbackHandler.on_done(&mut ime.ctx, 0);
+        assert!(!ime.state().host_is_active());
+        assert!(ime.ctx.client_to_host_queue.is_empty());
     }
 
     #[test]
     fn guest_commit_serial_wraps_and_is_forwarded_unchanged() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        {
-            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.set_guest_commits(u32::MAX);
-            state.host = HostApplied::Inactive;
-        }
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-        handler.on_commit(&mut ctx);
+        let mut ime = Ime::new();
+        let state = ime.state();
+        state.set_guest_commits(u32::MAX);
+        state.host = HostApplied::Inactive;
+        ime.ctx.last_sender_id = TI;
+        TextInputV3Handler.on_commit(&mut ime.ctx);
 
-        assert_eq!(ctx.text_inputs[&guest_id].guest_commit_serial(), 0);
-        let commit_state = ctx.client_to_host_queue.last().unwrap();
-        assert_eq!(msg_done_serial(std::slice::from_ref(commit_state), 0), 0);
+        assert_eq!(ime.state().guest_commit_serial(), 0);
+        let queue = std::mem::take(&mut ime.ctx.client_to_host_queue);
+        let (activate, extension, commit_state) = (&queue[..1], &queue[1..3], &queue[3..]);
+        let activate = decoded(activate, V1::from_wire);
+        assert_eq!(
+            activate,
+            [(
+                HOST,
+                V1::Activate {
+                    seat: HOST_SEAT,
+                    surface: HOST_SURFACE
+                }
+            )]
+        );
+        let extension = decoded(extension, Ext::from_wire);
+        assert!(extension.iter().all(|(sender, _)| *sender == HOST_EXT));
+        let commit_state = decoded(commit_state, V1::from_wire);
+        assert_eq!(commit_state, [(HOST, V1::CommitState { serial: 0 })]);
     }
 
+    /// An extension whose version the object table lacks is taken to have
+    /// every request, as the newest does.
     #[test]
-    fn destroy_drops_v3_request_and_cleans_host_extension_routing() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.shadow_table
-            .insert_host_only_for_test(30, "zcr_extended_text_input_v1", 11);
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
+    fn an_extension_without_a_version_takes_the_newest_requests() {
+        use zcr_extended_text_input_v1::{
+            INLINE_COMPOSITION_SUPPORT_SUPPORTED, INPUT_FLAGS_HAS_BEEN_PASSWORD,
+            INPUT_MODE_NUMERIC, INPUT_TYPE_NUMBER, LEARNING_MODE_DISABLED,
+            SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
+        };
+        let mut ime = Ime::with_extension_version(None);
+        ime.ctx.last_sender_id = TI;
+        let pin = zwp_text_input_v3::CONTENT_PURPOSE_PIN;
+        TextInputV3Handler.on_set_content_type(&mut ime.ctx, 0, pin);
+        TextInputV3Handler.on_commit(&mut ime.ctx);
 
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
-        assert!(!ctx.text_inputs.contains_key(&guest_id));
-        assert!(ctx.shadow_table.get_host_id(guest_id).is_none());
-        assert!(
-            !ctx.shadow_table.is_host_id_available(10),
-            "the host v1 backing ID must remain reserved after guest v3 destroy"
-        );
-        assert!(ctx.shadow_table.get_host_interface(30).is_none());
-        assert!(
-            !ctx.shadow_table.is_host_id_available(30),
-            "the destroyed host extension ID must remain reserved until host delete_id"
-        );
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 10);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 1);
+        let support = Ext::SetSurroundingTextSupport {
+            support: SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
+        };
+        let set_input_type = Ext::SetInputType {
+            input_type: INPUT_TYPE_NUMBER,
+            input_mode: INPUT_MODE_NUMERIC,
+            input_flags: INPUT_FLAGS_HAS_BEEN_PASSWORD,
+            learning_mode: LEARNING_MODE_DISABLED,
+            inline_composition_support: INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+        };
         assert_eq!(
-            u32::from_ne_bytes(ctx.client_to_host_queue[0].0[8..12].try_into().unwrap()),
-            2,
-            "deactivate must carry the live host wl_seat ID"
+            ime.requests(),
+            [
+                (HOST_EXT, support.into()),
+                (HOST_EXT, set_input_type.into()),
+                (HOST, V1::CommitState { serial: 1 }.into()),
+            ]
         );
-        assert_eq!(ctx.client_to_host_queue.len(), 3);
-        assert_eq!(
-            msg_sender(&ctx.client_to_host_queue, 2),
-            30,
-            "host extension release follows the text-input generation barrier"
-        );
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 1), 1);
-        assert_eq!(
-            msg_opcode(&ctx.client_to_host_queue, 1),
-            wl_display::REQ_SYNC
-        );
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 2), 0);
-        assert_eq!(
-            msg_sender(&ctx.host_to_client_queue, 0),
-            1,
-            "guest-local destruction must be acknowledged by wl_display"
-        );
-        assert_eq!(
-            msg_opcode(&ctx.host_to_client_queue, 0),
-            crate::protocols::wayland::wl_display::EVT_DELETE_ID
-        );
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap()),
-            guest_id
-        );
-    }
-
-    #[test]
-    fn destroying_inactive_sibling_preserves_active_repeat_lease() {
-        let (mut ctx, _, active_id) = setup_v1_ctx();
-        let sibling_id = 21;
-        ctx.shadow_table
-            .insert_paired_for_test(sibling_id, 11, "zwp_text_input_v3");
-        ctx.text_inputs.insert(
-            sibling_id,
-            crate::state::TextInputState::new(11, None, 0, Some(900)),
-        );
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), active_id);
-
-        ctx.last_sender_id = sibling_id;
-        assert_eq!(TextInputV3Handler.on_destroy(&mut ctx), Action::Drop);
-
-        assert_eq!(
-            ctx.key_generations
-                .ime_repeat_owner(HostId(41), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
-            Some(active_id)
-        );
-    }
-
-    #[test]
-    fn destroy_after_seat_release_does_not_deactivate_destroyed_host_seat() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        let guest_seat = 7;
-        let host_seat = 70;
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(guest_seat, host_seat, "wl_seat", 5);
-        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = guest_seat;
-        ctx.shadow_table
-            .insert_host_only_for_test(30, "zcr_extended_text_input_v1", 11);
-        ctx.last_sender_id = guest_seat;
-        let mut release = WireMessage::new(
-            guest_seat,
-            crate::protocols::wayland::wl_seat::REQ_RELEASE,
-            &[],
-        );
-        assert!(crate::protocols::wayland::wl_seat::dispatch_request(
-            &mut release,
-            &mut SeatHandler,
-            &mut ctx,
-        )
-        .expect("wl_seat.release should decode")
-        .is_some());
-        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_seat));
-
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
-        assert!(!ctx.text_inputs.contains_key(&guest_id));
-        assert!(ctx.shadow_table.get_host_id(guest_id).is_none());
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .all(|message| msg_sender(std::slice::from_ref(message), 0) != host_v1_id),
-            "a child text-input must not reference its released parent host seat"
-        );
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 30);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 0);
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(
-            msg_opcode(&ctx.host_to_client_queue, 0),
-            crate::protocols::wayland::wl_display::EVT_DELETE_ID
-        );
-    }
-
-    #[test]
-    fn destroy_without_seat_mapping_completes_without_invalid_deactivate() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = 7;
-        ctx.shadow_table
-            .insert_host_only_for_test(30, "zcr_extended_text_input_v1", 11);
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
-        assert!(!ctx.text_inputs.contains_key(&guest_id));
-        assert!(ctx.shadow_table.get_host_id(guest_id).is_none());
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .all(|message| msg_sender(std::slice::from_ref(message), 0) != host_v1_id),
-            "a missing parent seat must not be encoded as object ID zero"
-        );
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 30);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 0);
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-    }
-
-    #[test]
-    fn a_seat_id_reused_for_another_object_is_not_sent_as_a_seat() {
-        use zwp_text_input_v1::{REQ_ACTIVATE, REQ_DEACTIVATE};
-        // The active text input's seat ended, and the guest reused its ID
-        // for a surface, which the host would reject as a seat.
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.shadow_table.insert_paired_for_test(7, 70, "wl_surface");
-        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = 7;
-        ctx.last_sender_id = guest_id;
-        let mut v3 = TextInputV3Handler;
-
-        // Neither disabling the field nor enabling it again sends the ID.
-        v3.on_disable(&mut ctx);
-        v3.on_commit(&mut ctx);
-        v3.on_enable(&mut ctx);
-        v3.on_commit(&mut ctx);
-        let requests = take_requests(&mut ctx);
-        assert!(
-            !requests.iter().any(|&(sender, opcode)| {
-                sender == host_v1_id && matches!(opcode, REQ_ACTIVATE | REQ_DEACTIVATE)
-            }),
-            "{requests:?}"
-        );
-        assert!(!ctx.text_inputs[&guest_id].host_is_active());
-    }
-
-    #[test]
-    fn a_released_seat_whose_id_becomes_a_surface_carries_no_deactivate() {
-        use crate::handler::display::DisplayHandler;
-        use crate::protocols::wayland::wl_display::WlDisplayHandler;
-        use crate::protocols::wayland::wl_seat;
-        // The guest releases the active text input's seat, the host deletes
-        // it, and the guest reuses its ID for a surface before disabling.
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        let (guest_seat, host_seat) = (7, 70);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(guest_seat, host_seat, "wl_seat", 5);
-        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = guest_seat;
-        ctx.last_sender_id = guest_seat;
-        let mut release = WireMessage::new(guest_seat, wl_seat::REQ_RELEASE, &[]);
-        wl_seat::dispatch_request(&mut release, &mut SeatHandler, &mut ctx)
-            .expect("wl_seat.release decodes");
-        DisplayHandler.on_delete_id(&mut ctx, host_seat);
-        ctx.shadow_table
-            .insert_paired_for_test(guest_seat, 71, "wl_surface");
-        take_requests(&mut ctx);
-
-        ctx.last_sender_id = guest_id;
-        let mut v3 = TextInputV3Handler;
-        v3.on_disable(&mut ctx);
-        v3.on_commit(&mut ctx);
-        let requests = take_requests(&mut ctx);
-        assert!(
-            !requests.iter().any(|&(sender, opcode)| sender == host_v1_id
-                && opcode == zwp_text_input_v1::REQ_DEACTIVATE),
-            "{requests:?}"
-        );
-        assert!(!ctx.text_inputs[&guest_id].host_is_active());
-    }
-
-    #[test]
-    fn text_input_creation_works_without_optional_chromeos_extension() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.host_text_input_manager_v1_id = Some(50);
-        set_test_focus(&mut ctx, HostId(70), 7, 99);
-        let mut handler = TextInputManagerV3Handler;
-
-        assert_eq!(handler.on_get_text_input(&mut ctx, 20, 7), Action::Drop);
-        let state = &ctx.text_inputs[&20];
-        assert!(state.host_ext_id.is_none());
-        assert_eq!(state.guest_seat, 7);
-        assert_eq!(state.active_surface, Some(99));
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 50);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 0);
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 0), 20);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 0);
-        assert_eq!(
-            wire_message(&ctx.host_to_client_queue, 0)
-                .read_u32()
-                .unwrap(),
-            99
-        );
-
-        ctx.last_sender_id = 20;
-        let mut v3_handler = TextInputV3Handler;
-        v3_handler.on_enable(&mut ctx);
-        v3_handler.on_commit(&mut ctx);
-        assert!(ctx
-            .client_to_host_queue
-            .iter()
-            .all(|message| { matches!(msg_sender(std::slice::from_ref(message), 0), 50 | 2) }));
     }
 
     #[test]
@@ -4494,398 +4317,166 @@ mod tests {
         assert!(ctx.client_to_host_queue.is_empty());
     }
 
+    /// Exo sends a keysym's timestamp as its serial and its serial as its
+    /// time; the guest gets them back in their places, as a key pair of
+    /// the text input's that invents no physical key state.
     #[test]
     fn on_keysym_translates_exo_timestamp_and_serial_to_wl_keyboard() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
+        use xkbcommon::xkb::keysyms::KEY_BackSpace;
+        let mut ime = Ime::with_keyboard();
+        ime.keysym(KEY_BackSpace, PRESSED, 456, 123);
+        assert_eq!(ime.events(), [key(KEYBOARD, BACKSPACE, PRESSED, 456, 123)]);
+        let generations = &ime.ctx.key_generations;
+        assert!(!generations.physically_held(HOST_KEYBOARD, BACKSPACE));
+        assert_eq!(ime.owner(BACKSPACE), Some(GuestKeyOwner::TextInputKeysym));
 
-        // Register a guest wl_keyboard ID to capture the forwarded key
-        let guest_keyboard_id = 999u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, 888, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-
-        let mut handler = TextInputV1Handler;
-        // 0xff08 is KEY_BackSpace
-        let action = handler.on_keysym(&mut ctx, 123, 456, 0xff08, 1, 0);
-        assert_eq!(action, Action::Drop);
-
-        // Should produce 1 message on host_to_client_queue: wl_keyboard::key (opcode 3)
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 3);
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 0), guest_keyboard_id);
-
-        let payload = &ctx.host_to_client_queue[0].0[8..];
-        let serial = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
-        let time = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
-        assert_eq!(serial, 456);
-        assert_eq!(time, 123);
-        assert!(
-            !ctx.key_generations
-                .physically_held(HostId(888), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
-            "a text-input keysym must not invent physical-key state"
-        );
+        ime.keysym(KEY_BackSpace, RELEASED, 457, 124);
+        assert_eq!(ime.events(), [key(KEYBOARD, BACKSPACE, RELEASED, 457, 124)]);
+        let generations = &ime.ctx.key_generations;
+        assert!(!generations.physically_held(HOST_KEYBOARD, BACKSPACE));
         assert_eq!(
-            ctx.guest_key_owner(HostId(888), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
-            Some(GuestKeyOwner::TextInputKeysym),
-            "a synthetic keysym press must be paired with a later release"
+            ime.owner(BACKSPACE),
+            Some(GuestKeyOwner::ImeRecovery),
+            "the release leaves a completed-generation tombstone"
         );
     }
 
+    /// A keysym of a key another owner holds for the guest, its physical
+    /// press or a pair synthesized for the IME, neither duplicates nor
+    /// steals its press or release.
     #[test]
-    fn duplicate_keysym_press_does_not_duplicate_a_real_keyboard_press() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.key_generations.observe_physical_state(
-            HostId(host_keyboard_id),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            1,
-        );
-        assert!(ctx.claim_guest_key(
-            HostId(host_keyboard_id),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            GuestKeyOwner::Physical
-        ));
-        ctx.last_sender_id = host_v1_id;
+    fn keysyms_leave_a_key_another_owner_holds() {
+        use xkbcommon::xkb::keysyms::KEY_BackSpace;
+        for (owner, state) in [
+            (GuestKeyOwner::Physical, PRESSED),
+            (GuestKeyOwner::Physical, RELEASED),
+            (GuestKeyOwner::ImeRecovery, PRESSED),
+        ] {
+            let mut ime = Ime::with_keyboard();
+            ime.hold_owned(BACKSPACE, owner);
 
-        let mut handler = TextInputV1Handler;
-        assert_eq!(
-            handler.on_keysym(
-                &mut ctx,
-                123,
-                456,
-                xkbcommon::xkb::keysyms::KEY_BackSpace,
-                wl_keyboard::KEY_STATE_PRESSED,
-                0,
-            ),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "a keysym duplicate must not emit a second wl_keyboard.key press"
-        );
-        assert_eq!(
-            ctx.guest_key_owner(
-                HostId(host_keyboard_id),
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE
-            ),
-            Some(GuestKeyOwner::Physical),
-            "a real keyboard press must not be mislabeled as synthetic"
-        );
-        assert!(
-            ctx.key_generations.physically_held(
-                HostId(host_keyboard_id),
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE
-            ),
-            "dropping the duplicate must preserve the real physical press"
-        );
+            ime.keysym(KEY_BackSpace, state, 456, 123);
+            let case = format!("{owner:?} {state}");
+            assert_eq!(ime.events(), [], "{case}");
+            assert_eq!(ime.owner(BACKSPACE), Some(owner), "{case}");
+            let generations = &ime.ctx.key_generations;
+            assert!(
+                generations.physically_held(HOST_KEYBOARD, BACKSPACE),
+                "{case}"
+            );
+        }
     }
 
+    /// A repeated keysym repeats a guest press, and invents none.
     #[test]
     fn repeated_keysym_forwards_only_for_an_existing_guest_press() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        let keycode = keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a)
-            .expect("fallback keymap must contain KEY_a");
-        assert!(ctx.claim_guest_key(HostId(host_keyboard_id), keycode, GuestKeyOwner::Physical));
-        ctx.key_generations
-            .observe_physical_state(HostId(host_keyboard_id), keycode, 1);
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        assert_eq!(
-            handler.on_keysym(
-                &mut ctx,
-                123,
-                456,
-                xkbcommon::xkb::keysyms::KEY_a,
-                wl_keyboard::KEY_STATE_REPEATED,
-                0,
-            ),
-            Action::Drop
-        );
-        assert_eq!(
-            ctx.host_to_client_queue.len(),
-            1,
-            "a valid repeated keysym must reach the guest keyboard"
-        );
-        let payload = &ctx.host_to_client_queue[0].0[8..];
-        assert_eq!(
-            u32::from_ne_bytes(payload[8..12].try_into().unwrap()),
-            keycode
-        );
-        assert_eq!(
-            u32::from_ne_bytes(payload[12..16].try_into().unwrap()),
-            wl_keyboard::KEY_STATE_REPEATED
-        );
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        for pressed in [true, false] {
+            let mut ime = Ime::with_keyboard();
+            if pressed {
+                ime.hold_owned(a, GuestKeyOwner::Physical);
+            }
+            ime.keysym(KEY_a, REPEATED, 456, 123);
+            let expected = Vec::from_iter(pressed.then(|| key(KEYBOARD, a, REPEATED, 456, 123)));
+            assert_eq!(ime.events(), expected, "pressed: {pressed}");
+        }
     }
 
+    /// A keysym press whose serial a completed generation had is a delayed
+    /// duplicate, also across the serial's wrap; a newer one opens the next
+    /// generation.
+    #[test]
+    fn keysym_serial_distinguishes_delayed_duplicate_from_next_generation() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        // Each sequence opens and closes two generations; the presses that
+        // repeat serial 1 are dropped.
+        for (keysyms, forwarded) in [
+            (
+                &[
+                    (1, PRESSED),
+                    (2, RELEASED),
+                    (1, PRESSED),
+                    (3, PRESSED),
+                    (4, RELEASED),
+                    (1, PRESSED),
+                ][..],
+                [1, 2, 3, 4],
+            ),
+            (
+                &[
+                    (u32::MAX - 1, PRESSED),
+                    (u32::MAX, RELEASED),
+                    (0, PRESSED),
+                    (1, RELEASED),
+                ],
+                [u32::MAX - 1, u32::MAX, 0, 1],
+            ),
+        ] {
+            let mut ime = Ime::with_keyboard();
+            for &(serial, state) in keysyms {
+                ime.keysym(KEY_a, state, serial, 10);
+            }
+            let states = [PRESSED, RELEASED, PRESSED, RELEASED];
+            let expected = Vec::from_iter(
+                states
+                    .into_iter()
+                    .zip(forwarded)
+                    .map(|(state, serial)| key(KEYBOARD, a, state, serial, 10)),
+            );
+            assert_eq!(ime.events(), expected, "{keysyms:?}");
+        }
+    }
+
+    /// The physical channel's press of a generation that started as a
+    /// keysym is no second press.
     #[test]
     fn delayed_peek_and_keyboard_press_keep_keysym_pair_balanced() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        let host_extended_id = 777u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.keyboard_to_extended_keyboard
-            .insert(HostId(host_keyboard_id), HostId(host_extended_id));
-        ctx.extended_keyboard_to_keyboard
-            .insert(HostId(host_extended_id), HostId(host_keyboard_id));
-        let keycode = keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a)
-            .expect("fallback keymap must contain KEY_a");
-        let mut text_input = TextInputV1Handler;
-        let mut keyboard = KeyboardHandler::new();
-
-        ctx.last_sender_id = host_v1_id;
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.keysym(KEY_a, PRESSED, 1, 10);
+        ime.peek(a, PRESSED, 1, 10);
         assert_eq!(
-            text_input.on_keysym(
-                &mut ctx,
-                10,
-                1,
-                xkbcommon::xkb::keysyms::KEY_a,
-                wl_keyboard::KEY_STATE_PRESSED,
-                0,
-            ),
-            Action::Drop
-        );
-
-        ctx.last_sender_id = host_extended_id;
-        assert_eq!(
-            keyboard.on_peek_key(&mut ctx, 1, 10, keycode, wl_keyboard::KEY_STATE_PRESSED,),
-            Action::Drop
-        );
-        ctx.last_sender_id = host_keyboard_id;
-        assert_eq!(
-            keyboard.on_key(&mut ctx, 1, 10, keycode, wl_keyboard::KEY_STATE_PRESSED,),
+            ime.key(a, PRESSED, 1, 10),
             Action::Drop,
             "the delayed keyboard channel must not emit a duplicate press"
         );
-
-        ctx.last_sender_id = host_v1_id;
+        ime.keysym(KEY_a, RELEASED, 2, 20);
         assert_eq!(
-            text_input.on_keysym(
-                &mut ctx,
-                20,
-                2,
-                xkbcommon::xkb::keysyms::KEY_a,
-                wl_keyboard::KEY_STATE_RELEASED,
-                0,
-            ),
-            Action::Drop
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-        let states = ctx
-            .host_to_client_queue
-            .iter()
-            .map(|(message, _)| u32::from_ne_bytes(message[20..24].try_into().unwrap()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            states,
-            vec![
-                wl_keyboard::KEY_STATE_PRESSED,
-                wl_keyboard::KEY_STATE_RELEASED,
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 1, 10),
+                key(KEYBOARD, a, RELEASED, 2, 20)
             ]
         );
-        assert_eq!(
-            ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
-            Some(GuestKeyOwner::ImeRecovery)
-        );
-    }
-
-    #[test]
-    fn keysym_serial_distinguishes_delayed_duplicate_from_next_generation() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        for (serial, state) in [
-            (1, wl_keyboard::KEY_STATE_PRESSED),
-            (2, wl_keyboard::KEY_STATE_RELEASED),
-        ] {
-            handler.on_keysym(
-                &mut ctx,
-                serial * 10,
-                serial,
-                xkbcommon::xkb::keysyms::KEY_a,
-                state,
-                0,
-            );
-        }
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-
-        handler.on_keysym(
-            &mut ctx,
-            10,
-            1,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
-        assert_eq!(
-            ctx.host_to_client_queue.len(),
-            2,
-            "the completed generation's press serial must remain suppressed"
-        );
-
-        for (serial, state) in [
-            (3, wl_keyboard::KEY_STATE_PRESSED),
-            (4, wl_keyboard::KEY_STATE_RELEASED),
-        ] {
-            handler.on_keysym(
-                &mut ctx,
-                serial * 10,
-                serial,
-                xkbcommon::xkb::keysyms::KEY_a,
-                state,
-                0,
-            );
-        }
-        assert_eq!(
-            ctx.host_to_client_queue.len(),
-            4,
-            "a newer serial must open and close the next keysym generation"
-        );
-
-        handler.on_keysym(
-            &mut ctx,
-            10,
-            1,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
-        assert_eq!(
-            ctx.host_to_client_queue.len(),
-            4,
-            "an older press must not reopen a generation after a newer pair completed"
-        );
-    }
-
-    #[test]
-    fn keysym_serial_wrap_opens_the_next_generation() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, 888, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        for (serial, state) in [
-            (u32::MAX - 1, wl_keyboard::KEY_STATE_PRESSED),
-            (u32::MAX, wl_keyboard::KEY_STATE_RELEASED),
-            (0, wl_keyboard::KEY_STATE_PRESSED),
-            (1, wl_keyboard::KEY_STATE_RELEASED),
-        ] {
-            handler.on_keysym(
-                &mut ctx,
-                10,
-                serial,
-                xkbcommon::xkb::keysyms::KEY_a,
-                state,
-                0,
-            );
-        }
-
-        assert_eq!(
-            ctx.host_to_client_queue.len(),
-            4,
-            "serial wrap must not suppress the next balanced keysym pair"
-        );
+        assert_eq!(ime.owner(a), Some(GuestKeyOwner::ImeRecovery));
     }
 
     #[test]
     fn released_tombstone_accepts_new_keysym_before_new_peek() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        let host_extended_id = 777u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.keyboard_to_extended_keyboard
-            .insert(HostId(host_keyboard_id), HostId(host_extended_id));
-        ctx.extended_keyboard_to_keyboard
-            .insert(HostId(host_extended_id), HostId(host_keyboard_id));
-        let keycode = keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a)
-            .expect("fallback keymap must contain KEY_a");
-        let mut text_input = TextInputV1Handler;
-        let mut keyboard = KeyboardHandler::new();
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.peek(a, PRESSED, 0x8000_0010, 1000);
+        ime.keysym(KEY_a, PRESSED, 0x8000_0010, 1000);
+        ime.keysym(KEY_a, RELEASED, 0x8000_0011, 1010);
+        ime.peek(a, RELEASED, 0x8000_0012, 1020);
 
-        ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            0x8000_0010,
-            1000,
-            keycode,
-            wl_keyboard::KEY_STATE_PRESSED,
-        );
-        ctx.last_sender_id = host_v1_id;
-        text_input.on_keysym(
-            &mut ctx,
-            1000,
-            0x8000_0010,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
-        text_input.on_keysym(
-            &mut ctx,
-            1010,
-            0x8000_0011,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_RELEASED,
-            0,
-        );
-        ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            0x8000_0012,
-            1020,
-            keycode,
-            wl_keyboard::KEY_STATE_RELEASED,
-        );
-
-        ctx.last_sender_id = host_v1_id;
-        text_input.on_keysym(
-            &mut ctx,
-            1100,
-            0x8000_0020,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
+        ime.keysym(KEY_a, PRESSED, 0x8000_0020, 1100);
         assert_eq!(
-            ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
-            Some(GuestKeyOwner::TextInputKeysym)
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 0x8000_0010, 1000),
+                key(KEYBOARD, a, RELEASED, 0x8000_0011, 1010),
+                key(KEYBOARD, a, PRESSED, 0x8000_0020, 1100),
+            ]
         );
-
-        ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            0x8000_0020,
-            1100,
-            keycode,
-            wl_keyboard::KEY_STATE_PRESSED,
-        );
+        assert_eq!(ime.owner(a), Some(GuestKeyOwner::TextInputKeysym));
+        ime.peek(a, PRESSED, 0x8000_0020, 1100);
         assert_eq!(
-            ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
+            ime.owner(a),
             Some(GuestKeyOwner::TextInputKeysym),
             "the delayed physical channel must attach to the keysym-first generation"
         );
@@ -4893,99 +4484,34 @@ mod tests {
 
     #[test]
     fn released_generation_drops_delayed_keysym_press_before_release_boundary() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        let host_extended_id = 777u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.keyboard_to_extended_keyboard
-            .insert(HostId(host_keyboard_id), HostId(host_extended_id));
-        ctx.extended_keyboard_to_keyboard
-            .insert(HostId(host_extended_id), HostId(host_keyboard_id));
-        let keycode = keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a)
-            .expect("fallback keymap must contain KEY_a");
-        let mut text_input = TextInputV1Handler;
-        let mut keyboard = KeyboardHandler::new();
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.peek(a, PRESSED, u32::MAX - 3, 1000);
+        ime.keysym(KEY_a, PRESSED, u32::MAX - 2, 1000);
+        ime.peek(a, RELEASED, 0, 1010);
 
-        ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            u32::MAX - 3,
-            1000,
-            keycode,
-            wl_keyboard::KEY_STATE_PRESSED,
-        );
-        ctx.last_sender_id = host_v1_id;
-        text_input.on_keysym(
-            &mut ctx,
-            1000,
-            u32::MAX - 2,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
-        ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(&mut ctx, 0, 1010, keycode, wl_keyboard::KEY_STATE_RELEASED);
-
-        ctx.last_sender_id = host_v1_id;
-        text_input.on_keysym(
-            &mut ctx,
-            1005,
-            u32::MAX - 1,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
+        ime.keysym(KEY_a, PRESSED, u32::MAX - 1, 1005);
         assert_eq!(
-            ctx.host_to_client_queue.len(),
-            1,
+            ime.events(),
+            [key(KEYBOARD, a, PRESSED, u32::MAX - 2, 1000)],
             "a delayed press before the wrapped release boundary must not reach the guest"
         );
+        let generations = &ime.ctx.key_generations;
         assert_eq!(
-            ctx.key_generations
-                .guest_press_serial(HostId(host_keyboard_id), keycode),
+            generations.guest_press_serial(HOST_KEYBOARD, a),
             Some(u32::MAX - 2)
         );
 
-        text_input.on_keysym(
-            &mut ctx,
-            1100,
-            1,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
-        text_input.on_keysym(
-            &mut ctx,
-            1010,
-            u32::MAX,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_RELEASED,
-            0,
-        );
-        text_input.on_keysym(
-            &mut ctx,
-            1110,
-            2,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_RELEASED,
-            0,
-        );
-
-        let states = ctx
-            .host_to_client_queue
-            .iter()
-            .map(|(message, _)| u32::from_ne_bytes(message[20..24].try_into().unwrap()))
-            .collect::<Vec<_>>();
+        ime.keysym(KEY_a, PRESSED, 1, 1100);
+        ime.keysym(KEY_a, RELEASED, u32::MAX, 1010);
+        ime.keysym(KEY_a, RELEASED, 2, 1110);
         assert_eq!(
-            states,
-            vec![
-                wl_keyboard::KEY_STATE_PRESSED,
-                wl_keyboard::KEY_STATE_PRESSED,
-                wl_keyboard::KEY_STATE_RELEASED,
-                wl_keyboard::KEY_STATE_RELEASED,
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 1, 1100),
+                key(KEYBOARD, a, RELEASED, u32::MAX, 1010),
+                key(KEYBOARD, a, RELEASED, 2, 1110),
             ],
             "the old and current generations must each retain one balanced key pair"
         );
@@ -4993,827 +4519,178 @@ mod tests {
 
     #[test]
     fn delayed_keysym_release_closes_retired_generation_only() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        let host_extended_id = 777u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.keyboard_to_extended_keyboard
-            .insert(HostId(host_keyboard_id), HostId(host_extended_id));
-        ctx.extended_keyboard_to_keyboard
-            .insert(HostId(host_extended_id), HostId(host_keyboard_id));
-        let keycode = keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a)
-            .expect("fallback keymap must contain KEY_a");
-        let mut text_input = TextInputV1Handler;
-        let mut keyboard = KeyboardHandler::new();
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.peek(a, PRESSED, 10, 100);
+        ime.keysym(KEY_a, PRESSED, 10, 100);
+        ime.peek(a, RELEASED, 11, 110);
+        ime.peek(a, PRESSED, 20, 200);
 
-        ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(&mut ctx, 10, 100, keycode, wl_keyboard::KEY_STATE_PRESSED);
-        ctx.last_sender_id = host_v1_id;
-        text_input.on_keysym(
-            &mut ctx,
-            100,
-            10,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
-        ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(&mut ctx, 11, 110, keycode, wl_keyboard::KEY_STATE_RELEASED);
-        keyboard.on_peek_key(&mut ctx, 20, 200, keycode, wl_keyboard::KEY_STATE_PRESSED);
-
-        ctx.last_sender_id = host_v1_id;
-        text_input.on_keysym(
-            &mut ctx,
-            110,
-            11,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_RELEASED,
-            0,
-        );
+        ime.keysym(KEY_a, RELEASED, 11, 110);
         assert!(
-            ctx.key_generations
-                .physically_held(HostId(host_keyboard_id), keycode),
+            ime.ctx.key_generations.physically_held(HOST_KEYBOARD, a),
             "the retired release must not close the current physical generation"
         );
         assert_eq!(
-            ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
+            ime.owner(a),
             None,
             "the new generation must remain available after the retired release"
         );
 
-        for (serial, state) in [
-            (20, wl_keyboard::KEY_STATE_PRESSED),
-            (21, wl_keyboard::KEY_STATE_RELEASED),
-        ] {
-            text_input.on_keysym(
-                &mut ctx,
-                serial * 10,
-                serial,
-                xkbcommon::xkb::keysyms::KEY_a,
-                state,
-                0,
-            );
-        }
-        let states = ctx
-            .host_to_client_queue
-            .iter()
-            .map(|(message, _)| u32::from_ne_bytes(message[20..24].try_into().unwrap()))
-            .collect::<Vec<_>>();
+        ime.keysym(KEY_a, PRESSED, 20, 200);
+        ime.keysym(KEY_a, RELEASED, 21, 210);
         assert_eq!(
-            states,
-            vec![
-                wl_keyboard::KEY_STATE_PRESSED,
-                wl_keyboard::KEY_STATE_RELEASED,
-                wl_keyboard::KEY_STATE_PRESSED,
-                wl_keyboard::KEY_STATE_RELEASED,
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 10, 100),
+                key(KEYBOARD, a, RELEASED, 11, 110),
+                key(KEYBOARD, a, PRESSED, 20, 200),
+                key(KEYBOARD, a, RELEASED, 21, 210),
             ],
             "each physical generation must produce one balanced guest pair"
         );
     }
 
+    /// The releases of a retired keysym generation and of the current one
+    /// each close their own press, in either order.
     #[test]
     fn current_keysym_release_does_not_consume_retired_release() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        let host_extended_id = 777u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.keyboard_to_extended_keyboard
-            .insert(HostId(host_keyboard_id), HostId(host_extended_id));
-        ctx.extended_keyboard_to_keyboard
-            .insert(HostId(host_extended_id), HostId(host_keyboard_id));
-        let keycode = keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a)
-            .expect("fallback keymap must contain KEY_a");
-        let mut text_input = TextInputV1Handler;
-        let mut keyboard = KeyboardHandler::new();
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.peek(a, PRESSED, 10, 100);
+        ime.keysym(KEY_a, PRESSED, 10, 100);
+        ime.peek(a, RELEASED, 11, 110);
+        ime.peek(a, PRESSED, 20, 200);
 
-        ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(&mut ctx, 10, 100, keycode, wl_keyboard::KEY_STATE_PRESSED);
-        ctx.last_sender_id = host_v1_id;
-        text_input.on_keysym(
-            &mut ctx,
-            100,
-            10,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
-        ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(&mut ctx, 11, 110, keycode, wl_keyboard::KEY_STATE_RELEASED);
-        keyboard.on_peek_key(&mut ctx, 20, 200, keycode, wl_keyboard::KEY_STATE_PRESSED);
-
-        ctx.last_sender_id = host_v1_id;
-        for (serial, state) in [
-            (20, wl_keyboard::KEY_STATE_PRESSED),
-            (21, wl_keyboard::KEY_STATE_RELEASED),
-        ] {
-            text_input.on_keysym(
-                &mut ctx,
-                serial * 10,
-                serial,
-                xkbcommon::xkb::keysyms::KEY_a,
-                state,
-                0,
-            );
-        }
+        ime.keysym(KEY_a, PRESSED, 20, 200);
+        ime.keysym(KEY_a, RELEASED, 21, 210);
         assert_eq!(
-            ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
+            ime.owner(a),
             Some(GuestKeyOwner::ImeRecovery),
             "the current release must complete the current owner"
         );
-
-        text_input.on_keysym(
-            &mut ctx,
-            110,
-            11,
-            xkbcommon::xkb::keysyms::KEY_a,
-            wl_keyboard::KEY_STATE_RELEASED,
-            0,
-        );
+        ime.keysym(KEY_a, RELEASED, 11, 110);
         assert_eq!(
-            ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
+            ime.owner(a),
             Some(GuestKeyOwner::ImeRecovery),
             "the delayed retired release must not disturb the current tombstone"
         );
-        let states = ctx
-            .host_to_client_queue
-            .iter()
-            .map(|(message, _)| u32::from_ne_bytes(message[20..24].try_into().unwrap()))
-            .collect::<Vec<_>>();
         assert_eq!(
-            states
-                .iter()
-                .filter(|&&state| state == wl_keyboard::KEY_STATE_PRESSED)
-                .count(),
-            2
-        );
-        assert_eq!(
-            states
-                .iter()
-                .filter(|&&state| state == wl_keyboard::KEY_STATE_RELEASED)
-                .count(),
-            2,
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 10, 100),
+                key(KEYBOARD, a, PRESSED, 20, 200),
+                key(KEYBOARD, a, RELEASED, 21, 210),
+                key(KEYBOARD, a, RELEASED, 11, 110),
+            ],
             "both guest presses must eventually receive one release"
         );
     }
 
+    /// The next keysym press is the first event of its generation: it
+    /// retires the still-open previous keysym owner before the new peek
+    /// catches up, and either release order balances both.
     #[test]
     fn keysym_first_generation_retires_open_previous_owner() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
         for old_release_first in [true, false] {
-            let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-            let guest_keyboard_id = 999u32;
-            let host_keyboard_id = 888u32;
-            let host_extended_id = 777u32;
-            ctx.shadow_table.insert_paired_for_test(
-                guest_keyboard_id,
-                host_keyboard_id,
-                "wl_keyboard",
-            );
-            ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-            ctx.keyboard_to_extended_keyboard
-                .insert(HostId(host_keyboard_id), HostId(host_extended_id));
-            ctx.extended_keyboard_to_keyboard
-                .insert(HostId(host_extended_id), HostId(host_keyboard_id));
-            let keycode = keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a)
-                .expect("fallback keymap must contain KEY_a");
-            let mut text_input = TextInputV1Handler;
-            let mut keyboard = KeyboardHandler::new();
+            let mut ime = Ime::with_extended_keyboard();
+            ime.peek(a, PRESSED, u32::MAX - 3, 1000);
+            ime.keysym(KEY_a, PRESSED, u32::MAX - 2, 1000);
+            ime.peek(a, RELEASED, u32::MAX - 1, 1010);
 
-            ctx.last_sender_id = host_extended_id;
-            keyboard.on_peek_key(
-                &mut ctx,
-                u32::MAX - 3,
-                1000,
-                keycode,
-                wl_keyboard::KEY_STATE_PRESSED,
-            );
-            ctx.last_sender_id = host_v1_id;
-            text_input.on_keysym(
-                &mut ctx,
-                1000,
-                u32::MAX - 2,
-                xkbcommon::xkb::keysyms::KEY_a,
-                wl_keyboard::KEY_STATE_PRESSED,
-                0,
-            );
-            ctx.last_sender_id = host_extended_id;
-            keyboard.on_peek_key(
-                &mut ctx,
-                u32::MAX - 1,
-                1010,
-                keycode,
-                wl_keyboard::KEY_STATE_RELEASED,
-            );
+            ime.keysym(KEY_a, PRESSED, 0, 1100);
+            assert_eq!(ime.owner(a), Some(GuestKeyOwner::TextInputKeysym));
+            ime.peek(a, PRESSED, 1, 1100);
 
-            // The next keysym press is the first event of its generation. It
-            // must retire the still-open previous keysym owner before the new
-            // peek channel catches up.
-            ctx.last_sender_id = host_v1_id;
-            text_input.on_keysym(
-                &mut ctx,
-                1100,
-                0,
-                xkbcommon::xkb::keysyms::KEY_a,
-                wl_keyboard::KEY_STATE_PRESSED,
-                0,
-            );
-            assert_eq!(
-                ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
-                Some(GuestKeyOwner::TextInputKeysym)
-            );
-            ctx.last_sender_id = host_extended_id;
-            keyboard.on_peek_key(&mut ctx, 1, 1100, keycode, wl_keyboard::KEY_STATE_PRESSED);
-
-            ctx.last_sender_id = host_v1_id;
-            let releases = if old_release_first {
-                [(1010, u32::MAX - 1), (1200, 2)]
-            } else {
-                [(1200, 2), (1010, u32::MAX - 1)]
-            };
-            for (timestamp, serial) in releases {
-                text_input.on_keysym(
-                    &mut ctx,
-                    timestamp,
-                    serial,
-                    xkbcommon::xkb::keysyms::KEY_a,
-                    wl_keyboard::KEY_STATE_RELEASED,
-                    0,
-                );
+            let mut releases = [(u32::MAX - 1, 1010), (2, 1200)];
+            if !old_release_first {
+                releases.reverse();
             }
-
+            for (serial, time) in releases {
+                ime.keysym(KEY_a, RELEASED, serial, time);
+            }
             assert_eq!(
-                ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
+                ime.owner(a),
                 Some(GuestKeyOwner::ImeRecovery),
                 "the current owner must complete regardless of release order"
             );
-            let states = ctx
-                .host_to_client_queue
-                .iter()
-                .map(|(message, _)| u32::from_ne_bytes(message[20..24].try_into().unwrap()))
-                .collect::<Vec<_>>();
+            let mut expected = vec![
+                key(KEYBOARD, a, PRESSED, u32::MAX - 2, 1000),
+                key(KEYBOARD, a, PRESSED, 0, 1100),
+            ];
+            expected
+                .extend(releases.map(|(serial, time)| key(KEYBOARD, a, RELEASED, serial, time)));
             assert_eq!(
-                states
-                    .iter()
-                    .filter(|&&state| state == wl_keyboard::KEY_STATE_PRESSED)
-                    .count(),
-                2
-            );
-            assert_eq!(
-                states
-                    .iter()
-                    .filter(|&&state| state == wl_keyboard::KEY_STATE_RELEASED)
-                    .count(),
-                2,
+                ime.events(),
+                expected,
                 "both keysym-first generations must remain balanced"
             );
         }
     }
 
+    /// Without a focused keyboard on the seat, a keysym takes the keyboard
+    /// with the lowest ID, whatever order a map holds them in, but one
+    /// whose Backspace the IME fallback holds only for Backspace.
     #[test]
-    fn repeated_keysym_without_a_guest_press_is_dropped() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.last_sender_id = host_v1_id;
+    fn on_keysym_selects_guest_keyboard_deterministically() {
+        use xkbcommon::xkb::keysyms::{KEY_BackSpace, KEY_A};
+        let mut ime = Ime::new();
+        ime.keyboard(999, HostId(888));
+        ime.keyboard(100, HostId(777));
+        ime.keysym(KEY_BackSpace, PRESSED, 456, 123);
+        assert_eq!(ime.events(), [key(100, BACKSPACE, PRESSED, 456, 123)]);
 
-        let mut handler = TextInputV1Handler;
+        let mut ime = Ime::new();
+        ime.keyboard(100, HostId(101));
+        ime.keyboard(200, HostId(201));
+        let generations = &mut ime.ctx.key_generations;
+        generations.observe_physical_state(HostId(101), BACKSPACE, 1);
+        ime.keysym(KEY_A, PRESSED, 456, 123);
+        let [(keyboard, _)] = ime.events()[..] else {
+            panic!("the keysym reached no one keyboard");
+        };
         assert_eq!(
-            handler.on_keysym(
-                &mut ctx,
-                123,
-                456,
-                xkbcommon::xkb::keysyms::KEY_a,
-                wl_keyboard::KEY_STATE_REPEATED,
-                0,
-            ),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "a repeated keysym must not invent a press for the guest"
-        );
-    }
-
-    #[test]
-    fn keysym_backspace_does_not_duplicate_an_ime_synthetic_pair() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.key_generations.observe_physical_state(
-            HostId(host_keyboard_id),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            1,
-        );
-        assert!(ctx.claim_guest_key(
-            HostId(host_keyboard_id),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            GuestKeyOwner::ImeRecovery
-        ));
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        assert_eq!(
-            handler.on_keysym(
-                &mut ctx,
-                123,
-                456,
-                xkbcommon::xkb::keysyms::KEY_BackSpace,
-                wl_keyboard::KEY_STATE_PRESSED,
-                0,
-            ),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "a keysym Backspace must not duplicate a pair already synthesized for the IME"
-        );
-        assert!(
-            ctx.guest_key_owner(
-                HostId(host_keyboard_id),
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE
-            ) == Some(GuestKeyOwner::ImeRecovery),
-            "the physical release marker must remain until the real release arrives"
-        );
-    }
-
-    #[test]
-    fn keysym_non_backspace_prefers_keyboard_without_held_backspace() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let first_guest_keyboard = 100;
-        let second_guest_keyboard = 200;
-        let first_host_keyboard = 101;
-        let second_host_keyboard = 201;
-        for (guest_keyboard, host_keyboard) in [
-            (first_guest_keyboard, first_host_keyboard),
-            (second_guest_keyboard, second_host_keyboard),
-        ] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-            ctx.keyboard_to_seat.insert(guest_keyboard, 0);
-        }
-        ctx.key_generations.observe_physical_state(
-            HostId(first_host_keyboard),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            1,
-        );
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        assert_eq!(
-            handler.on_keysym(
-                &mut ctx,
-                123,
-                456,
-                xkbcommon::xkb::keysyms::KEY_A,
-                wl_keyboard::KEY_STATE_PRESSED,
-                0,
-            ),
-            Action::Drop
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(
-            msg_sender(&ctx.host_to_client_queue, 0),
-            second_guest_keyboard,
-            "an ordinary keysym must not be routed to the keyboard currently
-             reserved for IME Backspace fallback"
+            keyboard, 200,
+            "an ordinary keysym must not be routed to the keyboard reserved for IME Backspace fallback"
         );
     }
 
     #[test]
     fn keysym_prefers_keyboard_with_current_surface_focus() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let stale_guest_keyboard = 100;
-        let focused_guest_keyboard = 200;
-        let stale_host_keyboard = 101;
-        let focused_host_keyboard = 201;
-        let current_surface = 300;
+        use xkbcommon::xkb::keysyms::KEY_A;
+        let mut ime = Ime::new();
+        ime.keyboard(100, HostId(101));
+        ime.keyboard(200, HostId(201));
+        ime.focus(HostId(201));
 
-        for (guest_keyboard, host_keyboard) in [
-            (stale_guest_keyboard, stale_host_keyboard),
-            (focused_guest_keyboard, focused_host_keyboard),
-        ] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-            ctx.keyboard_to_seat.insert(guest_keyboard, 0);
-        }
-        set_test_focus(&mut ctx, HostId(focused_host_keyboard), 0, current_surface);
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
+        ime.keysym(KEY_A, PRESSED, 456, 123);
+        let [(keyboard, _)] = ime.events()[..] else {
+            panic!("the keysym reached no one keyboard");
+        };
         assert_eq!(
-            handler.on_keysym(
-                &mut ctx,
-                123,
-                456,
-                xkbcommon::xkb::keysyms::KEY_A,
-                wl_keyboard::KEY_STATE_PRESSED,
-                0,
-            ),
-            Action::Drop
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(
-            msg_sender(&ctx.host_to_client_queue, 0),
-            focused_guest_keyboard,
+            keyboard, 200,
             "a host keysym must target the keyboard whose surface owns the seat focus"
         );
     }
 
     #[test]
-    fn keysym_release_without_synthetic_press_is_dropped() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        let host_keyboard_id = 888u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.key_generations.observe_physical_state(
-            HostId(host_keyboard_id),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            1,
-        );
-        assert!(ctx.claim_guest_key(
-            HostId(host_keyboard_id),
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            GuestKeyOwner::Physical
-        ));
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        assert_eq!(
-            handler.on_keysym(
-                &mut ctx,
-                124,
-                457,
-                xkbcommon::xkb::keysyms::KEY_BackSpace,
-                wl_keyboard::KEY_STATE_RELEASED,
-                0,
-            ),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "a keysym release must not steal the release for a real press"
-        );
-        assert!(
-            ctx.guest_key_owner(
-                HostId(host_keyboard_id),
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE
-            ) == Some(GuestKeyOwner::Physical),
-            "the real press must remain paired with its physical release"
-        );
-        assert!(
-            ctx.key_generations.physically_held(
-                HostId(host_keyboard_id),
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE
-            ),
-            "dropping the duplicate must preserve the physical state"
-        );
-    }
-
-    #[test]
-    fn on_keysym_release_closes_synthetic_keyboard_pair() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        let guest_keyboard_id = 999u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard_id, 888, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        handler.on_keysym(
-            &mut ctx,
-            123,
-            456,
-            xkbcommon::xkb::keysyms::KEY_BackSpace,
-            wl_keyboard::KEY_STATE_PRESSED,
-            0,
-        );
-        handler.on_keysym(
-            &mut ctx,
-            124,
-            457,
-            xkbcommon::xkb::keysyms::KEY_BackSpace,
-            wl_keyboard::KEY_STATE_RELEASED,
-            0,
-        );
-
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-        assert!(
-            !ctx.key_generations
-                .physically_held(HostId(888), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
-            "keysym delivery must remain independent of physical-key state"
-        );
-        assert!(
-            ctx.guest_key_owner(HostId(888), crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
-                == Some(GuestKeyOwner::ImeRecovery),
-            "keysym release must retain a completed-generation tombstone"
-        );
-    }
-
-    #[test]
-    fn empty_preedit_confirmation_requires_a_held_backspace() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .expect("text input")
-            .current_preedit = "가".to_string();
-
-        let mut v1_handler = TextInputV1Handler;
-        assert_eq!(
-            v1_handler.on_preedit_string(&mut ctx, 1, &String::new(), &String::new()),
-            Action::Drop
-        );
-        assert!(!ime_repeat_active_for_seat(&ctx, 0));
-
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = 30;
-        assert_eq!(
-            ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 0),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "confirm_preedit must not synthesize Backspace without a held key"
-        );
-    }
-
-    #[test]
     fn fallback_keysym_lookup_is_stable_and_reusable() {
-        assert_eq!(
-            keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_BackSpace),
-            Some(crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
-        );
-        assert_eq!(
-            keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_BackSpace),
-            Some(crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
-        );
+        use xkbcommon::xkb::keysyms::{KEY_BackSpace, KEY_a, KEY_A};
+        for _ in 0..2 {
+            assert_eq!(keysym_to_evdev_keycode(KEY_BackSpace), Some(BACKSPACE));
+        }
         assert_eq!(keysym_to_evdev_keycode(u32::MAX), None);
-    }
-
-    #[test]
-    fn fallback_keysym_lookup_includes_shifted_symbols() {
-        assert_eq!(
-            keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a),
-            keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_A)
-        );
         assert!(
-            keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_A).is_some(),
+            keysym_to_evdev_keycode(KEY_A).is_some(),
             "uppercase keysym events must map to the same physical key"
         );
-    }
-
-    #[test]
-    fn on_keysym_selects_guest_keyboard_deterministically() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        for (guest_keyboard, host_keyboard) in [(999, 888), (100, 777)] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-            ctx.keyboard_to_seat.insert(guest_keyboard, 0);
-        }
-        ctx.last_sender_id = host_v1_id;
-
         assert_eq!(
-            TextInputV1Handler.on_keysym(
-                &mut ctx,
-                123,
-                456,
-                xkbcommon::xkb::keysyms::KEY_BackSpace,
-                1,
-                0,
-            ),
-            Action::Drop
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(
-            msg_sender(&ctx.host_to_client_queue, 0),
-            100,
-            "keysym routing must not depend on HashMap iteration order"
-        );
-    }
-
-    #[test]
-    fn held_backspace_fallback_rejects_unmapped_guest_keyboard() {
-        let (mut ctx, _, _) = setup_v1_ctx();
-        // A stale route can survive a malformed/reordered bind, but without a
-        // host keyboard there is no physical key or compositor time domain from
-        // which a synthetic pair may safely be generated.
-        ctx.keyboard_to_seat.insert(40, 0);
-        ctx.last_sender_id = 30;
-
-        let mut handler = ExtendedTextInputV1Handler;
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "synthetic Backspace must require a mapped host keyboard"
-        );
-    }
-
-    #[test]
-    fn non_empty_v1_commit_clears_stale_repeat_fallback() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-        state.current_preedit = "가".to_string();
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        handler.on_preedit_string(&mut ctx, 1, &String::new(), &"확정".to_string());
-
-        assert!(!backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
-    }
-
-    #[test]
-    fn test_activation_state_machine() {
-        let (mut ctx, _host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .expect("text input fixture")
-            .active_surface = None;
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host = HostApplied::Inactive;
-
-        // Guest calls commit before focus (active_surface is None).
-        ctx.last_sender_id = guest_id;
-        let mut v3_handler = TextInputV3Handler;
-        let action = v3_handler.on_commit(&mut ctx);
-        assert_eq!(action, Action::Drop);
-
-        // Should NOT send activate (opcode 0) to host because active_surface is None.
-        let mut found_activate = false;
-        for (msg, _) in &ctx.client_to_host_queue {
-            let opcode = u32::from(crate::test_support::msg_opcode(msg));
-            if opcode == 0 {
-                found_activate = true;
-            }
-        }
-        assert!(
-            !found_activate,
-            "Should not send activate when active_surface is None"
-        );
-
-        // 2. Keyboard enter is received from host. Set active_surface to a mock guest surface ID (1234).
-        let guest_surface = 1234u32;
-        let host_surface = 5678u32;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_surface, host_surface, "wl_surface");
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.active_surface = Some(guest_surface);
-        }
-        reconcile_host(&mut ctx, guest_id, None);
-
-        // Now it should have sent activate (opcode 0) with surface host_surface (5678).
-        let mut found_activate = false;
-        let mut activate_surface = 0u32;
-        for (msg, _) in &ctx.client_to_host_queue {
-            let opcode = u32::from(crate::test_support::msg_opcode(msg));
-            if opcode == 0 {
-                found_activate = true;
-                let payload = &msg[8..];
-                // activate(seat, surface) -> seat is first u32, surface is second u32 (offset 4)
-                activate_surface = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
-            }
-        }
-        assert!(found_activate, "Should send activate when focused");
-        assert_eq!(activate_surface, host_surface);
-
-        // Clear the queue to check next transition.
-        ctx.client_to_host_queue.clear();
-
-        // 3. Keyboard leave is received (active_surface is None).
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.active_surface = None;
-        }
-        reconcile_host(&mut ctx, guest_id, None);
-
-        // Now it should have sent deactivate (opcode 1).
-        let mut found_deactivate = false;
-        for (msg, _) in &ctx.client_to_host_queue {
-            let opcode = u32::from(crate::test_support::msg_opcode(msg));
-            if opcode == 1 {
-                found_deactivate = true;
-            }
-        }
-        assert!(
-            found_deactivate,
-            "Should send deactivate when focus is lost"
-        );
-    }
-
-    #[test]
-    fn v3_requests_after_leave_are_ignored_until_next_enter() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .expect("text input fixture")
-            .active_surface = None;
-        let before = ctx.text_inputs[&guest_id].pending.clone();
-        let commits_before = ctx.text_inputs[&guest_id].guest_commit_serial();
-        ctx.last_sender_id = guest_id;
-        let mut handler = TextInputV3Handler;
-
-        assert_eq!(handler.on_enable(&mut ctx), Action::Drop);
-        assert_eq!(
-            handler.on_set_surrounding_text(&mut ctx, &"stale".to_string(), 0, 0),
-            Action::Drop
-        );
-        assert_eq!(handler.on_set_text_change_cause(&mut ctx, 7), Action::Drop);
-        assert_eq!(handler.on_set_content_type(&mut ctx, 3, 4), Action::Drop);
-        assert_eq!(
-            handler.on_set_cursor_rectangle(&mut ctx, 1, 2, 3, 4),
-            Action::Drop
-        );
-        assert_eq!(handler.on_disable(&mut ctx), Action::Drop);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-
-        assert!(
-            ctx.client_to_host_queue.is_empty(),
-            "requests after v3 leave must not reach the host IME"
-        );
-        let state = &ctx.text_inputs[&guest_id];
-        assert_eq!(
-            state.pending, before,
-            "inactive v3 requests must not mutate double-buffered state"
-        );
-        assert_eq!(
-            state.guest_commit_serial(),
-            commits_before.wrapping_add(1),
-            "an inactive commit still counts toward the done serial"
-        );
-    }
-
-    /// text-input-v3 numbers `done` by every commit on the object, so the
-    /// commits a client makes while unfocused must count as well.
-    #[test]
-    fn v3_done_serial_counts_commits_made_while_unfocused() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        let first_surface = ctx.text_inputs[&guest_id].active_surface;
-        let next_surface = 901;
-        ctx.shadow_table
-            .insert_paired_for_test(next_surface, 902, "wl_surface");
-        let guest_seat = ctx.text_inputs[&guest_id].guest_seat;
-        let mut v3 = TextInputV3Handler;
-
-        // Focus leaves; the client disables and commits while unfocused.
-        apply_keyboard_focus_changes(
-            &mut ctx,
-            &[SeatFocusChange {
-                guest_seat,
-                previous_surface: first_surface,
-                current_surface: None,
-            }],
-        );
-        let barrier = ctx.text_inputs[&guest_id]
-            .draining_callback()
-            .expect("leaving deactivates the host text input behind a barrier");
-        ctx.last_sender_id = guest_id;
-        assert_eq!(v3.on_disable(&mut ctx), Action::Drop);
-        assert_eq!(v3.on_commit(&mut ctx), Action::Drop);
-
-        // Focus enters again; the client enables and commits.
-        apply_keyboard_focus_changes(
-            &mut ctx,
-            &[SeatFocusChange {
-                guest_seat,
-                previous_surface: None,
-                current_surface: Some(next_surface),
-            }],
-        );
-        ctx.last_sender_id = guest_id;
-        assert_eq!(v3.on_enable(&mut ctx), Action::Drop);
-        assert_eq!(v3.on_commit(&mut ctx), Action::Drop);
-        ctx.last_sender_id = barrier.0;
-        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
-        assert!(ctx.text_inputs[&guest_id].host_is_active());
-
-        // The IME commits text; `done` must carry the client's commit count.
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = host_v1_id;
-        assert_eq!(
-            TextInputV1Handler.on_commit_string(&mut ctx, 2, &"가".to_string()),
-            Action::Drop
-        );
-        let done = ctx.host_to_client_queue.len() - 1;
-        assert_eq!(
-            msg_opcode(&ctx.host_to_client_queue, done),
-            zwp_text_input_v3::EVT_DONE
-        );
-        assert_eq!(
-            msg_done_serial(&ctx.host_to_client_queue, done),
-            2,
-            "the client made two commits"
+            keysym_to_evdev_keycode(KEY_a),
+            keysym_to_evdev_keycode(KEY_A)
         );
     }
 }

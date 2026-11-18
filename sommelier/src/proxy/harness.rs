@@ -90,7 +90,7 @@ impl Session {
     }
 
     /// The guest sends `requests`, which must end the session.
-    pub(super) async fn guest_fatal(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
+    pub(crate) async fn guest_fatal(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
         assert!(
             !self.send(Direction::ClientToHost, requests).await,
             "the guest's requests did not end the session"
@@ -116,21 +116,21 @@ impl Session {
     /// Make every later send to the guest fail, as when its connection
     /// breaks. Closing the guest's end would not do: a process another test
     /// spawns may hold a copy of it.
-    pub(super) fn break_guest_connection(&self) {
+    pub(crate) fn break_guest_connection(&self) {
         let socket = self.client.client_conn.as_raw_fd();
         assert_eq!(unsafe { libc::shutdown(socket, libc::SHUT_WR) }, 0);
     }
 
     /// Whether a guest request waits for a fence, holding back the guest's
     /// stream.
-    pub(super) fn parked(&self) -> bool {
+    pub(crate) fn parked(&self) -> bool {
         self.client.parked.is_some()
     }
 
     /// Wait until the parked guest request is due, as `Client::run` does,
     /// and dispatch the guest's stream from it, which must not end the
     /// session.
-    pub(super) async fn resume(&mut self) {
+    pub(crate) async fn resume(&mut self) {
         assert!(self.parked(), "no guest request waits for a fence");
         ParkedRequest::due(self.client.parked.as_ref()).await;
         self.guest([]).await;
@@ -158,7 +158,7 @@ impl Session {
     }
 
     /// [`Self::guest_received_and_error`], with the error's diagnostic.
-    pub(super) fn guest_received_and_diagnosed_error(
+    pub(crate) fn guest_received_and_diagnosed_error(
         &mut self,
     ) -> (Vec<(u32, AnyEvent)>, (u32, u32), String) {
         assert!(self.client.ended, "the session goes on");
@@ -233,7 +233,21 @@ impl Session {
     /// of the new object, which are not kept. What the proxy sends the host
     /// is not kept either: its own reactions to the global, and the bind,
     /// unless the proxy implements the global.
-    pub(super) async fn bind(&mut self, interface: &str, version: u32) -> u32 {
+    pub(crate) async fn bind(&mut self, interface: &str, version: u32) -> u32 {
+        self.bind_global(interface, version).await.0
+    }
+
+    /// [`Self::bind`] for a global the proxy forwards: returns the guest's
+    /// object and the host object its bind creates.
+    pub(crate) async fn bind_paired(&mut self, interface: &str, version: u32) -> Object {
+        let (id, host) = self.bind_global(interface, version).await;
+        let host = host.expect("the proxy forwards the bind");
+        Object { id, host }
+    }
+
+    /// [`Self::bind`], which also returns the host object the forward of
+    /// the guest's bind creates, if the proxy forwards it.
+    async fn bind_global(&mut self, interface: &str, version: u32) -> (u32, Option<u32>) {
         let earlier = (self.guest.received.len(), self.host.received.len());
         let name = self.advertise(interface, version).await;
         let advertised = self.guest.received.split_off(earlier.0);
@@ -251,8 +265,15 @@ impl Session {
         assert_eq!(*advertised_name, name);
         let registry = self.registry.expect("advertising created the registry");
         let id = self.new_id();
+        let advertised = self.host.received.len();
         self.guest([wl_registry::req::bind(registry.id, name, interface, *version, id).unwrap()])
             .await;
+        let forward = self.host.received[advertised..]
+            .iter()
+            .find_map(|request| match request {
+                (_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. })) => Some(id.2),
+                _ => None,
+            });
         let host = self.host.received.split_off(earlier.1);
         for (sender, request) in &host {
             if let AnyRequest::WlRegistry(wl_registry::Request::Bind {
@@ -270,12 +291,12 @@ impl Session {
             events.iter().all(|(sender, _)| *sender == id),
             "the guest got events of other objects: {events:?}"
         );
-        id
+        (id, forward)
     }
 
     /// A new `wl_surface`, from a `wl_compositor` the guest binds on first
     /// use.
-    pub(super) async fn surface(&mut self) -> Object {
+    pub(crate) async fn surface(&mut self) -> Object {
         let compositor = match self.compositor {
             Some(compositor) => compositor,
             None => {
