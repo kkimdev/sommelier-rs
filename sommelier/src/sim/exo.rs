@@ -348,6 +348,22 @@ struct Ima {
     composing: bool,
 }
 
+/// What became of a key's text, the verdict of [`Exo::answer`] on a part of
+/// the engine's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Answer {
+    /// Nothing out of the ordinary: the text went out with the key, or the
+    /// key made none.
+    Normal,
+    /// The key's text was made before a reset that IMA made after Exo
+    /// handed the engine the key, and went out with its callback anyway:
+    /// the late answer of E5.
+    Late,
+    /// A reset fell between the key's text and its callback, which dropped
+    /// the text: the key went out with none.
+    Dropped,
+}
+
 /// A key handed to the engine that it has not answered.
 struct PendingKey {
     id: u64,
@@ -360,6 +376,9 @@ struct PendingKey {
     /// Whether IMA reset after Exo handed the engine the key and before its
     /// text came.
     late: bool,
+    /// Whether IMA dropped the key's buffered text, after the text came and
+    /// before the callback.
+    dropped: bool,
 }
 
 /// Exo's seat and its text inputs, as far as the model goes.
@@ -462,6 +481,7 @@ impl Exo {
             time,
             answered: false,
             late: false,
+            dropped: false,
         });
         self.to_engine.push(EngineIn::Key { key, pressed, id });
     }
@@ -473,10 +493,10 @@ impl Exo {
     /// composition ([`Exo::confirm_composition`]), then sends the text,
     /// then the key (E7, E8). A release goes the way its press went.
     ///
-    /// Returns whether the callback sent text that the engine made before
-    /// a reset that IMA made after Exo handed it the key: the late answer of
-    /// E5.
-    pub(super) fn answer(&mut self, out: &EngineOut) -> bool {
+    /// The verdict ([`Answer`]) on what became of the key's text is given
+    /// at the callback, once it is known; a text part always returns
+    /// [`Answer::Normal`].
+    pub(super) fn answer(&mut self, out: &EngineOut) -> Answer {
         match out {
             EngineOut::Text { id, actions } => {
                 let key = self.in_engine.front_mut().expect("a key the engine has");
@@ -485,7 +505,7 @@ impl Exo {
                 if self.ima.client.is_some() {
                     self.buffer(actions);
                 }
-                false
+                Answer::Normal
             }
             &EngineOut::Done { id, handled } => {
                 let key = self.in_engine.pop_front().expect("a key the engine has");
@@ -494,7 +514,7 @@ impl Exo {
                 if !key.pressed {
                     let consumed = self.release(k);
                     self.key_events(k, time, wl_keyboard::KEY_STATE_RELEASED, consumed);
-                    return false;
+                    return Answer::Normal;
                 }
                 let code = keymap::keycode(k).0;
                 self.pressed.insert(code, handled);
@@ -503,14 +523,21 @@ impl Exo {
                     self.key_events(k, time, pressed, true);
                     self.flush()
                 } else {
-                    if let Some(client) = self.ima.client {
-                        self.confirm_composition(client);
-                    }
-                    let sent = self.flush();
+                    let shown = self
+                        .ima
+                        .client
+                        .is_some_and(|client| self.confirm_composition(client));
+                    let sent = self.flush() || shown;
                     self.key_events(k, time, pressed, false);
                     sent
                 };
-                key.late && sent
+                if key.dropped {
+                    Answer::Dropped
+                } else if key.late && sent {
+                    Answer::Late
+                } else {
+                    Answer::Normal
+                }
             }
         }
     }
@@ -814,7 +841,9 @@ impl Exo {
     /// (`OnDidChangeFocusedClient`).
     fn serve(&mut self, client: Option<u32>) {
         if let Some(served) = self.ima.client {
-            self.ima.commit = None;
+            if self.ima.commit.take().is_some() {
+                self.mark_dropped();
+            }
             self.confirm_composition(served);
         }
         self.ima.client = client;
@@ -865,13 +894,15 @@ impl Exo {
     /// happens. Otherwise a buffered composition is shown, the composition
     /// Exo tracks is confirmed if there is one, or always where the
     /// extension has `confirm_preedit` (`SupportsAlwaysConfirmComposition`),
-    /// and IMA resets, keeping the buffered commit.
-    fn confirm_composition(&mut self, id: u32) {
+    /// and IMA resets, keeping the buffered commit. Returns whether it
+    /// showed the buffered composition.
+    fn confirm_composition(&mut self, id: u32) -> bool {
         if self.ima.commit.is_some() && self.ima.composition.is_none() {
-            return;
+            return false;
         }
-        if let Some(text) = self.ima.composition.take() {
-            self.set_composition(id, &text);
+        let shown = self.ima.composition.take();
+        if let Some(text) = &shown {
+            self.set_composition(id, text);
         }
         let extension = self.confirming_extension(id);
         let composing = !self.text_input(id).text.predicted.composition().is_empty();
@@ -881,6 +912,7 @@ impl Exo {
         let commit = self.ima.commit.take();
         self.reset_context();
         self.ima.commit = commit;
+        shown.is_some()
     }
 
     /// `TextInput::ConfirmCompositionText(keep_selection = true)`: with
@@ -918,13 +950,23 @@ impl Exo {
         if served.is_none_or(|ti| ti.field.content_type.input_type == extended::INPUT_TYPE_NONE) {
             return;
         }
-        self.ima.commit = None;
-        self.ima.composition = None;
+        let dropped = self.ima.commit.take().is_some() | self.ima.composition.take().is_some();
+        if dropped {
+            self.mark_dropped();
+        }
         for key in self.in_engine.iter_mut().filter(|key| !key.answered) {
             key.late = true;
         }
         if std::mem::take(&mut self.ima.composing) {
             self.to_engine.push(EngineIn::Reset);
+        }
+    }
+
+    /// IMA dropped the text it buffered for the key in flight, which is the
+    /// first, as the engine answers in order.
+    fn mark_dropped(&mut self) {
+        if let Some(key) = self.in_engine.front_mut().filter(|key| key.answered) {
+            key.dropped = true;
         }
     }
 
@@ -1155,9 +1197,9 @@ mod tests {
         };
         if !actions.is_empty() {
             let actions = actions.to_vec();
-            assert!(!exo.answer(&EngineOut::Text { id, actions }));
+            assert_eq!(exo.answer(&EngineOut::Text { id, actions }), Answer::Normal);
         }
-        assert!(!exo.answer(&EngineOut::Done { id, handled }));
+        assert_eq!(exo.answer(&EngineOut::Done { id, handled }), Answer::Normal);
         events(exo)
     }
 
@@ -1503,8 +1545,8 @@ mod tests {
     }
 
     /// The text and the handled callback of key `id`.
-    fn answer(exo: &mut Exo, id: u64, actions: Vec<TextAction>) -> bool {
-        assert!(!exo.answer(&EngineOut::Text { id, actions }));
+    fn answer(exo: &mut Exo, id: u64, actions: Vec<TextAction>) -> Answer {
+        assert_eq!(exo.answer(&EngineOut::Text { id, actions }), Answer::Normal);
         exo.answer(&EngineOut::Done { id, handled: true })
     }
 
@@ -1522,7 +1564,7 @@ mod tests {
         assert_eq!(predicted(&exo).composition, None);
         // IMA was composing, so the engine resets too.
         assert_eq!(exo.take_engine(), [EngineIn::Reset]);
-        assert!(answer(&mut exo, 1, vec![shows("가")]), "late");
+        assert_eq!(answer(&mut exo, 1, vec![shows("가")]), Answer::Late);
         let [cursor, string] = preedit(3, "가");
         assert_eq!(events(&mut exo), [peek(1, 'k', DOWN), cursor, string]);
         // Between the text and the callback, the reset drops the text, and
@@ -1532,17 +1574,71 @@ mod tests {
         exo.key(NOW, k('k'), DOWN);
         exo.take_engine();
         let actions = vec![shows("가")];
-        assert!(!exo.answer(&EngineOut::Text { id: 1, actions }));
+        assert_eq!(
+            exo.answer(&EngineOut::Text { id: 1, actions }),
+            Answer::Normal
+        );
         send(&mut exo, TI, reset());
-        assert!(!exo.answer(&EngineOut::Done {
+        let done = EngineOut::Done {
             id: 1,
-            handled: true
-        }));
+            handled: true,
+        };
+        assert_eq!(exo.answer(&done), Answer::Dropped);
         assert_eq!(events(&mut exo), [peek(1, 'k', DOWN)]);
         // With nothing composed, the engine is left alone.
         let mut exo = active(V10);
         send(&mut exo, TI, reset());
         assert_eq!(exo.take_engine(), []);
+    }
+
+    #[test]
+    fn an_unhandled_press_shows_the_late_text_that_its_confirmation_shows() {
+        // The reset falls before the key's text, which comes after it and
+        // is shown by the confirmation, not by the flush.
+        let mut exo = active(V10);
+        exo.key(NOW, k('a'), DOWN);
+        exo.take_engine();
+        send(&mut exo, TI, zwp_text_input_v1::Request::Reset {});
+        let actions = vec![shows("ㅎ")];
+        assert_eq!(
+            exo.answer(&EngineOut::Text { id: 0, actions }),
+            Answer::Normal
+        );
+        let done = EngineOut::Done {
+            id: 0,
+            handled: false,
+        };
+        assert_eq!(exo.answer(&done), Answer::Late);
+        // A key whose text came before the reset is not late.
+        let mut exo = active(V10);
+        exo.key(NOW, k('a'), DOWN);
+        exo.take_engine();
+        let actions = vec![shows("ㅎ")];
+        assert_eq!(
+            exo.answer(&EngineOut::Text { id: 0, actions }),
+            Answer::Normal
+        );
+        assert_eq!(exo.answer(&done), Answer::Normal);
+    }
+
+    #[test]
+    fn a_change_of_the_served_text_input_drops_the_text_of_a_key_in_flight() {
+        let mut exo = active(V11);
+        let create = zwp_text_input_manager_v1::Request::CreateTextInput { id: TI2 };
+        send(&mut exo, TI_MANAGER, create);
+        exo.key(NOW, k('r'), DOWN);
+        exo.take_engine();
+        let actions = vec![commits("가")];
+        assert_eq!(
+            exo.answer(&EngineOut::Text { id: 0, actions }),
+            Answer::Normal
+        );
+        send(&mut exo, TI2, activate(A));
+        let done = EngineOut::Done {
+            id: 0,
+            handled: true,
+        };
+        assert_eq!(exo.answer(&done), Answer::Dropped);
     }
 
     #[test]
@@ -1660,22 +1756,31 @@ mod tests {
         };
         assert_eq!(exo.take_engine(), [r(true, 0)]);
         let actions = vec![shows("ㄱ")];
-        assert!(!exo.answer(&EngineOut::Text { id: 0, actions }));
+        assert_eq!(
+            exo.answer(&EngineOut::Text { id: 0, actions }),
+            Answer::Normal
+        );
         assert_eq!(events(&mut exo), [], "nothing before the callback");
-        assert!(!exo.answer(&EngineOut::Done {
-            id: 0,
-            handled: true
-        }));
+        assert_eq!(
+            exo.answer(&EngineOut::Done {
+                id: 0,
+                handled: true
+            }),
+            Answer::Normal
+        );
         let [cursor, string] = preedit(2, "ㄱ");
         assert_eq!(events(&mut exo), [peek(1, 'r', DOWN), cursor, string]);
         // The release goes as its press did, consumed, with the same
         // serial, which only a key sent frees.
         exo.key(NOW, k('r'), UP);
         assert_eq!(exo.take_engine(), [r(false, 1)]);
-        assert!(!exo.answer(&EngineOut::Done {
-            id: 1,
-            handled: false
-        }));
+        assert_eq!(
+            exo.answer(&EngineOut::Done {
+                id: 1,
+                handled: false
+            }),
+            Answer::Normal
+        );
         assert_eq!(events(&mut exo), [peek(1, 'r', UP)]);
         let enter = press(&mut exo, '⏎', &[commits("ㄱ")], false);
         let passed = [commit(3, "ㄱ"), peek(1, '⏎', DOWN), key(1, '⏎', DOWN)];
