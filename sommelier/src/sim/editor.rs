@@ -328,6 +328,28 @@ impl Reference {
         }
     }
 
+    /// Whether `action` moves the focus away from the focused field while
+    /// it composes.
+    pub fn leaves_composition(&self, action: UserAction) -> bool {
+        let field = match action {
+            UserAction::Click { field, .. } | UserAction::Tap { field, .. } => field,
+            UserAction::Focus(field) => field,
+            UserAction::Key(_) | UserAction::Settle => return false,
+        };
+        field != self.focus && !self.composer.preedit().is_empty()
+    }
+
+    /// Applies `action` as [`Reference::apply`] does, except that a move of
+    /// the focus away from a composing field loses the composition rather
+    /// than committing it, as the proxy's known issue P1 does.
+    pub fn apply_losing_composition(&mut self, action: UserAction) {
+        if self.leaves_composition(action) {
+            self.composer.reset();
+            self.fields[self.focus].preedit.clear();
+        }
+        self.apply(action);
+    }
+
     /// Whether the input method's engine would pass `key` to the field
     /// rather than consume it; a Latin layout has no engine. The ChromeOS
     /// Korean engine takes a Space that ends a composition, with it (E15).
@@ -579,6 +601,25 @@ mod tests {
         let editor = reference(&["0", "1"], &actions);
         assert_eq!(editor.fields(), [model("0가", 4, ""), model("1", 1, "나")]);
         assert_eq!(editor.focus(), 1);
+    }
+
+    #[test]
+    fn a_focus_move_may_lose_the_composition_instead() {
+        let mut editor = reference(&["0", "1"], &typing("rk"));
+        let tap = UserAction::Tap {
+            field: 0,
+            at: Target::Start,
+        };
+        assert!(!editor.leaves_composition(tap), "a tap in the same field");
+        assert!(editor.leaves_composition(UserAction::Focus(1)));
+        editor.apply_losing_composition(UserAction::Focus(1));
+        assert_eq!(editor.fields(), [model("0", 1, ""), model("1", 1, "")]);
+        // The next syllable starts afresh.
+        for action in typing("sk") {
+            editor.apply_losing_composition(action);
+        }
+        assert_eq!(editor.fields()[1], model("1", 1, "나"));
+        assert!(!editor.leaves_composition(UserAction::Focus(1)));
     }
 
     #[test]

@@ -17,34 +17,33 @@ limitations under the License.
 //! The two oracles that judge a case once it has settled.
 //!
 //! **Tier 1, exact, every case.** [`SpecText`] reads what reached the
-//! proxy and what it sent the host, in order ([`Seen`]), and applies the
-//! text semantics of the design's section 2 (`docs/IME_REDESIGN.md`) to
-//! an ideal client's [`TextModel`] per field. It takes the proxy's own
-//! activation decisions (`activate`, `deactivate`, the `reset` and its
-//! fence) from what the proxy sent, as given, and so the keys it passed,
-//! which are the keyboard concern's. [`Shadow`] is the same ideal
-//! client fed what the proxy actually sent the guest. They must agree
-//! ([`exact`]), whatever the timing, since neither lags. Exo's composition
-//! must equal the guest's preedit, and Exo's field must hold what the
-//! guest last committed ([`V3Field`]).
+//! proxy, in order ([`Seen`]), and applies the specification of the
+//! design's section 2 (`docs/IME_REDESIGN.md`) to an ideal client per
+//! field. From the inputs alone it decides what the proxy must ask of the
+//! host: an `activate` or a `deactivate` and its barrier where the field's
+//! wish and the link differ, and a `reset` and its fence for a press that
+//! ends a composition. Each step's decisions must be the proxy's own.
+//! [`Shadow`] is the same ideal client fed what the proxy sent the guest.
+//! The two must agree ([`exact`]) in text, cursor, preedit and preedit
+//! cursor, whatever the timing, since neither lags. The guest's preedit
+//! must also be what Exo composes, and Exo must hold the field the guest
+//! last committed ([`V3Field`]).
 //!
 //! **Tier 2, user intent, settled cases only.** The client model's fields
-//! must equal those of [`Reference`], which applied the user's actions
-//! through an ideal input method ([`intended`]). Both sides are compared
-//! after NFC normalisation, so that it does not matter which form of a
-//! syllable a client keeps (C14).
-//!
-//! A tier-2 failure the proxy is known to cause is a [`KnownIssue`]
-//! ([`classify`]), counted rather than failed.
+//! and focus must equal those of [`Reference`], which applied the user's
+//! actions through an ideal input method ([`intended`]). A failure the
+//! proxy is known to cause is a [`KnownIssue`] ([`classify`]): the client
+//! must then show exactly what the issue predicts.
 //!
 //! The engine makes no deletes or preedit regions before D6, so `SpecText`
 //! does not track whether the guest's text is ahead of what it reported
 //! (H9, X1), and panics on either event. For the same reason no case yet
 //! needs Chromium's prediction to replay Exo's history (the design's
-//! 4.5): the text a client predicts matters only to measure a delete.
+//! 4.5): the text a client predicts matters only to measure a delete. Nor
+//! does Exo send `preedit_styling` (H4).
 
 use super::client::Client;
-use super::editor::{Reference, TextModel, Txn};
+use super::editor::{Reference, Target, TextModel, Txn, Typing, UserAction};
 use super::exo::{self, Exo};
 use super::keymap;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
@@ -59,24 +58,37 @@ use crate::wire::IndexedString;
 pub(super) enum Seen<'a> {
     /// A request of the guest's text input reached the proxy.
     Guest(&'a v3::Request),
-    /// An event from host object `sender` reached the proxy; `late` if it
-    /// carries an engine answer made before a reset that came after its key
-    /// (E5's outcome (c), P3).
+    /// An event from host object `sender` reached the proxy.
     Host {
         sender: u32,
         event: &'a AnyEvent,
-        late: bool,
+        origin: Origin,
     },
     /// The proxy sent the host a request.
     ToHost(&'a AnyRequest),
     /// The proxy sent the guest an event.
     ToGuest(&'a AnyEvent),
+    /// The proxy sent the guest a button press or a touch-down, which
+    /// lands at `at` on the guest's surface `surface`.
+    GuestPress { surface: u32, at: Target },
+    /// The proxy has sent all it sends for the message that reached it.
+    StepEnd,
+}
+
+/// What engine text a host event carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Origin {
+    /// An answer the engine made before a reset that reached it after the
+    /// key (E5's outcome (c), P3).
+    pub late: bool,
+    /// How many resets Exo had handed the engine when it sent the event.
+    pub resets: u64,
 }
 
 /// Which oracle a check belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tier {
-    /// Tier 1: the specification's text, exactly.
+    /// Tier 1: the specification, exactly.
     Exact,
     /// Tier 2: the user's intent.
     Intent,
@@ -86,8 +98,8 @@ pub(super) enum Tier {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Failure {
     pub tier: Tier,
-    /// What was checked: `"text"`, `"composition"`, `"field state"` or
-    /// `"focus"`.
+    /// What was checked: `"text"`, `"decision"`, `"composition"`,
+    /// `"field state"` or `"focus"`.
     pub check: &'static str,
     /// The field it failed on, if the check is of one.
     pub field: Option<usize>,
@@ -149,57 +161,128 @@ struct Pending {
     cursor_rectangle: Option<Option<(i32, i32, i32, i32)>>,
 }
 
-/// The reset fence (F4, W2): open from the proxy's `reset` until the
-/// `done` of the sync it sends right after.
+/// The host link of the text input (section 3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    Detached,
+    Attached,
+    /// Deactivated, until the `done` of this barrier.
+    Draining(Option<u32>),
+}
+
+/// The reset fence (F4, W2): open from the press's `reset` until the
+/// `done` of the sync after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fence {
     Closed,
-    /// The `reset` went out; its sync is next.
-    Reset,
-    /// The sync with this callback went out.
-    Open(u32),
+    Open(Option<u32>),
 }
 
-/// What the tier-1 oracle counts in a case.
+/// What the proxy asks of the host in one step, as far as the IME's
+/// decisions go.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Decisions {
+    /// `activate` on this host surface.
+    activate: Option<u32>,
+    deactivate: bool,
+    reset: bool,
+    /// `wl_display.sync`: the barrier and the fence.
+    syncs: u32,
+}
+
+/// The preedit the guest shows, as the proxy tracks it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Shown {
+    text: String,
+    cursor: (i32, i32),
+    origin: Origin,
+}
+
+/// A field as a client shows it: its model, and the cursor of its preedit,
+/// `(0, 0)` without one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct View {
+    pub model: TextModel,
+    pub preedit_cursor: (i32, i32),
+}
+
+impl View {
+    fn new(text: &str) -> Self {
+        Self {
+            model: TextModel::new(text),
+            preedit_cursor: (0, 0),
+        }
+    }
+
+    /// The client applies `txn` at `done`, with the preedit at `cursor`.
+    fn apply(&mut self, txn: &Txn, cursor: (i32, i32)) {
+        self.model.apply_txn(txn);
+        self.preedit_cursor = if txn.preedit.is_empty() {
+            (0, 0)
+        } else {
+            cursor
+        };
+    }
+}
+
+/// What a case counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Counts {
     /// Presses that ended a composition (F4).
     pub press_commits: u64,
     /// Host composition events the fence dropped.
     pub fence_drops: u64,
-    /// Late engine answers the guest got (P3).
-    pub late_applied: u64,
+    /// Host events of late engine answers that the guest got (P3).
+    pub late_shown: u64,
     /// Keys that reached the guest while no text input was attached (E7).
     pub raw_keys: u64,
+    /// Engine answers made before a reset that reached the engine after
+    /// their key (E5's outcome (c)).
+    pub late: u64,
+    /// Engine answers whose text a reset dropped (E5's outcome (b)).
+    pub dropped: u64,
 }
 
-/// What the specification says an ideal client shows, from what reached
-/// the proxy and the proxy's own activation decisions. The case has one
-/// guest text input on one seat, which follows the keyboard focus.
+impl std::ops::AddAssign for Counts {
+    fn add_assign(&mut self, other: Self) {
+        self.press_commits += other.press_commits;
+        self.fence_drops += other.fence_drops;
+        self.late_shown += other.late_shown;
+        self.raw_keys += other.raw_keys;
+        self.late += other.late;
+        self.dropped += other.dropped;
+    }
+}
+
+/// What the specification says the proxy does: the decisions it asks of
+/// the host, and what an ideal client then shows. The case has one guest
+/// text input on one seat, which follows the keyboard focus.
 pub(super) struct SpecText {
     /// Each field's host surface.
     surfaces: Vec<u32>,
-    fields: Vec<TextModel>,
+    views: Vec<View>,
     /// The field the keyboard focuses, which the text input follows (F1).
     focus: Option<usize>,
-    /// Shift is held.
     shift: bool,
     /// The surface the pointer is on, and where.
     pointer: Option<(u32, i32)>,
     /// The committed state, if the field is enabled.
     committed: Option<V3Field>,
     pending: Pending,
-    /// The proxy activated the host text input, and neither it nor Exo
-    /// detached it since.
-    attached: bool,
+    link: Link,
     fence: Fence,
-    /// The preedit the guest shows, as the proxy tracks it.
-    shown: Option<String>,
-    /// The host event being read carries a late answer.
-    late: bool,
-    /// The shown preedit came from a late answer, which the engine made
-    /// before a reset that dropped it since.
-    shown_late: bool,
+    shown: Option<Shown>,
+    /// The last `preedit_cursor` since a terminal event (H5).
+    assembly: Option<i32>,
+    /// The step's decisions: what the specification asks, and what the
+    /// proxy sent, with the callback of each sync after its request.
+    expected: Decisions,
+    sent: Decisions,
+    synced: (Option<u32>, Option<u32>),
+    /// What reached the proxy in this step, for a report.
+    input: String,
+    /// The steps whose decisions were not the specification's.
+    pub wrong_decisions: Vec<String>,
     pub counts: Counts,
 }
 
@@ -208,17 +291,21 @@ impl SpecText {
     pub fn new(surfaces: &[u32], texts: &[String]) -> Self {
         Self {
             surfaces: surfaces.to_vec(),
-            fields: texts.iter().map(|text| TextModel::new(text)).collect(),
+            views: texts.iter().map(|text| View::new(text)).collect(),
             focus: None,
             shift: false,
             pointer: None,
             committed: None,
             pending: Pending::default(),
-            attached: false,
+            link: Link::Detached,
             fence: Fence::Closed,
             shown: None,
-            late: false,
-            shown_late: false,
+            assembly: None,
+            expected: Decisions::default(),
+            sent: Decisions::default(),
+            synced: (None, None),
+            input: String::new(),
+            wrong_decisions: Vec::new(),
             counts: Counts::default(),
         }
     }
@@ -226,24 +313,32 @@ impl SpecText {
     /// Follows one message at the proxy.
     pub fn see(&mut self, seen: Seen<'_>) {
         match seen {
-            Seen::Guest(request) => self.guest(request),
+            Seen::Guest(request) => {
+                self.input = format!("{request:?}");
+                self.guest(request);
+            }
             Seen::Host {
                 sender,
                 event,
-                late,
+                origin,
             } => {
-                self.late = late;
-                self.host(sender, event);
+                self.input = format!("{sender} {event:?}");
+                self.host(sender, event, origin);
             }
             Seen::ToHost(request) => self.decision(request),
-            Seen::ToGuest(event) => self.key(event),
+            Seen::ToGuest(_) | Seen::GuestPress { .. } => {}
+            Seen::StepEnd => self.step_end(),
         }
     }
 
     /// The gate: host composition events reach the guest only while the
-    /// text input is attached and no fence is open.
+    /// enabled, focused field's text input is attached and no fence is
+    /// open.
     fn gate(&self) -> bool {
-        self.attached && self.fence == Fence::Closed
+        self.link == Link::Attached
+            && self.fence == Fence::Closed
+            && self.focus.is_some()
+            && self.committed.is_some()
     }
 
     /// G3 to G9: the guest's requests, which count only while the text
@@ -317,15 +412,19 @@ impl SpecText {
         if let Some(rectangle) = cursor_rectangle {
             field.cursor_rectangle = rectangle;
         }
-        let preedit = self.shown.clone().unwrap_or_default();
-        self.apply(Txn {
+        let (preedit, cursor) = self
+            .shown
+            .as_ref()
+            .map_or_else(Default::default, |shown| (shown.text.clone(), shown.cursor));
+        let txn = Txn {
             preedit,
             ..Txn::default()
-        });
+        };
+        self.apply(&txn, cursor);
     }
 
     /// What reached the proxy from the host.
-    fn host(&mut self, sender: u32, event: &AnyEvent) {
+    fn host(&mut self, sender: u32, event: &AnyEvent, origin: Origin) {
         match event {
             AnyEvent::WlKeyboard(event) => self.keyboard(event),
             AnyEvent::WlPointer(wl_pointer::Event::Enter {
@@ -345,20 +444,26 @@ impl SpecText {
             }
             AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => self.press(*surface, *x),
             AnyEvent::WlCallback(wl_callback::Event::Done { .. }) => {
-                if self.fence == Fence::Open(sender) {
-                    self.fence = Fence::Closed;
+                if self.link == Link::Draining(Some(sender)) {
+                    self.link = Link::Detached; // W1
+                }
+                if self.fence == Fence::Open(Some(sender)) {
+                    self.fence = Fence::Closed; // W2
                 }
             }
-            AnyEvent::ZwpTextInputV1(event) => self.text_input(event),
+            AnyEvent::ZwpTextInputV1(event) => self.text_input(event, origin),
             AnyEvent::ZcrExtendedTextInputV1(extended::Event::ConfirmPreedit { .. }) => {
-                // X2: confirm the shown preedit; X2' recovers a held key, of
+                // X2 confirms the shown preedit; X2' recovers a held key, of
                 // which a case has none.
-                let commit = self.shown.clone();
-                self.composition_event(|_| {
-                    commit.map(|commit| Txn {
-                        commit,
-                        ..Txn::default()
-                    })
+                self.composition_event(origin, |spec| {
+                    let commit = spec.shown.take()?.text;
+                    Some((
+                        Txn {
+                            commit,
+                            ..Txn::default()
+                        },
+                        (0, 0),
+                    ))
                 });
             }
             AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion { .. }) => {
@@ -368,8 +473,11 @@ impl SpecText {
         }
     }
 
-    /// The keyboard: its focus, which resets the text input (F1), and
-    /// Shift.
+    /// The keyboard: its focus, which resets the text input (F1), Shift,
+    /// and its keys. The ideal client types every press the host sends.
+    /// The keyboard concern may keep a press from the guest only by a rule
+    /// of its own, and no case reaches one before D7: a case holds no key,
+    /// so no press repeats a held one, and Exo sends no keysym (H10).
     fn keyboard(&mut self, event: &wl_keyboard::Event) {
         match *event {
             wl_keyboard::Event::Enter { surface, .. } => self.move_focus(Some(self.field(surface))),
@@ -377,23 +485,15 @@ impl SpecText {
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
                 self.shift = mods_depressed & keymap::SHIFT != 0;
             }
+            wl_keyboard::Event::Key { key, state, .. } => {
+                let typed = keymap::key(key, self.shift);
+                let pressed = state == wl_keyboard::KEY_STATE_PRESSED;
+                if let (true, Some(field), Some(key)) = (pressed, self.focus, typed) {
+                    self.counts.raw_keys += u64::from(self.link != Link::Attached);
+                    self.views[field].model.insert_key(key);
+                }
+            }
             _ => {}
-        }
-    }
-
-    /// A key the proxy passed the guest, which an ideal client types. Which
-    /// keys reach the guest is the keyboard concern's, not the IME's: it
-    /// passes a press of a held key, for one, only once.
-    fn key(&mut self, event: &AnyEvent) {
-        let AnyEvent::WlKeyboard(wl_keyboard::Event::Key { key, state, .. }) = *event else {
-            return;
-        };
-        let typed = keymap::key(key, self.shift);
-        if let (true, Some(field), Some(key)) =
-            (state == wl_keyboard::KEY_STATE_PRESSED, self.focus, typed)
-        {
-            self.counts.raw_keys += u64::from(!self.attached);
-            self.fields[field].insert_key(key);
         }
     }
 
@@ -404,7 +504,8 @@ impl SpecText {
             return;
         }
         if let Some(left) = self.focus {
-            self.fields[left].preedit.clear();
+            self.views[left].model.preedit.clear();
+            self.views[left].preedit_cursor = (0, 0);
         }
         self.focus = focus;
         self.committed = None;
@@ -413,64 +514,75 @@ impl SpecText {
     }
 
     /// F4: a press on the surface of the enabled, focused field while the
-    /// gate is open and the guest shows a preedit commits it; the press
-    /// then moves the cursor of the field it lands in.
+    /// gate is open and the guest shows a preedit commits it and resets the
+    /// host behind a fence; the press then moves the cursor of the field it
+    /// lands in.
     fn press(&mut self, surface: u32, x: i32) {
         let field = self.field(surface);
-        let enabled = self.committed.is_some() && self.focus == Some(field);
-        if enabled && self.gate() {
-            if let Some(commit) = self.shown.take() {
+        if self.gate() && self.focus == Some(field) {
+            if let Some(shown) = self.shown.take() {
                 self.counts.press_commits += 1;
-                self.apply(Txn {
-                    commit,
+                self.assembly = None;
+                self.expected.reset = true;
+                let txn = Txn {
+                    commit: shown.text,
                     ..Txn::default()
-                });
+                };
+                self.apply(&txn, (0, 0));
             }
         }
         let at = keymap::target(x).expect("a press at a target");
-        self.fields[field].click(at);
+        self.views[field].model.click(at);
     }
 
-    /// H2, H7 and H8.
-    fn text_input(&mut self, event: &v1::Event) {
+    /// H2, H5, H7 and H8.
+    fn text_input(&mut self, event: &v1::Event, origin: Origin) {
         match event {
-            v1::Event::Leave {} if self.attached => {
+            v1::Event::Leave {} if self.link == Link::Attached => {
                 // H2: Exo detached on its own.
-                if self.shown.take().is_some() {
-                    self.apply(Txn::default());
+                if self.shown.is_some() {
+                    self.apply(&Txn::default(), (0, 0));
                 }
-                self.attached = false;
+                self.leave_attached(Link::Detached);
+            }
+            &v1::Event::PreeditCursor { index } if self.link == Link::Attached => {
+                self.assembly = Some(index);
             }
             v1::Event::PreeditString { text, commit, .. } => {
-                let text = match text {
-                    IndexedString::Utf8(text) => Some(text.clone()),
-                    IndexedString::NotUtf8(_) => None,
+                let IndexedString::Utf8(text) = text else {
+                    return self.composition_event(origin, |_| None);
                 };
-                let shown = self.shown.is_some();
-                self.composition_event(|spec| {
-                    let text = text?;
+                self.composition_event(origin, |spec| {
+                    let shown = spec.shown.take();
                     if text.is_empty() {
-                        spec.shown = None;
-                        let commit = if shown { commit.clone() } else { String::new() };
-                        return Some(Txn {
+                        let commit = shown.map_or_else(String::new, |_| commit.clone());
+                        let txn = Txn {
                             commit,
                             ..Txn::default()
-                        });
+                        };
+                        return Some((txn, (0, 0)));
                     }
-                    spec.shown = Some(text.clone());
-                    Some(Txn {
-                        preedit: text,
+                    let cursor = preedit_cursor(text, spec.assembly);
+                    spec.shown = Some(Shown {
+                        text: text.clone(),
+                        cursor,
+                        origin,
+                    });
+                    let txn = Txn {
+                        preedit: text.clone(),
                         ..Txn::default()
-                    })
+                    };
+                    Some((txn, cursor))
                 });
             }
             v1::Event::CommitString { text, .. } => {
-                let commit = text.clone();
-                self.composition_event(|_| {
-                    Some(Txn {
-                        commit,
+                self.composition_event(origin, |spec| {
+                    spec.shown = None;
+                    let txn = Txn {
+                        commit: text.clone(),
                         ..Txn::default()
-                    })
+                    };
+                    Some((txn, (0, 0)))
                 });
             }
             v1::Event::DeleteSurroundingText { .. } => panic!("deletes come with D6"),
@@ -478,46 +590,95 @@ impl SpecText {
         }
     }
 
-    /// A host composition event: through the gate, `txn` decides what the guest gets (none if it drops the
-    /// event), which ends the shown preedit unless `txn` set it. Without
-    /// the gate it is dropped.
-    fn composition_event(&mut self, txn: impl FnOnce(&mut Self) -> Option<Txn>) {
+    /// A terminal host composition event, which takes the assembly: through
+    /// the gate, `txn` says what the guest gets, if anything, and with
+    /// which preedit cursor; without it, the event is dropped.
+    fn composition_event(
+        &mut self,
+        origin: Origin,
+        txn: impl FnOnce(&mut Self) -> Option<(Txn, (i32, i32))>,
+    ) {
         if !self.gate() {
-            self.counts.fence_drops += u64::from(self.attached);
+            self.assembly = None;
+            self.counts.fence_drops += u64::from(self.link == Link::Attached);
             return;
         }
-        if let Some(txn) = txn(self) {
-            if txn.preedit.is_empty() {
-                self.shown = None;
-            }
-            self.counts.late_applied += u64::from(self.late);
-            self.shown_late = self.late && self.shown.is_some();
-            self.apply(txn);
+        let edit = txn(self);
+        self.assembly = None;
+        if let Some((txn, cursor)) = edit {
+            self.counts.late_shown += u64::from(origin.late);
+            self.apply(&txn, cursor);
         }
     }
 
-    /// The proxy's own activation decisions, and its fence.
+    /// Leaves `Attached` for `link`, which ends the composition.
+    fn leave_attached(&mut self, link: Link) {
+        self.link = link;
+        self.shown = None;
+        self.assembly = None;
+    }
+
+    /// A request the proxy sent the host, as far as the IME decides it.
     fn decision(&mut self, request: &AnyRequest) {
-        match request {
-            AnyRequest::ZwpTextInputV1(v1::Request::Activate { .. }) => self.attached = true,
-            AnyRequest::ZwpTextInputV1(v1::Request::Deactivate { .. }) => {
-                self.attached = false;
-                self.shown = None;
+        let sent = &mut self.sent;
+        match *request {
+            AnyRequest::ZwpTextInputV1(v1::Request::Activate { surface, .. }) => {
+                sent.activate = Some(surface);
             }
-            AnyRequest::ZwpTextInputV1(v1::Request::Reset {}) => self.fence = Fence::Reset,
-            &AnyRequest::WlDisplay(wl_display::Request::Sync { callback })
-                if self.fence == Fence::Reset =>
-            {
-                self.fence = Fence::Open(callback);
+            AnyRequest::ZwpTextInputV1(v1::Request::Deactivate { .. }) => sent.deactivate = true,
+            AnyRequest::ZwpTextInputV1(v1::Request::Reset {}) => sent.reset = true,
+            AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) => {
+                sent.syncs += 1;
+                // The barrier follows the deactivate, the fence the reset.
+                match (sent.deactivate, self.synced.0, sent.reset) {
+                    (true, None, _) => self.synced.0 = Some(callback),
+                    (_, _, true) => self.synced.1 = Some(callback),
+                    _ => {}
+                }
             }
             _ => {}
         }
     }
 
+    /// The end of a step: the reconcile the specification runs after every
+    /// input (2, Reconcile; R2). The field wants input while it is enabled
+    /// and focused. A link that differs from that wish is deactivated
+    /// behind a barrier, or activated on the focused surface; a draining
+    /// one waits for its barrier. The proxy's decisions must be these.
+    fn step_end(&mut self) {
+        let wants = self.focus.is_some() && self.committed.is_some();
+        match self.link {
+            Link::Attached if !wants => {
+                self.expected.deactivate = true;
+                self.leave_attached(Link::Draining(self.synced.0));
+            }
+            Link::Detached if wants => {
+                let field = self.focus.expect("a focused field");
+                self.expected.activate = Some(self.surfaces[field]);
+                self.link = Link::Attached;
+            }
+            _ => {}
+        }
+        if self.expected.reset {
+            self.fence = Fence::Open(self.synced.1);
+        }
+        let expected = &mut self.expected;
+        expected.syncs = u32::from(expected.deactivate) + u32::from(expected.reset);
+        if self.sent != *expected && self.wrong_decisions.len() < 5 {
+            self.wrong_decisions.push(format!(
+                "after {}: the proxy sent {:?}, the specification asks {:?}",
+                self.input, self.sent, expected
+            ));
+        }
+        self.expected = Decisions::default();
+        self.sent = Decisions::default();
+        self.synced = (None, None);
+    }
+
     /// The guest applies `txn` to the focused field.
-    fn apply(&mut self, txn: Txn) {
+    fn apply(&mut self, txn: &Txn, cursor: (i32, i32)) {
         let field = self.focus.expect("a transaction for the focused field");
-        self.fields[field].apply_txn(&txn);
+        self.views[field].apply(txn, cursor);
     }
 
     fn field(&self, surface: u32) -> usize {
@@ -526,21 +687,32 @@ impl SpecText {
     }
 }
 
+/// The cursor of a preedit `text` whose `preedit_cursor` was `index`: there,
+/// if it is a character boundary of the text, and otherwise at its end
+/// (H7).
+fn preedit_cursor(text: &str, index: Option<i32>) -> (i32, i32) {
+    let end = i32::try_from(text.len()).expect("a short preedit");
+    match index {
+        Some(index) if index < 0 => (-1, -1),
+        Some(index) if text.is_char_boundary(index as usize) => (index, index),
+        _ => (end, end),
+    }
+}
+
 /// An ideal client fed what the proxy sent the guest: it applies each
 /// transaction at `done` to the entered field, drops the preedit at
-/// `leave`, and takes keys and presses as [`TextModel`] does.
+/// `leave`, and types keys and takes presses as [`TextModel`] does.
 pub(super) struct Shadow {
     /// Each field's guest surface.
     surfaces: Vec<u32>,
-    fields: Vec<TextModel>,
+    views: Vec<View>,
     /// The field the text input entered.
     entered: Option<usize>,
     /// The field the keyboard focuses.
     keyboard: Option<usize>,
     shift: bool,
-    pointer: Option<(u32, i32)>,
-    /// The transaction in progress.
-    txn: Txn,
+    /// The transaction in progress, with its preedit cursor.
+    txn: (Txn, (i32, i32)),
 }
 
 impl Shadow {
@@ -548,97 +720,84 @@ impl Shadow {
     pub fn new(surfaces: &[u32], texts: &[String]) -> Self {
         Self {
             surfaces: surfaces.to_vec(),
-            fields: texts.iter().map(|text| TextModel::new(text)).collect(),
+            views: texts.iter().map(|text| View::new(text)).collect(),
             entered: None,
             keyboard: None,
             shift: false,
-            pointer: None,
-            txn: Txn::default(),
+            txn: Default::default(),
         }
     }
 
     /// Follows one message at the proxy: what it sent the guest.
     pub fn see(&mut self, seen: Seen<'_>) {
-        let Seen::ToGuest(event) = seen else {
-            return;
-        };
-        match event {
-            AnyEvent::ZwpTextInputV3(event) => self.text_input(event),
-            AnyEvent::WlKeyboard(event) => match *event {
+        match seen {
+            Seen::ToGuest(AnyEvent::ZwpTextInputV3(event)) => self.text_input(event),
+            Seen::ToGuest(AnyEvent::WlKeyboard(event)) => match *event {
                 wl_keyboard::Event::Enter { surface, .. } => {
-                    self.keyboard = Some(self.field(surface))
+                    self.keyboard = Some(self.field(surface));
                 }
                 wl_keyboard::Event::Leave { .. } => self.keyboard = None,
                 wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
                     self.shift = mods_depressed & keymap::SHIFT != 0;
                 }
-                wl_keyboard::Event::Key { key, state, .. }
-                    if state == wl_keyboard::KEY_STATE_PRESSED =>
-                {
-                    if let (Some(field), Some(key)) = (self.keyboard, keymap::key(key, self.shift))
-                    {
-                        self.fields[field].insert_key(key);
+                wl_keyboard::Event::Key { key, state, .. } => {
+                    let typed = keymap::key(key, self.shift);
+                    let pressed = state == wl_keyboard::KEY_STATE_PRESSED;
+                    if let (true, Some(field), Some(key)) = (pressed, self.keyboard, typed) {
+                        self.views[field].model.insert_key(key);
                     }
                 }
                 _ => {}
             },
-            AnyEvent::WlPointer(wl_pointer::Event::Enter {
-                surface, surface_x, ..
-            }) => self.pointer = Some((*surface, *surface_x)),
-            AnyEvent::WlPointer(wl_pointer::Event::Motion { surface_x, .. }) => {
-                if let Some((_, x)) = &mut self.pointer {
-                    *x = *surface_x;
-                }
+            Seen::GuestPress { surface, at } => {
+                let field = self.field(surface);
+                self.views[field].model.click(at);
             }
-            AnyEvent::WlPointer(wl_pointer::Event::Leave { .. }) => self.pointer = None,
-            AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. })
-                if *state == wl_pointer::BUTTON_STATE_PRESSED =>
-            {
-                let (surface, x) = self.pointer.expect("a press on a surface");
-                self.press(surface, x);
-            }
-            AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => self.press(*surface, *x),
             _ => {}
         }
     }
 
     fn text_input(&mut self, event: &v3::Event) {
+        let (txn, cursor) = &mut self.txn;
         match event {
             &v3::Event::Enter { surface } => self.entered = Some(self.field(surface)),
             v3::Event::Leave { .. } => {
                 if let Some(field) = self.entered.take() {
-                    self.fields[field].preedit.clear();
+                    self.views[field].model.preedit.clear();
+                    self.views[field].preedit_cursor = (0, 0);
                 }
-                self.txn = Txn::default();
+                self.txn = Default::default();
             }
-            v3::Event::PreeditString { text, .. } => {
-                self.txn.preedit = match text {
+            v3::Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => {
+                txn.preedit = match text {
                     Some(IndexedString::Utf8(text)) => text.clone(),
                     _ => String::new(),
                 };
+                *cursor = (*cursor_begin, *cursor_end);
             }
-            v3::Event::CommitString { text } => self.txn.commit = text.clone().unwrap_or_default(),
+            v3::Event::CommitString { text } => txn.commit = text.clone().unwrap_or_default(),
             &v3::Event::DeleteSurroundingText {
                 before_length,
                 after_length,
-            } => self.txn.delete = (before_length as usize, after_length as usize),
+            } => txn.delete = (before_length as usize, after_length as usize),
             v3::Event::Done { .. } => {
-                let txn = std::mem::take(&mut self.txn);
-                let field = &mut self.fields[self.entered.expect("a done while entered")];
+                let (txn, cursor) = std::mem::take(&mut self.txn);
+                let view = &mut self.views[self.entered.expect("a done while entered")];
                 let (before, after) = txn.delete;
                 assert!(
-                    field.delete_range(before, after).is_some(),
-                    "the proxy sent a delete of ({before}, {after}) that does not fit {field:?}"
+                    view.model.delete_range(before, after).is_some(),
+                    "the proxy sent a delete of ({before}, {after}) that does not fit {view:?}"
                 );
-                field.apply_txn(&txn);
+                // The view keeps the cursor as sent, an empty preedit's
+                // included, which the specification holds to (0, 0).
+                view.model.apply_txn(&txn);
+                view.preedit_cursor = cursor;
             }
         }
-    }
-
-    fn press(&mut self, surface: u32, x: i32) {
-        let field = self.field(surface);
-        let at = keymap::target(x).expect("a press at a target");
-        self.fields[field].click(at);
     }
 
     fn field(&self, surface: u32) -> usize {
@@ -647,25 +806,29 @@ impl Shadow {
     }
 }
 
-/// Tier 1 at quiescence: `shadow` against `spec` per field; the guest's
-/// preedit against what Exo composes; and Exo's field on the focused
-/// surface against what the guest last committed, for a host whose
-/// text-input extension is `extension`.
+/// Tier 1 at quiescence:
+///
+/// - `shadow` against `spec`, per field;
+/// - the proxy's decisions against the specification's;
+/// - the guest's preedit against what Exo composes;
+/// - Exo's field on the focused surface against what the guest last
+///   committed, for a host whose text-input extension is `extension`.
 ///
 /// Exo composes in two places that can disagree for a while, so the
-/// preedit must match one of them: the engine's composition (`engine`),
-/// and the one Exo tracks in the field's text. A key the engine answered
-/// after a reset sends a composition the engine itself has since dropped
-/// (E5), and a report Exo cannot match to its prediction drops the one Exo
-/// tracks (E4). A preedit from such a late answer (P3) may match neither,
-/// and is not checked. A proxy that did not reset Exo where it ended the
-/// guest's composition, or that showed the guest a composition Exo never
-/// sent, fails.
+/// preedit must match one of them: the engine's composition (`engine`), or
+/// the one Exo tracks in the field's text, which a report Exo cannot match
+/// to its prediction drops (E4). The engine can also drop the composition
+/// the guest shows, by a reset Exo's client never hears of: a late answer
+/// shows a composition the reset behind its key dropped (E5, P3), and IMA
+/// resets the engine on its own, as at a content type change. Of such a
+/// preedit, which `resets`, the engine resets so far, tells, Exo may
+/// compose nothing at all.
 pub(super) fn exact(
     spec: &SpecText,
     shadow: &Shadow,
     exo: &Exo,
     engine: &str,
+    resets: u64,
     extension: Option<u32>,
 ) -> Vec<Failure> {
     let mut failures = Vec::new();
@@ -675,17 +838,21 @@ pub(super) fn exact(
         field,
         detail,
     };
-    for (i, (spec, shadow)) in spec.fields.iter().zip(&shadow.fields).enumerate() {
+    for (i, (spec, shadow)) in spec.views.iter().zip(&shadow.views).enumerate() {
         if spec != shadow {
             let detail = format!("spec:   {}\nshadow: {}", show(spec), show(shadow));
             failures.push(failure("text", Some(i), detail));
         }
     }
-    let late = spec.shown_late && spec.shown.is_some();
-    let composition = exo.composition().filter(|_| !late);
-    if let (Some(field), Some(tracked)) = (spec.focus, composition) {
-        let preedit = &spec.fields[field].preedit;
-        if *preedit != tracked && preedit != engine {
+    if !spec.wrong_decisions.is_empty() {
+        failures.push(failure("decision", None, spec.wrong_decisions.join("\n")));
+    }
+    if let (Some(field), Some(tracked)) = (spec.focus, exo.composition()) {
+        let preedit = &spec.views[field].model.preedit;
+        let dropped = spec.shown.as_ref().is_some_and(|shown| {
+            (shown.origin.late || shown.origin.resets < resets) && engine.is_empty()
+        });
+        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) {
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
             );
@@ -705,8 +872,7 @@ pub(super) fn exact(
     failures
 }
 
-/// Tier 2: each of `client`'s fields against `reference`'s, after NFC
-/// normalisation, and the focus.
+/// Tier 2: each of `client`'s fields against `reference`'s, and the focus.
 pub(super) fn intended(reference: &Reference, client: &dyn Client) -> Vec<Failure> {
     let mut failures = Vec::new();
     let failure = |check, field, detail| Failure {
@@ -717,11 +883,11 @@ pub(super) fn intended(reference: &Reference, client: &dyn Client) -> Vec<Failur
     };
     let fields = client.fields().iter().map(|field| &field.model);
     for (i, (intended, got)) in reference.fields().iter().zip(fields).enumerate() {
-        if nfc_model(intended) != nfc_model(got) {
+        if intended != got {
             let detail = format!(
                 "intended: {}\nclient:   {}\nclient drops: {:?}",
-                show(intended),
-                show(got),
+                show_model(intended),
+                show_model(got),
                 client.drops()
             );
             failures.push(failure("text", Some(i), detail));
@@ -742,8 +908,8 @@ pub(super) fn intended(reference: &Reference, client: &dyn Client) -> Vec<Failur
 /// PR that fixes one deletes its variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum KnownIssue {
-    /// P1: a focus change while the client shows a preedit loses the
-    /// syllable, or keeps it, depending on the client.
+    /// P1: a focus move away from a field that composes loses the
+    /// composition in a client that does not keep it itself (GTK).
     FocusWhileComposing,
 }
 
@@ -768,19 +934,61 @@ impl KnownIssue {
 }
 
 /// The known issue that explains a case's `failures`, if one does: tier 1
-/// passed, and tier 2 failed only on the text of fields that a focus move,
-/// click or tap left while their client showed a preedit (`left`).
-pub(super) fn classify(failures: &[Failure], left: &[bool]) -> Option<KnownIssue> {
-    let known = |failure: &Failure| {
-        failure.tier == Tier::Intent
-            && failure.check == "text"
-            && failure.field.is_some_and(|field| left[field])
-    };
-    (!failures.is_empty() && failures.iter().all(known)).then_some(KnownIssue::FocusWhileComposing)
+/// passed, and the client shows exactly what the issue predicts
+/// (`predicts`, asked only then).
+pub(super) fn classify(
+    failures: &[Failure],
+    predicts: impl FnOnce() -> bool,
+) -> Option<KnownIssue> {
+    let intent_only = !failures.is_empty() && failures.iter().all(|f| f.tier == Tier::Intent);
+    (intent_only && predicts()).then_some(KnownIssue::FocusWhileComposing)
 }
 
-/// A field as `"text with | at the cursor" preedit "…"`.
-fn show(model: &TextModel) -> String {
+/// Whether `client` shows exactly what P1 predicts of `actions` on fields
+/// holding `texts`, typed as `typing` says: the user's intent, except that
+/// some of the focus moves away from a composing field lose the
+/// composition instead of committing it. Which ones depends on Exo's order
+/// at each move (E12), so each choice of them is tried, up to 12 moves.
+pub(super) fn focus_moves_lose_composition(
+    texts: &[String],
+    typing: Typing,
+    actions: &[UserAction],
+    client: &dyn Client,
+) -> bool {
+    let fresh = || {
+        let fields = texts.iter().map(|text| TextModel::new(text)).collect();
+        Reference::new(fields).typing(typing)
+    };
+    let mut reference = fresh();
+    let mut moves = Vec::new();
+    for (i, &action) in actions.iter().enumerate() {
+        if reference.leaves_composition(action) {
+            moves.push(i);
+        }
+        reference.apply(action);
+    }
+    if moves.is_empty() || moves.len() > 12 {
+        return false;
+    }
+    (1..1_u32 << moves.len()).any(|lost| {
+        let mut reference = fresh();
+        for (i, &action) in actions.iter().enumerate() {
+            match moves.iter().position(|&m| m == i) {
+                Some(bit) if lost >> bit & 1 == 1 => reference.apply_losing_composition(action),
+                _ => reference.apply(action),
+            }
+        }
+        intended(&reference, client).is_empty()
+    })
+}
+
+/// A field as `"text with | at the cursor" preedit "…" at (begin, end)`.
+fn show(view: &View) -> String {
+    format!("{} at {:?}", show_model(&view.model), view.preedit_cursor)
+}
+
+/// A model as `"text with | at the cursor" preedit "…"`.
+fn show_model(model: &TextModel) -> String {
     let (before, after) = model.text.split_at(model.cursor);
     format!(
         "{:?} preedit {:?}",
@@ -789,112 +997,103 @@ fn show(model: &TextModel) -> String {
     )
 }
 
-/// `model` with its text and preedit in NFC, and its cursor after the
-/// normalised text before it.
-fn nfc_model(model: &TextModel) -> TextModel {
-    let text = nfc(&model.text);
-    let cursor = nfc(&model.text[..model.cursor]).len();
-    TextModel {
-        text,
-        cursor,
-        preedit: nfc(&model.preedit),
-    }
-}
-
-/// `text` in NFC, as far as the simulation types it: conjoining Hangul
-/// jamo compose into syllables; nothing else it types decomposes.
-fn nfc(text: &str) -> String {
-    let mut out: Vec<char> = Vec::new();
-    for c in text.chars() {
-        match out.last().and_then(|&last| compose(last, c)) {
-            Some(syllable) => *out.last_mut().expect("a last character") = syllable,
-            None => out.push(c),
-        }
-    }
-    out.into_iter().collect()
-}
-
-/// The syllable that `first` then `second` compose into: a leading
-/// consonant and a vowel, or a syllable without a trailing consonant and
-/// one (Unicode's canonical composition of Hangul).
-fn compose(first: char, second: char) -> Option<char> {
-    let (first, second) = (u32::from(first), u32::from(second));
-    let syllable = if (0x1100..0x1113).contains(&first) && (0x1161..0x1176).contains(&second) {
-        0xAC00 + ((first - 0x1100) * 21 + (second - 0x1161)) * 28
-    } else if (0xAC00..0xD7A4).contains(&first)
-        && (first - 0xAC00) % 28 == 0
-        && (0x11A8..0x11C3).contains(&second)
-    {
-        first + second - 0x11A7
-    } else {
-        return None;
-    };
-    char::from_u32(syllable)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::wayland::wl_callback;
+    use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1 as manager;
     use crate::sim::client::{gtk::Gtk, Field};
     use crate::sim::clock::Micros;
-    use crate::sim::editor::{Target, UserAction};
     use crate::sim::hangul::Key;
 
     /// The host surfaces of field 0 and field 1, and their guest ones.
     const HOST: [u32; 2] = [20, 21];
     const GUEST: [u32; 2] = [30, 31];
-    const CALLBACK: u32 = 40;
+    /// The callbacks of the proxy's syncs.
+    const SYNC: u32 = 40;
 
-    /// The spec of fields holding `texts`, the keyboard on field 0, with
-    /// the guest's field enabled and the text input attached.
-    fn attached(texts: &[&str]) -> SpecText {
-        let texts: Vec<String> = texts.iter().map(|text| text.to_string()).collect();
-        let mut spec = SpecText::new(&HOST, &texts);
-        host(
-            &mut spec,
-            wl_keyboard::Event::Enter {
-                serial: 1,
-                surface: HOST[0],
-                keys: Vec::new(),
-            },
-        );
-        guest(&mut spec, &[v3::Request::Enable {}, v3::Request::Commit {}]);
-        decide(
-            &mut spec,
-            v1::Request::Activate {
-                seat: 1,
-                surface: HOST[0],
-            },
-        );
+    fn texts(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|text| text.to_string()).collect()
+    }
+
+    /// A step: `event` reaches the proxy from the host, which sends
+    /// `decisions`.
+    fn host(spec: &mut SpecText, event: impl Into<AnyEvent>, decisions: &[AnyRequest]) {
+        let event = event.into();
+        spec.see(Seen::Host {
+            sender: SYNC,
+            event: &event,
+            origin: Origin::default(),
+        });
+        decisions
+            .iter()
+            .for_each(|request| spec.see(Seen::ToHost(request)));
+        spec.see(Seen::StepEnd);
+    }
+
+    /// Steps of the guest's `requests`, the last answered with `decisions`.
+    fn guest(spec: &mut SpecText, requests: &[v3::Request], decisions: &[AnyRequest]) {
+        for (i, request) in requests.iter().enumerate() {
+            spec.see(Seen::Guest(request));
+            if i + 1 == requests.len() {
+                decisions
+                    .iter()
+                    .for_each(|request| spec.see(Seen::ToHost(request)));
+            }
+            spec.see(Seen::StepEnd);
+        }
+    }
+
+    fn activate(field: usize) -> AnyRequest {
+        v1::Request::Activate {
+            seat: 1,
+            surface: HOST[field],
+        }
+        .into()
+    }
+
+    fn deactivate() -> AnyRequest {
+        v1::Request::Deactivate { seat: 1 }.into()
+    }
+
+    fn reset() -> AnyRequest {
+        v1::Request::Reset {}.into()
+    }
+
+    fn sync() -> AnyRequest {
+        wl_display::Request::Sync { callback: SYNC }.into()
+    }
+
+    fn enter(field: usize) -> wl_keyboard::Event {
+        wl_keyboard::Event::Enter {
+            serial: 1,
+            surface: HOST[field],
+            keys: Vec::new(),
+        }
+    }
+
+    fn enable() -> [v3::Request; 2] {
+        [v3::Request::Enable {}, v3::Request::Commit {}]
+    }
+
+    /// The spec of fields holding `fields`, the keyboard on field 0, its
+    /// text input enabled and attached.
+    fn attached(fields: &[&str]) -> SpecText {
+        let mut spec = SpecText::new(&HOST, &texts(fields));
+        host(&mut spec, enter(0), &[]);
+        guest(&mut spec, &enable(), &[activate(0)]);
         spec
     }
 
-    fn host(spec: &mut SpecText, event: impl Into<AnyEvent>) {
-        let event = event.into();
-        spec.see(Seen::Host {
-            sender: CALLBACK,
-            event: &event,
-            late: false,
-        });
-    }
-
-    fn guest(spec: &mut SpecText, requests: &[v3::Request]) {
-        requests
-            .iter()
-            .for_each(|request| spec.see(Seen::Guest(request)));
-    }
-
-    fn decide(spec: &mut SpecText, request: impl Into<AnyRequest>) {
-        spec.see(Seen::ToHost(&request.into()));
-    }
-
-    fn preedit(text: &str) -> v1::Event {
-        v1::Event::PreeditString {
+    /// Exo's `preedit_cursor` and `preedit_string` of `text`.
+    fn preedit(spec: &mut SpecText, text: &str) {
+        let index = i32::try_from(text.len()).expect("a short preedit");
+        host(spec, v1::Event::PreeditCursor { index }, &[]);
+        let event = v1::Event::PreeditString {
             serial: 0,
             text: IndexedString::Utf8(text.to_owned()),
             commit: text.to_owned(),
-        }
+        };
+        host(spec, event, &[]);
     }
 
     fn commit(text: &str) -> v1::Event {
@@ -904,124 +1103,177 @@ mod tests {
         }
     }
 
-    fn press(spec: &mut SpecText, field: usize, at: Target) {
-        let surface = HOST[field];
-        let x = keymap::position(at);
-        host(
-            spec,
-            wl_touch::Event::Down {
-                serial: 0,
-                time: 0,
-                surface,
-                id: 0,
-                x,
-                y: 0,
-            },
-        );
+    fn tap(field: usize, at: Target) -> wl_touch::Event {
+        wl_touch::Event::Down {
+            serial: 0,
+            time: 0,
+            surface: HOST[field],
+            id: 0,
+            x: keymap::position(at),
+            y: 0,
+        }
     }
 
-    fn model(text: &str, cursor: usize, preedit: &str) -> TextModel {
-        TextModel {
-            text: text.to_owned(),
-            cursor,
-            preedit: preedit.to_owned(),
+    fn view(text: &str, cursor: usize, preedit: &str) -> View {
+        let preedit_cursor = match preedit.len() {
+            0 => (0, 0),
+            end => (end as i32, end as i32),
+        };
+        View {
+            model: TextModel {
+                text: text.to_owned(),
+                cursor,
+                preedit: preedit.to_owned(),
+            },
+            preedit_cursor,
         }
     }
 
     #[test]
     fn composition_events_reach_the_guest_only_through_the_gate() {
-        let texts = ["0".to_owned()];
-        let mut spec = SpecText::new(&HOST[..1], &texts);
-        host(
-            &mut spec,
-            wl_keyboard::Event::Enter {
-                serial: 1,
-                surface: HOST[0],
-                keys: Vec::new(),
-            },
-        );
         // Not attached: dropped, but not by a fence.
-        host(&mut spec, preedit("가"));
-        assert_eq!(spec.fields, [model("0", 1, "")]);
-        // H7, then H8 ends the preedit.
-        let mut spec = attached(&["0"]);
-        host(&mut spec, preedit("가"));
-        assert_eq!(spec.fields[0], model("0", 1, "가"));
-        host(&mut spec, commit("각"));
-        assert_eq!(spec.fields[0], model("0각", 4, ""));
+        let mut spec = SpecText::new(&HOST[..1], &texts(&["0"]));
+        host(&mut spec, enter(0), &[]);
+        preedit(&mut spec, "가");
+        assert_eq!(spec.views, [view("0", 1, "")]);
+        // H7 shows a preedit at its cursor (H5); H8 ends it.
+        let mut spec = attached(&["0", "1"]);
+        preedit(&mut spec, "가");
+        assert_eq!(spec.views[0], view("0", 1, "가"));
+        host(&mut spec, commit("각"), &[]);
+        assert_eq!(spec.views[0], view("0각", 4, ""));
         // X2 commits the shown preedit; X2' with none changes nothing.
-        host(&mut spec, preedit("ㄴ"));
+        preedit(&mut spec, "ㄴ");
         let confirm = || extended::Event::ConfirmPreedit {
             selection_behavior: 1,
         };
-        host(&mut spec, confirm());
-        host(&mut spec, confirm());
-        assert_eq!(spec.fields[0], model("0각ㄴ", 7, ""));
-        assert_eq!(spec.counts.fence_drops, 0);
+        host(&mut spec, confirm(), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.views[0], view("0각ㄴ", 7, ""));
+        assert_eq!(
+            (spec.counts.fence_drops, &spec.wrong_decisions),
+            (0, &vec![])
+        );
     }
 
     #[test]
-    fn a_press_commits_the_preedit_and_fences_until_its_sync_returns() {
+    fn a_preedit_cursor_is_where_exo_put_it_or_at_the_end() {
+        assert_eq!(preedit_cursor("가나", Some(3)), (3, 3));
+        assert_eq!(
+            preedit_cursor("가나", Some(1)),
+            (6, 6),
+            "inside a character"
+        );
+        assert_eq!(preedit_cursor("가나", None), (6, 6));
+        assert_eq!(preedit_cursor("가", Some(-1)), (-1, -1));
+        // A terminal event takes the assembly, even a dropped one.
+        let mut spec = attached(&["0"]);
+        host(&mut spec, v1::Event::PreeditCursor { index: 0 }, &[]);
+        host(&mut spec, commit(""), &[]);
+        let event = v1::Event::PreeditString {
+            serial: 0,
+            text: IndexedString::Utf8("가".to_owned()),
+            commit: String::new(),
+        };
+        host(&mut spec, event, &[]);
+        assert_eq!(spec.views[0].preedit_cursor, (3, 3));
+    }
+
+    #[test]
+    fn a_press_commits_the_preedit_and_resets_behind_a_fence() {
         let mut spec = attached(&["0a", "1"]);
-        host(&mut spec, preedit("가"));
-        // F4 commits, then the press moves the cursor.
-        press(&mut spec, 0, Target::Start);
-        assert_eq!(spec.fields[0], model("0a가", 0, ""));
-        assert_eq!(spec.counts.press_commits, 1);
-        decide(&mut spec, v1::Request::Reset {});
-        decide(&mut spec, wl_display::Request::Sync { callback: CALLBACK });
+        preedit(&mut spec, "가");
+        // F4 commits, then the press moves the cursor; the proxy must reset.
+        host(&mut spec, tap(0, Target::Start), &[reset(), sync()]);
+        assert_eq!(spec.views[0], view("0a가", 0, ""));
+        assert_eq!(
+            (spec.counts.press_commits, &spec.wrong_decisions),
+            (1, &vec![])
+        );
         // W2: the fence drops what Exo sent before the reset.
-        host(&mut spec, preedit("각"));
-        assert_eq!(spec.fields[0], model("0a가", 0, ""));
+        preedit(&mut spec, "각");
+        assert_eq!(spec.views[0], view("0a가", 0, ""));
         assert_eq!(spec.counts.fence_drops, 1);
-        host(&mut spec, wl_callback::Event::Done { callback_data: 0 });
-        host(&mut spec, preedit("ㄴ"));
-        assert_eq!(spec.fields[0], model("0a가", 0, "ㄴ"));
-        // A press on the other field commits nothing, and only moves its
-        // cursor.
-        press(&mut spec, 1, Target::Start);
-        assert_eq!(spec.fields[0].preedit, "ㄴ");
-        assert_eq!(spec.fields[1], model("1", 0, ""));
+        host(
+            &mut spec,
+            wl_callback::Event::Done { callback_data: 0 },
+            &[],
+        );
+        preedit(&mut spec, "ㄴ");
+        assert_eq!(spec.views[0], view("0a가", 0, "ㄴ"));
+        // A press on the other field commits nothing; one that resets
+        // anyway is a wrong decision.
+        host(&mut spec, tap(1, Target::Start), &[reset(), sync()]);
+        assert_eq!(spec.views[1], view("1", 0, ""));
+        assert_eq!(spec.wrong_decisions.len(), 1);
+    }
+
+    #[test]
+    fn the_link_follows_the_fields_wish_through_a_barrier() {
+        let mut spec = SpecText::new(&HOST, &texts(&["0", "1"]));
+        host(&mut spec, enter(0), &[]);
+        // An enabled, focused field must be activated on its surface.
+        guest(&mut spec, &enable(), &[activate(1)]);
+        assert_eq!(spec.wrong_decisions.len(), 1, "the wrong surface");
+        let mut spec = attached(&["0", "1"]);
+        // F1: the keyboard moves, so the field resets and must deactivate.
+        host(&mut spec, enter(1), &[deactivate(), sync()]);
+        // Enabled again while draining, it waits for the barrier (R2), then
+        // activates.
+        guest(&mut spec, &enable(), &[]);
+        host(
+            &mut spec,
+            wl_callback::Event::Done { callback_data: 0 },
+            &[activate(1)],
+        );
+        // H2: Exo detaches on its own, so the field activates again.
+        host(&mut spec, v1::Event::Leave {}, &[activate(1)]);
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+        // A spurious reset, or a missing deactivate, is wrong.
+        guest(&mut spec, &[v3::Request::Commit {}], &[reset(), sync()]);
+        guest(
+            &mut spec,
+            &[v3::Request::Disable {}, v3::Request::Commit {}],
+            &[],
+        );
+        assert_eq!(spec.wrong_decisions.len(), 2);
     }
 
     #[test]
     fn exo_or_the_proxy_detaching_or_a_focus_change_drops_the_preedit() {
         // H2: Exo's own detach clears the preedit, committing nothing.
         let mut spec = attached(&["0", "1"]);
-        host(&mut spec, preedit("가"));
-        host(&mut spec, v1::Event::Leave {});
-        assert_eq!(spec.fields[0], model("0", 1, ""));
-        // F1: the keyboard leaves; the field resets, and the guest drops the
-        // preedit at the text input's leave.
+        preedit(&mut spec, "가");
+        host(&mut spec, v1::Event::Leave {}, &[activate(0)]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        // F1: the keyboard leaves; the guest drops the preedit at the text
+        // input's leave.
         let mut spec = attached(&["0", "1"]);
-        host(&mut spec, preedit("가"));
-        host(
-            &mut spec,
-            wl_keyboard::Event::Leave {
-                serial: 2,
-                surface: HOST[0],
-            },
-        );
-        assert_eq!(spec.fields[0], model("0", 1, ""));
-        assert_eq!(spec.committed, None);
-        // The proxy's deactivate closes the gate.
-        let mut spec = attached(&["0"]);
-        decide(&mut spec, v1::Request::Deactivate { seat: 1 });
-        host(&mut spec, preedit("가"));
-        assert_eq!(spec.fields[0], model("0", 1, ""));
+        preedit(&mut spec, "가");
+        let leave = wl_keyboard::Event::Leave {
+            serial: 2,
+            surface: HOST[0],
+        };
+        host(&mut spec, leave, &[deactivate(), sync()]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        // Draining, the gate is shut.
+        preedit(&mut spec, "각");
+        host(&mut spec, enter(0), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
     }
 
     #[test]
     fn a_guest_commit_is_answered_with_the_shown_preedit_and_records_the_field() {
         let mut spec = attached(&["0"]);
-        host(&mut spec, preedit("가"));
+        preedit(&mut spec, "가");
         let surrounding = v3::Request::SetSurroundingText {
             text: IndexedString::Utf8("0".to_owned()),
             cursor: 1,
             anchor: 1,
         };
-        guest(&mut spec, &[surrounding, v3::Request::Commit {}]);
-        assert_eq!(spec.fields[0], model("0", 1, "가"));
+        guest(&mut spec, &[surrounding, v3::Request::Commit {}], &[]);
+        assert_eq!(spec.views[0], view("0", 1, "가"));
         let field = V3Field {
             surrounding_text: Some(("0".to_owned(), 1, 1)),
             ..V3Field::default()
@@ -1030,18 +1282,17 @@ mod tests {
         // A disable is a new field, which forgets the shown preedit; the
         // guest keeps showing it until the answer to the next enable, a
         // `done` with no preedit, clears it.
-        guest(
-            &mut spec,
-            &[v3::Request::Disable {}, v3::Request::Commit {}],
-        );
+        let disable = [v3::Request::Disable {}, v3::Request::Commit {}];
+        guest(&mut spec, &disable, &[deactivate(), sync()]);
         assert_eq!((&spec.committed, &spec.shown), (&None, &None));
-        assert_eq!(spec.fields[0], model("0", 1, "가"));
-        guest(&mut spec, &[v3::Request::Enable {}, v3::Request::Commit {}]);
-        assert_eq!(spec.fields[0], model("0", 1, ""));
+        assert_eq!(spec.views[0], view("0", 1, "가"));
+        guest(&mut spec, &enable(), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
     }
 
     #[test]
-    fn the_guest_types_the_keys_the_proxy_passes() {
+    fn the_guest_types_every_key_the_host_presses() {
         let mut spec = attached(&["0"]);
         let key = |state| wl_keyboard::Event::Key {
             serial: 0,
@@ -1049,25 +1300,21 @@ mod tests {
             key: keymap::keycode(Key::Char('a')).0,
             state,
         };
-        // Only a press types, and only one the proxy passed.
-        host(&mut spec, key(wl_keyboard::KEY_STATE_PRESSED));
-        let pressed = AnyEvent::from(key(wl_keyboard::KEY_STATE_PRESSED));
-        let released = AnyEvent::from(key(wl_keyboard::KEY_STATE_RELEASED));
-        spec.see(Seen::ToGuest(&pressed));
-        spec.see(Seen::ToGuest(&released));
-        assert_eq!(spec.fields[0], model("0a", 2, ""));
+        host(&mut spec, key(wl_keyboard::KEY_STATE_PRESSED), &[]);
+        host(&mut spec, key(wl_keyboard::KEY_STATE_RELEASED), &[]);
+        host(&mut spec, key(wl_keyboard::KEY_STATE_PRESSED), &[]);
+        assert_eq!(spec.views[0], view("0aa", 3, ""));
         assert_eq!(spec.counts.raw_keys, 0);
     }
 
     #[test]
     fn the_shadow_applies_what_the_guest_got() {
-        let texts = ["0".to_owned(), "1".to_owned()];
-        let mut shadow = Shadow::new(&GUEST, &texts);
+        let mut shadow = Shadow::new(&GUEST, &texts(&["0", "1"]));
         let events: Vec<AnyEvent> = vec![
             v3::Event::Enter { surface: GUEST[0] }.into(),
             v3::Event::PreeditString {
                 text: Some(IndexedString::Utf8("가".to_owned())),
-                cursor_begin: 3,
+                cursor_begin: 0,
                 cursor_end: 3,
             }
             .into(),
@@ -1076,23 +1323,30 @@ mod tests {
             }
             .into(),
         ];
-        for event in &events {
-            shadow.see(Seen::ToGuest(event));
-        }
+        events
+            .iter()
+            .for_each(|event| shadow.see(Seen::ToGuest(event)));
         // Nothing applies before `done`.
-        assert_eq!(shadow.fields[0], model("0", 1, ""));
+        assert_eq!(shadow.views[0], view("0", 1, ""));
         shadow.see(Seen::ToGuest(&v3::Event::Done { serial: 0 }.into()));
-        assert_eq!(shadow.fields[0], model("0a", 2, "가"));
-        // `leave` drops the preedit.
-        let leave = v3::Event::Leave { surface: GUEST[0] }.into();
-        shadow.see(Seen::ToGuest(&leave));
-        assert_eq!(shadow.fields[0], model("0a", 2, ""));
+        let mut shown = view("0a", 2, "가");
+        shown.preedit_cursor = (0, 3);
+        assert_eq!(shadow.views[0], shown);
+        // A press moves the cursor; `leave` drops the preedit.
+        shadow.see(Seen::GuestPress {
+            surface: GUEST[0],
+            at: Target::Start,
+        });
+        shadow.see(Seen::ToGuest(
+            &v3::Event::Leave { surface: GUEST[0] }.into(),
+        ));
+        assert_eq!(shadow.views[0], view("0a", 0, ""));
     }
 
     #[test]
     #[should_panic(expected = "does not fit")]
     fn the_shadow_refuses_a_delete_that_does_not_fit() {
-        let mut shadow = Shadow::new(&GUEST[..1], &["가".to_owned()]);
+        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["가"]));
         let events: Vec<AnyEvent> = vec![
             v3::Event::Enter { surface: GUEST[0] }.into(),
             v3::Event::DeleteSurroundingText {
@@ -1109,75 +1363,74 @@ mod tests {
 
     #[test]
     fn exos_composition_must_be_the_engines_or_the_one_it_tracks() {
-        use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1 as manager;
         // Exo attached a text input on field 0, and tracks no composition.
         let mut exo = Exo::default();
         exo.set_text_input_focus(Some(HOST[0]));
-        let create = manager::Request::CreateTextInput { id: 10 };
-        exo.request(3, &create.into());
-        let activate = v1::Request::Activate {
-            seat: 1,
-            surface: HOST[0],
-        };
-        exo.request(10, &activate.into());
-        let checks = |spec: &SpecText, engine: &str| -> Vec<&'static str> {
+        exo.request(3, &manager::Request::CreateTextInput { id: 10 }.into());
+        exo.request(10, &activate(0));
+        let checks = |spec: &SpecText, engine: &str, resets| -> Vec<&'static str> {
             let shadow = Shadow {
-                fields: spec.fields.clone(),
+                views: spec.views.clone(),
                 ..Shadow::new(&GUEST[..1], &[])
             };
-            let failures = exact(spec, &shadow, &exo, engine, None);
-            failures.iter().map(|failure| failure.check).collect()
+            let failures = exact(spec, &shadow, &exo, engine, resets, None);
+            let checks = failures.iter().map(|failure| failure.check);
+            checks.filter(|&check| check != "field state").collect()
         };
         let mut spec = attached(&["0"]);
         // The guest shows nothing, which Exo tracks.
-        assert_eq!(checks(&spec, "가"), ["field state"]);
+        assert_eq!(checks(&spec, "가", 0), Vec::<&str>::new());
         // The guest shows what the engine composes.
-        host(&mut spec, preedit("가"));
-        assert_eq!(checks(&spec, "가"), ["field state"]);
-        // Neither composes it.
-        assert_eq!(checks(&spec, "각"), ["composition", "field state"]);
-        // A late answer's preedit is not checked.
+        preedit(&mut spec, "가");
+        assert_eq!(checks(&spec, "가", 0), Vec::<&str>::new());
+        // Nothing composes it.
+        assert_eq!(checks(&spec, "", 0), ["composition"]);
+        // Unless the engine reset since it made it, without Exo's client
+        // hearing of it.
+        assert_eq!(checks(&spec, "", 1), Vec::<&str>::new());
+        assert_eq!(checks(&spec, "각", 1), ["composition"]);
+        // Or the guest got it late.
+        let late = v1::Event::PreeditString {
+            serial: 0,
+            text: IndexedString::Utf8("각".to_owned()),
+            commit: "각".to_owned(),
+        };
+        let origin = Origin {
+            late: true,
+            resets: 0,
+        };
         spec.see(Seen::Host {
             sender: 10,
-            event: &preedit("각").into(),
-            late: true,
+            event: &late.into(),
+            origin,
         });
-        assert_eq!(checks(&spec, ""), ["field state"]);
+        assert_eq!(checks(&spec, "", 0), Vec::<&str>::new());
+        assert_eq!(spec.counts.late_shown, 1);
+    }
+
+    /// GTK4 showing `texts`, the keyboard on field `focus`.
+    fn gtk(texts: [&str; 2], focus: usize) -> Gtk {
+        let fields = texts
+            .iter()
+            .zip(GUEST)
+            .map(|(text, surface)| Field {
+                surface,
+                model: TextModel::new(text),
+            })
+            .collect();
+        let mut gtk = Gtk::new(true, 10, fields);
+        gtk.keyboard_focus(Micros(0), Some(GUEST[focus]));
+        gtk
     }
 
     #[test]
-    fn nfc_composes_conjoining_hangul_only() {
-        assert_eq!(nfc("\u{1100}\u{1161}"), "가");
-        assert_eq!(nfc("\u{1100}\u{1161}\u{11A8}"), "각");
-        assert_eq!(nfc("가\u{11A8}"), "각");
-        assert_eq!(nfc("각\u{11A8}"), "각\u{11A8}");
-        assert_eq!(nfc("a\u{1100}b"), "a\u{1100}b");
-        let model = nfc_model(&model("\u{1100}\u{1161}b", 6, "\u{1100}"));
-        assert_eq!(
-            model,
-            TextModel {
-                text: "가b".to_owned(),
-                cursor: 3,
-                preedit: "\u{1100}".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn the_intent_is_compared_after_nfc_with_the_focus() {
-        let fields = |texts: [&str; 2]| -> Vec<Field> {
-            texts
-                .iter()
-                .zip(GUEST)
-                .map(|(text, surface)| Field {
-                    surface,
-                    model: TextModel::new(text),
-                })
-                .collect()
-        };
-        let mut gtk = Gtk::new(true, 10, fields(["\u{1100}\u{1161}", "1"]));
-        gtk.keyboard_focus(Micros(0), Some(GUEST[1]));
-        let mut reference = Reference::new(vec![TextModel::new("가"), TextModel::new("1")]);
+    fn the_intent_is_the_fields_and_the_focus() {
+        let gtk = gtk(["가", "1"], 1);
+        let fields = texts(&["가", "1"])
+            .iter()
+            .map(|text| TextModel::new(text))
+            .collect();
+        let mut reference = Reference::new(fields);
         reference.apply(UserAction::Focus(1));
         assert_eq!(intended(&reference, &gtk), []);
         reference.apply(UserAction::Key(Key::Char('a')));
@@ -1188,22 +1441,35 @@ mod tests {
     }
 
     #[test]
-    fn only_lost_text_in_a_field_left_while_composing_is_known() {
-        let failure = |tier, check, field| Failure {
-            tier,
-            check,
-            field,
+    fn a_known_issue_must_predict_exactly_what_the_client_shows() {
+        // The user typed 가 in field 0 and moved to field 1: P1 loses it.
+        let actions = [
+            UserAction::Key(Key::Char('r')),
+            UserAction::Key(Key::Char('k')),
+            UserAction::Focus(1),
+        ];
+        let fields = texts(&["0", "1"]);
+        let predicts = |client: &Gtk| {
+            focus_moves_lose_composition(&fields, Typing::default(), &actions, client)
+        };
+        assert!(predicts(&gtk(["0", "1"], 1)));
+        assert!(!predicts(&gtk(["0가", "1"], 1)), "it kept the syllable");
+        assert!(!predicts(&gtk(["0", "1x"], 1)), "and lost something else");
+        let lost = Failure {
+            tier: Tier::Intent,
+            check: "text",
+            field: Some(0),
             detail: String::new(),
         };
-        let lost = failure(Tier::Intent, "text", Some(0));
         let known = Some(KnownIssue::FocusWhileComposing);
-        assert_eq!(classify(std::slice::from_ref(&lost), &[true, false]), known);
-        assert_eq!(classify(std::slice::from_ref(&lost), &[false, true]), None);
-        assert_eq!(classify(&[], &[true, true]), None);
-        let exact = failure(Tier::Exact, "text", Some(0));
-        assert_eq!(classify(&[lost.clone(), exact], &[true, true]), None);
-        let focus = failure(Tier::Intent, "focus", None);
-        assert_eq!(classify(&[lost, focus], &[true, true]), None);
+        assert_eq!(classify(std::slice::from_ref(&lost), || true), known);
+        assert_eq!(classify(std::slice::from_ref(&lost), || false), None);
+        assert_eq!(classify(&[], || true), None);
+        let exact = Failure {
+            tier: Tier::Exact,
+            ..lost.clone()
+        };
+        assert_eq!(classify(&[lost, exact], || true), None);
         let issue = KnownIssue::FocusWhileComposing;
         assert!(!issue.reason().is_empty() && issue.tracking().contains("C5"));
     }

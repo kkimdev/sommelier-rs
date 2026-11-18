@@ -57,7 +57,7 @@ use crate::test_support::Rng;
 use editor::{Reference, TextModel, Typing, UserAction};
 use engine::Lag;
 use oracle::{Counts, Failure, KnownIssue, Tier};
-use sched::{Choices, Line, Setup, Tally, World};
+use sched::{Choices, Line, Setup, World};
 
 /// A client model a case types into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +127,21 @@ impl Case {
     fn choices(&self) -> Choices {
         Choices::new(self.seed ^ 0x5eed_5eed)
     }
+
+    /// The reference editor on the case's fields, before any action.
+    fn reference_at_start(&self) -> Reference {
+        let fields = self.texts.iter().map(|text| TextModel::new(text)).collect();
+        Reference::new(fields).typing(self.typing())
+    }
+
+    /// The user's intent: the reference editor after the case's actions.
+    fn reference(&self) -> Reference {
+        let mut reference = self.reference_at_start();
+        for &action in &self.actions {
+            reference.apply(action);
+        }
+        reference
+    }
 }
 
 /// What a case came to.
@@ -137,7 +152,6 @@ struct Outcome {
     /// The known issue that explains the failures, if one does.
     known: Option<KnownIssue>,
     counts: Counts,
-    tally: Tally,
     /// The text-input extension the host had, and the engine's lag.
     extension: Option<u32>,
     lag: Lag,
@@ -167,7 +181,6 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
             failures: Vec::new(),
             known: None,
             counts: Counts::default(),
-            tally: world.tally,
             extension,
             lag,
             choices: world.choices.recorded().to_vec(),
@@ -182,17 +195,17 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
             return outcome;
         };
         outcome.counts = spec.counts;
-        let engine = world.engine_composition();
-        let mut failures = oracle::exact(spec, shadow, &world.exo, &engine, extension);
+        let (engine, resets) = (world.engine_composition(), world.engine_resets());
+        let mut failures = oracle::exact(spec, shadow, &world.exo, &engine, resets, extension);
         if case.settled {
-            let fields = case.texts.iter().map(|text| TextModel::new(text)).collect();
-            let mut reference = Reference::new(fields).typing(case.typing());
-            for &action in &case.actions {
-                reference.apply(action);
-            }
-            failures.extend(oracle::intended(&reference, world.client()));
+            failures.extend(oracle::intended(&case.reference(), world.client()));
         }
-        outcome.known = oracle::classify(&failures, &world.left_composing);
+        // P1 shows only in GTK, whose blur keeps no composition (C11).
+        let gtk = case.client != ClientKind::Chromium;
+        outcome.known = oracle::classify(&failures, || {
+            let (texts, typing, actions) = (&case.texts, case.typing(), &case.actions);
+            gtk && oracle::focus_moves_lose_composition(texts, typing, actions, world.client())
+        });
         if outcome.known.is_none() {
             outcome.failures = failures;
         }
@@ -200,7 +213,8 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
     })
 }
 
-/// The report of a failed case, with the end of its trace.
+/// The report of a failed case, with the end of its trace, its choices
+/// and how to replay it.
 fn report(case: &Case, outcome: &Outcome, failures: &[Failure], trace: &[Line]) -> String {
     let mode = if case.settled { "settled" } else { "free" };
     let mut report = format!(
@@ -231,8 +245,12 @@ fn report(case: &Case, outcome: &Outcome, failures: &[Failure], trace: &[Line]) 
         report += &format!("    {line}\n");
     }
     report += &format!("  actions: {:?}\n", case.actions);
+    report += &format!("  choices: {:?}\n", outcome.choices);
+    let client = std::env::var("SOMMELIER_DST_CLIENT")
+        .map(|client| format!(" SOMMELIER_DST_CLIENT={client}"))
+        .unwrap_or_default();
     report += &format!(
-        "  replay: SOMMELIER_DST_SEED={} SOMMELIER_DST_CASES=1 cargo test -p sommelier --bins sim::\n",
+        "  replay: SOMMELIER_DST_SEED={} SOMMELIER_DST_CASES=1{client} cargo test -p sommelier --bins sim::\n",
         case.seed
     );
     report
@@ -268,6 +286,60 @@ fn cases(settled: bool) -> Vec<Case> {
         .collect()
 }
 
+/// How often a run met each variant a case draws, and the paths only
+/// some cases take.
+#[derive(Debug, Default)]
+struct Coverage {
+    /// By the host's text-input extension: none, 7, 10 and 11.
+    extensions: [u64; 4],
+    /// By client: Chromium, GTK3 and GTK4.
+    clients: [u64; 3],
+    /// By the engine's lag: fast, normal and slow.
+    lags: [u64; 3],
+    /// Latin layouts.
+    latin: u64,
+    /// Backspaces a GTK client takes after a Hangul syllable (C14).
+    nfd_backspaces: u64,
+    /// Focus moves, clicks and taps that leave a composing field.
+    leaves_composing: u64,
+}
+
+impl Coverage {
+    /// Counts `case`, which came to `outcome`.
+    fn count(&mut self, case: &Case, outcome: &Outcome) {
+        let versions = [None, Some(7), Some(10), Some(11)];
+        let extension = versions.iter().position(|&v| v == outcome.extension);
+        self.extensions[extension.expect("a drawn version")] += 1;
+        let client = ClientKind::ALL.iter().position(|&kind| kind == case.client);
+        self.clients[client.expect("a client")] += 1;
+        let lag = [Lag::Fast, Lag::Normal, Lag::Slow]
+            .iter()
+            .position(|&l| l == outcome.lag);
+        self.lags[lag.expect("a lag")] += 1;
+        self.latin += u64::from(case.latin);
+        let mut reference = case.reference_at_start();
+        for &action in &case.actions {
+            self.leaves_composing += u64::from(reference.leaves_composition(action));
+            if let UserAction::Key(hangul::Key::Backspace) = action {
+                let field = &reference.fields()[reference.focus()];
+                let before = field.text[..field.cursor].chars().next_back();
+                let syllable = before.is_some_and(|c| ('가'..='힣').contains(&c));
+                let passed = reference.engine_passes(hangul::Key::Backspace);
+                self.nfd_backspaces += u64::from(case.typing().nfd_backspace && passed && syllable);
+            }
+            reference.apply(action);
+        }
+    }
+
+    /// The counters, each of which a full run must have raised.
+    fn counters(&self, free: bool) -> Vec<u64> {
+        let mut counters = [&self.extensions[..], &self.clients, &self.lags].concat();
+        counters.extend([self.latin, self.nfd_backspaces]);
+        counters.extend(free.then_some(self.leaves_composing));
+        counters
+    }
+}
+
 /// What a run of cases came to.
 #[derive(Debug, Default)]
 struct Summary {
@@ -275,13 +347,13 @@ struct Summary {
     /// The cases a known issue explains, with the issue.
     known: Vec<(u64, KnownIssue)>,
     counts: Counts,
-    tally: Tally,
+    coverage: Coverage,
     /// The reports of the cases that failed.
     failed: Vec<String>,
 }
 
-/// Runs `cases`, each in a fresh world; one in 50 runs twice, and its two
-/// traces must be identical.
+/// Runs `cases`, each in a fresh world; two in 50, an even and an odd
+/// seed, run twice, and their two traces must be identical.
 fn run_all(cases: &[Case]) -> Summary {
     let mut summary = Summary::default();
     for case in cases {
@@ -305,18 +377,18 @@ fn run_all(cases: &[Case]) -> Summary {
                     failures: Vec::new(),
                     known: None,
                     counts: Counts::default(),
-                    tally: Tally::default(),
                     extension: None,
                     lag: Lag::Fast,
                     choices: Vec::new(),
                 };
+                summary.cases += 1;
                 summary
                     .failed
                     .push(report(case, &outcome, &[failure], &trace));
                 continue;
             }
         };
-        if case.seed % 50 == 0 {
+        if case.seed % 50 < 2 {
             let mut again = Vec::new();
             run(case, case.choices(), &mut again);
             if again != trace {
@@ -337,13 +409,8 @@ fn run_all(cases: &[Case]) -> Summary {
         summary
             .known
             .extend(outcome.known.map(|issue| (case.seed, issue)));
-        let (counts, tally) = (&mut summary.counts, &mut summary.tally);
-        counts.press_commits += outcome.counts.press_commits;
-        counts.fence_drops += outcome.counts.fence_drops;
-        counts.late_applied += outcome.counts.late_applied;
-        counts.raw_keys += outcome.counts.raw_keys;
-        tally.late += outcome.tally.late;
-        tally.dropped += outcome.tally.dropped;
+        summary.counts += outcome.counts;
+        summary.coverage.count(case, &outcome);
         if !outcome.failures.is_empty() {
             summary
                 .failed
@@ -372,9 +439,10 @@ fn pinned(test: &str, body: impl FnOnce()) {
 
 /// Runs the cases of one mode ([`pinned`]), and fails with the report of
 /// the first case that failed. A run of the default size or more must also
-/// have reached what the mode is there to reach: in free cases, presses
-/// that end a composition, fence drops, late answers the guest got and
-/// raw keys; in settled ones, presses and the known issue.
+/// have met each variant a case draws and each path the mode is there to
+/// reach: in free cases, presses that end a composition, fence drops, late
+/// answers the guest got and raw keys; in settled ones, presses and the
+/// known issue, and no fence drop, which a settled case must not cause.
 fn check(test: &str, settled: bool) {
     pinned(test, || {
         let summary = run_all(&cases(settled));
@@ -382,10 +450,10 @@ fn check(test: &str, settled: bool) {
             cases,
             known,
             counts,
-            tally,
+            coverage,
             failed,
         } = &summary;
-        println!("{cases} cases, {counts:?}, {tally:?}");
+        println!("{cases} cases, {counts:?}, {coverage:?}");
         let mut issues: Vec<KnownIssue> = known.iter().map(|&(_, issue)| issue).collect();
         issues.sort();
         issues.dedup();
@@ -398,22 +466,29 @@ fn check(test: &str, settled: bool) {
                 issue.tracking()
             );
         }
-        let reached = match settled {
-            false => vec![
+        let mut reached = coverage.counters(!settled);
+        match settled {
+            false => reached.extend([
                 counts.press_commits,
                 counts.fence_drops,
-                counts.late_applied,
+                counts.late_shown,
                 counts.raw_keys,
-            ],
-            true => vec![counts.press_commits, known.len() as u64],
-        };
+            ]),
+            // The known issue's count drops to 0 once C5 fixes P1, which
+            // then deletes it here.
+            true => reached.extend([counts.press_commits, known.len() as u64]),
+        }
         if *cases >= 300 {
             let known = known.len();
             assert!(
                 !reached.contains(&0),
-                "a counter stayed at 0: {counts:?}, {known} known"
+                "a counter stayed at 0: {counts:?}, {coverage:?}, {known} known"
             );
         }
+        assert!(
+            !settled || counts.fence_drops == 0,
+            "a settled case met the fence: {counts:?}"
+        );
         for report in failed {
             let heading = report.lines().filter(|line| !line.starts_with("    "));
             heading
@@ -507,7 +582,43 @@ fn a_report_names_the_seed_the_tier_and_the_field_with_a_trace() {
     assert_eq!(lines.next(), Some("  check: tier2 text, field Some(1)"));
     assert_eq!(lines.next(), Some("    intended: x"));
     assert!(report.contains(&format!("    {}\n", trace[trace.len() - 1])));
+    assert!(report.contains(&format!("  choices: {:?}\n", outcome.choices)));
     assert!(report.contains("SOMMELIER_DST_SEED=7 SOMMELIER_DST_CASES=1"));
+}
+
+#[test]
+fn coverage_counts_each_draw_and_the_rare_paths() {
+    use hangul::Key;
+    let mut case = Case::new(0, &[ClientKind::Gtk3]);
+    case.latin = false;
+    case.texts = vec!["가".to_owned(), "1".to_owned()];
+    // A Backspace that takes back a jamo, one that reaches GTK after a
+    // syllable, and a focus move away from a composition.
+    case.actions = [
+        Key::Char('r'),
+        Key::Backspace,
+        Key::Backspace,
+        Key::Char('r'),
+    ]
+    .map(UserAction::Key)
+    .into_iter()
+    .chain([UserAction::Focus(1)])
+    .collect();
+    let outcome = Outcome {
+        failures: Vec::new(),
+        known: None,
+        counts: Counts::default(),
+        extension: Some(10),
+        lag: Lag::Slow,
+        choices: Vec::new(),
+    };
+    let mut coverage = Coverage::default();
+    coverage.count(&case, &outcome);
+    assert_eq!(coverage.extensions, [0, 0, 1, 0]);
+    assert_eq!((coverage.clients, coverage.lags), ([0, 1, 0], [0, 0, 1]));
+    assert_eq!((coverage.latin, coverage.nfd_backspaces), (0, 1));
+    assert_eq!(coverage.leaves_composing, 1);
+    assert!(coverage.counters(true).contains(&0));
 }
 
 #[test]

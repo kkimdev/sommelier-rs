@@ -51,11 +51,11 @@ use super::client::gtk::Gtk;
 use super::client::{Client, Field, PressKind};
 use super::clock::Micros;
 use super::display::Display;
-use super::editor::{TextModel, UserAction};
+use super::editor::{Target, TextModel, UserAction};
 use super::engine::{Engine, EngineIn, Lag};
 use super::exo::{Answer, Exo};
 use super::keymap;
-use super::oracle::{Seen, Shadow, SpecText};
+use super::oracle::{Origin, Seen, Shadow, SpecText};
 use super::ClientKind;
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{
@@ -249,15 +249,8 @@ pub(super) struct Setup<'a> {
     pub texts: &'a [String],
 }
 
-/// What a case counts beside the oracle.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Tally {
-    /// Engine answers that went out after a reset made after the key was
-    /// handed over (E5's outcome (c), P3).
-    pub late: u64,
-    /// Engine answers whose text a reset dropped (E5's outcome (b)).
-    pub dropped: u64,
-}
+/// A press the guest got: its surface and the target it lands on.
+type Press = (u32, Target);
 
 /// One case's client, proxy, Exo, engine and display, joined by channels.
 pub(super) struct World<'t> {
@@ -270,17 +263,20 @@ pub(super) struct World<'t> {
     engine: Engine,
     display: Display,
     c_to_p: Channel<Outgoing>,
-    p_to_c: Channel<(u32, AnyEvent)>,
+    /// Each event to the guest, and the press it is, if it is one: where
+    /// the guest's pointer or finger is on which of its surfaces.
+    p_to_c: Channel<(u32, AnyEvent, Option<Press>)>,
     p_to_e: Channel<(u32, AnyRequest)>,
-    /// Each host event, and whether it carries an engine answer that came
-    /// late ([`Answer::Late`]).
-    e_to_p: Channel<(Outgoing, bool)>,
+    /// Each host event, and what engine text it carries.
+    e_to_p: Channel<(Outgoing, Origin)>,
     to_engine: Channel<EngineIn>,
     /// The guest's view of what the client models do not take: the
-    /// globals, Shift and where its pointer is.
+    /// globals, Shift and where its pointer is, as the proxy tells it.
     globals: BTreeMap<String, (u32, u32)>,
     shift: bool,
     pointer: Option<(u32, i32)>,
+    /// The resets Exo handed the engine.
+    resets: u64,
     /// The guest's text input.
     text_input: u32,
     /// The fields' guest surfaces.
@@ -288,10 +284,6 @@ pub(super) struct World<'t> {
     /// The oracle's two readers, from the end of the setup.
     pub spec: Option<SpecText>,
     pub shadow: Option<Shadow>,
-    /// Which fields a focus move, click or tap left while their client
-    /// showed a preedit ([`super::oracle::classify`]).
-    pub left_composing: Vec<bool>,
-    pub tally: Tally,
     /// The proxy ended the session.
     pub ended: bool,
     trace: &'t mut Vec<Line>,
@@ -322,12 +314,11 @@ impl<'t> World<'t> {
             globals: BTreeMap::new(),
             shift: false,
             pointer: None,
+            resets: 0,
             text_input: 0,
             surfaces: Vec::new(),
             spec: None,
             shadow: None,
-            left_composing: vec![false; setup.texts.len()],
-            tally: Tally::default(),
             ended: false,
             trace,
         };
@@ -391,6 +382,11 @@ impl<'t> World<'t> {
         self.engine.composition()
     }
 
+    /// The resets Exo handed the engine.
+    pub fn engine_resets(&self) -> u64 {
+        self.resets
+    }
+
     /// The client model.
     pub fn client(&self) -> &dyn Client {
         self.client.as_deref().expect("a client model")
@@ -431,8 +427,8 @@ impl<'t> World<'t> {
                     self.deliver_guest_request(request).await;
                 }
                 1 => {
-                    let (sender, event) = self.p_to_c.take();
-                    self.deliver_to_guest(sender, event);
+                    let (sender, event, press) = self.p_to_c.take();
+                    self.deliver_to_guest(sender, event, press);
                 }
                 2 => {
                     let (sender, request) = self.p_to_e.take();
@@ -440,8 +436,8 @@ impl<'t> World<'t> {
                     self.host_sends(events, false);
                 }
                 3 => {
-                    let (event, late) = self.e_to_p.take();
-                    self.deliver_host_event(event, late).await;
+                    let (event, origin) = self.e_to_p.take();
+                    self.deliver_host_event(event, origin).await;
                 }
                 4 => {
                     let input = self.to_engine.take();
@@ -486,13 +482,6 @@ impl<'t> World<'t> {
         };
         let surface = self.display.surfaces()[field];
         if self.exo.focus() != Some(surface) {
-            let left = self
-                .exo
-                .focus()
-                .map(|s| self.display.surfaces().iter().position(|&f| f == s));
-            if let (Some(Some(left)), Some(client)) = (left, &self.client) {
-                self.left_composing[left] |= !client.fields()[left].model.preedit.is_empty();
-            }
             self.exo.move_focus(Some(surface), &mut self.choices);
         }
         let presses = match action {
@@ -505,16 +494,24 @@ impl<'t> World<'t> {
 
     /// Exo's events since its last input, then `events`, go to the proxy,
     /// and what Exo handed the engine goes to the engine. Exo's events carry
-    /// a late answer if `late`.
+    /// a late answer if `late`, made before the resets this input hands the
+    /// engine.
     fn host_sends(&mut self, events: Vec<Outgoing>, late: bool) {
+        let origin = Origin {
+            late,
+            resets: self.resets,
+        };
         for event in self.exo.take_events() {
-            self.e_to_p.send(self.now, (event, late), &mut self.choices);
+            self.e_to_p
+                .send(self.now, (event, origin), &mut self.choices);
         }
         for event in events {
+            let origin = Origin::default();
             self.e_to_p
-                .send(self.now, (event, false), &mut self.choices);
+                .send(self.now, (event, origin), &mut self.choices);
         }
         for input in self.exo.take_engine() {
+            self.resets += u64::from(input == EngineIn::Reset);
             self.to_engine.send(self.now, input, &mut self.choices);
         }
     }
@@ -524,10 +521,9 @@ impl<'t> World<'t> {
         let answer = self.engine.take(&mut self.choices);
         self.log(Place::Engine, format!("{answer:?}"));
         let verdict = self.exo.answer(&answer);
-        match verdict {
-            Answer::Normal => {}
-            Answer::Late => self.tally.late += 1,
-            Answer::Dropped => self.tally.dropped += 1,
+        if let Some(spec) = &mut self.spec {
+            spec.counts.late += u64::from(verdict == Answer::Late);
+            spec.counts.dropped += u64::from(verdict == Answer::Dropped);
         }
         self.host_sends(Vec::new(), verdict == Answer::Late);
     }
@@ -560,14 +556,14 @@ impl<'t> World<'t> {
     }
 
     /// A host event reaches the proxy.
-    async fn deliver_host_event(&mut self, event: Outgoing, late: bool) {
+    async fn deliver_host_event(&mut self, event: Outgoing, origin: Origin) {
         let (sender, decoded) = self.display.decode(&event);
-        let note = if late { " (late)" } else { "" };
+        let note = if origin.late { " (late)" } else { "" };
         self.log(Place::EToP, format!("{sender} {decoded:?}{note}"));
         self.see(Seen::Host {
             sender,
             event: &decoded,
-            late,
+            origin,
         });
         let goes_on = self.session.try_host([event]).await;
         self.send_proxy_output(goes_on);
@@ -584,15 +580,49 @@ impl<'t> World<'t> {
         for (sender, event) in self.session.guest_received() {
             self.log(Place::PToC, format!("{sender} {event:?}"));
             self.see(Seen::ToGuest(&event));
+            let press = self.press(&event);
+            if let Some((surface, at)) = press {
+                self.see(Seen::GuestPress { surface, at });
+            }
             self.p_to_c
-                .send(self.now, (sender, event), &mut self.choices);
+                .send(self.now, (sender, event, press), &mut self.choices);
         }
+        self.see(Seen::StepEnd);
         self.ended |= !goes_on;
     }
 
+    /// The press `event` to the guest is, if it is one: its surface and
+    /// target. Follows the guest's pointer.
+    fn press(&mut self, event: &AnyEvent) -> Option<Press> {
+        let target = |x| keymap::target(x).expect("a press at a target");
+        match *event {
+            AnyEvent::WlPointer(wl_pointer::Event::Enter {
+                surface, surface_x, ..
+            }) => self.pointer = Some((surface, surface_x)),
+            AnyEvent::WlPointer(wl_pointer::Event::Motion { surface_x, .. }) => {
+                if let Some((_, x)) = &mut self.pointer {
+                    *x = surface_x;
+                }
+            }
+            AnyEvent::WlPointer(wl_pointer::Event::Leave { .. }) => self.pointer = None,
+            AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. })
+                if state == wl_pointer::BUTTON_STATE_PRESSED =>
+            {
+                let (surface, x) = self.pointer.expect("a press on a surface");
+                return Some((surface, target(x)));
+            }
+            AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => {
+                return Some((surface, target(x)));
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// An event reaches the guest: the client model takes what it models,
-    /// and the guest keeps the globals, Shift and the pointer's place.
-    fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent) {
+    /// a press as `press` resolved it, and the guest keeps the globals and
+    /// Shift.
+    fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>) {
         let now = self.now;
         if let AnyEvent::WlRegistry(wl_registry::Event::Global {
             name,
@@ -606,20 +636,27 @@ impl<'t> World<'t> {
         let Some(client) = self.client.as_mut() else {
             return;
         };
-        let press = |x| keymap::target(x).expect("a press at a target");
-        let requests = match event {
-            AnyEvent::ZwpTextInputV3(event) => client.event(now, sender, event),
-            AnyEvent::WlKeyboard(wl_keyboard::Event::Enter { surface, .. }) => {
+        let requests = match (event, press) {
+            (AnyEvent::WlPointer(_), Some((surface, at))) => {
+                client.press(now, surface, at, PressKind::Button)
+            }
+            (AnyEvent::WlTouch(_), Some((surface, at))) => {
+                client.press(now, surface, at, PressKind::Touch)
+            }
+            (AnyEvent::WlPointer(wl_pointer::Event::Button { .. }), None)
+            | (AnyEvent::WlTouch(wl_touch::Event::Up { .. }), None) => client.release(now, false),
+            (AnyEvent::ZwpTextInputV3(event), _) => client.event(now, sender, event),
+            (AnyEvent::WlKeyboard(wl_keyboard::Event::Enter { surface, .. }), _) => {
                 client.keyboard_focus(now, Some(surface))
             }
-            AnyEvent::WlKeyboard(wl_keyboard::Event::Leave { .. }) => {
+            (AnyEvent::WlKeyboard(wl_keyboard::Event::Leave { .. }), _) => {
                 client.keyboard_focus(now, None)
             }
-            AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { mods_depressed, .. }) => {
+            (AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { mods_depressed, .. }), _) => {
                 self.shift = mods_depressed & keymap::SHIFT != 0;
                 Vec::new()
             }
-            AnyEvent::WlKeyboard(wl_keyboard::Event::Key { key, state, .. })
+            (AnyEvent::WlKeyboard(wl_keyboard::Event::Key { key, state, .. }), _)
                 if state == wl_keyboard::KEY_STATE_PRESSED =>
             {
                 match keymap::key(key, self.shift) {
@@ -627,29 +664,6 @@ impl<'t> World<'t> {
                     None => Vec::new(),
                 }
             }
-            AnyEvent::WlPointer(wl_pointer::Event::Enter {
-                surface, surface_x, ..
-            }) => {
-                self.pointer = Some((surface, surface_x));
-                Vec::new()
-            }
-            AnyEvent::WlPointer(wl_pointer::Event::Motion { surface_x, .. }) => {
-                if let Some((_, x)) = &mut self.pointer {
-                    *x = surface_x;
-                }
-                Vec::new()
-            }
-            AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. }) => {
-                let (surface, x) = self.pointer.expect("a button on a surface");
-                match state == wl_pointer::BUTTON_STATE_PRESSED {
-                    true => client.press(now, surface, press(x), PressKind::Button),
-                    false => client.release(now, false),
-                }
-            }
-            AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => {
-                client.press(now, surface, press(x), PressKind::Touch)
-            }
-            AnyEvent::WlTouch(wl_touch::Event::Up { .. }) => client.release(now, false),
             _ => Vec::new(),
         };
         self.guest(requests);
