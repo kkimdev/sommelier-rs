@@ -789,6 +789,83 @@ fn row_G10_destroy_of_the_enabled_input_lets_another_enable() {
     assert_eq!(out.guest, [v3(TI2, V3::Done { serial: 1 })]);
 }
 
+/// G7 for each extension version: one request per way of sending a
+/// content type (INVARIANTS "`set_input_type` replaces v1
+/// `set_content_type`").
+#[test]
+fn row_G7_a_content_type_takes_one_host_request_per_extension_version() {
+    use zwp_text_input_v3::CONTENT_PURPOSE_PIN as PIN;
+    let (hint, purpose, input_type, input_mode, input_flags, learning_mode) =
+        map_v3_content_type(0, PIN);
+    for version in [None, Some(1), Some(7), Some(8), Some(9)] {
+        let mut ime = Ime::new();
+        let ext = version.map(|version| HostExt {
+            id: ext_id(TI),
+            version,
+            manager: 3,
+        });
+        ime.step(Input::Create {
+            ti: TI,
+            seat: SEAT,
+            host: HostTi { v1: v1(TI), ext },
+            manager: MANAGER,
+        });
+        ime.step(Input::Enable(TI));
+        ime.step(Input::ContentType(TI, (0, PIN)));
+        let out = ime.step(Input::Commit(TI));
+        let set_content_type = req(v1(TI), V1::SetContentType { hint, purpose });
+        let deprecated = req(
+            ext_id(TI),
+            Ext::DeprecatedSetInputType {
+                input_type,
+                input_mode,
+                input_flags,
+                learning_mode,
+            },
+        );
+        let support = req(
+            ext_id(TI),
+            Ext::SetSurroundingTextSupport {
+                support: ext::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
+            },
+        );
+        let set_input_type = || {
+            req(
+                ext_id(TI),
+                Ext::SetInputType {
+                    input_type,
+                    input_mode,
+                    input_flags,
+                    learning_mode,
+                    inline_composition_support: ext::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+                },
+            )
+        };
+        let content_type = match version {
+            None | Some(1) => vec![set_content_type],
+            Some(7) => vec![set_content_type, deprecated],
+            Some(8) => vec![set_input_type()],
+            _ => vec![support, set_input_type()],
+        };
+        assert_eq!(out.host[2..out.host.len() - 2], content_type, "{version:?}");
+    }
+}
+
+/// A commit's pending state belongs to its field: a refocus drops it.
+#[test]
+fn row_G9c_a_refocus_drops_the_pending_enable() {
+    let mut ime = Ime::new();
+    ime.create(TI);
+    ime.step(Input::Enable(TI));
+    ime.step(Input::FocusChanged {
+        seat: SEAT,
+        surface: Some(OTHER),
+    });
+    let out = ime.step(Input::Commit(TI));
+    assert_eq!(out.host, [commit_state(TI, 1)]);
+    assert_eq!(out.guest, []);
+}
+
 // 2.2 Host events.
 
 #[test]
@@ -965,6 +1042,24 @@ fn row_H8_a_commit_ends_the_preedit() {
     assert_eq!(ime.step(Input::Commit(TI)).guest, [preedit("가"), done(2)]);
 }
 
+/// An empty commit with no preedit shown edits nothing, so an absolute
+/// delete after it still applies.
+#[test]
+fn row_H8_an_empty_commit_is_no_edit() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    let out = ime.v1(HostIme::Commit {
+        serial: 0,
+        text: String::new(),
+    });
+    assert_eq!(out.guest, [done(2)]);
+    let out = ime.v1(HostIme::Delete {
+        index: 0,
+        length: 2,
+    });
+    assert_eq!(out.guest, [delete(2, 0), done(2)]);
+}
+
 #[test]
 fn row_H9_an_absolute_delete_becomes_lengths_around_the_cursor() {
     let mut ime = Ime::enabled();
@@ -1050,6 +1145,26 @@ fn row_X1_a_preedit_region_turns_text_into_the_preedit() {
     assert_eq!(out.guest, [no_preedit(), done(2)]);
 }
 
+/// With no assembly, the preedit cursor stays where the text cursor was,
+/// inside the region; and an empty region edits nothing.
+#[test]
+fn row_X1_a_region_keeps_the_cursor_and_an_empty_one_edits_nothing() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 1);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let out = ime.ext(region(-1, 2));
+    assert_eq!(out.guest, [delete(1, 1), preedit_at("ab", 1, 1), done(2)]);
+
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    assert_eq!(ime.ext(region(0, 0)).guest, [done(2)]);
+    let out = ime.v1(HostIme::Delete {
+        index: 0,
+        length: 2,
+    });
+    assert_eq!(out.guest, [delete(2, 0), done(2)]);
+}
+
 #[test]
 fn row_X1prime_a_region_the_text_cannot_hold_is_dropped() {
     let mut ime = Ime::enabled();
@@ -1121,6 +1236,37 @@ fn row_W2_a_fence_ends_only_with_its_own_barrier() {
     assert_eq!(ime.compose("나").guest, []);
     ime.step(Input::BarrierDone(fence));
     assert_eq!(ime.compose("다").guest, [preedit("다"), done(3)]);
+}
+
+/// A drain ends only with its own barrier, not with a press's fence.
+#[test]
+fn row_W1_only_its_own_barrier_ends_a_drain() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let fence = ime.press(SURFACE).barriers()[0];
+    ime.step(Input::Disable(TI));
+    let drain = ime.step(Input::Commit(TI)).barriers()[0];
+    ime.step(Input::BarrierDone(fence));
+    let out = ime.enable(TI);
+    assert_eq!(
+        out.host,
+        [
+            surrounding(TI, "", 0),
+            cursor_rect(TI, (0, 0, 0, 0)),
+            commit_state(TI, 3),
+        ]
+    );
+    let out = ime.step(Input::BarrierDone(drain));
+    assert_eq!(
+        out.host[0],
+        req(
+            v1(TI),
+            V1::Activate {
+                seat: HOST_SEAT,
+                surface: HOST_SURFACE,
+            },
+        )
+    );
 }
 
 // 2.3 Cross-concern inputs and reconcile outcomes.
