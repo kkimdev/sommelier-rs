@@ -322,6 +322,13 @@ pub struct TextInputState {
     pub(crate) unreported_host_edit: bool,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
+    /// The `wl_display.sync` queued after the `reset` a pointer press sent
+    /// the host ([`Self::prepare_press_commit`]), until it returns. Exo
+    /// sends nothing in answer to the `reset`, but the events it sent
+    /// before it handled the `reset` still arrive, and they belong to the
+    /// composition the press committed (INVARIANTS "A pointer press ends
+    /// the composition on its surface").
+    pub(crate) reset_fence: Option<HostId>,
     /// Whether the proxy warned that the guest seat cannot carry an
     /// activation, which every later reconcile would repeat. It is never
     /// reset, so the proxy warns once per text input, not once per seat it
@@ -408,6 +415,7 @@ impl TextInputState {
             pending_cursor_position: None,
             unreported_host_edit: false,
             host: HostApplied::default(),
+            reset_fence: None,
             warned_seat_missing: false,
             warned_delete_range: false,
         }
@@ -535,14 +543,26 @@ impl TextInputState {
         self.pending_cursor_position = Some((index, anchor));
     }
 
+    /// Whether host composition events (a preedit, a preedit region, a
+    /// commit, a delete or a confirmation) are current: the host
+    /// generation is active, and they were not sent before the host
+    /// handled a press's `reset` ([`Self::reset_fence`]). Every
+    /// `prepare_*` plan of one checks it, so a stale one is dropped.
+    pub(crate) fn host_composition_is_current(&self) -> bool {
+        self.host_is_active() && self.reset_fence.is_none()
+    }
+
+    /// The plan of a host preedit, or `None` if it is stale
+    /// ([`Self::host_composition_is_current`]).
     pub(crate) fn prepare_host_preedit(&self) -> Option<HostPreeditPlan> {
-        self.host_is_active().then_some(HostPreeditPlan {
-            guest_seat: self.guest_seat,
-            done_serial: self.guest_commit_serial,
-            had_preedit: self.current_preedit.has_text(),
-            selection: self.pending_preedit_selection,
-            cursor: self.pending_preedit_cursor,
-        })
+        self.host_composition_is_current()
+            .then_some(HostPreeditPlan {
+                guest_seat: self.guest_seat,
+                done_serial: self.guest_commit_serial,
+                had_preedit: self.current_preedit.has_text(),
+                selection: self.pending_preedit_selection,
+                cursor: self.pending_preedit_cursor,
+            })
     }
 
     pub(crate) fn finish_host_preedit(
@@ -571,13 +591,16 @@ impl TextInputState {
         arm_backspace_repeat
     }
 
+    /// The plan of a host commit, or `None` if it is stale
+    /// ([`Self::host_composition_is_current`]).
     pub(crate) fn prepare_host_commit(&self) -> Option<HostCommitPlan> {
-        self.host_is_active().then_some(HostCommitPlan {
-            guest_seat: self.guest_seat,
-            done_serial: self.guest_commit_serial,
-            had_preedit: self.current_preedit.has_text(),
-            cursor_position: self.pending_cursor_position,
-        })
+        self.host_composition_is_current()
+            .then_some(HostCommitPlan {
+                guest_seat: self.guest_seat,
+                done_serial: self.guest_commit_serial,
+                had_preedit: self.current_preedit.has_text(),
+                cursor_position: self.pending_cursor_position,
+            })
     }
 
     /// Close a host commit or delete, which `edited` the text unless it
@@ -590,8 +613,11 @@ impl TextInputState {
         self.unreported_host_edit |= edited;
     }
 
+    /// The plan of a host preedit region, or `None` if it is stale
+    /// ([`Self::host_composition_is_current`]) or the guest stated no
+    /// surrounding text.
     pub(crate) fn prepare_preedit_region(&self) -> Option<PreeditRegionPlan> {
-        if !self.host_is_active() {
+        if !self.host_composition_is_current() {
             return None;
         }
         let (surrounding_text, surrounding_cursor, _) = self.committed.surrounding_text.as_ref()?;
@@ -639,12 +665,34 @@ impl TextInputState {
         self.prepare_confirm_preedit()
     }
 
+    /// The host was sent the press's `reset`, behind the sync `callback`.
+    ///
+    /// No fence is pending then: a press commits only a shown preedit, and
+    /// no host preedit reaches the guest while one is.
+    pub(crate) fn fence_reset(&mut self, callback: HostId) {
+        debug_assert_eq!(self.reset_fence, None, "a press overwrote a pending fence");
+        self.reset_fence = Some(callback);
+    }
+
+    /// The sync `callback` returned: if it is the fence of the press's
+    /// `reset`, the host has handled the `reset`, and its events are
+    /// current again.
+    pub(crate) fn complete_reset_fence(&mut self, callback: HostId) {
+        if self.reset_fence == Some(callback) {
+            self.reset_fence = None;
+        }
+    }
+
+    /// The plan of a host confirmation, or of a press's commit, or `None`
+    /// if host composition events are stale
+    /// ([`Self::host_composition_is_current`]).
     pub(crate) fn prepare_confirm_preedit(&self) -> Option<ConfirmPreeditPlan> {
-        self.host_is_active().then(|| ConfirmPreeditPlan {
-            guest_seat: self.guest_seat,
-            done_serial: self.guest_commit_serial,
-            preedit_text: self.current_preedit.text.clone(),
-        })
+        self.host_composition_is_current()
+            .then(|| ConfirmPreeditPlan {
+                guest_seat: self.guest_seat,
+                done_serial: self.guest_commit_serial,
+                preedit_text: self.current_preedit.text.clone(),
+            })
     }
 
     /// The guest was not shown the preedit the proxy repeated, which it

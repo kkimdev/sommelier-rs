@@ -101,10 +101,19 @@
   while it is composing. The syllable must stay where it was, committed
   once. The next jamo must start a new syllable at the click point,
   without joining the old one, and the old syllable must not show up
-  again there. A click on a subsurface, which the keyboard focus never
-  names, does not end the composition. mutter also matches the exact
-  surface; KWin matches the window. Touch does not end a composition
-  yet; mutter's and KWin's do.
+  again there.
+  - Press Space and click at the same instant, many times. The syllable
+    should appear once.
+  - The reset's fence covers only events already on the wire. A commit
+    the input method makes after Exo handled the `reset`, for a key it
+    was still processing, still doubles the syllable. Note how often
+    that happens.
+  - A key the input method takes within the click's round trip is lost
+    by design (see the rule).
+  - A click on a subsurface, which the keyboard focus never names, does
+    not end the composition. mutter also matches the exact surface; KWin
+    matches the window.
+  - Touch does not end a composition yet; mutter's and KWin's do.
 - The `done` that answers each guest text-input-v3 commit has not been
   checked on a host. In Chrome or VS Code started with
   `--enable-wayland-ime --wayland-text-input-version=3`, type Korean and

@@ -214,7 +214,8 @@ Two mechanisms let a handler act outside its own message:
   guest's own message.
 - `callback::queue_internal_sync` issues a host-only `wl_display.sync` and
   `state::InternalCallbacks` records what it waits for, such as the
-  text-input drain or the placement barrier.
+  text-input drain, the fence after a pointer press's `reset`, or the
+  placement barrier.
 
 ### Window placement
 
@@ -470,8 +471,11 @@ committed. A guest commit that leaves the field enabled is answered
 with a `done`, which Chromium waits for before it sends more. A pointer
 press on the surface of a composition ends it before the guest gets the
 press, as mutter and KWin do: `pointer.rs` follows each pointer's surface,
-the guest commits the preedit it shows, and Exo is told to `reset`. The
-rules are under [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
+the guest commits the preedit it shows, and Exo is told to `reset`.
+Behind the `reset` goes a fence, a host `wl_display.sync`. Until it
+returns, the field's host composition events are dropped, because Exo
+sent them for the composition the press committed. The rules are under
+[Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 
 Keys can reach the guest twice: as a `wl_keyboard.key` and as a
 host-generated keysym from the IME. `state/input.rs` assigns each physical

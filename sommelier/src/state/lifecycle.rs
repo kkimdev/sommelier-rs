@@ -326,6 +326,15 @@ impl Context {
         }
         for (&text_input, state) in &self.text_inputs {
             guest("text input state", text_input, "zwp_text_input_v3");
+            // A fence that outlived its callback would drop the field's
+            // composition events for good.
+            if let Some(fence) = state.reset_fence {
+                assert_eq!(
+                    self.internal_callbacks.get(fence),
+                    Some(super::InternalCallback::TextInputResetFence { text_input }),
+                    "text input {text_input} keeps a reset fence whose callback is not pending"
+                );
+            }
             if let Some(surface) = state.active_surface {
                 guest("text input focus", surface, "wl_surface");
             }
