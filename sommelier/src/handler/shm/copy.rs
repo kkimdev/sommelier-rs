@@ -289,7 +289,7 @@ pub(crate) fn copy_shm_damage(
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_shm_damage, ShmCopyError, ShmCopyLayout};
+    use super::{coalesce_damage_rects, copy_shm_damage, ShmCopyError, ShmCopyLayout};
     use crate::protocols::wayland::wl_shm;
     use crate::state::{BufferRect, DamageRegion, HostMapping};
     use crate::test_support::{host_mapping, shm_pool_file};
@@ -364,12 +364,11 @@ mod tests {
             ..ARGB8888_1X1
         };
         let last_row = DamageRegion::from(vec![BufferRect::new(0, 2, 4, 1)]);
-        // Two spans that stay apart: the first pixel of row 0, which fits,
-        // and the last pixel of row 2, which does not.
-        let fitting_span_then_overrun = DamageRegion::from(vec![
-            BufferRect::new(0, 0, 1, 1),
-            BufferRect::new(3, 2, 1, 1),
-        ]);
+        // Two spans that stay apart, in this order: the first pixel of
+        // row 0, which fits, and the last pixel of row 2, which does not.
+        let spans = vec![BufferRect::new(0, 0, 1, 1), BufferRect::new(3, 2, 1, 1)];
+        assert_eq!(coalesce_damage_rects(&spans), spans, "kept apart, in order");
+        let fitting_span_then_overrun = DamageRegion::from(spans);
         for damage in [&DamageRegion::Full, &last_row, &fitting_span_then_overrun] {
             let destination = host_mapping(&[0; 47]);
             assert!(matches!(
