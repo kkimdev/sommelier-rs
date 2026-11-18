@@ -381,7 +381,9 @@ mod tests {
         ctx.last_sender_id = GTK_SHELL;
         GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
         assert!(
-            !ctx.window_placement.has_arc_application_ids(),
+            !ctx.window_placement
+                .arc()
+                .is_some_and(|arc| arc.has_arc_application_ids()),
             "identities are allocated lazily by the paths that send them"
         );
     }
@@ -422,7 +424,8 @@ mod tests {
         assert_eq!(
             Some(application_id.as_str()),
             ctx.window_placement
-                .arc_application_id(WL_SURFACE_GUEST)
+                .arc_mut()
+                .and_then(|arc| arc.arc_application_id(WL_SURFACE_GUEST))
                 .as_deref()
         );
     }

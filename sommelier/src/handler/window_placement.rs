@@ -14,65 +14,72 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Window-placement mechanics: the Aura objects, requests, and configure
-//! ordering behind compositor-owned placement shortcuts.
+//! Window placement: the one boundary between the core protocol handlers
+//! and the placement backends.
 //!
 //! The keyboard handler decides that a chord is a placement shortcut; this
-//! module moves the focused window. It owns the Aura toplevel that carries
-//! `zaura_toplevel.set_window_bounds`, the surface's ARC policy identity
-//! (see `sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`), the host-stream
-//! barrier that orders each bounds request, the configures held behind that
-//! barrier, and the translation of `zaura_toplevel.configure` into the
-//! guest's `xdg_toplevel.configure`. Its per-connection state lives in
-//! [`crate::state::WindowPlacementState`]; protocol handlers translate wire
-//! events and delegate here, one call per event:
+//! module moves the focused window. Resolving the target is shared by every
+//! backend: the toplevel the keyboard focuses, the output it entered last,
+//! and the bounds the bound rectangle maps to in that output's work area.
+//! The connection's backend ([`crate::state::WindowPlacementState`]) then
+//! moves the window its own way. Each backend owns its per-connection
+//! state, its host objects and its requests in a submodule of its own:
+//!
+//! - [`arc`]: `zaura_toplevel.set_window_bounds` on a surface that carries
+//!   an ARC policy identity.
+//! - [`remote_shell`]: a host `zcr_remote_surface_v2` role in place of the
+//!   XDG role, placed with `set_bounds_in_output`, under proxy-local XDG
+//!   objects.
+//!
+//! Protocol handlers translate wire events and call in here, one entry
+//! point per event. Each entry point dispatches to the active backend and
+//! does nothing while placement is off, the default:
 //!
 //! | Caller | Entry point |
 //! | :--- | :--- |
 //! | consumed placement chord (`wl_keyboard.key`) | [`place_focused`] |
+//! | `zaura_shell` bound (`wl_registry.global`) | [`shell_bound`] |
+//! | `zcr_remote_shell_v2` advertised, bound, retired | [`wants_remote_shell`], [`remote_shell_bound`], [`remote_shell_name`], [`remote_shell_retired`] |
+//! | guest `wl_output` bound | [`output_bound`] |
+//! | `wl_output.done` | [`output_committed`] |
+//! | `xdg_wm_base.get_xdg_surface` | [`claim_xdg_surface`] |
+//! | a guest request from a local XDG object, or to the decoration manager | [`dispatch_facade_request`] |
 //! | `xdg_surface.get_toplevel`, after dispatch | [`attach_toplevel`] |
-//! | `zaura_shell` bound late | [`attach_recorded_toplevels`] |
+//! | `wl_surface.commit` that shows a buffer, before its forward | [`surface_shown`] |
+//! | facade `xdg_popup` end | [`forget_xdg_popup`] |
 //! | XDG role teardown | [`release_toplevel`] |
+//! | `wl_surface` end | [`forget_surface`] |
 //! | XDG and GTK application IDs | [`set_aura_application_id`] |
-//! | `wl_callback.done` | [`complete_barrier`] |
+//! | `wl_callback.done` of a placement barrier | [`complete_barrier`] |
 //! | `xdg_surface.configure` | [`hold_surface_configure`] |
 //! | `xdg_toplevel.configure` | [`hold_toplevel_configure`] |
 //! | `zaura_toplevel.configure` | [`translate_aura_configure`] |
 //!
 //! The host Aura surface is shared ([`crate::state::AuraSurfaces`]), and
-//! `crate::handler::aura_objects` creates and releases it and the placement
-//! Aura toplevel.
+//! `crate::handler::aura_objects` creates and releases every Aura object.
 
-use crate::handler::aura_objects::{
-    self, aura_object_version, ensure_host_zaura_surface, AuraChild,
-};
-use crate::handler::callback::queue_internal_sync;
+mod arc;
+mod remote_shell;
+
+#[cfg(test)]
+pub(crate) use self::arc::register_window_bounds_barrier_for_test;
+pub(crate) use self::remote_shell::RemoteShellHandler;
+
+use crate::handler::aura_objects::{self, ensure_host_zaura_surface};
 use crate::protocols::aura_shell::zaura_output::EVT_INSETS_SINCE;
-use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE;
-use crate::protocols::aura_shell::zaura_surface::{self, REQ_UNSET_SNAP_SINCE};
-use crate::protocols::aura_shell::zaura_toplevel::{
-    self, REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE, REQ_SET_WINDOW_BOUNDS_SINCE,
-};
-use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
-use crate::state::{Context, HostId, InternalCallback};
+use crate::protocols::aura_shell::zaura_surface;
+use crate::state::{Context, HostId, OutputState, RemoteShellManager, WindowPlacementState};
 use crate::window_layout::{Rect, WindowLayoutAction};
-use crate::wire::queue_or_drop;
+use crate::wire::{queue_or_drop, Action, Outgoing, ProtocolError, WireMessage};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The `zaura_shell` version placement needs.
 ///
-/// Placement creates an Aura toplevel only to send
-/// `set_supports_screen_coordinates` and `set_window_bounds`, and it
-/// measures the work area with `zaura_output.insets`, without which the
-/// work area would include the shelf. Every Aura child takes its shell's
-/// version, so placement requires the newest of the messages it uses; the
-/// assertion below keeps that true if the vendored protocol changes.
+/// Every backend measures the work area with `zaura_output.insets`, without
+/// which the work area would include the shelf. Every Aura child takes its
+/// shell's version, so a backend that sends Aura requests asserts that they
+/// are no newer than this.
 const PLACEMENT_SHELL_SINCE: u32 = EVT_INSETS_SINCE;
-const _: () = assert!(
-    REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE <= PLACEMENT_SHELL_SINCE
-        && REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE <= PLACEMENT_SHELL_SINCE
-        && REQ_SET_WINDOW_BOUNDS_SINCE <= PLACEMENT_SHELL_SINCE
-);
 
 /// Whether [`warn_if_shell_cannot_place`] has warned. Every client
 /// connection binds the same host shell, so one warning per process says
@@ -80,13 +87,12 @@ const _: () = assert!(
 static OLD_SHELL_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Warn, once per process, that placement is disabled because the host
-/// `zaura_shell` is older than [`PLACEMENT_SHELL_SINCE`]. The registry calls
-/// this when it binds the shell while the ARC bounds policy is active.
+/// `zaura_shell` is older than [`PLACEMENT_SHELL_SINCE`].
 ///
 /// # Returns
 ///
 /// Whether this call logged the warning.
-pub(crate) fn warn_if_shell_cannot_place(shell_version: u32) -> bool {
+fn warn_if_shell_cannot_place(shell_version: u32) -> bool {
     if shell_version >= PLACEMENT_SHELL_SINCE || OLD_SHELL_WARNED.swap(true, Ordering::Relaxed) {
         return false;
     }
@@ -97,6 +103,76 @@ pub(crate) fn warn_if_shell_cannot_place(shell_version: u32) -> bool {
         PLACEMENT_SHELL_SINCE
     );
     true
+}
+
+/// Set up what placement needs from a newly bound `zaura_shell` of
+/// `shell_version`.
+///
+/// A guest may bind an output, or create a toplevel, before the host
+/// registry delivers `zaura_shell`, so this retries what their own paths
+/// could not do yet: every live output's Aura output, and the active
+/// backend's per-toplevel setup.
+pub(crate) fn shell_bound(ctx: &mut Context, shell_version: u32) {
+    if !ctx.window_placement.is_active() {
+        return;
+    }
+    for output_host_id in ctx.outputs.live_outputs() {
+        aura_objects::ensure_zaura_output(ctx, output_host_id);
+    }
+    match ctx.window_placement {
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {}
+        WindowPlacementState::Arc(_) => arc::attach_recorded_toplevels(ctx),
+    }
+    warn_if_shell_cannot_place(shell_version);
+}
+
+// ── The remote shell ──────────────────────────────────────────────────────
+
+/// Whether the registry binds a host `zcr_remote_shell_v2` advertised at
+/// `version`: only the remote-shell-v2 backend uses one.
+pub(crate) fn wants_remote_shell(ctx: &Context, version: u32) -> bool {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => remote_shell::wants_manager(version),
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => false,
+    }
+}
+
+/// Create and record the host `zcr_remote_shell_v2` the registry binds
+/// from global `global_name`, advertised at `version`.
+///
+/// # Returns
+///
+/// The manager, with the host ID and version to bind it at, or `None`
+/// without the remote-shell-v2 backend, which alone wants one.
+pub(crate) fn remote_shell_bound(
+    ctx: &mut Context,
+    global_name: u32,
+    version: u32,
+) -> Option<RemoteShellManager> {
+    ctx.window_placement.remote_shell()?;
+    Some(remote_shell::bind_manager(ctx, global_name, version))
+}
+
+/// The registry name of the bound `zcr_remote_shell_v2`, if any.
+pub(crate) fn remote_shell_name(ctx: &Context) -> Option<u32> {
+    ctx.window_placement.remote_shell()?;
+    remote_shell::manager_name(ctx)
+}
+
+/// Retire the `zcr_remote_shell_v2` bound from global `global_name`, if any.
+pub(crate) fn remote_shell_retired(ctx: &mut Context, global_name: u32) {
+    if ctx.window_placement.remote_shell().is_some() {
+        remote_shell::manager_retired(ctx, global_name);
+    }
+}
+
+/// Create the host-only Aura output of a newly bound guest `wl_output`,
+/// whose scale factors and insets the work area needs. A missing shell is
+/// retried by [`shell_bound`].
+pub(crate) fn output_bound(ctx: &mut Context, output_host_id: u32) {
+    if ctx.window_placement.is_active() {
+        aura_objects::ensure_zaura_output(ctx, output_host_id);
+    }
 }
 
 // ── Placing the focused window ────────────────────────────────────────────
@@ -118,6 +194,9 @@ pub(crate) enum PlacementSkip {
     NoAuraToplevel,
     /// The host Aura surface is unavailable (no zaura_shell).
     NoAuraSurface,
+    /// The toplevel has no host remote surface: it was created while no
+    /// `zcr_remote_shell_v2` was bound, so it took the XDG path.
+    NoRemoteSurface,
 }
 
 impl PlacementSkip {
@@ -128,7 +207,9 @@ impl PlacementSkip {
     /// focus or output state and stay at debug.
     pub(crate) fn log_level(self) -> log::Level {
         match self {
-            Self::RectNotRepresentable | Self::NoAuraToplevel => log::Level::Info,
+            Self::RectNotRepresentable | Self::NoAuraToplevel | Self::NoRemoteSurface => {
+                log::Level::Info
+            }
             Self::NoFocusedToplevel | Self::NoUsableOutput | Self::NoAuraSurface => {
                 log::Level::Debug
             }
@@ -139,7 +220,6 @@ impl PlacementSkip {
 /// The xdg_toplevel a keyboard focuses, with the IDs placement needs.
 struct FocusedToplevel {
     xdg_toplevel_guest_id: u32,
-    xdg_toplevel_host_id: u32,
     wl_surface_guest_id: u32,
 }
 
@@ -155,35 +235,10 @@ fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedTo
         return None;
     }
     let xdg_toplevel_guest_id = ctx.xdg_roles.toplevel_on_wl_surface(wl_surface_guest_id)?;
-    // `record_xdg_toplevel` records only mapped toplevels, and every path
-    // that unmaps one removes its record first, so the lookup cannot miss.
-    let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id);
-    debug_assert!(
-        xdg_toplevel_host_id.is_some(),
-        "recorded xdg_toplevel {xdg_toplevel_guest_id} has no host object"
-    );
     Some(FocusedToplevel {
         xdg_toplevel_guest_id,
-        xdg_toplevel_host_id: xdg_toplevel_host_id?,
         wl_surface_guest_id,
     })
-}
-
-/// Leave fullscreen, maximized and snapped state before new bounds apply.
-///
-/// The Aura surface may predate `unset_snap`: it keeps the version of the
-/// `zaura_shell` generation that created it, even after a newer shell is
-/// bound. Such a surface cannot be snapped by this proxy, and sending it
-/// the request would be a protocol error, so it is skipped.
-fn clear_window_state(ctx: &mut Context, host_xdg_toplevel_id: u32, zaura_surface_id: u32) {
-    ctx.client_to_host_queue.extend([
-        xdg_toplevel::req::unset_fullscreen(host_xdg_toplevel_id),
-        xdg_toplevel::req::unset_maximized(host_xdg_toplevel_id),
-    ]);
-    if aura_object_version(ctx, zaura_surface_id) >= REQ_UNSET_SNAP_SINCE {
-        ctx.client_to_host_queue
-            .push(zaura_surface::req::unset_snap(zaura_surface_id));
-    }
 }
 
 /// Resolve the screen bounds for a placement action on an output.
@@ -192,19 +247,60 @@ fn clear_window_state(ctx: &mut Context, host_xdg_toplevel_id: u32, zaura_surfac
 /// by [`crate::window_layout::NormalizedRect::to_work_area_bounds`], which
 /// owns the rounding rule. Returns `None` when the output has no usable
 /// work area or the rectangle cannot be represented in it.
-fn bounds_for_action(
-    action: WindowLayoutAction,
-    output: crate::state::OutputState,
-) -> Option<Rect> {
+fn bounds_for_action(action: WindowLayoutAction, output: OutputState) -> Option<Rect> {
     action.rect().to_work_area_bounds(output.work_area()?)
+}
+
+/// What one placement moves, and where, resolved the same way for every
+/// backend.
+#[derive(Clone, Copy, Debug)]
+struct PlacementTarget {
+    /// The placement, for the log.
+    action: WindowLayoutAction,
+    xdg_toplevel_guest_id: u32,
+    wl_surface_guest_id: u32,
+    /// The host `wl_output` the window is placed on.
+    output_host_id: u32,
+    /// That output's state.
+    output: OutputState,
+    /// The window's new bounds in screen coordinates, inside `output`'s
+    /// work area.
+    bounds: Rect,
+}
+
+/// Resolve the toplevel that `host_keyboard_id` focuses, the output it
+/// entered last, and the bounds `action` maps to in that output's work
+/// area.
+fn resolve_target(
+    ctx: &Context,
+    host_keyboard_id: HostId,
+    action: WindowLayoutAction,
+) -> Result<PlacementTarget, PlacementSkip> {
+    let FocusedToplevel {
+        xdg_toplevel_guest_id,
+        wl_surface_guest_id,
+    } = focused_toplevel(ctx, host_keyboard_id).ok_or(PlacementSkip::NoFocusedToplevel)?;
+    let (output_host_id, output) = ctx
+        .shadow_table
+        .get_host_id(wl_surface_guest_id)
+        .and_then(|host_surface_id| ctx.outputs.for_surface(host_surface_id))
+        .ok_or(PlacementSkip::NoUsableOutput)?;
+    let bounds = bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
+    Ok(PlacementTarget {
+        action,
+        xdg_toplevel_guest_id,
+        wl_surface_guest_id,
+        output_host_id,
+        output,
+        bounds,
+    })
 }
 
 /// Place the focused toplevel for one consumed placement chord.
 ///
-/// Resolves the toplevel that `host_keyboard_id` focuses and the output it
-/// has entered, maps `action` into that output's work area, and queues the
-/// state reset, `zaura_toplevel.set_window_bounds`, and the barrier that
-/// holds configures until the host has applied the bounds.
+/// Resolves the toplevel that `host_keyboard_id` focuses, the output it
+/// has entered, and the bounds `action` maps to in that output's work area
+/// (see [`resolve_target`]), and has the connection's backend move it.
 ///
 /// # Arguments
 ///
@@ -222,75 +318,137 @@ pub(crate) fn place_focused(
     action: WindowLayoutAction,
 ) -> Result<(), PlacementSkip> {
     debug_assert!(
-        ctx.window_placement.uses_arc_bounds(),
-        "classify_key yields placement actions only while the ARC bounds policy is active"
+        ctx.window_placement.is_active(),
+        "classify_key yields placement actions only while a placement backend is active"
     );
-    let FocusedToplevel {
-        xdg_toplevel_guest_id: guest_xdg_toplevel_id,
-        xdg_toplevel_host_id: host_xdg_toplevel_id,
-        wl_surface_guest_id: guest_wl_surface_id,
-    } = focused_toplevel(ctx, host_keyboard_id).ok_or(PlacementSkip::NoFocusedToplevel)?;
-    let (output_host_id, output) = ctx
-        .shadow_table
-        .get_host_id(guest_wl_surface_id)
-        .and_then(|host_surface_id| ctx.outputs.for_surface(host_surface_id))
-        .ok_or(PlacementSkip::NoUsableOutput)?;
-    let bounds = bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
-    let zaura_toplevel_id =
-        attach_placement_toplevel(ctx, guest_xdg_toplevel_id, guest_wl_surface_id)
-            .ok_or(PlacementSkip::NoAuraToplevel)?;
-    let zaura_surface_id =
-        ensure_host_zaura_surface(ctx, guest_wl_surface_id).ok_or(PlacementSkip::NoAuraSurface)?;
-    // Every check that can skip placement has run, so a skip never leaves
-    // part of the batch below in the host stream. Setup requests queued
-    // above (the Aura objects) stay valid for the next attempt.
-    //
-    // `attach_placement_toplevel` allocated the identity, and every Aura
-    // surface supports `set_application_id` (the registry binds no older
-    // `zaura_shell`), so applying it cannot fail here.
-    let identity_applied = apply_arc_identity(ctx, guest_wl_surface_id, zaura_surface_id);
-    debug_assert!(
-        identity_applied,
-        "an attached placement toplevel's surface always takes its ARC identity"
-    );
-
-    clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
-    ctx.client_to_host_queue
-        .push(zaura_toplevel::req::set_window_bounds(
-            zaura_toplevel_id,
-            bounds.x,
-            bounds.y,
-            bounds.width,
-            bounds.height,
-            output_host_id,
-        ));
-    queue_window_bounds_barrier(ctx, zaura_toplevel_id);
-    log::info!(
-        "window layout {:?}: xdg_toplevel={} zaura_toplevel={} bounds=({}, {}, {}, {}) output={}",
-        action,
-        guest_xdg_toplevel_id,
-        zaura_toplevel_id,
-        bounds.x,
-        bounds.y,
-        bounds.width,
-        bounds.height,
-        output_host_id
-    );
-    Ok(())
+    let target = resolve_target(ctx, host_keyboard_id, action)?;
+    match ctx.window_placement {
+        // Bindings exist only while a backend is active.
+        WindowPlacementState::Off => Ok(()),
+        WindowPlacementState::Arc(_) => arc::apply_bounds(ctx, target),
+        WindowPlacementState::RemoteShellV2(_) => remote_shell::apply_bounds(ctx, target),
+    }
 }
 
-// ── ARC policy identity and the Aura toplevel ─────────────────────────────
+// ── Toplevel and surface lifecycle ────────────────────────────────────────
+
+/// Prepare a newly created XDG toplevel for placement.
+///
+/// Called once the generated dispatcher has accepted and mapped
+/// `xdg_surface.get_toplevel`.
+pub(crate) fn attach_toplevel(
+    ctx: &mut Context,
+    xdg_toplevel_guest_id: u32,
+    wl_surface_guest_id: u32,
+) {
+    match ctx.window_placement {
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {}
+        WindowPlacementState::Arc(_) => {
+            arc::attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
+        }
+    }
+}
+
+/// Release what placement holds for a guest XDG toplevel whose role ended.
+///
+/// Called whenever the XDG role ends (see `XdgRoles`' remove methods),
+/// before the role's own destructor is queued.
+pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
+    match ctx.window_placement {
+        WindowPlacementState::Off => {}
+        WindowPlacementState::Arc(_) => arc::release_toplevel(ctx, xdg_toplevel_guest_id),
+        WindowPlacementState::RemoteShellV2(_) => {
+            remote_shell::release_toplevel(ctx, xdg_toplevel_guest_id);
+        }
+    }
+}
+
+/// Claim a new guest `xdg_surface` for the backend, which then implements
+/// it and its role objects.
+///
+/// # Returns
+///
+/// The action of the guest's `xdg_wm_base.get_xdg_surface` when it must
+/// not reach the host: the remote-shell-v2 backend made the xdg_surface a
+/// local object, because Exo gives a surface one role, or rejected it.
+/// `None` when it is forwarded.
+pub(crate) fn claim_xdg_surface(
+    ctx: &mut Context,
+    xdg_surface_guest_id: u32,
+    wl_surface_guest_id: u32,
+) -> Option<Action> {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => {
+            remote_shell::claim_xdg_surface(ctx, xdg_surface_guest_id, wl_surface_guest_id)
+        }
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => None,
+    }
+}
+
+/// Dispatch a guest request to an XDG object that the backend claimed.
+///
+/// # Returns
+///
+/// `None` for every other request, which the caller dispatches as usual.
+pub(crate) fn dispatch_facade_request(
+    ctx: &mut Context,
+    interface: &str,
+    msg: &mut WireMessage,
+) -> Option<Result<Option<Outgoing>, ProtocolError>> {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => {
+            remote_shell::dispatch_facade_request(ctx, interface, msg)
+        }
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => None,
+    }
+}
+
+/// Let the backend act on an output whose metadata a `wl_output.done`
+/// committed: one may now place a window shown before it could.
+pub(crate) fn output_committed(ctx: &mut Context) {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => remote_shell::output_committed(ctx),
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => {}
+    }
+}
+
+/// Let the backend act on a `wl_surface.commit` that shows a buffer of
+/// `size` surface units, before the commit is forwarded, so that what it
+/// sends applies with the commit.
+pub(crate) fn surface_shown(ctx: &mut Context, wl_surface_guest_id: u32, size: (i32, i32)) {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => {
+            remote_shell::first_bounds(ctx, wl_surface_guest_id, size);
+        }
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => {}
+    }
+}
+
+/// Forget a guest `xdg_popup` that ended: a facade popup is its
+/// xdg_surface's role.
+pub(crate) fn forget_xdg_popup(ctx: &mut Context, xdg_popup_guest_id: u32) {
+    if ctx.window_placement.remote_shell().is_some() {
+        remote_shell::forget_popup(ctx, xdg_popup_guest_id);
+    }
+}
+
+/// Forget what placement holds for a guest `wl_surface` that ended.
+pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32) {
+    if let Some(state) = ctx.window_placement.arc_mut() {
+        state.forget_surface(wl_surface_guest_id);
+    }
+}
+
+// ── Application IDs ───────────────────────────────────────────────────────
 
 /// Send the application ID the guest set (through XDG or GTK) to the
 /// surface's host Aura surface, creating that surface if needed. Nothing is
 /// sent while no `zaura_shell` is bound.
 ///
-/// `zaura_surface.set_application_id` is also what Exo checks before it
-/// accepts `zaura_toplevel.set_window_bounds`. While the ARC bounds policy
-/// is active, the surface's ARC identity therefore replaces the guest's ID
-/// (see [`apply_arc_identity`]); otherwise the guest's ID is sent in the
-/// Guest OS namespace. The Aura surface needs no version check: the
-/// registry binds no `zaura_shell` older than `set_application_id`.
+/// The ARC backend replaces the ID with the surface's ARC identity;
+/// otherwise the guest's ID is sent in the Guest OS namespace. The Aura
+/// surface needs no version check: the registry binds no `zaura_shell`
+/// older than `set_application_id`.
 ///
 /// # Arguments
 ///
@@ -305,344 +463,75 @@ pub(crate) fn set_aura_application_id(
     let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id) else {
         return;
     };
-    if ctx.window_placement.uses_arc_bounds() {
-        log::debug!(
-            "Not sending application ID {} to zaura_surface (host_id={}): the ARC bounds policy replaces it",
+    match ctx.window_placement {
+        WindowPlacementState::Arc(_) => arc::replace_application_id(
+            ctx,
+            wl_surface_guest_id,
+            zaura_surface_host_id,
             native_application_id,
-            zaura_surface_host_id
-        );
-        if !apply_arc_identity(ctx, wl_surface_guest_id, zaura_surface_host_id) {
-            log::warn!(
-                "Unable to apply ARC policy identity for wl_surface {}",
-                wl_surface_guest_id
-            );
+        ),
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {
+            if queue_or_drop(
+                &mut ctx.client_to_host_queue,
+                zaura_surface::req::set_application_id(
+                    zaura_surface_host_id,
+                    Some(native_application_id),
+                ),
+                format_args!("the application ID of zaura_surface {zaura_surface_host_id}"),
+            ) {
+                log::debug!(
+                    "Set application ID to {} on zaura_surface (host_id={})",
+                    native_application_id,
+                    zaura_surface_host_id
+                );
+            }
         }
-        return;
-    }
-    if queue_or_drop(
-        &mut ctx.client_to_host_queue,
-        zaura_surface::req::set_application_id(zaura_surface_host_id, Some(native_application_id)),
-        format_args!("the application ID of zaura_surface {zaura_surface_host_id}"),
-    ) {
-        log::debug!(
-            "Set application ID to {} on zaura_surface (host_id={})",
-            native_application_id,
-            zaura_surface_host_id
-        );
     }
 }
 
-/// Queue the surface's ARC policy identity to its host Aura surface, once.
-///
-/// While the ARC bounds policy is active, this identity replaces every
-/// application ID the guest sets on the Aura surface, because Exo
-/// authorizes `set_window_bounds` only for it. An XDG client may omit
-/// `xdg_toplevel.set_app_id`, so placement also applies it before the first
-/// bounds request. The applied set keeps repeated calls from emitting
-/// duplicate metadata requests.
-///
-/// # Returns
-///
-/// `true` when the identity is (or already was) queued; `false` when no
-/// identity can be allocated (the block is exhausted).
-fn apply_arc_identity(
-    ctx: &mut Context,
-    wl_surface_guest_id: u32,
-    zaura_surface_host_id: u32,
-) -> bool {
-    if ctx
-        .window_placement
-        .arc_application_id_applied(wl_surface_guest_id)
-    {
-        return true;
-    }
-    let Some(application_id) = ctx.window_placement.arc_application_id(wl_surface_guest_id) else {
-        return false;
-    };
-    // The identity is proxy-generated and at most
-    // `ARC_APPLICATION_ID_PREFIX` plus ten digits, so it always fits.
-    let message =
-        zaura_surface::req::set_application_id(zaura_surface_host_id, Some(&application_id))
-            .expect("an ARC identity fits a message");
-    log::debug!(
-        "Set ARC policy application ID {} on zaura_surface (host_id={})",
-        application_id,
-        zaura_surface_host_id
-    );
-    ctx.client_to_host_queue.push(message);
-    ctx.window_placement
-        .mark_arc_application_id_applied(wl_surface_guest_id);
-    true
-}
-
-/// Create or reuse the internal Aura toplevel associated with a guest
-/// `xdg_toplevel`. The object is needed for screen-coordinate bounds requests.
-/// Private so that every caller goes through the policy and identity gate
-/// in [`attach_placement_toplevel`].
-fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Option<u32> {
-    if let Some(existing_id) = ctx
-        .window_placement
-        .aura_toplevel_for_xdg_toplevel(xdg_toplevel_guest_id)
-    {
-        return Some(existing_id);
-    }
-
-    let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
-    if ctx
-        .host_zaura_shell
-        .is_none_or(|shell| shell.version < PLACEMENT_SHELL_SINCE)
-    {
-        return None;
-    }
-    let zaura_toplevel_host_id =
-        aura_objects::create(ctx, AuraChild::TOPLEVEL, xdg_toplevel_host_id)?;
-    ctx.client_to_host_queue
-        .push(zaura_toplevel::req::set_supports_screen_coordinates(
-            zaura_toplevel_host_id,
-        ));
-    ctx.window_placement
-        .remember_aura_toplevel(xdg_toplevel_guest_id, zaura_toplevel_host_id);
-    Some(zaura_toplevel_host_id)
-}
-
-/// Attach the host Aura toplevel that placement uses for an XDG toplevel.
-///
-/// Placement needs a `zaura_toplevel` only while the ARC bounds policy is
-/// active, and Exo authorizes bounds requests only for a surface carrying an
-/// ARC policy identity. The identity is allocated first so exhaustion fails
-/// closed: no Aura child is created that placement could never use. Every
-/// path that creates a placement toplevel ([`attach_toplevel`],
-/// [`attach_recorded_toplevels`], and placement itself) goes through here.
-///
-/// # Returns
-///
-/// The host `zaura_toplevel` ID, or `None` when the policy is inactive, the
-/// identity is unavailable, or the host has no usable `zaura_shell` yet.
-fn attach_placement_toplevel(
-    ctx: &mut Context,
-    xdg_toplevel_guest_id: u32,
-    wl_surface_guest_id: u32,
-) -> Option<u32> {
-    if !ctx.window_placement.uses_arc_bounds() {
-        return None;
-    }
-    if ctx
-        .window_placement
-        .arc_application_id(wl_surface_guest_id)
-        .is_none()
-    {
-        log::warn!(
-            "Unable to allocate ARC policy identity for wl_surface {}",
-            wl_surface_guest_id
-        );
-        return None;
-    }
-    ensure_zaura_toplevel(ctx, xdg_toplevel_guest_id)
-}
-
-/// Attach the placement Aura toplevel to a newly created XDG toplevel.
-///
-/// Called once the generated dispatcher has accepted and mapped
-/// `xdg_surface.get_toplevel`. A toplevel that cannot attach yet needs no
-/// handling here: a missing `zaura_shell` is retried by
-/// [`attach_recorded_toplevels`], and placement attaches lazily.
-pub(crate) fn attach_toplevel(
-    ctx: &mut Context,
-    xdg_toplevel_guest_id: u32,
-    wl_surface_guest_id: u32,
-) {
-    // `None` is the documented "not yet" outcome above, not an error.
-    let _ = attach_placement_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
-}
-
-/// Attach every recorded XDG toplevel after `zaura_shell` is bound.
-///
-/// A guest may create toplevels before the host registry delivers
-/// `zaura_shell`; their guest-side associations are already recorded, so
-/// the late shell can attach the missing Aura children through the same
-/// identity gate as `get_toplevel`. A toplevel that still cannot attach is
-/// retried lazily by placement.
-pub(crate) fn attach_recorded_toplevels(ctx: &mut Context) {
-    for (xdg_toplevel_guest_id, wl_surface_guest_id) in ctx.xdg_roles.toplevels() {
-        attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
-    }
-}
-
-/// Release the placement Aura toplevel of a guest XDG toplevel.
-///
-/// Called whenever the XDG role ends (see `XdgRoles`' remove methods). Does
-/// nothing when the toplevel has no Aura toplevel. A barrier still in flight
-/// stays pending until its `done` but no longer gates anything.
-pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
-    if let Some(zaura_toplevel_host_id) = ctx
-        .window_placement
-        .take_aura_toplevel(xdg_toplevel_guest_id)
-    {
-        aura_objects::release(ctx, AuraChild::TOPLEVEL, zaura_toplevel_host_id);
-    }
-}
-
-// ── Bounds barrier and configures ─────────────────────────────────────────
-
-/// Queue a host `wl_display.sync` immediately after a
-/// `zaura_toplevel.set_window_bounds` request.
-///
-/// Exo can emit a configure for the old bounds before it has processed the
-/// placement request. The callback is an ordered host-stream barrier: once
-/// `done` arrives, all events generated by requests before the sync have
-/// already been delivered. Keep the callback host ID reserved through its
-/// subsequent `wl_display.delete_id`, just like the other internal barriers.
-fn queue_window_bounds_barrier(ctx: &mut Context, zaura_toplevel_host_id: u32) {
-    // A new shortcut supersedes the previous barrier for this toplevel. The
-    // old callback remains pending until its terminal event so its host ID
-    // cannot be recycled while Exo still has the object alive.
-    let callback = queue_internal_sync(
-        ctx,
-        InternalCallback::WindowBoundsBarrier {
-            zaura_toplevel: zaura_toplevel_host_id,
-        },
-    );
-    ctx.window_placement
-        .register_barrier(callback.0, zaura_toplevel_host_id);
-}
-
-/// Make `callback_host_id`, already tracked as a host-only `wl_callback`,
-/// the newest bounds barrier of `zaura_toplevel_host_id`, as
-/// `queue_window_bounds_barrier` does without queueing the request.
-#[cfg(test)]
-pub(crate) fn register_window_bounds_barrier_for_test(
-    ctx: &mut Context,
-    callback_host_id: u32,
-    zaura_toplevel_host_id: u32,
-) {
-    ctx.internal_callbacks.register(
-        HostId(callback_host_id),
-        InternalCallback::WindowBoundsBarrier {
-            zaura_toplevel: zaura_toplevel_host_id,
-        },
-    );
-    ctx.window_placement
-        .register_barrier(callback_host_id, zaura_toplevel_host_id);
-}
-
-/// Keep only the XDG states the guest's `xdg_toplevel` version can receive.
-///
-/// `zaura_toplevel.configure` carries XDG states plus Aura-only supplements
-/// (`immersive` = 100, `minimized` = 101) that are not part of xdg-shell, and
-/// it is not filtered by the guest's negotiated `xdg_toplevel` version. The
-/// array is a sequence of native-endian u32 values; a trailing partial entry
-/// is malformed and dropped.
-fn guest_xdg_toplevel_states(states: &[u8], guest_version: u32) -> Vec<u8> {
-    let (entries, _malformed_tail) = states.as_chunks::<4>();
-    entries
-        .iter()
-        .filter(|entry| {
-            let state = u32::from_ne_bytes(**entry);
-            xdg_toplevel::state_since(state).is_some_and(|since| since <= guest_version)
-        })
-        .flatten()
-        .copied()
-        .collect()
-}
-
-/// Queue a guest `xdg_toplevel.configure` carrying the host's states,
-/// filtered to the guest's negotiated version.
-fn queue_guest_xdg_configure(
-    ctx: &mut Context,
-    guest_xdg_toplevel_id: u32,
-    width: i32,
-    height: i32,
-    states: &[u8],
-) {
-    // Without a recorded version, assume the baseline so only states every
-    // xdg_toplevel client understands are delivered.
-    let guest_version = ctx
-        .shadow_table
-        .guest_object_version(guest_xdg_toplevel_id)
-        .unwrap_or(1);
-    let states = guest_xdg_toplevel_states(states, guest_version);
-    // The states array is host data, so its encoder is fallible. It is a
-    // filtered copy of an array that already fit in the host's message, so
-    // a failure means corrupted state and is only logged.
-    queue_or_drop(
-        &mut ctx.host_to_client_queue,
-        xdg_toplevel::evt::configure(guest_xdg_toplevel_id, width, height, &states),
-        format_args!("the configure of xdg_toplevel {guest_xdg_toplevel_id}"),
-    );
-}
-
-fn queue_guest_xdg_surface_configure(ctx: &mut Context, guest_xdg_surface_id: u32, serial: u32) {
-    ctx.host_to_client_queue
-        .push(xdg_surface::evt::configure(guest_xdg_surface_id, serial));
-}
+// ── Configures ────────────────────────────────────────────────────────────
 
 /// Handle `wl_callback.done` for a bounds barrier
-/// ([`InternalCallback::WindowBoundsBarrier`]), which the callback handler
-/// has already retired.
-///
-/// Flushes the newest configures retained behind it. Older callbacks flush
-/// nothing: a newer barrier owns the pending configures and flushes them on
-/// its own `done`.
+/// ([`crate::state::InternalCallback::WindowBoundsBarrier`]), which the
+/// callback handler has already retired.
 pub(crate) fn complete_barrier(
     ctx: &mut Context,
     callback_host_id: u32,
     zaura_toplevel_host_id: u32,
 ) {
-    let held = ctx
-        .window_placement
-        .complete_barrier(callback_host_id, zaura_toplevel_host_id);
-    if let Some(configure) = held.configure {
-        queue_guest_xdg_configure(
-            ctx,
-            configure.guest_xdg_toplevel_id,
-            configure.width,
-            configure.height,
-            &configure.states,
-        );
-    }
-    if let Some(configure) = held.surface_configure {
-        queue_guest_xdg_surface_configure(ctx, configure.guest_xdg_surface_id, configure.serial);
+    match ctx.window_placement {
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {}
+        WindowPlacementState::Arc(_) => {
+            arc::complete_barrier(ctx, callback_host_id, zaura_toplevel_host_id);
+        }
     }
 }
 
-/// Hold a host `xdg_surface.configure` behind an active bounds barrier.
+/// Hold a host `xdg_surface.configure` while the backend orders it.
 ///
 /// # Returns
 ///
-/// `true` when the configure is held and must not be forwarded now; it is
-/// delivered when the barrier completes. `false` when no barrier gates the
-/// surface's toplevel and the caller forwards the event.
+/// `true` when the configure is held and must not be forwarded now;
+/// `false` when the caller forwards the event.
 pub(crate) fn hold_surface_configure(
     ctx: &mut Context,
     guest_xdg_surface_id: u32,
     serial: u32,
 ) -> bool {
-    let Some(guest_xdg_toplevel_id) = ctx.xdg_roles.toplevel_of_xdg_surface(guest_xdg_surface_id)
-    else {
-        return false;
-    };
-    let Some(zaura_toplevel_host_id) = ctx
-        .window_placement
-        .aura_toplevel_for_xdg_toplevel(guest_xdg_toplevel_id)
-    else {
-        return false;
-    };
-    ctx.window_placement.hold_surface_configure(
-        zaura_toplevel_host_id,
-        crate::state::PendingWindowBoundsSurfaceConfigure {
-            guest_xdg_surface_id,
-            serial,
-        },
-    )
+    match ctx.window_placement {
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => false,
+        WindowPlacementState::Arc(_) => {
+            arc::hold_surface_configure(ctx, guest_xdg_surface_id, serial)
+        }
+    }
 }
 
-/// Hold a host `xdg_toplevel.configure` behind an active bounds barrier.
+/// Hold a host `xdg_toplevel.configure` while the backend orders it.
 ///
 /// # Returns
 ///
-/// `true` when the configure is held (the newest one replaces any older)
-/// and must not be forwarded now; `false` when no barrier gates the
-/// toplevel and the caller forwards the event.
+/// `true` when the configure is held and must not be forwarded now;
+/// `false` when the caller forwards the event.
 pub(crate) fn hold_toplevel_configure(
     ctx: &mut Context,
     guest_xdg_toplevel_id: u32,
@@ -650,55 +539,16 @@ pub(crate) fn hold_toplevel_configure(
     height: i32,
     states: &[u8],
 ) -> bool {
-    let Some(zaura_toplevel_host_id) = ctx
-        .window_placement
-        .aura_toplevel_for_xdg_toplevel(guest_xdg_toplevel_id)
-    else {
-        return false;
-    };
-    hold_toplevel_configure_behind_barrier(
-        ctx,
-        zaura_toplevel_host_id,
-        guest_xdg_toplevel_id,
-        width,
-        height,
-        states,
-    )
+    match ctx.window_placement {
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => false,
+        WindowPlacementState::Arc(_) => {
+            arc::hold_toplevel_configure(ctx, guest_xdg_toplevel_id, width, height, states)
+        }
+    }
 }
 
-/// Hold a toplevel configure, from either the XDG or the Aura toplevel,
-/// behind the active barrier of `zaura_toplevel_host_id`.
-///
-/// # Returns
-///
-/// `false`, holding nothing, when no barrier gates the toplevel.
-fn hold_toplevel_configure_behind_barrier(
-    ctx: &mut Context,
-    zaura_toplevel_host_id: u32,
-    guest_xdg_toplevel_id: u32,
-    width: i32,
-    height: i32,
-    states: &[u8],
-) -> bool {
-    ctx.window_placement.hold_configure(
-        zaura_toplevel_host_id,
-        crate::state::PendingWindowBoundsConfigure {
-            guest_xdg_toplevel_id,
-            width,
-            height,
-            states: states.to_vec(),
-        },
-    )
-}
-
-/// Translate a host `zaura_toplevel.configure` into the guest's
-/// `xdg_toplevel.configure`.
-///
-/// The event is held behind an active bounds barrier like an XDG configure;
-/// otherwise it is delivered now with its states filtered to the guest's
-/// `xdg_toplevel` version. An event for an Aura toplevel that is no longer
-/// attached is dropped. `x` and `y` are only logged: `xdg_toplevel` has no
-/// origin.
+/// Deliver a host `zaura_toplevel.configure` to the guest. Only the ARC
+/// backend creates Aura toplevels; the event is dropped otherwise.
 pub(crate) fn translate_aura_configure(
     ctx: &mut Context,
     zaura_toplevel_host_id: u32,
@@ -708,87 +558,62 @@ pub(crate) fn translate_aura_configure(
     height: i32,
     states: &[u8],
 ) {
-    let Some(guest_xdg_toplevel_id) = ctx
-        .window_placement
-        .xdg_toplevel_for_aura_toplevel(zaura_toplevel_host_id)
-    else {
-        return;
-    };
-    log::debug!(
-        "zaura_toplevel.configure host={} guest={} bounds={}x{} origin=({}, {}) barrier_active={}",
-        zaura_toplevel_host_id,
-        guest_xdg_toplevel_id,
-        width,
-        height,
-        x,
-        y,
-        ctx.window_placement
-            .has_active_barrier(zaura_toplevel_host_id)
-    );
-    if !hold_toplevel_configure_behind_barrier(
-        ctx,
-        zaura_toplevel_host_id,
-        guest_xdg_toplevel_id,
-        width,
-        height,
-        states,
-    ) {
-        queue_guest_xdg_configure(ctx, guest_xdg_toplevel_id, width, height, states);
+    match ctx.window_placement {
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {}
+        WindowPlacementState::Arc(_) => {
+            arc::translate_aura_configure(ctx, zaura_toplevel_host_id, x, y, width, height, states)
+        }
     }
 }
 
+/// Fixtures shared by the boundary's and the backends' tests.
 #[cfg(test)]
-mod tests {
+mod fixture {
     use super::*;
-    use crate::arc_task_ids::ArcIdAllocator;
     use crate::handler::compositor::CompositorHandler;
-    use crate::handler::display::DisplayHandler;
     use crate::placement_config::PlacementConfig;
-    use crate::protocols::aura_shell::zaura_shell;
-    use crate::protocols::aura_shell::zaura_surface::REQ_RELEASE as REQ_RELEASE_AURA_SURFACE;
-    use crate::protocols::aura_shell::zaura_toplevel::{
-        ZauraToplevelHandler, REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL,
-        REQ_RELEASE_SINCE as REQ_RELEASE_AURA_TOPLEVEL_SINCE,
-    };
-    use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
-    use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler};
-    use crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler;
-    use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
+    use crate::protocols::aura_shell::zaura_toplevel;
+    use crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler;
+    use crate::protocols::aura_shell::{zaura_output, zaura_shell};
+    use crate::protocols::wayland::{wl_keyboard, wl_output, wl_registry};
+    use crate::protocols::xdg_shell::xdg_toplevel;
+    use crate::protocols::xdg_shell::xdg_wm_base;
     use crate::protocols::{AnyEvent, AnyRequest};
-    use crate::state::{OutputState, ARC_APPLICATION_ID_PREFIX};
-    use crate::test_support::{decode, msg_sender, queued_headers};
+    use crate::proxy::harness::{Object, Session};
+    use crate::state::OutputState;
+    use crate::test_support::{decode, msg_sender};
     use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
     use std::collections::VecDeque;
 
     /// A guest object and the host object it is paired with.
     #[derive(Clone, Copy)]
-    struct Paired {
-        guest: u32,
-        host: u32,
+    pub(super) struct Paired {
+        pub(super) guest: u32,
+        pub(super) host: u32,
     }
 
-    const SURFACE: Paired = Paired {
+    pub(super) const SURFACE: Paired = Paired {
         guest: 100,
         host: 200,
     };
-    const XDG_SURFACE: Paired = Paired {
+    pub(super) const XDG_SURFACE: Paired = Paired {
         guest: 110,
         host: 210,
     };
-    const TOPLEVEL: Paired = Paired {
+    pub(super) const TOPLEVEL: Paired = Paired {
         guest: 120,
         host: 220,
     };
     /// The host `zaura_shell`, at the vendored version.
-    const SHELL: u32 = 300;
+    pub(super) const SHELL: u32 = 300;
     /// Host keyboard 5 (guest 10, on seat 11).
-    const KEYBOARD: Paired = Paired { guest: 10, host: 5 };
+    pub(super) const KEYBOARD: Paired = Paired { guest: 10, host: 5 };
     /// A 3840x2160 output at 1x.
-    const OUTPUT: u32 = 25;
+    pub(super) const OUTPUT: u32 = 25;
 
     /// Give `ctx` wl_surface [`SURFACE`] with the toplevel role:
     /// [`XDG_SURFACE`] and its [`TOPLEVEL`].
-    fn add_toplevel(ctx: &mut Context) {
+    pub(super) fn add_toplevel(ctx: &mut Context) {
         for (object, interface) in [
             (SURFACE, "wl_surface"),
             (XDG_SURFACE, "xdg_surface"),
@@ -802,21 +627,21 @@ mod tests {
     }
 
     /// A context under `placement` with [`add_toplevel`] and [`SHELL`].
-    fn toplevel_ctx_with(placement: PlacementConfig) -> Context {
+    pub(super) fn toplevel_ctx_with(placement: PlacementConfig) -> Context {
         let mut ctx = Context::with_placement_for_test(placement);
         add_toplevel(&mut ctx);
         ctx.bind_aura_shell_for_test(SHELL);
         ctx
     }
 
-    /// [`toplevel_ctx_with`] the default placement policy.
-    fn toplevel_ctx() -> Context {
-        toplevel_ctx_with(PlacementConfig::for_test(Vec::new()))
+    /// [`toplevel_ctx_with`] the ARC backend, without bindings.
+    pub(super) fn toplevel_ctx() -> Context {
+        toplevel_ctx_with(PlacementConfig::arc_bounds_for_test(""))
     }
 
     /// Focus [`KEYBOARD`] on [`SURFACE`], which is all focus resolution
     /// reads.
-    fn focus(ctx: &mut Context) {
+    pub(super) fn focus(ctx: &mut Context) {
         let seat = 11;
         ctx.shadow_table
             .insert_paired_for_test(KEYBOARD.guest, KEYBOARD.host, "wl_keyboard");
@@ -826,7 +651,7 @@ mod tests {
     }
 
     /// An output of `mode` at 1x, at `origin_x`.
-    fn output(origin_x: i32, mode: (i32, i32)) -> OutputState {
+    pub(super) fn output(origin_x: i32, mode: (i32, i32)) -> OutputState {
         OutputState {
             origin_x,
             mode_width: mode.0,
@@ -839,7 +664,7 @@ mod tests {
 
     /// [`toplevel_ctx_with`] the ARC bounds policy, focused through
     /// [`KEYBOARD`], on [`OUTPUT`].
-    fn focused_ctx() -> Context {
+    pub(super) fn focused_ctx() -> Context {
         let mut ctx = toplevel_ctx_with(PlacementConfig::arc_bounds_for_test(""));
         focus(&mut ctx);
         ctx.outputs.bind_for_test(OUTPUT, output(0, (3840, 2160)));
@@ -848,13 +673,19 @@ mod tests {
 
     /// Place the focused toplevel with `action`; returns what it sends the
     /// host.
-    fn place(ctx: &mut Context, action: WindowLayoutAction) -> Vec<(u32, AnyRequest)> {
+    pub(super) fn place(ctx: &mut Context, action: WindowLayoutAction) -> Vec<(u32, AnyRequest)> {
         ctx.client_to_host_queue.clear();
         assert_eq!(place_focused(ctx, HostId(KEYBOARD.host), action), Ok(()));
         host_requests(ctx)
     }
 
-    fn window_bounds(x: i32, y: i32, width: i32, height: i32, output: u32) -> AnyRequest {
+    pub(super) fn window_bounds(
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        output: u32,
+    ) -> AnyRequest {
         zaura_toplevel::Request::SetWindowBounds {
             x,
             y,
@@ -867,7 +698,7 @@ mod tests {
 
     /// Each message of `queue`, decoded as the interface `interface_of` its
     /// sender has. Panics if a message leaves a descriptor unread.
-    fn decode_queue<'a, M>(
+    pub(super) fn decode_queue<'a, M>(
         queue: &[Outgoing],
         interface_of: impl Fn(u32) -> Option<&'a str>,
         from_wire: fn(&str, &mut crate::wire::WireMessage) -> Result<M, crate::wire::ProtocolError>,
@@ -892,7 +723,7 @@ mod tests {
     }
 
     /// What `ctx` queued for the host.
-    fn host_requests(ctx: &Context) -> Vec<(u32, AnyRequest)> {
+    pub(super) fn host_requests(ctx: &Context) -> Vec<(u32, AnyRequest)> {
         let table = &ctx.shadow_table;
         // The fixtures pair neither the display nor the shell.
         let interface_of = |id| match id {
@@ -908,7 +739,7 @@ mod tests {
     }
 
     /// What `ctx` queued for the guest.
-    fn guest_events(ctx: &Context) -> Vec<(u32, AnyEvent)> {
+    pub(super) fn guest_events(ctx: &Context) -> Vec<(u32, AnyEvent)> {
         let table = &ctx.shadow_table;
         decode_queue(
             &ctx.host_to_client_queue,
@@ -918,7 +749,7 @@ mod tests {
     }
 
     /// Deliver the host `wl_callback.done` of `callback_host_id`.
-    fn done(ctx: &mut Context, callback_host_id: u32) {
+    pub(super) fn done(ctx: &mut Context, callback_host_id: u32) {
         use crate::protocols::wayland::wl_callback::WlCallbackHandler;
 
         ctx.last_sender_id = callback_host_id;
@@ -929,7 +760,12 @@ mod tests {
     }
 
     /// The host's `zaura_toplevel.configure` of `aura_toplevel`.
-    fn aura_configure(ctx: &mut Context, aura_toplevel: u32, size: (i32, i32), states: &[u8]) {
+    pub(super) fn aura_configure(
+        ctx: &mut Context,
+        aura_toplevel: u32,
+        size: (i32, i32),
+        states: &[u8],
+    ) {
         ctx.last_sender_id = aura_toplevel;
         let action = ZauraToplevelHandler::on_configure(
             &mut CompositorHandler,
@@ -944,7 +780,7 @@ mod tests {
     }
 
     /// The guest's `xdg_toplevel.configure` of [`TOPLEVEL`].
-    fn toplevel_configure(size: (i32, i32), states: &[u32]) -> (u32, AnyEvent) {
+    pub(super) fn toplevel_configure(size: (i32, i32), states: &[u32]) -> (u32, AnyEvent) {
         let configure = xdg_toplevel::Event::Configure {
             width: size.0,
             height: size.1,
@@ -953,7 +789,7 @@ mod tests {
         (TOPLEVEL.guest, configure.into())
     }
 
-    fn encode_states(states: &[u32]) -> Vec<u8> {
+    pub(super) fn encode_states(states: &[u32]) -> Vec<u8> {
         states
             .iter()
             .flat_map(|state| state.to_ne_bytes())
@@ -961,12 +797,210 @@ mod tests {
     }
 
     /// Give [`TOPLEVEL`] the v38 Aura toplevel `aura_toplevel`.
-    fn remember_aura_toplevel(ctx: &mut Context, aura_toplevel: u32) {
+    pub(super) fn remember_aura_toplevel(ctx: &mut Context, aura_toplevel: u32) {
         ctx.window_placement
+            .arc_mut()
+            .expect("the ARC backend")
             .remember_aura_toplevel(TOPLEVEL.guest, aura_toplevel);
         ctx.shadow_table
             .insert_host_only_for_test(aura_toplevel, "zaura_toplevel", 38);
     }
+
+    /// A whole proxy session for placement tests, with the objects every
+    /// backend needs: the proxy's own `zaura_shell`, a 1920x1080 output at
+    /// 1x whose shelf takes 48 pixels, an `xdg_wm_base`, a keyboard and a
+    /// surface.
+    pub(super) struct Desk {
+        pub(super) s: Session,
+        /// The host `zaura_shell` the proxy bound.
+        pub(super) shell: u32,
+        pub(super) output: Object,
+        /// The host-only `zaura_output` of `output`.
+        pub(super) aura_output: u32,
+        pub(super) wm_base: Object,
+        pub(super) keyboard: Object,
+        pub(super) surface: Object,
+    }
+
+    /// The work area of [`Desk`]'s output: the shelf takes its bottom.
+    pub(super) const DESK_WORK_AREA: (i32, i32) = (1920, 1080 - 48);
+
+    impl Desk {
+        /// A session under `placement`, which must have a backend: the
+        /// output gets its Aura output, whose metadata the host sends.
+        /// What either peer gets for this is checked and not kept.
+        pub(super) async fn new(placement: PlacementConfig) -> Self {
+            Self::with_output(placement, 0, 1000).await
+        }
+
+        /// [`Self::new`] with the output's left edge at `origin_x` and a
+        /// device scale factor of `device_scale` thousandths.
+        pub(super) async fn with_output(
+            placement: PlacementConfig,
+            origin_x: i32,
+            device_scale: u32,
+        ) -> Self {
+            Self::with_output_zoom(placement, origin_x, 1000, device_scale).await
+        }
+
+        /// [`Self::with_output`] with a display zoom of `current_scale`
+        /// thousandths, which Aura sends as the output's current
+        /// `zaura_output.scale`.
+        pub(super) async fn with_output_zoom(
+            placement: PlacementConfig,
+            origin_x: i32,
+            current_scale: u32,
+            device_scale: u32,
+        ) -> Self {
+            let mut d = Self::unmeasured(placement).await;
+            assert_eq!(d.measure(origin_x, current_scale, device_scale).await, []);
+            assert_eq!(d.s.host_received(), []);
+            d
+        }
+
+        /// The host sends the output's metadata, its mode at `origin_x`
+        /// and Aura's `current_scale` and `device_scale` thousandths and
+        /// insets, which the guest gets as its output's events first; returns
+        /// what else the guest gets. What the proxy sends the host is kept.
+        pub(super) async fn measure(
+            &mut self,
+            origin_x: i32,
+            current_scale: u32,
+            device_scale: u32,
+        ) -> Vec<(u32, AnyEvent)> {
+            let (output, aura_output) = (self.output, self.aura_output);
+            self.s
+                .host([
+                    wl_output::evt::geometry(output.host, origin_x, 0, 0, 0, 0, "", "", 0).unwrap(),
+                    wl_output::evt::mode(output.host, wl_output::MODE_CURRENT, 1920, 1080, 60),
+                    zaura_output::evt::scale(
+                        aura_output,
+                        zaura_output::SCALE_PROPERTY_CURRENT,
+                        current_scale,
+                    ),
+                    zaura_output::evt::device_scale_factor(aura_output, device_scale),
+                    zaura_output::evt::insets(aura_output, 0, 0, 1080 - DESK_WORK_AREA.1, 0),
+                    wl_output::evt::done(output.host),
+                ])
+                .await;
+            let mut guest = self.s.guest_received();
+            let others = guest.split_off(
+                guest
+                    .iter()
+                    .position(|(sender, _)| *sender != output.id)
+                    .unwrap_or(guest.len()),
+            );
+            assert!(!guest.is_empty(), "the guest gets its output's events");
+            others
+        }
+
+        /// [`Self::new`] whose host has not sent the output's metadata, so
+        /// that the output cannot place a window yet.
+        pub(super) async fn unmeasured(placement: PlacementConfig) -> Self {
+            let mut s = Session::with_context(Context::with_placement_for_test(placement));
+            let registry = s.registry().await;
+            s.advertise("zaura_shell", zaura_shell::VERSION).await;
+            let host = s.host_received();
+            let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))] = &host[..]
+            else {
+                panic!("the proxy did not bind zaura_shell: {host:?}");
+            };
+            let shell = id.2;
+            assert_eq!(s.guest_received().len(), 1, "gtk_shell1 is advertised");
+
+            let output_name = s.advertise("wl_output", wl_output::VERSION).await;
+            let advertised = s.guest_received();
+            let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+                &advertised[..]
+            else {
+                panic!("the output was not advertised: {advertised:?}");
+            };
+            let id = s.new_id();
+            s.guest([
+                wl_registry::req::bind(registry.id, output_name, "wl_output", *version, id)
+                    .unwrap(),
+            ])
+            .await;
+            let host = s.host_received();
+            let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id: bound, .. })), (
+                aura_shell,
+                AnyRequest::ZauraShell(zaura_shell::Request::GetAuraOutput {
+                    id: aura_output,
+                    output: aura_of,
+                }),
+            )] = &host[..]
+            else {
+                panic!("the output got no Aura output: {host:?}");
+            };
+            assert_eq!((*aura_shell, *aura_of), (shell, bound.2));
+            let output = Object { id, host: bound.2 };
+            let aura_output = *aura_output;
+
+            let wm_base = s.bind_paired("xdg_wm_base", xdg_wm_base::VERSION).await;
+            let (_, keyboard) = s.keyboard().await;
+            let surface = s.surface().await;
+            Self {
+                s,
+                shell,
+                output,
+                aura_output,
+                wm_base,
+                keyboard,
+                surface,
+            }
+        }
+
+        /// The host gives the keyboard's focus to the surface and holds
+        /// Alt.
+        pub(super) async fn focus(&mut self) {
+            let alt = 1 << 3;
+            self.s
+                .host([
+                    wl_keyboard::evt::enter(self.keyboard.host, 1, self.surface.host, &[]).unwrap(),
+                    wl_keyboard::evt::modifiers(self.keyboard.host, 2, alt, 0, 0, 0),
+                ])
+                .await;
+            assert_eq!(self.s.guest_received().len(), 3, "enter and modifiers");
+            assert_eq!(self.s.host_received(), []);
+        }
+
+        /// The host sends a press and release of Q, which with Alt is the
+        /// `<Alt>q` chord, as key events `serial` and `serial + 1`.
+        pub(super) async fn chord(&mut self, serial: u32) {
+            let q = 16;
+            self.s
+                .host([
+                    wl_keyboard::evt::key(
+                        self.keyboard.host,
+                        serial,
+                        serial,
+                        q,
+                        wl_keyboard::KEY_STATE_PRESSED,
+                    ),
+                    wl_keyboard::evt::key(
+                        self.keyboard.host,
+                        serial + 1,
+                        serial + 1,
+                        q,
+                        wl_keyboard::KEY_STATE_RELEASED,
+                    ),
+                ])
+                .await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::*;
+    use super::*;
+    use crate::arc_task_ids::ArcIdAllocator;
+    use crate::placement_config::PlacementConfig;
+    use crate::protocols::aura_shell::zaura_shell;
+    use crate::protocols::aura_shell::zaura_toplevel;
+    use crate::protocols::wayland::wl_surface::{self};
+    use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
+    use crate::protocols::{AnyEvent, AnyRequest};
 
     #[test]
     fn grid_bounds_use_two_by_two_work_area_cells() {
@@ -1010,123 +1044,6 @@ mod tests {
         );
     }
 
-    /// The first placement creates the Aura toplevel (in screen
-    /// coordinates) and surface and sets the ARC identity; each placement
-    /// then resets the window state and sends direct bounds, never a snap
-    /// request, followed by its barrier.
-    #[test]
-    fn place_focused_queues_bounds_after_state_reset() {
-        use WindowLayoutAction::{Fullscreen, Left, Right};
-        // Each sequence of placements, with the x and width of its bounds.
-        for placements in [
-            &[(Fullscreen, 0, 3840)][..],
-            &[(Left, 0, 1920), (Right, 1920, 1920)],
-        ] {
-            let mut ctx = focused_ctx();
-            for (placement, &(action, x, width)) in placements.iter().enumerate() {
-                let sent = place(&mut ctx, action);
-                let aura_toplevel = ctx
-                    .window_placement
-                    .aura_toplevel_for_xdg_toplevel(TOPLEVEL.guest)
-                    .expect("an Aura toplevel");
-                let aura_surface = ctx
-                    .aura_surfaces
-                    .get(SURFACE.host)
-                    .expect("an Aura surface");
-                let application_id = ctx.window_placement.arc_application_id(SURFACE.guest);
-                assert!(application_id
-                    .as_ref()
-                    .is_some_and(|id| id.starts_with(ARC_APPLICATION_ID_PREFIX)));
-                let mut expected: Vec<(u32, AnyRequest)> = Vec::new();
-                if placement == 0 {
-                    expected.extend([
-                        (
-                            SHELL,
-                            zaura_shell::Request::GetAuraToplevelForXdgToplevel {
-                                id: aura_toplevel,
-                                toplevel: TOPLEVEL.host,
-                            }
-                            .into(),
-                        ),
-                        (
-                            aura_toplevel,
-                            zaura_toplevel::Request::SetSupportsScreenCoordinates {}.into(),
-                        ),
-                        (
-                            SHELL,
-                            zaura_shell::Request::GetAuraSurface {
-                                id: aura_surface,
-                                surface: SURFACE.host,
-                            }
-                            .into(),
-                        ),
-                        (
-                            aura_surface,
-                            zaura_surface::Request::SetApplicationId { application_id }.into(),
-                        ),
-                    ]);
-                }
-                let callback = ctx
-                    .window_placement
-                    .active_barrier_for_toplevel(aura_toplevel)
-                    .expect("a barrier");
-                expected.extend([
-                    (
-                        TOPLEVEL.host,
-                        xdg_toplevel::Request::UnsetFullscreen {}.into(),
-                    ),
-                    (
-                        TOPLEVEL.host,
-                        xdg_toplevel::Request::UnsetMaximized {}.into(),
-                    ),
-                    (aura_surface, zaura_surface::Request::UnsetSnap {}.into()),
-                    (aura_toplevel, window_bounds(x, 0, width, 2160, OUTPUT)),
-                    (WL_DISPLAY_ID, wl_display::Request::Sync { callback }.into()),
-                ]);
-                assert_eq!(sent, expected, "{action:?}");
-            }
-        }
-    }
-
-    /// `zaura_surface.unset_snap` exists only from version 16. An Aura
-    /// surface created under an older `zaura_shell` generation keeps its
-    /// version after the shell is re-advertised at a newer one, so placement
-    /// must not send it the request (Exo would reject the unknown method and
-    /// disconnect the client). A new enough surface still gets it.
-    #[test]
-    fn unset_snap_is_sent_only_to_an_aura_surface_that_has_it() {
-        for (surface_version, expect_unset_snap) in [
-            (REQ_UNSET_SNAP_SINCE - 1, false),
-            (REQ_UNSET_SNAP_SINCE, true),
-        ] {
-            let mut ctx = focused_ctx();
-            let aura_surface = 0x7000;
-            ctx.shadow_table.insert_host_only_for_test(
-                aura_surface,
-                "zaura_surface",
-                surface_version,
-            );
-            ctx.aura_surfaces.remember(SURFACE.host, aura_surface);
-
-            let sent = place(&mut ctx, WindowLayoutAction::TopLeft);
-            let unset_snap: (u32, AnyRequest) =
-                (aura_surface, zaura_surface::Request::UnsetSnap {}.into());
-            assert_eq!(
-                sent.contains(&unset_snap),
-                expect_unset_snap,
-                "zaura_surface v{surface_version}"
-            );
-            let aura_toplevel = ctx
-                .window_placement
-                .aura_toplevel_for_xdg_toplevel(TOPLEVEL.guest)
-                .expect("Aura toplevel");
-            assert!(
-                sent.contains(&(aura_toplevel, window_bounds(0, 0, 1920, 1080, OUTPUT))),
-                "the bounds request does not depend on unset_snap"
-            );
-        }
-    }
-
     /// Placement maps into the work area of the output the focused surface
     /// entered, with that output's own origin, scale and rotation: a 2x
     /// panel, a 1x external monitor left of it (negative coordinates), and
@@ -1146,7 +1063,8 @@ mod tests {
             let sent = place(ctx, WindowLayoutAction::Right);
             let aura_toplevel = ctx
                 .window_placement
-                .aura_toplevel_for_xdg_toplevel(TOPLEVEL.guest)
+                .arc()
+                .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(TOPLEVEL.guest))
                 .expect("an Aura toplevel");
             sent.into_iter()
                 .find(|(sender, request)| {
@@ -1189,146 +1107,6 @@ mod tests {
     }
 
     #[test]
-    fn arc_policy_identity_is_unique_and_stable_per_surface() {
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(""));
-        let first = ctx
-            .window_placement
-            .arc_application_id(10)
-            .expect("first identity");
-        assert_eq!(
-            ctx.window_placement.arc_application_id(10).as_deref(),
-            Some(first.as_str())
-        );
-        let second = ctx
-            .window_placement
-            .arc_application_id(11)
-            .expect("second identity");
-        assert_ne!(first, second);
-        for identity in [&first, &second] {
-            assert!(!identity.starts_with("org.chromium.arc.session."));
-            let id = identity
-                .strip_prefix(ARC_APPLICATION_ID_PREFIX)
-                .expect("task-form ARC prefix")
-                .parse::<u32>()
-                .expect("numeric ARC task ID");
-            assert!((crate::arc_task_ids::ARC_ID_POOL_START
-                ..=crate::arc_task_ids::ARC_ID_POOL_END)
-                .contains(&id));
-        }
-    }
-
-    #[test]
-    fn arc_policy_identity_fails_closed_when_the_block_is_exhausted() {
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::resolve_for_test(
-            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
-            None,
-            ArcIdAllocator::exhausted_for_test(),
-        ));
-        assert!(ctx.window_placement.arc_application_id(10).is_none());
-        assert!(!ctx.window_placement.has_arc_application_ids());
-    }
-
-    #[test]
-    fn arc_policy_identity_is_applied_before_placement_without_app_id() {
-        let mut ctx = toplevel_ctx_with(PlacementConfig::arc_bounds_for_test(""));
-        let aura_surface =
-            ensure_host_zaura_surface(&mut ctx, SURFACE.guest).expect("Aura surface");
-        assert!(apply_arc_identity(&mut ctx, SURFACE.guest, aura_surface));
-        assert!(ctx
-            .window_placement
-            .arc_application_id_applied(SURFACE.guest));
-        let application_id = ctx.window_placement.arc_application_id(SURFACE.guest);
-        let sent = host_requests(&ctx);
-        assert_eq!(
-            sent,
-            [
-                (
-                    SHELL,
-                    zaura_shell::Request::GetAuraSurface {
-                        id: aura_surface,
-                        surface: SURFACE.host,
-                    }
-                    .into()
-                ),
-                (
-                    aura_surface,
-                    zaura_surface::Request::SetApplicationId { application_id }.into()
-                ),
-            ]
-        );
-
-        assert!(apply_arc_identity(&mut ctx, SURFACE.guest, aura_surface));
-        assert_eq!(
-            host_requests(&ctx),
-            sent,
-            "repeated placement must not duplicate ARC metadata"
-        );
-    }
-
-    /// A bounds barrier holds the Aura toplevel's configure, and the
-    /// `xdg_surface.configure` that ends its sequence if one arrived, until
-    /// its `done`, which sends the guest the toplevel's configure first.
-    #[test]
-    fn bounds_barrier_holds_configures_until_done_and_flushes_toplevel_first() {
-        for surface_serial in [None, Some(77)] {
-            let mut ctx = toplevel_ctx();
-            let (aura_toplevel, callback) = (650, 651);
-            remember_aura_toplevel(&mut ctx, aura_toplevel);
-            ctx.shadow_table
-                .insert_host_only_for_test(callback, "wl_callback", 1);
-            register_window_bounds_barrier_for_test(&mut ctx, callback, aura_toplevel);
-            if let Some(serial) = surface_serial {
-                ctx.last_sender_id = XDG_SURFACE.host;
-                assert_eq!(
-                    XdgSurfaceHandler::on_configure(&mut CompositorHandler, &mut ctx, serial),
-                    Action::Drop
-                );
-            }
-            aura_configure(&mut ctx, aura_toplevel, (800, 600), &[]);
-            assert!(ctx.host_to_client_queue.is_empty(), "{surface_serial:?}");
-            assert!(ctx.window_placement.has_held_configure(aura_toplevel));
-
-            done(&mut ctx, callback);
-            assert!(!ctx.window_placement.has_active_barrier(aura_toplevel));
-            let mut expected = vec![toplevel_configure((800, 600), &[])];
-            expected.extend(surface_serial.map(|serial| {
-                let configure = xdg_surface::Event::Configure { serial };
-                (XDG_SURFACE.guest, configure.into())
-            }));
-            assert_eq!(guest_events(&ctx), expected);
-        }
-    }
-
-    /// A `zaura_shell` without `set_window_bounds` cannot place, and one
-    /// without `zaura_output.insets` would measure a work area that
-    /// includes the shelf, so neither gets an Aura toplevel; the first
-    /// version with both does.
-    #[test]
-    fn placement_needs_a_shell_with_window_bounds_and_output_insets() {
-        for (shell_version, expect_toplevel) in [
-            (REQ_SET_WINDOW_BOUNDS_SINCE, false),
-            (EVT_INSETS_SINCE - 1, false),
-            (EVT_INSETS_SINCE, true),
-        ] {
-            let mut ctx = toplevel_ctx_with(PlacementConfig::arc_bounds_for_test(""));
-            ctx.host_zaura_shell
-                .as_mut()
-                .expect("bound zaura_shell")
-                .version = shell_version;
-            attach_toplevel(&mut ctx, TOPLEVEL.guest, SURFACE.guest);
-            let attached = ctx
-                .window_placement
-                .aura_toplevel_for_xdg_toplevel(TOPLEVEL.guest);
-            assert_eq!(attached.is_some(), expect_toplevel, "v{shell_version}");
-            assert_eq!(
-                ctx.client_to_host_queue.is_empty(),
-                !expect_toplevel,
-                "zaura_shell v{shell_version}"
-            );
-        }
-    }
-
-    #[test]
     fn an_old_shell_is_reported_once_per_process() {
         OLD_SHELL_WARNED.store(false, Ordering::Relaxed);
         assert!(!warn_if_shell_cannot_place(PLACEMENT_SHELL_SINCE));
@@ -1336,221 +1114,220 @@ mod tests {
         assert!(!warn_if_shell_cannot_place(PLACEMENT_SHELL_SINCE - 1));
     }
 
-    /// Before `zaura_toplevel.release` the Aura toplevel has no destructor:
-    /// releasing the XDG role retires its ID without a request, and the ID
-    /// stays reserved for the connection.
-    #[test]
-    fn aura_toplevel_without_release_is_retired_silently() {
-        let mut ctx = toplevel_ctx();
-        ctx.host_zaura_shell
-            .as_mut()
-            .expect("bound zaura_shell")
-            .version = REQ_RELEASE_AURA_TOPLEVEL_SINCE - 1;
-        let aura_id = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("aura toplevel");
-        ctx.client_to_host_queue.clear();
+    /// With placement off, the default, the proxy sends either peer what it
+    /// sent before placement had backends: it binds no remote shell and no
+    /// Aura output or toplevel, the Aura surface gets the guest's ID in the
+    /// Guest OS namespace, configures pass through, and a chord that a
+    /// binding source names reaches the guest, since no source is read.
+    #[tokio::test]
+    async fn placement_off_traffic_is_unchanged() {
+        use crate::protocols::wayland::{wl_keyboard, wl_output, wl_registry};
+        use crate::protocols::xdg_shell::xdg_wm_base;
+        use crate::proxy::harness::Session;
 
-        release_toplevel(&mut ctx, TOPLEVEL.guest);
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(
-            ctx.window_placement
-                .aura_toplevel_for_xdg_toplevel(TOPLEVEL.guest),
-            None
+        let placement = PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left")],
+            None,
+            ArcIdAllocator::block_for_test(),
         );
-        assert_eq!(ctx.shadow_table.get_host_interface(aura_id), None);
-        assert!(ctx.shadow_table.is_retired_host(aura_id));
-        assert!(!ctx.shadow_table.is_host_id_available(aura_id));
-    }
+        let mut s = Session::with_context(Context::with_placement_for_test(placement));
+        let registry = s.registry().await;
 
-    /// A malformed client that gives one wl_surface two xdg_surfaces ends
-    /// only the destroyed xdg_surface's toplevel role.
-    #[test]
-    fn destroying_one_of_two_xdg_surfaces_ends_only_its_toplevel() {
-        let mut ctx = toplevel_ctx_with(PlacementConfig::arc_bounds_for_test(""));
-        let (second_xdg_surface, second_toplevel) = (130, 140);
-        ctx.shadow_table
-            .insert_paired_for_test(second_xdg_surface, 230, "xdg_surface");
-        ctx.shadow_table
-            .insert_paired_for_test(second_toplevel, 240, "xdg_toplevel");
-        ctx.xdg_roles.add_toplevel_role_for_test(
-            second_xdg_surface,
-            SURFACE.guest,
-            second_toplevel,
-        );
-        let first_aura = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("toplevel");
-        let second_aura = ensure_zaura_toplevel(&mut ctx, second_toplevel).expect("toplevel");
-        ctx.client_to_host_queue.clear();
-
-        ctx.guest_destroyed(XDG_SURFACE.guest);
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(first_aura, REQ_RELEASE_AURA_TOPLEVEL)]
-        );
-        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(TOPLEVEL.guest), None);
-        assert_eq!(
-            ctx.xdg_roles.wl_surface_of_toplevel(second_toplevel),
-            Some(SURFACE.guest)
-        );
-        assert_eq!(
-            ctx.window_placement
-                .aura_toplevel_for_xdg_toplevel(second_toplevel),
-            Some(second_aura)
-        );
-    }
-
-    /// A wl_surface destroyed under a live XDG toplevel ends the toplevel's
-    /// role: its Aura toplevel and Aura surface are both released before
-    /// the wl_surface destructor.
-    #[test]
-    fn wl_surface_destroy_releases_its_aura_children_first() {
-        let mut ctx = toplevel_ctx_with(PlacementConfig::arc_bounds_for_test(""));
-        let aura_toplevel = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("toplevel");
-        let aura_surface = ensure_host_zaura_surface(&mut ctx, SURFACE.guest).expect("surface");
-        ctx.client_to_host_queue.clear();
-
-        ctx.last_sender_id = SURFACE.guest;
-        assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
-            Action::Drop
-        );
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [
-                (aura_toplevel, REQ_RELEASE_AURA_TOPLEVEL),
-                (aura_surface, REQ_RELEASE_AURA_SURFACE),
-                (SURFACE.host, wl_surface::REQ_DESTROY),
-            ]
-        );
-    }
-
-    #[test]
-    fn xdg_toplevel_destroy_reserves_aura_id_until_host_delete_id() {
-        let mut ctx = toplevel_ctx();
-        let aura_id = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("aura toplevel");
-        ctx.client_to_host_queue.clear();
-        ctx.last_sender_id = TOPLEVEL.guest;
-
-        assert_eq!(
-            XdgToplevelHandler::on_destroy(&mut CompositorHandler, &mut ctx),
-            Action::Drop
-        );
-        assert_eq!(
-            ctx.window_placement
-                .aura_toplevel_for_xdg_toplevel(TOPLEVEL.guest),
-            None
-        );
-        // Child-first: the Aura extension is released before its xdg role.
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [
-                (aura_id, REQ_RELEASE_AURA_TOPLEVEL),
-                (TOPLEVEL.host, xdg_toplevel::REQ_DESTROY),
-            ]
-        );
-        assert!(ctx.shadow_table.is_retired_host(aura_id));
-        assert!(!ctx.shadow_table.is_host_id_available(aura_id));
-
-        ctx.last_sender_id = WL_DISPLAY_ID;
-        assert_eq!(DisplayHandler.on_delete_id(&mut ctx, aura_id), Action::Drop);
-        assert!(!ctx.shadow_table.is_retired_host(aura_id));
-        assert!(ctx.shadow_table.is_host_id_available(aura_id));
-    }
-
-    #[test]
-    fn window_bounds_barrier_is_queued_after_placement_request() {
-        let mut ctx = toplevel_ctx();
-        let aura_id = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("aura toplevel");
-        ctx.client_to_host_queue.clear();
-
-        queue_window_bounds_barrier(&mut ctx, aura_id);
-        let callback = ctx
-            .window_placement
-            .active_barrier_for_toplevel(aura_id)
-            .expect("an active barrier");
-        assert_eq!(
-            host_requests(&ctx),
-            [(WL_DISPLAY_ID, wl_display::Request::Sync { callback }.into())]
-        );
-        assert_eq!(
-            ctx.internal_callbacks.get(HostId(callback)),
-            Some(InternalCallback::WindowBoundsBarrier {
-                zaura_toplevel: aura_id
-            })
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(callback),
-            Some("wl_callback")
-        );
-    }
-
-    /// An Aura configure reaches the guest as an `xdg_toplevel.configure` of
-    /// the same size, without the Aura-only states (immersive 100,
-    /// minimized 101) and the states the guest's version predates.
-    #[test]
-    fn aura_configure_is_translated_to_guest_xdg_configure() {
-        let host_states = [1, 5, 8, 9, 10, 13, 14];
-        for (guest_version, states, expected) in [
-            (6, &[1, 2, 3, 4][..], &[1, 2, 3, 4][..]),
-            // fullscreen, immersive, minimized and activated.
-            (6, &[2, 100, 101, 4], &[2, 4]),
-            (1, &host_states, &[1]),
-            (2, &host_states, &[1, 5, 8]),
-            (6, &host_states, &[1, 5, 8, 9]),
-            (7, &host_states, &[1, 5, 8, 9, 10, 13]),
-        ] {
-            let mut ctx = toplevel_ctx();
-            ctx.shadow_table
-                .set_guest_version_for_test(TOPLEVEL.guest, guest_version);
-            remember_aura_toplevel(&mut ctx, 77);
-            aura_configure(&mut ctx, 77, (1920, 1080), &encode_states(states));
-            assert_eq!(
-                guest_events(&ctx),
-                [toplevel_configure((1920, 1080), expected)],
-                "v{guest_version} {states:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn aura_configure_drops_truncated_state_entry() {
-        assert_eq!(guest_xdg_toplevel_states(&[2, 0, 0, 0, 4, 0], 6).len(), 4);
-    }
-
-    #[test]
-    fn held_aura_configure_is_filtered_when_barrier_completes() {
-        let mut ctx = toplevel_ctx();
-        ctx.shadow_table
-            .set_guest_version_for_test(TOPLEVEL.guest, 1);
-        let aura_id = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("aura toplevel");
-        queue_window_bounds_barrier(&mut ctx, aura_id);
-        let callback = ctx
-            .window_placement
-            .active_barrier_for_toplevel(aura_id)
-            .expect("active barrier");
-        aura_configure(
-            &mut ctx,
-            aura_id,
-            (800, 600),
-            &encode_states(&[2, 5, 100, 101]),
-        );
-        assert!(ctx.host_to_client_queue.is_empty());
-
-        done(&mut ctx, callback);
-        assert_eq!(guest_events(&ctx), [toplevel_configure((800, 600), &[2])]);
-    }
-
-    #[test]
-    fn aura_origin_change_is_dropped_with_or_without_a_bounds_barrier() {
-        let mut ctx = toplevel_ctx();
-        let aura_id = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("aura toplevel");
-        ctx.client_to_host_queue.clear();
-        let origin_change = |ctx: &mut Context| {
-            ctx.last_sender_id = aura_id;
-            ZauraToplevelHandler::on_origin_change(&mut CompositorHandler, ctx, 123, 456)
+        // A remote shell is neither bound nor advertised.
+        s.advertise("zcr_remote_shell_v2", 6).await;
+        assert_eq!(s.host_received(), []);
+        assert_eq!(s.guest_received(), []);
+        // An output gets no Aura output: the host gets only the bind, and
+        // a zaura_shell bound later retries none.
+        let output_name = s.advertise("wl_output", wl_output::VERSION).await;
+        let advertised = s.guest_received();
+        let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+            &advertised[..]
+        else {
+            panic!("the output was not advertised: {advertised:?}");
         };
+        let output = s.new_id();
+        s.guest([
+            wl_registry::req::bind(registry.id, output_name, "wl_output", *version, output)
+                .unwrap(),
+        ])
+        .await;
+        let host = s.host_received();
+        assert!(
+            matches!(
+                &host[..],
+                [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { name, .. }))]
+                    if *name == output_name
+            ),
+            "{host:?}"
+        );
+        // The proxy binds zaura_shell for itself, and only it, even with a
+        // live output.
+        let shell_name = s.advertise("zaura_shell", zaura_shell::VERSION).await;
+        let host = s.host_received();
+        let [(sender, AnyRequest::WlRegistry(wl_registry::Request::Bind { name, id }))] = &host[..]
+        else {
+            panic!("the proxy did not bind zaura_shell alone: {host:?}");
+        };
+        assert_eq!((*sender, *name), (registry.host, shell_name));
+        assert_eq!((id.0.as_str(), id.1), ("zaura_shell", zaura_shell::VERSION));
+        let shell = id.2;
+        // It stands behind the guest's gtk_shell1.
+        assert_eq!(
+            s.guest_received(),
+            [(
+                registry.id,
+                wl_registry::Event::Global {
+                    name: shell_name,
+                    interface: "gtk_shell1".to_string(),
+                    version: 1
+                }
+                .into()
+            )]
+        );
+        let (_, keyboard) = s.keyboard().await;
+        let wm_base = s.bind_paired("xdg_wm_base", xdg_wm_base::VERSION).await;
+        assert_eq!(s.host_received(), []);
 
-        assert_eq!(origin_change(&mut ctx), Action::Drop);
-        queue_window_bounds_barrier(&mut ctx, aura_id);
-        assert_eq!(origin_change(&mut ctx), Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
+        let surface = s.surface().await;
+        let xdg_surface = s.new_id();
+        let host_xdg_surface = s
+            .create(xdg_wm_base::req::get_xdg_surface(
+                wm_base.id,
+                xdg_surface,
+                surface.id,
+            ))
+            .await;
+        let toplevel = s.new_id();
+        let host_toplevel = s
+            .create(xdg_surface::req::get_toplevel(xdg_surface, toplevel))
+            .await;
+        assert_eq!(s.host_received(), [], "no Aura toplevel");
+        assert_eq!(s.guest_received(), []);
+
+        s.guest([xdg_toplevel::req::set_app_id(toplevel, "org.example.App").unwrap()])
+            .await;
+        let native = "org.chromium.guest_os.termina.wayland.org.example.App".to_string();
+        let host = s.host_received();
+        let aura_surface = match &host[..] {
+            [_, (_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { id, .. })), _] => {
+                *id
+            }
+            _ => panic!("no Aura surface: {host:?}"),
+        };
+        assert_eq!(
+            host,
+            [
+                (
+                    host_toplevel,
+                    xdg_toplevel::Request::SetAppId {
+                        app_id: native.clone()
+                    }
+                    .into()
+                ),
+                (
+                    shell,
+                    zaura_shell::Request::GetAuraSurface {
+                        id: aura_surface,
+                        surface: surface.host
+                    }
+                    .into()
+                ),
+                (
+                    aura_surface,
+                    zaura_surface::Request::SetApplicationId {
+                        application_id: Some(native)
+                    }
+                    .into()
+                ),
+            ]
+        );
+
+        s.host([
+            xdg_toplevel::evt::configure(host_toplevel, 800, 600, &[]).unwrap(),
+            xdg_surface::evt::configure(host_xdg_surface, 7),
+        ])
+        .await;
+        assert_eq!(
+            s.guest_received(),
+            [
+                (
+                    toplevel,
+                    xdg_toplevel::Event::Configure {
+                        width: 800,
+                        height: 600,
+                        states: Vec::new()
+                    }
+                    .into()
+                ),
+                (
+                    xdg_surface,
+                    xdg_surface::Event::Configure { serial: 7 }.into()
+                ),
+            ]
+        );
+
+        // The chord reaches the guest.
+        let alt = 1 << 3;
+        let q = 16;
+        s.host([
+            wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap(),
+            wl_keyboard::evt::modifiers(keyboard.host, 2, alt, 0, 0, 0),
+            wl_keyboard::evt::key(keyboard.host, 3, 3, q, wl_keyboard::KEY_STATE_PRESSED),
+            wl_keyboard::evt::key(keyboard.host, 4, 4, q, wl_keyboard::KEY_STATE_RELEASED),
+        ])
+        .await;
+        let key = |serial, state| {
+            let key = wl_keyboard::Event::Key {
+                serial,
+                time: serial,
+                key: q,
+                state,
+            };
+            (keyboard.id, key.into())
+        };
+        let modifiers = |serial, mods_depressed| {
+            let modifiers = wl_keyboard::Event::Modifiers {
+                serial,
+                mods_depressed,
+                mods_latched: 0,
+                mods_locked: 0,
+                group: 0,
+            };
+            (keyboard.id, modifiers.into())
+        };
+        let enter = wl_keyboard::Event::Enter {
+            serial: 1,
+            surface: surface.id,
+            keys: Vec::new(),
+        };
+        assert_eq!(
+            s.guest_received(),
+            [
+                (keyboard.id, enter.into()),
+                modifiers(1, 0),
+                modifiers(2, alt),
+                key(3, wl_keyboard::KEY_STATE_PRESSED),
+                key(4, wl_keyboard::KEY_STATE_RELEASED),
+            ]
+        );
+        assert_eq!(s.host_received(), []);
+
+        s.guest([
+            xdg_toplevel::req::destroy(toplevel),
+            xdg_surface::req::destroy(xdg_surface),
+            wl_surface::req::destroy(surface.id),
+        ])
+        .await;
+        assert_eq!(
+            s.host_received(),
+            [
+                (host_toplevel, xdg_toplevel::Request::Destroy {}.into()),
+                (host_xdg_surface, xdg_surface::Request::Destroy {}.into()),
+                (aura_surface, zaura_surface::Request::Release {}.into()),
+                (surface.host, wl_surface::Request::Destroy {}.into()),
+            ]
+        );
+        assert_eq!(s.guest_received(), []);
     }
 }

@@ -99,6 +99,39 @@ pub struct OutputState {
 }
 
 impl OutputState {
+    /// The output's effective scale from DIPs to its pixels: the display
+    /// zoom (the current `zaura_output.scale`) times the device scale
+    /// factor, as Exo scales logical coordinates, in units of
+    /// `AURA_SCALE_UNITS` squared.
+    ///
+    /// # Returns
+    ///
+    /// `None` until both Aura factors are known.
+    fn aura_scale(self) -> Option<u64> {
+        u64::from(self.aura_current_scale?).checked_mul(u64::from(self.aura_device_scale_factor?))
+    }
+
+    /// Convert `pixels` of this output to DIPs, rounding to the nearest.
+    ///
+    /// Aura reports both factors in thousandths, truncated, so at a
+    /// fractional scale such as 16/9 (sent as 1.777) the result can be one
+    /// DIP more than Exo's own: 2560 pixels become 1441, not 1440.
+    ///
+    /// # Returns
+    ///
+    /// `None` until both Aura factors are known, for a zero factor, and for
+    /// a result that does not fit an `i32`.
+    pub fn pixels_to_dips(self, pixels: i32) -> Option<i32> {
+        let scale = i128::from(self.aura_scale()?);
+        if scale == 0 {
+            return None;
+        }
+        let units = i128::from(AURA_SCALE_UNITS * AURA_SCALE_UNITS);
+        let scaled = i128::from(pixels) * units;
+        let half = if scaled < 0 { -scale / 2 } else { scale / 2 };
+        i32::try_from((scaled + half) / scale).ok()
+    }
+
     /// The output's work area in logical screen coordinates.
     ///
     /// The native pixel mode is rotated by the panel transform, divided by
@@ -109,8 +142,7 @@ impl OutputState {
     /// `None` until both Aura factors are known, and for an empty or
     /// overflowing area.
     pub fn work_area(self) -> Option<Rect> {
-        let scale = u64::from(self.aura_current_scale?)
-            .checked_mul(u64::from(self.aura_device_scale_factor?))?;
+        let scale = self.aura_scale()?;
         let (mode_width, mode_height) =
             transformed_extent(self.panel_transform, self.mode_width, self.mode_height);
         // Legacy Aura factors are quantized to thousandths, so retain their
@@ -344,6 +376,11 @@ impl OutputRegistry {
         self.records.iter().find_map(OutputRecord::usable)
     }
 
+    /// The committed metadata of `output` while it is usable.
+    pub(crate) fn usable(&self, output: u32) -> Option<OutputState> {
+        Some(self.record(output)?.usable()?.1)
+    }
+
     /// The output to use for placing `surface`: the one it entered last.
     ///
     /// Only a surface on no output (before its first enter event, or after
@@ -430,6 +467,26 @@ impl OutputRegistry {
 
 #[cfg(test)]
 mod tests {
+    /// Converted bounds include the display zoom and round to the nearest
+    /// DIP, in either direction from zero.
+    #[test]
+    fn pixels_round_to_the_nearest_dip_at_the_effective_scale() {
+        use super::OutputState;
+        let at = |current, device| OutputState {
+            aura_current_scale: Some(current),
+            aura_device_scale_factor: Some(device),
+            ..OutputState::default()
+        };
+        assert_eq!(at(1000, 2000).pixels_to_dips(1280), Some(640));
+        assert_eq!(at(1250, 1000).pixels_to_dips(960), Some(768));
+        assert_eq!(at(1000, 2000).pixels_to_dips(3), Some(2));
+        assert_eq!(at(1000, 2000).pixels_to_dips(-3), Some(-2));
+        assert_eq!(at(1250, 1000).pixels_to_dips(-100), Some(-80));
+        assert_eq!(at(1000, 1777).pixels_to_dips(2560), Some(1441));
+        assert_eq!(at(1000, 0).pixels_to_dips(10), None);
+        assert_eq!(OutputState::default().pixels_to_dips(10), None);
+    }
+
     use super::*;
 
     #[test]

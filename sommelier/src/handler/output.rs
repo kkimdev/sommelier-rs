@@ -90,6 +90,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
 
     fn on_done(&mut self, ctx: &mut Context) -> Action {
         ctx.outputs.commit(ctx.last_sender_id);
+        crate::handler::window_placement::output_committed(ctx);
         Action::Forward
     }
 

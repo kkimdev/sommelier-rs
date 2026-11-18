@@ -2051,7 +2051,8 @@ mod tests {
     fn queued_bounds(ctx: &Context) -> Vec<[i32; 4]> {
         let Some(aura_toplevel) = ctx
             .window_placement
-            .aura_toplevel_for_xdg_toplevel(PLACED_TOPLEVEL)
+            .arc()
+            .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(PLACED_TOPLEVEL))
         else {
             return Vec::new();
         };
@@ -2131,7 +2132,13 @@ mod tests {
         assert_eq!(p.owner(PLACING, KEY_Q), Some(CompositorShortcut));
         assert_eq!(p.key(PLACING, 2, 101, KEY_Q, RELEASED), Action::Drop);
         assert_eq!(p.owner(PLACING, KEY_Q), None);
-        assert_eq!(p.ctx.window_placement.aura_toplevel_count(), 0);
+        assert_eq!(
+            p.ctx
+                .window_placement
+                .arc()
+                .map_or(0, |arc| arc.aura_toplevel_count()),
+            0
+        );
         assert_eq!(p.ctx.aura_surfaces.count(), 0);
         assert_eq!(p.ctx.internal_callbacks.count(), 0);
         assert!(
@@ -2237,7 +2244,14 @@ mod tests {
             );
             assert_eq!(p.owner(PLACING, KEY_Q), None, "{skip:?}");
             assert_eq!(p.ctx.internal_callbacks.count(), 0, "{skip:?}");
-            assert_eq!(p.ctx.window_placement.aura_toplevel_count(), 0, "{skip:?}");
+            assert_eq!(
+                p.ctx
+                    .window_placement
+                    .arc()
+                    .map_or(0, |arc| arc.aura_toplevel_count()),
+                0,
+                "{skip:?}"
+            );
         }
         assert_eq!(
             PlacementSkip::NoFocusedToplevel.log_level(),
@@ -2335,7 +2349,14 @@ mod tests {
                 release,
                 "{event:?}"
             );
-            assert_eq!(p.ctx.window_placement.aura_toplevel_count(), 0, "{event:?}");
+            assert_eq!(
+                p.ctx
+                    .window_placement
+                    .arc()
+                    .map_or(0, |arc| arc.aura_toplevel_count()),
+                0,
+                "{event:?}"
+            );
             assert_eq!(p.ctx.internal_callbacks.count(), 0, "{event:?}");
             assert!(queued_bounds(&p.ctx).is_empty(), "{event:?}");
         }
@@ -2405,7 +2426,13 @@ mod tests {
         );
         assert_eq!(p.owner(PLACING, KEY_Q), None);
         assert!(queued_bounds(&p.ctx).is_empty());
-        assert_eq!(p.ctx.window_placement.aura_toplevel_count(), 0);
+        assert_eq!(
+            p.ctx
+                .window_placement
+                .arc()
+                .map_or(0, |arc| arc.aura_toplevel_count()),
+            0
+        );
     }
 
     #[test]
@@ -2484,15 +2511,21 @@ mod tests {
             let aura_toplevel = p
                 .ctx
                 .window_placement
-                .aura_toplevel_for_xdg_toplevel(PLACED_TOPLEVEL)
+                .arc()
+                .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(PLACED_TOPLEVEL))
                 .expect("placement must create the Aura toplevel");
             let barrier = p
                 .ctx
                 .window_placement
-                .active_barrier_for_toplevel(aura_toplevel)
+                .arc()
+                .and_then(|arc| arc.active_barrier_for_toplevel(aura_toplevel))
                 .expect("placement must order its bounds behind a barrier");
             complete_callback(&mut p.ctx, barrier);
-            assert!(!p.ctx.window_placement.has_active_barrier(aura_toplevel));
+            assert!(!p
+                .ctx
+                .window_placement
+                .arc()
+                .is_some_and(|arc| arc.has_active_barrier(aura_toplevel)));
         }
         assert_eq!(queued_bounds(&p.ctx), [TOP_LEFT_BOUNDS; 2]);
 
@@ -2587,12 +2620,14 @@ mod tests {
         let aura_toplevel = p
             .ctx
             .window_placement
-            .aura_toplevel_for_xdg_toplevel(PLACED_TOPLEVEL)
+            .arc()
+            .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(PLACED_TOPLEVEL))
             .expect("placement must create the Aura toplevel");
         let placement_barrier = p
             .ctx
             .window_placement
-            .active_barrier_for_toplevel(aura_toplevel)
+            .arc()
+            .and_then(|arc| arc.active_barrier_for_toplevel(aura_toplevel))
             .expect("placement must order its bounds behind a barrier");
 
         // A real host focus cycle lands while the placement barrier holds
@@ -2632,14 +2667,22 @@ mod tests {
                 }
             ))
         );
-        assert!(p.ctx.window_placement.has_active_barrier(aura_toplevel));
+        assert!(p
+            .ctx
+            .window_placement
+            .arc()
+            .is_some_and(|arc| arc.has_active_barrier(aura_toplevel)));
 
         // The placement barrier then retires without disturbing the fresh
         // IME generation.
         let host_queue_len = p.ctx.client_to_host_queue.len();
         let state_after_activation = p.ctx.text_inputs[&t.guest].clone();
         complete_callback(&mut p.ctx, placement_barrier);
-        assert!(!p.ctx.window_placement.has_active_barrier(aura_toplevel));
+        assert!(!p
+            .ctx
+            .window_placement
+            .arc()
+            .is_some_and(|arc| arc.has_active_barrier(aura_toplevel)));
         assert_eq!(p.ctx.client_to_host_queue.len(), host_queue_len);
         assert_eq!(p.ctx.text_inputs[&t.guest], state_after_activation);
     }

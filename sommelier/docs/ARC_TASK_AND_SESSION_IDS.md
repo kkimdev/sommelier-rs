@@ -1,7 +1,8 @@
 # ARC task and restore-session IDs
 
 This note records the ChromeOS application-ID namespaces relevant to the
-opt-in window placement experiment (`SOMMELIER_WINDOW_BOUNDS_AS_ARC`). It
+opt-in window placement experiment's ARC backend
+(`SOMMELIER_WINDOW_PLACEMENT_BACKEND=arc`). It
 describes host behavior observed in Chromium/ChromeOS source; an ARC-looking
 app ID is not a supported way to turn a Crostini window into an Android task.
 
@@ -14,9 +15,21 @@ window policy to that namespace, and current Exo builds may reject arbitrary
 
 The host recognizes `org.chromium.arc.*` as an ARC application namespace. The
 ARC policy path is currently what allows the opt-in bounds backend to work.
-That classification can also affect restore/ghost bookkeeping, IME routing,
-shelf and task observation, pointer lock, drag-and-drop, clipboard,
-accessibility, and metrics. It is a compatibility workaround, not a generic
+That classification changes more than bounds:
+
+- **IME.** The window's keys are expected to bypass the ChromeOS IME, so
+  Korean and other composition would not work in it. Chromium's
+  `exo_app_type_resolver.cc` sets `aura::client::kSkipImeProcessing` on a
+  window with an ARC application ID, and `window_event_dispatcher.cc`
+  (`PreDispatchKeyEvent`) skips the IME for it. This follows from the
+  source and has not been verified on a host; see
+  [The ARC backend and the IME](WINDOW_SHORTCUT_CONFIGURATION.md#the-arc-backend-and-the-ime).
+- It can also affect restore/ghost bookkeeping, shelf and task
+  observation, pointer lock, drag-and-drop, clipboard, accessibility, and
+  metrics.
+
+The remote-shell-v2 placement backend keeps the Guest OS application ID,
+so none of this applies to it. It is a compatibility workaround, not a generic
 authorization mechanism: a Crostini client can provide its own app ID, so the
 ARC prefix must not be treated as proof of trust.
 
@@ -39,7 +52,7 @@ restore handshake, so neither spelling creates a genuine ARC task/session.
 
 ## IDs used by Sommelier
 
-When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is enabled, each guest `wl_surface`
+While the ARC placement backend is active, each guest `wl_surface`
 receives its own task-form identity:
 
 ```text
@@ -57,7 +70,7 @@ org.chromium.guest_os.<vm>.wayland.<app>
 `<id>` comes from the process-wide allocator described in
 [Sommelier's task-ID allocator](#sommeliers-task-id-allocator).
 
-`WindowPlacementState` (`sommelier/src/state/window_placement.rs`) owns the
+`ArcPlacementState` (`sommelier/src/state/window_placement/arc.rs`) owns the
 per-surface identity: it is allocated on first use (when an XDG toplevel is
 created for the surface, or when GTK metadata or a placement first sends it),
 shared by the XDG and GTK metadata paths, queued to the Aura surface at most
@@ -115,9 +128,9 @@ only.
   produced.
 - **Blocks.** The pool is split into 148 blocks of 1,000,000 IDs; the last
   block is partial.
-- **Reservation at startup.** When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set to
-  a true value (see [the settings](WINDOW_SHORTCUT_CONFIGURATION.md#settings)),
-  the proxy reserves one block for the whole process while it resolves its
+- **Reservation at startup.** When the settings choose the ARC backend
+  (see [the settings](WINDOW_SHORTCUT_CONFIGURATION.md#settings)), the
+  proxy reserves one block for the whole process while it resolves its
   placement configuration at startup, before it accepts a client. The search
   starts at a random block and walks every block once.
 - **Lock.** A block is reserved by an exclusive, non-blocking `flock` on

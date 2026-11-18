@@ -74,6 +74,10 @@ mod protocols {
     ));
     include!(concat!(env!("OUT_DIR"), "/gtk_shell_protocol.rs"));
     include!(concat!(env!("OUT_DIR"), "/aura_shell_protocol.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/remote_shell_unstable_v2_protocol.rs"
+    ));
     include!(concat!(env!("OUT_DIR"), "/protocol_routing.rs"));
 }
 
@@ -102,8 +106,8 @@ struct Args {
 
     /// Read window placement shortcut bindings from a versioned TOML file.
     ///
-    /// Used only while the ARC bounds policy is active
-    /// (SOMMELIER_WINDOW_BOUNDS_AS_ARC), and mutually exclusive with
+    /// Used only while a placement backend is active
+    /// (SOMMELIER_WINDOW_PLACEMENT_BACKEND), and mutually exclusive with
     /// SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS. An unusable file is logged and
     /// leaves placement shortcuts disabled; SIGHUP reloads it and keeps the
     /// previous bindings if the new file is invalid. See

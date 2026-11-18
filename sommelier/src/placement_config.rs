@@ -18,9 +18,10 @@ limitations under the License.
 //!
 //! [`PlacementConfig`] is the single owner of every placement setting:
 //!
-//! * the ARC bounds policy: the `SOMMELIER_WINDOW_BOUNDS_AS_ARC` gate and the
-//!   process's ARC task-ID block, which together decide whether the policy
-//!   is active;
+//! * the placement backend: `SOMMELIER_WINDOW_PLACEMENT_BACKEND`, or the
+//!   legacy `SOMMELIER_WINDOW_BOUNDS_AS_ARC` gate, chooses one, and the ARC
+//!   backend is active only once the process's ARC task-ID block is
+//!   reserved;
 //! * the host accelerators from `SOMMELIER_ACCELERATORS`;
 //! * the placement bindings, from exactly one source:
 //!   `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` (`CHORD=ACTION,...`, never
@@ -52,7 +53,9 @@ use crate::accelerator::{parse_accelerator, parse_accelerators, Accelerator, Par
 use crate::arc_task_ids::ArcIdAllocator;
 use crate::window_layout::{NormalizedRect, RectError, WindowLayoutAction};
 
-/// The ARC bounds policy gate.
+/// The placement backend setting.
+const BACKEND_VARIABLE: &str = "SOMMELIER_WINDOW_PLACEMENT_BACKEND";
+/// The legacy ARC backend gate.
 const ARC_BOUNDS_VARIABLE: &str = "SOMMELIER_WINDOW_BOUNDS_AS_ARC";
 /// Keys the host compositor handles.
 const HOST_ACCELERATORS_VARIABLE: &str = "SOMMELIER_ACCELERATORS";
@@ -164,6 +167,10 @@ enum PlacementConfigError {
     ConflictingSources,
     #[error("{variable} is not valid UTF-8")]
     NotUnicode { variable: &'static str },
+    #[error("unknown {BACKEND_VARIABLE} {value:?}; expected `arc`, `remote-shell-v2` or `off`")]
+    UnknownBackend { value: String },
+    #[error("{BACKEND_VARIABLE}={value} contradicts {ARC_BOUNDS_VARIABLE}")]
+    ConflictingBackends { value: String },
     #[error(
         "cannot check placement bindings: invalid {HOST_ACCELERATORS_VARIABLE} {value:?}: {source}"
     )]
@@ -187,6 +194,7 @@ enum PlacementConfigError {
 /// The process environment that configures placement, captured once.
 #[derive(Debug, Default)]
 struct PlacementEnvironment {
+    backend: Option<OsString>,
     arc_bounds: Option<OsString>,
     host_accelerators: Option<OsString>,
     shortcuts: Option<OsString>,
@@ -195,6 +203,7 @@ struct PlacementEnvironment {
 impl PlacementEnvironment {
     fn read() -> Self {
         Self {
+            backend: std::env::var_os(BACKEND_VARIABLE),
             arc_bounds: std::env::var_os(ARC_BOUNDS_VARIABLE),
             host_accelerators: std::env::var_os(HOST_ACCELERATORS_VARIABLE),
             shortcuts: std::env::var_os(SHORTCUTS_VARIABLE),
@@ -216,6 +225,37 @@ impl PlacementEnvironment {
                     "1" | "true" | "yes" | "on"
                 )
             })
+    }
+
+    /// Return what the deployment asked for.
+    ///
+    /// `SOMMELIER_WINDOW_PLACEMENT_BACKEND` chooses, case-insensitively and
+    /// ignoring surrounding whitespace; `off` wins over the legacy gate.
+    /// Unset or blank, the gate chooses the ARC backend or nothing.
+    ///
+    /// # Errors
+    ///
+    /// The setting is not UTF-8, names no backend, or names a backend other
+    /// than the one the gate, which is on, chooses. Placement is then off:
+    /// guessing which backend was meant could change every window's host
+    /// behaviour.
+    fn requested_backend(&self) -> Result<BackendChoice, PlacementConfigError> {
+        let gate = self.arc_bounds_requested();
+        let Some(value) = configured_text(self.backend.as_deref(), BACKEND_VARIABLE)? else {
+            return Ok(if gate {
+                BackendChoice::Backend(BackendRequest::Arc)
+            } else {
+                BackendChoice::Unchosen
+            });
+        };
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "arc" => Ok(BackendChoice::Backend(BackendRequest::Arc)),
+            "off" => Ok(BackendChoice::Off),
+            "remote-shell-v2" if gate => Err(PlacementConfigError::ConflictingBackends { value }),
+            "remote-shell-v2" => Ok(BackendChoice::Backend(BackendRequest::RemoteShellV2)),
+            _ => Err(PlacementConfigError::UnknownBackend { value }),
+        }
     }
 
     /// Parse the host accelerators; a blank or unset variable is an empty
@@ -332,21 +372,48 @@ impl BindingSource<'_> {
     }
 }
 
+/// What the backend settings ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendChoice {
+    /// Neither setting chooses a backend.
+    Unchosen,
+    /// `SOMMELIER_WINDOW_PLACEMENT_BACKEND=off`.
+    Off,
+    Backend(BackendRequest),
+}
+
+/// A placement backend a deployment asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendRequest {
+    Arc,
+    RemoteShellV2,
+}
+
+/// The placement backend every connection of the process uses.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PlacementBackend {
+    /// `zaura_toplevel.set_window_bounds` under an ARC policy identity
+    /// from the process's reserved ARC task-ID block.
+    Arc(&'static ArcIdAllocator),
+    /// Host `zcr_remote_surface_v2` roles placed with
+    /// `set_bounds_in_output`.
+    RemoteShellV2,
+}
+
 /// Process-wide window placement configuration.
 #[derive(Debug)]
 pub(crate) struct PlacementConfig {
     /// Parsed `SOMMELIER_ACCELERATORS`: chords the host keeps.
     host_accelerators: Vec<Accelerator>,
-    /// `None` while the ARC bounds policy is off. Bindings live inside it,
-    /// so the policy being off and a chord being consumed cannot coexist.
-    arc_bounds: Option<ArcBoundsPolicy>,
+    /// `None` while placement is off. Bindings live inside it, so
+    /// placement being off and a chord being consumed cannot coexist.
+    active: Option<ActivePlacement>,
 }
 
-/// The active ARC bounds policy and its bindings.
+/// The active placement backend and its bindings.
 #[derive(Debug)]
-struct ArcBoundsPolicy {
-    /// The process's reserved ARC task-ID block.
-    arc_ids: &'static ArcIdAllocator,
+struct ActivePlacement {
+    backend: PlacementBackend,
     /// The current generation. A reload replaces the whole `Arc`, so every
     /// lookup sees one complete generation.
     bindings: RwLock<Bindings>,
@@ -358,9 +425,10 @@ struct ArcBoundsPolicy {
 impl PlacementConfig {
     /// Resolve the configuration from the process environment.
     ///
-    /// Reads `SOMMELIER_WINDOW_BOUNDS_AS_ARC`, `SOMMELIER_ACCELERATORS` and
+    /// Reads `SOMMELIER_WINDOW_PLACEMENT_BACKEND`,
+    /// `SOMMELIER_WINDOW_BOUNDS_AS_ARC`, `SOMMELIER_ACCELERATORS` and
     /// `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`, reserves the process's ARC
-    /// task-ID block when the gate is on, and loads the bindings.
+    /// task-ID block when the ARC backend is chosen, and loads the bindings.
     ///
     /// This never fails. Every problem is logged here, once, and leaves
     /// placement shortcuts disabled; the rules are specified in
@@ -379,7 +447,7 @@ impl PlacementConfig {
 
     /// Apply the resolution rules to captured inputs.
     ///
-    /// `reserve_arc_ids` is called only when the gate is on.
+    /// `reserve_arc_ids` is called only when the ARC backend is chosen.
     fn resolve(
         environment: &PlacementEnvironment,
         shortcuts_file: Option<&Path>,
@@ -395,32 +463,44 @@ impl PlacementConfig {
         };
         let host_accelerators = environment.host_accelerators();
 
-        let gate = environment.arc_bounds_requested();
-        let arc_ids = if gate { reserve_arc_ids() } else { None };
-        let Some(arc_ids) = arc_ids else {
+        let (backend, off_reason) = match environment.requested_backend() {
+            Err(error) => {
+                log::error!("{error}. Window placement is off.");
+                (None, "its backend setting is unusable")
+            }
+            Ok(BackendChoice::Unchosen) => (
+                None,
+                "neither SOMMELIER_WINDOW_PLACEMENT_BACKEND nor \
+                 SOMMELIER_WINDOW_BOUNDS_AS_ARC chooses a backend",
+            ),
+            Ok(BackendChoice::Off) => (None, "SOMMELIER_WINDOW_PLACEMENT_BACKEND is off"),
+            // The allocator logs why it could not reserve a block.
+            Ok(BackendChoice::Backend(BackendRequest::Arc)) => (
+                reserve_arc_ids().map(PlacementBackend::Arc),
+                "no ARC task-ID block could be reserved",
+            ),
+            Ok(BackendChoice::Backend(BackendRequest::RemoteShellV2)) => {
+                (Some(PlacementBackend::RemoteShellV2), "")
+            }
+        };
+        let Some(backend) = backend else {
             if let Some(source) = &source {
-                // The allocator logs why it could not reserve a block.
-                let reason = if gate {
-                    "no ARC task-ID block could be reserved".to_string()
-                } else {
-                    format!("{ARC_BOUNDS_VARIABLE} is not set to a true value")
-                };
                 log::warn!(
-                    "Window placement shortcuts from {} are ignored and not read: the ARC \
-                     bounds policy is off because {reason}",
+                    "Window placement shortcuts from {} are ignored and not read: placement \
+                     is off because {off_reason}",
                     source.describe()
                 );
             }
             return Self {
                 host_accelerators: host_accelerators_or_unfiltered(host_accelerators),
-                arc_bounds: None,
+                active: None,
             };
         };
 
         let Some(source) = source else {
-            return Self::with_arc_bounds(
+            return Self::with_backend(
                 host_accelerators_or_unfiltered(host_accelerators),
-                arc_ids,
+                backend,
                 Vec::new(),
                 None,
             );
@@ -433,14 +513,13 @@ impl PlacementConfig {
                 log::error!(
                     "{error}. Window placement shortcuts and accelerator filtering are disabled."
                 );
-                return Self::with_arc_bounds(Vec::new(), arc_ids, Vec::new(), None);
+                return Self::with_backend(Vec::new(), backend, Vec::new(), None);
             }
         };
         let (reload_path, bindings) = source.load(&host_accelerators);
         match bindings {
             Ok(bindings) => {
-                let config =
-                    Self::with_arc_bounds(host_accelerators, arc_ids, bindings, reload_path);
+                let config = Self::with_backend(host_accelerators, backend, bindings, reload_path);
                 config.log_loaded("Loaded");
                 config
             }
@@ -451,21 +530,21 @@ impl PlacementConfig {
                     ""
                 };
                 log::error!("{error}. Window placement shortcuts are disabled{until}.");
-                Self::with_arc_bounds(host_accelerators, arc_ids, Vec::new(), reload_path)
+                Self::with_backend(host_accelerators, backend, Vec::new(), reload_path)
             }
         }
     }
 
-    fn with_arc_bounds(
+    fn with_backend(
         host_accelerators: Vec<Accelerator>,
-        arc_ids: &'static ArcIdAllocator,
+        backend: PlacementBackend,
         bindings: Vec<PlacementBinding>,
         reload_path: Option<PathBuf>,
     ) -> Self {
         Self {
             host_accelerators,
-            arc_bounds: Some(ArcBoundsPolicy {
-                arc_ids,
+            active: Some(ActivePlacement {
+                backend,
                 bindings: RwLock::new(Bindings::from(bindings)),
                 reload_path,
             }),
@@ -479,7 +558,7 @@ impl PlacementConfig {
 
     /// Return the action bound to a chord in the current generation.
     ///
-    /// Always `None` while the ARC bounds policy is off. A generation
+    /// Always `None` while placement is off. A generation
     /// published by a reload is visible to the next lookup.
     pub(crate) fn action_for(&self, chord: &Accelerator) -> Option<WindowLayoutAction> {
         self.bindings()?
@@ -488,15 +567,14 @@ impl PlacementConfig {
             .map(PlacementBinding::action)
     }
 
-    /// Return the process's ARC task-ID block while the ARC bounds policy is
-    /// active, and `None` while it is off.
-    pub(crate) fn arc_id_allocator(&self) -> Option<&'static ArcIdAllocator> {
-        self.arc_bounds.as_ref().map(|policy| policy.arc_ids)
+    /// Return the placement backend, or `None` while placement is off.
+    pub(crate) fn backend(&self) -> Option<PlacementBackend> {
+        self.active.as_ref().map(|active| active.backend)
     }
 
-    /// Return the current bindings, or `None` while the policy is off.
+    /// Return the current bindings, or `None` while placement is off.
     fn bindings(&self) -> Option<Bindings> {
-        let policy = self.arc_bounds.as_ref()?;
+        let policy = self.active.as_ref()?;
         // A writer only swaps in a complete `Arc`, so a poisoned lock still
         // holds a whole generation.
         Some(Arc::clone(
@@ -512,7 +590,7 @@ impl PlacementConfig {
     /// # Returns
     ///
     /// `None` when no file is in use; there is nothing to reload. That is
-    /// the case without `--window-shortcuts-config`, while the policy is off,
+    /// the case without `--window-shortcuts-config`, while placement is off,
     /// and when startup could not use the file at all (see
     /// [`BindingSource::load`]).
     ///
@@ -520,7 +598,7 @@ impl PlacementConfig {
     ///
     /// Returns the load error and leaves the published bindings untouched.
     pub(crate) fn reload(&self) -> Option<Result<(), BindingsError>> {
-        let policy = self.arc_bounds.as_ref()?;
+        let policy = self.active.as_ref()?;
         let path = policy.reload_path.as_deref()?;
         Some(
             load_shortcut_config(path, &self.host_accelerators).map(|bindings| {
@@ -544,7 +622,7 @@ impl PlacementConfig {
     }
 
     fn log_loaded(&self, verb: &str) {
-        let Some(policy) = &self.arc_bounds else {
+        let Some(policy) = &self.active else {
             return;
         };
         let count = self.bindings().map_or(0, |bindings| bindings.len());
@@ -800,11 +878,19 @@ fn load_shortcut_config(
 
 #[cfg(test)]
 impl PlacementConfig {
-    /// The ARC bounds policy off, with the given host accelerators.
+    /// Placement off, with the given host accelerators.
     pub(crate) fn for_test(host_accelerators: Vec<Accelerator>) -> Self {
         Self {
             host_accelerators,
-            arc_bounds: None,
+            active: None,
+        }
+    }
+
+    /// The process's ARC task-ID block while the ARC backend is active.
+    pub(crate) fn arc_id_allocator(&self) -> Option<&'static ArcIdAllocator> {
+        match self.backend()? {
+            PlacementBackend::Arc(arc_ids) => Some(arc_ids),
+            PlacementBackend::RemoteShellV2 => None,
         }
     }
 
@@ -820,6 +906,7 @@ impl PlacementConfig {
         let mut environment = PlacementEnvironment::default();
         for &(name, value) in variables {
             let slot = match name {
+                BACKEND_VARIABLE => &mut environment.backend,
                 ARC_BOUNDS_VARIABLE => &mut environment.arc_bounds,
                 HOST_ACCELERATORS_VARIABLE => &mut environment.host_accelerators,
                 SHORTCUTS_VARIABLE => &mut environment.shortcuts,
@@ -828,6 +915,24 @@ impl PlacementConfig {
             *slot = Some(OsString::from(value));
         }
         Self::resolve(&environment, shortcuts_file, || Some(arc_ids))
+    }
+
+    /// The remote-shell-v2 backend with
+    /// `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`-syntax bindings.
+    pub(crate) fn remote_shell_for_test(shortcuts: &str) -> Self {
+        let config = Self::resolve_for_test(
+            &[
+                (BACKEND_VARIABLE, "remote-shell-v2"),
+                (SHORTCUTS_VARIABLE, shortcuts),
+            ],
+            None,
+            ArcIdAllocator::block_for_test(),
+        );
+        assert!(matches!(
+            config.backend(),
+            Some(PlacementBackend::RemoteShellV2)
+        ));
+        config
     }
 
     /// The ARC bounds policy on, with a fresh test block and
@@ -887,6 +992,7 @@ action = "fullscreen"
         shortcuts: Option<&str>,
     ) -> PlacementEnvironment {
         PlacementEnvironment {
+            backend: None,
             arc_bounds: arc_bounds.map(OsString::from),
             host_accelerators: host_accelerators.map(OsString::from),
             shortcuts: shortcuts.map(OsString::from),
@@ -916,7 +1022,7 @@ action = "fullscreen"
     }
 
     fn reload_path(config: &PlacementConfig) -> Option<&Path> {
-        config.arc_bounds.as_ref()?.reload_path.as_deref()
+        config.active.as_ref()?.reload_path.as_deref()
     }
 
     /// The failure policy: the ARC policy stays active, but no chord is
@@ -1157,6 +1263,115 @@ action = "fullscreen"
     }
 
     // ── Environment rules ─────────────────────────────────────────────
+
+    /// `SOMMELIER_WINDOW_PLACEMENT_BACKEND` chooses the backend, ignoring
+    /// case and surrounding whitespace, and `off` wins over the legacy
+    /// gate; unset or blank, the gate still chooses the ARC backend.
+    #[test]
+    fn the_backend_setting_chooses_the_backend() {
+        const BACKEND: &str = "SOMMELIER_WINDOW_PLACEMENT_BACKEND";
+        const GATE: &str = "SOMMELIER_WINDOW_BOUNDS_AS_ARC";
+        for (variables, arc) in [
+            (&[(BACKEND, "arc")][..], true),
+            (&[(BACKEND, " ARC ")], true),
+            (&[(BACKEND, "arc"), (GATE, "1")], true),
+            (&[(GATE, "1")], true),
+            (&[(BACKEND, " "), (GATE, "1")], true),
+            (&[(BACKEND, " ")], false),
+            (&[(BACKEND, "off")], false),
+            (&[(BACKEND, "Off"), (GATE, "0")], false),
+            (&[(BACKEND, "off"), (GATE, "1")], false),
+        ] {
+            let mut variables = variables.to_vec();
+            variables.push(("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left"));
+            let config = PlacementConfig::resolve_for_test(
+                &variables,
+                None,
+                ArcIdAllocator::block_for_test(),
+            );
+            assert_eq!(config.arc_id_allocator().is_some(), arc, "{variables:?}");
+            assert_eq!(
+                config.action_for(&alt(xkb::keysyms::KEY_q)).is_some(),
+                arc,
+                "{variables:?}"
+            );
+        }
+    }
+
+    /// The remote-shell-v2 backend needs no ARC block, and its bindings
+    /// are active.
+    #[test]
+    fn the_remote_shell_backend_needs_no_arc_block() {
+        let environment = PlacementEnvironment {
+            backend: Some(" Remote-Shell-V2 ".into()),
+            shortcuts: Some("<Alt>q=left".into()),
+            ..PlacementEnvironment::default()
+        };
+        let (config, reserved) = resolve(&environment, None, block());
+        assert!(!reserved);
+        assert!(matches!(
+            config.backend(),
+            Some(PlacementBackend::RemoteShellV2)
+        ));
+        assert_eq!(
+            config.action_for(&alt(xkb::keysyms::KEY_q)),
+            Some(WindowLayoutAction::Left)
+        );
+    }
+
+    /// A blank backend setting is unset, not a request, and `off` is a
+    /// choice, not a conflict with the gate.
+    #[test]
+    fn a_blank_backend_setting_is_unset_and_off_is_a_choice() {
+        let choice = |backend: &str, gate: Option<&str>| {
+            PlacementEnvironment {
+                backend: Some(backend.into()),
+                arc_bounds: gate.map(OsString::from),
+                ..PlacementEnvironment::default()
+            }
+            .requested_backend()
+            .ok()
+        };
+        assert_eq!(choice(" ", None), Some(BackendChoice::Unchosen));
+        assert_eq!(
+            choice("", Some("1")),
+            Some(BackendChoice::Backend(BackendRequest::Arc))
+        );
+        assert_eq!(choice("off", Some("1")), Some(BackendChoice::Off));
+        assert_eq!(choice(" OFF ", None), Some(BackendChoice::Off));
+    }
+
+    /// A backend setting that is not UTF-8, names no backend, or
+    /// contradicts the legacy gate is a configuration problem: placement is
+    /// off, no ARC block is reserved, and no binding source is read.
+    #[test]
+    fn an_unusable_backend_setting_turns_placement_off() {
+        let shortcuts = Some(OsString::from("<Alt>q=left"));
+        for environment in [
+            PlacementEnvironment {
+                backend: Some("tile".into()),
+                ..PlacementEnvironment::default()
+            },
+            PlacementEnvironment {
+                backend: Some(OsString::from_vec(vec![b'a', b'r', b'c', 0xff])),
+                ..PlacementEnvironment::default()
+            },
+            PlacementEnvironment {
+                backend: Some("remote-shell-v2".into()),
+                arc_bounds: Some("yes".into()),
+                ..PlacementEnvironment::default()
+            },
+        ] {
+            let environment = PlacementEnvironment {
+                shortcuts: shortcuts.clone(),
+                ..environment
+            };
+            let (config, reserved) = resolve(&environment, None, block());
+            assert!(!reserved, "{environment:?}");
+            assert!(config.backend().is_none(), "{environment:?}");
+            assert_eq!(config.action_for(&alt(xkb::keysyms::KEY_q)), None);
+        }
+    }
 
     #[test]
     fn arc_bounds_gate_requires_an_explicit_true_spelling() {
