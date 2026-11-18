@@ -32,11 +32,13 @@ limitations under the License.
 //! callback for it, sends a handled press before that text and an
 //! unhandled one after, confirms the composition before an unhandled press
 //! and when the text input it serves changes or detaches, and drops the
-//! buffer on a reset. A key goes raw while IMA serves no text input. The version of the extension is drawn
-//! per case ([`Host`]). Answers that belong to the display, a sync's `done`
-//! and the `delete_id` of a destroyed object, are left to whoever plays it,
-//! as is the keyboard's focus in the fuzzer. The model is a test oracle,
-//! not a reimplementation: it keeps only the state those read.
+//! buffer on a reset. A key goes raw while IMA serves no text input. The
+//! extension's version is the one the proxy binds; a case draws the one
+//! the host advertises ([`draw_extension_version`]). Answers that belong to
+//! the display, a sync's `done` and the `delete_id` of a destroyed object,
+//! are left to whoever plays it, as is the keyboard's focus in the fuzzer.
+//! The model is a test oracle, not a reimplementation: it keeps only the
+//! state those read.
 //!
 //! Each rule cites Chromium's `components/exo/text_input.cc` (`TextInput`)
 //! or `components/exo/wayland/zwp_text_input_manager.cc` (the request
@@ -79,7 +81,7 @@ use crate::protocols::text_input_extension_unstable_v1::{
     zcr_extended_text_input_v1 as extended, zcr_text_input_extension_v1,
 };
 use crate::protocols::text_input_unstable_v1::{zwp_text_input_manager_v1, zwp_text_input_v1};
-use crate::protocols::wayland::{wl_keyboard, wl_seat};
+use crate::protocols::wayland::{wl_keyboard, wl_registry, wl_seat};
 use crate::protocols::AnyRequest;
 use crate::wire::{IndexedString, Outgoing};
 use std::collections::{BTreeMap, VecDeque};
@@ -301,19 +303,13 @@ impl TextInput {
     }
 }
 
-/// What a case draws about the host.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Host {
-    /// The `zcr_text_input_extension_v1` version, if the host has one.
-    pub extension: Option<u32>,
-}
-
-impl Host {
-    pub fn draw(choices: &mut impl Choose) -> Self {
-        Self {
-            extension: [None, Some(7), Some(10), Some(11)][choices.pick(4) as usize],
-        }
-    }
+/// The `zcr_text_input_extension_v1` version a case's host advertises, if
+/// any. Exo advertises v14, which the proxy binds at v11, its newest, so 11
+/// comes first and stands for Exo; the older versions and none test that
+/// the proxy copes with other hosts, one for each way it sends a content
+/// type or a confirmation.
+pub(super) fn draw_extension_version(choices: &mut impl Choose) -> Option<u32> {
+    [Some(11), None, Some(7), Some(10)][choices.pick(4) as usize]
 }
 
 /// The seat's `wl_keyboard`. A case has one, as a client binds one.
@@ -359,7 +355,8 @@ struct PendingKey {
 /// Exo's seat and its text inputs, as far as the model goes.
 #[derive(Default)]
 pub(crate) struct Exo {
-    host: Host,
+    /// The version the proxy bound `zcr_text_input_extension_v1` at.
+    extension_version: Option<u32>,
     /// The seat's focused surface.
     focus: Option<u32>,
     /// By host `zwp_text_input_v1` ID.
@@ -390,13 +387,6 @@ pub(crate) struct Exo {
 }
 
 impl Exo {
-    pub(super) fn new(host: Host) -> Self {
-        Self {
-            host,
-            ..Self::default()
-        }
-    }
-
     pub(crate) fn focus(&self) -> Option<u32> {
         self.focus
     }
@@ -580,6 +570,12 @@ impl Exo {
                 zcr_text_input_extension_v1::Request::GetExtendedTextInput { id, text_input },
             ) => {
                 self.extensions.insert(*id, *text_input);
+            }
+            AnyRequest::WlRegistry(wl_registry::Request::Bind {
+                id: (interface, version, _),
+                ..
+            }) if interface == zcr_text_input_extension_v1::NAME => {
+                self.extension_version = Some(*version);
             }
             AnyRequest::ZcrExtendedTextInputV1(request) => self.extension_request(sender, request),
             AnyRequest::ZwpTextInputV1(request) => self.text_input_request(sender, request),
@@ -1010,7 +1006,7 @@ impl Exo {
     /// (`SupportsConfirmPreedit`).
     fn confirming_extension(&self, id: u32) -> Option<u32> {
         let extension = self.extension_of(id)?;
-        (self.host.extension >= Some(11)).then_some(extension)
+        (self.extension_version >= Some(11)).then_some(extension)
     }
 
     /// The extension of text input `id`, if it has one.
@@ -1060,10 +1056,10 @@ mod tests {
     const PEEK: u32 = 31;
     const KEYBOARD2: u32 = 32;
     const TI2: u32 = 40;
-    /// A host whose extension has `confirm_preedit`.
-    const V11: Host = Host {
-        extension: Some(11),
-    };
+    const REGISTRY: u32 = 6;
+    /// Extension versions with `confirm_preedit` and without it.
+    const V11: u32 = 11;
+    const V10: u32 = 10;
     /// The time of every key, and its milliseconds.
     const NOW: Micros = Micros(7_000);
     const MS: u32 = 7;
@@ -1071,14 +1067,21 @@ mod tests {
     const UP: u32 = wl_keyboard::KEY_STATE_RELEASED;
 
     fn exo() -> Exo {
-        exo_for(Host::default())
+        exo_for(V10)
     }
 
-    /// Exo for `host`, whose seat focuses surface `A`, with keyboard
-    /// `KEYBOARD` and its extension `PEEK`, and text input `TI` and its
-    /// extension `EXT`, not yet activated.
-    fn exo_for(host: Host) -> Exo {
-        let mut exo = Exo::new(host);
+    /// Exo whose seat focuses surface `A`, with keyboard `KEYBOARD` and its
+    /// extension `PEEK`, and text input `TI` and its extension `EXT`, bound
+    /// at `version`, not yet activated.
+    fn exo_for(version: u32) -> Exo {
+        let mut exo = Exo::default();
+        let interface = zcr_text_input_extension_v1::NAME.to_owned();
+        let id = (interface, version, EXT_MANAGER);
+        send(
+            &mut exo,
+            REGISTRY,
+            wl_registry::Request::Bind { name: 1, id },
+        );
         send(
             &mut exo,
             SEAT,
@@ -1101,8 +1104,8 @@ mod tests {
     }
 
     /// [`exo_for`] with `TI` active on `A`, and its events taken.
-    fn active(host: Host) -> Exo {
-        let mut exo = exo_for(host);
+    fn active(version: u32) -> Exo {
+        let mut exo = exo_for(version);
         send(&mut exo, TI, activate(A));
         exo.take_events();
         exo
@@ -1403,7 +1406,7 @@ mod tests {
 
     #[test]
     fn e4_exo_predicts_the_text_from_reports_and_the_input_methods_edits() {
-        let mut exo = active(Host::default());
+        let mut exo = active(V10);
         send(&mut exo, TI, surrounding("ab", 1));
         press(&mut exo, 'r', &[commits("가")], true);
         press(&mut exo, 's', &[shows("ㄴ")], true);
@@ -1462,7 +1465,7 @@ mod tests {
         let reset = || zwp_text_input_v1::Request::Reset {};
         // Before the engine sends a key's text, the reset cancels nothing
         // of it: the text goes out late, with the key.
-        let mut exo = active(Host::default());
+        let mut exo = active(V10);
         press(&mut exo, 'r', &[shows("ㄱ")], true);
         exo.key(NOW, k('k'), DOWN);
         exo.take_engine();
@@ -1476,7 +1479,7 @@ mod tests {
         assert_eq!(events(&mut exo), [peek(1, 'k', DOWN), cursor, string]);
         // Between the text and the callback, the reset drops the text, and
         // the key goes out handled with none.
-        let mut exo = active(Host::default());
+        let mut exo = active(V10);
         press(&mut exo, 'r', &[shows("ㄱ")], true);
         exo.key(NOW, k('k'), DOWN);
         exo.take_engine();
@@ -1489,7 +1492,7 @@ mod tests {
         }));
         assert_eq!(events(&mut exo), [peek(1, 'k', DOWN)]);
         // With nothing composed, the engine is left alone.
-        let mut exo = active(Host::default());
+        let mut exo = active(V10);
         send(&mut exo, TI, reset());
         assert_eq!(exo.take_engine(), []);
     }
@@ -1501,10 +1504,10 @@ mod tests {
         send(&mut exo, TI, deactivate());
         assert_eq!(events(&mut exo), [confirm(), leave()]);
         // Before it, only a composition, as the cursor and a commit.
-        let mut exo = active(Host::default());
+        let mut exo = active(V10);
         send(&mut exo, TI, deactivate());
         assert_eq!(events(&mut exo), [leave()]);
-        let mut exo = active(Host::default());
+        let mut exo = active(V10);
         press(&mut exo, 'r', &[shows("가")], true);
         send(&mut exo, TI, deactivate());
         assert_eq!(events(&mut exo), [cursor(3), commit(3, "가"), leave()]);
@@ -1549,7 +1552,7 @@ mod tests {
 
     #[test]
     fn e7_a_key_through_the_engine_goes_out_with_its_callback() {
-        let mut exo = active(Host::default());
+        let mut exo = active(V10);
         exo.key(NOW, k('r'), DOWN);
         let r = |pressed, id| EngineIn::Key {
             key: k('r'),
@@ -1582,7 +1585,7 @@ mod tests {
 
     #[test]
     fn e8_a_handled_press_precedes_its_text_and_an_unhandled_one_follows_it() {
-        let mut exo = active(Host::default());
+        let mut exo = active(V10);
         let [cursor, string] = preedit(2, "ㄱ");
         let handled = [peek(1, 'r', DOWN), cursor, string];
         assert_eq!(press(&mut exo, 'r', &[shows("ㄱ")], true), handled);
@@ -1597,7 +1600,7 @@ mod tests {
         let empty = [confirm(), peek(1, 'a', DOWN), key(1, 'a', DOWN)];
         assert_eq!(press(&mut exo, 'a', &[], false), empty);
         // Before it, only a composition, as the cursor and a commit.
-        let mut exo = active(Host::default());
+        let mut exo = active(V10);
         press(&mut exo, 'r', &[shows("가")], true);
         let confirmed = [
             cursor(3),
@@ -1652,7 +1655,7 @@ mod tests {
     #[test]
     fn e12_a_focus_move_reaches_the_keyboard_and_text_inputs_in_the_drawn_order() {
         for text_inputs_first in [false, true] {
-            let mut exo = active(Host::default());
+            let mut exo = active(V10);
             exo.move_focus(Some(B), &mut |_| u32::from(text_inputs_first));
             let keyboard_leave = wl_keyboard::Event::Leave {
                 serial: 1,
@@ -1693,8 +1696,8 @@ mod tests {
 
     #[test]
     fn a_case_draws_the_extension_version() {
-        assert_eq!(Host::draw(&mut |_| 0), Host::default());
-        assert_eq!(Host::draw(&mut |n| n - 1), V11);
+        let versions = [0, 1, 2, 3].map(|choice| draw_extension_version(&mut |_| choice));
+        assert_eq!(versions, [Some(V11), None, Some(7), Some(V10)]);
     }
 
     #[test]
