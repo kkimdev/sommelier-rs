@@ -30,6 +30,7 @@ mod guest;
 mod host;
 mod serial;
 mod state;
+mod step;
 
 use state::TextInput;
 
