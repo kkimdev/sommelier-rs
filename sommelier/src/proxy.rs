@@ -769,10 +769,10 @@ impl Client {
 mod tests {
     use super::harness::Session;
     use super::*;
-    use crate::protocols::AnyRequest;
+    use crate::protocols::{AnyEvent, AnyRequest};
     use crate::state::PlaneFenceForTest;
     use crate::test_support::{
-        any_fd_has_identity, fd_identity, fds_with_identity, msg_header, raw_dispatch,
+        any_fd_has_identity, fd_identity, fds_with_identity, msg_header, raw_dispatch, respell,
         shm_pool_file, stream_headers,
     };
     use crate::wire::{MessageBuilder, WL_DISPLAY_ID};
@@ -1843,6 +1843,109 @@ mod tests {
                 ProtocolError::InvalidString.to_string()
             )
         );
+    }
+
+    /// A guest `xdg_toplevel` of a new surface, and the host's.
+    async fn session_with_a_toplevel() -> (Session, super::harness::Object) {
+        use protocols::xdg_shell::{xdg_surface, xdg_wm_base};
+        let (mut s, surface) = session_with_a_surface().await;
+        let wm_base = s.bind_paired("xdg_wm_base", xdg_wm_base::VERSION).await;
+        let xdg_surface = s.new_id();
+        s.create(xdg_wm_base::req::get_xdg_surface(
+            wm_base.id,
+            xdg_surface,
+            surface.id,
+        ))
+        .await;
+        let id = s.new_id();
+        let host = s
+            .create(xdg_surface::req::get_toplevel(xdg_surface, id))
+            .await;
+        (s, super::harness::Object { id, host })
+    }
+
+    /// libwayland passes a string that is not UTF-8 through, so a client
+    /// that sets its title from Latin-1 bytes keeps its session: the host
+    /// gets the title with each invalid sequence replaced by U+FFFD.
+    #[tokio::test]
+    async fn a_guest_string_that_is_not_utf8_reaches_the_host_with_replacement_characters() {
+        use protocols::xdg_shell::xdg_toplevel;
+        let (mut s, toplevel) = session_with_a_toplevel().await;
+        let title = xdg_toplevel::req::set_title(toplevel.id, "Cafe creme").unwrap();
+        s.guest([respell(title, "Cafe creme", b"Caf\xe9 cr\xe8me")])
+            .await;
+        let title = "Caf\u{fffd} cr\u{fffd}me".to_string();
+        assert_eq!(
+            s.host_received(),
+            [(
+                toplevel.host,
+                xdg_toplevel::Request::SetTitle { title }.into()
+            )]
+        );
+    }
+
+    /// The host direction follows the same rule.
+    #[tokio::test]
+    async fn a_host_string_that_is_not_utf8_reaches_the_guest_with_replacement_characters() {
+        use protocols::wayland::wl_seat;
+        let mut s = Session::new();
+        let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+        let name = wl_seat::evt::name(seat.host, "seat-e").unwrap();
+        s.host([respell(name, "seat-e", b"seat-\xe9")]).await;
+        let name = "seat-\u{fffd}".to_string();
+        assert_eq!(
+            s.guest_received(),
+            [(seat.id, wl_seat::Event::Name { name }.into())]
+        );
+    }
+
+    /// An interface name that is not UTF-8 names nothing the proxy knows:
+    /// a host global of one is not advertised, and a guest bind with one is
+    /// an invalid bind, as a bind of any other interface is.
+    #[tokio::test]
+    async fn an_interface_name_that_is_not_utf8_names_no_global() {
+        use protocols::wayland::{wl_display, wl_registry, wl_seat};
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        let global = wl_registry::evt::global(registry.host, 100, "wl_seaX", 1).unwrap();
+        s.host([respell(global, "wl_seaX", b"wl_sea\xf4")]).await;
+        assert_eq!(s.guest_received(), []);
+
+        let name = s.advertise("wl_seat", wl_seat::VERSION).await;
+        let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+            s.guest_received()[..]
+        else {
+            panic!("the guest was not advertised the seat");
+        };
+        let id = s.new_id();
+        let bind = wl_registry::req::bind(registry.id, name, "wl_seaX", version, id).unwrap();
+        s.guest_fatal([respell(bind, "wl_seaX", b"wl_sea\xf4")])
+            .await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (registry.id, wl_display::ERROR_INVALID_OBJECT))
+        );
+        assert_eq!(s.host_received(), []);
+    }
+
+    /// libwayland rejects a string with a NUL inside, and so does the
+    /// proxy.
+    #[tokio::test]
+    async fn a_string_with_a_nul_inside_is_an_invalid_method() {
+        use protocols::wayland::wl_display;
+        use protocols::xdg_shell::xdg_toplevel;
+        let (mut s, toplevel) = session_with_a_toplevel().await;
+        let title = xdg_toplevel::req::set_title(toplevel.id, "a b").unwrap();
+        s.guest_fatal([respell(title, "a b", b"a\0b")]).await;
+        assert_eq!(
+            s.guest_received_and_diagnosed_error(),
+            (
+                vec![],
+                (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD),
+                ProtocolError::InvalidString.to_string()
+            )
+        );
+        assert_eq!(s.host_received(), []);
     }
 
     /// What earlier messages of the batch send back toward the guest still

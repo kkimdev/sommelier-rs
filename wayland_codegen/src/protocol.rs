@@ -92,6 +92,10 @@ pub struct Arg {
     pub allow_null: Option<bool>,
     #[serde(rename = "@enum", default)]
     pub enum_name: Option<String>,
+    /// A string that other arguments index by byte offset; the generator
+    /// sets it from its `BYTE_INDEXED_STRINGS`, not from the XML.
+    #[serde(skip)]
+    pub byte_indexed: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

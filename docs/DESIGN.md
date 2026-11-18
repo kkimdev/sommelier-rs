@@ -106,6 +106,11 @@ build time (`sommelier/build.rs`). For each protocol it generates:
   repeated, null or reserved ID cannot overwrite an entry, and each
   message is checked against the version that introduced it (see
   [Object translation](#object-translation)).
+- String arguments as `String`s, with sequences that are not UTF-8
+  replaced, except the few that other arguments index by byte offset
+  (`BYTE_INDEXED_STRINGS`), which decode to `wire::IndexedString` so their
+  handler can ignore one that is not UTF-8 (see
+  [Wire messages](INVARIANTS.md#wire-messages)).
 - An encoder per message, `req::<request>` and `evt::<event>`, for every
   message the proxy builds itself (see
   [Wire messages](INVARIANTS.md#wire-messages)).

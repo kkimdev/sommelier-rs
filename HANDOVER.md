@@ -75,6 +75,11 @@
   parking, which can lead to it (a parked stream is not read), and the
   fence deadline does not bound it, because the loop is waiting in the
   send. Only that client stalls.
+- Replacing invalid UTF-8 in a forwarded string can make it up to three
+  times longer, so a message near the 4096-byte limit with many invalid
+  bytes still ends the session as too large
+  ([Wire messages](docs/INVARIANTS.md#wire-messages)). No client is known
+  to send one.
 - The `zxdg_output_manager_v1` passthrough has not been checked on a host.
   That Exo advertises the global is inferred from ChromiumOS Sommelier,
   whose direct-scale mode binds it and assumes it is present.

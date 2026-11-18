@@ -1140,6 +1140,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         }
 
         let Some(advertised_version) = forwarded_global_version(ctx, interface, version) else {
+            if interface.contains(char::REPLACEMENT_CHARACTER) {
+                log::debug!(
+                    "Hiding global {name}, whose interface name {interface:?} is not UTF-8"
+                );
+            }
             record_registry_global_visibility(ctx, name, false);
             return Action::Drop;
         };

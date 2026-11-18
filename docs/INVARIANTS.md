@@ -131,6 +131,43 @@ always consumed; a configuration problem never stops the proxy) is owned by
   Tests: `oversized_host_text_is_dropped_without_panicking`,
   `generated_forwarding_rejects_messages_that_exceed_wire_length`,
   `an_encoder_that_cannot_build_its_message_closes_its_descriptors`.
+- **A string that is not UTF-8 does not end the session.** Wayland
+  requires UTF-8, but libwayland does not check it, so a client that sets
+  its title from arbitrary bytes, or names a Latin-1 file, works with
+  other compositors. `WireMessage::read_string` decides for every string
+  in both directions: it replaces each invalid sequence with U+FFFD (and
+  logs it at debug), and the proxy forwards and matches the replaced
+  string. A replaced interface name or MIME type matches nothing: a host
+  global of one is not advertised, a guest bind of one is an invalid bind,
+  and a type offered under one is asked for by a name its owner does not
+  know, so that transfer gets no data. The exception is a string that
+  other arguments index by byte offset, whose offsets a replacement would
+  move: the text of `set_surrounding_text` and `preedit_string` in both
+  text-input versions (the generator's `BYTE_INDEXED_STRINGS`) decodes to
+  `wire::IndexedString`, and a handler drops one that is not UTF-8,
+  logging it at debug. A guest `zwp_text_input_v3` surrounding text makes
+  the pending one empty, so that its commit empties the host's rather than
+  leave the input method editing text the guest no longer has, while the
+  field keeps its support for surrounding text and the host its content
+  type. A host `zwp_text_input_v1` preedit reaches the guest as nothing,
+  taking the `preedit_cursor` and `preedit_styling` sent for it with it.
+  The host's `commit_string` is replaced: the only offsets into it, in
+  `cursor_position`, have no v3 equivalent. A NUL inside a string is still
+  an `invalid_method` (`ProtocolError::InvalidString`), as libwayland
+  rejects it. A replacement can make a string up to three times longer, so
+  a forwarded message near the length limit can still end the session as
+  `MessageTooLarge` (see above).
+  Tests: `wire_message_replaces_invalid_utf8_in_strings`,
+  `a_guest_string_that_is_not_utf8_reaches_the_host_with_replacement_characters`,
+  `a_host_string_that_is_not_utf8_reaches_the_guest_with_replacement_characters`,
+  `an_interface_name_that_is_not_utf8_names_no_global`,
+  `indexed_strings_keep_bytes_that_are_not_utf8`,
+  `test_generate_byte_indexed_strings`,
+  `test_byte_indexed_strings_each_name_one_argument`,
+  `surrounding_text_that_is_not_utf8_clears_the_hosts`,
+  `host_ime_events_become_v3_transactions`,
+  `a_string_with_a_nul_inside_is_an_invalid_method`,
+  `wire_message_rejects_string_with_embedded_nul`.
 - **A rejected request is reported.** A guest request the proxy cannot
   frame, decode or dispatch ends the session, with its descriptors closed,
   after one `wl_display.error` reaches the guest. The error is always on

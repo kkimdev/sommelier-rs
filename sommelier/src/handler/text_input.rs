@@ -28,7 +28,7 @@ use crate::state::{
     reconcile, ActivationStep, Context, CursorRect, GuestKeyDelivery, GuestKeyEvent, HostApplied,
     HostContentType, HostId, HostTarget, InternalCallback, Link, SeatFocusChange, TextInputState,
 };
-use crate::wire::{queue_or_drop, Action, Outgoing};
+use crate::wire::{queue_or_drop, Action, IndexedString, Outgoing};
 
 /// Queue `zwp_text_input_v3.preedit_string`, or drop host text that does not
 /// fit a message (see [`queue_or_drop`]).
@@ -561,6 +561,26 @@ pub(crate) fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u3
     )
 }
 
+/// Drop a host event that would set the preedit of active text input
+/// `guest_id` but does not reach the guest, with the preedit_cursor and
+/// preedit_styling that were part of it.
+fn drop_host_preedit(ctx: &mut Context, guest_id: u32) -> Action {
+    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+        state.discard_pending_preedit_styling();
+    }
+    Action::Drop
+}
+
+/// Drop a host `commit_string` for active text input `guest_id` that does
+/// not reach the guest, with the delete_surrounding_text and
+/// cursor_position that were part of it.
+fn drop_host_commit(ctx: &mut Context, guest_id: u32) -> Action {
+    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+        state.discard_pending_commit_state();
+    }
+    Action::Drop
+}
+
 pub struct TextInputManagerV1Handler;
 impl zwp_text_input_manager_v1::ZwpTextInputManagerV1Handler for TextInputManagerV1Handler {}
 
@@ -570,7 +590,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         &mut self,
         ctx: &mut Context,
         serial: u32,
-        text: &String,
+        text: &IndexedString,
         commit: &String,
     ) -> Action {
         let host_id = ctx.last_sender_id;
@@ -586,6 +606,12 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                 guest_id
             );
             return Action::Drop;
+        };
+        // The preedit_cursor and preedit_styling before it are byte offsets
+        // into it, which replacing an invalid sequence would move.
+        let IndexedString::Utf8(text) = text else {
+            log::debug!("Ignoring a host preedit that is not UTF-8");
+            return drop_host_preedit(ctx, guest_id);
         };
         let repeat_keyboard = held_backspace_keyboard_for_seat(ctx, plan.guest_seat);
         let (cursor_begin, cursor_end) = resolve_preedit_cursor(text, plan.selection, plan.cursor);
@@ -617,11 +643,11 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             && !commit.is_empty()
             && !push_commit_string_to(&mut transaction, guest_id, commit)
         {
-            return Action::Drop;
+            return drop_host_preedit(ctx, guest_id);
         }
 
         if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
-            return Action::Drop;
+            return drop_host_preedit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
@@ -686,7 +712,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
 
         let mut transaction = Vec::new();
         if plan.had_preedit && !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0) {
-            return Action::Drop;
+            return drop_host_commit(ctx, guest_id);
         }
 
         // v1 requires delete_surrounding_text and cursor_position to be
@@ -699,7 +725,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         }
 
         if !push_commit_string_to(&mut transaction, guest_id, text) {
-            return Action::Drop;
+            return drop_host_commit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
@@ -1037,6 +1063,9 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
                 "on_set_preedit_region: inactive input or no surrounding text for host_ext_id={}",
                 host_ext_id
             );
+            if state.host_is_active() {
+                return drop_host_preedit(ctx, guest_id);
+            }
             return Action::Drop;
         };
 
@@ -1060,7 +1089,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
                 cursor_i64,
                 text.len()
             );
-            return Action::Drop;
+            return drop_host_preedit(ctx, guest_id);
         }
 
         let preedit_text = text[start_idx as usize..(start_idx + length_i64) as usize].to_string();
@@ -1092,7 +1121,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             cursor_begin,
             cursor_end,
         ) {
-            return Action::Drop;
+            return drop_host_preedit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
@@ -1224,11 +1253,11 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         );
         let mut transaction = Vec::new();
         if !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0) {
-            return Action::Drop;
+            return drop_host_preedit(ctx, guest_id);
         }
 
         if !push_commit_string_to(&mut transaction, guest_id, &plan.preedit_text) {
-            return Action::Drop;
+            return drop_host_preedit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
@@ -1823,7 +1852,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
     fn on_set_surrounding_text(
         &mut self,
         ctx: &mut Context,
-        text: &String,
+        text: &IndexedString,
         cursor: i32,
         anchor: i32,
     ) -> Action {
@@ -1831,6 +1860,18 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         if !v3_is_focused(ctx, guest_id) {
             return Action::Drop;
         }
+        // The cursor and anchor are byte offsets into the text, which
+        // replacing an invalid sequence would move. Empty the field's text
+        // instead, so that the host's input method does not go on editing
+        // text the guest no longer has, and keep its support for
+        // surrounding text, which would change the host's content type.
+        let IndexedString::Utf8(text) = text else {
+            log::debug!("Emptying surrounding text that is not UTF-8");
+            if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+                state.pending.surrounding_text = Some(Some((String::new(), 0, 0)));
+            }
+            return Action::Drop;
+        };
         log::trace!(
             ">>> v3 on_set_surrounding_text: guest_id={}, text={:?}, cursor={}, anchor={}",
             guest_id,
@@ -2001,7 +2042,7 @@ mod tests {
     use crate::protocols::wayland::{wl_callback, wl_compositor, wl_registry, wl_seat};
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
-    use crate::test_support::decoded;
+    use crate::test_support::{decoded, respell};
     use crate::wire::WL_DISPLAY_ID;
     use std::os::fd::OwnedFd;
     use zcr_extended_text_input_v1::{evt as ext, Request as Ext};
@@ -3167,6 +3208,49 @@ mod tests {
         }
     }
 
+    /// The cursor and anchor are byte offsets into the surrounding text,
+    /// which replacing an invalid sequence would move, so surrounding text
+    /// that is not UTF-8 cannot reach the host. It empties the field's
+    /// surrounding text instead, rather than leave the host's input method
+    /// editing text the guest no longer has, and the field keeps its
+    /// support for surrounding text, so the host's content type stays. The
+    /// session goes on, and the next valid text reaches the host.
+    #[tokio::test]
+    async fn surrounding_text_that_is_not_utf8_clears_the_hosts() {
+        let mut f = Field::enabled().await;
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "가", 3, 3).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let mut expected = vec![f.surrounding_text("가", 3, 3)];
+        expected.extend(f.content_type((0, 0), true));
+        expected.push(f.commit_state(2));
+        assert_eq!(f.s.host_received(), expected);
+
+        let latin1 = v3::set_surrounding_text(f.ti, "Cafe", 3, 3).unwrap();
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "나", 3, 3).unwrap(),
+            respell(latin1, "Cafe", b"Caf\xe9"),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(
+            f.s.host_received(),
+            [f.surrounding_text("", 0, 0), f.commit_state(3)]
+        );
+
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "Café", 5, 5).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(
+            f.s.host_received(),
+            [f.surrounding_text("Café", 5, 5), f.commit_state(4)]
+        );
+    }
+
     /// The v3 content type maps to the host's, which is told with it that
     /// a v3 client supports inline composition, and whether the field has
     /// surrounding text.
@@ -3684,6 +3768,62 @@ mod tests {
                 ],
             ),
             (
+                // Its preedit_cursor and preedit_styling are byte offsets
+                // into it, which replacing an invalid sequence would move.
+                "a preedit that is not UTF-8 is ignored",
+                |f| {
+                    let latin1 = respell(f.preedit("Cafe", ""), "Cafe", b"Caf\xe9");
+                    vec![f.preedit("가", ""), latin1, f.preedit("가나", "")]
+                },
+                vec![preedit("가"), DONE, preedit("가나"), DONE],
+            ),
+            (
+                "an ignored preedit takes its cursor and styling with it",
+                |f| {
+                    let latin1 = respell(f.preedit("Cafe", ""), "Cafe", b"Caf\xe9");
+                    vec![
+                        v1::preedit_styling(f.host, 0, 3, 6),
+                        v1::preedit_cursor(f.host, 3),
+                        latin1,
+                        f.preedit("가나", ""),
+                    ]
+                },
+                vec![preedit("가나"), DONE],
+            ),
+            (
+                "a preedit region without surrounding text takes the cursor and styling with it",
+                |f| {
+                    vec![
+                        v1::preedit_styling(f.host, 0, 3, 6),
+                        v1::preedit_cursor(f.host, 3),
+                        ext::set_preedit_region(f.host_ext, -3, 3),
+                        f.preedit("가나", ""),
+                    ]
+                },
+                vec![preedit("가나"), DONE],
+            ),
+            (
+                // Nothing the proxy uses indexes committed text.
+                "a commit that is not UTF-8 commits replacement characters",
+                |f| vec![respell(f.commit("Cafe"), "Cafe", b"Caf\xe9")],
+                vec![commit("Caf\u{fffd}"), DONE],
+            ),
+            (
+                // Each 0xff becomes the three bytes of U+FFFD, too long for
+                // the guest's message.
+                "a commit too long once replaced takes its deletes with it",
+                |f| {
+                    let text = "x".repeat(4_000);
+                    let latin1 = respell(f.commit(&text), &text, &[0xff; 4_000]);
+                    vec![
+                        v1::delete_surrounding_text(f.host, -3, 3),
+                        latin1,
+                        f.commit("나"),
+                    ]
+                },
+                vec![commit("나"), DONE],
+            ),
+            (
                 "a delete waits for its commit",
                 |f| vec![v1::delete_surrounding_text(f.host, -3, 5)],
                 vec![],
@@ -3829,7 +3969,12 @@ mod tests {
         expected.extend(f.content_type((0, 0), true));
         expected.push(f.commit_state(2));
         assert_eq!(f.s.host_received(), expected);
-        f.s.host([ext::set_preedit_region(f.host_ext, -6, 3)]).await;
+        // A region apart from the cursor takes the pending cursor with it.
+        f.s.host([
+            v1::preedit_cursor(f.host, 0),
+            ext::set_preedit_region(f.host_ext, -6, 3),
+        ])
+        .await;
         assert_eq!(f.s.guest_received(), []);
 
         f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
@@ -4574,7 +4719,7 @@ mod tests {
 
         fn preedit(&mut self, text: &str, commit: &str) {
             self.ctx.last_sender_id = HOST;
-            let (text, commit) = (text.to_string(), commit.to_string());
+            let (text, commit) = (IndexedString::from(text), commit.to_string());
             TextInputV1Handler.on_preedit_string(&mut self.ctx, 0, &text, &commit);
         }
 
@@ -4714,6 +4859,7 @@ mod tests {
         let oversized = "x".repeat(4_084);
         let end = oversized.len() as i32;
         ime.ctx.last_sender_id = TI;
+        let oversized = IndexedString::from(oversized.as_str());
         TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &oversized, end, end);
         TextInputV3Handler.on_set_content_type(&mut ime.ctx, 0, 13);
         let mut expected = ime.state().clone();
@@ -4725,7 +4871,14 @@ mod tests {
     }
 
     /// Host text too long for a message is dropped whole: the guest gets
-    /// nothing, and the text input and its repeat lease stay as they were.
+    /// nothing, and the text input and its repeat lease stay as they were,
+    /// except that the event takes what the host recorded for it: a
+    /// preedit, preedit region or confirmation the preedit cursor and
+    /// styling, a commit the deletes and cursor position. Otherwise the next
+    /// one would apply them, a delete at a cursor that has moved. Only host
+    /// text the proxy lengthened by replacing invalid UTF-8 fits the host's
+    /// message but not the guest's (`host_ime_events_become_v3_transactions`
+    /// sends such a commit); this test reaches every such drop directly.
     #[test]
     fn oversized_host_text_does_not_partially_advance_state() {
         let oversized = "x".repeat(4_084);
@@ -4746,11 +4899,18 @@ mod tests {
             assert!(state.record_delete(3, 0));
             state.record_cursor_position(1, 1);
             ime.lease_backspace_repeat(TI);
-            let before = ime.state().clone();
+            let mut expected = ime.state().clone();
+            if case == "commit" {
+                expected.pending_deletes.clear();
+                expected.pending_cursor_position = None;
+            } else {
+                expected.pending_preedit_cursor = None;
+                expected.pending_preedit_selection = None;
+            }
 
             event(&mut ime, &oversized);
             assert_eq!(ime.events(), [], "{case}");
-            assert_eq!(ime.state(), &before, "{case}");
+            assert_eq!(ime.state(), &expected, "{case}");
             assert!(ime.repeat_active(), "{case}");
         }
     }
