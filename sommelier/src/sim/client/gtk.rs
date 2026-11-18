@@ -47,7 +47,7 @@ use super::{
 };
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{self, req, Event};
 use crate::sim::clock::Micros;
-use crate::sim::editor::{Target, Txn};
+use crate::sim::editor::{Target, TextModel, Txn};
 use crate::sim::hangul::Key;
 use crate::wire::Outgoing;
 
@@ -392,7 +392,8 @@ impl Client for Gtk {
     }
 
     /// The entry edits as [`TextModel::insert_key`] does, except that
-    /// Enter activates it rather than inserting a line break.
+    /// Enter activates it rather than inserting a line break, and
+    /// Backspace may leave part of a Hangul syllable ([`backspace`]).
     ///
     /// - A printable key goes through the context, which commits it to the
     ///   entry and so reports as C6 does (GTK3's `GtkIMContextSimple`,
@@ -417,7 +418,11 @@ impl Client for Gtk {
                 out
             }
             Key::Backspace if model.cursor == 0 => Vec::new(),
-            Key::Backspace | Key::Left | Key::Right => {
+            Key::Backspace => {
+                backspace(model);
+                self.reset(field)
+            }
+            Key::Left | Key::Right => {
                 model.insert_key(key);
                 self.reset(field)
             }
@@ -465,6 +470,48 @@ impl Client for Gtk {
         let out = self.enable();
         self.layout(out)
     }
+}
+
+/// A passed Backspace, at a cursor past the start. GTK deletes the
+/// grapheme cluster before the cursor and, where Pango sets
+/// `backspace_deletes_character` (on every boundary except after a Latin,
+/// Cyrillic or Greek base character), re-inserts all but the last
+/// character of its NFD decomposition (`gtk_entry_backspace` in GTK3's
+/// `gtkentry.c`, `gtk_text_backspace` in GTK4's `gtktext.c`). So 가
+/// becomes the conjoining jamo ᄀ, and 각 the conjoining 가 (ᄀ and ᅡ).
+///
+/// Only Hangul is modelled. A precomposed syllable decomposes
+/// algorithmically. A cluster of conjoining jamo is its own
+/// decomposition, so it loses its last jamo, as deleting that character
+/// alone does. Any other character is deleted whole, as the simulation
+/// types no other script that decomposes.
+fn backspace(model: &mut TextModel) {
+    let last = model.text[..model.cursor]
+        .chars()
+        .next_back()
+        .expect("a character before the cursor");
+    let decomposed = decompose_hangul(last);
+    let kept: String = decomposed[..decomposed.len() - 1].iter().collect();
+    model.apply_txn(&Txn {
+        delete: (last.len_utf8(), 0),
+        commit: kept,
+        preedit: model.preedit.clone(),
+    });
+}
+
+/// The NFD decomposition of `c` if it is a precomposed Hangul syllable:
+/// its leading consonant, vowel and any trailing consonant as conjoining
+/// jamo; otherwise `c` alone.
+fn decompose_hangul(c: char) -> Vec<char> {
+    let Some(index) = u32::from(c).checked_sub(0xAC00).filter(|&i| i < 11_172) else {
+        return vec![c];
+    };
+    let jamo = |code: u32| char::from_u32(code).expect("a conjoining jamo");
+    let mut out = vec![jamo(0x1100 + index / 588), jamo(0x1161 + index % 588 / 28)];
+    if index % 28 != 0 {
+        out.push(jamo(0x11A7 + index % 28));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -757,5 +804,32 @@ mod tests {
             DropReason::NoFocusedField,
         );
         assert_eq!(gtk.drops(), [expected]);
+    }
+
+    #[test]
+    fn backspace_leaves_the_start_of_a_hangul_syllable() {
+        for v4 in [false, true] {
+            let mut gtk = entered(v4, &["a가각"]);
+            let t0 = Micros(0);
+            // 각 leaves the conjoining 가, which looks the same as 가.
+            gtk.key(t0, Key::Backspace);
+            let field = &gtk.fields()[0].model;
+            assert_eq!(field, &model("a가\u{1100}\u{1161}", 10, ""), "v4: {v4}");
+            // That cluster, and then 가, each leave the conjoining ᄀ, which
+            // a third Backspace deletes; Latin goes whole.
+            gtk.key(t0, Key::Backspace);
+            assert_eq!(
+                gtk.fields()[0].model,
+                model("a가\u{1100}", 7, ""),
+                "v4: {v4}"
+            );
+            gtk.key(t0, Key::Backspace);
+            assert_eq!(gtk.fields()[0].model, model("a가", 4, ""), "v4: {v4}");
+            gtk.key(t0, Key::Backspace);
+            assert_eq!(gtk.fields()[0].model, model("a\u{1100}", 4, ""), "v4: {v4}");
+            gtk.key(t0, Key::Backspace);
+            gtk.key(t0, Key::Backspace);
+            assert_eq!(gtk.fields()[0].model, model("", 0, ""), "v4: {v4}");
+        }
     }
 }
