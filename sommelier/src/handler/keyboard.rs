@@ -2864,25 +2864,49 @@ mod tests {
     #[tokio::test]
     async fn each_key_generation_reaches_the_guest_once() {
         use Route::*;
-        let cases: [(&str, &[(u32, Route)]); 4] = [
-            ("an untracked release", &[(RELEASED, Host)]),
+        // Each event, where it goes, and whether the key is down after it:
+        // from its press to its release, wherever they go, but not from a
+        // repeat the host keeps.
+        type Event = (u32, Route, bool);
+        let cases: [(&str, u32, &[Event]); 5] = [
+            ("an untracked release", KEY_A, &[(RELEASED, Host, false)]),
             (
                 "a repeat without a press",
-                &[(REPEATED, Host), (RELEASED, Host)],
+                KEY_A,
+                &[(REPEATED, Host, false), (RELEASED, Host, false)],
             ),
             (
                 "a duplicate press",
-                &[(PRESSED, Guest), (PRESSED, Consumed), (RELEASED, Guest)],
+                KEY_A,
+                &[
+                    (PRESSED, Guest, true),
+                    (PRESSED, Consumed, true),
+                    (RELEASED, Guest, false),
+                ],
             ),
             (
                 "a held key",
-                &[(PRESSED, Guest), (REPEATED, Guest), (RELEASED, Guest)],
+                KEY_A,
+                &[
+                    (PRESSED, Guest, true),
+                    (REPEATED, Guest, true),
+                    (RELEASED, Guest, false),
+                ],
+            ),
+            (
+                "a host accelerator",
+                KEY_B,
+                &[(PRESSED, Host, true), (RELEASED, Host, false)],
             ),
         ];
-        for (case, events) in cases {
-            let mut kb = Kb::new().await;
-            for (serial, &(state, route)) in (2..).zip(events) {
-                assert_eq!(kb.key(serial, KEY_A, state).await, route, "{case}");
+        for (case, key, events) in cases {
+            let mut kb = Kb::with_accelerators("b").await;
+            for (serial, &(state, route, held)) in (2..).zip(events) {
+                assert_eq!(kb.key(serial, key, state).await, route, "{case}");
+                // That a key is down shows in no message until a later
+                // event of it, which each row would then have to add.
+                let keys = &kb.s.ctx().key_generations;
+                assert_eq!(keys.physically_held(HostId(kb.k.host), key), held, "{case}");
             }
         }
     }
@@ -2996,7 +3020,11 @@ mod tests {
     #[tokio::test]
     async fn accelerator_state_is_scoped_to_its_keyboard() {
         let mut kb = Kb::with_accelerators("<Control>a").await;
+        // Control is held when the other keyboard gets its keymap, and
+        // pressed again once it has one.
+        kb.modifiers(CONTROL).await;
         let other = kb.another_keyboard().await;
+        kb.modifiers(0).await;
         kb.modifiers(CONTROL).await;
 
         assert_eq!(kb.key(2, KEY_A, PRESSED).await, Route::Host);
@@ -3203,6 +3231,16 @@ mod tests {
             ]
         );
 
+        // The keyboard holds Backspace, which the IME's Backspace fallback
+        // may claim, so a character the IME sends goes through another
+        // keyboard on the surface.
+        let other = kb.another_keyboard().await;
+        let ime = kb.text_input().await;
+        kb.keysym(ime, 10, 3, keysyms::KEY_a, PRESSED).await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [key_event(other, 3, 10, KEY_A, PRESSED)]
+        );
         // The guest was told the key is held, so its release is the guest's.
         assert_eq!(kb.key(2, BACKSPACE, RELEASED).await, Route::Guest);
     }
