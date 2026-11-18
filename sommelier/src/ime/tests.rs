@@ -31,7 +31,7 @@ use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_
 };
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1::Request as ExtManager;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1::Request as V1Manager;
-use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::Request as V1;
+use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::{self, Request as V1};
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{self, Event as V3};
 use crate::protocols::wayland::wl_pointer;
 use crate::protocols::{AnyEvent, AnyRequest};
@@ -751,4 +751,338 @@ fn row_G10_destroy_of_the_enabled_input_lets_another_enable() {
     let out = ime.enable(TI2);
     assert_eq!(out.host, activation(TI2, 1));
     assert_eq!(out.guest, [v3(TI2, V3::Done { serial: 1 })]);
+}
+
+// 2.2 Host events.
+
+#[test]
+fn row_H2_an_exo_detach_clears_the_preedit_and_activates_again() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let out = ime.step(Input::HostLeave(TI));
+    assert_eq!(out.guest, [no_preedit(), done(1)]);
+    let mut host = vec![req(
+        v1(TI),
+        V1::Activate {
+            seat: HOST_SEAT,
+            surface: HOST_SURFACE,
+        },
+    )];
+    host.extend(content_type(TI, false));
+    host.push(commit_state(TI, 1));
+    assert_eq!(out.host, host);
+    assert_eq!(ime.compose("나").guest, [preedit("나"), done(1)]);
+}
+
+#[test]
+fn row_H2prime_a_leave_that_answers_a_deactivate_is_ignored() {
+    let mut ime = Ime::new();
+    ime.create(TI);
+    let out = ime.step(Input::HostLeave(TI));
+    assert!(out.host.is_empty() && out.guest.is_empty());
+    ime.enable(TI);
+    ime.step(Input::Disable(TI));
+    ime.step(Input::Commit(TI));
+    let out = ime.step(Input::HostLeave(TI));
+    assert!(out.host.is_empty() && out.guest.is_empty());
+}
+
+#[test]
+fn row_H4_a_selection_style_becomes_the_preedit_cursor() {
+    let mut ime = Ime::enabled();
+    let style = |style| HostIme::PreeditStyling {
+        index: 3,
+        length: 3,
+        style,
+    };
+    ime.v1(style(zwp_text_input_v1::PREEDIT_STYLE_UNDERLINE));
+    assert_eq!(ime.compose("가나").guest, [preedit("가나"), done(1)]);
+    ime.v1(style(zwp_text_input_v1::PREEDIT_STYLE_SELECTION));
+    assert_eq!(
+        ime.compose("가나").guest,
+        [preedit_at("가나", 3, 6), done(1)]
+    );
+
+    // Only an attached text input records one.
+    ime.step(Input::Disable(TI));
+    let barrier = ime.step(Input::Commit(TI)).barriers()[0];
+    ime.v1(style(zwp_text_input_v1::PREEDIT_STYLE_SELECTION));
+    ime.step(Input::BarrierDone(barrier));
+    ime.enable(TI);
+    assert_eq!(ime.compose("가나").guest, [preedit("가나"), done(3)]);
+}
+
+#[test]
+fn row_H5_a_preedit_cursor_places_the_cursor() {
+    let mut ime = Ime::enabled();
+    for (cursor, expected) in [(3, (3, 3)), (1, (6, 6)), (-1, (-1, -1))] {
+        ime.v1(HostIme::PreeditCursor(cursor));
+        let out = ime.compose("가나");
+        assert_eq!(
+            out.guest,
+            [preedit_at("가나", expected.0, expected.1), done(1)]
+        );
+    }
+}
+
+#[test]
+fn row_H6_a_cursor_position_is_only_logged() {
+    let mut ime = Ime::enabled();
+    let out = ime.v1(HostIme::CursorPosition {
+        index: 0,
+        anchor: 0,
+    });
+    assert!(out.guest.is_empty() && out.host.is_empty() && out.keys.is_empty());
+    let out = ime.v1(HostIme::Commit {
+        serial: 0,
+        text: "a".into(),
+    });
+    assert_eq!(out.guest, [commit("a"), done(1)]);
+}
+
+#[test]
+fn row_H7_a_preedit_shows_and_its_clear_arms_the_lease() {
+    let mut ime = Ime::enabled();
+    let out = ime.compose("가");
+    assert_eq!(out.guest, [preedit("가"), done(1)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    let out = ime.compose("");
+    assert_eq!(out.guest, [no_preedit(), done(1)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::ArmIfBackspaceHeld)]);
+    // An empty preedit while none shows sends its done alone.
+    let out = ime.compose("");
+    assert_eq!(out.guest, [done(1)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+}
+
+#[test]
+fn row_H7_a_cleared_preedit_with_commit_text_commits_it() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.compose("가");
+    let out = ime.v1(HostIme::Preedit {
+        serial: 0,
+        text: "".into(),
+        commit: "가".into(),
+    });
+    assert_eq!(out.guest, [no_preedit(), commit("가"), done(2)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    // The guest has yet to report that commit, against which Exo measures
+    // its next absolute delete.
+    let out = ime.v1(HostIme::Delete {
+        index: 0,
+        length: 2,
+    });
+    assert_eq!(out.guest, []);
+    ime.report("ab가", 5);
+    let out = ime.v1(HostIme::Delete {
+        index: 2,
+        length: 3,
+    });
+    assert_eq!(out.guest, [delete(3, 0), done(3)]);
+}
+
+#[test]
+fn row_H7_a_preedit_that_does_not_fit_is_dropped() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    ime.v1(HostIme::PreeditCursor(0));
+    let out = ime.compose(&"x".repeat(4_084));
+    assert!(out.guest.is_empty() && out.keys.is_empty());
+    // The guest still shows its preedit, and the next one is placed by
+    // its own cursor.
+    let out = ime.step(Input::Commit(TI));
+    assert_eq!(out.guest, [preedit("가"), done(2)]);
+    assert_eq!(ime.compose("나").guest, [preedit("나"), done(2)]);
+}
+
+#[test]
+fn row_H7prime_a_preedit_that_is_not_utf8_is_dropped() {
+    let mut ime = Ime::enabled();
+    ime.v1(HostIme::PreeditCursor(0));
+    let out = ime.v1(HostIme::Preedit {
+        serial: 0,
+        text: IndexedString::NotUtf8(vec![0xff]),
+        commit: String::new(),
+    });
+    assert!(out.guest.is_empty() && out.keys.is_empty());
+    assert_eq!(ime.compose("나").guest, [preedit("나"), done(1)]);
+}
+
+#[test]
+fn row_H8_a_commit_ends_the_preedit() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let out = ime.v1(HostIme::Commit {
+        serial: 0,
+        text: "각".into(),
+    });
+    assert_eq!(out.guest, [no_preedit(), commit("각"), done(1)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    // One that does not fit is dropped.
+    ime.compose("가");
+    let out = ime.v1(HostIme::Commit {
+        serial: 0,
+        text: "x".repeat(4_090),
+    });
+    assert!(out.guest.is_empty() && out.keys.is_empty());
+    assert_eq!(ime.step(Input::Commit(TI)).guest, [preedit("가"), done(2)]);
+}
+
+#[test]
+fn row_H9_an_absolute_delete_becomes_lengths_around_the_cursor() {
+    let mut ime = Ime::enabled();
+    ime.report("abcd", 2);
+    let out = ime.v1(HostIme::Delete {
+        index: 1,
+        length: 2,
+    });
+    assert_eq!(out.guest, [delete(1, 1), done(2)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    // The guest has yet to report it: an absolute delete waits, and a
+    // relative one counts from the cursor. A shown preedit is cleared.
+    let absolute = HostIme::Delete {
+        index: 0,
+        length: 1,
+    };
+    assert_eq!(ime.v1(absolute).guest, []);
+    ime.compose("가");
+    let relative = HostIme::Delete {
+        index: -1,
+        length: 1,
+    };
+    assert_eq!(
+        ime.v1(relative).guest,
+        [no_preedit(), delete(1, 0), done(2)]
+    );
+}
+
+#[test]
+fn row_H9_a_delete_that_cannot_be_measured_is_dropped() {
+    type Case = (&'static str, Option<(&'static str, i32, i32)>, i32, u32);
+    let cases: [Case; 5] = [
+        ("no surrounding text", None, 0, 1),
+        ("a selection", Some(("abcd", 2, 0)), 0, 1),
+        ("not around the cursor", Some(("abcd", 2, 2)), 3, 1),
+        ("off a character boundary", Some(("가", 3, 3)), 1, 2),
+        ("empty", Some(("ab", 1, 1)), 1, 0),
+    ];
+    for (case, text, index, length) in cases {
+        let mut ime = Ime::enabled();
+        if let Some((text, cursor, anchor)) = text {
+            ime.step(Input::SurroundingText(TI, text.into(), cursor, anchor));
+            ime.step(Input::Commit(TI));
+        }
+        let out = ime.v1(HostIme::Delete { index, length });
+        assert!(out.guest.is_empty() && out.keys.is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn row_H10_keysyms_go_to_an_attached_input_whatever_its_fence() {
+    let mut ime = Ime::new();
+    ime.create(TI);
+    assert_eq!(ime.core.keysym_target(TI), None);
+    ime.enable(TI);
+    assert_eq!(ime.core.keysym_target(TI), Some(SEAT));
+    ime.compose("가");
+    ime.press(SURFACE);
+    assert_eq!(ime.core.keysym_target(TI), Some(SEAT));
+    ime.step(Input::Disable(TI));
+    ime.step(Input::Commit(TI));
+    assert_eq!(ime.core.keysym_target(TI), None);
+}
+
+#[test]
+fn row_X1_a_preedit_region_turns_text_into_the_preedit() {
+    let mut ime = Ime::enabled();
+    ime.report("a가b", 4);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let out = ime.ext(region(-3, 3));
+    assert_eq!(out.guest, [delete(3, 0), preedit_at("가", 3, 3), done(2)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    // The assembly places its cursor, and the text being ahead does not
+    // stop it.
+    ime.v1(HostIme::PreeditCursor(0));
+    let out = ime.ext(region(-3, 4));
+    assert_eq!(
+        out.guest,
+        [no_preedit(), delete(3, 1), preedit_at("가b", 0, 0), done(2)]
+    );
+    // An empty one deletes nothing and clears the shown preedit.
+    let out = ime.ext(region(0, 0));
+    assert_eq!(out.guest, [no_preedit(), done(2)]);
+}
+
+#[test]
+fn row_X1prime_a_region_the_text_cannot_hold_is_dropped() {
+    let mut ime = Ime::enabled();
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    ime.v1(HostIme::PreeditCursor(0));
+    let out = ime.ext(region(-1, 1));
+    assert!(out.guest.is_empty() && out.keys.is_empty());
+    assert_eq!(ime.compose("나").guest, [preedit("나"), done(1)]);
+    ime.report("ab", 1);
+    assert_eq!(ime.ext(region(1, 1)).guest, []);
+}
+
+#[test]
+fn row_X2_a_confirmation_commits_the_shown_preedit() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let out = ime.ext(HostIme::Confirm);
+    assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+}
+
+#[test]
+fn row_X2prime_an_empty_confirmation_recovers_the_held_key() {
+    let mut ime = Ime::enabled();
+    let out = ime.ext(HostIme::Confirm);
+    assert_eq!(out.guest, []);
+    assert_eq!(out.keys, [Key::Recover(TI, vec![done(1)])]);
+}
+
+#[test]
+fn row_W1_a_drained_link_activates_again() {
+    let mut ime = Ime::enabled();
+    ime.step(Input::Disable(TI));
+    let barrier = ime.step(Input::Commit(TI)).barriers()[0];
+    // An enable before the drain ends waits for it (R2).
+    let out = ime.enable(TI);
+    assert_eq!(
+        out.host,
+        [
+            surrounding(TI, "", 0),
+            cursor_rect(TI, (0, 0, 0, 0)),
+            commit_state(TI, 3),
+        ]
+    );
+    assert_eq!(out.guest, [done(3)]);
+    let out = ime.step(Input::BarrierDone(barrier));
+    let mut host = vec![req(
+        v1(TI),
+        V1::Activate {
+            seat: HOST_SEAT,
+            surface: HOST_SURFACE,
+        },
+    )];
+    host.extend(content_type(TI, false));
+    host.push(commit_state(TI, 3));
+    assert_eq!(out.host, host);
+}
+
+#[test]
+fn row_W2_a_fence_ends_only_with_its_own_barrier() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let fence = ime.press(SURFACE).barriers()[0];
+    // A drain, its barrier and a new activation leave the fence pending.
+    ime.step(Input::Disable(TI));
+    let barrier = ime.step(Input::Commit(TI)).barriers()[0];
+    ime.step(Input::BarrierDone(barrier));
+    ime.enable(TI);
+    assert_eq!(ime.compose("나").guest, []);
+    ime.step(Input::BarrierDone(fence));
+    assert_eq!(ime.compose("다").guest, [preedit("다"), done(3)]);
 }
