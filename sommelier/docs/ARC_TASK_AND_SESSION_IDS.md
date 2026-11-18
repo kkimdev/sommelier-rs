@@ -15,9 +15,21 @@ window policy to that namespace, and current Exo builds may reject arbitrary
 
 The host recognizes `org.chromium.arc.*` as an ARC application namespace. The
 ARC policy path is currently what allows the opt-in bounds backend to work.
-That classification can also affect restore/ghost bookkeeping, IME routing,
-shelf and task observation, pointer lock, drag-and-drop, clipboard,
-accessibility, and metrics. It is a compatibility workaround, not a generic
+That classification changes more than bounds:
+
+- **IME.** The window's keys are expected to bypass the ChromeOS IME, so
+  Korean and other composition would not work in it. Chromium's
+  `exo_app_type_resolver.cc` sets `aura::client::kSkipImeProcessing` on a
+  window with an ARC application ID, and `window_event_dispatcher.cc`
+  (`PreDispatchKeyEvent`) skips the IME for it. This follows from the
+  source and has not been verified on a host; see
+  [The ARC backend and the IME](WINDOW_SHORTCUT_CONFIGURATION.md#the-arc-backend-and-the-ime).
+- It can also affect restore/ghost bookkeeping, shelf and task
+  observation, pointer lock, drag-and-drop, clipboard, accessibility, and
+  metrics.
+
+The remote-shell-v2 placement backend keeps the Guest OS application ID,
+so none of this applies to it. It is a compatibility workaround, not a generic
 authorization mechanism: a Crostini client can provide its own app ID, so the
 ARC prefix must not be treated as proof of trust.
 

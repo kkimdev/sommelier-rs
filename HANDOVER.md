@@ -87,6 +87,11 @@
   [Output and work area](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#output-and-work-area);
   popups on a toplevel repaired through a late `zaura_shell` bind were also
   never checked on a host.
+- Neither placement backend has been checked on a host since they were
+  separated, and the remote-shell-v2 backend never has: stock Crostini
+  does not advertise `zcr_remote_shell_v2`. The
+  [manual test plan](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#manual-test-plan)
+  lists what to check for each.
 
 ## Next steps
 

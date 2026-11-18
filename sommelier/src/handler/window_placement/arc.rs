@@ -21,7 +21,18 @@ limitations under the License.
 //! ARC window, so while this backend is active every surface's Aura
 //! surface gets a per-surface `org.chromium.arc.<task_id>` identity instead
 //! of the guest's application ID (see
-//! `sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`). The backend owns the
+//! `sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`).
+//!
+//! That identity makes Chrome treat the window as an ARC app. Chromium's
+//! `exo_app_type_resolver.cc` sets `aura::client::kSkipImeProcessing` on it,
+//! and `window_event_dispatcher.cc` then sends its keys past the IME, so the
+//! ChromeOS IME, Korean composition included, is expected not to work in any
+//! window while this backend is active. This is inferred from the source and
+//! unverified on a host; the remote-shell-v2 backend does not have it (see
+//! "The ARC backend and the IME" in
+//! `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`).
+//!
+//! The backend owns the
 //! placement Aura toplevel of each XDG toplevel, that identity, the
 //! host-stream barrier that orders each bounds request, the configures held
 //! behind that barrier, and the translation of `zaura_toplevel.configure`

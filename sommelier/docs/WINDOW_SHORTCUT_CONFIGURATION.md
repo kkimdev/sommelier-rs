@@ -81,7 +81,17 @@ problem is logged once per process instead. The rules apply in this order:
 
 Every backend shares the configuration, the chord handling, the output and
 work area, and the rounding rule below; it differs only in how the window
-is moved.
+is moved, and in what that costs:
+
+| | `arc` | `remote-shell-v2` |
+| --- | --- | --- |
+| Host requirement | Any Exo whose `zaura_shell` sends `zaura_output.insets` | An Exo whose security delegate allows remote shell, which Crostini's does not |
+| Window classification | ARC app: the surface's Aura application ID is an ARC identity | Unchanged: the Guest OS application ID |
+| ChromeOS IME (Korean and other composition) | Expected to be bypassed in every window, so composition does not work (unverified on a host; see [The ARC backend and the IME](#the-arc-backend-and-the-ime)) | Expected to keep working, since the window is not ARC-classified (unverified on a host) |
+| Other side effects | Clipboard, drag and drop, restore and more may change ([ARC task and session IDs](ARC_TASK_AND_SESSION_IDS.md)) | XDG popups, window states and window geometry are not bridged (below) |
+
+So for using the ChromeOS IME in Linux apps the ARC backend is not usable
+as it stands, and the remote-shell-v2 backend needs a host that offers it.
 
 - **`arc`** sends `zaura_toplevel.set_window_bounds` in screen
   coordinates. Exo accepts it only from a surface it classifies as an ARC
@@ -89,9 +99,11 @@ is moved.
   `org.chromium.arc.<task_id>` identity while the backend is active (see
   [ARC task and session IDs](ARC_TASK_AND_SESSION_IDS.md)). That
   classification also changes how Chrome treats the window beyond its
-  bounds. Before the bounds, the window leaves fullscreen, maximized and
-  snapped state; a host barrier holds the configures Exo sends until it has
-  applied them.
+  bounds, most of all its keyboard input: the ChromeOS IME is expected to
+  be bypassed (see [The ARC backend and the IME](#the-arc-backend-and-the-ime)).
+  Before the bounds, the window leaves fullscreen, maximized and snapped
+  state; a host barrier holds the configures Exo sends until it has applied
+  them.
 - **`remote-shell-v2`** gives each toplevel's surface a host
   `zcr_remote_surface_v2` role from a host `zcr_remote_shell_v2` (v4 or
   newer), which the proxy binds for itself and never advertises to the
@@ -133,6 +145,29 @@ is moved.
     decorations: the host has no XDG toplevel to decorate.
   - A toplevel created while no remote shell is bound stays an XDG
     toplevel and is never placed, even after one is bound.
+
+### The ARC backend and the IME
+
+**The ARC backend is expected to disable the ChromeOS IME, including
+Korean composition, in every window while it is active.** This follows
+from Chromium's source and has not been verified on a host:
+
+- [`exo_app_type_resolver.cc`](https://chromium.googlesource.com/chromium/src/+/main/chrome/browser/ui/ash/shelf/app_service/exo_app_type_resolver.cc)
+  classifies a window whose application ID parses as an ARC task or
+  session, such as the `org.chromium.arc.<task_id>` identity this backend
+  gives every surface, as an ARC app, and sets
+  `aura::client::kSkipImeProcessing` on it.
+- [`window_event_dispatcher.cc`](https://chromium.googlesource.com/chromium/src/+/main/ui/aura/window_event_dispatcher.cc)
+  (`WindowEventDispatcher::PreDispatchKeyEvent`) then sends that window's
+  key events past the IME.
+- [`keyboard.cc`](https://chromium.googlesource.com/chromium/src/+/main/components/exo/keyboard.cc) treats the key as not
+  consumed: Exo expects an ARC client to send the events back to the IME
+  over its own bridge, which a Linux app does not have.
+
+A remote-shell-v2 window keeps the Guest OS application ID, so it is not
+ARC-classified and the IME is expected to keep working there; that backend
+needs a host whose security delegate allows remote shell
+(`CanAccessRemoteShell`), which Crostini's does not.
 
 ## Chord handling
 
@@ -370,6 +405,86 @@ thread: it runs between other tasks' steps, so it never races a key event,
 and it never waits for the accept loop. The file is read synchronously
 there; the 64 KiB bound and the regular-file check keep that read short. If
 that task ends, an error says reloads have stopped.
+
+## Manual test plan
+
+Both backends are verified by unit and Session tests only; this plan is
+for a host check. Follow
+[Manual verification](../../docs/INVARIANTS.md#manual-verification): run a
+separate test proxy on an unused socket, never the primary service, and
+make sure it runs the binary you built.
+
+```sh
+WIN=shortcuts.toml   # for example the file in "File format"
+RUST_LOG=sommelier=debug SOMMELIER_WINDOW_PLACEMENT_BACKEND=<backend> \
+  ./target/release/sommelier --virtio-wl /dev/wl0 \
+  --window-shortcuts-config "$WIN" wayland-placement-test
+WAYLAND_DISPLAY=wayland-placement-test <app>
+```
+
+For each backend, with a GTK app (such as `gedit`) and a non-GTK one
+(such as `foot`):
+
+1. The startup log names the backend and the loaded bindings, and no
+   configuration error.
+2. Every named action, and one `rect`, moves the focused window to its
+   region of the work area, which excludes the shelf, with no gap or
+   overlap between neighbours (under remote-shell-v2, a client-side
+   decorated window's shadow margin is part of its bounds, so its visible
+   edges leave a gap); each placement logs `window layout ...`.
+3. The window stays on its own monitor with two outputs, and placement is
+   right on a rotated output and at a fractional display scale; the window
+   content stays sharp.
+4. The shelf icon still matches the app, and pinning works.
+5. A chord is never typed into the app, even when a placement is skipped
+   (each skip is logged).
+
+**ARC** (`SOMMELIER_WINDOW_PLACEMENT_BACKEND=arc`): Chrome treats every
+window as an ARC window, so also check, against a run with placement off:
+
+- IME: type Korean in an ARC-placed window (`sommelier_test_app`);
+  expect the IME to be bypassed, so no composition appears (see
+  [The ARC backend and the IME](#the-arc-backend-and-the-ime)). Record
+  whether it is, which no host has confirmed yet.
+- Clipboard: copy and paste in both directions, text and an image.
+- Drag and drop between a guest window and a Chrome window.
+- Window restore: after signing out and in, or a restart of the VM, no
+  ghost or duplicate windows appear, and no window is restored as an
+  Android app.
+- Pointer lock in a game or a remote-desktop client, and the accessibility
+  tree (ChromeVox reads the window).
+- Overview, Alt+Tab and the shelf's window list show each window once.
+
+**Remote shell** (`SOMMELIER_WINDOW_PLACEMENT_BACKEND=remote-shell-v2`):
+it needs a host whose Exo offers `zcr_remote_shell_v2` to the guest's
+server, which stock Crostini does not; the log then says
+`Bound zcr_remote_shell_v2 v<N>`. If it warns that the host has no
+`zcr_remote_shell_v2`, the backend cannot be tested on that host. Then
+also check:
+
+- A new window maps with its title, centred in the work area at its own
+  size, before any placement, and without a frame of Exo's: a client that
+  draws no decorations shows none.
+- Its content is sharp at 1x, 2x and a fractional scale (the remote
+  surface's scale factor of 1.0 against the guest's buffer scale).
+- A placement takes effect at the app's next frame; an app that ignores a
+  same-size configure may not move on a placement that only changes the
+  position.
+- Exo's own moves (a display change, a snap from the window's frame
+  menu) leave the window where Exo put it, without the debug log showing
+  `set_bounds_in_output` repeating, which would mean the proxy and Exo
+  disagree about units.
+- Closing the window from the shelf or overview closes the app.
+- Menus and tooltips are dismissed at once (a known limit), and
+  maximize, fullscreen and interactive move or resize do nothing.
+- None of the ARC side effects above appear; in particular, Korean input
+  in `sommelier_test_app` composes and commits, and renders as glyphs.
+- Exo's remote-shell code sets its default scale cancellation for the
+  whole Exo server when a client binds `zcr_remote_shell_v2`; check that
+  Android apps and other guest windows still scale correctly while the
+  test proxy runs.
+
+Record the host's Chrome version, the backend, and each result.
 
 ## Code map
 
