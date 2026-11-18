@@ -1060,6 +1060,25 @@ fn row_H8_an_empty_commit_is_no_edit() {
     assert_eq!(out.guest, [delete(2, 0), done(2)]);
 }
 
+/// An empty commit over a shown preedit edits nothing either (the old
+/// code's `edited = !text.is_empty()`), so an absolute delete after it
+/// still applies.
+#[test]
+fn row_H8_an_empty_commit_over_a_preedit_is_no_edit() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.compose("가");
+    ime.v1(HostIme::Commit {
+        serial: 0,
+        text: String::new(),
+    });
+    let out = ime.v1(HostIme::Delete {
+        index: 0,
+        length: 2,
+    });
+    assert!(!out.guest.is_empty());
+}
+
 #[test]
 fn row_H9_an_absolute_delete_becomes_lengths_around_the_cursor() {
     let mut ime = Ime::enabled();

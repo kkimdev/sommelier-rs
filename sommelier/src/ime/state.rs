@@ -511,9 +511,10 @@ impl<'a> Current<'a> {
         self.plan(txn, false, lease)
     }
 
-    /// H8.
+    /// H8. An empty commit is no edit, whether or not a preedit shows, so
+    /// it leaves Exo's prediction of the text where it was.
     pub(super) fn host_commit(self, text: String) -> Planned<'a> {
-        let ahead = self.shown().is_some() || !text.is_empty();
+        let ahead = !text.is_empty();
         let txn = GuestTxn {
             commit: Some(text),
             ..GuestTxn::default()
