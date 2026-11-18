@@ -147,7 +147,7 @@ fn delete_lengths(text: &str, cursor: i32, index: i32, length: u32) -> Option<(u
 }
 
 fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
-    static KEYCODES: std::sync::OnceLock<std::collections::HashMap<u32, u32>> =
+    static KEYCODES: std::sync::OnceLock<std::collections::BTreeMap<u32, u32>> =
         std::sync::OnceLock::new();
     KEYCODES
         .get_or_init(|| {
@@ -162,10 +162,10 @@ fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
                 xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
             ) else {
                 log::error!("Could not initialize the fallback XKB keysym map");
-                return std::collections::HashMap::new();
+                return std::collections::BTreeMap::new();
             };
 
-            let mut keycodes = std::collections::HashMap::new();
+            let mut keycodes = std::collections::BTreeMap::new();
             for keycode_raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
                 if keycode_raw < 8 {
                     // Wayland exposes evdev keycodes (XKB code minus 8);
@@ -659,22 +659,24 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             guest_id
         );
 
+        // An empty preedit clears the shown one before its reset commit;
+        // a new preedit carries no commit, so it is last
+        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
+        let mut transaction = Vec::new();
+        if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
+            return drop_host_preedit(ctx, guest_id);
+        }
         // The v1 `commit` argument is the replacement text to use if this
         // preedit is reset, not text to insert alongside every live preedit
         // update. Exo commonly sends identical non-empty `text` and `commit`
         // values while composing Korean; forwarding both would insert every
         // intermediate syllable. Apply the fallback only when the host
         // actually clears the preedit (notably on reset/unfocus).
-        let mut transaction = Vec::new();
         if plan.had_preedit
             && text.is_empty()
             && !commit.is_empty()
             && !push_commit_string_to(&mut transaction, guest_id, commit)
         {
-            return drop_host_preedit(ctx, guest_id);
-        }
-
-        if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
             return drop_host_preedit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
@@ -1115,7 +1117,7 @@ impl zcr_text_input_extension_v1::ZcrTextInputExtensionV1Handler for TextInputEx
 pub struct ExtendedTextInputV1Handler;
 impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextInputV1Handler {
     // Translates zcr_extended_text_input_v1::set_preedit_region (cursor-relative index/length)
-    // into zwp_text_input_v1::delete_surrounding_text + preedit_string + done.
+    // into zwp_text_input_v3::delete_surrounding_text + preedit_string + done.
     fn on_set_preedit_region(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
         let host_ext_id = ctx.last_sender_id;
         log::trace!(
@@ -1166,6 +1168,8 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         let (cursor_begin, cursor_end) =
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
+        // The new preedit goes after the delete
+        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
         let mut transaction = Vec::new();
         transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
             guest_id,
@@ -2407,6 +2411,14 @@ mod tests {
                 keyboard_extension_with_keymap: true,
             })
             .await;
+            f.start_typing().await;
+            f
+        }
+
+        /// The guest enables the field with the surrounding text "가",
+        /// and the host activates it, as for [`Self::typing`].
+        async fn start_typing(&mut self) {
+            let f = self;
             f.s.guest([
                 v3::enable(f.ti),
                 v3::set_surrounding_text(f.ti, "가", 3, 3).unwrap(),
@@ -2433,7 +2445,6 @@ mod tests {
             ];
             assert_eq!(f.s.host_received(), expected);
             f.answered(1);
-            f
         }
 
         /// The host advertises the keyboard extension, which the proxy
@@ -3348,6 +3359,44 @@ mod tests {
             );
         }
     }
+
+    /// The text inputs of a seat follow its focus in ascending ID order,
+    /// whatever order the guest created them in, so what the proxy sends
+    /// never depends on how it hashes them. With eight, an order that
+    /// depends on hashing is all but certain to differ; two would match it
+    /// half the time.
+    #[tokio::test]
+    async fn the_text_inputs_of_a_seat_follow_its_focus_in_id_order() {
+        let mut f = Field::enabled().await;
+        let first = f.text_input();
+        let mut ids = vec![first.ti];
+        ids.extend((1..8).map(|_| f.s.new_id()));
+        for &id in ids[1..].iter().rev() {
+            f.create_text_input(id).await;
+        }
+        f.select(first);
+        let (keyboard, surface) = (f.keyboard, f.surface.id);
+
+        let leave = wl_keyboard::evt::leave(keyboard.host, 2, f.surface.host);
+        f.s.host([leave]).await;
+        let mut expected: Vec<(u32, AnyEvent)> = vec![(
+            keyboard.id,
+            wl_keyboard::Event::Leave { serial: 2, surface }.into(),
+        )];
+        expected.extend(ids.iter().map(|&ti| (ti, V3::Leave { surface }.into())));
+        assert_eq!(f.s.guest_received(), expected);
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(callback)]);
+
+        let entered: Vec<(u32, AnyEvent)> = ids
+            .iter()
+            .map(|&ti| (ti, V3::Enter { surface }.into()))
+            .collect();
+        assert_eq!(f.enter_surface().await, entered);
+        assert_eq!(f.s.host_received(), []);
+    }
+
     /// A disable invalidates the surrounding text, at the host too, and
     /// deactivates it, but only at its commit.
     #[tokio::test]
@@ -3407,7 +3456,7 @@ mod tests {
         f.s.host([f.preedit("간", "간")]).await;
         assert_eq!(f.s.guest_received(), f.events([preedit("간"), done()]));
         f.s.host([f.preedit("", "간")]).await;
-        let expected = [commit("간"), no_preedit(), done()];
+        let expected = [no_preedit(), commit("간"), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
@@ -4728,7 +4777,7 @@ mod tests {
             (
                 "a preedit reset commits its fallback",
                 |f| vec![f.preedit("미완성", ""), f.preedit("", "확정")],
-                vec![preedit("미완성"), DONE, commit("확정"), no_preedit(), DONE],
+                vec![preedit("미완성"), DONE, no_preedit(), commit("확정"), DONE],
             ),
             (
                 "a reset without a preedit commits nothing",
@@ -5220,7 +5269,7 @@ mod tests {
         let mut f = Field::with_surrounding_text("abc", 3, 3).await;
         f.s.host([f.preedit("가", "가"), f.preedit("", "가")]).await;
         let done = || V3::Done { serial: 2 };
-        let expected = [preedit("가"), done(), commit("가"), no_preedit(), done()];
+        let expected = [preedit("가"), done(), no_preedit(), commit("가"), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         f.s.host([f.delete_range(2, 1)]).await;
@@ -5629,6 +5678,72 @@ mod tests {
         };
         f.s.host([f.peek(backspace), f.confirm()]).await;
         assert_eq!(f.s.guest_received(), f.recovered(backspace));
+    }
+
+    /// The keys a `wl_keyboard.enter` reports held are numbered in the
+    /// host's order, each at its first listing, and a peek of such a key
+    /// takes its number. So when the host lists S, then A, then S again,
+    /// and peeks S, then A, an empty confirmation stands for A, the key
+    /// numbered last and peeked last: the order follows the host, not the
+    /// keycodes. The guest holds A since the enter, so it gets no key
+    /// pair, only the `done` that closes the transaction. Numbered by
+    /// keycode, A would come first, the latest peek would not be the
+    /// newest key, and the confirmation would stand for nothing.
+    #[tokio::test]
+    async fn keys_held_at_an_enter_are_numbered_in_the_hosts_order() {
+        const KEY_S: u32 = 31;
+        const KEY_A: u32 = 30;
+        let mut f = Field::offered(Host {
+            text_input_extension: EXTENSION,
+            keyboard_extension_with_keymap: true,
+        })
+        .await;
+        f.keyboard_leave().await;
+        let keys: Vec<u8> = [KEY_S, KEY_A, KEY_S]
+            .iter()
+            .flat_map(|key| key.to_ne_bytes())
+            .collect();
+        let enter = wl_keyboard::evt::enter(f.keyboard.host, 3, f.surface.host, &keys);
+        f.s.host([enter.unwrap()]).await;
+        let (keyboard, surface) = (f.keyboard.id, f.surface.id);
+        let modifiers = wl_keyboard::Event::Modifiers {
+            serial: 3,
+            mods_depressed: 0,
+            mods_latched: 0,
+            mods_locked: 0,
+            group: 0,
+        };
+        let mut expected: Vec<(u32, AnyEvent)> = vec![
+            (
+                keyboard,
+                wl_keyboard::Event::Enter {
+                    serial: 3,
+                    surface,
+                    keys,
+                }
+                .into(),
+            ),
+            (keyboard, modifiers.into()),
+        ];
+        expected.extend(f.events([V3::Enter { surface }]));
+        assert_eq!(f.s.guest_received(), expected);
+        assert_eq!(f.s.host_received(), []);
+        f.start_typing().await;
+
+        let s = Stroke {
+            key: KEY_S,
+            state: PRESSED,
+            serial: 800,
+            time: 2_000,
+        };
+        let a = Stroke {
+            key: KEY_A,
+            serial: 801,
+            time: 2_001,
+            ..s
+        };
+        f.s.host([f.peek(s), f.peek(a), f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), f.events([DONE]));
     }
 
     /// A text input destroyed while its deactivation drains sends nothing

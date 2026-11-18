@@ -24,7 +24,7 @@ limitations under the License.
 //! rather than stored, and each destructor ends exactly the roles it
 //! removes. All IDs are guest IDs.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// The role an `xdg_surface` gives its `wl_surface`.
 #[derive(Debug, Clone, Copy)]
@@ -35,10 +35,12 @@ struct XdgSurfaceRole {
     toplevel: Option<u32>,
 }
 
-/// One connection's guest `xdg_surface` and `xdg_toplevel` links.
+/// One connection's guest `xdg_surface` and `xdg_toplevel` links, ordered
+/// by `xdg_surface`, the order in which a late `zaura_shell` attaches the
+/// toplevels.
 #[derive(Debug, Default)]
 pub(crate) struct XdgRoles {
-    by_xdg_surface: HashMap<u32, XdgSurfaceRole>,
+    by_xdg_surface: BTreeMap<u32, XdgSurfaceRole>,
 }
 
 impl XdgRoles {

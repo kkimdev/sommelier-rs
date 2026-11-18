@@ -222,6 +222,19 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `earlier_reverse_output_reaches_the_guest_before_the_error`,
   `a_forward_that_ends_the_session_discards_its_deferred_work`,
   `an_invalid_message_length_is_reported_before_closing`.
+- **Nothing the proxy sends depends on hash order.** No message the
+  proxy sends, and no state that later decides one (an ID or number it
+  allocates, or which of several objects it picks), depends on the order
+  of a hash collection. When a message makes the proxy send something for
+  each of several objects, it visits them in ascending order of a key the
+  session's messages decide, such as an ID. The crate therefore uses no
+  hash collection: every map and set is a `BTreeMap` or `BTreeSet`, and
+  `sommelier/clippy.toml` makes `std::collections::HashMap` and `HashSet`
+  `clippy::disallowed_types` errors. So the same messages always make the
+  same bytes, and a session can be replayed exactly.
+  Tests: `the_text_inputs_of_a_seat_follow_its_focus_in_id_order`,
+  `a_host_format_reaches_every_guest_shm_in_id_order`,
+  `keys_held_at_an_enter_are_numbered_in_the_hosts_order`.
 
 ## Protocol errors
 
@@ -882,6 +895,44 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   outside tests it does so only in `TextInputState::count_guest_commit`.
   Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
   `v3_requests_after_leave_are_ignored_until_next_enter`.
+- **A v3 transaction's events go in one order.** Every transaction the
+  proxy sends a guest text input puts its events in this order, each one
+  it has: a `preedit_string("")` that clears the preedit the guest shows,
+  `delete_surrounding_text`, `commit_string`, a new non-empty
+  `preedit_string`, then `done`. It is the order of mutter, which sends
+  a delete when the input method makes it, a commit right after a
+  preedit clear, and the new preedit last, with the `done`
+  (`src/wayland/meta-wayland-text-input.c` 317, 336-337 and 195-224,
+  revision b766717a), and of KWin (`src/wayland/textinput_v3.cpp`
+  268-323, revision f213b9af). Clients that store each event and apply
+  the transaction at its `done`, in the protocol's order (delete, commit,
+  then preedit), do not depend on it: Chromium's
+  `ZwpTextInputV3Impl::OnDone`
+  (`ui/ozone/platform/wayland/host/zwp_text_input_v3.cc`, revision
+  ffb4f13519), GTK3's `text_input_done` (`modules/input/imwayland.c`,
+  revision c780332c), GTK4's (`gtk/gtkimcontextwayland.c`, revision
+  92348cd4), Qt's `QWaylandTextInputv3::zwp_text_input_v3_done`
+  (qtbase `src/plugins/platforms/wayland/qwaylandtextinputv3.cpp` 188,
+  revision 8a98cde366ff) and kitty's `text_input_done`
+  (`glfw/wl_text_input.c` 103, revision 32f3f1dc71e8). Other clients
+  depend on it:
+  - winit drops the pending preedit at a `commit_string`
+    (`winit-wayland/src/seat/text_input/mod.rs` 117-119, master
+    f0abec90a3f9; `src/platform_impl/linux/wayland/seat/text_input/mod.rs`
+    114-116 in 0.30.12), so a new preedit before a commit is lost.
+  - SDL3 acts on each event as it arrives and turns a delete into a
+    Backspace (`src/video/wayland/SDL_waylandevents.c` 2649-2710, main
+    1fc62260fc81), which its `testime` ignores while a preedit is shown
+    (`test/testime.c` 1084-1086), so a delete after a new preedit deletes
+    nothing.
+
+  No transaction has both a delete and a commit yet, since Exo's deletes
+  stand alone (next rule). One order also gives each transaction one wire
+  form, which a recorded trace can compare byte for byte.
+  Tests: `host_ime_events_become_v3_transactions`,
+  `a_reset_commit_waits_for_the_guest_to_report_it`,
+  `on_set_preedit_region_translates_correctly`,
+  `exo_deletes_become_v3_deletes_around_the_cursor`.
 - **Exo's deletes are absolute and stand alone.** Exo sends
   `zwp_text_input_v1.delete_surrounding_text(index, length)` with `index`
   a byte offset from the start of the surrounding text, not from the
@@ -1197,6 +1248,13 @@ end it.
   lifetime and only then removes a stale socket. If another process holds
   the lock, the proxy exits and leaves that socket alone.
   Test: `a_held_socket_lock_protects_the_live_socket`.
+- **A failed start is logged, not a panic.** When the proxy cannot start
+  (no `XDG_RUNTIME_DIR`, no device or compositor, a socket it cannot
+  claim or bind), it logs why and exits with status 1. No test covers
+  the device or compositor case.
+  Tests: `a_missing_runtime_directory_is_a_logged_startup_error`,
+  `an_unbindable_socket_is_a_logged_startup_error`, and, for a socket
+  another process holds, `a_held_socket_lock_protects_the_live_socket`.
 
 ## ChromeOS shelf application IDs
 

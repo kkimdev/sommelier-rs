@@ -14,8 +14,12 @@
 # name. It cannot tell a blocking read or ioctl from a non-blocking one, so
 # those stay a review matter.
 #
-# One lint, clippy::disallowed_methods, enforces all three rules, so an
-# allow for one of them lifts the others too. Allow it on the narrowest
+# Nothing the proxy sends may depend on hash order; see "Wire messages"
+# in docs/INVARIANTS.md. The crate uses no hash collection at all, so
+# clippy::disallowed_types rejects HashMap and HashSet, with no exception.
+#
+# One lint, clippy::disallowed_methods, enforces the first three rules, so
+# an allow for one of them lifts the others too. Allow it on the narrowest
 # item that needs it: a module-wide allow (the generated protocols, the
 # fuzzer, test modules) also lets blocking calls through.
 disallowed-methods = [
@@ -44,4 +48,9 @@ disallowed-methods = [
     { path = "std::process::Command::output", reason = "waiting for a child process stalls every client; use tokio::process" },
     { path = "std::process::Command::status", reason = "waiting for a child process stalls every client; use tokio::process" },
     { path = "std::thread::JoinHandle::join", reason = "waiting for a thread stalls every client" },
+]
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "nothing the proxy sends may depend on hash order (INVARIANTS \"Nothing the proxy sends depends on hash order\"); use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "nothing the proxy sends may depend on hash order (INVARIANTS \"Nothing the proxy sends depends on hash order\"); use BTreeSet" },
 ]

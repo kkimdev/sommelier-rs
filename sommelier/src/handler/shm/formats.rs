@@ -361,6 +361,38 @@ mod tests {
         assert_eq!(s.host_received(), []);
     }
 
+    /// A format the host's wl_shm reports reaches every guest `wl_shm` in
+    /// ascending ID order, whatever order the guest bound them in, so what
+    /// the proxy sends never depends on how it hashes them. With eight, an
+    /// order that depends on hashing is all but certain to differ.
+    #[tokio::test]
+    async fn a_host_format_reaches_every_guest_shm_in_id_order() {
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        let name = s.advertise("wl_shm", wl_shm::VERSION).await;
+        let host_shm = internal_bind(&s.host_received(), "wl_shm");
+        let advertised = s.guest_received();
+        let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+            &advertised[..]
+        else {
+            panic!("the guest was not advertised wl_shm: {advertised:?}");
+        };
+        let format =
+            |shm, format| -> (u32, AnyEvent) { (shm, wl_shm::Event::Format { format }.into()) };
+        let shms = (0..8).map(|_| s.new_id()).collect::<Vec<_>>();
+        for &shm in shms.iter().rev() {
+            let bind = wl_registry::req::bind(registry.id, name, "wl_shm", *version, shm);
+            s.guest([bind.unwrap()]).await;
+            assert_eq!(s.guest_received(), [format(shm, 0), format(shm, 1)]);
+        }
+        assert_eq!(s.host_received(), [], "the proxy implements wl_shm");
+
+        s.host([wl_shm::evt::format(host_shm, wl_shm::FORMAT_RGB565)])
+            .await;
+        let expected = shms.iter().map(|&shm| format(shm, wl_shm::FORMAT_RGB565));
+        assert_eq!(s.guest_received(), expected.collect::<Vec<_>>());
+    }
+
     #[test]
     fn replacement_shm_capability_does_not_reach_stale_guest_object() {
         use crate::handler::registry::RegistryHandler;
