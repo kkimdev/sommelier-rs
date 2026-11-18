@@ -861,13 +861,15 @@ fn admit_guest_bind(
     // bindable until wl_global_destroy, as Exo does by deferring it after
     // wl_global_remove. A host that destroyed it at once would answer the
     // bind with INVALID_OBJECT, as it would a native client's.
-    if let Some(inert_bind_version) = ctx
+    if let Some(removal) = ctx
         .registries
         .get(&registry_host_id)
         .and_then(|record| record.removal(name))
     {
         let inert = interface == INERT_BIND_INTERFACE
-            && inert_bind_version.is_some_and(|version| (1..=version).contains(&requested_version));
+            && removal
+                .inert_bind_version
+                .is_some_and(|version| (1..=version).contains(&requested_version));
         return inert.then_some(BindAdmission::Inert);
     }
 

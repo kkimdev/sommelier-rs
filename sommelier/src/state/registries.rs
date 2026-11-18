@@ -42,6 +42,15 @@ struct RegistryGlobal {
     status: Status,
 }
 
+/// What a registry's removal of a global leaves behind for a bind that
+/// crossed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Removal {
+    /// The version the guest saw, if a bind that crossed the removal may
+    /// create an inert object (see `INERT_BIND_INTERFACE`).
+    pub(crate) inert_bind_version: Option<u32>,
+}
+
 /// Whether a registry still lists a global it advertised.
 #[derive(Clone, Copy, Debug)]
 enum Status {
@@ -96,11 +105,10 @@ impl RegistryRecord {
     }
 
     /// If the registry saw global `name` removed and has not listed it
-    /// since, the version at which a bind that crossed the removal may
-    /// create an inert object, if any.
-    pub(crate) fn removal(&self, name: u32) -> Option<Option<u32>> {
+    /// since, what the removal leaves for a bind that crossed it.
+    pub(crate) fn removal(&self, name: u32) -> Option<Removal> {
         match self.globals.get(&name)?.status {
-            Status::Removed { inert_bind_version } => Some(inert_bind_version),
+            Status::Removed { inert_bind_version } => Some(Removal { inert_bind_version }),
             Status::Listed { .. } => None,
         }
     }
