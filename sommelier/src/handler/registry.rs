@@ -1446,14 +1446,15 @@ mod tests {
     use super::{
         forwarded_global_version, keyboard_extension_version, should_bind_internal_dmabuf,
         RegistryHandler, Singleton, FORWARDED_PROTOCOLS, KEYBOARD_EXTENSION_VERSION,
-        LINUX_DMABUF_CAPABILITY_VERSION, TEXT_INPUT_EXTENSION_VERSION, WL_SHM_VERSION,
-        XDG_DECORATION_ALLOWED, ZAURA_SHELL_MIN_VERSION,
+        LINUX_DMABUF_CAPABILITY_VERSION, WL_SHM_VERSION, XDG_DECORATION_ALLOWED,
+        ZAURA_SHELL_MIN_VERSION,
     };
     use crate::handler::callback::CallbackHandler;
     use crate::handler::linux_dmabuf::LinuxDmabufHandler;
     use crate::placement_config::PlacementConfig;
     use crate::protocols::aura_shell::{zaura_output, zaura_shell};
     use crate::protocols::gtk::gtk_shell1;
+    use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
@@ -1654,345 +1655,243 @@ mod tests {
         assert!(ctx.shadow_table.is_pending_destroy_guest(A.guest));
     }
 
+    /// Each registry gets its own synthetic global, under the name its host
+    /// registry gave it, and every such name is bindable.
     #[test]
-    fn synthetic_shm_global_is_sent_to_each_guest_registry() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_for_test(10, 100, "wl_registry");
-        ctx.shadow_table
-            .insert_paired_for_test(11, 101, "wl_registry");
-        let mut handler = RegistryHandler;
-        let shm = "wl_shm".to_string();
+    fn synthetic_globals_are_sent_to_each_guest_registry() {
+        for (interface, version, advertised) in
+            [("wl_shm", 2, "wl_shm"), ("zaura_shell", 38, "gtk_shell1")]
+        {
+            for name_on_b in [7, 8] {
+                let mut ctx = context(&[A, B]);
+                assert_eq!(A.global(&mut ctx, 7, interface, version), Action::Drop);
+                assert_eq!(
+                    B.global(&mut ctx, name_on_b, interface, version),
+                    Action::Drop
+                );
+                assert_eq!(
+                    guest_globals(&mut ctx),
+                    [
+                        (A.guest, global_event(7, advertised, 1)),
+                        (B.guest, global_event(name_on_b, advertised, 1)),
+                    ],
+                    "{interface} as {name_on_b} on B"
+                );
+                assert_eq!(
+                    ctx.host_globals.get(&name_on_b),
+                    Some(&HostGlobal {
+                        interface: advertised.to_string(),
+                        version: 1,
+                    }),
+                    "{interface} as {name_on_b} on B"
+                );
 
-        ctx.last_sender_id = 100;
-        assert_eq!(handler.on_global(&mut ctx, 7, &shm, 2), Action::Drop);
-        ctx.host_to_client_queue.clear();
-
-        ctx.last_sender_id = 101;
-        assert_eq!(
-            handler.on_global(&mut ctx, 7, &shm, 2),
-            Action::Drop,
-            "the second registry must consume the host event locally"
-        );
-        assert_eq!(
-            ctx.host_to_client_queue.len(),
-            1,
-            "each registry needs its own synthetic wl_shm global event"
-        );
-        let message = &ctx.host_to_client_queue[0].0;
-        assert_eq!(
-            crate::test_support::msg_sender(message),
-            11,
-            "the synthetic event must target the second guest registry"
-        );
+                assert_eq!(B.bind(&mut ctx, name_on_b, advertised, 1, 20), Action::Drop);
+                assert!(!ctx.is_fatal(), "{interface} as {name_on_b} on B");
+                assert_eq!(
+                    ctx.shadow_table.get_interface(20),
+                    Some(advertised),
+                    "{interface} as {name_on_b} on B"
+                );
+            }
+        }
     }
 
+    /// The proxy serves the `gtk_shell1` it advertises for `zaura_shell`
+    /// itself, and sends its capabilities once the host has answered a
+    /// sync.
     #[test]
-    fn aura_global_exposes_local_gtk_shell_to_every_registry() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 100, "wl_registry", 1);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(11, 101, "wl_registry", 1);
-        let mut handler = RegistryHandler;
-        let aura = "zaura_shell".to_string();
+    fn a_gtk_shell_bind_is_served_locally() {
+        let mut ctx = context(&[A]);
+        assert_eq!(A.global(&mut ctx, 7, "zaura_shell", 38), Action::Drop);
+        guest_globals(&mut ctx);
+        ctx.client_to_host_queue.clear();
 
-        ctx.last_sender_id = 100;
-        assert_eq!(handler.on_global(&mut ctx, 7, &aura, 38), Action::Drop);
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        let global = &ctx.host_to_client_queue[0].0;
-        assert_eq!(crate::test_support::msg_sender(global), 10);
-        let mut wire = crate::wire::WireMessage::new(10, 0, &global[8..]);
-        assert_eq!(wire.read_u32().unwrap(), 7);
-        assert_eq!(wire.read_string().unwrap(), "gtk_shell1");
-        assert_eq!(wire.read_u32().unwrap(), 1);
-
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = 101;
-        assert_eq!(handler.on_global(&mut ctx, 7, &aura, 38), Action::Drop);
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(
-            crate::test_support::msg_sender(&ctx.host_to_client_queue[0].0),
-            11
-        );
-
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = 10;
-        assert_eq!(
-            handler.on_bind(&mut ctx, 7, &("gtk_shell1".to_string(), 1, 50)),
-            Action::Drop
-        );
+        assert_eq!(A.bind(&mut ctx, 7, "gtk_shell1", 1, 50), Action::Drop);
         assert!(ctx.shadow_table.is_local(50));
         assert!(ctx.gtk_shells.contains_key(&50));
-        assert!(ctx.host_to_client_queue.is_empty());
-        let callback_id = ctx
-            .client_to_host_queue
-            .iter()
-            .rev()
-            .find(|(message, _)| {
-                message[0..4] == 1u32.to_ne_bytes()
-                    && crate::test_support::msg_opcode(message)
-                        == crate::protocols::wayland::wl_display::REQ_SYNC
-            })
-            .map(|(message, _)| u32::from_ne_bytes(message[8..12].try_into().unwrap()))
-            .expect("GTK capability callback");
+        assert_eq!(guest_globals(&mut ctx), []);
+        let requests = host_requests(&mut ctx, &[]);
+        let [(WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            requests[..]
+        else {
+            panic!("the host got {requests:?}, not one sync");
+        };
         assert_eq!(
-            ctx.internal_callbacks.get(HostId(callback_id)),
+            ctx.internal_callbacks.get(HostId(callback)),
             Some(InternalCallback::GtkShellCapabilities { gtk_shell: 50 })
         );
-        ctx.last_sender_id = callback_id;
+
+        ctx.last_sender_id = callback;
         assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        let capabilities = &ctx.host_to_client_queue[0].0;
-        assert_eq!(crate::test_support::msg_sender(capabilities), 50);
         assert_eq!(
-            crate::test_support::msg_opcode(capabilities),
-            gtk_shell1::EVT_CAPABILITIES
-        );
-        assert_eq!(
-            u32::from_ne_bytes(capabilities[8..12].try_into().unwrap()),
-            0
+            decoded(&ctx.host_to_client_queue, gtk_shell1::Event::from_wire),
+            [(50, gtk_shell1::Event::Capabilities { capabilities: 0 })]
         );
     }
 
+    /// The proxy binds each global it uses itself at the newest version
+    /// both it and the host support, and keeps each binding's host ID from
+    /// reuse.
     #[test]
-    fn re_advertised_synthetic_shm_global_remains_bindable() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_for_test(10, 100, "wl_registry");
-        ctx.shadow_table
-            .insert_paired_for_test(11, 101, "wl_registry");
-        let mut handler = RegistryHandler;
-        let shm = "wl_shm".to_string();
-
-        ctx.last_sender_id = 100;
-        assert_eq!(handler.on_global(&mut ctx, 7, &shm, 2), Action::Drop);
-        ctx.host_to_client_queue.clear();
-
-        // The second registry receives the same synthetic global with a new
-        // host global name. It must carry its own metadata: bind validation is
-        // keyed by the numeric name, not merely by interface.
-        ctx.last_sender_id = 101;
-        assert_eq!(handler.on_global(&mut ctx, 8, &shm, 2), Action::Drop);
-        assert_eq!(
-            ctx.host_globals.get(&8),
-            Some(&HostGlobal {
-                interface: shm.clone(),
-                version: 1,
-            }),
-            "every visible synthetic global needs bind metadata"
-        );
-
-        ctx.last_sender_id = 11;
-        let bind = (shm, 1, 20);
-        assert_eq!(handler.on_bind(&mut ctx, 8, &bind), Action::Drop);
-        assert_eq!(
-            ctx.shadow_table.get_interface(20),
-            Some("wl_shm"),
-            "the second registry's synthetic global must accept a bind"
-        );
-    }
-
-    #[test]
-    fn internal_bindings_are_capped_to_generated_protocol_versions() {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-
-        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
-        assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 99), Action::Drop);
-        let dmabuf_id = ctx.host_dmabuf_id.expect("dmabuf binding");
-        assert_eq!(ctx.shadow_table.host_object_version(dmabuf_id), Some(3));
-
-        let extension = "zcr_text_input_extension_v1".to_string();
-        assert_eq!(
-            handler.on_global(&mut ctx, 11, &extension, 99),
-            Action::Drop
-        );
-        let extension_id = ctx
-            .host_text_input_extension_v1_id
-            .expect("text input extension binding");
-        assert_eq!(
-            ctx.shadow_table.host_object_version(extension_id),
-            Some(TEXT_INPUT_EXTENSION_VERSION)
-        );
-    }
-
-    #[test]
-    fn internally_bound_objects_are_reserved_from_host_id_reuse() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-
-        for (name, (interface, version)) in [
-            (100, ("zwp_text_input_manager_v1", 1)),
-            (101, ("zcr_text_input_extension_v1", 1)),
-            (102, ("zcr_keyboard_extension_v1", 2)),
-            (103, ("wl_shm", 1)),
-        ] {
-            let interface = interface.to_string();
-            let _ = handler.on_global(&mut ctx, name, &interface, version);
+    fn internal_bindings_are_capped_and_reserved_from_host_id_reuse() {
+        let mut ctx = context(&[A]);
+        // Offered at v99, each is bound at the newest version the proxy
+        // supports: the vendored XML's, or wl_shm's v1.
+        let bindings = [
+            (
+                1,
+                "zwp_text_input_manager_v1",
+                zwp_text_input_manager_v1::VERSION,
+                2,
+            ),
+            (
+                2,
+                "zcr_text_input_extension_v1",
+                zcr_text_input_extension_v1::VERSION,
+                3,
+            ),
+            (
+                3,
+                "zcr_keyboard_extension_v1",
+                zcr_keyboard_extension_v1::VERSION,
+                4,
+            ),
+            (4, "wl_shm", 1, 5),
+        ];
+        for (name, interface, _, _) in bindings {
+            assert_eq!(A.global(&mut ctx, name, interface, 99), Action::Drop);
         }
 
+        assert_eq!(
+            host_requests(&mut ctx, &[]),
+            bindings.map(|(name, interface, version, id)| {
+                (A.host, bind_request(name, interface, version, id))
+            })
+        );
         assert_eq!(ctx.host_text_input_manager_v1_id, Some(2));
         assert_eq!(ctx.host_text_input_extension_v1_id, Some(3));
-        assert_eq!(ctx.host_keyboard_extension_id.map(|id| id.0), Some(4));
+        assert_eq!(ctx.host_keyboard_extension_id, Some(HostId(4)));
         assert_eq!(ctx.host_shm_id, Some(5));
-        assert_eq!(ctx.shadow_table.create_host_only("wl_callback", 1), 6);
-        for (id, interface) in [
-            (2, "zwp_text_input_manager_v1"),
-            (3, "zcr_text_input_extension_v1"),
-            (4, "zcr_keyboard_extension_v1"),
-            (5, "wl_shm"),
-        ] {
+        for (_, interface, version, id) in bindings {
             assert_eq!(ctx.shadow_table.get_host_interface(id), Some(interface));
+            assert_eq!(ctx.shadow_table.host_object_version(id), Some(version));
+        }
+        assert_eq!(ctx.shadow_table.create_host_only("wl_callback", 1), 6);
+
+        // Offered at v1, each is bound at v1.
+        for (_, interface, _, _) in bindings {
+            let mut ctx = context(&[A]);
+            assert_eq!(A.global(&mut ctx, 1, interface, 1), Action::Drop);
+            assert_eq!(
+                host_requests(&mut ctx, &[]),
+                [(A.host, bind_request(1, interface, 1, 2))],
+                "{interface}"
+            );
+            assert_eq!(ctx.shadow_table.host_object_version(2), Some(1));
         }
     }
 
+    /// Without synthetic feedback the guest gets the host's linux-dmabuf at
+    /// once, capped at v3, the version the proxy binds to collect legacy
+    /// format modifiers.
     #[test]
-    fn internal_dmabuf_binding_uses_capability_version_three() {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
+    fn a_dmabuf_without_synthetic_feedback_is_offered_and_bound_at_v3() {
+        let dmabuf = "zwp_linux_dmabuf_v1";
+        for version in [4, 5, 99] {
+            let mut ctx = gpu_context(&[A]);
+            assert_eq!(A.global(&mut ctx, 10, dmabuf, version), Action::Drop);
 
-        assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 5), Action::Drop);
-
-        let host_id = ctx.host_dmabuf_id.expect("internal dmabuf binding");
-        assert_eq!(
-            ctx.shadow_table.host_object_version(host_id),
-            Some(3),
-            "the internal binding must collect v3 legacy modifiers while the \
-             guest-facing global supports feedback v4+"
-        );
-
-        let bind = &ctx.client_to_host_queue[0].0;
-        let mut wire = crate::wire::WireMessage::new(1, 0, &bind[8..]);
-        assert_eq!(wire.read_u32().unwrap(), 10);
-        assert_eq!(wire.read_string().unwrap(), dmabuf);
-        assert_eq!(
-            wire.read_u32().unwrap(),
-            3,
-            "internal host bind should request v3 for legacy modifier discovery"
-        );
-        assert_eq!(wire.read_u32().unwrap(), host_id);
+            let host_id = ctx.host_dmabuf_id.expect("the internal binding");
+            assert_eq!(ctx.shadow_table.host_object_version(host_id), Some(3));
+            assert_eq!(
+                host_requests(&mut ctx, &[]),
+                [(A.host, bind_request(10, dmabuf, 3, host_id))],
+                "v{version}"
+            );
+            assert_eq!(
+                guest_globals(&mut ctx),
+                [(A.guest, global_event(10, dmabuf, 3))]
+            );
+            assert_eq!(
+                ctx.host_globals.get(&10),
+                Some(&HostGlobal {
+                    interface: dmabuf.to_string(),
+                    version: 3,
+                })
+            );
+            assert!(ctx.pending_dmabuf_globals.is_empty());
+            assert_eq!(ctx.internal_callbacks.count(), 0);
+        }
     }
 
+    /// With synthetic feedback the guest's linux-dmabuf global waits for
+    /// the capabilities of its binding, and stays hidden if the host offers
+    /// no format the proxy supports.
     #[test]
-    fn gpu_without_allocator_exposes_host_v3_without_feedback_barrier() {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
+    fn a_synthetic_dmabuf_global_waits_for_its_capabilities() {
+        let dmabuf = "zwp_linux_dmabuf_v1";
+        for (formats, offered) in [(&[XRGB8888_LINEAR][..], Some(4)), (&[], None)] {
+            let mut ctx = gpu_context(&[A]);
+            ctx.synthetic_feedback_available_for_test = true;
+            assert_eq!(A.global(&mut ctx, 10, dmabuf, 4), Action::Drop);
+            let generation = ctx.global_generations[&10];
+            assert!(!ctx.host_globals.contains_key(&10));
+            assert_eq!(guest_globals(&mut ctx), []);
+            assert_eq!(ctx.pending_dmabuf_globals.len(), 1);
 
-        assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 4), Action::Drop);
+            ctx.dmabuf_capabilities
+                .get_mut(&generation)
+                .expect("capability generation")
+                .format_modifiers
+                .extend_from_slice(formats);
+            LinuxDmabufHandler::complete_capability_discovery(&mut ctx, generation);
 
-        assert_eq!(
-            ctx.host_globals.get(&10),
-            Some(&HostGlobal {
-                interface: dmabuf,
-                version: 3,
-            })
-        );
-        assert!(ctx.pending_dmabuf_globals.is_empty());
-        assert_eq!(ctx.internal_callbacks.count(), 0);
-        assert_eq!(
-            ctx.client_to_host_queue.len(),
-            1,
-            "only the internal v3 bind should be sent without feedback synthesis"
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        let global = &ctx.host_to_client_queue[0].0;
-        let mut wire = crate::wire::WireMessage::new(1, 0, &global[8..]);
-        assert_eq!(wire.read_u32().unwrap(), 10);
-        assert_eq!(wire.read_string().unwrap(), "zwp_linux_dmabuf_v1");
-        assert_eq!(wire.read_u32().unwrap(), 3);
+            assert!(ctx.pending_dmabuf_globals.is_empty());
+            assert_eq!(
+                ctx.host_globals.get(&10),
+                offered
+                    .map(|version| HostGlobal {
+                        interface: dmabuf.to_string(),
+                        version,
+                    })
+                    .as_ref()
+            );
+            assert_eq!(
+                guest_globals(&mut ctx),
+                Vec::from_iter(offered.map(|version| (A.guest, global_event(10, dmabuf, version))))
+            );
+            assert_eq!(
+                ctx.registry_global_visibility[&A.host].get(&10),
+                Some(&offered.is_some())
+            );
+        }
     }
 
+    /// A global of version 0 is malformed; the proxy drops it.
     #[test]
-    fn synthetic_dmabuf_global_waits_for_completed_capabilities() {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.synthetic_feedback_available_for_test = true;
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 4), Action::Drop);
-        let generation = ctx.global_generations[&10];
+    fn a_zero_version_global_is_dropped() {
+        let mut ctx = context(&[A]);
+        assert_eq!(A.global(&mut ctx, 10, "wl_seat", 0), Action::Drop);
         assert!(!ctx.host_globals.contains_key(&10));
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert_eq!(ctx.pending_dmabuf_globals.len(), 1);
+        assert_eq!(guest_globals(&mut ctx), []);
+    }
 
-        ctx.dmabuf_capabilities
-            .get_mut(&generation)
-            .expect("capability generation")
-            .format_modifiers
-            .push((0x3432_5258, 0));
-        LinuxDmabufHandler::complete_capability_discovery(&mut ctx, generation);
-
+    /// A second global under a name a registry lists is a duplicate; the
+    /// proxy drops it and keeps the first.
+    #[test]
+    fn a_duplicate_global_name_is_dropped() {
+        let mut ctx = context(&[A]);
+        assert_eq!(A.global(&mut ctx, 11, "wl_seat", 5), Action::Forward);
+        assert_eq!(A.global(&mut ctx, 11, "wl_output", 3), Action::Drop);
         assert_eq!(
-            ctx.host_globals.get(&10),
+            ctx.host_globals.get(&11),
             Some(&HostGlobal {
-                interface: dmabuf,
-                version: 4,
-            })
-        );
-        assert!(ctx.pending_dmabuf_globals.is_empty());
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(ctx.registry_global_visibility[&1].get(&10), Some(&true));
-    }
-
-    #[test]
-    fn synthetic_dmabuf_global_stays_hidden_without_supported_formats() {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.synthetic_feedback_available_for_test = true;
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 4), Action::Drop);
-        let generation = ctx.global_generations[&10];
-        LinuxDmabufHandler::complete_capability_discovery(&mut ctx, generation);
-
-        assert!(!ctx.host_globals.contains_key(&10));
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert!(ctx.pending_dmabuf_globals.is_empty());
-        assert_eq!(ctx.registry_global_visibility[&1].get(&10), Some(&false));
-    }
-
-    #[test]
-    fn malformed_zero_version_global_is_not_exposed() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let mut handler = RegistryHandler;
-        let seat = "wl_seat".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &seat, 0), Action::Drop);
-        assert!(!ctx.host_globals.contains_key(&10));
-        assert!(ctx.host_to_client_queue.is_empty());
-    }
-
-    #[test]
-    fn duplicate_global_name_does_not_overwrite_existing_metadata() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let mut handler = RegistryHandler;
-        let first = "wl_seat".to_string();
-        let second = "wl_output".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &first, 5), Action::Forward);
-        assert_eq!(handler.on_global(&mut ctx, 10, &second, 3), Action::Drop);
-        assert_eq!(
-            ctx.host_globals.get(&10),
-            Some(&HostGlobal {
-                interface: first,
+                interface: "wl_seat".to_string(),
                 version: 5,
             })
         );
+        assert_eq!(guest_globals(&mut ctx), []);
     }
 
     /// A removed output is forgotten and its `zaura_output` released at
