@@ -441,3 +441,191 @@ impl Exo {
         self.text_inputs.get_mut(id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::AnyEvent;
+    use crate::test_support::decoded;
+
+    const SEAT: u32 = 2;
+    const TI_MANAGER: u32 = 3;
+    const EXT_MANAGER: u32 = 4;
+    const TI: u32 = 10;
+    const EXT: u32 = 11;
+    const A: u32 = 20;
+    const B: u32 = 21;
+
+    /// Exo whose seat focuses surface `A`, with text input `TI` and its
+    /// extension `EXT`, not yet activated.
+    fn exo() -> Exo {
+        let mut exo = Exo::default();
+        let create = zwp_text_input_manager_v1::Request::CreateTextInput { id: TI };
+        send(&mut exo, TI_MANAGER, create);
+        let extend = zcr_text_input_extension_v1::Request::GetExtendedTextInput {
+            id: EXT,
+            text_input: TI,
+        };
+        send(&mut exo, EXT_MANAGER, extend);
+        exo.set_focus(Some(A));
+        exo
+    }
+
+    fn send(exo: &mut Exo, sender: u32, request: impl Into<AnyRequest>) {
+        exo.request(sender, &request.into());
+    }
+
+    fn activate(surface: u32) -> zwp_text_input_v1::Request {
+        zwp_text_input_v1::Request::Activate {
+            seat: SEAT,
+            surface,
+        }
+    }
+
+    /// A content type of `input_type` with every other value set apart
+    /// from the defaults.
+    fn input_type(input_type: u32) -> extended::Request {
+        extended::Request::SetInputType {
+            input_type,
+            input_mode: extended::INPUT_MODE_NUMERIC,
+            input_flags: extended::INPUT_FLAGS_AUTOCORRECT_OFF,
+            learning_mode: extended::LEARNING_MODE_DISABLED,
+            inline_composition_support: extended::INLINE_COMPOSITION_SUPPORT_UNSUPPORTED,
+        }
+    }
+
+    fn support(supported: bool) -> extended::Request {
+        let support = if supported {
+            extended::SURROUNDING_TEXT_SUPPORT_SUPPORTED
+        } else {
+            extended::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
+        };
+        extended::Request::SetSurroundingTextSupport { support }
+    }
+
+    /// The events Exo sent since the last call, decoded.
+    fn events(exo: &mut Exo) -> Vec<(u32, AnyEvent)> {
+        decoded(&exo.take_events(), |msg| {
+            AnyEvent::from_wire(interface(msg.sender_id), msg)
+        })
+    }
+
+    /// The interface of each object the tests name.
+    fn interface(id: u32) -> &'static str {
+        match id {
+            TI => "zwp_text_input_v1",
+            EXT => "zcr_extended_text_input_v1",
+            _ => panic!("no test object has ID {id}"),
+        }
+    }
+
+    fn enter(surface: u32) -> (u32, AnyEvent) {
+        (TI, zwp_text_input_v1::Event::Enter { surface }.into())
+    }
+
+    fn leave() -> (u32, AnyEvent) {
+        (TI, zwp_text_input_v1::Event::Leave {}.into())
+    }
+
+    fn field(exo: &Exo) -> &Field {
+        &exo.text_inputs[&TI].field
+    }
+
+    #[test]
+    fn e1_activate_moves_the_input_method_only_to_another_surface() {
+        let mut exo = exo();
+        send(&mut exo, TI, activate(A));
+        assert_eq!(events(&mut exo), [enter(A)]);
+        send(&mut exo, TI, activate(A));
+        assert_eq!(events(&mut exo), []);
+        // The seat does not focus B, so nothing attaches there until it
+        // does.
+        send(&mut exo, TI, activate(B));
+        assert_eq!(events(&mut exo), [leave()]);
+        exo.set_focus(Some(B));
+        assert_eq!(events(&mut exo), [enter(B)]);
+    }
+
+    #[test]
+    fn e2_attaching_sets_text_and_keeps_the_flags_learning_and_support() {
+        let mut exo = exo();
+        send(&mut exo, TI, activate(A));
+        send(&mut exo, EXT, support(false));
+        send(&mut exo, EXT, input_type(extended::INPUT_TYPE_PASSWORD));
+        let typed = field(&exo).content_type;
+        send(
+            &mut exo,
+            TI,
+            zwp_text_input_v1::Request::Deactivate { seat: SEAT },
+        );
+        let detached = ContentType {
+            input_type: extended::INPUT_TYPE_NONE,
+            input_mode: extended::INPUT_MODE_DEFAULT,
+            ..typed
+        };
+        assert_eq!(field(&exo).content_type, detached);
+        send(&mut exo, TI, activate(A));
+        let attached = ContentType {
+            input_type: extended::INPUT_TYPE_TEXT,
+            input_mode: extended::INPUT_MODE_TEXT,
+            ..typed
+        };
+        assert_eq!(field(&exo).content_type, attached);
+        assert!(!field(&exo).surrounding_text_supported);
+        assert_eq!(events(&mut exo), [enter(A), leave(), enter(A)]);
+    }
+
+    #[test]
+    fn e2_exo_detaches_on_focus_loss_surface_end_and_input_method_end() {
+        let mut exo = exo();
+        let detaches: [fn(&mut Exo); 3] = [
+            |exo| exo.set_focus(Some(B)),
+            |exo| exo.forget(|id| id != A),
+            |exo| assert!(exo.destroy_input_method()),
+        ];
+        for detach in detaches {
+            exo.set_focus(Some(A));
+            send(&mut exo, TI, activate(A));
+            assert_eq!(events(&mut exo), [enter(A)]);
+            detach(&mut exo);
+            assert_eq!(events(&mut exo), [leave()]);
+            assert_eq!(
+                field(&exo).content_type.input_type,
+                extended::INPUT_TYPE_NONE
+            );
+        }
+        // A surface that ends unfocused takes its activations with it, so
+        // a new surface with its ID gets none.
+        send(&mut exo, TI, activate(B));
+        exo.forget(|id| id != B);
+        exo.set_focus(Some(B));
+        assert_eq!(events(&mut exo), []);
+    }
+
+    #[test]
+    fn e3_a_content_type_spends_the_pending_support_and_needs_an_input_method() {
+        let mut exo = exo();
+        send(&mut exo, EXT, support(false));
+        send(&mut exo, EXT, input_type(extended::INPUT_TYPE_PASSWORD));
+        assert_eq!(
+            field(&exo).content_type.input_type,
+            extended::INPUT_TYPE_NONE
+        );
+        send(&mut exo, TI, activate(A));
+        let content_type = zwp_text_input_v1::Request::SetContentType {
+            hint: zwp_text_input_v1::CONTENT_HINT_NONE,
+            purpose: zwp_text_input_v1::CONTENT_PURPOSE_URL,
+        };
+        send(&mut exo, TI, content_type);
+        assert_eq!(
+            field(&exo).content_type.input_type,
+            extended::INPUT_TYPE_URL
+        );
+        assert!(field(&exo).surrounding_text_supported);
+        send(&mut exo, EXT, support(false));
+        send(&mut exo, EXT, input_type(extended::INPUT_TYPE_EMAIL));
+        assert!(!field(&exo).surrounding_text_supported);
+        send(&mut exo, EXT, input_type(extended::INPUT_TYPE_EMAIL));
+        assert!(field(&exo).surrounding_text_supported);
+    }
+}
