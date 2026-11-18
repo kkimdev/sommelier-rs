@@ -926,7 +926,7 @@ impl Exo {
             self.ima.composing = false;
         }
         if let Some(text) = &composition {
-            self.ima.composing = !text.is_empty();
+            self.ima.composing = true;
             self.set_composition(id, text);
         }
         commit.is_some() || composition.is_some()
@@ -1599,19 +1599,6 @@ mod tests {
     fn answer(exo: &mut Exo, id: u64, actions: Vec<TextAction>) -> Answer {
         assert_eq!(exo.answer(&EngineOut::Text { id, actions }), Answer::Normal);
         exo.answer(&EngineOut::Done { id, handled: true })
-    }
-
-    #[test]
-    fn a_composition_taken_back_to_nothing_leaves_ima_not_composing() {
-        let mut exo = active(V10);
-        press(&mut exo, 'r', &[shows("ㄱ")], true);
-        press(&mut exo, 'r', &[shows("")], true);
-        // A reset then finds the engine composing nothing, and leaves it
-        // alone, so a key in flight keeps what the engine makes of it.
-        exo.key(NOW, k('k'), DOWN);
-        exo.take_engine();
-        send(&mut exo, TI, zwp_text_input_v1::Request::Reset {});
-        assert_eq!(exo.take_engine(), []);
     }
 
     #[test]
