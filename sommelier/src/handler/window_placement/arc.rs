@@ -1074,7 +1074,10 @@ mod tests {
 
     #[test]
     fn aura_configure_drops_truncated_state_entry() {
-        assert_eq!(guest_xdg_toplevel_states(&[2, 0, 0, 0, 4, 0], 6).len(), 4);
+        // State 2 (fullscreen), then half of another entry.
+        let mut states = 2_u32.to_ne_bytes().to_vec();
+        states.extend([4, 0]);
+        assert_eq!(guest_xdg_toplevel_states(&states, 6), 2_u32.to_ne_bytes());
     }
 
     #[test]
