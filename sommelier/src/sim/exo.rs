@@ -691,6 +691,20 @@ impl Exo {
         std::mem::take(&mut self.events)
     }
 
+    /// The host text inputs an input method is attached to on the focused
+    /// surface: the ones whose preedits and presses matter.
+    pub(crate) fn composing_text_inputs(&self) -> Vec<u32> {
+        self.text_inputs
+            .iter()
+            .filter(|(_, text_input)| {
+                text_input.field.attached
+                    && self.focus.is_some()
+                    && text_input.surface == self.focus
+            })
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
     /// The fields of the text inputs active on the focused surface.
     pub(crate) fn focused_fields(&self) -> Vec<Field> {
         self.text_inputs
