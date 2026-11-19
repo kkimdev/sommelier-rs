@@ -20,7 +20,7 @@ limitations under the License.
 
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
-use super::state::{Confirm, Deferral, DeleteDrop, LinkState, TextInput};
+use super::state::{Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput};
 use super::{
     BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, Input, KeyEffect, LeaseOutcome,
     SeatId, SurfaceId, TiId,
@@ -344,6 +344,14 @@ impl ImeCore {
             },
             HostIme::PreeditRegion { index, length } => match cur.region(index, length, assembly) {
                 Ok(planned) => planned,
+                Err(RegionDrop::Uncovered) => {
+                    log::debug!(
+                        "Ignoring a preedit region {index}+{length} of text input {} that does \
+                         not cover the region it shows",
+                        ti.0
+                    );
+                    return;
+                }
                 Err(drop) => {
                     log::warn!(
                         "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
