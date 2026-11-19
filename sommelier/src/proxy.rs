@@ -563,6 +563,28 @@ impl Client {
                     .map(str::to_string),
             };
 
+            if direction == Direction::HostToClient {
+                // An empty IME confirmation's recovery of a held key waits
+                // for the host's next event, which may show that it was
+                // Exo's confirmation before a new press. What it sends the
+                // guest precedes this event's own forward.
+                crate::handler::ime_keys::before_host_event(
+                    &mut self.ctx,
+                    sender_id,
+                    interface.as_deref(),
+                    opcode,
+                    &packet[MessageHeader::LEN..],
+                );
+                let decided = self.ctx.take_effects();
+                debug_assert!(decided.end.is_none() && decided.wait.is_none());
+                for message in decided.to_guest {
+                    out.push(message);
+                }
+                for message in decided.to_host {
+                    reverse_out.push(message);
+                }
+            }
+
             let result = if let Some(interface) = interface {
                 // The message takes its descriptors from the front of the
                 // queue; dropping it unforwarded closes them.

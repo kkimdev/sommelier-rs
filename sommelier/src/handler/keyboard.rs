@@ -988,6 +988,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
 /// focus, destroy its extended keyboard, and clear its routing, keymap, XKB
 /// and key state.
 pub(crate) fn forget_keyboard(ctx: &mut Context, guest_keyboard_id: u32, host_keyboard_id: HostId) {
+    crate::handler::ime_keys::forget_recovery_of_keyboard(ctx, guest_keyboard_id);
     ctx.keyboard_to_seat.remove(&guest_keyboard_id);
     let focus_update = ctx.keyboard_focus.release(host_keyboard_id);
     // Clear per-keyboard keymap, dropped keys, XKB state, and modifiers.
@@ -1204,7 +1205,7 @@ mod tests {
     };
     use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
-    use crate::protocols::wayland::{wl_display, wl_registry, wl_seat};
+    use crate::protocols::wayland::{wl_callback, wl_display, wl_registry, wl_seat};
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
     use crate::state::{GuestKeyEvent, OutputState};
@@ -1753,11 +1754,27 @@ mod tests {
             }
         }
 
-        /// The host input method confirms its empty composition.
+        /// The host input method confirms its empty composition, and sends
+        /// nothing else before the `done` of the sync the proxy sends with
+        /// a recovery that waits, if it does: an autorepeat's confirmation
+        /// ([`crate::handler::ime_keys::PendingRecovery`]).
         async fn confirm(&mut self, ime: Ime) {
             self.s
                 .host([zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0)])
                 .await;
+            self.answer_recovery_sync().await;
+        }
+
+        /// The host answers the sync the proxy sent with a recovery that
+        /// waits, if it sent one.
+        async fn answer_recovery_sync(&mut self) {
+            match self.s.host_received()[..] {
+                [] => {}
+                [(_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] => {
+                    self.s.host([wl_callback::evt::done(callback, 0)]).await;
+                }
+                ref other => panic!("the host got {other:?}, not a recovery's sync"),
+            }
         }
 
         /// The host input method sends a keysym, which Exo stamps with the
@@ -4039,10 +4056,15 @@ mod tests {
     fn a_duplicate_pressed_peek_keeps_its_generation() {
         let mut p = Proxy::new();
         p.map(KEYBOARD);
+        let sequence = |p: &Proxy| {
+            let press = p.ctx.key_generations.peek(HostId(KEYBOARD.host), KEY_SPACE);
+            press.map(|press| press.sequence)
+        };
         assert_eq!(p.peek(KEYBOARD, 1, 100, KEY_SPACE, PRESSED), Action::Drop);
+        let first = sequence(&p);
+        assert!(first.is_some());
         assert_eq!(p.peek(KEYBOARD, 2, 200, KEY_SPACE, PRESSED), Action::Drop);
-        let press = p.ctx.key_generations.peek(HostId(KEYBOARD.host), KEY_SPACE);
-        assert_eq!(press.map(|press| press.sequence), Some(1));
+        assert_eq!(sequence(&p), first);
     }
 
     #[test]

@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::callback::queue_internal_sync;
 use crate::handler::text_input::active_guest_for_host_text_input;
+use crate::ime::{SeatId, TiId};
+use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{Context, GuestKeyDelivery, GuestKeyEvent, HostId};
+use crate::state::{Context, GuestKeyDelivery, GuestKeyEvent, HostId, InternalCallback};
 use crate::wire::Action;
 
 /// Return whether the repeat fallback belongs to this physical host
@@ -519,6 +523,261 @@ pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepe
     true
 }
 
+/// X2': an empty confirmation's recovery of a held key, which waits until
+/// the host shows whose confirmation it was.
+///
+/// At extension v11 Exo confirms before every press its input method did
+/// not handle (E13), and sends that press's `peek_key` and
+/// `wl_keyboard.key` after the confirmation (E8), in the same task. So an
+/// empty confirmation that finds a held key the input method took is
+/// either an autorepeat of that key or the confirmation of a new press,
+/// which the proxy cannot tell until the host's next events. It holds the
+/// recovery in [`Context::pending_recovery`], and the next host event
+/// decides it ([`before_host_event`]):
+///
+/// - before any peek, the keyboard's `modifiers` leave it waiting: Exo
+///   sends them right before the key they apply to;
+/// - the `peek_key` press of a key the keyboard does not hold leaves it
+///   waiting, as that key's possible press;
+/// - that key's `wl_keyboard.key` press, with the peek's serial, shows that
+///   the input method did not handle the press, so the confirmation was
+///   its own: no key is recovered, as when a confirmation finds no held
+///   key;
+/// - the text input's `leave` shows that the confirmation was the one Exo
+///   sends as it detaches the input method (E6): no key is recovered
+///   either, and the detach ends the recovery of every key held
+///   ([`forget_held_keys_for_seat`]);
+/// - any other event shows that the confirmation was an autorepeat: the
+///   held key is recovered ([`recover_pending`]), and then the event is
+///   handled.
+///
+/// A recovery that waits also syncs with the host, whose `done` follows
+/// every event of the confirmation's task (E11), so that one round trip
+/// decides it at the latest. No timer is involved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRecovery {
+    ti: TiId,
+    seat: SeatId,
+    /// The seat's eligible held key when the confirmation came.
+    held: HeldRepeatKey,
+    /// The `peek_key` press of a key not held before, since the
+    /// confirmation: its host keyboard, key and serial.
+    press: Option<(HostId, u32, u32)>,
+}
+
+impl PendingRecovery {
+    /// The guest text input, guest keyboard and host keyboard it names.
+    #[cfg(test)]
+    pub(crate) fn objects_for_test(&self) -> (u32, u32, HostId) {
+        let held = self.held;
+        (self.ti.0, held.guest_keyboard_id, held.host_keyboard_id)
+    }
+}
+
+/// X2': text input `ti` of `seat` confirmed an empty composition
+/// ([`crate::ime::KeyEffect::RecoverHeldKey`]). With no eligible held key,
+/// nothing is sent, and the Backspace lease ends. With one, the recovery
+/// waits for the host's next event ([`PendingRecovery`]).
+pub(super) fn hold_recovery(ctx: &mut Context, ti: TiId, seat: SeatId) {
+    debug_assert!(
+        ctx.pending_recovery.is_none(),
+        "the confirmation's own event decided the recovery before it"
+    );
+    let Some(held) = held_repeat_key_for_seat(ctx, seat.0) else {
+        end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
+        log::debug!(
+            "Ignoring confirm_preedit without an active preedit for guest {}",
+            ti.0
+        );
+        return;
+    };
+    ctx.pending_recovery = Some(PendingRecovery {
+        ti,
+        seat,
+        held,
+        press: None,
+    });
+    queue_internal_sync(ctx, InternalCallback::KeyRecovery);
+}
+
+/// Decide the pending recovery, if any, before the host event of
+/// `interface` (none for an untracked sender), whose sender is `sender`,
+/// `opcode` and `payload` are handled ([`PendingRecovery`]). What it sends
+/// the guest goes before that event.
+pub(crate) fn before_host_event(
+    ctx: &mut Context,
+    sender: u32,
+    interface: Option<&str>,
+    opcode: u16,
+    payload: &[u8],
+) {
+    let Some(pending) = ctx.pending_recovery else {
+        return;
+    };
+    let mut msg = crate::wire::WireMessage::new(sender, opcode, payload);
+    match (interface, pending.press) {
+        (Some(wl_keyboard::NAME), None) if opcode == wl_keyboard::EVT_MODIFIERS => {}
+        (Some(zcr_extended_keyboard_v1::NAME), None) => {
+            let peek = zcr_extended_keyboard_v1::Event::from_wire(&mut msg);
+            let Ok(zcr_extended_keyboard_v1::Event::PeekKey {
+                serial, key, state, ..
+            }) = peek
+            else {
+                return recover_pending(ctx);
+            };
+            let keyboard = ctx
+                .extended_keyboard_to_keyboard
+                .get(&HostId(sender))
+                .copied();
+            let press = keyboard.filter(|&keyboard| {
+                let seat = ctx
+                    .shadow_table
+                    .get_guest_id(keyboard.0)
+                    .and_then(|guest| ctx.keyboard_to_seat.get(&guest));
+                state == wl_keyboard::KEY_STATE_PRESSED
+                    && seat == Some(&pending.seat.0)
+                    && !ctx.key_generations.physically_held(keyboard, key)
+            });
+            match press {
+                Some(keyboard) => {
+                    let pending = ctx.pending_recovery.as_mut().expect("checked above");
+                    pending.press = Some((keyboard, key, serial));
+                }
+                None => recover_pending(ctx),
+            }
+        }
+        (Some(wl_keyboard::NAME), Some(press)) if opcode == wl_keyboard::EVT_KEY => {
+            let own_press = match wl_keyboard::Event::from_wire(&mut msg) {
+                Ok(wl_keyboard::Event::Key {
+                    serial, key, state, ..
+                }) => {
+                    state == wl_keyboard::KEY_STATE_PRESSED
+                        && press == (HostId(sender), key, serial)
+                }
+                _ => false,
+            };
+            match own_press {
+                true => drop_pending(ctx),
+                false => recover_pending(ctx),
+            }
+        }
+        (Some(zwp_text_input_v1::NAME), _)
+            if opcode == zwp_text_input_v1::EVT_LEAVE
+                && ctx.shadow_table.get_guest_id(sender) == Some(pending.ti.0) =>
+        {
+            drop_pending(ctx);
+        }
+        _ => recover_pending(ctx),
+    }
+}
+
+/// The pending recovery's confirmation was Exo's before the press it was
+/// waiting on (E13), or before its detach (E6): no key is recovered, and
+/// the Backspace lease ends, as when a confirmation finds no held key.
+fn drop_pending(ctx: &mut Context) {
+    let Some(PendingRecovery { ti, seat, held, .. }) = ctx.pending_recovery.take() else {
+        return;
+    };
+    log::debug!(
+        "An empty IME confirmation was the host's before a new press or a detach, not a \
+         repeat of held key {}",
+        held.key
+    );
+    end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
+}
+
+/// The pending recovery's confirmation was an autorepeat of its held key:
+/// the guest gets the key's press and release unless another channel
+/// already delivered it, then the transaction that closes the
+/// confirmation, whether or not the pair went. If the text input no longer
+/// passes the gate, or the key is no longer held, nothing is sent, and the
+/// lease ends. The lease:
+/// - a held Backspace whose pair is sent arms it, unless a press since the
+///   confirmation cancelled its repeat;
+/// - a held Backspace whose pair is skipped ends it;
+/// - another held key whose pair is sent ends it;
+/// - another held key whose pair is skipped leaves it alone.
+pub(crate) fn recover_pending(ctx: &mut Context) {
+    let Some(PendingRecovery { ti, seat, held, .. }) = ctx.pending_recovery.take() else {
+        return;
+    };
+    let keyboard_held = ctx.shadow_table.get_host_id(held.guest_keyboard_id)
+        == Some(held.host_keyboard_id.0)
+        && ctx
+            .key_generations
+            .physically_held(held.host_keyboard_id, held.key);
+    let done = keyboard_held.then(|| ctx.ime.recovery_done(ti)).flatten();
+    let Some(done) = done else {
+        end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
+        log::debug!(
+            "Dropping the recovery of held key {} for text input {}, which no longer \
+             passes the gate or holds the key",
+            held.key,
+            ti.0
+        );
+        return;
+    };
+    let backspace = held.key == crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
+    if synthesize_ime_consumed_key_pair(ctx, held) {
+        if backspace {
+            // A press since the confirmation may have cancelled the repeat,
+            // as it would have right after an immediate recovery.
+            ctx.key_generations
+                .arm_ime_repeat(held.host_keyboard_id, held.key, ti.0);
+        } else {
+            end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
+        }
+        log::debug!(
+            "Recovered empty IME confirmation as held key {} press/release",
+            held.key
+        );
+    } else if backspace {
+        end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
+    }
+    // GTK waits for the matching text-input transaction to finish before
+    // applying a key that passed through the active IME. A v1 confirm with
+    // no preedit has no text mutation, so its v3 equivalent is the guest's
+    // state again.
+    ctx.host_to_client_queue.extend(done);
+}
+
+/// H2: the input method detached text input on its own, as when its
+/// process restarts. The key events in flight died with it, as their
+/// callbacks never come, so a held key's release may never reach the
+/// keyboard, and the keys it took are no longer its to confirm. No key a
+/// keyboard of `guest_seat` holds now is recovered again; its next press
+/// starts a generation that can be.
+pub(super) fn forget_held_keys_for_seat(ctx: &mut Context, guest_seat: u32) {
+    let host_keyboards: Vec<_> = ctx
+        .keyboard_to_seat
+        .iter()
+        .filter(|(_, &seat)| seat == guest_seat)
+        .filter_map(|(&guest, _)| ctx.shadow_table.get_host_id(guest).map(HostId))
+        .collect();
+    for keyboard in host_keyboards {
+        ctx.key_generations.invalidate_peeks(keyboard);
+    }
+}
+
+/// Forget the pending recovery if it names guest text input `ti`, which
+/// ended.
+pub(crate) fn forget_recovery_of_text_input(ctx: &mut Context, ti: TiId) {
+    if ctx.pending_recovery.is_some_and(|pending| pending.ti == ti) {
+        ctx.pending_recovery = None;
+    }
+}
+
+/// Forget the pending recovery if its held key is on guest keyboard
+/// `guest_keyboard`, which ended.
+pub(crate) fn forget_recovery_of_keyboard(ctx: &mut Context, guest_keyboard: u32) {
+    if ctx
+        .pending_recovery
+        .is_some_and(|pending| pending.held.guest_keyboard_id == guest_keyboard)
+    {
+        ctx.pending_recovery = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +907,26 @@ mod tests {
             [],
             "releasing the superseding key must not revive an older generation"
         );
+    }
+
+    /// Keys held since `wl_keyboard.enter` are ordered by their peeks, not
+    /// by the order the enter listed them in: an empty confirmation stands
+    /// for the key peeked last. The guest holds both from the enter, so it
+    /// gets no pair, only the `done` of a held key found.
+    #[test]
+    fn keys_held_since_enter_are_ordered_by_their_peeks() {
+        const TAB: u32 = 15;
+        const SPACE: u32 = 57;
+        let mut ime = Ime::with_extended_keyboard();
+        let generations = &mut ime.ctx.key_generations;
+        generations.install_enter_snapshot(HOST_KEYBOARD, [TAB, SPACE]);
+        let repeatable = ime.ctx.keyboard_repeatable_keys.entry(HOST_KEYBOARD);
+        repeatable.or_default().extend([TAB, SPACE]);
+
+        ime.peek(SPACE, PRESSED, 700, 100);
+        ime.peek(TAB, PRESSED, 701, 101);
+        ime.confirm();
+        assert_eq!(ime.events(), [uncommitted_done()]);
     }
 
     #[test]

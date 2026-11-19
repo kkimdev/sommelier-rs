@@ -115,6 +115,22 @@ const CASES: &[Regression] = &[
         choices: &[],
     },
     Regression {
+        // Seed 456, shrunk. Backspace, which the input method takes, is
+        // held when Space is pressed, which it does not handle: Exo's
+        // confirmation before Space (E13) comes before Space's peek (E8).
+        name: "an empty confirmation before an unhandled press repeats no held key",
+        client: ClientKind::Chromium,
+        settled: false,
+        latin: false,
+        texts: &["0aa1b2닭닭", "0가가1닭2"],
+        actions: &[
+            UserAction::Key(Key::Char('v')),
+            UserAction::KeyDown(Key::Backspace),
+            UserAction::Key(Key::Char(' ')),
+        ],
+        choices: &[],
+    },
+    Regression {
         // Seed 1000050, shrunk. The guest shows a host preedit, which Exo
         // holds before its cursor, when the input method reconverts it.
         name: "a region over a host preedit is measured from Exo's cursor",

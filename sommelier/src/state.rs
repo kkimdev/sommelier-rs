@@ -455,6 +455,10 @@ pub struct Context {
     /// Physical, peek, repeat-recovery, and guest-delivery state for every
     /// keyboard/key generation.
     pub key_generations: KeyGenerationRegistry,
+    /// X2': an empty IME confirmation's recovery of a held key, which waits
+    /// for the host's next event to show whether the confirmation was an
+    /// autorepeat or Exo's before a new press (E13).
+    pub(crate) pending_recovery: Option<crate::handler::ime_keys::PendingRecovery>,
     /// Evdev keycodes that the active XKB keymap marks as repeatable.
     pub keyboard_repeatable_keys: BTreeMap<HostId, BTreeSet<u32>>,
     /// Parsed keymap for each host keyboard. Keymap updates and failures are
@@ -1077,6 +1081,7 @@ impl Context {
             keyboard_to_extended_keyboard: BTreeMap::new(),
             extended_keyboard_to_keyboard: BTreeMap::new(),
             key_generations: KeyGenerationRegistry::default(),
+            pending_recovery: None,
             keyboard_repeatable_keys: BTreeMap::new(),
             keyboard_keymaps: BTreeMap::new(),
             keyboard_xkb_states: BTreeMap::new(),

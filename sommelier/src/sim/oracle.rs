@@ -384,6 +384,13 @@ pub(super) struct Counts {
     pub recovered_keys: u64,
     pub recoveries_skipped: u64,
     pub confirms_unheld: u64,
+    /// Empty confirmations that found an eligible held key and turned out
+    /// to be Exo's before a new press (E13) or before its detach (E6),
+    /// which recovered nothing; and those whose text input left the gate,
+    /// or whose key ended, before the host's next event decided them.
+    pub confirms_before_a_press: u64,
+    pub confirms_before_a_detach: u64,
+    pub recoveries_dropped: u64,
     /// Backspace leases armed, and ended while armed.
     pub leases: u64,
     pub leases_ended: u64,
@@ -425,6 +432,9 @@ impl std::ops::AddAssign for Counts {
         self.recovered_keys += other.recovered_keys;
         self.recoveries_skipped += other.recoveries_skipped;
         self.confirms_unheld += other.confirms_unheld;
+        self.confirms_before_a_press += other.confirms_before_a_press;
+        self.confirms_before_a_detach += other.confirms_before_a_detach;
+        self.recoveries_dropped += other.recoveries_dropped;
         self.leases += other.leases;
         self.leases_ended += other.leases_ended;
         self.repeats += other.repeats;
@@ -445,6 +455,20 @@ struct Held {
     /// lease was cancelled for the rest of the press.
     leased: bool,
     cancelled: bool,
+    /// The input method detached on its own while the key was held (H2):
+    /// it is not recovered again.
+    stale: bool,
+}
+
+/// X2': the recovery of held key `key` for an empty confirmation, which
+/// waits for the host's next event. `press` is the key of a `peek_key`
+/// press that came since, of a key not held before; `origin` is the
+/// confirmation's.
+#[derive(Clone, Copy, Debug)]
+struct Waiting {
+    key: u32,
+    origin: Origin,
+    press: Option<u32>,
 }
 
 /// What the specification says the proxy does: the decisions it asks of
@@ -494,6 +518,9 @@ pub(super) struct SpecText {
     held: BTreeMap<u32, Held>,
     latest_peek: Option<u64>,
     peeks: u64,
+    /// X2': an empty confirmation's recovery that waits for the host's
+    /// next event ([`SpecText::decide_recovery`]).
+    recovery: Option<Waiting>,
 
     /// The step's decisions: what the specification asks, and what the
     /// proxy sent, with the callback of each sync after its request.
@@ -551,6 +578,7 @@ impl SpecText {
             held: BTreeMap::new(),
             latest_peek: None,
             peeks: 0,
+            recovery: None,
             expected: Decisions::default(),
             sent: Decisions::default(),
             synced: (None, None),
@@ -709,6 +737,7 @@ impl SpecText {
 
     /// What reached the proxy from the host.
     fn host(&mut self, sender: u32, event: &AnyEvent, origin: Origin, truth: Option<&RegionTruth>) {
+        self.decide_recovery(event);
         match event {
             AnyEvent::WlKeyboard(event) => self.keyboard(event),
             &AnyEvent::ZcrExtendedKeyboardV1(peek::Event::PeekKey { key, state, .. }) => {
@@ -878,13 +907,13 @@ impl SpecText {
 
     /// X2': an empty confirmation stands for the eligible held key, the
     /// one with the latest peek, if it is the latest peek since the focus
-    /// moved and not a cancelled Backspace. The guest gets its press and
-    /// release, unless `wl_keyboard.key` delivered it already, and then a
-    /// bare `done`. Recovering Backspace arms its lease; skipping it, or
-    /// recovering another key, ends it, and skipping another key leaves it.
-    /// With no eligible key, nothing goes out, and the lease ends.
-    /// `origin` says which key's press, if any, the confirmation is Exo's
-    /// confirmation before (E13).
+    /// moved and not a cancelled Backspace. With no eligible key, nothing
+    /// goes out, and the lease ends. With one, the recovery waits for the
+    /// host's next event ([`SpecText::decide_recovery`]): Exo confirms
+    /// before every press its input method does not handle (E13), and sends
+    /// the press's peek and key after the confirmation (E8). `origin` says
+    /// which key's press, if any, the confirmation is Exo's confirmation
+    /// before.
     fn recover_held_key(&mut self, origin: Origin) -> Option<(Txn, (i32, i32))> {
         let backspace = keymap::keycode(Key::Backspace).0;
         let latest = self.held.iter().max_by_key(|(_, held)| held.sequence);
@@ -892,11 +921,72 @@ impl SpecText {
             self.latest_peek
                 .is_none_or(|sequence| sequence == held.sequence)
                 && !(key == backspace && held.cancelled)
+                && !held.stale
         });
-        let Some((&key, &held)) = eligible else {
+        let Some((&key, _)) = eligible else {
             self.counts.confirms_unheld += 1;
             self.end_lease();
             return None;
+        };
+        self.recovery = Some(Waiting {
+            key,
+            origin,
+            press: None,
+        });
+        None
+    }
+
+    /// X2': the host's `event` decides the recovery that waits, if any,
+    /// before it is handled. Before any peek, the keyboard's modifiers
+    /// leave it waiting, and the peek of a press of a key not held leaves
+    /// it waiting on that press. That press's `wl_keyboard.key` shows that
+    /// the confirmation was Exo's before it, and the text input's `leave`
+    /// that it was Exo's as it detached (E6): nothing is recovered, and the
+    /// lease ends. Any other event recovers the key.
+    fn decide_recovery(&mut self, event: &AnyEvent) {
+        let Some(waiting) = &mut self.recovery else {
+            return;
+        };
+        let pressed = wl_keyboard::KEY_STATE_PRESSED;
+        match (event, waiting.press) {
+            (AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { .. }), None) => {}
+            (&AnyEvent::ZcrExtendedKeyboardV1(peek::Event::PeekKey { key, state, .. }), None)
+                if state == pressed && !self.held.contains_key(&key) =>
+            {
+                waiting.press = Some(key);
+            }
+            (&AnyEvent::WlKeyboard(wl_keyboard::Event::Key { key, state, .. }), Some(press))
+                if state == pressed && key == press =>
+            {
+                self.recovery = None;
+                self.counts.confirms_before_a_press += 1;
+                self.end_lease();
+            }
+            (AnyEvent::ZwpTextInputV1(v1::Event::Leave {}), _) => {
+                self.recovery = None;
+                self.counts.confirms_before_a_detach += 1;
+                self.end_lease();
+            }
+            _ => self.recover_waiting(),
+        }
+    }
+
+    /// X2': the recovery that waits was an autorepeat's. If the text input
+    /// still passes the gate and the key is held, the guest gets its press
+    /// and release, unless `wl_keyboard.key` delivered it already, and then
+    /// what it shows, again. Recovering Backspace arms its lease; skipping
+    /// it, or recovering another key, ends it, and skipping another key
+    /// leaves it. Otherwise nothing goes out, and the lease ends.
+    fn recover_waiting(&mut self) {
+        let Some(Waiting { key, origin, .. }) = self.recovery.take() else {
+            return;
+        };
+        let backspace = keymap::keycode(Key::Backspace).0;
+        let held = self.held.get(&key).copied();
+        let (Some(held), true) = (held, self.gate()) else {
+            self.counts.recoveries_dropped += 1;
+            self.end_lease();
+            return;
         };
         if held.forwarded {
             self.counts.recoveries_skipped += 1;
@@ -918,7 +1008,15 @@ impl SpecText {
                 false => self.end_lease(),
             }
         }
-        Some((Txn::default(), (0, 0)))
+        let (preedit, cursor) = self
+            .shown
+            .as_ref()
+            .map_or_else(Default::default, |shown| (shown.text.clone(), shown.cursor));
+        let txn = Txn {
+            preedit,
+            ..Txn::default()
+        };
+        self.apply(&txn, cursor);
     }
 
     /// F1: a focus change resets the text input. The field it leaves ends
@@ -970,8 +1068,12 @@ impl SpecText {
     fn text_input(&mut self, event: &v1::Event, origin: Origin) {
         match event {
             v1::Event::Leave {} if self.link == Link::Attached => {
-                // H2: Exo detached on its own.
+                // H2: Exo detached on its own. The keys in flight died with
+                // the input method, so no key held now is recovered again.
                 self.counts.host_detaches += 1;
+                for held in self.held.values_mut() {
+                    held.stale = true;
+                }
                 if self.shown.is_some() {
                     self.apply(&Txn::default(), (0, 0));
                 }
@@ -1744,10 +1846,6 @@ pub(super) enum KnownIssue {
     /// A restart of the input method while the guest shows a composition
     /// that Exo no longer tracks loses it, below v11 of the extension.
     RestartLosesUntrackedComposition,
-    /// An empty confirmation before the press of a key the input method
-    /// did not handle (E13) recovers the key held before it, as if it had
-    /// repeated (X2').
-    RecoveryBeforeAPress,
     /// A preedit region Exo made from text older than the guest's report
     /// the proxy already committed is measured in that newer report (X1).
     /// The report was on its way to Exo, or the proxy sent it while the
@@ -1815,13 +1913,6 @@ impl KnownIssue {
                  the proxy has already committed that report and measures the region in it \
                  (X1), so the guest shows other bytes than Exo composes"
             }
-            Self::RecoveryBeforeAPress => {
-                "at v11 Exo confirms before every key the input method did not handle (E13), \
-                 and that key's peek comes only after its confirmation (E8), so the proxy takes \
-                 the confirmation for one of the key held before, which is still the latest \
-                 peek, and sends the guest a press and release of it (X2'): a held Backspace \
-                 deletes once more, a held Space types once more"
-            }
             Self::RestartLosesUntrackedComposition => {
                 "a report Exo could not match to its prediction dropped the composition Exo \
                  tracks (E4), and below v11 of the extension Exo's detach confirms only a \
@@ -1837,9 +1928,6 @@ impl KnownIssue {
             Self::FocusWhileComposing => "docs/IME_REDESIGN.md 1.3 P1; fixed by C5",
             Self::RestartLosesUntrackedComposition => {
                 "docs/IME_REDESIGN.md 2.2 H2; C5 decides whether H2 commits the shown preedit"
-            }
-            Self::RecoveryBeforeAPress => {
-                "docs/IME_REDESIGN.md 2.2 X2', with REVIEW2's held-key peek sequence"
             }
             Self::RegionCrossesReport => {
                 "docs/IME_REDESIGN.md 2.2 X1; the core must measure a region against the text \
@@ -1865,8 +1953,7 @@ impl KnownIssue {
 /// passed, and the client shows exactly what a set of issues predicts
 /// together (`predicts`, asked of each set, the smallest first, and only
 /// then); or every failure is of tier 1 and a known issue's trigger
-/// explains it: a recovery check, of a key recovered for a confirmation
-/// before another's press; a composition check, in a case with a region
+/// explains it: a composition check, in a case with a region
 /// that crossed a report or was stale (`counts`); and a region check that
 /// says why Exo made the region in other text than the proxy knew
 /// ([`SpecText::judge_region`]).
@@ -1895,7 +1982,6 @@ pub(super) fn classify(
             (Tier::Exact, "region over an unheld preedit") => KnownIssue::RegionOverUnheldPreedit,
             (Tier::Exact, "region crossing a report") => KnownIssue::RegionCrossesReport,
             (Tier::Exact, "region while ahead") => KnownIssue::RegionWhileAhead,
-            (Tier::Exact, "recovery") => KnownIssue::RecoveryBeforeAPress,
             _ => {
                 unexplained.push(failure);
                 continue;
@@ -2544,17 +2630,33 @@ mod tests {
     const DOWN: u32 = wl_keyboard::KEY_STATE_PRESSED;
     const UP: u32 = wl_keyboard::KEY_STATE_RELEASED;
 
+    /// The `done` of the proxy's sync, after Exo's confirmation, which
+    /// decides a recovery that waits as an autorepeat's.
+    fn sync_done() -> wl_callback::Event {
+        wl_callback::Event::Done { callback_data: 0 }
+    }
+
+    /// An autorepeat's empty confirmation: the confirmation, then the
+    /// `done` of the proxy's sync.
+    fn repeat(spec: &mut SpecText) {
+        host(spec, confirm(), &[]);
+        host(spec, sync_done(), &[]);
+    }
+
     #[test]
     fn an_empty_confirmation_recovers_the_latest_held_key_unless_delivered() {
         let mut spec = attached(&["0"]);
         spec.txns.clear();
         let bare = || vec![(Txn::default(), (0, 0))];
         // Nothing held: nothing goes out.
-        host(&mut spec, confirm(), &[]);
+        repeat(&mut spec);
         assert_eq!(spec.txns, []);
-        // A held Space the input method consumed: its press, then a done.
+        // A held Space the input method consumed: at the host's next event,
+        // its press, then a done.
         host(&mut spec, peek_key(Key::Char(' '), DOWN), &[]);
         host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.txns, []);
+        host(&mut spec, sync_done(), &[]);
         assert_eq!(
             (&spec.views[0], std::mem::take(&mut spec.txns)),
             (&view("0 ", 2, ""), bare())
@@ -2562,14 +2664,14 @@ mod tests {
         // One that wl_keyboard delivered: only the done.
         host(&mut spec, peek_key(Key::Char(' '), UP), &[]);
         host(&mut spec, peek_key(Key::Char('a'), DOWN), &[]);
-        let key = wl_keyboard::Event::Key {
+        let key = |key, state| wl_keyboard::Event::Key {
             serial: 1,
             time: 0,
-            key: keymap::keycode(Key::Char('a')).0,
-            state: DOWN,
+            key: keymap::keycode(key).0,
+            state,
         };
-        host(&mut spec, key, &[]);
-        host(&mut spec, confirm(), &[]);
+        host(&mut spec, key(Key::Char('a'), DOWN), &[]);
+        repeat(&mut spec);
         assert_eq!(
             (&spec.views[0], std::mem::take(&mut spec.txns)),
             (&view("0 a", 3, ""), bare())
@@ -2577,28 +2679,49 @@ mod tests {
         // A key held but not the latest peek: nothing.
         host(&mut spec, peek_key(Key::Char('s'), DOWN), &[]);
         host(&mut spec, peek_key(Key::Char('s'), UP), &[]);
-        host(&mut spec, confirm(), &[]);
+        repeat(&mut spec);
         assert_eq!(spec.txns, []);
         let c = spec.counts;
         let counts = (c.recovered_keys, c.recoveries_skipped, c.confirms_unheld);
         assert_eq!(counts, (1, 1, 2));
-        // A held Space recovered for Exo's confirmation before Enter's press
-        // stands for no repeat.
+        // Exo's confirmation before the press of a key its input method
+        // did not handle (E13), whose peek and key follow it (E8): the held
+        // Space does not repeat.
         host(&mut spec, peek_key(Key::Char(' '), DOWN), &[]);
-        let before_enter = Origin {
-            press: Some(Key::Enter),
+        let before_b = Origin {
+            press: Some(Key::Char('b')),
             ..Origin::default()
         };
         let event = confirm().into();
         spec.see(Seen::Host {
             sender: SYNC,
             event: &event,
-            origin: before_enter,
+            origin: before_b,
             region: None,
         });
         spec.see(Seen::StepEnd);
-        assert_eq!(spec.views[0], view("0 a ", 4, ""));
-        assert_eq!(spec.counts.recoveries_before_a_press, 1);
+        host(&mut spec, peek_key(Key::Char('b'), DOWN), &[]);
+        host(&mut spec, key(Key::Char('b'), DOWN), &[]);
+        host(&mut spec, sync_done(), &[]);
+        assert_eq!(spec.views[0], view("0 ab", 4, ""));
+        assert_eq!(spec.txns, []);
+        let c = spec.counts;
+        assert_eq!(
+            (c.confirms_before_a_press, c.recoveries_before_a_press),
+            (1, 0)
+        );
+        // A peek of a key the input method handles, then anything else:
+        // the confirmation was the held Space's autorepeat.
+        host(&mut spec, peek_key(Key::Char(' '), UP), &[]);
+        host(&mut spec, peek_key(Key::Char(' '), DOWN), &[]);
+        host(&mut spec, confirm(), &[]);
+        host(&mut spec, peek_key(Key::Char('c'), DOWN), &[]);
+        assert_eq!(spec.txns, []);
+        host(&mut spec, sync_done(), &[]);
+        assert_eq!(
+            (&spec.views[0], std::mem::take(&mut spec.txns)),
+            (&view("0 ab ", 5, ""), bare())
+        );
     }
 
     #[test]
@@ -2615,12 +2738,12 @@ mod tests {
         // its repeats are recovered.
         host(&mut spec, backspace(DOWN), &[]);
         host(&mut spec, cleared(), &[]);
-        host(&mut spec, confirm(), &[]);
+        repeat(&mut spec);
         assert_eq!(spec.views[0], view("0a", 2, ""));
         assert_eq!((spec.counts.leases, spec.counts.leases_ended), (1, 0));
         // An edit ends it for the rest of the press.
         host(&mut spec, commit("x"), &[]);
-        host(&mut spec, confirm(), &[]);
+        repeat(&mut spec);
         assert_eq!(spec.views[0], view("0ax", 3, ""));
         assert_eq!(spec.counts.leases_ended, 1);
         // So does another key's press, lease or not.
@@ -2628,7 +2751,7 @@ mod tests {
         host(&mut spec, backspace(DOWN), &[]);
         host(&mut spec, peek_key(Key::Char('a'), DOWN), &[]);
         host(&mut spec, peek_key(Key::Char('a'), UP), &[]);
-        host(&mut spec, confirm(), &[]);
+        repeat(&mut spec);
         assert_eq!(spec.views[0], view("0ax", 3, ""));
         assert_eq!(spec.counts.recovered_keys, 1);
         assert_eq!(spec.wrong_decisions, Vec::<String>::new());
@@ -3053,22 +3176,30 @@ mod tests {
         };
         let one = std::slice::from_ref(&composition);
         assert_eq!(classify(one, &none, |_| true), []);
-        // A key recovered for a confirmation before another's press.
+        // A region measured in a report that crossed it, alone or not.
+        let crossing = Failure {
+            tier: Tier::Exact,
+            check: "region crossing a report",
+            ..lost.clone()
+        };
+        let crosses = KnownIssue::RegionCrossesReport;
+        assert_eq!(
+            classify(std::slice::from_ref(&crossing), &none, |_| false),
+            [crosses]
+        );
+        assert_eq!(
+            classify(&[crossing.clone(), composition], &none, |_| false),
+            []
+        );
+        assert_eq!(classify(&[crossing, lost.clone()], &none, |_| true), []);
+        // No issue explains a key recovered for Exo's confirmation before
+        // another key's press (X2').
         let recovery = Failure {
             tier: Tier::Exact,
             check: "recovery",
-            ..lost.clone()
+            ..lost
         };
-        let before = KnownIssue::RecoveryBeforeAPress;
-        assert_eq!(
-            classify(std::slice::from_ref(&recovery), &none, |_| false),
-            [before]
-        );
-        assert_eq!(
-            classify(&[recovery.clone(), composition], &none, |_| false),
-            []
-        );
-        assert_eq!(classify(&[recovery, lost], &none, |_| true), []);
+        assert_eq!(classify(&[recovery], &none, |_| true), []);
         assert!(!P1.reason().is_empty() && P1.tracking().contains("C5"));
         assert!(!Lost.reason().is_empty() && Lost.tracking().contains("H2"));
     }

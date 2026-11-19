@@ -100,6 +100,18 @@
   (`a_client_that_waits_for_done_reports_the_text_an_edit_leaves`), so
   only a delete within that round trip can land wrong. Mirroring Exo's
   `SurroundingTextTracker` would close this; no host has shown it.
+- An empty IME confirmation while a key the input method took is held
+  recovers that key only once the host's next event shows it repeated,
+  one round trip later at most
+  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A text-input
+  event before the next `peek_key` counts as such proof. So if Exo sent a
+  new unhandled press's own text between its confirmation and its peek,
+  the held key would still repeat once. IMA sends text there only when it
+  had buffered a composition as well as a commit, which it shows before
+  it confirms, so the confirmation is then not empty; no DST case does it.
+  Exo's own detach of the input method ends the recovery of the keys held
+  then, whose releases may have died with it, so a key held across an
+  input-method restart stops repeating until its next press.
 - A preedit region is measured in Exo's text as the proxy knows it: the
   guest's text with the preedit Exo holds at the guest's cursor
   ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). These cases

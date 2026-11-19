@@ -410,7 +410,7 @@ reconcile that ends every step.
 | X1 | ext `set_preedit_region(index, length)` | Gate; a committed surrounding text; the range lies around Exo's cursor in Exo's text on char boundaries | `Txn{delete: (before, after), preedit: (region, cursor)}` | `shown := region`, which Exo holds with its cursor where it was (`held`); the text becomes `Ahead` only for a non-empty region (#80: an empty one deletes nothing and leaves no preedit); the lease ends. The assembly is taken. Not gated by `Ahead`, on purpose. **Exo's text** (#97): Exo measures a region from its own cursor, in the text it predicts, which holds its composition inline (E4). The core measures it in that text as far as it knows it (`Current::predicted`): the committed surrounding text without the bytes regions took since the guest last reported (`taken` of the composition; the old code's `unreported_taken`), which is the guest's text, with the preedit Exo holds at the guest's cursor and Exo's cursor in it (`held`; the old code's `ShownPreedit::host_cursor`). Exo holds every preedit the core shows but a region's whose bytes the guest has since reported without, which Exo cannot match, so it drops its composition (E4). **The region must cover the preedit Exo holds**: it deletes only the bytes beyond it on each side, which `taken` gains, and shows them with it. #85's region over a region is the case where the held preedit is the bytes taken. An empty region at Exo's cursor right after the held preedit ends Exo's composition and leaves that preedit as text, so the guest commits it as at X2 (`Txn{commit: p, preedit: none}`; `shown`, `taken` and `held` cleared; the text becomes `Ahead`). Any other region that does not cover it, an empty one with Exo's cursor inside the preedit and one short on either side included, is dropped with a debug log. A host `preedit_string` (H7) keeps `taken`; a report (G9c), every other edit (H8, H9, X2, F4), a reset commit included, a forgetting answer (G9c), and every end of the composition clear it. | Dropped; the assembly is taken. | `on_set_preedit_region`; Exo's region is cursor-relative [F]; `SurroundingTextTracker::OnSetCompositionFromExistingText` keeps an empty composition [F]; tests `on_set_preedit_region_translates_correctly`, `a_region_over_a_region_deletes_only_what_the_guest_has`, `row_X1_a_region_over_a_region_deletes_only_what_the_guest_has`, `row_X1_an_edit_that_ends_the_composition_gives_the_bytes_back`, `a_region_over_a_host_preedit_is_measured_from_exos_cursor`, `row_X1_a_region_over_a_host_preedit_is_measured_from_exos_cursor`, `row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped`, `row_X1_a_report_without_a_regions_bytes_ends_exos_composition`, `an_empty_region_over_a_held_preedit_commits_it`, `row_X1_an_empty_region_over_a_held_preedit_commits_it`, `row_F4_a_press_gives_back_the_bytes_a_region_took`, `row_G9c_an_answer_that_cannot_repeat_the_preedit_forgets_it` |
 | X1' | ext `set_preedit_region` | any other case | none | Dropped; the assembly is taken. A missing surrounding text warns. | n/a | same |
 | X2 | ext `confirm_preedit` | Gate; `shown = Some(p)` | `Txn{commit: p, preedit: none}` | `shown := none`; the text becomes `Ahead`; the lease ends; the assembly is taken. | Dropped; the assembly is taken. (`p` was encoded once, so this cannot happen in practice.) | `on_confirm_preedit`; Exo at v11 or later confirms instead of committing [F] |
-| X2' | ext `confirm_preedit` | Gate; `shown = None` | Through the keyboard concern: if the seat has an eligible held key, its press and release unless another channel already delivered it, then `done(count)`. **The `done` goes whenever a held key is found, even when its pair is skipped.** With no held key, nothing is sent. | `KeyEffect::RecoverHeldKey`. **Lease:** armed if a held Backspace's pair is sent; ended if a held Backspace's pair is skipped, if another held key's pair is sent, or if no key is held; left alone if another held key's pair is skipped (revision 3 corrects this from the old code). The eligible key is the held key with the highest sequence, if it is also the latest peek. *Open (REVIEW2 "held-key peek sequence"): a key held since `wl_keyboard.enter` keeps the sequence the enter gave it (since #75, in the order the host listed the keys), not one from its peek, so the order of the peeks does not decide. K1 or a fix before C3-pre should number such a key when its peek arrives.* | n/a | INVARIANTS "A recovered key carries the host's serial"; `on_confirm_preedit` with `held_repeat_key_for_seat` and `synthesize_ime_consumed_key_pair` |
+| X2' | ext `confirm_preedit` | Gate; `shown = None` | Through the keyboard concern: if the seat has an eligible held key, the recovery waits for the host's next event, which decides whether the confirmation was the key's autorepeat or Exo's before a new press (E13, E8). An autorepeat's: the key's press and release unless another channel already delivered it, then the G9c answer under the serial of then (`ImeCore::recovery_done`), if the text input still passes the gate and the key is held; otherwise nothing. **The `done` goes whenever the key is recovered, even when its pair is skipped.** A new press's, or with no held key: nothing is sent. | `KeyEffect::RecoverHeldKey`. **Decision**, before the host's next event is handled: before any peek, `wl_keyboard.modifiers` and the `peek_key` press of a key not held keep it waiting; that key's `wl_keyboard.key` press with the peek's serial makes it a new press's, and the text input's `leave` the detach's (E6); any other event, the `done` of the sync the proxy sends with it included, an autorepeat's (`ime_keys::PendingRecovery`; INVARIANTS "An empty confirmation recovers a held key only once the host shows it repeated"; row test `row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery`). Exo's own detach (H2) ends the recovery of every key the seat holds, whose releases may have died with the input method. **Lease:** armed if a held Backspace's pair is sent; ended if a held Backspace's pair is skipped, if another held key's pair is sent, or if no key is held; left alone if another held key's pair is skipped (revision 3 corrects this from the old code). The eligible key is the held key with the highest sequence, if it is also the latest peek. A peek numbers its key when it arrives, a key held since `wl_keyboard.enter` included, which the enter had numbered in the order the host listed the keys (#75), so the order of the peeks decides (REVIEW2 "held-key peek sequence"; test `keys_held_since_enter_are_ordered_by_their_peeks`). | n/a | INVARIANTS "A recovered key carries the host's serial"; `on_confirm_preedit` with `held_repeat_key_for_seat` and `synthesize_ime_consumed_key_pair`. The old code recovered at once, so a key typed while Backspace or Space was held repeated the held key (`KnownIssue::RecoveryBeforeAPress`, retired). |
 | X3 | ext grammar, autocorrect and occluded-bounds events | any | none | Ignored. | n/a | the handlers of the same names |
 | W1 | `wl_callback.done` of a drain barrier | `Draining{b}` | none | Link → `Detached`. The final reconcile then activates if the field wants input. | n/a | `CallbackHandler::on_done`; `complete_host_activation_barrier` |
 | W2 | `wl_callback.done` of a reset fence | `fence = Some(f)` | none | `fence := None`, **in any link state** (the fence lives beside the link, as today). | n/a | INVARIANTS press rule ("A focus change or the text input's end does not end it early"); `complete_reset_fence` |
@@ -846,9 +846,10 @@ impl GuestTxn {
 - The G9c answer is `GuestTxn { preedit: shown, .. }.encode(ti, false, ..)`.
   With `shown_before` false, it sends no clear, and it repeats the shown
   preedit even when unchanged.
-- The `done` that the keyboard concern sends after a recovered key (X2')
-  is `GuestTxn::default().encode(..)`, built in `state.rs` as `bare_done`.
-  That is the bare form of the same encoder, not a second builder.
+- The transaction that the keyboard concern sends after a recovered key
+  (X2') is the G9c answer, built when the key is recovered
+  (`ImeCore::recovery_done`). With nothing shown it is the bare form of
+  the same encoder, `bare_done`, not a second builder.
 - **`guest_txn_encodes_in_canonical_order`** pins all 16 combinations of
   a shown preedit, a delete, a commit and a new preedit, and that empty
   commits and `(0, 0)` deletes send nothing.
@@ -888,13 +889,16 @@ pub enum KeyEffect {
     /// Today's finish_host_preedit arm-or-end, and every end_lease.
     Lease { ti: TiId, seat: SeatId, outcome: LeaseOutcome },
     /// X2': recover the seat's latest eligible held key
-    /// (held_repeat_key_for_seat). If one is held, send its pair unless
-    /// another channel delivered it, then `done`, whether or not the pair
-    /// went. The lease: a held Backspace whose pair is sent arms it; a
-    /// held Backspace whose pair is skipped ends it; another held key
-    /// whose pair is sent ends it; another held key whose pair is skipped
-    /// leaves it alone; with no held key it ends, and nothing is sent.
-    RecoverHeldKey { ti: TiId, seat: SeatId, done: Outgoing },
+    /// (held_repeat_key_for_seat), once the host's next event shows the
+    /// confirmation to be its autorepeat (ime_keys::PendingRecovery). Then
+    /// send its pair unless another channel delivered it, then
+    /// ImeCore::recovery_done, whether or not the pair went. The lease: a
+    /// held Backspace whose pair is sent arms it; a held Backspace whose
+    /// pair is skipped ends it; another held key whose pair is sent ends
+    /// it; another held key whose pair is skipped leaves it alone; with no
+    /// held key, or a new press's confirmation, it ends, and nothing is
+    /// sent.
+    RecoverHeldKey { ti: TiId, seat: SeatId },
 }
 ```
 
@@ -1539,7 +1543,9 @@ sees them.
     `wl_keyboard.key` delivered; and the Backspace lease, which H7 and a
     recovered Backspace arm, and which every other composition edit, a
     new field, a focus move and another key's press end, cancelling
-    Backspace's repeat for the rest of its press.
+    Backspace's repeat for the rest of its press. A recovery waits for the
+    host's next event, as the keyboard concern's does, and Exo's own
+    detach (H2) ends the recovery of every key held (X2').
   - Settled cases hold no key: the user's intent for a hold depends on
     the client's own repeat, which the client models do not have.
 
@@ -1746,8 +1752,10 @@ Each mode gets half of the cases.
     over a shown preedit, or dropped;
   - guest reports that crossed an edit in flight (P4);
   - autorepeats the engine got; empty confirmations that recovered a held
-    key, skipped its pair as `wl_keyboard.key` had delivered it, or found
-    no eligible key (X2'); Backspace leases armed, and ended;
+    key, skipped its pair as `wl_keyboard.key` had delivered it, found
+    no eligible key, turned out to be Exo's before a new press or a
+    detach, or were dropped as their text input left the gate first
+    (X2'); Backspace leases armed, and ended;
   - surfaces the guest destroyed, and those that had the focus (F2);
   - client drops, by reason;
   - one counter per draw.
@@ -1796,7 +1804,8 @@ DST FAILURE seed=81321 mode=free client=Gtk{v4:false} ext=11 e6=confirm e8=text-
 
 #72 retired P2. P1 remains; reaching H2 added a second, D6 a third and
 D7 a fourth. Measuring a region in Exo's text (X1) retired the third,
-the region over a shown preedit.
+the region over a shown preedit, and deciding an empty confirmation at
+the host's next event (X2') the fourth, the recovery before a press.
 
 ```rust
 // sim/oracle.rs
@@ -1813,11 +1822,6 @@ enum KnownIssue {
     /// the text input hears of before a keyboard bound after its activate,
     /// detaches it so.
     RestartLosesUntrackedComposition,
-    /// X2': Exo's confirmation before a key the input method did not
-    /// handle (E13) comes before that key's peek (E8), so the proxy takes
-    /// it for a repeat of the key held before, which is still the latest
-    /// peek, and the guest gets one more press of it.
-    RecoveryBeforeAPress,
     /// X1: a region Exo makes from text older than a guest report the
     /// proxy has committed, which was on its way to Exo or was sent while
     /// the region was on its way back, is measured in that report.
@@ -1868,13 +1872,12 @@ strikes:
   the proxy while it is attached. It occurs in about 1 settled case in 100 (55 of seeds
   1,000,001 to 1,009,999, odd), so the run does not require it.
 
-The recovery before a press is a free case's issue, as only free cases
-hold keys. The scheduler labels each host event with the press,
-not autorepeat, it answers, so `SpecText` counts each held key it
-recovers for a confirmation before another key's press, and tier 1
-reports a `recovery` check, which the issue then explains if nothing
-else failed. It occurs in about 1 free case in 120 (41 of seeds
-1,000,000 to 1,009,998, even).
+The recovery before a press is no longer an issue. The scheduler still
+labels each host event with the press, not autorepeat, it answers, so
+`SpecText` counts each held key it recovers for a confirmation before
+another key's press, and tier 1 fails a case with one (a `recovery`
+check). Before the fix it occurred in about 1 free case in 100 (104 of
+seeds 0 to 19,998, even); none does since.
 
 Everything else fails the run. The scenario keeps being generated, so
 any other bug on that path stays visible. The summary prints the known
@@ -2034,7 +2037,8 @@ land before C3-pre blesses the goldens. The core must match each one.
 | A region over a region deletes only what the guest has. | `kkimdev/ime-region-over-region`, stacked on #80 | ready, no PR number yet | #82 follow-up |
 | G9b: an oversized surrounding text consumes the pending state, instead of being retried by every later commit. Updates `oversized_surrounding_commit_does_not_partially_advance_state`. | `kkimdev/old-g9b` | ready, no PR number yet | matches (#82) |
 | A reset commit gives back the bytes a region took; a region is measured in Exo's text, from Exo's cursor, and must cover the preedit Exo holds; an empty region at Exo's cursor after that preedit commits it. | #97 (4ae8277, 7227006, 8ee6ef9) | in review | matches (`kkimdev/core-align`) |
-| The empty confirm's eligible key is chosen by peek order (X2'). | to do, in K1 or before it | — | KeyEffect handling |
+| The empty confirm's eligible key is chosen by peek order (X2'). | `kkimdev/x2-recovery` | ready, no PR number yet | KeyEffect handling |
+| An empty confirm recovers its held key only once the host's next event shows it repeated, not Exo's confirmation before a new press (X2', E13). Retires `KnownIssue::RecoveryBeforeAPress`. | `kkimdev/x2-recovery` | ready, no PR number yet | `RecoverHeldKey` loses its `done`; `ImeCore::recovery_done` |
 
 The other PRs merged since revision 2 do not touch the IME: #77 (small
 correctness and docs fixes), #78 and #81 (the SHM split and its

@@ -832,7 +832,6 @@ impl<'a> Current<'a> {
             return Confirm::RecoverHeldKey(KeyEffect::RecoverHeldKey {
                 ti: self.ti,
                 seat: self.seat,
-                done: bare_done(self.ti, self.serial),
             });
         }
         Confirm::Commit(self.commit_shown())
