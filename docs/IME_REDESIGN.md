@@ -1509,7 +1509,11 @@ sees them.
     so the guest keeps showing the composition the region replaced, and
     the next key commits its text a second time; and
     the engine learns the region's text from the field, since it
-    measured the region in text that can lag.
+    measured the region in text that can lag. When IMA refuses a range
+    that lies past the text by the time it comes, as after a report that
+    moved the cursor, the engine keeps the region it had, as the field
+    does (IMA's `SetComposingRange` returns false before it changes
+    anything).
   - A free case makes half of these twice at once, for a delete while
     the guest's text is ahead (P4) and a region over a region (#85). A
     settled case makes them only right after a key, since GTK3 reports
