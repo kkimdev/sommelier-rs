@@ -83,8 +83,9 @@ assert_eq!(
 - A handler test decodes a queue with `test_support::decoded`.
 - A handler test outside `handler/text_input.rs` that sets up or reads
   text-input state no peer can observe goes through
-  `test_support::text_input`, so that each stage of the IME core's
-  switch rewrites one module.
+  `test_support::text_input`, so that a change of the IME core's storage
+  rewrites one module. It sets up only states the core can reach, which
+  the core's invariants check.
   The tests in `handler/ime_keys.rs` share the `text_input` test fixture
   (`text_input::tests`) and need no other setup.
 - Use `MessageBuilder` only for frames no encoder builds, such as
@@ -224,26 +225,6 @@ regression, fix the bug, then paste the snippet into `CASES` in
 `cargo test -p sommelier --bins sim::regressions`; it must fail on the old
 code and pass on the fix. A failure that does not replay from its choices,
 or a panic, is not shrunk.
-
-### Golden traces
-
-`sim::golden::golden_traces_match` guards the staged switch of the IME
-core (`docs/IME_REDESIGN.md`, sections 4.9 and 5.3). It runs the DST's
-first 2,000 seeds, as the default run makes them, and compares each
-seed's line in `sommelier/src/sim/golden.txt`: hashes of the bytes the
-proxy sent the guest and the host, message by message, and of the
-case's choices. A mismatch prints the seed and the 16 messages that
-hold the first difference. The run takes about 40 s.
-
-From C3-pre to C3c, no change to a DST model, its generator or the
-proxy's behaviour may merge: the goldens must keep describing the code
-before the switch, and each stage must match them byte for byte. Outside
-that window, a change meant to alter the traces blesses them again, which
-rewrites only `golden.txt`:
-
-```bash
-SOMMELIER_DST_BLESS=1 cargo test -p sommelier --bins sim::golden
-```
 
 ## End-to-end test
 

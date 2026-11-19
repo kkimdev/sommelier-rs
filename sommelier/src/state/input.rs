@@ -18,55 +18,6 @@ use std::collections::BTreeMap;
 
 use super::{serial_is_after, HostId};
 
-/// A text-input-v3 content type: `(hint, purpose)`.
-pub type ContentType = (u32, u32);
-/// Text-input-v3 surrounding text: `(text, cursor, anchor)`.
-pub type SurroundingText = (String, i32, i32);
-/// A text-input-v3 cursor rectangle: `(x, y, width, height)`.
-pub type CursorRect = (i32, i32, i32, i32);
-
-/// The text-input-v3 requests a guest made since its most recent commit,
-/// each `None` until made.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct V3Pending {
-    pub enabled: Option<bool>,
-    pub surrounding_text: Option<Option<SurroundingText>>,
-    pub content_type: Option<ContentType>,
-    pub cursor_rect: Option<CursorRect>,
-}
-
-impl V3Pending {
-    /// The pending state after `enable` or `disable`, which reset every
-    /// other piece of state. The host's v1 has no unset cursor rectangle,
-    /// so an empty one stands for it.
-    pub fn reset(enabled: bool) -> Self {
-        Self {
-            enabled: Some(enabled),
-            surrounding_text: Some(None),
-            content_type: Some(ContentType::default()),
-            cursor_rect: Some(CursorRect::default()),
-        }
-    }
-}
-
-/// The text-input-v3 state a guest has committed, but the cursor
-/// rectangle, which only the host keeps.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct V3Committed {
-    pub enabled: bool,
-    pub surrounding_text: Option<SurroundingText>,
-    pub content_type: ContentType,
-}
-
-/// A content type as the host applies it: the v3 content type, and the
-/// surrounding-text support told with it, or `None` if the host's
-/// extension cannot be told one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HostContentType {
-    pub content_type: ContentType,
-    pub surrounding_text_support: Option<bool>,
-}
-
 /// Provenance for one physical key generation observed through ChromeOS
 /// `peek_key`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

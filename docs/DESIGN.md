@@ -201,7 +201,7 @@ encode wire bytes ad hoc.
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs`, `ime_keys.rs` (keysym routing, held-key recovery, Backspace leases), `seat.rs` | `input.rs` (focus, key generations, text input) |
+| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs` (the IME core's adapter), `ime_keys.rs` (keysym routing, held-key recovery, Backspace leases), `seat.rs` | `input.rs` (focus, key generations); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
@@ -375,7 +375,7 @@ becomes an unused variable, which CI rejects. There is no generic
 
 - `SurfacePending` (`render.rs`) follows it for a `wl_surface`'s
   attachment, damage, scale, transform, offsets and viewport.
-- `V3Pending` (`input.rs`) follows it for a text-input-v3 object's
+- `V3Pending` (`ime/state.rs`) follows it for a text-input-v3 object's
   enable, surrounding text, content type and cursor rectangle, which
   `ime::TextInput::apply_commit` applies to `V3Committed`, except the cursor
   rectangle, which only the host keeps and the commit forwards. A commit
@@ -482,15 +482,21 @@ and bridges each guest v3 object to a host v1 object plus its extension.
 
 The IME core (`sommelier/src/ime`, `Context::ime`) owns the state of
 every text input: its field, its link to the host text input, its
-composition and its barriers. It is being wired in stages
-([IME_REDESIGN.md](IME_REDESIGN.md) section 5). The host's events, those
-of `zwp_text_input_v1` and its extension and the `done` of the core's
-drain barriers and reset fences, go through `ImeCore::step`:
-`text_input::ime` hands it one `ime::Input` and applies the effects it
-returns. Until it handles the rest, the guest's requests, focus changes
-and presses keep their old handlers, which change that state only
-through the core's named transitions, made `pub(crate)` for this window,
-and the core's `reconcile`.
+composition and its barriers. It is a sans-IO state machine
+([IME_REDESIGN.md](IME_REDESIGN.md) section 3): every message that can
+change that state reaches it as one `ime::Input` through `ImeCore::step`,
+which returns the guest events, host requests and barriers, and
+keyboard-concern requests it makes, and reads what it does not own (the
+object table's surfaces and seats, the keyboard focus) through
+`ime::Env`. `handler/text_input.rs` is its adapter: `text_input::ime`
+hands it an input and applies the effects where the message is handled.
+The inputs are the guest's `zwp_text_input_v3` requests and the object's
+end, the events of the host's `zwp_text_input_v1` and its extension, the
+`done` of the core's drain barriers and reset fences, each seat's
+keyboard focus change (`keyboard.rs`), a surface's end (`compositor.rs`),
+a `wl_seat` bind (`registry.rs`) and a pointer press or touch-down
+(`pointer.rs`, `touch.rs`). Nothing outside `ime` changes a text input,
+and only `ime/guest.rs` builds the v3 transaction events.
 
 The bridge reconciles state rather than translating requests, because Exo
 applies a request against state the proxy cannot see: it drops a content
@@ -499,12 +505,10 @@ type. `ime::LinkState` models what the host text input has applied, by
 those rules, and the pure `ime::reconcile` returns the requests that
 make it match the target the guest committed (`HostTarget`): the
 activation step and, when the attached input method lacks it, the content
-type. `step` sends them for every text input at the end of each input,
-and `text_input::reconcile_host` wherever the target or the host's
-ability to apply it changes: a guest commit, a focus change, a
-`wl_seat` bind and the object's destroy. A drain barrier's completion
-and Exo detaching the input method on its own (a host `leave` while
-active) are host events, which `step` handles.
+type. `step` sends them for every text input at the end of each input, so
+between messages every link matches its target, but one that drains, one
+whose activation no live seat can carry, and an attached one whose seat
+has ended (design 3.1, I1b).
 The surrounding text and cursor rectangle are not reconciled: Exo keeps
 both regardless and edits its copy of the text as the input method
 commits, so each guest commit forwards the ones it states. In the other

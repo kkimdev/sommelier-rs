@@ -163,13 +163,6 @@ impl Session {
         std::mem::take(&mut self.guest.received)
     }
 
-    /// Every message the proxy sent the guest and the host, in that order,
-    /// as its bytes and the number of descriptors it carried: the wire
-    /// itself, for a test that pins it byte for byte (`sim::golden`).
-    pub(crate) fn wire(&self) -> [&[(Vec<u8>, usize)]; 2] {
-        [&self.guest.wire, &self.host.wire]
-    }
-
     /// What the proxy sent the guest since the last call before the
     /// `wl_display.error` that ended the session, and that error's object
     /// and code. The error must be the guest's one error and its last
@@ -581,13 +574,12 @@ impl Drop for Session {
     }
 }
 
-/// A peer of the proxy: its end of the connection, the objects it knows,
-/// what it received, decoded, and all it ever received, as bytes.
+/// A peer of the proxy: its end of the connection, the objects it knows
+/// and what it received, decoded.
 struct Peer<M> {
     connection: WaylandConnection,
     objects: Objects,
     received: Vec<(u32, M)>,
-    wire: Vec<(Vec<u8>, usize)>,
 }
 
 impl<M: Message> Peer<M> {
@@ -596,7 +588,6 @@ impl<M: Message> Peer<M> {
             connection,
             objects: Objects(BTreeMap::from([(WL_DISPLAY_ID, "wl_display".to_string())])),
             received: Vec::new(),
-            wire: Vec::new(),
         }
     }
 
@@ -615,14 +606,11 @@ impl<M: Message> Peer<M> {
             MessageHeader::frame(&connection.read_buf[offset..])
         {
             let message = &connection.read_buf[offset..offset + len];
-            let fds = connection.read_fds.len();
             let decoded = self
                 .objects
                 .decode(message, &mut connection.read_fds)
                 .unwrap_or_else(|error| panic!("the proxy sent {message:?}: {error}"));
             self.received.push(decoded);
-            let fds = fds - connection.read_fds.len();
-            self.wire.push((message.to_vec(), fds));
             offset += len;
         }
         connection.read_buf.drain(..offset);

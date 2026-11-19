@@ -479,43 +479,91 @@ fn count_bumps_only_in_the_commit_arm() {
     assert_eq!(occurrences(".count_commit()"), ["step.rs"]);
 }
 
-/// B5 and the core's isolation: one builder of the v3 transaction
-/// events, and no import from the rest of the proxy but the wire, the
-/// generated protocols and the three state types the old code shares.
+/// B5 and the core's isolation: one builder of the v3 transaction events
+/// in the crate, and no import from the rest of the proxy but the wire and
+/// the generated protocols.
 #[test]
 fn ime_is_isolated() {
-    for event in [
-        "evt::preedit_string(",
-        "evt::delete_surrounding_text(",
-        "evt::commit_string(",
-        "evt::done(",
-    ] {
-        let files = occurrences(event);
+    const BUILDERS: [&str; 4] = [
+        "preedit_string",
+        "delete_surrounding_text",
+        "commit_string",
+        "done",
+    ];
+    for builder in BUILDERS {
+        let files = occurrences(&format!("evt::{builder}("));
         assert!(
             !files.is_empty() && files.iter().all(|&file| file == "guest.rs"),
-            "{event}"
+            "{builder}"
         );
     }
+    let builders = crate_sources()
+        .into_iter()
+        .filter(|(_, source)| builds_v3_transactions(source))
+        .map(|(file, _)| file)
+        .collect::<Vec<_>>();
+    assert_eq!(builders, ["ime/guest.rs"]);
     assert_eq!(occurrences("crate::handler"), [] as [&str; 0]);
-    let state_types = |names: &str| {
-        names
-            .trim_matches(['{', '}'])
-            .split(',')
-            .all(|name| ["HostContentType", "V3Committed", "V3Pending"].contains(&name))
-    };
     for (file, source) in SOURCES {
         let mut source = source;
         while let Some(start) = source.find("use crate::") {
             let rest = &source[start + "use crate::".len()..];
             let end = rest.find(';').expect("a use ends");
             let path: String = rest[..end].split_whitespace().collect();
-            let allowed = path.starts_with("protocols::")
-                || path.starts_with("wire::")
-                || path.strip_prefix("state::").is_some_and(state_types);
+            let allowed = path.starts_with("protocols::") || path.starts_with("wire::");
             assert!(allowed, "{file} uses crate::{path}");
             source = rest;
         }
     }
+}
+
+/// Every Rust source of the crate, by its path below `src/`, in path
+/// order.
+fn crate_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a source directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let name = path.strip_prefix(&root).expect("below src");
+            let source = std::fs::read_to_string(&path).expect("a readable source");
+            (name.to_string_lossy().into_owned(), source)
+        })
+        .collect()
+}
+
+/// Whether `source` can build a `zwp_text_input_v3` `preedit_string`,
+/// `delete_surrounding_text`, `commit_string` or `done`: it names the
+/// interface's event encoders for anything but `enter` and `leave`, or
+/// imports them.
+fn builds_v3_transactions(source: &str) -> bool {
+    let source: String = source.split_whitespace().collect();
+    // Split, so that this file does not name them.
+    let encoders = ["zwp_text_input_v3", "::evt"].concat();
+    let named = source.match_indices(&encoders).any(|(at, _)| {
+        let rest = &source[at + encoders.len()..];
+        !(rest.starts_with("::enter(") || rest.starts_with("::leave("))
+    });
+    let imported = source.match_indices("zwp_text_input_v3::{").any(|(at, _)| {
+        let group = &source[at..];
+        let group = &group[..group.find('}').unwrap_or(group.len())];
+        group
+            .split([',', '{'])
+            .any(|name| name == "evt" || name.starts_with("evtas") || name.starts_with("evt::"))
+    });
+    named || imported
 }
 
 // 2.1 Guest requests.
@@ -820,8 +868,8 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
 /// its `reconcile` over `HostApplied`, against the core's.
 #[test]
 fn reconcile_reaches_every_target_with_only_needed_requests() {
+    use super::host::HostContentType;
     use super::state::LinkState;
-    use crate::state::HostContentType;
     use host::{ActivationStep, HostSteps, HostTarget};
     let content_types: Vec<_> = [(1, 2), (3, 4)]
         .into_iter()
@@ -1932,6 +1980,28 @@ fn row_F4_a_press_gives_back_the_bytes_a_region_took() {
     ime.step(Input::BarrierDone(out.barriers()[0]));
     let out = ime.ext(region(-1, 1));
     assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
+}
+
+/// A press whose commit does not fit is forwarded, and leaves the preedit
+/// cursor and styling to the next preedit, as the old code's
+/// `end_composition_on_press` did: it took them only once the commit
+/// reached the guest.
+#[test]
+fn row_F4_a_press_whose_commit_does_not_fit_keeps_the_assembly() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let long = Preedit::new("x".repeat(4_090), (0, 0)).unwrap();
+    ime.core.inputs.get_mut(&TI).unwrap().replace_shown(long);
+    ime.v1(HostIme::PreeditStyling {
+        index: 0,
+        length: 3,
+        style: zwp_text_input_v1::PREEDIT_STYLE_SELECTION,
+    });
+    ime.v1(HostIme::PreeditCursor(0));
+    let out = ime.press(SURFACE);
+    assert!(out.forward && out.guest.is_empty() && out.host.is_empty());
+    assert_eq!(out.keys, []);
+    assert_eq!(ime.compose("나").guest, [preedit_at("나", 0, 3), done(1)]);
 }
 
 #[test]

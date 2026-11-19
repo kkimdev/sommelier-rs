@@ -31,8 +31,8 @@ impl CommitCount {
         self.0 = self.0.wrapping_add(1);
     }
 
-    /// A count of `commits` already made, for the handler tests of the
-    /// storage switch's window (`test_support::text_input`).
+    /// A count of `commits` already made, for the handler tests that set
+    /// up state no peer can (`test_support::text_input`).
     #[cfg(test)]
     pub(super) fn starting_at(commits: u32) -> Self {
         Self(commits)

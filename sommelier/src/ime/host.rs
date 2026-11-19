@@ -19,28 +19,36 @@ limitations under the License.
 //! [`LinkState`] to it ([`reconcile`]), and their
 //! encoding.
 
-use super::state::{LinkState, TextInput};
+use super::state::{ContentType, LinkState, TextInput};
 use super::Env;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::state::HostContentType;
 use crate::wire::Outgoing;
+
+/// A content type as the host applies it: the v3 content type, and the
+/// surrounding-text support told with it, or `None` if the host's
+/// extension cannot be told one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostContentType {
+    pub(super) content_type: ContentType,
+    pub(super) surrounding_text_support: Option<bool>,
+}
 
 /// The host state a text input should have (design 2, "Reconcile").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HostTarget {
+pub(super) struct HostTarget {
     /// The host surface of an enabled field, if the host knows it: the
     /// text input wants input there.
-    pub(crate) surface: Option<u32>,
+    pub(super) surface: Option<u32>,
     /// The host seat that can carry an `activate` or `deactivate`.
-    pub(crate) seat: Option<u32>,
-    pub(crate) content_type: HostContentType,
+    pub(super) seat: Option<u32>,
+    pub(super) content_type: HostContentType,
 }
 
 /// How the link's activation changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ActivationStep {
+pub(super) enum ActivationStep {
     Activate {
         seat: u32,
         surface: u32,
@@ -57,13 +65,13 @@ pub(crate) enum ActivationStep {
 
 /// The host requests that bring a link to its target, in order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct HostSteps {
-    pub(crate) activation: Option<ActivationStep>,
-    pub(crate) content_type: Option<HostContentType>,
+pub(super) struct HostSteps {
+    pub(super) activation: Option<ActivationStep>,
+    pub(super) content_type: Option<HostContentType>,
 }
 
 /// The host state text input `t` should have.
-pub(crate) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
+pub(super) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
     let field = t.field();
     let committed = field.map(|(_, committed)| committed);
     HostTarget {
@@ -88,7 +96,7 @@ pub(crate) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
 /// host gets each content type once it can apply it, and only then"). A
 /// draining link waits for its barrier. Pure, and idempotent once its
 /// steps are applied.
-pub(crate) fn reconcile(target: &HostTarget, link: LinkState) -> HostSteps {
+pub(super) fn reconcile(target: &HostTarget, link: LinkState) -> HostSteps {
     let activation = match (target.surface, link) {
         (Some(surface), LinkState::Detached) => target
             .seat
@@ -116,7 +124,7 @@ pub(crate) fn reconcile(target: &HostTarget, link: LinkState) -> HostSteps {
 
 /// Whether a host extension of `version`, if any, takes
 /// `set_surrounding_text_support`.
-pub(crate) fn takes_surrounding_text_support(ext_version: Option<u32>) -> bool {
+pub(super) fn takes_surrounding_text_support(ext_version: Option<u32>) -> bool {
     ext_version.is_some_and(|version| version >= ext::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE)
 }
 
@@ -124,7 +132,7 @@ pub(crate) fn takes_surrounding_text_support(ext_version: Option<u32>) -> bool {
 /// whose extension, if any, has the ID and version `ext`, with its
 /// surrounding-text support if it has one (INVARIANTS "`set_input_type`
 /// replaces v1 `set_content_type`").
-pub(crate) fn content_type_requests(
+pub(super) fn content_type_requests(
     v1: u32,
     ext: Option<(u32, u32)>,
     content_type: HostContentType,

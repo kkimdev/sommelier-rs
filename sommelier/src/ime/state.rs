@@ -24,10 +24,50 @@ use std::ops::Range;
 use super::guest::{delete_lengths, lengths_around_cursor, resolve_preedit_cursor};
 use super::guest::{GuestTxn, Preedit, TooLong};
 use super::host;
+use super::host::HostContentType;
 use super::serial::{CommitCount, Serial};
 use super::{BarrierToken, Env, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
-use crate::state::{HostContentType, V3Committed, V3Pending};
 use crate::wire::Outgoing;
+
+/// A text-input-v3 content type: `(hint, purpose)`.
+pub(super) type ContentType = (u32, u32);
+/// Text-input-v3 surrounding text: `(text, cursor, anchor)`.
+pub(super) type SurroundingText = (String, i32, i32);
+/// A text-input-v3 cursor rectangle: `(x, y, width, height)`.
+pub(super) type CursorRect = (i32, i32, i32, i32);
+
+/// The text-input-v3 requests a guest made since its most recent commit,
+/// each `None` until made.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct V3Pending {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) surrounding_text: Option<Option<SurroundingText>>,
+    pub(crate) content_type: Option<ContentType>,
+    pub(crate) cursor_rect: Option<CursorRect>,
+}
+
+impl V3Pending {
+    /// The pending state after `enable` or `disable`, which reset every
+    /// other piece of state. The host's v1 has no unset cursor rectangle,
+    /// so an empty one stands for it.
+    pub(crate) fn reset(enabled: bool) -> Self {
+        Self {
+            enabled: Some(enabled),
+            surrounding_text: Some(None),
+            content_type: Some(ContentType::default()),
+            cursor_rect: Some(CursorRect::default()),
+        }
+    }
+}
+
+/// The text-input-v3 state a guest has committed, but the cursor
+/// rectangle, which only the host keeps.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct V3Committed {
+    pub(crate) enabled: bool,
+    pub(crate) surrounding_text: Option<SurroundingText>,
+    pub(crate) content_type: ContentType,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TextInput {
@@ -127,7 +167,7 @@ struct Warned {
 
 /// Why an activation the target needs waits (R2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Deferral {
+pub(super) enum Deferral {
     /// The previous activation still drains.
     Draining,
     /// No live host seat can carry it.
@@ -135,7 +175,7 @@ pub(crate) enum Deferral {
 }
 
 impl TextInput {
-    pub(crate) fn new(seat: SeatId, host: HostTi, surface: Option<SurfaceId>) -> Self {
+    pub(super) fn new(seat: SeatId, host: HostTi, surface: Option<SurfaceId>) -> Self {
         Self {
             seat,
             host,
@@ -149,7 +189,7 @@ impl TextInput {
         }
     }
 
-    pub(crate) fn seat(&self) -> SeatId {
+    pub(super) fn seat(&self) -> SeatId {
         self.seat
     }
 
@@ -192,13 +232,13 @@ impl TextInput {
 
     /// G9: count a guest commit. The Commit arm of `step` is the only
     /// caller (test `count_bumps_only_in_the_commit_arm`).
-    pub(crate) fn count_commit(&mut self) {
+    pub(super) fn count_commit(&mut self) {
         self.commits.bump();
     }
 
     /// The pending state a commit consumes, or `None` while unfocused
     /// (G9a), which leaves it alone.
-    pub(crate) fn take_pending(&mut self) -> Option<V3Pending> {
+    pub(super) fn take_pending(&mut self) -> Option<V3Pending> {
         let pending = self.pending_mut()?;
         Some(std::mem::take(pending))
     }
@@ -209,7 +249,7 @@ impl TextInput {
     /// makes the reconcile leave `Attached`, which ends the composition
     /// with no guest output, since the guest reset itself; an enable or a
     /// rejected one starts from a link that was not attached (I1a).
-    pub(crate) fn apply_commit(&mut self, pending: V3Pending, enable_conflict: bool) -> bool {
+    pub(super) fn apply_commit(&mut self, pending: V3Pending, enable_conflict: bool) -> bool {
         let Field::Focused(f) = &mut self.field else {
             debug_assert!(false, "a commit applies only to a focused field");
             return false;
@@ -245,7 +285,7 @@ impl TextInput {
     /// G9b and G9c: the answer to a commit, if the field is enabled: a
     /// transaction that repeats the preedit the guest shows. A preedit
     /// that does not fit is forgotten, and a bare `done` goes out.
-    pub(crate) fn answer(&mut self, ti: TiId) -> Vec<Outgoing> {
+    pub(super) fn answer(&mut self, ti: TiId) -> Vec<Outgoing> {
         if !self.is_enabled() {
             return Vec::new();
         }
@@ -270,7 +310,7 @@ impl TextInput {
     /// preedit a plan shows fit a message once, so only this reaches the
     /// answer that forgets one (G9c).
     #[cfg(test)]
-    pub(crate) fn replace_shown(&mut self, preedit: Preedit) {
+    pub(super) fn replace_shown(&mut self, preedit: Preedit) {
         assert!(self.composition.shown.is_some(), "a preedit shows");
         self.composition.shown = Some(preedit);
     }
@@ -279,7 +319,7 @@ impl TextInput {
     /// if any, disabled and with nothing pending. Returns the old field's
     /// surface. The new field is disabled, so the step's reconcile leaves
     /// `Attached`, which ends the composition.
-    pub(crate) fn refocus(&mut self, surface: Option<SurfaceId>) -> Option<SurfaceId> {
+    pub(super) fn refocus(&mut self, surface: Option<SurfaceId>) -> Option<SurfaceId> {
         let old = self.focused_surface();
         self.pending = V3Pending::default();
         self.field = Field::focused_on(surface);
@@ -287,20 +327,20 @@ impl TextInput {
     }
 
     /// H4 and H5 record into the assembly only while attached.
-    pub(crate) fn assembly_mut(&mut self) -> Option<&mut Assembly> {
+    pub(super) fn assembly_mut(&mut self) -> Option<&mut Assembly> {
         self.is_attached().then_some(&mut self.composition.assembly)
     }
 
-    /// B3: every host composition event takes the assembly first, whatever
-    /// becomes of the event.
-    pub(crate) fn take_assembly(&mut self) -> Assembly {
+    /// B3: take the assembly, which a host composition event or a press
+    /// used up (design H9).
+    pub(super) fn take_assembly(&mut self) -> Assembly {
         std::mem::take(&mut self.composition.assembly)
     }
 
     /// The gate of every host composition event and press: the link is
     /// attached, no fence is pending, and the field is focused. The only
     /// constructor of [`Current`].
-    pub(crate) fn current(&mut self, ti: TiId) -> Option<Current<'_>> {
+    pub(super) fn current(&mut self, ti: TiId) -> Option<Current<'_>> {
         if !self.is_attached() || self.fence.is_some() {
             return None;
         }
@@ -318,12 +358,12 @@ impl TextInput {
         })
     }
 
-    pub(crate) fn activate_sent(&mut self) {
+    pub(super) fn activate_sent(&mut self) {
         debug_assert_eq!(self.link, LinkState::Detached);
         self.link = LinkState::Attached { content_type: None };
     }
 
-    pub(crate) fn content_type_sent(&mut self, applied: HostContentType) {
+    pub(super) fn content_type_sent(&mut self, applied: HostContentType) {
         debug_assert!(self.is_attached());
         self.link = LinkState::Attached {
             content_type: Some(applied),
@@ -343,13 +383,13 @@ impl TextInput {
         Some(std::mem::take(&mut self.composition))
     }
 
-    pub(crate) fn deactivate_sent(&mut self, barrier: BarrierToken) {
+    pub(super) fn deactivate_sent(&mut self, barrier: BarrierToken) {
         let left = self.leave_attached(LinkState::Draining { barrier });
         debug_assert!(left.is_some(), "only an attached link is deactivated");
     }
 
     /// R1: no live seat can carry the `deactivate` an attached link needs.
-    pub(crate) fn abandoned(&mut self) {
+    pub(super) fn abandoned(&mut self) {
         let left = self.leave_attached(LinkState::Detached);
         debug_assert!(left.is_some(), "only an attached link is abandoned");
     }
@@ -357,19 +397,19 @@ impl TextInput {
     /// H2: Exo detached its input method itself. Returns `None` if the
     /// link was not attached (H2'), and otherwise whether the guest showed
     /// a preedit, which it must now be told to clear.
-    pub(crate) fn exo_detached(&mut self) -> Option<bool> {
+    pub(super) fn exo_detached(&mut self) -> Option<bool> {
         let left = self.leave_attached(LinkState::Detached)?;
         Some(left.shown.is_some())
     }
 
     /// F6: the host deleted the v1 object, so nothing more goes to it.
-    pub(crate) fn host_deleted(&mut self) {
+    pub(super) fn host_deleted(&mut self) {
         self.leave_attached(LinkState::Detached);
     }
 
     /// W1 and W2: the barrier `token` returned. It ends the drain or the
     /// fence it is, in any link state.
-    pub(crate) fn barrier_done(&mut self, token: BarrierToken) {
+    pub(super) fn barrier_done(&mut self, token: BarrierToken) {
         if self.link == (LinkState::Draining { barrier: token }) {
             self.link = LinkState::Detached;
         }
@@ -380,19 +420,19 @@ impl TextInput {
 
     /// Note the activation's current deferral, and whether it started or
     /// changed, which is when it is logged.
-    pub(crate) fn deferral_changed(&mut self, deferral: Option<Deferral>) -> bool {
+    pub(super) fn deferral_changed(&mut self, deferral: Option<Deferral>) -> bool {
         let last = std::mem::replace(&mut self.warned.deferral, deferral);
         deferral.is_some() && deferral != last
     }
 
     /// Whether R2's missing seat is warned of now: once per text input.
-    pub(crate) fn first_seat_warning(&mut self) -> bool {
+    pub(super) fn first_seat_warning(&mut self) -> bool {
         !std::mem::replace(&mut self.warned.seat_missing, true)
     }
 
     /// Whether H9's delete around no cursor is warned of now: once per
     /// text input.
-    pub(crate) fn first_delete_range_warning(&mut self) -> bool {
+    pub(super) fn first_delete_range_warning(&mut self) -> bool {
         !std::mem::replace(&mut self.warned.delete_range, true)
     }
 
@@ -407,7 +447,7 @@ impl TextInput {
 
     /// I1a, I1b and I2 of design 3.1, and that an unfocused text input has
     /// nothing pending.
-    pub(crate) fn assert_invariants(&self, ti: TiId, env: &impl Env) {
+    pub(super) fn assert_invariants(&self, ti: TiId, env: &impl Env) {
         let attached = self.is_attached();
         assert!(!attached || self.is_enabled(), "I1a: {ti:?} {self:?}");
         // I1b: the link matches the target, but while it drains, while an
@@ -463,10 +503,10 @@ impl TextInput {
     }
 }
 
-/// What the handler tests of the storage switch's window set up and read
-/// directly (`test_support::text_input` and the tests of
-/// `handler/text_input.rs`), as no peer can. Each keeps the state as it
-/// finds it otherwise, legal or not, as those tests' fixtures did.
+/// What handler tests set up and read directly (`test_support::text_input`
+/// and the tests of `handler/text_input.rs`), as no peer can. Each keeps
+/// the state as it finds it otherwise; the fixtures check that what they
+/// build is legal.
 #[cfg(test)]
 impl TextInput {
     /// Start the commit count at `commits`, as if the guest had made them.
@@ -484,6 +524,13 @@ impl TextInput {
 
     pub(crate) fn set_link_for_test(&mut self, link: LinkState) {
         self.link = link;
+    }
+
+    /// Attach the host text input with the content type the field calls
+    /// for, as the reconcile of the guest commit that set its state would.
+    pub(crate) fn attach_for_test(&mut self, env: &impl Env) {
+        let content_type = Some(host::target(self, env).content_type);
+        self.link = LinkState::Attached { content_type };
     }
 
     /// Show `text` with the cursor at its end, which Exo holds there, or
@@ -543,7 +590,7 @@ fn bare_done(ti: TiId, serial: Serial) -> Outgoing {
 /// [`TextInput::current`]). Its fields are private to this file, so no
 /// other module can make one. Each method plans the transaction of one
 /// row.
-pub(crate) struct Current<'a> {
+pub(super) struct Current<'a> {
     ti: TiId,
     seat: SeatId,
     serial: Serial,
@@ -555,7 +602,7 @@ pub(crate) struct Current<'a> {
 
 /// Why a host delete (H9) is dropped.
 #[derive(Debug)]
-pub(crate) enum DeleteDrop {
+pub(super) enum DeleteDrop {
     NoSurroundingText,
     Selection,
     /// A non-negative index is measured against Exo's prediction of the
@@ -567,7 +614,7 @@ pub(crate) enum DeleteDrop {
 
 /// Why a preedit region (X1') is dropped.
 #[derive(Debug)]
-pub(crate) enum RegionDrop {
+pub(super) enum RegionDrop {
     NoSurroundingText,
     NotAroundCursor,
     /// The region does not cover the preedit Exo holds, whose rest Exo
@@ -587,13 +634,13 @@ struct Predicted {
 }
 
 /// What a confirmation (X2, X2') does.
-pub(crate) enum Confirm<'a> {
+pub(super) enum Confirm<'a> {
     Commit(Planned<'a>),
     RecoverHeldKey(KeyEffect),
 }
 
 impl<'a> Current<'a> {
-    pub(crate) fn shown(&self) -> Option<&Preedit> {
+    pub(super) fn shown(&self) -> Option<&Preedit> {
         self.composition.shown.as_ref()
     }
 
@@ -619,7 +666,7 @@ impl<'a> Current<'a> {
     /// H7. A cleared preedit with a commit text is Exo's reset commit,
     /// which gives the bytes regions took back as text, as every edit
     /// that ends the composition does. A preedit keeps them.
-    pub(crate) fn preedit(self, text: String, commit: String, assembly: Assembly) -> Planned<'a> {
+    pub(super) fn preedit(self, text: String, commit: String, assembly: Assembly) -> Planned<'a> {
         let shown = self.shown().is_some();
         if text.is_empty() && shown && !commit.is_empty() {
             let txn = GuestTxn {
@@ -654,7 +701,7 @@ impl<'a> Current<'a> {
 
     /// H8. An empty commit is no edit, whether or not a preedit shows, so
     /// it leaves Exo's prediction of the text where it was.
-    pub(crate) fn host_commit(self, text: String) -> Planned<'a> {
+    pub(super) fn host_commit(self, text: String) -> Planned<'a> {
         let ahead = !text.is_empty();
         let txn = GuestTxn {
             commit: Some(text),
@@ -665,7 +712,7 @@ impl<'a> Current<'a> {
 
     /// H9: a delete measured against the surrounding text the guest last
     /// committed (INVARIANTS "Exo's deletes are absolute and stand alone").
-    pub(crate) fn delete(self, index: i32, length: u32) -> Result<Planned<'a>, DeleteDrop> {
+    pub(super) fn delete(self, index: i32, length: u32) -> Result<Planned<'a>, DeleteDrop> {
         let Some((text, cursor, anchor)) = &self.committed.surrounding_text else {
             return Err(DeleteDrop::NoSurroundingText);
         };
@@ -693,7 +740,7 @@ impl<'a> Current<'a> {
     /// cover the preedit Exo holds, which the guest does not have as text,
     /// and deletes only the bytes beyond it; an empty one at Exo's cursor
     /// after that preedit commits it.
-    pub(crate) fn region(
+    pub(super) fn region(
         self,
         index: i32,
         length: u32,
@@ -776,7 +823,7 @@ impl<'a> Current<'a> {
 
     /// X2 commits the shown preedit; X2', with none shown, recovers the
     /// key the input method took.
-    pub(crate) fn confirm(self) -> Confirm<'a> {
+    pub(super) fn confirm(self) -> Confirm<'a> {
         if self.shown().is_none() {
             return Confirm::RecoverHeldKey(KeyEffect::RecoverHeldKey {
                 ti: self.ti,
@@ -787,15 +834,14 @@ impl<'a> Current<'a> {
         Confirm::Commit(self.commit_shown())
     }
 
-    /// F4's assembly, which the press takes whatever becomes of its
-    /// commit.
-    pub(crate) fn take_assembly(&mut self) {
-        self.composition.assembly = Assembly::default();
+    /// The assembly, which a preedit and a region apply (B3).
+    pub(super) fn take_assembly(&mut self) -> Assembly {
+        std::mem::take(&mut self.composition.assembly)
     }
 
     /// F4: a press commits the shown preedit, and fences the host's
     /// `reset` with `fence`.
-    pub(crate) fn press_commit(self, fence: BarrierToken) -> Planned<'a> {
+    pub(super) fn press_commit(self, fence: BarrierToken) -> Planned<'a> {
         debug_assert!(self.shown().is_some(), "a press commits a shown preedit");
         let mut planned = self.commit_shown();
         planned.fence = Some(fence);
@@ -816,7 +862,7 @@ impl<'a> Current<'a> {
 /// A planned transaction and the change it makes. [`Self::apply`] encodes
 /// it and makes the change; dropping it changes nothing.
 #[must_use = "apply it, or drop it to change nothing"]
-pub(crate) struct Planned<'a> {
+pub(super) struct Planned<'a> {
     cur: Current<'a>,
     txn: GuestTxn,
     /// The guest's text gains an edit it has yet to report.
@@ -834,7 +880,7 @@ impl Planned<'_> {
     /// Encode the transaction and, if it fits, make its change: the guest
     /// then shows the transaction's preedit. Returns its events and the
     /// lease effect; if it does not fit, nothing changes.
-    pub(crate) fn apply(self) -> Result<(Vec<Outgoing>, KeyEffect), TooLong> {
+    pub(super) fn apply(self) -> Result<(Vec<Outgoing>, KeyEffect), TooLong> {
         let Planned {
             cur,
             txn,

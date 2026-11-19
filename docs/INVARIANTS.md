@@ -822,9 +822,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   field's flags, learning mode and surrounding-text support, so a password
   field would be treated as text the IME may learn. It learns whether the
   field has surrounding text only with a content type. So the proxy keeps
-  what the host applied (`ime::LinkState`) and `ime::reconcile` sends the
-  committed content type, with its support, whenever the attached input
-  method lacks it: after every `activate`, including one a drain barrier
+  what the host applied (`ime::LinkState`), and at the end of every input
+  of the IME core (`ImeCore::step`) `ime::reconcile` brings every text
+  input to the state its guest committed: it sends the committed content
+  type, with its support, whenever the attached input method lacks it:
+  after every `activate`, including one a drain barrier
   or a seat without a host object deferred, when the guest changes it,
   when the field's surrounding text appears or goes, and when an enable
   or a disable starts a new field (an enable of an enabled field does
@@ -879,7 +881,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   while another text input on the connection is enabled, for any guest
   `wl_seat`, is therefore ignored: the commit still counts, closes the
   composition and applies the rest of its state, but the text input stays
-  disabled and is not activated.
+  disabled and is not activated. The flag lives in the committed state of
+  the focused field, so a focus change, a surface's end and the object's
+  end clear it with the field, and the IME core's invariants check that
+  one text input at most has it (I3 of
+  [IME_REDESIGN.md](IME_REDESIGN.md) 3.1).
   Test: `second_text_input_enable_on_the_connection_is_ignored`.
 - **Focus teardown sends `leave` itself.** When a focused text-input
   surface is destroyed or loses focus, the proxy MUST send
@@ -887,7 +893,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   is still valid, rather than waiting for the host's keyboard leave. A
   delayed host keyboard leave cannot be relied on, since it may be rejected
   as stale once the surface mapping is gone. Teardown is explicit and
-  idempotent: the later delayed leave does not duplicate the event.
+  idempotent: the later delayed leave does not duplicate the event. A
+  surface's end first moves the keyboard focus of each seat off it, which
+  resets that seat's fields (`ime::Input::FocusChanged`), then resets any
+  other field still focused on it to its seat's focus
+  (`ime::Input::SurfaceDestroyed`); each sends the `leave`.
   Tests: `wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave`,
   `ime_reaches_the_specified_text`.
 - **Every v3 commit counts.** A text-input-v3 `done` serial is the number
@@ -897,7 +907,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   v1 message consumes its pending state and changes nothing else, so no
   later commit retries that text. The count is a `CommitCount`
   (`ime/serial.rs`) with a private field, which only its `bump` changes,
-  called only from `ime::TextInput::count_commit`.
+  called only from `ime::TextInput::count_commit`, in the Commit arm of
+  `ImeCore::step`.
   Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
   `v3_requests_after_leave_are_ignored_until_next_enter`,
   `oversized_surrounding_commit_does_not_partially_advance_state`,
@@ -980,7 +991,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     `gtk_text_view_commit_text`, `gtk/gtktextview.c` 8779). Chromium
     skips an empty commit (`zwp_text_input_v3.cc` 452).
 
-  Tests: `host_ime_events_become_v3_transactions`,
+  One encoder, `ime::GuestTxn::encode`, builds every such transaction,
+  and nothing else in the crate builds these four events.
+  Tests: `guest_txn_encodes_in_canonical_order`, `ime_is_isolated`,
+  `host_ime_events_become_v3_transactions`,
   `a_reset_commit_waits_for_the_guest_to_report_it`,
   `on_set_preedit_region_translates_correctly`,
   `exo_deletes_become_v3_deletes_around_the_cursor`,
@@ -1102,18 +1116,14 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   tells the host its content type again. An enable of an enabled field
   keeps the composition, as mutter and KWin keep the preedit across it,
   and the host keeps the content type, since before the v8 extension a
-  resend would reset its composition. GTK3 sends one on every click in
-  the field, after the press; a press on the field's surface has already
-  ended the composition (next rule), so the composition it keeps is one
+  resend would reset its composition. GTK3 sends one on a click's
+  release in the field, after its press; a press on the field's surface
+  has already ended the composition (next rule), so the composition it keeps is one
   a click elsewhere, such as on a subsurface, left running. A commit that disables
   the field, and a commit while unfocused, get no `done`, as from mutter;
   nor does an enable ignored because another text input on the
-  connection is enabled, which leaves the field disabled. Nor do the
-  commits of a field whose focus a repair reset without telling the
-  guest (`repair_destroyed_surface_focus` finding the seat on the same
-  surface, which sends no `leave` and `enter`): the field counts as
-  disabled until the guest enables it again. A preedit the answer cannot
-  repeat is forgotten, since its bare `done` clears it. Host IME events reach the
+  connection is enabled, which leaves the field disabled. A preedit the
+  answer cannot repeat is forgotten, since its bare `done` clears it. Host IME events reach the
   guest as whole transactions, so this `done` never splits one, and it
   leaves `ExoText::Ahead` alone: only the surrounding text a commit
   states clears that. Unlike mutter and KWin, the proxy does not end the
@@ -1135,8 +1145,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   names that surface, while the guest shows a preedit, the proxy ends
   that composition before the guest gets the press or the down
   (`text_input::end_composition_on_press`, the one entry point of both
-  `pointer.rs` and `touch.rs`, decided by the gate
-  `ime::TextInput::current`). The guest gets one transaction
+  `pointer.rs` and `touch.rs`, hands it to the IME core as
+  `ime::Input::Press`, which the gate `ime::TextInput::current`
+  decides). The guest gets one transaction
   that clears the preedit, commits its text and ends with `done` carrying
   the current commit count, then the press or the down; the host gets
   `zwp_text_input_v1.reset`. Otherwise Exo keeps composing: the next jamo
