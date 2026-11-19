@@ -1871,14 +1871,18 @@ count.
 
 ### 4.9 Golden traces for the staged switch
 
-D4 records goldens; C3-pre commits them and C3c deletes them:
+C3-pre commits the goldens (**done**, `sim/golden.rs`; CONTRIBUTING,
+"Golden traces"), and C3c deletes them:
 
 - **Recording.** `SOMMELIER_DST_BLESS=1` writes `sim/golden.txt`, with
   one line per seed for 2,000 seeds: a hash of the full `P→C` and `P→E`
-  byte streams, and the case's choices.
+  byte streams, and of the case's choices. A keymap's size, which
+  depends on the machine's XKB data, is left out.
 - **The test.** `golden_traces_match` replays each seed and compares the
-  hashes, and prints the first differing message for a mismatch. It
-  runs in CI from C3-pre to C3c, and C3c deletes it and the file.
+  hashes. For a mismatch it prints the seed and the 16 messages that
+  hold the first difference, which a checkpoint every 16 messages
+  locates. It runs in CI from C3-pre to C3c, and C3c deletes it and the
+  file.
 - **Freeze.** No DST model, generator or proxy behaviour change may
   merge between C3-pre and C3c. A golden then always describes the
   pre-switch code.
@@ -2000,7 +2004,7 @@ in review.
 | **D5** | `sim/shrink.rs`, the replay snippet, `regressions.rs`. | D4 | 0 / +200 |
 | **D6** | Engine phase 2: the engine's `Delete` and Exo's absolute delete (E10), suggestion accept against `predicted`, and reconversion regions, including a region over a region. Exercises H9, X1 and P4. | D4 | 0 / +200 |
 | **D7** | Holds: `UserAction::KeyDown` and `KeyUp`, extending #73's enum; engine autorepeat; the empty confirm before each unhandled key (E13, X2') and the Backspace lease. | D4 | 0 / +150 |
-| **C3-pre** | No production change. Tests outside `text_input.rs` that build or read `TextInputState`, `HostApplied` or `ctx.text_inputs` directly (`keyboard.rs`, `compositor.rs`, `seat.rs`, `display.rs`, `registry.rs`, `state.rs`, `lifecycle.rs`: about 52 references) move to Session wire level, or to one `#[cfg(test)]` fixture module, `test_support::text_input`, the only test code that touches the storage. Commits `sim/golden.txt` and `golden_traces_match`, blessed on this base. | K1, D4, D5, D6, D7, the old-code fixes below, the #82 follow-up | 0 / ±600 |
+| **C3-pre** | No production change. Tests outside `text_input.rs` that build or read `TextInputState`, `HostApplied` or `ctx.text_inputs` directly (`keyboard.rs`, `compositor.rs`, `seat.rs`, `display.rs`, `registry.rs`, `state.rs`, `lifecycle.rs`: about 52 references) move to Session wire level, or to one `#[cfg(test)]` fixture module, `test_support::text_input`, the only test code that touches the storage. Commits `sim/golden.txt` and `golden_traces_match`, blessed on this base (**done**, 4.9). | K1, D4, D5, D6, D7, the old-code fixes below, the #82 follow-up | 0 / ±600 |
 | **C3a** | **The storage switch.** `Context::text_inputs` becomes `Context::ime: ImeCore`. `TextInputState`, `HostApplied`, `ShownPreedit`, the plan structs, `prepare_*`/`finish_*` and the old `reconcile` are deleted. The old handler bodies keep their shape, but call `ImeCore`'s state methods, made `pub(crate)` for this window only, and the core's `reconcile`. `InternalCallback` merges to `TextInput { token }`. The fixture module is rewritten. `Context::assert_no_orphans` calls `ImeCore::assert_invariants`. | #82, C3-pre | ≈ −650 / ±200 |
 | **C3b** | Host events (H, X and W rows) go through `step`. The old v1, extension and callback handler bodies are deleted. | C3a | ≈ −700 / 0 |
 | **C3c** | Guest requests and cross-concern inputs go through `step`. The rest of the old code is deleted, the window's `pub(crate)` items go private, and the crate-wide form of `ime_is_isolated` holds. The three shared state types move into `ime`. INVARIANTS and DESIGN are updated (Appendix A). `golden.txt` and its test are deleted. | C3b | ≈ −450 / −80 |
