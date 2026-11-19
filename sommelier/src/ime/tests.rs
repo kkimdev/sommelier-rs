@@ -1270,7 +1270,8 @@ fn row_X1_a_region_over_a_region_deletes_only_what_the_guest_has() {
 /// The old code's
 /// `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`: a host
 /// preedit replaces the region's preedit, but the guest still lacks the
-/// bytes the region took.
+/// bytes the region took. Exo holds the new preedit in place of those
+/// bytes, so the region takes it.
 #[test]
 fn row_X1_a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
     let mut ime = Ime::enabled();
@@ -1286,10 +1287,76 @@ fn row_X1_a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
     });
     assert_eq!(out.guest, [preedit("x"), done(2)]);
 
-    // The guest's text is "abc|ef": of "cd", only "c" is left.
+    // The guest's text is "abc|ef", and Exo's "abcx|ef": of "cx", only
+    // "c" is in the guest's.
     let out = ime.ext(region(-2, 2));
-    let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done(2)];
+    let expected = [no_preedit(), delete(1, 0), preedit_at("cx", 2, 2), done(2)];
     assert_eq!(out.guest, expected);
+}
+
+/// The old code's
+/// `a_region_over_a_host_preedit_is_measured_from_exos_cursor`: Exo holds
+/// the preedit the guest shows as text at the guest's cursor, with its own
+/// cursor where the preedit's was, and measures a region from there. With
+/// "a1b|" and "b" shown, region -2+2 is "bb", not "1b".
+#[test]
+fn row_X1_a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
+    let mut ime = Ime::enabled();
+    ime.report("a1b", 3);
+    ime.v1(HostIme::PreeditCursor(1));
+    let out = ime.compose("b");
+    assert_eq!(out.guest, [preedit_at("b", 1, 1), done(2)]);
+
+    let out = ime.ext(HostIme::PreeditRegion {
+        index: -2,
+        length: 2,
+    });
+    let expected = [no_preedit(), delete(1, 0), preedit_at("bb", 2, 2), done(2)];
+    assert_eq!(out.guest, expected);
+}
+
+/// The old code's `a_region_that_does_not_cover_a_host_preedit_is_dropped`:
+/// a region that does not cover the host preedit the guest shows, an
+/// empty one included, is dropped, since Exo would leave the rest of that
+/// preedit as text. One that covers it on both sides deletes the bytes
+/// beyond it on each.
+#[test]
+fn row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped() {
+    let mut ime = Ime::enabled();
+    ime.report("abc", 1);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    // Exo holds "ax|bc".
+    ime.v1(HostIme::PreeditCursor(1));
+    let out = ime.compose("x");
+    assert_eq!(out.guest, [preedit_at("x", 1, 1), done(2)]);
+
+    for (index, length) in [(0, 0), (-2, 1), (0, 1)] {
+        let out = ime.ext(region(index, length));
+        let dropped = out.guest.is_empty() && out.keys.is_empty();
+        assert!(dropped, "region {index}+{length}");
+    }
+    let out = ime.ext(region(-2, 3));
+    let expected = [no_preedit(), delete(1, 1), preedit_at("axb", 2, 2), done(2)];
+    assert_eq!(out.guest, expected);
+}
+
+/// The old code's `an_empty_preedit_has_no_hidden_cursor`, for a region: a
+/// guest report without the bytes a region took names no text Exo
+/// predicted, so Exo drops its composition (E4), and an empty region
+/// clears the preedit it no longer holds.
+#[test]
+fn row_X1_a_report_without_a_regions_bytes_ends_exos_composition() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 4);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    ime.v1(HostIme::PreeditCursor(-1));
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("d", -1, -1), done(2)]);
+
+    let out = ime.report("abcef", 3);
+    assert_eq!(out.guest, [preedit_at("d", -1, -1), done(3)]);
+    let out = ime.ext(region(0, 0));
+    assert_eq!(out.guest, [no_preedit(), done(3)]);
 }
 
 /// The old code's `a_region_equal_to_the_shown_one_sends_only_the_preedit`.

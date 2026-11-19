@@ -347,7 +347,7 @@ impl ImeCore {
                 Err(RegionDrop::Uncovered) => {
                     log::debug!(
                         "Ignoring a preedit region {index}+{length} of text input {} that does \
-                         not cover the region it shows",
+                         not cover the preedit it shows",
                         ti.0
                     );
                     return;
