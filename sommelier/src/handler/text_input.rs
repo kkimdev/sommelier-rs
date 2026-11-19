@@ -20,7 +20,7 @@ use crate::handler::ime_keys::{
     held_backspace_keyboard_for_seat, held_repeat_key_for_seat, synthesize_ime_consumed_key_pair,
 };
 use crate::ime::{
-    self, content_type_requests, ActivationStep, BarrierToken, Confirm, DeleteDrop, Env, HostExt,
+    self, content_type_requests, ActivationStep, Confirm, DeleteDrop, Env, HostExt, HostOut,
     HostTi, KeyEffect, LeaseOutcome, LinkState, RegionDrop, SeatId, SurfaceId, TextInput, TiId,
     TooLong,
 };
@@ -33,7 +33,10 @@ use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::protocols::wayland::wl_seat;
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
-use crate::state::{Context, CursorRect, InternalCallback, Link, SeatFocusChange};
+use crate::state::{
+    Context, CursorRect, InternalCallback, KeyboardFocusRegistry, Link, SeatFocusChange,
+    ShadowTable,
+};
 use crate::wire::{queue_or_drop, Action, IndexedString, Outgoing};
 
 /// Queue `zwp_text_input_v3.preedit_string`, or drop host text that does not
@@ -72,24 +75,104 @@ fn push_commit_string_to(queue: &mut Vec<Outgoing>, guest_id: u32, text: &str) -
 }
 
 /// The facts the IME core reads and does not own: the object table's and
-/// the keyboard focus's.
-pub(crate) struct CtxEnv<'a>(pub(crate) &'a Context);
+/// the keyboard focus's. It borrows only those, so that the core can step
+/// beside it.
+pub(crate) struct CtxEnv<'a> {
+    table: &'a ShadowTable,
+    focus: &'a KeyboardFocusRegistry,
+}
+
+impl<'a> CtxEnv<'a> {
+    pub(crate) fn of(ctx: &'a Context) -> Self {
+        Self {
+            table: &ctx.shadow_table,
+            focus: &ctx.keyboard_focus,
+        }
+    }
+}
 
 impl Env for CtxEnv<'_> {
     fn host_surface(&self, surface: SurfaceId) -> Option<u32> {
-        self.0.shadow_table.get_host_id(surface.0)
+        self.table.get_host_id(surface.0)
     }
 
     fn host_seat(&self, seat: SeatId) -> Option<u32> {
-        live_host_seat(self.0, seat.0)
+        live_host_seat(self.table, seat.0)
     }
 
     fn keyboard_focus(&self, seat: SeatId) -> Option<SurfaceId> {
-        self.0
-            .keyboard_focus
-            .surface_for_seat(seat.0)
-            .map(SurfaceId)
+        self.focus.surface_for_seat(seat.0).map(SurfaceId)
     }
+}
+
+/// Hand `input` to the IME core and apply its effects where the message
+/// is handled (design 3.3): the guest events, the host requests and
+/// barriers, then what it asks of the keyboard concern.
+///
+/// # Returns
+///
+/// Whether a press is to be forwarded ([`ime::Effects::forward`]).
+pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
+    let env = CtxEnv {
+        table: &ctx.shadow_table,
+        focus: &ctx.keyboard_focus,
+    };
+    let fx = ctx.ime.step(input, &env);
+    ctx.host_to_client_queue.extend(fx.to_guest);
+    for out in fx.to_host {
+        match out {
+            HostOut::Request(request) => ctx.client_to_host_queue.push(request),
+            HostOut::Barrier(token) => {
+                queue_internal_sync(ctx, InternalCallback::TextInput { token });
+            }
+            HostOut::Retire(id) => ctx.retire_destroyed_host_object(id),
+        }
+    }
+    for key in fx.keys {
+        apply_key_effect(ctx, key);
+    }
+    fx.forward
+}
+
+/// Apply what the IME core asks of the keyboard concern.
+fn apply_key_effect(ctx: &mut Context, effect: KeyEffect) {
+    match effect {
+        KeyEffect::Lease { .. } => apply_lease(ctx, effect),
+        KeyEffect::RecoverHeldKey { ti, seat, done } => recover_held_key(ctx, ti, seat, done),
+    }
+}
+
+/// X2': recover the seat's latest eligible held key, which the input
+/// method took and confirmed with nothing composed ([`KeyEffect`]).
+fn recover_held_key(ctx: &mut Context, ti: TiId, seat: SeatId, done: Outgoing) {
+    let (guest_id, guest_seat) = (ti.0, seat.0);
+    let Some(held) = held_repeat_key_for_seat(ctx, guest_seat) else {
+        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
+        log::debug!("Ignoring confirm_preedit without an active preedit for guest {guest_id}");
+        return;
+    };
+    let backspace_repeat = held.key == crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
+    if synthesize_ime_consumed_key_pair(ctx, held) {
+        if backspace_repeat {
+            let armed =
+                ctx.key_generations
+                    .arm_ime_repeat(held.host_keyboard_id, held.key, guest_id);
+            debug_assert!(armed, "recovered held key disappeared within one event");
+        } else {
+            end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
+        }
+        log::debug!(
+            "Recovered empty IME confirmation as held key {} press/release",
+            held.key
+        );
+    } else if backspace_repeat {
+        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
+    }
+    // GTK waits for the matching text-input transaction to finish before
+    // applying a key that passed through the active IME. A v1 confirm with
+    // no preedit has no text mutation, so its v3 equivalent is an empty
+    // done.
+    ctx.host_to_client_queue.push(done);
 }
 
 pub(super) fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<u32> {
@@ -107,7 +190,7 @@ fn attached_text_input(ctx: &mut Context, host_id: u32) -> Option<&mut TextInput
 /// input.
 fn apply_lease(ctx: &mut Context, effect: KeyEffect) {
     let KeyEffect::Lease { ti, seat, outcome } = effect else {
-        unreachable!("a host event's transaction ends with a lease");
+        unreachable!("a transaction ends with a lease");
     };
     let held = match outcome {
         LeaseOutcome::End => None,
@@ -590,39 +673,8 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             return Action::Drop;
         };
         let Some(shown) = current.shown().map(|shown| shown.text().to_string()) else {
-            if let Some(held) = held_repeat_key_for_seat(ctx, guest_seat) {
-                let backspace_repeat = held.key == crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
-                if synthesize_ime_consumed_key_pair(ctx, held) {
-                    if backspace_repeat {
-                        let armed = ctx.key_generations.arm_ime_repeat(
-                            held.host_keyboard_id,
-                            held.key,
-                            guest_id,
-                        );
-                        debug_assert!(armed, "recovered held key disappeared within one event");
-                    } else {
-                        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-                    }
-                    log::debug!(
-                        "Recovered empty IME confirmation as held key {} press/release",
-                        held.key
-                    );
-                } else if backspace_repeat {
-                    end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-                }
-                // GTK waits for the matching text-input transaction to finish
-                // before applying a key that passed through the active IME.
-                // A v1 confirm with no preedit has no text mutation, so its v3
-                // equivalent is an empty done.
-                ctx.host_to_client_queue
-                    .push(zwp_text_input_v3::evt::done(guest_id, done_serial));
-                return Action::Drop;
-            }
-            end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-            log::debug!(
-                "Ignoring confirm_preedit without an active preedit for guest {}",
-                guest_id
-            );
+            let done = zwp_text_input_v3::evt::done(guest_id, done_serial);
+            recover_held_key(ctx, ti, SeatId(guest_seat), done);
             return Action::Drop;
         };
         log::debug!("  -> committing cached preedit={shown:?}, guest_id={guest_id}");
@@ -726,8 +778,8 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
 /// reuse its ID for any object, which the host would reject as a seat. A
 /// seat awaiting its `delete_id` carries nothing either, and neither does
 /// an ID with no host object (ID 0 is a protocol error).
-fn live_host_seat(ctx: &Context, guest_seat: u32) -> Option<u32> {
-    let seat = ctx.shadow_table.request_object(guest_seat, wl_seat::NAME)?;
+fn live_host_seat(table: &ShadowTable, guest_seat: u32) -> Option<u32> {
+    let seat = table.request_object(guest_seat, wl_seat::NAME)?;
     match seat {
         Link::Host(host_seat) => Some(host_seat),
         // The proxy implements no wl_seat itself.
@@ -761,7 +813,7 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
     let Some(t) = ctx.ime.get(ti) else {
         return;
     };
-    let target = ime::target(t, &CtxEnv(ctx));
+    let target = ime::target(t, &CtxEnv::of(ctx));
     let link = t.link();
     let steps = ime::reconcile(&target, link);
     let host = t.host();
@@ -857,25 +909,6 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
         transaction.push(zwp_text_input_v1::req::commit_state(host.v1, serial));
     }
     ctx.client_to_host_queue.extend(transaction);
-}
-
-/// Complete the text-input barrier `token` ([`InternalCallback::TextInput`]):
-/// a drain, which then reconciles the newest guest state, or the fence of
-/// the `reset` a press sent, after which the host's composition events are
-/// current again. A token is never reused, so a text input that reuses a
-/// forgotten one's guest ID cannot hold it.
-pub(crate) fn complete_barrier(ctx: &mut Context, token: BarrierToken) {
-    let drained = ctx
-        .ime
-        .iter()
-        .find(|(_, t)| t.link() == LinkState::Draining { barrier: token })
-        .map(|(ti, _)| ti);
-    for (_, t) in ctx.ime.iter_mut() {
-        t.barrier_done(token);
-    }
-    if let Some(ti) = drained {
-        reconcile_host(ctx, ti.0, None);
-    }
 }
 
 /// Reconcile the text inputs of the guest seat `guest_seat`, which a bind
@@ -5988,8 +6021,8 @@ pub(super) mod tests {
 
     /// A drain barrier completes only the generation it drains: the guest
     /// destroyed the text input and reused its ID for one with another
-    /// host text input, enabled and not yet active, which the old barrier
-    /// must not activate.
+    /// host text input, enabled and not yet active, as it waits for a
+    /// drain of its own, which the old barrier must not end.
     #[test]
     fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
         let mut ime = Ime::new();
@@ -6010,6 +6043,10 @@ pub(super) mod tests {
             .ime
             .insert(TiId(TI), SeatId(SEAT), replacement, surface);
         ime.committed().enabled = true;
+        let drain = ime.ctx.ime.new_barrier();
+        queue_internal_sync(&mut ime.ctx, InternalCallback::TextInput { token: drain });
+        let link = LinkState::Draining { barrier: drain };
+        ime.state().set_link_for_test(link);
         ime.ctx.client_to_host_queue.clear();
 
         ime.ctx.last_sender_id = callback.0;

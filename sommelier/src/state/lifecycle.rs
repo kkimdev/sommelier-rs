@@ -342,7 +342,7 @@ impl Context {
             }
         }
         self.ime
-            .assert_invariants(&crate::handler::text_input::CtxEnv(self));
+            .assert_invariants(&crate::handler::text_input::CtxEnv::of(self));
 
         // SHM and dma-buf.
         for &pool in self.pools.keys().chain(&self.stale_shm_pools) {
