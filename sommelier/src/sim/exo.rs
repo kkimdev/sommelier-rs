@@ -257,10 +257,12 @@ struct Tracker {
     /// A report it could not match dropped the composition, and nothing
     /// composed since (E4).
     dropped: bool,
-    /// The composition is a region composed from existing text for a text
-    /// input without an extension, which its client never sees, and
-    /// nothing has changed it since.
-    hidden: bool,
+    /// While the composition is a region composed from existing text for a
+    /// text input without an extension, which its client never sees, and
+    /// nothing has changed it since: the composition the client still
+    /// shows, the one that stood before the first such region, since
+    /// nothing tells the client to drop it.
+    hidden: Option<String>,
 }
 
 impl Tracker {
@@ -276,7 +278,7 @@ impl Tracker {
             Some(state) => drop(self.expected.drain(..state)),
             None => {
                 self.dropped |= self.predicted.composition.is_some();
-                self.hidden = false;
+                self.hidden = None;
                 self.predicted = Predicted {
                     text,
                     cursor,
@@ -290,7 +292,7 @@ impl Tracker {
     /// `OnSetCompositionText`.
     fn set_composition(&mut self, text: &str) {
         self.dropped = false;
-        self.hidden = false;
+        self.hidden = None;
         let range = self.predicted.replace(text);
         self.predicted.composition = (!range.is_empty()).then_some(range);
         self.expected.push(self.predicted.clone());
@@ -310,7 +312,7 @@ impl Tracker {
         predicted.text.replace_range(range.clone(), "");
         predicted.cursor = range.start;
         predicted.composition = None;
-        self.hidden = false;
+        self.hidden = None;
         self.expected.push(self.predicted.clone());
     }
 
@@ -318,7 +320,9 @@ impl Tracker {
     /// composition, which the client never sees if `hidden`; returns it.
     fn compose_existing(&mut self, range: Range<usize>, hidden: bool) -> String {
         self.dropped = false;
-        self.hidden = hidden && !range.is_empty();
+        let shown = self.hidden.take();
+        self.hidden = (hidden && !range.is_empty())
+            .then(|| shown.unwrap_or_else(|| self.predicted.composition().to_owned()));
         let predicted = &mut self.predicted;
         let composed = predicted.text[range.clone()].to_owned();
         predicted.composition = (!range.is_empty()).then_some(range);
@@ -328,7 +332,7 @@ impl Tracker {
 
     /// `OnInsertText`.
     fn insert(&mut self, text: &str) {
-        self.hidden = false;
+        self.hidden = None;
         self.predicted.replace(text);
         self.expected.push(self.predicted.clone());
     }
@@ -336,7 +340,7 @@ impl Tracker {
     /// `OnConfirmCompositionText`: the composition stays, as text, and the
     /// state that leaves is one more an edit led to.
     fn confirm(&mut self) {
-        self.hidden = false;
+        self.hidden = None;
         self.predicted.composition = None;
         self.expected.push(self.predicted.clone());
     }
@@ -346,7 +350,7 @@ impl Tracker {
     /// not name the prediction replaces it as `ResetInternal` does, and the
     /// prediction is the only state to catch up to.
     fn cancel(&mut self) {
-        self.hidden = false;
+        self.hidden = None;
         self.predicted.composition = None;
         self.expected = vec![self.predicted.clone()];
     }
@@ -969,12 +973,13 @@ impl Exo {
         Some(tracker.predicted.composition().to_owned())
     }
 
-    /// Whether that composition is a region its client never sees, as the
-    /// text input has no extension, and which nothing has committed or
-    /// changed since.
-    pub(super) fn composition_hidden(&self) -> bool {
-        let id = self.composing_text_inputs().first().copied();
-        id.is_some_and(|id| self.text_inputs[&id].text.hidden)
+    /// If that composition is a region its client never sees, as the text
+    /// input has no extension, and which nothing has committed or changed
+    /// since: the composition the client shows instead, the one that stood
+    /// before the region.
+    pub(super) fn composition_shown_instead(&self) -> Option<String> {
+        let id = *self.composing_text_inputs().first()?;
+        self.text_inputs[&id].text.hidden.clone()
     }
 
     /// The host text inputs an input method is attached to on the focused
@@ -1880,9 +1885,9 @@ mod tests {
             let mut tracker = Tracker::default();
             tracker.update("0a".to_owned(), 2, 2);
             tracker.compose_existing(1..2, true);
-            assert!(tracker.hidden);
+            assert!(tracker.hidden.is_some());
             apply(&mut tracker);
-            assert!(!tracker.hidden, "{change}");
+            assert!(tracker.hidden.is_none(), "{change}");
         }
     }
 
@@ -2387,12 +2392,25 @@ mod tests {
         assert_eq!(events(&mut exo), []);
         assert_eq!(*predicted(&exo), predicts("0a", 2, Some(1..2)));
         assert_eq!(exo.take_composed_region().as_deref(), Some("a"));
-        assert!(exo.composition_hidden());
+        assert_eq!(exo.composition_shown_instead().as_deref(), Some(""));
         // Its commit ends it.
         exo.ask(Request::AcceptSuggestion);
         exo.take_engine();
         answer_request(&mut exo, 1, vec![commits("a")]);
-        assert!(!exo.composition_hidden());
+        assert_eq!(exo.composition_shown_instead(), None);
+        // A region over a composition the client shows leaves it shown,
+        // through the regions after it too.
+        exo.ask(Request::AcceptSuggestion);
+        exo.take_engine();
+        answer_request(&mut exo, 2, vec![shows("b")]);
+        assert_eq!(exo.composition_shown_instead(), None);
+        for (id, before) in [(3, 2), (4, 1)] {
+            exo.ask(Request::Reconvert);
+            exo.take_engine();
+            answer_request(&mut exo, id, vec![TextAction::Region { before, after: 0 }]);
+            assert_eq!(exo.composition_shown_instead().as_deref(), Some("b"));
+        }
+        assert_eq!(exo.composition().as_deref(), Some("b"));
     }
 
     #[test]

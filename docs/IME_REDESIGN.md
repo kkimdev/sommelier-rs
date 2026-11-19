@@ -1491,7 +1491,8 @@ sees them.
     next key commits the region as it is. Exo sends the region with
     `set_preedit_region` from its cursor, only with an extension; without
     one it composes the region all the same, which the guest never sees,
-    so the next key commits its text a second time; and
+    so the guest keeps showing the composition the region replaced, and
+    the next key commits its text a second time; and
     the engine learns the region's text from the field, since it
     measured the region in text that can lag.
   - A free case makes half of these twice at once, for a delete while

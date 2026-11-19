@@ -1677,13 +1677,9 @@ pub(super) fn exact(
             (shown.origin.late || shown.origin.resets < resets) && engine.is_empty()
         });
         // Without the extension, Exo composes a reconverted region the
-        // guest never sees: while it stands uncommitted, Exo composes
-        // nothing the guest can show.
-        let tracked = if exo.composition_hidden() {
-            String::new()
-        } else {
-            tracked
-        };
+        // guest never sees: while it stands uncommitted, the guest still
+        // shows the composition that stood before it.
+        let tracked = exo.composition_shown_instead().unwrap_or(tracked);
         if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) {
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
