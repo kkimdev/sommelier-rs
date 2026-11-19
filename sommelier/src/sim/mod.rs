@@ -58,7 +58,7 @@ use crate::test_support::Rng;
 use editor::{Reference, TextModel, Typing, UserAction};
 use engine::Lag;
 use oracle::{Counts, Failure, KnownIssue, Tier};
-use sched::{Choices, Line, Setup, World};
+use sched::{Choices, Choose, Line, Setup, World};
 
 /// A client model a case types into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,11 +170,15 @@ struct Outcome {
 fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
     let extension = exo::draw_extension_version(&mut choices);
     let lag = Lag::draw(&mut choices);
+    // Half the guests bind their keyboard again once the text input is
+    // active, as a client that rebuilds its seat devices does.
+    let late_keyboard = choices.pick(2) == 1;
     let setup = Setup {
         client: case.client,
         latin: case.latin,
         extension,
         lag,
+        late_keyboard,
         texts: &case.texts,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -214,7 +218,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
             texts: &case.texts,
             typing: case.typing(extension),
             actions: &case.actions,
-            untracked_restarts: &world.untracked_restarts,
+            detaches: &world.detaches,
         };
         outcome.known = oracle::classify(&failures, &spec.counts, |issues| {
             (gtk || !issues.contains(&KnownIssue::FocusWhileComposing))
@@ -505,6 +509,7 @@ fn check(test: &str, settled: bool) {
         reached.extend([
             counts.press_commits,
             counts.host_detaches,
+            counts.detaches_before_keyboard,
             counts.deletes,
             counts.regions,
         ]);

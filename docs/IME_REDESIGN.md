@@ -1597,7 +1597,14 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
   its own (E2, E6); its confirmation resets the engine only if a text
   input was attached, and a key in flight never gets its callback. Ash
   destroys `InputMethodAsh` only at shutdown, so this is a model's
-  trigger, not production's. It is the only action
+  trigger, not production's. Production reaches H2 when a keyboard is
+  bound after the text input's `activate`: it registers as the seat's
+  observer after the text input, so the text input's detach comes
+  before the keyboard's `leave` at the next focus move (E12). Half the
+  cases bind their keyboard again once the text input is active (the
+  new one first, the old one's release once it entered, so the seat
+  keeps its focus), which the counter `detaches_before_keyboard` counts.
+  Before that, the restart was the only action
   that reaches H2: since E12, a focus move always reaches the keyboard
   first, so the proxy has already deactivated when Exo's `leave` comes
   (H2'). A surface the guest destroys (F2) cannot reach H2 either: the
@@ -1737,7 +1744,9 @@ enum KnownIssue {
     /// H2: below v11 of the extension, Exo's detach confirms only a
     /// composition it tracks, and a report it cannot match drops that
     /// (E4); at the leave the proxy clears the preedit the guest shows.
-    /// C5 decides whether H2 commits it.
+    /// C5 decides whether H2 commits it. A restart, or a focus move that
+    /// the text input hears of before a keyboard bound after its activate,
+    /// detaches it so.
     RestartLosesUntrackedComposition,
     /// X1: a region while the guest shows a preedit whose bytes the
     /// committed text does not hold (a host preedit, or a region the
@@ -1751,6 +1760,10 @@ enum KnownIssue {
     /// it for a repeat of the key held before, which is still the latest
     /// peek, and the guest gets one more press of it.
     RecoveryBeforeAPress,
+    /// X1: a region Exo makes from text older than a guest report the
+    /// proxy has committed, still on its way to Exo, is measured from
+    /// the newer cursor.
+    RegionCrossesReport,
 }
 ```
 
@@ -1762,9 +1775,11 @@ strikes:
 
 - P1, in GTK only, at each `Focus` (or click or tap on the other field)
   that leaves a field while it composes;
-- the lost restart, at each restart where the world recorded that Exo
-  could confirm nothing: the extension is below v11 and Exo tracked no
-  composition. It occurs in about 1 settled case in 100 (55 of seeds
+- the lost detach, at each restart, and each focus move the text input
+  hears of first, where the world recorded that Exo could confirm
+  nothing: the extension is below v11 and Exo tracked no composition. P1
+  does not strike at such a focus move, since Exo's confirmation reaches
+  the proxy while it is attached. It occurs in about 1 settled case in 100 (55 of seeds
   1,000,001 to 1,009,999, odd), so the run does not require it.
 
 The region over a shown preedit is a free case's issue: it shows as tier
