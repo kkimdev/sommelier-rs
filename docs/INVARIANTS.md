@@ -791,19 +791,38 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   detach (H2), as when the input method's process restarts, also ends the
   recovery of every key the seat holds: the key events in flight die with
   the input method, so a held key's release may never come, and only the
-  key's next press can be recovered. A `peek_key` press of a key still
-  held is that next press, whose release died. The detach ends nothing
-  else: such a key is still guest input, so its keysym reaches the guest,
-  which a flag of its own (`PeekKeyProvenance::stale`) keeps apart from
-  the one that marks an accelerator's key. Otherwise a key typed while
-  Backspace or Space is held would also repeat the held key, and so would
-  a restart.
+  key's next press can be recovered. The detach ends nothing else: such a
+  key is still guest input, so its keysym reaches the guest, which a flag
+  of its own on the key's generation (`KeyGeneration::stale`) keeps apart
+  from the one that marks an accelerator's key. Otherwise a key typed
+  while Backspace or Space is held would also repeat the held key, and so
+  would a restart. A `peek_key` press of a key the proxy still counts held
+  across the detach, one held since `wl_keyboard.enter` without a peek
+  included, is that next press, whose predecessor's release died: it
+  retires the held generation
+  (`KeyGenerationRegistry::retire_stale_generation`) and starts a new one,
+  so nothing of the old press carries over, neither its guest owner, nor
+  its recovery, nor an accelerator's suppression; otherwise the new press
+  would be dropped as the old one's duplicate. A late release of the old
+  press, under a serial before the peek's, ends nothing. A guest that
+  still holds the old press, which `wl_keyboard`, a keysym or the enter
+  gave it, gets its release first, under the peek's serial and time, so it
+  never sees two presses without a release between, and its autorepeat of
+  the old press stops. Being a new press, it also leaves a waiting
+  recovery waiting, as the press of a key not held does
+  (`KeyGenerationRegistry::peek_press_is_new`).
   Tests: `a_confirmation_before_an_unhandled_press_recovers_no_held_key`,
   `a_confirmation_before_a_handled_press_recovers_the_held_key`,
   `a_press_on_another_seats_keyboard_keeps_a_recovery_waiting`,
   `a_waiting_recovery_ends_with_its_text_input_or_keyboard`,
   `an_input_method_detach_ends_the_recovery_of_held_keys`,
   `a_key_held_across_a_detach_is_typed_and_recovered_again`,
+  `a_press_after_a_detach_releases_the_old_press_the_guest_holds`,
+  `a_recovered_key_pressed_again_after_a_detach_reaches_the_guest`,
+  `a_press_of_a_key_held_across_a_detach_keeps_a_recovery_waiting`,
+  `a_key_held_since_enter_is_pressed_anew_after_a_detach`,
+  `a_press_after_a_detach_ends_an_accelerators_suppression`,
+  `a_late_release_of_a_press_retired_by_a_detach_is_dropped`,
   `keys_held_since_enter_are_ordered_by_their_peeks`.
 - **A key waits for at most one late release per channel.** When a key
   is pressed again before the channel that gave the guest its previous

@@ -30,12 +30,6 @@ pub struct PeekKeyProvenance {
     /// placement chords permanently clear this bit for the lifetime of the
     /// generation.
     pub eligible: bool,
-    /// The input method detached on its own while the key was held (H2),
-    /// so the key's release may have died with it: the generation recovers
-    /// no IME-consumed repeat, and the key's next `peek_key` press starts a
-    /// new one. It concerns only that recovery; the key is still guest
-    /// input.
-    pub stale: bool,
 }
 
 /// Causal watermark for the newest physical generation in one seat/focus
@@ -179,6 +173,13 @@ struct KeyGeneration {
     guest_owner: Option<GuestKeyOwner>,
     guest_press_serial: Option<u32>,
     host_accelerator_suppressed: bool,
+    /// The input method detached on its own while the key was held (H2),
+    /// so the key's release may have died with it: the generation recovers
+    /// no IME-consumed repeat, and the key's next `peek_key` press retires
+    /// it for a new one. It concerns every held key, one held since
+    /// `wl_keyboard.enter` without a peek included, and only that recovery
+    /// and that press; the key is still guest input.
+    stale: bool,
 }
 
 impl KeyGeneration {
@@ -194,6 +195,7 @@ impl KeyGeneration {
             guest_owner: None,
             guest_press_serial: None,
             host_accelerator_suppressed: false,
+            stale: false,
         }
     }
 
@@ -628,7 +630,6 @@ impl KeyGenerationRegistry {
             time,
             sequence,
             eligible,
-            stale: false,
         });
         sequence
     }
@@ -662,15 +663,54 @@ impl KeyGenerationRegistry {
         }
     }
 
-    /// No key `keyboard` holds now may recover an IME-consumed repeat
-    /// ([`PeekKeyProvenance::stale`]).
-    pub(crate) fn mark_peeks_stale(&mut self, keyboard: HostId) {
+    /// No key `keyboard` holds now may recover an IME-consumed repeat, and
+    /// its next `peek_key` press is a new press (`KeyGeneration::stale`).
+    pub(crate) fn mark_held_keys_stale(&mut self, keyboard: HostId) {
         let generations = self.entries.get_mut(&keyboard).into_iter().flatten();
         for (_, generation) in generations {
-            if let Some(peek) = generation.peek.as_mut() {
-                peek.stale = true;
+            if generation.physical_state == PhysicalKeyState::Held {
+                generation.stale = true;
             }
         }
+    }
+
+    /// Whether a `peek_key` press of `key` is a new press: the key is not
+    /// held, or is held only across the input method's own detach (H2),
+    /// whose generation that press retires
+    /// ([`Self::retire_stale_generation`]).
+    pub(crate) fn peek_press_is_new(&self, keyboard: HostId, key: u32) -> bool {
+        !self.physically_held(keyboard, key) || self.held_key_is_stale(keyboard, key)
+    }
+
+    /// Whether `key` is held across the input method's own detach (H2)
+    /// (`KeyGeneration::stale`).
+    pub(crate) fn held_key_is_stale(&self, keyboard: HostId, key: u32) -> bool {
+        self.entries
+            .get(&keyboard)
+            .and_then(|keys| keys.get(&key))
+            .is_some_and(|generation| {
+                generation.physical_state == PhysicalKeyState::Held && generation.stale
+            })
+    }
+
+    /// Retire `key`'s held generation if its peek is stale, for the key's
+    /// new `peek_key` press: the old press's release died with the input
+    /// method (H2), so nothing of its generation, the guest's ownership,
+    /// a recovery or an accelerator's suppression, may carry over to the
+    /// new press. The old press ends as a physical release would end it.
+    ///
+    /// Returns whether the guest still holds the old press, which
+    /// `wl_keyboard` or a keysym gave it, and is owed its release.
+    pub(crate) fn retire_stale_generation(&mut self, keyboard: HostId, key: u32) -> bool {
+        if !self.held_key_is_stale(keyboard, key) {
+            return false;
+        }
+        let release = self.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease);
+        if let Some(keys) = self.entries.get_mut(&keyboard) {
+            keys.remove(&key);
+        }
+        self.prune_key(keyboard, key);
+        release.delivery == GuestKeyDelivery::Forward
     }
 
     pub(crate) fn cancel_backspace_repeat(&mut self, keyboard: HostId, backspace: u32) {
@@ -2496,7 +2536,6 @@ mod tests {
                     time,
                     sequence,
                     eligible,
-                    stale: false,
                 });
             }
 
