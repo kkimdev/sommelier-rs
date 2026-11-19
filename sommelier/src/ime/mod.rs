@@ -46,7 +46,7 @@ pub(crate) use guest::TooLong;
 pub(crate) use host::{reconcile, target, ActivationStep};
 #[cfg(test)]
 pub(crate) use state::Assembly;
-pub(crate) use state::{Confirm, DeleteDrop, LinkState, RegionDrop, TextInput};
+pub(crate) use state::{Confirm, LinkState, RegionDrop, TextInput};
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

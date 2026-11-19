@@ -20,8 +20,8 @@ use crate::handler::ime_keys::{
     held_backspace_keyboard_for_seat, held_repeat_key_for_seat, synthesize_ime_consumed_key_pair,
 };
 use crate::ime::{
-    self, content_type_requests, ActivationStep, Confirm, DeleteDrop, Env, HostExt, HostOut,
-    HostTi, KeyEffect, LeaseOutcome, LinkState, RegionDrop, SeatId, SurfaceId, TextInput, TiId,
+    self, content_type_requests, ActivationStep, Confirm, Env, HostExt, HostIme, HostOut, HostTi,
+    Input, KeyEffect, LeaseOutcome, LinkState, RegionDrop, SeatId, SurfaceId, TextInput, TiId,
     TooLong,
 };
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
@@ -38,26 +38,6 @@ use crate::state::{
     ShadowTable,
 };
 use crate::wire::{queue_or_drop, Action, IndexedString, Outgoing};
-
-/// Queue `zwp_text_input_v3.preedit_string`, or drop host text that does not
-/// fit a message (see [`queue_or_drop`]).
-///
-/// # Returns
-///
-/// Whether the event was queued.
-fn push_preedit_string_to(
-    queue: &mut Vec<Outgoing>,
-    guest_id: u32,
-    text: &str,
-    cursor_begin: i32,
-    cursor_end: i32,
-) -> bool {
-    queue_or_drop(
-        queue,
-        zwp_text_input_v3::evt::preedit_string(guest_id, Some(text), cursor_begin, cursor_end),
-        format_args!("the preedit of text input {guest_id}"),
-    )
-}
 
 /// Queue `zwp_text_input_v3.commit_string`, or drop host text that does not
 /// fit a message (see [`queue_or_drop`]).
@@ -180,12 +160,6 @@ pub(super) fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> O
     ctx.ime.keysym_target(TiId(guest_id)).map(|_| guest_id)
 }
 
-/// The attached text input whose host `zwp_text_input_v1` is `host_id`.
-fn attached_text_input(ctx: &mut Context, host_id: u32) -> Option<&mut TextInput> {
-    let guest_id = active_guest_for_host_text_input(ctx, host_id)?;
-    ctx.ime.get_mut(TiId(guest_id))
-}
-
 /// Apply what the IME core asks of the Backspace repeat leased to a text
 /// input.
 fn apply_lease(ctx: &mut Context, effect: KeyEffect) {
@@ -245,6 +219,12 @@ impl zwp_text_input_manager_v1::ZwpTextInputManagerV1Handler for TextInputManage
 
 pub struct TextInputV1Handler;
 impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
+    /// H7. The v1 `commit` argument is the text to commit if this preedit
+    /// is reset, not text to insert alongside every live preedit: Exo
+    /// commonly sends the same non-empty `text` and `commit` while
+    /// composing Korean, and forwarding both would insert every
+    /// intermediate syllable. The core commits it only when the host
+    /// clears the preedit.
     fn on_preedit_string(
         &mut self,
         ctx: &mut Context,
@@ -252,96 +232,18 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         text: &IndexedString,
         commit: &String,
     ) -> Action {
-        let host_id = ctx.last_sender_id;
-        let Some(guest_id) = ctx.shadow_table.get_guest_id(host_id) else {
-            return Action::Drop;
-        };
-        let ti = TiId(guest_id);
-        let Some(t) = ctx.ime.get_mut(ti) else {
-            return Action::Drop;
-        };
-        // A preedit takes the preedit_cursor and preedit_styling before it,
-        // whatever becomes of it.
-        let assembly = t.take_assembly();
-        let done_serial = t.serial().get();
-        let Some(current) = t.current(ti) else {
-            log::debug!("Ignoring stale preedit_string for text input {guest_id}");
-            return Action::Drop;
-        };
-        // The preedit_cursor and preedit_styling before it are byte offsets
-        // into it, which replacing an invalid sequence would move.
-        let IndexedString::Utf8(text) = text else {
-            log::debug!("Ignoring a host preedit that is not UTF-8");
-            return Action::Drop;
-        };
-        if serial != done_serial {
-            log::debug!(
-                "Host preedit references guest serial {}, current serial is {}",
-                serial,
-                done_serial
-            );
-        }
-
-        log::trace!(
-            ">>> on_preedit_string: serial={}, text={:?}, commit={:?}, guest_id={}",
+        let event = HostIme::Preedit {
             serial,
-            text,
-            commit,
-            guest_id
-        );
-
-        // The v1 `commit` argument is the replacement text to use if this
-        // preedit is reset, not text to insert alongside every live preedit
-        // update. Exo commonly sends identical non-empty `text` and `commit`
-        // values while composing Korean; forwarding both would insert every
-        // intermediate syllable. The core applies the fallback only when the
-        // host actually clears the preedit (notably on reset/unfocus).
-        // Exo allocates v1 event serials independently. text-input-v3 instead
-        // requires the number of the latest guest commit request.
-        let applied = current
-            .preedit(text.clone(), commit.clone(), assembly)
-            .apply();
-        queue_transaction(ctx, ti, applied);
-        Action::Drop
+            text: text.clone(),
+            commit: commit.clone(),
+        };
+        host_v1_event(ctx, event)
     }
 
+    /// H8.
     fn on_commit_string(&mut self, ctx: &mut Context, serial: u32, text: &String) -> Action {
-        let host_id = ctx.last_sender_id;
-        let Some(guest_id) = ctx.shadow_table.get_guest_id(host_id) else {
-            return Action::Drop;
-        };
-        let ti = TiId(guest_id);
-        let Some(t) = ctx.ime.get_mut(ti) else {
-            return Action::Drop;
-        };
-        let done_serial = t.serial().get();
-        let Some(current) = t.current(ti) else {
-            log::debug!("Ignoring stale commit_string for text input {guest_id}");
-            return Action::Drop;
-        };
-        if serial != done_serial {
-            log::debug!(
-                "Host commit references guest serial {}, current serial is {}",
-                serial,
-                done_serial
-            );
-        }
-
-        log::trace!(
-            ">>> on_commit_string: serial={}, text={:?}, guest_id={}",
-            serial,
-            text,
-            guest_id
-        );
-
-        // An empty commit changes no text: the guest gets at most the clear
-        // of its preedit, as from an empty preedit.
-        let applied = current.host_commit(text.clone()).apply();
-        if applied.is_ok() {
-            take_assembly(ctx, ti);
-        }
-        queue_transaction(ctx, ti, applied);
-        Action::Drop
+        let text = text.clone();
+        host_v1_event(ctx, HostIme::Commit { serial, text })
     }
 
     fn on_keysym(
@@ -367,40 +269,13 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         Action::Drop
     }
 
-    /// Exo detached the input method. While attached Exo did so on its own
-    /// and is now deactivated ([`LinkState`]): the link ends, its
-    /// composition goes, a preedit the guest shows is cleared, and
-    /// reconciling activates again if the guest still wants input. A
-    /// `leave` that answers the proxy's `deactivate` arrives while draining
-    /// and is ignored.
+    /// H2: Exo detached the input method. While attached Exo did so on its
+    /// own; a `leave` that answers the proxy's `deactivate` arrives while
+    /// draining and is ignored (H2').
     fn on_leave(&mut self, ctx: &mut Context) -> Action {
-        let host_v1_id = ctx.last_sender_id;
-        let Some(guest_id) = ctx.shadow_table.get_guest_id(host_v1_id) else {
-            return Action::Drop;
-        };
-        let Some(t) = ctx
-            .ime
-            .get_mut(TiId(guest_id))
-            .filter(|t| t.host().v1 == host_v1_id)
-        else {
-            return Action::Drop;
-        };
-        let Some(had_preedit) = t.exo_detached() else {
-            log::debug!(">>> on_leave: host_v1_id={host_v1_id} while not active");
-            return Action::Drop;
-        };
-        log::info!("Exo detached the input method of text input {guest_id} (host {host_v1_id})");
-        // The composition went with the input method, as when its process
-        // restarts: the guest would otherwise keep showing it.
-        if had_preedit {
-            let serial = t.serial().get();
-            let mut transaction = Vec::new();
-            if push_preedit_string_to(&mut transaction, guest_id, "", 0, 0) {
-                transaction.push(zwp_text_input_v3::evt::done(guest_id, serial));
-                ctx.host_to_client_queue.extend(transaction);
-            }
+        if let Some(ti) = v1_sender(ctx) {
+            ime(ctx, Input::HostLeave(ti));
         }
-        reconcile_host(ctx, guest_id, None);
         Action::Drop
     }
 
@@ -414,6 +289,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         Action::Drop
     }
 
+    /// H4.
     fn on_preedit_styling(
         &mut self,
         ctx: &mut Context,
@@ -421,96 +297,32 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         length: u32,
         style: u32,
     ) -> Action {
-        log::trace!(
-            ">>> on_preedit_styling: index={}, length={}, style={}",
-            index,
-            length,
-            style
-        );
-        // v3 has no general preedit styling protocol. Its cursor range can
-        // represent v1's selection styling, which is the part needed by IMEs
-        // for highlighted candidate ranges.
-        if style == zwp_text_input_v1::PREEDIT_STYLE_SELECTION {
-            let host_id = ctx.last_sender_id;
-            if let Some(assembly) =
-                attached_text_input(ctx, host_id).and_then(TextInput::assembly_mut)
-            {
-                assembly.selection = Some((index, length));
-            }
-        }
-        Action::Drop
+        host_v1_event(
+            ctx,
+            HostIme::PreeditStyling {
+                index,
+                length,
+                style,
+            },
+        )
     }
 
+    /// H5.
     fn on_preedit_cursor(&mut self, ctx: &mut Context, index: i32) -> Action {
-        log::trace!(">>> on_preedit_cursor: index={}", index);
-        let host_id = ctx.last_sender_id;
-        if let Some(assembly) = attached_text_input(ctx, host_id).and_then(TextInput::assembly_mut)
-        {
-            assembly.cursor = Some(index);
-        }
-        Action::Drop
+        host_v1_event(ctx, HostIme::PreeditCursor(index))
     }
 
-    /// Exo sends it only right before a commit_string. text-input-v3 has no
-    /// cursor-position event, and the commit still must be delivered;
-    /// Chromium places the cursor at the end of the committed string and
-    /// then reports its resulting surrounding state in the next commit.
-    fn on_cursor_position(&mut self, _ctx: &mut Context, index: i32, anchor: i32) -> Action {
-        log::debug!("Cannot represent v1 cursor_position({index}, {anchor}) in text-input-v3");
-        Action::Drop
+    /// H6: Exo sends it only right before a commit_string, and
+    /// text-input-v3 has no cursor-position event.
+    fn on_cursor_position(&mut self, ctx: &mut Context, index: i32, anchor: i32) -> Action {
+        host_v1_event(ctx, HostIme::CursorPosition { index, anchor })
     }
 
+    /// H9. Exo counts `index` from the start of the surrounding text,
+    /// against the v1 XML (docs/INVARIANTS.md, "Exo's deletes are absolute
+    /// and stand alone").
     fn on_delete_surrounding_text(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
-        let host_id = ctx.last_sender_id;
-        let Some(guest_id) = ctx.shadow_table.get_guest_id(host_id) else {
-            return Action::Drop;
-        };
-        let ti = TiId(guest_id);
-        let Some(t) = ctx.ime.get_mut(ti) else {
-            return Action::Drop;
-        };
-        // A delete ends the composition, as a commit does.
-        let Some(current) = t.current(ti) else {
-            log::debug!("Ignoring stale delete_surrounding_text for text input {guest_id}");
-            return Action::Drop;
-        };
-        log::trace!(
-            ">>> on_delete_surrounding_text: index={}, length={}, guest_id={}",
-            index,
-            length,
-            guest_id
-        );
-        // Exo counts `index` from the start of the surrounding text, against
-        // the v1 XML, and sends no commit_string with the delete, so it
-        // becomes a v3 transaction of its own (docs/INVARIANTS.md, "Exo's
-        // deletes are absolute and stand alone").
-        let planned = match current.delete(index, length) {
-            Ok(planned) => planned,
-            Err(DeleteDrop::NotAroundCursor) => {
-                // The delete is lost, which only the log shows: warn once
-                // per text input.
-                let level = match t.first_delete_range_warning() {
-                    true => log::Level::Warn,
-                    false => log::Level::Debug,
-                };
-                log::log!(
-                    level,
-                    "Ignoring v1 delete range {index}+{length}, which is not around the \
-                     cursor of the surrounding text"
-                );
-                return Action::Drop;
-            }
-            Err(drop) => {
-                log::debug!("Ignoring v1 delete range {index}+{length}: {drop:?}");
-                return Action::Drop;
-            }
-        };
-        let applied = planned.apply();
-        if applied.is_ok() {
-            take_assembly(ctx, ti);
-        }
-        queue_transaction(ctx, ti, applied);
-        Action::Drop
+        host_v1_event(ctx, HostIme::Delete { index, length })
     }
 
     fn on_language(&mut self, ctx: &mut Context, serial: u32, _language: &String) -> Action {
@@ -538,6 +350,21 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         );
         Action::Drop
     }
+}
+
+/// The text input whose host `zwp_text_input_v1` sent the event being
+/// handled. A host text input is paired with one guest text input until
+/// the guest destroys it.
+fn v1_sender(ctx: &Context) -> Option<TiId> {
+    ctx.shadow_table.get_guest_id(ctx.last_sender_id).map(TiId)
+}
+
+/// H4 to H9: hand a host `zwp_text_input_v1` event to the IME core.
+fn host_v1_event(ctx: &mut Context, event: HostIme) -> Action {
+    if let Some(ti) = v1_sender(ctx) {
+        ime(ctx, Input::V1(ti, event));
+    }
+    Action::Drop
 }
 
 pub struct TextInputExtensionV1Handler;
@@ -5663,9 +5490,20 @@ pub(super) mod tests {
                 .insert(ti, SeatId(SEAT), host, Some(SurfaceId(SURFACE)));
             let mut ime = Self { ctx };
             ime.committed().enabled = true;
-            ime.state()
-                .set_link_for_test(LinkState::Attached { content_type: None });
+            ime.settle();
             ime
+        }
+
+        /// Attach the host text input with the content type the field
+        /// calls for, as the reconcile of the guest commit that set its
+        /// state would. A host event reconciles every text input, and
+        /// would send it otherwise.
+        pub(in crate::handler) fn settle(&mut self) {
+            let t = self.ctx.ime.get(TiId(TI)).expect("the text input");
+            let target = ime::target(t, &CtxEnv::of(&self.ctx));
+            let content_type = Some(target.content_type);
+            self.state()
+                .set_link_for_test(LinkState::Attached { content_type });
         }
 
         /// The fixture with guest keyboard [`KEYBOARD`] on the seat.
@@ -5972,6 +5810,7 @@ pub(super) mod tests {
         for (case, event) in cases {
             let mut ime = Ime::with_keyboard();
             ime.committed().surrounding_text = Some((oversized.clone(), 4_084, 4_084));
+            ime.settle();
             let state = ime.state();
             state.show_for_test(&oversized);
             state.set_assembly_for_test(crate::ime::Assembly {
