@@ -668,11 +668,19 @@ impl Exo {
     /// (`~InputMethodAsh`), and then `TextInput::OnInputMethodDestroyed`
     /// deactivates each text input it was attached to; nothing attaches it
     /// again until the next `activate`. Returns whether one was attached.
+    ///
+    /// The new input method is there for that `activate` at once: the
+    /// model leaves out a window in which an `activate` finds none, which
+    /// would leave Exo unattached until the focus next moves. Its engine
+    /// starts afresh, reset as the next attach would have reset it had the
+    /// old one stayed, so a key in flight is late.
     pub(crate) fn destroy_input_method(&mut self) -> bool {
         if let Some(client) = self.ima.client {
             self.confirm_composition(client);
         }
-        self.ima = Ima::default();
+        if std::mem::take(&mut self.ima).composing {
+            self.reset_engine();
+        }
         let mut detached = false;
         for id in self.ids() {
             if self.text_inputs[&id].field.attached {
@@ -1010,11 +1018,17 @@ impl Exo {
             self.mark_dropped();
         }
         if std::mem::take(&mut self.ima.composing) {
-            for key in self.in_engine.iter_mut().filter(|key| !key.answered) {
-                key.late = true;
-            }
-            self.to_engine.push(EngineIn::Reset);
+            self.reset_engine();
         }
+    }
+
+    /// IMA resets the engine, which reaches the reset after the keys in
+    /// flight, so their answers are late.
+    fn reset_engine(&mut self) {
+        for key in self.in_engine.iter_mut().filter(|key| !key.answered) {
+            key.late = true;
+        }
+        self.to_engine.push(EngineIn::Reset);
     }
 
     /// IMA dropped the text it buffered for the key in flight, which is the
@@ -1761,6 +1775,33 @@ mod tests {
         send(&mut exo, TI, activate(A));
         assert_eq!(exo.take_engine(), [EngineIn::Reset]);
         assert!(exo.in_engine[0].late);
+    }
+
+    #[test]
+    fn a_restart_of_the_input_method_starts_its_engine_afresh() {
+        // Detached by a deactivate, IMA still takes the engine to compose,
+        // and its next attach would reset it. A restart replaces IMA, so it
+        // resets the engine itself, and the key in flight is late.
+        let mut exo = active(V10);
+        press(&mut exo, 'r', &[shows("가")], true);
+        exo.key(NOW, k('k'), DOWN);
+        exo.take_engine();
+        send(&mut exo, TI, deactivate());
+        events(&mut exo);
+        assert!(!exo.destroy_input_method());
+        assert_eq!(exo.take_engine(), [EngineIn::Reset]);
+        assert!(exo.in_engine[0].late);
+        // The next activate attaches the new input method, which composes
+        // nothing.
+        send(&mut exo, TI, activate(A));
+        assert_eq!(events(&mut exo), [enter(A)]);
+        assert_eq!(exo.take_engine(), []);
+        // Attached, the restart confirms, which resets the engine once.
+        let mut exo = active(V10);
+        press(&mut exo, 'r', &[shows("가")], true);
+        assert!(exo.destroy_input_method());
+        assert_eq!(events(&mut exo), [cursor(3), commit(3, "가"), leave()]);
+        assert_eq!(exo.take_engine(), [EngineIn::Reset]);
     }
 
     #[test]
