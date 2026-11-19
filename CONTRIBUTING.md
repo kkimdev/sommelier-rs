@@ -211,6 +211,18 @@ SOMMELIER_DST_CASES=1`, which replays it exactly;
 `SOMMELIER_DST_CLIENT=chromium|gtk3|gtk4` and
 `SOMMELIER_DST_MODE=free|settled` narrow a run.
 
+The first failed case of a run is shrunk (`sim/shrink.rs`) after its
+report: ddmin over its actions, zeroing runs of its choices (0 is the
+minimum latency or the first variant), then dropping the trailing zeros,
+within 2,000 re-runs or 60 s, keeping a step only if the same check still
+fails. The report ends with `SHRUNK from ...`, the shrunk case's own
+report, and a `Regression { ... }` snippet that replays it. To add a
+regression, fix the bug, then paste the snippet into `CASES` in
+`sim/regressions.rs`, give it a name that says what it caught, and run
+`cargo test -p sommelier --bins sim::regressions`; it must fail on the old
+code and pass on the fix. A failure that does not replay from its choices,
+or a panic, is not shrunk.
+
 ## End-to-end test
 
 `sommelier/tests/weston_e2e.rs` runs real clients through
