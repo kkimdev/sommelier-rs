@@ -24,7 +24,9 @@
   [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
 - The IME core is being redesigned. [`docs/IME_REDESIGN.md`](docs/IME_REDESIGN.md)
   holds the plan: a deterministic simulation test first, then a pure IME
-  core that replaces `TextInputState` in staged, golden-trace-gated PRs.
+  core that replaces the old text-input handlers in staged,
+  golden-trace-gated PRs. C3a, the storage switch, is done: the handlers
+  keep their shape but keep all state in `Context::ime` (`ime::ImeCore`).
 
 ## Known issues and debt
 
@@ -123,7 +125,7 @@
     10174). It probably also feeds `StaleRegionAfterCommit`. Mirroring
     Exo's tracker (the edits since the last report) would close it.
   - Selection: Exo's tracker replaces a selection with the composition
-    (`OnSetCompositionText`), while `TextInputState::host_text` inserts
+    (`OnSetCompositionText`), while `ime::Current::predicted` inserts
     the preedit at the guest's cursor and ignores the anchor, so a region
     while the guest has a selection is measured in other text than
     Exo's. No DST case makes a selection.

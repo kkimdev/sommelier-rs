@@ -822,7 +822,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   field's flags, learning mode and surrounding-text support, so a password
   field would be treated as text the IME may learn. It learns whether the
   field has surrounding text only with a content type. So the proxy keeps
-  what the host applied (`HostApplied`) and `reconcile` sends the
+  what the host applied (`ime::LinkState`) and `ime::reconcile` sends the
   committed content type, with its support, whenever the attached input
   method lacks it: after every `activate`, including one a drain barrier
   or a seat without a host object deferred, when the guest changes it,
@@ -851,7 +851,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   reaches a surface an `activate` found unfocused, after a
   `wl_keyboard.leave` that set the proxy draining, so an `enter` while
   active answers the proxy's own `activate` and resends nothing.
-  `HostApplied` is therefore sound only while every host
+  `LinkState` is therefore sound only while every host
   `zwp_text_input_v1.leave`, `wl_keyboard.leave` and `wl_keyboard.enter`
   reaches the text-input state in order with the events around it, never
   dropped, delayed or coalesced with its pair: otherwise the proxy would
@@ -895,9 +895,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   while unfocused or whose state could not be encoded; those are still not
   forwarded to the host. A commit whose surrounding text does not fit a
   v1 message consumes its pending state and changes nothing else, so no
-  later commit retries that text. The count is a private field of
-  `TextInputState`, so only code in `state/input.rs` can change it, and
-  outside tests it does so only in `TextInputState::count_guest_commit`.
+  later commit retries that text. The count is a `CommitCount`
+  (`ime/serial.rs`) with a private field, which only its `bump` changes,
+  called only from `ime::TextInput::count_commit`.
   Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
   `v3_requests_after_leave_are_ignored_until_next_enter`,
   `oversized_surrounding_commit_does_not_partially_advance_state`,
@@ -1021,7 +1021,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     proxy forwarded (a non-empty commit, the reset commit of a cleared
     preedit, a confirmation, a non-empty preedit region or a delete) is
     not yet in a surrounding text the guest committed
-    (`TextInputState::unreported_host_edit`), since Exo measures against
+    (the field's text is `ExoText::Ahead`), since Exo measures against
     its prediction of the text, which includes the edit;
   - if the range does not contain the cursor, does not fit that text on
     character boundaries, or the guest stated no surrounding text, which
@@ -1031,7 +1031,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   an edit in flight states text without it, which the proxy takes as
   caught up while Exo replays the edit onto it, so the next delete may
   land wrong (see HANDOVER). Preedit regions are deliberately not gated
-  by `unreported_host_edit`: dropping one would leave Exo composing text
+  by `ExoText::Ahead`: dropping one would leave Exo composing text
   the guest does not show, so a region right after an unreported edit may
   take its text from the guest's last report.
 
@@ -1043,12 +1043,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   (`SurroundingTextTracker::OnSetCompositionText`,
   `ui/base/ime/surrounding_text_tracker.cc`), while the guest shows its
   preedit outside its text. So the proxy measures a region in Exo's text
-  as far as it knows it (`TextInputState::host_text`): the guest's text,
+  as far as it knows it (`ime::Current::predicted`): the guest's text,
   with the preedit Exo holds at the guest's cursor and Exo's cursor in it
-  (`ShownPreedit::host_cursor`, where Exo sent that preedit's cursor, or
+  (`Composition::held`, where Exo sent that preedit's cursor, or
   its end). The guest's text is the committed surrounding text without
   the bytes around its cursor that preedit regions took since the guest
-  last reported (`TextInputState::unreported_taken`; only the guest's
+  last reported (`Composition::taken`; only the guest's
   committed surrounding text, or an edit that ends the composition and
   gives the bytes back as text, a preedit cleared with a reset commit
   included, clears it, and any other host `preedit_string` does not). Exo
@@ -1069,7 +1069,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   region short on either side included, is dropped with a debug log: Exo
   would leave the rest of that preedit as text, which only a commit after
   the region's delete could give the guest. A guest report that crosses the
-  transaction clears `unreported_taken` early, the same race as above.
+  transaction clears `taken` early, the same race as above.
   Tests: `exo_deletes_become_v3_deletes_around_the_cursor`,
   `a_region_over_a_region_deletes_only_what_the_guest_has`,
   `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`,
@@ -1094,7 +1094,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   its candidate window and compose against a stale caret and text. A
   `done` applies the preedit sent since the one before, or none, so the
   proxy first repeats the preedit the guest shows, with the cursor it was
-  sent with (`TextInputState::current_preedit`); GTK, Qt and Chromium
+  sent with (`Composition::shown`); GTK, Qt and Chromium
   would otherwise drop the composition. That preedit must be the one the
   host is still composing, so only a commit that changes whether the
   field is enabled, or an enable the proxy ignores, starts a new field,
@@ -1115,7 +1115,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   disabled until the guest enables it again. A preedit the answer cannot
   repeat is forgotten, since its bare `done` clears it. Host IME events reach the
   guest as whole transactions, so this `done` never splits one, and it
-  leaves `unreported_host_edit` alone: only the surrounding text a commit
+  leaves `ExoText::Ahead` alone: only the surrounding text a commit
   states clears that. Unlike mutter and KWin, the proxy does not end the
   host's composition when the guest resets its own; only a pointer press
   or a touch-down does (next rule).
@@ -1135,8 +1135,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   names that surface, while the guest shows a preedit, the proxy ends
   that composition before the guest gets the press or the down
   (`text_input::end_composition_on_press`, the one entry point of both
-  `pointer.rs` and `touch.rs`, decided by
-  `TextInputState::prepare_press_commit`). The guest gets one transaction
+  `pointer.rs` and `touch.rs`, decided by the gate
+  `ime::TextInput::current`). The guest gets one transaction
   that clears the preedit, commits its text and ends with `done` carrying
   the current commit count, then the press or the down; the host gets
   `zwp_text_input_v1.reset`. Otherwise Exo keeps composing: the next jamo
@@ -1179,7 +1179,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   commit is the only commit of that text that the reset causes.
 
   The commit is an input-method edit the guest has yet to report
-  (`unreported_host_edit`), and it ends the Backspace repeat leased to
+  (`ExoText::Ahead`), and it ends the Backspace repeat leased to
   the field, as a confirmation does. The press is re-sent after the
   transaction rather than forwarded, since a forward precedes its
   message's other events; the rest of its host batch follows it in order
@@ -1197,15 +1197,15 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Events Exo sent before it handled the `reset` still arrive, and they
   belong to the composition the press committed. So the `reset` goes
   behind a fence, a `wl_display.sync`
-  (`InternalCallback::TextInputResetFence`, kept in
-  `TextInputState::reset_fence`). Exo handles requests in order. So the
+  (`InternalCallback::TextInput`, whose barrier token the text input
+  keeps as its fence). Exo handles requests in order. So the
   sync's `done` comes after every event Exo sent before it handled the
   `reset`, and before any event of a request sent later, a later
   `activate` included, so the fence needs no generation of its own.
   Until the fence returns, every host composition event of the field is
   dropped: a preedit, a preedit region, a commit, a delete or a
-  confirmation. One predicate, `TextInputState::host_composition_is_current`,
-  gates each one's plan. Why each is dropped:
+  confirmation. One gate, `ime::TextInput::current`, makes each one's
+  plan. Why each is dropped:
   - A preedit or a preedit region would show text Exo no longer composes,
     which a second press would commit again. A region would also delete
     text the guest already has.
