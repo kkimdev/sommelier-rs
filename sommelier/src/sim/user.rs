@@ -29,14 +29,13 @@ limitations under the License.
 //! press but before the press's reset, whose result the proxy drops by
 //! design (the fence), or a key can reach the client raw while a focus
 //! move's activation is in flight (E7). A settled case also settles after
-//! each key the engine passes. IMA confirms before such a key (E13), and
-//! if it has composed since its last commit, even a composition taken
-//! back to nothing, it then resets the engine behind the next key, if
-//! that is already in flight: the host loses the key's text (E5), which
-//! no proxy can restore.
+//! a key the engine passes while IMA takes the engine to compose ([`Ima`]):
+//! IMA confirms before the key (E13) and then resets the engine behind the
+//! next key, if that is already in flight, so the host loses that key's
+//! text (E5), which no proxy can restore.
 
 use super::editor::{Reference, Target, TextModel, Typing, UserAction};
-use super::hangul::Key;
+use super::hangul::{Composer, Key};
 use crate::test_support::Rng;
 
 /// The fields a case has.
@@ -74,6 +73,7 @@ pub(super) fn actions(
 ) -> Vec<UserAction> {
     let fields = texts.iter().map(|text| TextModel::new(text)).collect();
     let mut reference = Reference::new(fields).typing(typing);
+    let mut ima = Ima::default();
     let mut actions = Vec::new();
     for _ in 0..10 + rng.below(51) {
         let action = match rng.below(100) {
@@ -90,7 +90,20 @@ pub(super) fn actions(
             _ => UserAction::Settle,
         };
         let moves = !matches!(action, UserAction::Key(_) | UserAction::Settle);
-        let passed = matches!(action, UserAction::Key(key) if reference.engine_passes(key));
+        let stale = match action {
+            UserAction::Key(key) => !typing.latin && ima.key(key),
+            UserAction::Click { field, .. } | UserAction::Tap { field, .. } => {
+                ima.moved(field != reference.focus());
+                false
+            }
+            UserAction::Focus(field) => {
+                if field != reference.focus() {
+                    ima.moved(true);
+                }
+                false
+            }
+            UserAction::Settle => false,
+        };
         if settled && moves {
             settle(&mut actions);
         }
@@ -99,7 +112,7 @@ pub(super) fn actions(
             UserAction::Settle => settle(&mut actions),
             action => actions.push(action),
         }
-        if settled && (moves || passed) {
+        if settled && (moves || stale) {
             settle(&mut actions);
         }
     }
@@ -115,6 +128,48 @@ pub(super) fn settled(actions: &[UserAction]) -> bool {
         matches!(action, UserAction::Key(_) | UserAction::Settle)
             || (settles(i.checked_sub(1).map(|i| &actions[i])) && settles(actions.get(i + 1)))
     })
+}
+
+/// Whether `InputMethodAsh` takes the Korean engine to be composing
+/// (`composing_text_`), as the user's keys leave it. Any composition the
+/// engine shows sets it, an empty one included, and only a commit or a
+/// reset clears it (`input_method_ash.cc`).
+#[derive(Clone, Debug, Default)]
+struct Ima {
+    /// The engine's composer.
+    composer: Composer,
+    composing: bool,
+}
+
+impl Ima {
+    /// The user types `key`. Returns whether the engine passes it while IMA
+    /// takes the engine to compose: IMA's confirmation before it then
+    /// resets the engine (E13), behind the next key if that is in flight.
+    fn key(&mut self, key: Key) -> bool {
+        let shown = self.composer.preedit();
+        let out = self.composer.key(key);
+        // The engine takes a Space that ends a composition (E15).
+        let ends_with_space = key == Key::Char(' ') && !out.commit.is_empty();
+        if !out.consumed && !ends_with_space {
+            return std::mem::take(&mut self.composing);
+        }
+        if !out.commit.is_empty() {
+            self.composing = !out.preedit.is_empty();
+        } else if out.preedit != shown {
+            self.composing = true;
+        }
+        false
+    }
+
+    /// A press, or a focus move `away` to another field. A focus move
+    /// detaches IMA, which resets; a press resets it only if it ends a
+    /// composition, as only then does the proxy reset the host (F4).
+    fn moved(&mut self, away: bool) {
+        if away || !self.composer.preedit().is_empty() {
+            self.composing = false;
+        }
+        self.composer.confirm();
+    }
 }
 
 /// A `Settle`, unless the last action is one.
@@ -157,6 +212,7 @@ fn target(rng: &mut Rng) -> Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::hangul::keys;
 
     /// The actions of seeds 0 to 199, each with its fields' texts.
     fn cases(typing: Typing, settled: bool) -> Vec<(Vec<String>, Vec<UserAction>)> {
@@ -194,18 +250,57 @@ mod tests {
         ]));
     }
 
+    /// Whether IMA confirms with a stale flag before each key of
+    /// `script` (see [`crate::sim::hangul::keys`]), `|` being a click on
+    /// the focused field and `>` a focus move to the other one.
+    fn stale(script: &str) -> Vec<bool> {
+        let mut ima = Ima::default();
+        let mut stale = Vec::new();
+        for c in script.chars() {
+            match c {
+                '|' => ima.moved(false),
+                '>' => ima.moved(true),
+                c => stale.push(ima.key(keys(&c.to_string())[0])),
+            }
+        }
+        stale
+    }
+
     #[test]
-    fn a_settled_case_settles_after_each_key_the_engine_passes() {
-        for (texts, actions) in cases(Typing::default(), true) {
-            let fields = texts.iter().map(|text| TextModel::new(text)).collect();
-            let mut reference = Reference::new(fields);
+    fn ima_stays_composing_after_any_composition_until_a_commit_or_a_reset() {
+        // A key the engine passes with nothing ever composed, or after a
+        // commit, finds IMA not composing.
+        assert_eq!(stale("  rk  "), [false, false, false, false, false, false]);
+        // A composition taken back to nothing leaves it composing, until
+        // the passed key's confirmation resets it.
+        assert_eq!(stale("r⌫  "), [false, false, true, false]);
+        // A focus move resets it; a click resets it only if it ends a
+        // composition, as only then does the proxy reset the host.
+        assert_eq!(stale("r⌫> "), [false, false, false]);
+        assert_eq!(stale("r⌫| "), [false, false, true]);
+        assert_eq!(stale("r| "), [false, false]);
+    }
+
+    #[test]
+    fn a_settled_case_settles_after_a_key_that_imas_stale_flag_confirms() {
+        for (_, actions) in cases(Typing::default(), true) {
+            let mut ima = Ima::default();
+            let mut focus = 0;
             for (i, &action) in actions.iter().enumerate() {
-                if let UserAction::Key(key) = action {
-                    if reference.engine_passes(key) {
+                match action {
+                    UserAction::Key(key) if ima.key(key) => {
                         assert_eq!(actions.get(i + 1), Some(&UserAction::Settle), "{actions:?}");
                     }
+                    UserAction::Click { field, .. } | UserAction::Tap { field, .. } => {
+                        ima.moved(field != focus);
+                        focus = field;
+                    }
+                    UserAction::Focus(field) if field != focus => {
+                        ima.moved(true);
+                        focus = field;
+                    }
+                    _ => {}
                 }
-                reference.apply(action);
             }
         }
     }
