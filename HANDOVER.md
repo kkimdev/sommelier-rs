@@ -96,13 +96,28 @@
   (`a_client_that_waits_for_done_reports_the_text_an_edit_leaves`), so
   only a delete within that round trip can land wrong. Mirroring Exo's
   `SurroundingTextTracker` would close this; no host has shown it.
-- A preedit region over a preedit an earlier region made deletes only the
-  bytes the guest still has, but one case stays approximate. A region
-  that does not cover the shown one, an empty one included, is dropped:
-  the guest keeps showing the old preedit while Exo composes the new
-  range, as the right answer, giving the old text back before the new
-  delete, needs a commit before a delete, which one v3 transaction
-  cannot order.
+- A preedit region is measured in Exo's text as the proxy knows it: the
+  guest's text with the preedit Exo holds at the guest's cursor
+  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). Three cases
+  stay approximate.
+  - A region that does not cover the preedit Exo holds, an empty one
+    included, is dropped: the guest keeps showing the old preedit while
+    Exo composes the new range and keeps the rest of the old one as
+    text. The exact answer commits that rest after the region's delete,
+    and the proxy would then have to track text the guest gained, not
+    only bytes it lost, until the guest reports.
+  - The proxy assumes Exo matched every guest report but one without a
+    region's bytes. A report that changes the text while a host preedit
+    shows, which Exo cannot match either, leaves Exo without the
+    composition the proxy still measures with.
+  - Chromium applies a transaction's delete before its preedit clear and
+    drops a delete while it shows a composition (C3 of
+    [IME_REDESIGN](docs/IME_REDESIGN.md)), so a region over a shown
+    preedit that deletes bytes beyond it leaves them in Chromium's text
+    as well as in the new preedit. Ending the old preedit with a `done`
+    of its own first would serve Chromium, but the report Chromium
+    answers it with lacks the preedit, so Exo would drop its
+    composition (E4).
 - The pointer press or touch-down that ends a composition
   ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)) has not been
   checked on a host. In VS Code or Chrome started with
