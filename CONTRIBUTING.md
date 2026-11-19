@@ -83,8 +83,9 @@ assert_eq!(
 - A handler test decodes a queue with `test_support::decoded`.
 - A handler test outside `handler/text_input.rs` that sets up or reads
   text-input state no peer can observe goes through
-  `test_support::text_input`, so that each stage of the IME core's
-  switch rewrites one module.
+  `test_support::text_input`, so that a change of the IME core's storage
+  rewrites one module. It sets up only states the core can reach, which
+  the core's invariants check.
   The tests in `handler/ime_keys.rs` share the `text_input` test fixture
   (`text_input::tests`) and need no other setup.
 - Use `MessageBuilder` only for frames no encoder builds, such as

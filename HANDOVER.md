@@ -22,12 +22,13 @@
   the rules every change must keep.
 - The opt-in window placement feature is described, with its code map, in
   [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
-- The IME core is being redesigned. [`docs/IME_REDESIGN.md`](docs/IME_REDESIGN.md)
+- The IME core has been redesigned. [`docs/IME_REDESIGN.md`](docs/IME_REDESIGN.md)
   holds the plan: a deterministic simulation test first, then a pure IME
-  core that replaces the old text-input handlers in staged,
-  golden-trace-gated PRs. C3a, the storage switch, is done: the handlers
-  keep their shape but keep all state in `Context::ime` (`ime::ImeCore`).
-  C3b is done too: host events go through `ImeCore::step`.
+  core that replaced the old text-input handlers in staged,
+  golden-trace-gated PRs. The switch (C3a to C3c) is done: every IME
+  input goes through `ImeCore::step`, and `handler/text_input.rs` is its
+  adapter. Behaviour changes come next, one per PR, starting with C5
+  (focus loss commits the shown preedit).
 
 ## Known issues and debt
 
