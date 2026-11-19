@@ -97,21 +97,50 @@ fn action(action: UserAction) -> String {
 /// The regressions, each replayed against the oracle. The first is a
 /// placeholder that shows the form and smoke-tests the replay: no bug
 /// produced it. Real ones come from a shrunk failure.
-const CASES: &[Regression] = &[Regression {
-    name: "placeholder: a syllable, a Backspace and a focus move, on the sequential schedule",
-    client: ClientKind::Gtk4,
-    settled: false,
-    latin: false,
-    texts: &["가", "1"],
-    actions: &[
-        UserAction::Key(Key::Char('r')),
-        UserAction::Key(Key::Char('k')),
-        UserAction::Key(Key::Backspace),
-        UserAction::Focus(1),
-        UserAction::Settle,
-    ],
-    choices: &[],
-}];
+const CASES: &[Regression] = &[
+    Regression {
+        name: "placeholder: a syllable, a Backspace and a focus move, on the sequential schedule",
+        client: ClientKind::Gtk4,
+        settled: false,
+        latin: false,
+        texts: &["가", "1"],
+        actions: &[
+            UserAction::Key(Key::Char('r')),
+            UserAction::Key(Key::Char('k')),
+            UserAction::Key(Key::Backspace),
+            UserAction::Focus(1),
+            UserAction::Settle,
+        ],
+        choices: &[],
+    },
+    Regression {
+        // Seed 1008182, shrunk. The guest shows a host preedit, which Exo
+        // holds before its cursor, when the input method reconverts it.
+        name: "a region over a host preedit is measured from Exo's cursor",
+        client: ClientKind::Gtk3,
+        settled: false,
+        latin: false,
+        texts: &["01닭가2가", "0닭a1aa2"],
+        actions: &[
+            UserAction::Key(Key::Char('w')),
+            UserAction::Key(Key::Char('T')),
+            UserAction::Key(Key::Char('j')),
+            UserAction::Key(Key::Char('v')),
+            UserAction::Key(Key::Char('d')),
+            UserAction::RestartInputMethod,
+            UserAction::Reconvert,
+        ],
+        choices: &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 568, 0, 0, 0, 0, 0, 0, 0, 0, 914, 0, 0, 0, 0,
+            0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0,
+            0, 1, 0, 1, 0, 0, 0, 1,
+        ],
+    },
+];
 
 #[test]
 fn every_regression_passes_the_oracle() {

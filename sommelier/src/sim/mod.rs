@@ -216,7 +216,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
             actions: &case.actions,
             untracked_restarts: &world.untracked_restarts,
         };
-        outcome.known = oracle::classify(&failures, &spec.counts, |issues| {
+        outcome.known = oracle::classify(&failures, |issues| {
             (gtk || !issues.contains(&KnownIssue::FocusWhileComposing))
                 && oracle::issues_predict(issues, &played, world.client())
         });

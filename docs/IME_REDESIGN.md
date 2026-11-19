@@ -229,8 +229,8 @@ The DST should find or measure these automatically.
 - **P4. A Chromium report crossing an edit in flight** (HANDOVER,
   deletes). It needs the engine's deletes, which D6 adds. The DST
   counts the reports that cross an edit and the absolute deletes the
-  proxy drops while the guest's text is ahead (H9); a region crossing a
-  report is the known issue `RegionOverShownPreedit` (4.8).
+  proxy drops while the guest's text is ahead (H9); a region is measured
+  in Exo's text, with the preedit Exo holds (X1).
 
 ---
 
@@ -407,7 +407,7 @@ reconcile that ends every step.
 | H8 | `commit_string(serial, t)` | Gate | `Txn{commit: t, preedit: none}` | `shown := none`. The text becomes `Ahead` if `t` is non-empty; an empty commit is not sent, so the guest has no edit to report, shown preedit or not (#80; tests `row_H8_an_empty_commit_is_no_edit` and `row_H8_an_empty_commit_over_a_preedit_is_no_edit` in #82). The lease ends. The assembly is taken. | Dropped; the assembly is taken. | `on_commit_string` |
 | H9 | `delete_surrounding_text(index, length)` | Gate | `Txn{delete: (before, after), preedit: none}` | `shown := none`; the text becomes `Ahead`; the lease ends. The assembly is taken. **Dropped without other change** when: there is no committed surrounding text; there is a selection; `index ≥ 0` while the text is `Ahead`; the range does not hold the cursor or does not lie on char boundaries (the first such drop warns, later ones log at debug); or the range is empty. A negative index counts from the cursor. *Intended difference: every dropped terminal event (H7 to X2) takes the assembly. The old code differs only where no client can tell, since Exo sends styling and a cursor only right before their preedit [F]: a dropped commit takes only its `cursor_position`, and a dropped delete or confirmation takes nothing (#82, the B3 arm of `host_event`).* | Dropped; the assembly is taken. | INVARIANTS "Exo's deletes are absolute and stand alone"; `on_delete_surrounding_text`. [F] Chromium drops a delete while a composition is shown (`InputMethodAuraLinux::OnDeleteSurroundingText`). |
 | H10 | `keysym(...)` | `Attached` (the fence is **not** checked) | `wl_keyboard.key`, through the keyboard concern | Not a core input. `ime_keys` asks `ImeCore::keysym_target(ti)`. Unchanged. Exo sends none today [F, U1]. | n/a | `on_keysym`; INVARIANTS "A key waits for at most one late release per channel" |
-| X1 | ext `set_preedit_region(index, length)` | Gate; a committed surrounding text; the range lies around the cursor on char boundaries | `Txn{delete: (before, after), preedit: (region, cursor)}` | `shown := region`; the text becomes `Ahead` only for a non-empty region (#80: an empty one deletes nothing and leaves no preedit); the lease ends. The assembly is taken. Not gated by `Ahead`, on purpose. **A region over a region** (branch `kkimdev/ime-region-over-region`): while the guest has not reported since a region (even across host `preedit_string`s, `unreported_taken`), the committed text still holds the bytes the regions took, so a new region deletes only the rest; one that does not cover them is dropped, with a debug log. #82's X1 does not do this yet and must match before C3-pre. | Dropped; the assembly is taken. | `on_set_preedit_region`; Exo's region is cursor-relative [F]; tests `on_set_preedit_region_translates_correctly`, `a_region_over_a_region_deletes_only_what_the_guest_has` |
+| X1 | ext `set_preedit_region(index, length)` | Gate; a committed surrounding text; the range lies around the cursor on char boundaries | `Txn{delete: (before, after), preedit: (region, cursor)}` | `shown := region`; the text becomes `Ahead` only for a non-empty region (#80: an empty one deletes nothing and leaves no preedit); the lease ends. The assembly is taken. Not gated by `Ahead`, on purpose. **A region over a region** (#85): while the guest has not reported since a region (even across host `preedit_string`s, `unreported_taken`), the committed text still holds the bytes the regions took, so a new region deletes only the rest; one that does not cover them is dropped, with a debug log. **A region over a shown preedit** (branch `kkimdev/fix-region-over-preedit`): Exo measures the region from its own cursor, in its text, which holds its composition inline (E4), so the proxy measures it in the guest's text with the preedit Exo holds at the guest's cursor (`ShownPreedit::host_cursor`: where Exo sent its cursor, or its end; a region's, where Exo's cursor was; none once the guest reported text without a region's bytes, E4). The region must cover that preedit and deletes only the bytes beyond it; one that does not is dropped, with a debug log. #85's rule is the case where the preedit Exo holds is the bytes taken. #82's X1 does neither yet and must match before C3-pre. | Dropped; the assembly is taken. | `on_set_preedit_region`; Exo's region is cursor-relative [F]; tests `on_set_preedit_region_translates_correctly`, `a_region_over_a_region_deletes_only_what_the_guest_has`, `a_region_over_a_host_preedit_is_measured_from_exos_cursor` |
 | X1' | ext `set_preedit_region` | any other case | none | Dropped; the assembly is taken. A missing surrounding text warns. | n/a | same |
 | X2 | ext `confirm_preedit` | Gate; `shown = Some(p)` | `Txn{commit: p, preedit: none}` | `shown := none`; the text becomes `Ahead`; the lease ends; the assembly is taken. | Dropped; the assembly is taken. (`p` was encoded once, so this cannot happen in practice.) | `on_confirm_preedit`; Exo at v11 or later confirms instead of committing [F] |
 | X2' | ext `confirm_preedit` | Gate; `shown = None` | Through the keyboard concern: if the seat has an eligible held key, its press and release unless another channel already delivered it, then `done(count)`. **The `done` goes whenever a held key is found, even when its pair is skipped.** With no held key, nothing is sent. | `KeyEffect::RecoverHeldKey`. **Lease:** armed if a held Backspace's pair is sent; ended if a held Backspace's pair is skipped, if another held key's pair is sent, or if no key is held; left alone if another held key's pair is skipped (revision 3 corrects this from the old code). The eligible key is the held key with the highest sequence, if it is also the latest peek. *Open (REVIEW2 "held-key peek sequence"): a key held since `wl_keyboard.enter` keeps the sequence the enter gave it (since #75, in the order the host listed the keys), not one from its peek, so the order of the peeks does not decide. K1 or a fix before C3-pre should number such a key when its peek arrives.* | n/a | INVARIANTS "A recovered key carries the host's serial"; `on_confirm_preedit` with `held_repeat_key_for_seat` and `synthesize_ime_consumed_key_pair` |
@@ -1156,7 +1156,7 @@ describe the result.
 | **G9b**: the core consumes an oversized commit's pending state, as the table says. The old code keeps it. | The old code's retry loop is a bug. It is fixed on the old code before C3-pre, so the goldens agree. | G9b, 5.1 |
 | **Reconcile timing**: a dead seat is noticed at the next input to any text input of the connection. | This follows from reconciling every text input at the end of every step. No DST case releases a seat. | 2.3, after R2 |
 | **The assembly**: every terminal event takes it, and `cursor_position` is only logged. | The old code differs only where no client can tell. | H6, H9 |
-| **X1 over a region** does not yet subtract what a previous region took. | The fix landed on the old code after #82 was written. | X1, 5.1 |
+| **X1 over a region** does not yet subtract what a previous region took, nor measure a region over a shown preedit in Exo's text. | The fixes landed on the old code after #82 was written. | X1, 5.1 |
 
 #82 has a row test for every row that is a core input and that some
 input can reach. The rows without one are not core inputs: G2, G6, H1,
@@ -1719,7 +1719,8 @@ DST FAILURE seed=81321 mode=free client=Gtk{v4:false} ext=11 e6=confirm e8=text-
 ### 4.8 The known-issue list
 
 #72 retired P2. P1 remains; reaching H2 added a second, D6 a third and
-D7 a fourth.
+D7 a fourth. Measuring a region in Exo's text (X1) retired the third,
+the region over a shown preedit.
 
 ```rust
 // sim/oracle.rs
@@ -1734,13 +1735,6 @@ enum KnownIssue {
     /// (E4); at the leave the proxy clears the preedit the guest shows.
     /// C5 decides whether H2 commits it.
     RestartLosesUntrackedComposition,
-    /// X1: a region while the guest shows a preedit whose bytes the
-    /// committed text does not hold (a host preedit, or a region the
-    /// guest has reported) is measured from the guest's cursor, before
-    /// that preedit, while Exo makes it from its own, after the
-    /// composition it holds as text; and Chromium drops such a region's
-    /// delete while it shows a preedit (C3). The core's X1 decides.
-    RegionOverShownPreedit,
     /// X2': Exo's confirmation before a key the input method did not
     /// handle (E13) comes before that key's peek (E8), so the proxy takes
     /// it for a repeat of the key held before, which is still the latest
@@ -1762,15 +1756,8 @@ strikes:
   composition. It occurs in about 1 settled case in 100 (55 of seeds
   1,000,001 to 1,009,999, odd), so the run does not require it.
 
-The region over a shown preedit is a free case's issue: it shows as tier
-1's composition check, since Exo composes other bytes than the guest
-shows. It explains a case whose only failures are that check, if the
-case had such a region (`Counts::regions_over_preedits`). It occurs in
-about 1 free case in 1,000 to 5,000 (1 to 5 of seeds 1,000,000 to
-1,009,998, even, as the generator changed).
-
-The recovery before a press is a free case's issue too, as only free
-cases hold keys. The scheduler labels each host event with the press,
+The recovery before a press is a free case's issue, as only free cases
+hold keys. The scheduler labels each host event with the press,
 not autorepeat, it answers, so `SpecText` counts each held key it
 recovers for a confirmation before another key's press, and tier 1
 reports a `recovery` check, which the issue then explains if nothing
@@ -2167,7 +2154,7 @@ table says so.
 |---|---|---|
 | The final canonical wire order: a clearing `preedit("")` only when a shown preedit is cleared, deleted around or committed over; `delete` only if non-zero; `commit` only if non-empty; a new non-empty preedit; `done`. An empty preedit is `(0, 0)`. The G9c answer repeats an unchanged preedit. Client evidence: Chromium, GTK, Qt and kitty are order-neutral; winit and SDL3 are order-sensitive. Supersedes CL-3. | 2 Conventions; 3.2 | #76 (merged); #80; REVIEW2 "Design doc canonical order" and "After #80 merges" |
 | H7, H8 and X1: an empty `t`, commit or region sends nothing beyond the clear and makes no edit. | 2.2 | #80 |
-| X1 over a region deletes only what the guest has; the core must match. | 2.2; 3.7; 5.1 | branch `kkimdev/ime-region-over-region`; REVIEW2 "Region over a region" |
+| X1 over a region deletes only what the guest has, and a region over a shown preedit is measured in Exo's text; the core must match. | 2.2; 3.7; 5.1 | branch `kkimdev/ime-region-over-region`; REVIEW2 "Region over a region" |
 | X2' lease outcomes corrected; the held-key peek sequence is open. | 2.2 | #82's `KeyEffect` doc; `on_confirm_preedit`; #75 (6cfb121); REVIEW2 "Held-key peek sequence" |
 | E6, E8, E12 and U11 (now E13) settled as [F]. E5's reset race has three outcomes. E4 replays the tracker's history. E14: Exo advertises v14. E15: the Korean engine consumes Space. Supersedes CL-6's and H-7's "drawn". | 2.4; 4.3; 6.2 | Chromium `input_method_ash.cc`, `text_input.cc`, `surrounding_text_tracker.cc`, `wayland_server.cc`; REVIEW2 "Design doc: Chromium source settles several unknowns"; the captured trace in `held_space_repeats_after_ime_commit_until_physical_release` |
 | P1 restated: the keyboard's `leave` comes first, so the proxy drops the confirmation; Chromium may still confirm on blur. | 1.3 | E6, E12, C11 |

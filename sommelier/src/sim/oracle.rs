@@ -1369,9 +1369,6 @@ pub(super) enum KnownIssue {
     /// A restart of the input method while the guest shows a composition
     /// that Exo no longer tracks loses it, below v11 of the extension.
     RestartLosesUntrackedComposition,
-    /// A preedit region while the guest shows a preedit whose bytes the
-    /// committed text does not hold takes other bytes than Exo composes.
-    RegionOverShownPreedit,
     /// An empty confirmation before the press of a key the input method
     /// did not handle (E13) recovers the key held before it, as if it had
     /// repeated (X2').
@@ -1405,14 +1402,6 @@ impl KnownIssue {
                  peek, and sends the guest a press and release of it (X2'): a held Backspace \
                  deletes once more, a held Space types once more"
             }
-            Self::RegionOverShownPreedit => {
-                "Exo makes a region from its own cursor, which follows the composition it holds \
-                 as text, while the proxy measures it from the guest's reported cursor, before \
-                 the preedit the guest shows: a host preedit, or a region the guest reported, \
-                 which clears what the proxy knows of the bytes it took (X1); Chromium, which \
-                 applies a delete before it clears its preedit, also drops the region's delete \
-                 while it shows one (C3)"
-            }
             Self::RestartLosesUntrackedComposition => {
                 "a report Exo could not match to its prediction dropped the composition Exo \
                  tracks (E4), and below v11 of the extension Exo's detach confirms only a \
@@ -1429,10 +1418,6 @@ impl KnownIssue {
             Self::RestartLosesUntrackedComposition => {
                 "docs/IME_REDESIGN.md 2.2 H2; C5 decides whether H2 commits the shown preedit"
             }
-            Self::RegionOverShownPreedit => {
-                "docs/IME_REDESIGN.md 2.2 X1; the core's X1 must decide how a region over a \
-                 reported region is measured"
-            }
             Self::RecoveryBeforeAPress => {
                 "docs/IME_REDESIGN.md 2.2 X2', with REVIEW2's held-key peek sequence"
             }
@@ -1444,12 +1429,10 @@ impl KnownIssue {
 /// passed, and the client shows exactly what a set of issues predicts
 /// together (`predicts`, asked of each set, the smallest first, and only
 /// then); or every failure is of tier 1 and a known issue's trigger
-/// explains it: a composition check, in a case with a region over a shown
-/// preedit (`counts`), whose region Exo composes elsewhere, and a recovery
-/// check, of a key recovered for a confirmation before another's press.
+/// explains it: a recovery check, of a key recovered for a confirmation
+/// before another's press.
 pub(super) fn classify(
     failures: &[Failure],
-    counts: &Counts,
     mut predicts: impl FnMut(&[KnownIssue]) -> bool,
 ) -> Vec<KnownIssue> {
     // Tier 1 failures that a known issue's trigger explains.
@@ -1457,9 +1440,6 @@ pub(super) fn classify(
     let mut unexplained = Vec::new();
     for failure in failures {
         let issue = match (failure.tier, failure.check) {
-            (Tier::Exact, "composition") if counts.regions_over_preedits > 0 => {
-                KnownIssue::RegionOverShownPreedit
-            }
             (Tier::Exact, "recovery") => KnownIssue::RecoveryBeforeAPress,
             _ => {
                 unexplained.push(failure);
@@ -2304,39 +2284,24 @@ mod tests {
             detail: String::new(),
         };
         let one = std::slice::from_ref(&lost);
-        let none = Counts::default();
-        assert_eq!(classify(one, &none, |_| true), [P1]);
-        assert_eq!(classify(one, &none, |issues| issues == [Lost]), [Lost]);
-        assert_eq!(classify(one, &none, |issues| issues.len() == 2), [P1, Lost]);
-        assert_eq!(classify(one, &none, |_| false), []);
-        assert_eq!(classify(&[], &none, |_| true), []);
+        assert_eq!(classify(one, |_| true), [P1]);
+        assert_eq!(classify(one, |issues| issues == [Lost]), [Lost]);
+        assert_eq!(classify(one, |issues| issues.len() == 2), [P1, Lost]);
+        assert_eq!(classify(one, |_| false), []);
+        assert_eq!(classify(&[], |_| true), []);
         let exact = Failure {
             tier: Tier::Exact,
             ..lost.clone()
         };
-        assert_eq!(classify(&[lost.clone(), exact], &none, |_| true), []);
-        // Only a composition that Exo composes elsewhere, after a region
-        // over a shown preedit.
+        assert_eq!(classify(&[lost.clone(), exact], |_| true), []);
+        // No issue explains a composition that Exo composes elsewhere.
         let composition = Failure {
             tier: Tier::Exact,
             check: "composition",
             ..lost.clone()
         };
-        let region = Counts {
-            regions_over_preedits: 1,
-            ..Counts::default()
-        };
-        let both = [composition.clone(), lost.clone()];
-        let known = [KnownIssue::RegionOverShownPreedit];
-        assert_eq!(
-            classify(std::slice::from_ref(&composition), &region, |_| false),
-            known
-        );
-        assert_eq!(
-            classify(std::slice::from_ref(&composition), &none, |_| true),
-            []
-        );
-        assert_eq!(classify(&both, &region, |_| true), []);
+        let one = std::slice::from_ref(&composition);
+        assert_eq!(classify(one, |_| true), []);
         // A key recovered for a confirmation before another's press.
         let recovery = Failure {
             tier: Tier::Exact,
@@ -2345,13 +2310,11 @@ mod tests {
         };
         let before = KnownIssue::RecoveryBeforeAPress;
         assert_eq!(
-            classify(std::slice::from_ref(&recovery), &none, |_| false),
+            classify(std::slice::from_ref(&recovery), |_| false),
             [before]
         );
-        let explained = [recovery.clone(), composition];
-        let both = [before, KnownIssue::RegionOverShownPreedit];
-        assert_eq!(classify(&explained, &region, |_| false), both);
-        assert_eq!(classify(&[recovery, lost], &none, |_| true), []);
+        assert_eq!(classify(&[recovery.clone(), composition], |_| false), []);
+        assert_eq!(classify(&[recovery, lost], |_| true), []);
         assert!(!P1.reason().is_empty() && P1.tracking().contains("C5"));
         assert!(!Lost.reason().is_empty() && Lost.tracking().contains("H2"));
     }
