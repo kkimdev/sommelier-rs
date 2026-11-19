@@ -47,8 +47,10 @@ impl wl_touch::WlTouchHandler for TouchHandler {
         ) else {
             return Action::Forward;
         };
-        crate::handler::text_input::end_composition_on_press(ctx, guest_surface, || {
-            wl_touch::evt::down(guest_touch, serial, time, guest_surface, id, x, y)
-        })
+        crate::handler::text_input::end_composition_on_press(
+            ctx,
+            guest_surface,
+            wl_touch::evt::down(guest_touch, serial, time, guest_surface, id, x, y),
+        )
     }
 }

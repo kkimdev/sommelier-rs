@@ -23,10 +23,13 @@ use std::ops::Range;
 
 use super::guest::{delete_lengths, lengths_around_cursor, resolve_preedit_cursor};
 use super::guest::{GuestTxn, Preedit, TooLong};
+#[cfg(test)]
 use super::host;
 use super::host::HostContentType;
 use super::serial::{CommitCount, Serial};
-use super::{BarrierToken, Env, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
+#[cfg(test)]
+use super::Env;
+use super::{BarrierToken, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
 use crate::wire::Outgoing;
 
 /// A text-input-v3 content type: `(hint, purpose)`.
@@ -446,7 +449,8 @@ impl TextInput {
     }
 
     /// I1a, I1b and I2 of design 3.1, and that an unfocused text input has
-    /// nothing pending.
+    /// nothing pending. Test-only; see `ImeCore::assert_invariants`.
+    #[cfg(test)]
     pub(super) fn assert_invariants(&self, ti: TiId, env: &impl Env) {
         let attached = self.is_attached();
         assert!(!attached || self.is_enabled(), "I1a: {ti:?} {self:?}");

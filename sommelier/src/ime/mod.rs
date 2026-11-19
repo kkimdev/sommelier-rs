@@ -74,7 +74,8 @@ pub struct HostTi {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostExt {
     pub id: u32,
-    /// Its version; an unknown one is the largest, which allows every
+    /// Its version, cached when the extension is created and never
+    /// updated. An unknown one is the largest, which allows every
     /// request.
     pub version: u32,
     /// The host `zcr_text_input_extension_v1` it is created from.
@@ -181,7 +182,7 @@ pub struct Effects {
     pub to_guest: Vec<Outgoing>,
     /// Host requests and barriers.
     pub to_host: Vec<HostOut>,
-    /// Requests to the keyboard concern, applied after `to_guest`.
+    /// Requests to the keyboard concern, applied after `to_guest` and `to_host`.
     pub keys: Vec<KeyEffect>,
     /// Whether the press of an [`Input::Press`] is to be forwarded: it
     /// ended no composition. The core consumes every other input's
@@ -329,7 +330,9 @@ impl ImeCore {
 
     /// Check the invariants of design 3.1 (I1a to I4) that hold between
     /// steps, and that every pending barrier is one the core numbered,
-    /// once. I5 is the adapter's.
+    /// once. I5 is the adapter's. Test-only, so that a panicking check
+    /// cannot be wired into production.
+    #[cfg(test)]
     pub fn assert_invariants(&self, env: &impl Env) {
         let mut enabled = Vec::new();
         let mut barriers = Vec::new();
