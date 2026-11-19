@@ -157,10 +157,65 @@ impl V3Field {
             content_type,
             surrounding_text_supported: self.surrounding_text.is_some()
                 || extension_version < extended::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
-            surrounding_text: self.surrounding_text.clone().unwrap_or_default(),
+            surrounding_text: host_surrounding_text(self.surrounding_text.as_ref(), None),
             cursor_rectangle: self.cursor_rectangle.unwrap_or_default(),
         }
     }
+}
+
+/// The surrounding text the proxy reports to the host for a commit that
+/// states `stated`, while the guest shows the preedit `shown`: the text,
+/// cursor and anchor as the guest stated them, or `("", 0, 0)` for a
+/// cleared one (an enable or a disable). The one place the oracle says what
+/// a report to the host holds, per step ([`SpecText`]) and at quiescence
+/// ([`V3Field::on_host`]).
+pub(crate) fn host_surrounding_text(
+    stated: Option<&(String, u32, u32)>,
+    shown: Option<&str>,
+) -> (String, u32, u32) {
+    let _ = shown;
+    stated.cloned().unwrap_or_default()
+}
+
+/// What a content-type request to the host must hold for a field whose
+/// committed content type is `(hint, purpose)` and which states a
+/// surrounding text or not (`surrounding`), if `request` is one: `Some` of
+/// whether it does.
+fn content_type_matches(
+    request: &AnyRequest,
+    (hint, purpose): (u32, u32),
+    surrounding: bool,
+) -> Option<bool> {
+    let (v1_hint, v1_purpose, input_type, input_mode, flags, learning_mode) =
+        crate::ime::map_v3_content_type(hint, purpose);
+    Some(match *request {
+        AnyRequest::ZwpTextInputV1(v1::Request::SetContentType { hint, purpose }) => {
+            (hint, purpose) == (v1_hint, v1_purpose)
+        }
+        AnyRequest::ZcrExtendedTextInputV1(extended::Request::DeprecatedSetInputType {
+            input_type: t,
+            input_mode: m,
+            input_flags: f,
+            learning_mode: l,
+        }) => (t, m, f, l) == (input_type, input_mode, flags, learning_mode),
+        AnyRequest::ZcrExtendedTextInputV1(extended::Request::SetInputType {
+            input_type: t,
+            input_mode: m,
+            input_flags: f,
+            learning_mode: l,
+            inline_composition_support: i,
+        }) => {
+            let inline = extended::INLINE_COMPOSITION_SUPPORT_SUPPORTED;
+            (t, m, f, l, i) == (input_type, input_mode, flags, learning_mode, inline)
+        }
+        AnyRequest::ZcrExtendedTextInputV1(extended::Request::SetSurroundingTextSupport {
+            support,
+        }) => {
+            let supported = extended::SURROUNDING_TEXT_SUPPORT_SUPPORTED;
+            (support == supported) == surrounding
+        }
+        _ => return None,
+    })
 }
 
 /// The v3 state a guest has sent since its last commit (G3 to G8).
@@ -304,10 +359,8 @@ pub(super) struct Counts {
     /// Preedit regions Exo made while a report the proxy sent it was on
     /// its way (KnownIssue::RegionCrossesReport).
     pub regions_crossing_reports: u64,
-    /// Regions Exo composed for a text input without an extension, which
-    /// the guest never sees, and ranges IMA sent after the commit of the
-    /// key it held them for (KnownIssue::StaleRegionAfterCommit).
-    pub regions_hidden: u64,
+    /// Ranges IMA sent after the commit of the key it held them for
+    /// (KnownIssue::StaleRegionAfterCommit).
     pub regions_stale: u64,
     /// Regions after which the guest shows another preedit than Exo
     /// composed, as Exo made them over a composition it no longer held
@@ -355,7 +408,6 @@ impl std::ops::AddAssign for Counts {
         self.regions_dropped += other.regions_dropped;
         self.crossed_reports += other.crossed_reports;
         self.regions_crossing_reports += other.regions_crossing_reports;
-        self.regions_hidden += other.regions_hidden;
         self.regions_stale += other.regions_stale;
         self.regions_unheld += other.regions_unheld;
         self.regions_ahead += other.regions_ahead;
@@ -448,6 +500,15 @@ pub(super) struct SpecText {
     /// The regions after which the guest shows another preedit than Exo
     /// composed, with the check that failed ([`SpecText::judge_region`]).
     pub wrong_regions: Vec<(&'static str, String)>,
+    /// The surrounding text the proxy must report to the host in the step,
+    /// if a commit stated one, and the reports it sent.
+    report: Option<(String, u32, u32)>,
+    reported: Vec<(String, u32, u32)>,
+    /// The content-type requests the proxy sent in the step that are not
+    /// the committed field's.
+    typed: Vec<String>,
+    /// The steps whose reports to the host were not the specification's.
+    pub wrong_reports: Vec<String>,
     pub counts: Counts,
 }
 
@@ -485,6 +546,10 @@ impl SpecText {
             input: String::new(),
             wrong_decisions: Vec::new(),
             wrong_regions: Vec::new(),
+            report: None,
+            reported: Vec::new(),
+            typed: Vec::new(),
+            wrong_reports: Vec::new(),
             counts: Counts::default(),
         }
     }
@@ -581,6 +646,12 @@ impl SpecText {
             content_type,
             cursor_rectangle,
         } = std::mem::take(&mut self.pending);
+        // The commit reports a stated surrounding text to the host, enabled
+        // or not.
+        if let Some(text) = &surrounding_text {
+            let shown = self.shown.as_ref().map(|shown| shown.text.as_str());
+            self.report = Some(host_surrounding_text(text.as_ref(), shown));
+        }
         let was_enabled = self.committed.is_some();
         let enabled = enabled.unwrap_or(was_enabled);
         if enabled != was_enabled {
@@ -1174,6 +1245,25 @@ impl SpecText {
 
     /// A request the proxy sent the host, as far as the IME decides it.
     fn decision(&mut self, request: &AnyRequest) {
+        if let AnyRequest::ZwpTextInputV1(v1::Request::SetSurroundingText {
+            text: IndexedString::Utf8(text),
+            cursor,
+            anchor,
+        }) = request
+        {
+            self.reported.push((text.clone(), *cursor, *anchor));
+        }
+        // The step's commit came before the proxy sent anything.
+        let committed = self.committed.as_ref();
+        let matches = committed.and_then(|field| {
+            let surrounding = field.surrounding_text.is_some();
+            content_type_matches(request, field.content_type, surrounding)
+        });
+        let typed = content_type_matches(request, (0, 0), false).is_some();
+        if typed && matches != Some(true) {
+            self.typed
+                .push(format!("{request:?} for the committed {committed:?}"));
+        }
         let sent = &mut self.sent;
         let after = std::mem::take(&mut self.after);
         match *request {
@@ -1238,6 +1328,28 @@ impl SpecText {
         self.expected = Decisions::default();
         self.sent = Decisions::default();
         self.synced = (None, None);
+        self.check_reports();
+    }
+
+    /// The reports the proxy sent the host in the step must be what the
+    /// guest committed in it: the surrounding text a commit stated, once,
+    /// and every content type and surrounding-text support as the committed
+    /// field's.
+    fn check_reports(&mut self) {
+        let reported = std::mem::take(&mut self.reported);
+        let expected: Vec<_> = self.report.take().into_iter().collect();
+        let mut wrong = Vec::new();
+        if reported != expected {
+            wrong.push(format!(
+                "the surrounding text {reported:?}, the specification asks {expected:?}"
+            ));
+        }
+        wrong.append(&mut self.typed);
+        if !wrong.is_empty() && self.wrong_reports.len() < 5 {
+            let wrong = wrong.join("; ");
+            self.wrong_reports
+                .push(format!("after {}: the proxy reported {wrong}", self.input));
+        }
     }
 
     /// The guest gets `txn`, which it applies to the focused field.
@@ -1483,6 +1595,9 @@ pub(super) fn exact(
     for (check, detail) in &spec.wrong_regions {
         failures.push(failure(check, spec.focus, detail.clone()));
     }
+    if !spec.wrong_reports.is_empty() {
+        failures.push(failure("report", None, spec.wrong_reports.join("\n")));
+    }
     let recoveries = spec.counts.recoveries_before_a_press;
     if recoveries > 0 {
         let detail = format!(
@@ -1496,9 +1611,14 @@ pub(super) fn exact(
             (shown.origin.late || shown.origin.resets < resets) && engine.is_empty()
         });
         // Without the extension, Exo composes a reconverted region the
-        // guest never sees, over what it shows or not.
-        let hidden = extension.is_none() && spec.counts.regions_hidden > 0;
-        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) && !hidden {
+        // guest never sees: while it stands uncommitted, Exo composes
+        // nothing the guest can show.
+        let tracked = if exo.composition_hidden() {
+            String::new()
+        } else {
+            tracked
+        };
+        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) {
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
             );
@@ -1876,8 +1996,19 @@ mod tests {
     fn attached(fields: &[&str]) -> SpecText {
         let mut spec = SpecText::new(&HOST, &texts(fields));
         host(&mut spec, enter(0), &[]);
-        guest(&mut spec, &enable(), &[activate(0)]);
+        guest(&mut spec, &enable(), &[activate(0), reported("", 0)]);
         spec
+    }
+
+    /// The proxy's report of `text`, with the cursor at `cursor`, to the
+    /// host.
+    fn reported(text: &str, cursor: u32) -> AnyRequest {
+        v1::Request::SetSurroundingText {
+            text: IndexedString::Utf8(text.to_owned()),
+            cursor,
+            anchor: cursor,
+        }
+        .into()
     }
 
     /// Exo's `preedit_cursor` and `preedit_string` of `text`.
@@ -2125,7 +2256,36 @@ mod tests {
             cursor,
             anchor: cursor,
         };
-        guest(spec, &[surrounding, v3::Request::Commit {}], &[]);
+        let report = reported(text, cursor as u32);
+        guest(spec, &[surrounding, v3::Request::Commit {}], &[report]);
+    }
+
+    #[test]
+    fn every_report_to_the_host_must_be_what_the_guest_committed_in_the_step() {
+        let mut spec = attached(&["0ab"]);
+        assert_eq!(spec.wrong_reports, Vec::<String>::new());
+        let surrounding = |cursor| v3::Request::SetSurroundingText {
+            text: IndexedString::Utf8("0ab".to_owned()),
+            cursor,
+            anchor: cursor,
+        };
+        let commit = || v3::Request::Commit {};
+        // A report with another cursor, a missing report, and one no commit
+        // stated.
+        guest(
+            &mut spec,
+            &[surrounding(3), commit()],
+            &[reported("0ab", 0)],
+        );
+        guest(&mut spec, &[surrounding(2), commit()], &[]);
+        host(&mut spec, enter(0), &[reported("0ab", 2)]);
+        // A content type that is not the committed one.
+        let typed = v1::Request::SetContentType {
+            hint: 0,
+            purpose: v1::CONTENT_PURPOSE_PASSWORD,
+        };
+        guest(&mut spec, &[commit()], &[typed.into()]);
+        assert_eq!(spec.wrong_reports.len(), 4, "{:?}", spec.wrong_reports);
     }
 
     #[test]
@@ -2474,6 +2634,57 @@ mod tests {
         });
         assert_eq!(checks(&spec, "", 0), Vec::<&str>::new());
         assert_eq!(spec.counts.late_shown, 1);
+    }
+
+    #[test]
+    fn a_hidden_region_excuses_a_composition_only_while_it_stands() {
+        use crate::sim::engine::{EngineOut, Request, TextAction};
+        // Exo, with no extension, composes a region of "0a" that the guest
+        // never sees.
+        let mut exo = Exo::default();
+        exo.set_text_input_focus(Some(HOST[0]));
+        exo.request(3, &manager::Request::CreateTextInput { id: 10 }.into());
+        exo.request(10, &activate(0));
+        exo.request(10, &reported("0a", 2));
+        exo.take_events();
+        exo.take_engine();
+        exo.ask(Request::Reconvert);
+        exo.take_engine();
+        let region = TextAction::Region {
+            before: 1,
+            after: 0,
+        };
+        exo.answer(&EngineOut::Text {
+            id: 0,
+            actions: vec![region],
+        });
+        exo.answer(&EngineOut::Done {
+            id: 0,
+            handled: true,
+        });
+        let spec = attached(&["0a"]);
+        let checks = |exo: &Exo, engine: &str| -> Vec<&'static str> {
+            let shadow = Shadow {
+                views: spec.views.clone(),
+                ..Shadow::new(&GUEST[..1], &[])
+            };
+            let failures = exact(&[], &spec, &shadow, exo, engine, 0, None);
+            let checks = failures.iter().map(|failure| failure.check);
+            checks.filter(|&check| check == "composition").collect()
+        };
+        assert_eq!(checks(&exo, ""), Vec::<&str>::new());
+        // Once a key composes over it, the guest must show that.
+        exo.key(Micros(0), Key::Char('r'), wl_keyboard::KEY_STATE_PRESSED);
+        exo.take_engine();
+        exo.answer(&EngineOut::Text {
+            id: 1,
+            actions: vec![TextAction::Preedit("ㄱ".to_owned())],
+        });
+        exo.answer(&EngineOut::Done {
+            id: 1,
+            handled: true,
+        });
+        assert_eq!(checks(&exo, "ㄱ"), ["composition"]);
     }
 
     /// GTK4 showing `texts`, the keyboard on field `focus`.

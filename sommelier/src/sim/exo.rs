@@ -257,6 +257,10 @@ struct Tracker {
     /// A report it could not match dropped the composition, and nothing
     /// composed since (E4).
     dropped: bool,
+    /// The composition is a region composed from existing text for a text
+    /// input without an extension, which its client never sees, and
+    /// nothing has changed it since.
+    hidden: bool,
 }
 
 impl Tracker {
@@ -272,6 +276,7 @@ impl Tracker {
             Some(state) => drop(self.expected.drain(..state)),
             None => {
                 self.dropped |= self.predicted.composition.is_some();
+                self.hidden = false;
                 self.predicted = Predicted {
                     text,
                     cursor,
@@ -285,6 +290,7 @@ impl Tracker {
     /// `OnSetCompositionText`.
     fn set_composition(&mut self, text: &str) {
         self.dropped = false;
+        self.hidden = false;
         let range = self.predicted.replace(text);
         self.predicted.composition = (!range.is_empty()).then_some(range);
         self.expected.push(self.predicted.clone());
@@ -304,13 +310,15 @@ impl Tracker {
         predicted.text.replace_range(range.clone(), "");
         predicted.cursor = range.start;
         predicted.composition = None;
+        self.hidden = false;
         self.expected.push(self.predicted.clone());
     }
 
     /// `OnSetCompositionFromExistingText`: the text in `range` becomes the
-    /// composition; returns it.
-    fn compose_existing(&mut self, range: Range<usize>) -> String {
+    /// composition, which the client never sees if `hidden`; returns it.
+    fn compose_existing(&mut self, range: Range<usize>, hidden: bool) -> String {
         self.dropped = false;
+        self.hidden = hidden && !range.is_empty();
         let predicted = &mut self.predicted;
         let composed = predicted.text[range.clone()].to_owned();
         predicted.composition = (!range.is_empty()).then_some(range);
@@ -320,6 +328,7 @@ impl Tracker {
 
     /// `OnInsertText`.
     fn insert(&mut self, text: &str) {
+        self.hidden = false;
         self.predicted.replace(text);
         self.expected.push(self.predicted.clone());
     }
@@ -327,6 +336,7 @@ impl Tracker {
     /// `OnConfirmCompositionText`: the composition stays, as text, and the
     /// state that leaves is one more an edit led to.
     fn confirm(&mut self) {
+        self.hidden = false;
         self.predicted.composition = None;
         self.expected.push(self.predicted.clone());
     }
@@ -336,6 +346,7 @@ impl Tracker {
     /// not name the prediction replaces it as `ResetInternal` does, and the
     /// prediction is the only state to catch up to.
     fn cancel(&mut self) {
+        self.hidden = false;
         self.predicted.composition = None;
         self.expected = vec![self.predicted.clone()];
     }
@@ -508,10 +519,8 @@ pub(crate) struct Exo {
     composed_region: Option<String>,
     /// The seat's observers registered so far (E12).
     observers: u64,
-    /// The regions composed for a text input without an extension, which
-    /// its client never sees, and the ranges IMA held for a key and sent
-    /// after that key's commit, so that they compose the committed text.
-    pub(super) regions_hidden: u64,
+    /// The ranges IMA held for a key and sent after that key's commit, so
+    /// that they compose the committed text.
     pub(super) regions_stale: u64,
 }
 
@@ -960,6 +969,14 @@ impl Exo {
         Some(tracker.predicted.composition().to_owned())
     }
 
+    /// Whether that composition is a region its client never sees, as the
+    /// text input has no extension, and which nothing has committed or
+    /// changed since.
+    pub(super) fn composition_hidden(&self) -> bool {
+        let id = self.composing_text_inputs().first().copied();
+        id.is_some_and(|id| self.text_inputs[&id].text.hidden)
+    }
+
     /// The host text inputs an input method is attached to on the focused
     /// surface: the ones whose preedits and presses matter.
     pub(crate) fn composing_text_inputs(&self) -> Vec<u32> {
@@ -1372,8 +1389,11 @@ impl Exo {
             dropped: text.dropped,
             composed: String::new(),
         };
-        let composed = text.compose_existing(range.clone());
-        self.regions_hidden += u64::from(self.extension_of(id).is_none());
+        let hidden = self.extension_of(id).is_none();
+        let composed = self
+            .text_input(id)
+            .text
+            .compose_existing(range.clone(), hidden);
         if let Some(extension) = self.extension_of(id) {
             let index = -i32::try_from(cursor - range.start).expect("a short region");
             let length = u32::try_from(range.len()).expect("a short region");
@@ -2345,6 +2365,12 @@ mod tests {
         assert_eq!(events(&mut exo), []);
         assert_eq!(*predicted(&exo), predicts("0a", 2, Some(1..2)));
         assert_eq!(exo.take_composed_region().as_deref(), Some("a"));
+        assert!(exo.composition_hidden());
+        // Its commit ends it.
+        exo.ask(Request::AcceptSuggestion);
+        exo.take_engine();
+        answer_request(&mut exo, 1, vec![commits("a")]);
+        assert!(!exo.composition_hidden());
     }
 
     #[test]
