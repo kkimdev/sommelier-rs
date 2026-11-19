@@ -18,6 +18,7 @@ use crate::handler::callback::queue_internal_sync;
 use crate::handler::text_input::active_guest_for_host_text_input;
 use crate::ime::{SeatId, TiId};
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
 use crate::state::{Context, GuestKeyDelivery, GuestKeyEvent, HostId, InternalCallback};
 use crate::wire::Action;
@@ -542,6 +543,10 @@ pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepe
 ///   the input method did not handle the press, so the confirmation was
 ///   its own: no key is recovered, as when a confirmation finds no held
 ///   key;
+/// - the text input's `leave` shows that the confirmation was the one Exo
+///   sends as it detaches the input method (E6): no key is recovered
+///   either, and the detach ends the recovery of every key held
+///   ([`forget_held_keys_for_seat`]);
 /// - any other event shows that the confirmation was an autorepeat: the
 ///   held key is recovered ([`recover_pending`]), and then the event is
 ///   handled.
@@ -656,20 +661,26 @@ pub(crate) fn before_host_event(
                 false => recover_pending(ctx),
             }
         }
+        (Some(zwp_text_input_v1::NAME), _)
+            if opcode == zwp_text_input_v1::EVT_LEAVE
+                && ctx.shadow_table.get_guest_id(sender) == Some(pending.ti.0) =>
+        {
+            drop_pending(ctx);
+        }
         _ => recover_pending(ctx),
     }
 }
 
 /// The pending recovery's confirmation was Exo's before the press it was
-/// waiting on (E13): no key is recovered, and the Backspace lease ends, as
-/// when a confirmation finds no held key.
+/// waiting on (E13), or before its detach (E6): no key is recovered, and
+/// the Backspace lease ends, as when a confirmation finds no held key.
 fn drop_pending(ctx: &mut Context) {
     let Some(PendingRecovery { ti, seat, held, .. }) = ctx.pending_recovery.take() else {
         return;
     };
     log::debug!(
-        "An empty IME confirmation was the host's before a new press, not a repeat of \
-         held key {}",
+        "An empty IME confirmation was the host's before a new press or a detach, not a \
+         repeat of held key {}",
         held.key
     );
     end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
@@ -728,6 +739,24 @@ pub(crate) fn recover_pending(ctx: &mut Context) {
     // no preedit has no text mutation, so its v3 equivalent is the guest's
     // state again.
     ctx.host_to_client_queue.extend(done);
+}
+
+/// H2: the input method detached text input on its own, as when its
+/// process restarts. The key events in flight died with it, as their
+/// callbacks never come, so a held key's release may never reach the
+/// keyboard, and the keys it took are no longer its to confirm. No key a
+/// keyboard of `guest_seat` holds now is recovered again; its next press
+/// starts a generation that can be.
+pub(super) fn forget_held_keys_for_seat(ctx: &mut Context, guest_seat: u32) {
+    let host_keyboards: Vec<_> = ctx
+        .keyboard_to_seat
+        .iter()
+        .filter(|(_, &seat)| seat == guest_seat)
+        .filter_map(|(&guest, _)| ctx.shadow_table.get_host_id(guest).map(HostId))
+        .collect();
+    for keyboard in host_keyboards {
+        ctx.key_generations.invalidate_peeks(keyboard);
+    }
 }
 
 /// Forget the pending recovery if it names guest text input `ti`, which

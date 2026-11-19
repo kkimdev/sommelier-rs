@@ -654,6 +654,16 @@ impl KeyGenerationRegistry {
         }
     }
 
+    /// No key `keyboard` holds now may recover an IME-consumed repeat.
+    pub(crate) fn invalidate_peeks(&mut self, keyboard: HostId) {
+        let generations = self.entries.get_mut(&keyboard).into_iter().flatten();
+        for (_, generation) in generations {
+            if let Some(peek) = generation.peek.as_mut() {
+                peek.eligible = false;
+            }
+        }
+    }
+
     pub(crate) fn cancel_backspace_repeat(&mut self, keyboard: HostId, backspace: u32) {
         if self.physically_held(keyboard, backspace) {
             let generation = self.ensure_generation(keyboard, backspace);

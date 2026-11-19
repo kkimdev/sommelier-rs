@@ -385,10 +385,11 @@ pub(super) struct Counts {
     pub recoveries_skipped: u64,
     pub confirms_unheld: u64,
     /// Empty confirmations that found an eligible held key and turned out
-    /// to be Exo's before a new press (E13), which recovered nothing; and
-    /// those whose text input left the gate, or whose key ended, before
-    /// the host's next event decided them.
+    /// to be Exo's before a new press (E13) or before its detach (E6),
+    /// which recovered nothing; and those whose text input left the gate,
+    /// or whose key ended, before the host's next event decided them.
     pub confirms_before_a_press: u64,
+    pub confirms_before_a_detach: u64,
     pub recoveries_dropped: u64,
     /// Backspace leases armed, and ended while armed.
     pub leases: u64,
@@ -432,6 +433,7 @@ impl std::ops::AddAssign for Counts {
         self.recoveries_skipped += other.recoveries_skipped;
         self.confirms_unheld += other.confirms_unheld;
         self.confirms_before_a_press += other.confirms_before_a_press;
+        self.confirms_before_a_detach += other.confirms_before_a_detach;
         self.recoveries_dropped += other.recoveries_dropped;
         self.leases += other.leases;
         self.leases_ended += other.leases_ended;
@@ -453,6 +455,9 @@ struct Held {
     /// lease was cancelled for the rest of the press.
     leased: bool,
     cancelled: bool,
+    /// The input method detached on its own while the key was held (H2):
+    /// it is not recovered again.
+    stale: bool,
 }
 
 /// X2': the recovery of held key `key` for an empty confirmation, which
@@ -916,6 +921,7 @@ impl SpecText {
             self.latest_peek
                 .is_none_or(|sequence| sequence == held.sequence)
                 && !(key == backspace && held.cancelled)
+                && !held.stale
         });
         let Some((&key, _)) = eligible else {
             self.counts.confirms_unheld += 1;
@@ -934,7 +940,8 @@ impl SpecText {
     /// before it is handled. Before any peek, the keyboard's modifiers
     /// leave it waiting, and the peek of a press of a key not held leaves
     /// it waiting on that press. That press's `wl_keyboard.key` shows that
-    /// the confirmation was Exo's before it: nothing is recovered, and the
+    /// the confirmation was Exo's before it, and the text input's `leave`
+    /// that it was Exo's as it detached (E6): nothing is recovered, and the
     /// lease ends. Any other event recovers the key.
     fn decide_recovery(&mut self, event: &AnyEvent) {
         let Some(waiting) = &mut self.recovery else {
@@ -953,6 +960,11 @@ impl SpecText {
             {
                 self.recovery = None;
                 self.counts.confirms_before_a_press += 1;
+                self.end_lease();
+            }
+            (AnyEvent::ZwpTextInputV1(v1::Event::Leave {}), _) => {
+                self.recovery = None;
+                self.counts.confirms_before_a_detach += 1;
                 self.end_lease();
             }
             _ => self.recover_waiting(),
@@ -1056,8 +1068,12 @@ impl SpecText {
     fn text_input(&mut self, event: &v1::Event, origin: Origin) {
         match event {
             v1::Event::Leave {} if self.link == Link::Attached => {
-                // H2: Exo detached on its own.
+                // H2: Exo detached on its own. The keys in flight died with
+                // the input method, so no key held now is recovered again.
                 self.counts.host_detaches += 1;
+                for held in self.held.values_mut() {
+                    held.stale = true;
+                }
                 if self.shown.is_some() {
                     self.apply(&Txn::default(), (0, 0));
                 }

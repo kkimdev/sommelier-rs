@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::handler::callback::queue_internal_sync;
 use crate::handler::ime_keys::{
-    end_backspace_repeat_for_seat, end_backspace_repeat_for_text_input,
+    end_backspace_repeat_for_seat, end_backspace_repeat_for_text_input, forget_held_keys_for_seat,
     forget_recovery_of_text_input, held_backspace_keyboard_for_seat, hold_recovery,
 };
 use crate::ime::{
@@ -200,7 +200,11 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     /// draining and is ignored (H2').
     fn on_leave(&mut self, ctx: &mut Context) -> Action {
         if let Some(ti) = v1_sender(ctx) {
+            let detached = ctx.ime.keysym_target(ti);
             ime(ctx, Input::HostLeave(ti));
+            if let Some(seat) = detached {
+                forget_held_keys_for_seat(ctx, seat.0);
+            }
         }
         Action::Drop
     }
@@ -4295,6 +4299,52 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), expected);
         f.answer_recovery_syncs().await;
         assert_eq!(f.s.guest_received(), []);
+    }
+
+    /// Exo confirms as it detaches the input method on its own (E6), as
+    /// when the input method's process restarts, then sends `leave` (H2).
+    /// That confirmation is the detach's, not a repeat of the held Space,
+    /// which the input method took. The key events in flight die with the
+    /// input method, so a held key's release may never come: Space is not
+    /// recovered again, but its next press is.
+    #[tokio::test]
+    async fn an_input_method_detach_ends_the_recovery_of_held_keys() {
+        let mut f = Field::typing().await;
+        let space = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 700,
+            time: 1_234,
+        };
+        f.s.host([f.peek(space), f.preedit("가", ""), f.commit("가 ")])
+            .await;
+        let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([f.confirm(), v1::leave(f.host)]).await;
+        assert_eq!(f.s.guest_received(), []);
+        let callback = barrier(&f.s.host_received());
+        let answer = wl_callback::evt::done(callback, 0);
+        f.s.host([answer, v1::enter(f.host, f.surface.host)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.s.host([f.confirm()]).await;
+        assert_eq!(f.s.host_received(), [], "no recovery waits");
+        assert_eq!(f.s.guest_received(), []);
+
+        let release = Stroke {
+            state: RELEASED,
+            serial: 701,
+            ..space
+        };
+        let again = Stroke {
+            serial: 702,
+            time: 1_400,
+            ..space
+        };
+        f.s.host([f.peek(release), f.peek(again), f.confirm()])
+            .await;
+        f.answer_recovery_syncs().await;
+        assert_eq!(f.s.guest_received(), f.recovered(again));
     }
 
     /// A recovery that waits goes only to a text input that still passes

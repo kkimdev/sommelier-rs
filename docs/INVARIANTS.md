@@ -768,18 +768,24 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   host's next event. Before any peek, `wl_keyboard.modifiers` leave it
   waiting, and so does the `peek_key` press of a key the keyboard does not
   hold. That key's `wl_keyboard.key` press, with the peek's serial, drops
-  it, as a confirmation that finds no held key. Any other host event
-  recovers the key first, so that its pair and `done` precede that event.
+  it, as a confirmation that finds no held key, and so does the text
+  input's `leave`: Exo confirms as it detaches the input method (E6). Any
+  other host event recovers the key first, so that its pair and `done`
+  precede that event.
   With a recovery that waits the proxy sends the host a `wl_display.sync`,
   whose `done` follows the whole task (E11), so one round trip decides it
   at the latest, with no timer. The pair goes only if the text input still
   passes the gate and the key is still held on its keyboard, and the
-  `done` carries the guest's state under the serial of then. Otherwise a
-  key typed while Backspace or Space is held would also repeat the held
-  key.
+  `done` carries the guest's state under the serial of then. Exo's own
+  detach (H2), as when the input method's process restarts, also ends the
+  recovery of every key the seat holds: the key events in flight die with
+  the input method, so a held key's release may never come, and only the
+  key's next press can be recovered. Otherwise a key typed while Backspace
+  or Space is held would also repeat the held key, and so would a restart.
   Tests: `a_confirmation_before_an_unhandled_press_recovers_no_held_key`,
   `a_confirmation_before_a_handled_press_recovers_the_held_key`,
   `a_waiting_recovery_ends_with_its_text_input_or_keyboard`,
+  `an_input_method_detach_ends_the_recovery_of_held_keys`,
   `keys_held_since_enter_are_ordered_by_their_peeks`.
 - **A key waits for at most one late release per channel.** When a key
   is pressed again before the channel that gave the guest its previous

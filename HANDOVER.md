@@ -109,6 +109,9 @@
   the held key would still repeat once. IMA sends text there only when it
   had buffered a composition as well as a commit, which it shows before
   it confirms, so the confirmation is then not empty; no DST case does it.
+  Exo's own detach of the input method ends the recovery of the keys held
+  then, whose releases may have died with it, so a key held across an
+  input-method restart stops repeating until its next press.
 - A preedit region is measured in Exo's text as the proxy knows it: the
   guest's text with the preedit Exo holds at the guest's cursor
   ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). These cases
