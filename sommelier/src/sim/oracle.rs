@@ -190,6 +190,15 @@ struct Decisions {
     syncs: u32,
 }
 
+/// What a sync of the proxy's follows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum After {
+    Deactivate,
+    Reset,
+    #[default]
+    Other,
+}
+
 /// The preedit the guest shows, as the proxy tracks it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Shown {
@@ -279,6 +288,11 @@ pub(super) struct SpecText {
     expected: Decisions,
     sent: Decisions,
     synced: (Option<u32>, Option<u32>),
+    /// The request the proxy sent last in the step, as far as its syncs go.
+    after: After,
+    /// The transactions the guest must get in the step, each with its
+    /// preedit cursor.
+    txns: Vec<(Txn, (i32, i32))>,
     /// What reached the proxy in this step, for a report.
     input: String,
     /// The steps whose decisions were not the specification's.
@@ -304,6 +318,8 @@ impl SpecText {
             expected: Decisions::default(),
             sent: Decisions::default(),
             synced: (None, None),
+            after: After::Other,
+            txns: Vec::new(),
             input: String::new(),
             wrong_decisions: Vec::new(),
             counts: Counts::default(),
@@ -621,21 +637,32 @@ impl SpecText {
     /// A request the proxy sent the host, as far as the IME decides it.
     fn decision(&mut self, request: &AnyRequest) {
         let sent = &mut self.sent;
+        let after = std::mem::take(&mut self.after);
         match *request {
             AnyRequest::ZwpTextInputV1(v1::Request::Activate { surface, .. }) => {
                 sent.activate = Some(surface);
             }
-            AnyRequest::ZwpTextInputV1(v1::Request::Deactivate { .. }) => sent.deactivate = true,
-            AnyRequest::ZwpTextInputV1(v1::Request::Reset {}) => sent.reset = true,
-            AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) => {
-                sent.syncs += 1;
-                // The barrier follows the deactivate, the fence the reset.
-                match (sent.deactivate, self.synced.0, sent.reset) {
-                    (true, None, _) => self.synced.0 = Some(callback),
-                    (_, _, true) => self.synced.1 = Some(callback),
-                    _ => {}
-                }
+            AnyRequest::ZwpTextInputV1(v1::Request::Deactivate { .. }) => {
+                sent.deactivate = true;
+                self.after = After::Deactivate;
             }
+            AnyRequest::ZwpTextInputV1(v1::Request::Reset {}) => {
+                sent.reset = true;
+                self.after = After::Reset;
+            }
+            // Only the sync right after a deactivate or a reset is the
+            // proxy's own barrier or fence.
+            AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) => match after {
+                After::Deactivate => {
+                    sent.syncs += 1;
+                    self.synced.0 = Some(callback);
+                }
+                After::Reset => {
+                    sent.syncs += 1;
+                    self.synced.1 = Some(callback);
+                }
+                After::Other => {}
+            },
             _ => {}
         }
     }
@@ -675,10 +702,12 @@ impl SpecText {
         self.synced = (None, None);
     }
 
-    /// The guest applies `txn` to the focused field.
+    /// The guest gets `txn`, which it applies to the focused field.
     fn apply(&mut self, txn: &Txn, cursor: (i32, i32)) {
         let field = self.focus.expect("a transaction for the focused field");
         self.views[field].apply(txn, cursor);
+        let cursor = self.views[field].preedit_cursor;
+        self.txns.push((txn.clone(), cursor));
     }
 
     fn field(&self, surface: u32) -> usize {
@@ -713,6 +742,8 @@ pub(super) struct Shadow {
     shift: bool,
     /// The transaction in progress, with its preedit cursor.
     txn: (Txn, (i32, i32)),
+    /// The transactions the guest got in the step.
+    txns: Vec<(Txn, (i32, i32))>,
 }
 
 impl Shadow {
@@ -725,6 +756,7 @@ impl Shadow {
             keyboard: None,
             shift: false,
             txn: Default::default(),
+            txns: Vec::new(),
         }
     }
 
@@ -796,6 +828,7 @@ impl Shadow {
                 // included, which the specification holds to (0, 0).
                 view.model.apply_txn(&txn);
                 view.preedit_cursor = cursor;
+                self.txns.push((txn, cursor));
             }
         }
     }
@@ -806,8 +839,35 @@ impl Shadow {
     }
 }
 
+/// Tier 1 at the end of each step: the guest got the transactions the
+/// specification asks, in order, and shows the same in every field, cursor
+/// and preedit cursor included. Returns the difference, if any, and starts
+/// the next step.
+pub(super) fn step(spec: &mut SpecText, shadow: &mut Shadow) -> Option<String> {
+    let (expected, got) = (
+        std::mem::take(&mut spec.txns),
+        std::mem::take(&mut shadow.txns),
+    );
+    if expected != got {
+        return Some(format!(
+            "after {}: the guest got the transactions {got:?}, the specification asks {expected:?}",
+            spec.input
+        ));
+    }
+    (spec.views != shadow.views).then(|| {
+        let views = |views: &[View]| views.iter().map(show).collect::<Vec<_>>().join(", ");
+        format!(
+            "after {}: spec [{}], shadow [{}]",
+            spec.input,
+            views(&spec.views),
+            views(&shadow.views)
+        )
+    })
+}
+
 /// Tier 1 at quiescence:
 ///
+/// - the steps that failed ([`step`]), the first few, `steps`;
 /// - `shadow` against `spec`, per field;
 /// - the proxy's decisions against the specification's;
 /// - the guest's preedit against what Exo composes;
@@ -824,6 +884,7 @@ impl Shadow {
 /// preedit, which `resets`, the engine resets so far, tells, Exo may
 /// compose nothing at all.
 pub(super) fn exact(
+    steps: &[String],
     spec: &SpecText,
     shadow: &Shadow,
     exo: &Exo,
@@ -843,6 +904,9 @@ pub(super) fn exact(
             let detail = format!("spec:   {}\nshadow: {}", show(spec), show(shadow));
             failures.push(failure("text", Some(i), detail));
         }
+    }
+    if !steps.is_empty() {
+        failures.push(failure("step", None, steps.join("\n")));
     }
     if !spec.wrong_decisions.is_empty() {
         failures.push(failure("decision", None, spec.wrong_decisions.join("\n")));
@@ -1221,6 +1285,59 @@ mod tests {
     }
 
     #[test]
+    fn only_a_sync_after_a_deactivate_or_a_reset_is_a_decision() {
+        let mut spec = attached(&["0"]);
+        // A sync of the proxy's for something else is no IME decision.
+        guest(&mut spec, &[v3::Request::Commit {}], &[sync()]);
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+        // A deactivate without its barrier is a wrong one.
+        let disable = [v3::Request::Disable {}, v3::Request::Commit {}];
+        guest(&mut spec, &disable, &[deactivate()]);
+        assert_eq!(spec.wrong_decisions.len(), 1);
+    }
+
+    #[test]
+    fn each_step_must_give_the_guest_the_transactions_the_specification_asks() {
+        let mut spec = attached(&["0"]);
+        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["0"]));
+        let to_guest = |shadow: &mut Shadow, events: Vec<AnyEvent>| {
+            events
+                .iter()
+                .for_each(|event| shadow.see(Seen::ToGuest(event)));
+        };
+        to_guest(
+            &mut shadow,
+            vec![v3::Event::Enter { surface: GUEST[0] }.into()],
+        );
+        // The answer to the enable: a bare done.
+        to_guest(&mut shadow, vec![v3::Event::Done { serial: 1 }.into()]);
+        assert_eq!(step(&mut spec, &mut shadow), None);
+        preedit(&mut spec, "가");
+        let shown = |cursor| -> Vec<AnyEvent> {
+            vec![
+                v3::Event::PreeditString {
+                    text: Some(IndexedString::Utf8("가".to_owned())),
+                    cursor_begin: cursor,
+                    cursor_end: cursor,
+                }
+                .into(),
+                v3::Event::Done { serial: 1 }.into(),
+            ]
+        };
+        // A bogus preedit before the real one heals by the end, but not
+        // within the step.
+        let mut bogus = shadow.views.clone();
+        to_guest(&mut shadow, shown(0));
+        to_guest(&mut shadow, shown(3));
+        assert!(step(&mut spec, &mut shadow).is_some_and(|f| f.contains("transactions")));
+        assert_eq!(step(&mut spec, &mut shadow), None);
+        // The same transactions, but a view that differs, as from a key.
+        bogus[0].model.text.push('x');
+        shadow.views = bogus;
+        assert!(step(&mut spec, &mut shadow).is_some_and(|f| f.contains("spec [")));
+    }
+
+    #[test]
     fn exo_or_the_proxy_detaching_or_a_focus_change_drops_the_preedit() {
         // H2: Exo's own detach clears the preedit, committing nothing.
         let mut spec = attached(&["0", "1"]);
@@ -1354,7 +1471,7 @@ mod tests {
                 views: spec.views.clone(),
                 ..Shadow::new(&GUEST[..1], &[])
             };
-            let failures = exact(spec, &shadow, &exo, engine, resets, None);
+            let failures = exact(&[], spec, &shadow, &exo, engine, resets, None);
             let checks = failures.iter().map(|failure| failure.check);
             checks.filter(|&check| check != "field state").collect()
         };
