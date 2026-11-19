@@ -17,7 +17,7 @@ limitations under the License.
 use crate::handler::callback::queue_internal_sync;
 use crate::handler::ime_keys::{
     end_backspace_repeat_for_seat, end_backspace_repeat_for_text_input,
-    held_backspace_keyboard_for_seat,
+    held_backspace_keyboard_for_seat, held_repeat_key_for_seat, synthesize_ime_consumed_key_pair,
 };
 use crate::ime::{
     content_type_requests, delete_lengths, lengths_around_cursor, resolve_preedit_cursor,
@@ -29,13 +29,13 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::protocols::wayland::{wl_keyboard, wl_seat};
+use crate::protocols::wayland::wl_seat;
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    reconcile, ActivationStep, ConfirmPreeditPlan, Context, CursorRect, GuestKeyDelivery,
-    GuestKeyEvent, HostApplied, HostContentType, HostId, HostPreeditContext, HostTarget,
-    InternalCallback, Link, SeatFocusChange, TextInputState,
+    reconcile, ActivationStep, ConfirmPreeditPlan, Context, CursorRect, HostApplied,
+    HostContentType, HostId, HostPreeditContext, HostTarget, InternalCallback, Link,
+    SeatFocusChange, TextInputState,
 };
 use crate::wire::{queue_or_drop, Action, IndexedString, Outgoing};
 
@@ -79,136 +79,6 @@ pub(super) fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> O
         .get(&guest_id)
         .filter(|state| state.host_is_active())
         .map(|_| guest_id)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HeldRepeatKey {
-    guest_keyboard_id: u32,
-    host_keyboard_id: HostId,
-    key: u32,
-    /// The serial of the key's latest `peek_key`.
-    serial: u32,
-    /// The time of the key's latest `peek_key`.
-    time: u32,
-}
-
-/// Resolve the physical key generation responsible for an empty IME
-/// confirmation.
-///
-/// Physical held state alone is insufficient: it has neither event order
-/// nor proof that the key was visible when the host IME consumed normal
-/// `wl_keyboard` delivery. `peek_key` provides both. Select the newest
-/// generation, preferring the keyboard focused on the seat's current surface,
-/// then validate that exact generation without falling back to an older key.
-fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option<HeldRepeatKey> {
-    let active_surface = ctx.keyboard_focus.surface_for_seat(guest_seat);
-    let mut candidates = Vec::new();
-
-    for (&guest_keyboard_id, &seat) in &ctx.keyboard_to_seat {
-        if seat != guest_seat {
-            continue;
-        }
-        let Some(host_keyboard_id) = ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId)
-        else {
-            continue;
-        };
-        let focused = active_surface.is_some_and(|surface| {
-            ctx.keyboard_focus
-                .keyboard_owns_surface(host_keyboard_id, surface)
-        });
-        for (key, press) in ctx.key_generations.peek_keys(host_keyboard_id) {
-            candidates.push((
-                focused,
-                press.sequence,
-                guest_keyboard_id,
-                host_keyboard_id,
-                key,
-                press,
-            ));
-        }
-    }
-
-    let (_, _, guest_keyboard_id, host_keyboard_id, key, press) = candidates
-        .into_iter()
-        .filter(|candidate| active_surface.is_none() || candidate.0)
-        .max_by_key(|candidate| candidate.1)?;
-
-    let latest_sequence = ctx
-        .key_generations
-        .latest_peek_sequence(guest_seat, active_surface);
-    let is_latest_generation = latest_sequence.is_none_or(|sequence| sequence == press.sequence);
-    let physically_held = ctx.key_generations.physically_held(host_keyboard_id, key);
-    let repeatable = ctx
-        .keyboard_repeatable_keys
-        .get(&host_keyboard_id)
-        .is_some_and(|keys| keys.contains(&key));
-    let backspace_cancelled = key == crate::handler::keyboard::EVDEV_KEY_BACKSPACE
-        && ctx.key_generations.backspace_repeat_cancelled(
-            host_keyboard_id,
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-        );
-    if !is_latest_generation
-        || !physically_held
-        || !press.eligible
-        || !repeatable
-        || backspace_cancelled
-    {
-        log::debug!(
-            "Ignoring empty IME confirmation for ineligible held key {} \
-             (latest_generation={}, physically_held={}, generation_eligible={}, \
-             repeatable={}, backspace_cancelled={})",
-            key,
-            is_latest_generation,
-            physically_held,
-            press.eligible,
-            repeatable,
-            backspace_cancelled
-        );
-        return None;
-    }
-
-    Some(HeldRepeatKey {
-        guest_keyboard_id,
-        host_keyboard_id,
-        key,
-        serial: press.serial,
-        time: press.time,
-    })
-}
-
-/// Send the guest a press and a release of the held key the host input
-/// method consumed, unless another channel already delivered it.
-///
-/// Both carry the serial and time of the key's latest `peek_key`, which
-/// are those of the `wl_keyboard.key` Exo would have sent; see
-/// INVARIANTS "A recovered key carries the host's serial".
-fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> bool {
-    let decision =
-        ctx.transition_guest_key(held.host_keyboard_id, held.key, GuestKeyEvent::RecoverIme);
-    if decision.delivery != GuestKeyDelivery::EmitBalancedPair {
-        // The normal wl_keyboard path already delivered this physical
-        // generation to the guest. The confirmation still closes a
-        // text-input transaction, but another key pair would duplicate it.
-        log::debug!(
-            "Skipping IME repeat recovery: key {} was already forwarded for host keyboard {}",
-            held.key,
-            held.host_keyboard_id.0
-        );
-        return false;
-    }
-    for state in [
-        wl_keyboard::KEY_STATE_PRESSED,
-        wl_keyboard::KEY_STATE_RELEASED,
-    ] {
-        ctx.host_to_client_queue.push(wl_keyboard::evt::key(
-            held.guest_keyboard_id,
-            held.serial,
-            held.time,
-            held.key,
-            state,
-        ));
-    }
-    true
 }
 
 /// Drop a host event that would set the preedit of active text input
@@ -1641,7 +1511,7 @@ mod tests {
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::ZwpTextInputV3Handler;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display;
-    use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
+    use crate::protocols::wayland::wl_keyboard::{self, WlKeyboardHandler};
     use crate::protocols::wayland::{
         wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_touch,
     };
