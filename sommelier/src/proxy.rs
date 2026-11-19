@@ -106,7 +106,7 @@ fn rejection(direction: Direction, error: &ProtocolError) -> SessionEnd {
         // Tell the guest why, as libwayland-server does.
         Direction::ClientToHost => crate::handler::display::request_error(error),
         // The host broke the protocol; the guest did nothing wrong.
-        Direction::HostToClient => SessionEnd::Internal,
+        Direction::HostToClient => SessionEnd::internal(),
     }
 }
 
@@ -541,7 +541,7 @@ impl Client {
                 // Only host events can be untracked: a guest request from an
                 // unknown sender is an error. The events before this one were
                 // valid and reach the guest ahead of its one error.
-                end = Some(SessionEnd::Internal);
+                end = Some(SessionEnd::internal());
                 break;
             }
 
@@ -687,7 +687,7 @@ impl Client {
                         "A {direction:?} message from object {sender_id} waits for a fence, \
                          but {why}; ending the session"
                     );
-                    self.ctx.end_session(SessionEnd::Internal);
+                    self.ctx.end_session(SessionEnd::internal());
                 }
             }
             // Work deferred until the message is forwarded runs only if it
@@ -721,7 +721,7 @@ impl Client {
                         "A dma-buf fence did not signal within {timeout:?} for a request \
                          from guest object {sender_id}; ending the session"
                     );
-                    end = Some(SessionEnd::Internal);
+                    end = Some(SessionEnd::internal());
                 } else {
                     self.parked = Some(parked);
                 }

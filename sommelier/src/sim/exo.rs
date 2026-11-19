@@ -700,11 +700,23 @@ impl Exo {
     /// The composition Exo tracks for the text input attached on the
     /// focused surface, if one is; empty if it composes nothing.
     pub(super) fn composition(&self) -> Option<String> {
-        let mut attached = self.text_inputs.values().filter(|text_input| {
-            text_input.field.attached && self.focus.is_some() && text_input.surface == self.focus
-        });
-        let text_input = attached.next()?;
-        Some(text_input.text.predicted.composition().to_owned())
+        let id = *self.composing_text_inputs().first()?;
+        let tracker = &self.text_inputs[&id].text;
+        Some(tracker.predicted.composition().to_owned())
+    }
+
+    /// The host text inputs an input method is attached to on the focused
+    /// surface: the ones whose preedits and presses matter.
+    pub(crate) fn composing_text_inputs(&self) -> Vec<u32> {
+        self.text_inputs
+            .iter()
+            .filter(|(_, text_input)| {
+                text_input.field.attached
+                    && self.focus.is_some()
+                    && text_input.surface == self.focus
+            })
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// The fields of the text inputs active on the focused surface.
