@@ -225,7 +225,7 @@ impl View {
 
     /// The client applies `txn` at `done`, with the preedit at `cursor`.
     fn apply(&mut self, txn: &Txn, cursor: (i32, i32)) {
-        self.model.apply_txn(txn);
+        self.model.apply_txn(&clamped(&self.model, txn));
         self.preedit_cursor = if txn.preedit.is_empty() {
             (0, 0)
         } else {
@@ -720,6 +720,27 @@ impl SpecText {
     }
 }
 
+/// `txn` as a client applies it to `model`: its delete clamped to the
+/// text and shrunk to whole characters. The proxy measures a delete
+/// against the text the guest last reported, which an ideal client, which
+/// does not lag or drop as the client model does, may not have.
+fn clamped(model: &TextModel, txn: &Txn) -> Txn {
+    let (text, cursor) = (&model.text, model.cursor);
+    let (before, after) = txn.delete;
+    let mut start = cursor.saturating_sub(before);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = cursor.saturating_add(after).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Txn {
+        delete: (cursor - start, end - cursor),
+        ..txn.clone()
+    }
+}
+
 /// The cursor of a preedit `text` whose `preedit_cursor` was `index`: there,
 /// if it is a character boundary of the text, and otherwise at its end
 /// (H7).
@@ -823,14 +844,9 @@ impl Shadow {
             v3::Event::Done { .. } => {
                 let (txn, cursor) = std::mem::take(&mut self.txn);
                 let view = &mut self.views[self.entered.expect("a done while entered")];
-                let (before, after) = txn.delete;
-                assert!(
-                    view.model.delete_range(before, after).is_some(),
-                    "the proxy sent a delete of ({before}, {after}) that does not fit {view:?}"
-                );
                 // The view keeps the cursor as sent, an empty preedit's
                 // included, which the specification holds to (0, 0).
-                view.model.apply_txn(&txn);
+                view.model.apply_txn(&clamped(&view.model, &txn));
                 view.preedit_cursor = cursor;
                 self.txns.push((txn, cursor));
             }
@@ -1502,21 +1518,38 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "does not fit")]
-    fn the_shadow_refuses_a_delete_that_does_not_fit() {
-        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["가"]));
-        let events: Vec<AnyEvent> = vec![
-            v3::Event::Enter { surface: GUEST[0] }.into(),
-            v3::Event::DeleteSurroundingText {
-                before_length: 1,
-                after_length: 0,
-            }
-            .into(),
-            v3::Event::Done { serial: 0 }.into(),
-        ];
-        events
-            .iter()
-            .for_each(|event| shadow.see(Seen::ToGuest(event)));
+    fn a_delete_that_does_not_fit_is_clamped_to_whole_characters() {
+        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["a가"]));
+        let delete = |before_length, after_length| -> [AnyEvent; 2] {
+            [
+                v3::Event::DeleteSurroundingText {
+                    before_length,
+                    after_length,
+                }
+                .into(),
+                v3::Event::Done { serial: 0 }.into(),
+            ]
+        };
+        let enter: AnyEvent = v3::Event::Enter { surface: GUEST[0] }.into();
+        shadow.see(Seen::ToGuest(&enter));
+        // Into 가, and past the end: nothing.
+        for event in delete(1, 2) {
+            shadow.see(Seen::ToGuest(&event));
+        }
+        assert_eq!(shadow.views[0], view("a가", 4, ""));
+        // Past the start: what there is.
+        for event in delete(9, 0) {
+            shadow.see(Seen::ToGuest(&event));
+        }
+        assert_eq!(shadow.views[0], view("", 0, ""));
+        let mut spec = attached(&["a가"]);
+        // The specification's ideal client clamps the same way.
+        let txn = Txn {
+            delete: (2, 0),
+            ..Txn::default()
+        };
+        spec.views[0].apply(&txn, (0, 0));
+        assert_eq!(spec.views[0], view("a가", 4, ""));
     }
 
     #[test]

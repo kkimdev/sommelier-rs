@@ -211,7 +211,6 @@ impl Chromium {
     fn enable(&mut self, now: Micros, field: usize) -> Vec<Outgoing> {
         self.client = Some(field);
         self.reset_text_input(now);
-        self.protocol.sent.clear();
         let ti = self.text_input();
         let mut out = vec![req::enable(ti), content_type(ti)];
         if let Some((text, cursor)) = self.latest.surrounding.clone() {
