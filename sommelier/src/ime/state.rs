@@ -239,7 +239,7 @@ impl TextInput {
         self.exo.withholds(report, self.composition.shown.as_ref())
     }
 
-    /// After a tracker-changing host event, with `frame` the one taken
+    /// After a tracker-changing host event, with `frame` the one made
     /// before it and `edit` what reached the guest (`ExoView::after`).
     pub(super) fn exo_after(&mut self, frame: Option<&Frame>, edit: Option<Edit>) {
         self.exo.after(frame, edit, self.composition.shown.as_ref());

@@ -108,7 +108,7 @@ pub(super) struct Frame {
     state: ExoState,
     /// The composition Exo holds, which the guest shows as its preedit; or
     /// else empty, at Exo's cursor, which is the guest's.
-    held: Range<usize>,
+    preedit: Range<usize>,
 }
 
 impl ExoView {
@@ -150,14 +150,14 @@ impl ExoView {
     pub(super) fn frame(&self, shown: Option<&Preedit>) -> Result<Frame, Unmeasured> {
         let mirror = self.mirror.as_ref().ok_or(Unmeasured::NoMirror)?;
         let state = mirror.exact().ok_or(Unmeasured::Unsure)?;
-        let held = held(state, shown).ok_or(Unmeasured::OutOfStep)?;
+        let preedit = preedit_in(state, shown).ok_or(Unmeasured::OutOfStep)?;
         Ok(Frame {
             state: state.clone(),
-            held,
+            preedit,
         })
     }
 
-    /// The frame `frame` taken before the event just observed, if it
+    /// The frame `frame` made before the event just observed, if it
     /// measures the event: the text input has a mirror, which was exact
     /// before the event and after it, the guest has stated every key and
     /// press, no report on its way to Exo crossed the event (design
@@ -221,7 +221,7 @@ impl ExoView {
         Self::health_changed(mirror, ti, health);
     }
 
-    /// After a tracker-changing host event, with `frame` the frame taken
+    /// After a tracker-changing host event, with `frame` the frame made
     /// before it, `edit` what reached the guest, if anything did, and
     /// `shown` the preedit the guest shows now: whether the event's
     /// transaction keeps a guest in step with Exo if it was, which the new
@@ -239,14 +239,17 @@ impl ExoView {
             if edit.deleted && edit.shown_before {
                 return None;
             }
-            let cursor = frame.held.start.checked_sub(edit.deleted_before as usize)?;
+            let cursor = frame
+                .preedit
+                .start
+                .checked_sub(edit.deleted_before as usize)?;
             Some(cursor + edit.committed)
         });
         let Some(mirror) = &mut self.mirror else {
             return;
         };
-        let held = mirror.exact().and_then(|state| held(state, shown));
-        let keeps = cursor.is_some_and(|cursor| held.map(|held| held.start) == Some(cursor));
+        let preedit = mirror.exact().and_then(|state| preedit_in(state, shown));
+        let keeps = cursor.is_some_and(|cursor| preedit.map(|range| range.start) == Some(cursor));
         self.in_step &= keeps;
         if let Some(edit) = edit {
             self.edits.from_exo += u64::from(edit.deleted || edit.committed > 0);
@@ -406,7 +409,7 @@ impl ExoView {
 /// Where the guest's preedit lies in `state`: the composition, if the guest
 /// shows its text; or else empty at Exo's cursor, if it is one. `None` if
 /// the guest cannot be in step with `state`.
-fn held(state: &ExoState, shown: Option<&Preedit>) -> Option<Range<usize>> {
+fn preedit_in(state: &ExoState, shown: Option<&Preedit>) -> Option<Range<usize>> {
     if state.composition.is_empty() {
         let cursor = state.selection;
         return cursor.is_empty().then_some(cursor.end..cursor.end);
@@ -435,25 +438,25 @@ impl Frame {
             .text
             .get(start..end)
             .ok_or(RegionDrop::NotAroundCursor)?;
-        let held = &self.held;
+        let shown = &self.preedit;
         if text.is_empty() {
-            let txn = match held.is_empty() {
+            let txn = match shown.is_empty() {
                 true => GuestTxn {
                     delete: Some((0, 0)),
                     ..GuestTxn::default()
                 },
                 false => GuestTxn {
-                    commit: Some(state.text[held.clone()].to_owned()),
+                    commit: Some(state.text[shown.clone()].to_owned()),
                     ..GuestTxn::default()
                 },
             };
             return Ok(txn);
         }
-        if held.start < start || end < held.end {
+        if shown.start < start || end < shown.end {
             return Err(RegionDrop::Uncovered);
         }
         // Both are at most the region's length.
-        let delete = ((held.start - start) as u32, (end - held.end) as u32);
+        let delete = ((shown.start - start) as u32, (end - shown.end) as u32);
         let before = exo_cursor.clamp(start, end) - start;
         let cursor = assembly.cursor.or(Some(before as i32));
         let cursor = resolve_preedit_cursor(text, assembly.selection, cursor);
@@ -470,10 +473,10 @@ impl Frame {
     /// no composition (IMA 1090-1102), around its cursor, the guest's.
     /// Returns the lengths before and after the cursor.
     pub(super) fn delete(&self, index: i32, length: u32) -> Result<(u32, u32), DeleteDrop> {
-        let cursor = self.held.start;
+        let cursor = self.preedit.start;
         let start = usize::try_from(index).map_err(|_| DeleteDrop::NotAroundCursor)?;
         let end = start + length as usize;
-        let around = self.held.is_empty() && start <= cursor && cursor <= end;
+        let around = self.preedit.is_empty() && start <= cursor && cursor <= end;
         if !around || self.state.text.get(start..end).is_none() {
             return Err(DeleteDrop::NotAroundCursor);
         }

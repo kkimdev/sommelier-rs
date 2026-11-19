@@ -1847,7 +1847,7 @@ pub(super) fn intended(reference: &Reference, client: &dyn Client) -> Vec<Failur
 /// tracked (H2), by committing the shown preedit at both. Report
 /// suppression (M4 of the Exo mirror plan) deleted the report that left
 /// out the shown preedit (E4), and the single Exo model (design
-/// single-exo-model) the four of Legacy mode's measurement of regions. None
+/// single-exo-model) the four of the old measurement of regions. None
 /// is known now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum KnownIssue {}
