@@ -1242,12 +1242,6 @@ impl SpecText {
         let end = cursor + taken_after;
         let exo_text = [text.get(..start)?, &held, text.get(end..)?].concat();
         let exo_cursor = start + at;
-        self.region_model = Some(RegionModel {
-            text: exo_text.clone(),
-            cursor: exo_cursor,
-            held: held.clone(),
-            ahead: self.ahead || self.stale_report,
-        });
         let region_start = exo_cursor as i64 + i64::from(index);
         let region = around(&exo_text, exo_cursor, region_start, length);
         let delete = region.and_then(|(before, after)| {
@@ -1255,6 +1249,12 @@ impl SpecText {
                 start.checked_sub(exo_cursor - before)?,
                 (exo_cursor + after).checked_sub(start + held.len())?,
             ))
+        });
+        self.region_model = Some(RegionModel {
+            text: exo_text.clone(),
+            cursor: exo_cursor,
+            held: held.clone(),
+            ahead: self.ahead || self.stale_report,
         });
         // A report Exo has yet to get moves what the proxy measures from.
         self.counts.regions_crossing_reports += u64::from(origin.crossed);
@@ -1308,7 +1308,10 @@ impl SpecText {
     /// X1, judged by what Exo did of the region (`truth`): the preedit the
     /// guest shows after `edit`, which the specification gives it, must be
     /// the text Exo composed. A region the specification drops is judged by
-    /// the composition check. Where Exo made the region in another text
+    /// the composition check; but one it drops when measured with a preedit
+    /// that a report Exo could not match had dropped (E4), which Exo takes
+    /// and composes all the same, leaves the guest with other text than
+    /// Exo for that reason (`RegionOverUnheldPreedit`). Where Exo made the region in another text
     /// than the one the specification takes Exo to hold, for a reason the
     /// proxy cannot know, the failure says which, so that only its known
     /// issue explains it: a report Exo could not match dropped the
@@ -1326,7 +1329,15 @@ impl SpecText {
         origin: Origin,
     ) {
         let model = self.region_model.take();
-        let (Some(truth), Some((txn, _)), Some(model)) = (truth, edit, model) else {
+        let (Some(truth), Some(model)) = (truth, model) else {
+            return;
+        };
+        let Some((txn, _)) = edit else {
+            let unheld = truth.dropped && truth.held.is_empty() && !model.held.is_empty();
+            if unheld && !truth.composed.is_empty() && self.diverged.is_none() {
+                self.counts.regions_unheld += 1;
+                self.diverged = Some("region over an unheld preedit");
+            }
             return;
         };
         if txn.preedit == truth.composed {
@@ -2538,6 +2549,57 @@ mod tests {
         host(&mut spec, region(-1, 1), &[]);
         assert_eq!(spec.views[0], view("", 0, "0b"));
         assert_eq!(counts(&spec), (4, 1, 2, 1));
+    }
+
+    /// A region the specification drops, measured with the preedit it
+    /// takes Exo to hold, which a report Exo could not match had dropped
+    /// (E4), while Exo composes from it: the regions after it, until the
+    /// guest reports, are measured in other text for that reason (seed
+    /// 12364).
+    #[test]
+    fn a_dropped_region_over_an_unheld_preedit_explains_the_regions_after_it() {
+        let region = |index, length| extended::Event::SetPreeditRegion { index, length };
+        let see = |spec: &mut SpecText, event: extended::Event, truth: &RegionTruth| {
+            spec.see(Seen::Host {
+                sender: SYNC,
+                event: &event.into(),
+                origin: Origin::default(),
+                region: Some(truth),
+            });
+            spec.see(Seen::StepEnd);
+        };
+        let truth = |held: &str, dropped, composed: &str| RegionTruth {
+            text: "0ab".to_owned(),
+            cursor: 3,
+            held: held.to_owned(),
+            dropped,
+            composed: composed.to_owned(),
+        };
+        let start = || {
+            let mut spec = attached(&["0ab"]);
+            report(&mut spec, "0ab", 3);
+            preedit(&mut spec, "가");
+            spec
+        };
+        // Exo dropped 가 and composes "b"; the proxy drops the region.
+        let mut spec = start();
+        see(&mut spec, region(-1, 1), &truth("", true, "b"));
+        assert_eq!(spec.views[0], view("0ab", 3, "가"));
+        assert_eq!(spec.counts.regions_unheld, 1);
+        assert_eq!(spec.wrong_regions, []);
+        // The next region is measured over 가, which Exo no longer holds.
+        see(&mut spec, region(-4, 4), &truth("b", false, "ab"));
+        assert_eq!(spec.views[0], view("0a", 2, "b가"));
+        let checks: Vec<_> = spec.wrong_regions.iter().map(|w| w.0).collect();
+        assert_eq!(checks, ["region over an unheld preedit"]);
+        // Where Exo still held the preedit, the dropped region explains
+        // nothing.
+        let mut spec = start();
+        see(&mut spec, region(-1, 1), &truth("가", false, ""));
+        see(&mut spec, region(-4, 4), &truth("b", false, "ab"));
+        assert_eq!(spec.counts.regions_unheld, 0);
+        let checks: Vec<_> = spec.wrong_regions.iter().map(|w| w.0).collect();
+        assert_eq!(checks, ["region"]);
     }
 
     /// The host's `peek_key` of `key`, pressed or released.

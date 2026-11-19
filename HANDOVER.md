@@ -137,15 +137,13 @@
     answer). A report Exo has yet to get, on its way to Exo or sent
     while the region is on its way back, is the converse
     (`RegionCrossesReport`; seeds 2452 and 8116 cross the region on the
-    wire). The judge cannot name every such case: in seed 12364 (free,
-    GTK3, extension v10), an engine answer made before a focus move
-    shows a preedit in the newly focused field that Exo drops at the
-    guest's next report; the proxy then drops Exo's first region as not
-    covering it, and Exo composes from that region, so the next region,
-    which the proxy measures over the dropped preedit, fails as a plain
-    `region` check. C5 made this seed reach it (its trajectory changed);
-    seed 50166, which failed in the same family before C5 (a preedit Exo
-    no longer tracked), passes since.
+    wire). A region the proxy drops can start such a divergence too: in
+    seed 12364 (free, GTK3, extension v10), an engine answer made before
+    a focus move shows a preedit in the newly focused field that Exo
+    drops at the guest's next report; the proxy drops Exo's next region,
+    measured with that preedit, and Exo composes from it, so the region
+    after it is measured over a preedit Exo no longer holds. The judge
+    names it `RegionOverUnheldPreedit` (regression in `sim/regressions.rs`).
   - Ahead: the proxy measures in the text the guest last reported, less
     the bytes regions took, so a region made while host commits, a
     press's commit, or a reset commit the guest has not reported yet

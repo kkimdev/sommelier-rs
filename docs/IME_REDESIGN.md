@@ -1851,8 +1851,10 @@ that the proxy committed before the region reached it but Exo had yet
 to get (`RegionCrossesReport`), or edits the guest has yet to
 report, a report that crossed one included
 (`RegionWhileAhead`); later regions until the guest's next report keep
-that reason. Only that issue explains such a check. In 20,000 cases from
-seed 0 they explain 1, 13 and 11 cases.
+that reason. A region the proxy drops, measured with a preedit a report
+Exo could not match had dropped, while Exo composes from it, gives later
+regions the first reason too (seed 12364). Only that issue explains such
+a check.
 
 A failure is classified as known only when every failure is of tier 1
 and the trigger of a known issue explains it: a `region` check that
