@@ -356,14 +356,14 @@ impl Tracker {
         self.expected.push(self.predicted.clone());
     }
 
-    /// `CancelComposition`: the composition stays, as text, and the states
-    /// the edits led to are forgotten, so that the next report that does
-    /// not name the prediction replaces it as `ResetInternal` does, and the
-    /// prediction is the only state to catch up to.
+    /// `CancelComposition`: the composition stays, as text, and the
+    /// history empties, the prediction too, so that the next report
+    /// replaces the prediction as `ResetInternal` does, whatever it names,
+    /// and an edit before it leaves only the state it led to.
     fn cancel(&mut self) {
         self.hidden = None;
         self.predicted.composition = None;
-        self.expected = vec![self.predicted.clone()];
+        self.expected.clear();
     }
 }
 
@@ -2056,10 +2056,10 @@ mod tests {
             }
             exo
         };
-        // A reset leaves the prediction as the one state to catch up to,
-        // so a report of an earlier state replaces it.
+        // A reset leaves no state to catch up to, so a report of an
+        // earlier state replaces the prediction.
         let mut exo = typed(false);
-        assert_eq!(exo.text_inputs[&TI].text.expected.len(), 1);
+        assert_eq!(exo.text_inputs[&TI].text.expected.len(), 0);
         send(&mut exo, TI, surrounding("a가b", 4));
         assert_eq!(*predicted(&exo), predicts("a가b", 4, None));
         // A confirmation adds a state, and the report is still catching up.
@@ -2067,6 +2067,29 @@ mod tests {
         assert_eq!(exo.text_inputs[&TI].text.expected.len(), 4);
         send(&mut exo, TI, surrounding("a가b", 4));
         assert_eq!(*predicted(&exo), predicts("a가ㄴb", 7, None));
+    }
+
+    /// `SurroundingTextTracker::CancelComposition` clears
+    /// `expected_updates_` and pushes nothing, so `Update` finds no state:
+    /// even a report of the prediction resets it (`ResetInternal`), and
+    /// one of the state before a later edit undoes that edit.
+    #[test]
+    fn cancel_empties_the_history() {
+        let mut tracker = Tracker::default();
+        tracker.update("ab".to_owned(), 1, 1);
+        tracker.set_composition("x");
+        tracker.cancel();
+        assert_eq!(tracker.expected, []);
+        assert_eq!(tracker.predicted, predicts("axb", 2, None));
+        tracker.update("axb".to_owned(), 2, 2);
+        assert_eq!(tracker.expected, [predicts("axb", 2, None)]);
+        // An edit after a cancel leaves a history of its own state only.
+        tracker.cancel();
+        tracker.insert("y");
+        assert_eq!(tracker.expected, [predicts("axyb", 3, None)]);
+        tracker.update("axb".to_owned(), 2, 2);
+        assert_eq!(tracker.predicted, predicts("axb", 2, None));
+        assert!(!tracker.dropped);
     }
 
     /// The text and the handled callback of key `id`.
