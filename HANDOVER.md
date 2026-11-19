@@ -27,6 +27,7 @@
   core that replaces the old text-input handlers in staged,
   golden-trace-gated PRs. C3a, the storage switch, is done: the handlers
   keep their shape but keep all state in `Context::ime` (`ime::ImeCore`).
+  C3b is done too: host events go through `ImeCore::step`.
 
 ## Known issues and debt
 

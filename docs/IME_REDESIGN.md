@@ -434,12 +434,15 @@ unconditional end-of-step reconcile reads `Env::host_seat`. An `Attached`
 link with a dead seat is therefore a normal state (I1 in 3.1;
 INVARIANTS "Releasing a parent does not end its children").
 
-Because every step reconciles every text input, the core notices a dead
-seat at the next input to *any* text input of the connection. The old
-code notices it only at that text input's own next reconcile. #82
-records this deviation. No DST case releases a seat, so the goldens
-cannot see it. A host event that reaches an attached text input in that
-gap is admitted by the old code and dropped by the core.
+Every step reconciles every text input, while the old code reconciles a
+text input only at the inputs that change its target or its link. #82
+recorded this as a deviation: the core would notice a dead seat at the
+next input to *any* text input of the connection. C3b found that it
+changes nothing on the wire (3.7, "Reconcile timing"). A seat's end
+changes no target's surface, and an attached link with a dead seat needs
+no request until its target turns inactive, which only an input that
+both codes reconcile at can do (a commit, a focus change or a surface's
+end); only then does the link end locally (R1).
 
 ### 2.4 Exo facts the models implement
 
@@ -1176,7 +1179,7 @@ describe the result.
 | An R2 deferral is logged when it starts or changes. | Not at every step that finds it waiting. | 2.3 R2 |
 | `ime` shares `HostContentType`, `V3Committed` and `V3Pending` with `state`. It keeps a copy of `resolve_preedit_cursor` until #80 merges. | C1 moves only stateless helpers (M-1), and #80 edits the old copy. | 3.0, 5.1 |
 | **G9b**: the core consumes an oversized commit's pending state, as the table says. The old code kept it. | The old code's retry loop was a bug. The old code is now fixed to match, so the goldens agree. | G9b, 5.1 |
-| **Reconcile timing**: a dead seat is noticed at the next input to any text input of the connection. | This follows from reconciling every text input at the end of every step. No DST case releases a seat. | 2.3, after R2 |
+| **Reconcile timing**: `step` reconciles every text input at the end of every input; the old code reconciles a text input only where its target or link changed: at a guest commit, a focus change, a surface's end, a seat's bind, the destroy, H2 and W1. | It follows from the unconditional phase 2 (3.4). **No wire change** (C3b, which routes H2 to X2, W1 and W2 through `step`): every message of the old code that changes a target or a link reconciles that text input, so between messages every link satisfies I1b, and on such a link `reconcile` returns no step: `Draining` waits; `Detached` with an active target has no live seat (R2); `Attached` has the target's content type, whatever its seat. A seat's end, the one change no input reports, changes no target's surface. A host event changes no target, since the target reads only the field, its surface and the seat, and changes a link only at H2 and W1, where the old code reconciled that text input too. So the extra reconciles send nothing; they only note the R2 deferral, which is logged. | 2.3, after R2 |
 | **The assembly**: `cursor_position` is only logged. #82 also took the assembly at every terminal event; C3b made the core take it where the old code does instead (B3, below H9). | The old code recorded `cursor_position` only to log it. The switch carries no wire change, and only a host that sends styling or a cursor before a commit, delete or confirmation could tell. | H6, H9 |
 
 #82 has a row test for every row that is a core input and that some
@@ -2010,7 +2013,7 @@ in review.
 | **D7** | Holds: `UserAction::KeyDown` and `KeyUp`, extending #73's enum; engine autorepeat; the empty confirm before each unhandled key (E13, X2') and the Backspace lease. | D4 | 0 / +150 |
 | **C3-pre** | No production change. Tests outside `text_input.rs` that build or read `TextInputState`, `HostApplied` or `ctx.text_inputs` directly (`keyboard.rs`, `compositor.rs`, `seat.rs`, `display.rs`, `registry.rs`, `state.rs`, `lifecycle.rs`: about 52 references) move to Session wire level, or to one `#[cfg(test)]` fixture module, `test_support::text_input`, the only test code that touches the storage. Commits `sim/golden.txt` and `golden_traces_match`, blessed on this base (**done**, 4.9). | K1, D4, D5, D6, D7, the old-code fixes below, the #82 follow-up | 0 / ±600 |
 | **C3a** | **The storage switch.** `Context::text_inputs` becomes `Context::ime: ImeCore`. `TextInputState`, `HostApplied`, `ShownPreedit`, the plan structs, `prepare_*`/`finish_*` and the old `reconcile` are deleted. The old handler bodies keep their shape, but call `ImeCore`'s state methods, made `pub(crate)` for this window only, and the core's `reconcile`. `InternalCallback` merges to `TextInput { token }`. The fixture module is rewritten. `Context::assert_no_orphans` calls `ImeCore::assert_invariants`. | #82, C3-pre | ≈ −650 / ±200 |
-| **C3b** | Host events (H, X and W rows) go through `step`. The old v1, extension and callback handler bodies are deleted. | C3a | ≈ −700 / 0 |
+| **C3b** | Host events (H, X and W rows) go through `step`. The old v1, extension and callback handler bodies are deleted. **Done:** `text_input::ime` steps the core and applies its effects; first the core takes the preedit cursor and styling where the old code does (B3, below H9), and the reconcile of every text input is shown to send nothing (3.7, "Reconcile timing"). | C3a | ≈ −700 / 0 |
 | **C3c** | Guest requests and cross-concern inputs go through `step`. The rest of the old code is deleted, the window's `pub(crate)` items go private, and the crate-wide form of `ime_is_isolated` holds. The three shared state types move into `ime`. INVARIANTS and DESIGN are updated (Appendix A). `golden.txt` and its test are deleted. | C3b | ≈ −450 / −80 |
 | **C5** | Focus loss commits the shown preedit before `leave` (F1, proposed). `KnownIssue::FocusWhileComposing` goes, and `SpecText` changes with the proxy. INVARIANTS is amended with its reasons (E6, E12; mutter and ibus commit on focus-out). E6 and E12 are now facts, so it no longer waits for a host check of the order. U5 (should the composition survive blur, as native Chrome keeps it?) and U13 decide only whether it is wanted. | C3c | +40 / +80 |
 | **C6** | Optional: a guest-initiated reset sends a host `reset` behind a fence (G6, Q3), if the DST shows that GTK's `cause=other` reset leaves Exo composing. C13's key-binding resets make this more likely to show. | C5 | +40 / +60 |
