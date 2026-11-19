@@ -2447,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "sommelier"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "clap",
  "drm",
