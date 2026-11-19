@@ -37,7 +37,9 @@ limitations under the License.
 //!
 //! `SpecText` tracks whether the guest's text is ahead of what it last
 //! reported, which drops Exo's absolute deletes (H9), and the bytes the
-//! preedit regions took since (X1). Exo sends no `preedit_styling` (H4).
+//! preedit regions took since, which with the preedit Exo holds give
+//! Exo's text, which Exo measures a region in (X1). Exo sends no
+//! `preedit_styling` (H4).
 
 use std::collections::BTreeMap;
 
@@ -208,6 +210,10 @@ struct Shown {
     text: String,
     cursor: (i32, i32),
     origin: Origin,
+    /// Where Exo's cursor is in `text`, while Exo holds `text` at the
+    /// guest's cursor (X1); `None` for a region's once the guest reported
+    /// text without its bytes, which Exo cannot match (E4).
+    host_cursor: Option<usize>,
 }
 
 /// A field as a client shows it: its model, and the cursor of its preedit,
@@ -266,8 +272,8 @@ pub(super) struct Counts {
     /// the guest had not reported.
     pub regions: u64,
     pub regions_over_regions: u64,
-    /// Preedit regions the guest got while it showed a preedit whose bytes
-    /// the committed text does not hold (KnownIssue::RegionOverShownPreedit).
+    /// Preedit regions the guest got over a preedit Exo holds whose bytes
+    /// the committed text does not hold, a host preedit's (X1).
     pub regions_over_preedits: u64,
     /// Preedit regions dropped for their range or for not covering a
     /// region the guest had not reported (X1').
@@ -507,7 +513,11 @@ impl SpecText {
         if let Some(text) = surrounding_text {
             field.surrounding_text = text;
             self.ahead = false;
-            self.taken = None;
+            if self.taken.take().is_some() {
+                if let Some(shown) = &mut self.shown {
+                    shown.host_cursor = None;
+                }
+            }
         }
         if let Some(content_type) = content_type {
             field.content_type = content_type;
@@ -805,10 +815,18 @@ impl SpecText {
                         return Some((txn, (0, 0)));
                     }
                     let cursor = preedit_cursor(text, spec.assembly);
+                    // Exo's cursor is where it sent the preedit's, or at
+                    // its end.
+                    let host_cursor = spec
+                        .assembly
+                        .and_then(|at| usize::try_from(at).ok())
+                        .filter(|&at| text.is_char_boundary(at))
+                        .unwrap_or(text.len());
                     spec.shown = Some(Shown {
                         text: text.clone(),
                         cursor,
                         origin,
+                        host_cursor: Some(host_cursor),
                     });
                     let txn = Txn {
                         preedit: text.clone(),
@@ -883,30 +901,39 @@ impl SpecText {
         Some((txn, (0, 0)))
     }
 
-    /// X1: the bytes from `index` before the committed cursor, `length`
-    /// long, become the preedit, at its cursor (H5) or where the guest's
-    /// cursor was. While the guest has not reported since a region, the
-    /// committed text still holds the bytes regions took, so the region
-    /// must cover them, and deletes only the rest.
+    /// X1: the bytes from `index` before Exo's cursor, `length` long,
+    /// become the preedit, at its cursor (H5) or where Exo's cursor was.
+    /// Exo's text is the guest's, which is the committed text without the
+    /// bytes regions took since the guest last reported, with the preedit
+    /// Exo holds at the guest's cursor, Exo's cursor in it. The region
+    /// must cover that preedit, and deletes only the rest.
     fn region(&mut self, index: i32, length: u32, origin: Origin) -> Option<(Txn, (i32, i32))> {
         let (text, cursor) = self.surrounding()?;
-        let start = cursor as i64 + i64::from(index);
-        let region = around(&text, cursor, start, length);
-        let delete = region.and_then(|(before, after)| match self.taken {
-            None => Some((before, after)),
-            Some((taken_before, taken_after)) => Some((
-                before.checked_sub(taken_before)?,
-                after.checked_sub(taken_after)?,
-            )),
+        let (taken_before, taken_after) = self.taken.unwrap_or_default();
+        let held = self.shown.as_ref().and_then(|shown| {
+            let at = shown.host_cursor?;
+            Some((shown.text.clone(), at))
+        });
+        let (held, at) = held.unwrap_or_default();
+        let start = cursor.checked_sub(taken_before)?;
+        let end = cursor + taken_after;
+        let exo_text = [text.get(..start)?, &held, text.get(end..)?].concat();
+        let exo_cursor = start + at;
+        let region_start = exo_cursor as i64 + i64::from(index);
+        let region = around(&exo_text, exo_cursor, region_start, length);
+        let delete = region.and_then(|(before, after)| {
+            Some((
+                start.checked_sub(exo_cursor - before)?,
+                (exo_cursor + after).checked_sub(start + held.len())?,
+            ))
         });
         let (Some((before, after)), Some(delete)) = (region, delete) else {
             self.counts.regions_dropped += 1;
             return None;
         };
-        let preedit = text[cursor - before..cursor + after].to_owned();
-        // The committed text holds no byte of the preedit the guest shows,
-        // which Exo holds as text, ahead of its cursor.
-        let over = self.taken.is_none() && self.shown.is_some();
+        let preedit = exo_text[exo_cursor - before..exo_cursor + after].to_owned();
+        // The committed text holds no byte of the preedit Exo holds.
+        let over = self.taken.is_none() && !held.is_empty();
         self.counts.regions_over_preedits += u64::from(over);
         let at = self.assembly.unwrap_or(before as i32);
         let preedit_cursor = preedit_cursor(&preedit, Some(at));
@@ -916,11 +943,13 @@ impl SpecText {
             self.counts.regions += 1;
             self.counts.regions_over_regions += u64::from(self.taken.is_some());
             self.ahead = true;
-            self.taken = Some((before, after));
+            let taken = (taken_before + delete.0, taken_after + delete.1);
+            self.taken = (taken != (0, 0)).then_some(taken);
             self.shown = Some(Shown {
                 text: preedit.clone(),
                 cursor: preedit_cursor,
                 origin,
+                host_cursor: Some(before),
             });
         }
         let txn = Txn {
@@ -1899,15 +1928,27 @@ mod tests {
             )
         };
         assert_eq!(counts(&spec), (2, 1, 1, 0));
-        // Once the guest reports, a region is measured from its cursor, and
-        // counts as over a shown preedit, as one over a host preedit does.
+        // Once the guest reports its text, which lacks the region's bytes,
+        // Exo drops its composition (E4): a region is measured from the
+        // guest's cursor.
         report(&mut spec, "0", 1);
         host(&mut spec, region(-1, 1), &[]);
         assert_eq!(spec.views[0], view("", 0, "0"));
-        assert_eq!(counts(&spec), (3, 1, 1, 1));
+        assert_eq!(counts(&spec), (3, 1, 1, 0));
         // A commit gives the bytes back.
         host(&mut spec, commit("0"), &[]);
         assert_eq!(spec.views[0], view("0", 1, ""));
+        // Exo holds a host preedit at the guest's cursor, its own cursor
+        // after it: a region over it takes it with the bytes before it.
+        report(&mut spec, "0", 1);
+        preedit(&mut spec, "b");
+        host(&mut spec, region(-2, 2), &[]);
+        assert_eq!(spec.views[0], view("", 0, "0b"));
+        assert_eq!(counts(&spec), (4, 1, 1, 1));
+        // One that does not cover it is dropped.
+        host(&mut spec, region(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("", 0, "0b"));
+        assert_eq!(counts(&spec), (4, 1, 2, 1));
     }
 
     /// The host's `peek_key` of `key`, pressed or released.

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use super::{serial_is_after, HostId};
 
@@ -263,6 +264,12 @@ pub struct ShownPreedit {
     pub text: String,
     /// The `cursor_begin` and `cursor_end` sent with `text`.
     pub cursor: (i32, i32),
+    /// Where Exo's cursor is in `text`, while Exo's predicted text holds
+    /// `text` at the guest's cursor (INVARIANTS "Exo's deletes are
+    /// absolute and stand alone"); `None` for no preedit, or for a
+    /// region's once the guest reported text without its bytes, which Exo
+    /// cannot match and so drops its composition.
+    pub host_cursor: Option<u32>,
 }
 
 impl ShownPreedit {
@@ -281,6 +288,7 @@ impl ShownPreedit {
         Self {
             text: text.to_string(),
             cursor: (end, end),
+            host_cursor: (!text.is_empty()).then_some(end as u32),
         }
     }
 }
@@ -323,12 +331,12 @@ pub struct TextInputState {
     pub(crate) unreported_host_edit: bool,
     /// The bytes before and after the committed surrounding text's cursor
     /// that preedit regions took since the guest last reported, which the
-    /// guest no longer has though that text still holds them. `Some` only
-    /// while [`Self::unreported_host_edit`] is set, and [`Self::commit`]
-    /// owns both. A host `preedit_string` leaves it alone; an edit that
-    /// ends the composition (a commit, a preedit cleared with a reset
-    /// commit, a delete, a confirmation) gives the bytes back as text, and
-    /// so clears it. A stale guest report that
+    /// guest no longer has though that text still holds them, never
+    /// `(0, 0)`. `Some` only while [`Self::unreported_host_edit`] is set,
+    /// and [`Self::commit`] owns both. A host `preedit_string` leaves it
+    /// alone; an edit that ends the composition (a commit, a preedit
+    /// cleared with a reset commit, a delete, a confirmation) gives the
+    /// bytes back as text, and so clears it. A stale guest report that
     /// crosses a transaction clears it early, the same race INVARIANTS
     /// already admits for the flag.
     pub(crate) unreported_taken: Option<(u32, u32)>,
@@ -392,15 +400,28 @@ pub(crate) struct HostCommitPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreeditRegionPlan {
     pub guest_seat: u32,
-    pub surrounding_text: String,
-    pub surrounding_cursor: i32,
+    /// Exo's text, which Exo measures the region in, or `None` if the
+    /// committed cursor does not split the committed text.
+    pub host_text: Option<HostText>,
     pub done_serial: u32,
     pub had_preedit: bool,
-    /// [`TextInputState::unreported_taken`], the bytes around
-    /// `surrounding_cursor` that earlier regions took.
-    pub unreported_taken: Option<(u32, u32)>,
     pub selection: Option<(u32, u32)>,
     pub cursor: Option<i32>,
+}
+
+/// What Exo predicts a field holds, as the proxy knows it: the committed
+/// surrounding text without the bytes regions took
+/// ([`TextInputState::unreported_taken`]), which is the guest's text, with
+/// the preedit Exo holds ([`ShownPreedit::host_cursor`]) at the guest's
+/// cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostText {
+    pub text: String,
+    /// Exo's cursor.
+    pub cursor: usize,
+    /// Where the preedit Exo holds lies in `text`; empty, at the guest's
+    /// cursor, if none.
+    pub composition: Range<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -525,7 +546,11 @@ impl TextInputState {
         if let Some(surrounding_text) = surrounding_text {
             self.committed.surrounding_text = surrounding_text;
             self.unreported_host_edit = false;
-            self.unreported_taken = None;
+            // A text without the bytes regions took names no state Exo
+            // predicted, so Exo drops its composition (E4).
+            if self.unreported_taken.take().is_some() {
+                self.current_preedit.host_cursor = None;
+            }
         }
         if let Some(content_type) = content_type {
             self.committed.content_type = content_type;
@@ -610,7 +635,19 @@ impl TextInputState {
             self.unreported_host_edit = true;
             self.unreported_taken = None;
         }
-        self.current_preedit = ShownPreedit { text, cursor };
+        // Exo's cursor is where it sent the preedit's, or else, as no
+        // cursor of its own converted, at the end.
+        let host_cursor = (!text.is_empty()).then(|| {
+            plan.cursor
+                .and_then(|at| u32::try_from(at).ok())
+                .filter(|&at| text.is_char_boundary(at as usize))
+                .unwrap_or(text.len() as u32)
+        });
+        self.current_preedit = ShownPreedit {
+            text,
+            cursor,
+            host_cursor,
+        };
         arm_backspace_repeat
     }
 
@@ -643,31 +680,48 @@ impl TextInputState {
         if !self.host_composition_is_current() {
             return None;
         }
-        let (surrounding_text, surrounding_cursor, _) = self.committed.surrounding_text.as_ref()?;
+        let (text, cursor, _) = self.committed.surrounding_text.as_ref()?;
         Some(PreeditRegionPlan {
             guest_seat: self.guest_seat,
-            surrounding_text: surrounding_text.clone(),
-            surrounding_cursor: *surrounding_cursor,
+            host_text: self.host_text(text, *cursor),
             done_serial: self.guest_commit_serial,
             had_preedit: self.current_preedit.has_text(),
-            // Only `commit` (a surrounding text the guest commits) clears
-            // it, so a host preedit_string, which replaces the preedit,
-            // does not give the guest those bytes back.
-            unreported_taken: self.unreported_taken,
             selection: self.pending_preedit_selection,
             cursor: self.pending_preedit_cursor,
         })
     }
 
-    /// Close a preedit region, which made `preedit_text` of the bytes
-    /// `region` before and after the committed cursor. It covers the bytes
-    /// earlier regions took, so it takes the total.
+    /// Exo's text, given the committed surrounding `text` and `cursor`, or
+    /// `None` if the cursor, or the bytes regions took around it, do not
+    /// split `text` on character boundaries.
+    fn host_text(&self, text: &str, cursor: i32) -> Option<HostText> {
+        let (before, after) = self.unreported_taken.unwrap_or_default();
+        let cursor = usize::try_from(cursor).ok()?;
+        let start = cursor.checked_sub(before as usize)?;
+        let end = cursor.checked_add(after as usize)?;
+        let (head, tail) = (text.get(..start)?, text.get(end..)?);
+        let shown = &self.current_preedit;
+        let (held, at) = match shown.host_cursor {
+            Some(at) => (shown.text.as_str(), at as usize),
+            None => ("", 0),
+        };
+        Some(HostText {
+            text: [head, held, tail].concat(),
+            cursor: start + at,
+            composition: start..start + held.len(),
+        })
+    }
+
+    /// Close a preedit region, which made `preedit_text` of the preedit
+    /// Exo held and the bytes `deleted` before and after it, which the
+    /// guest no longer has, with Exo's cursor `host_cursor` bytes into it.
     pub(crate) fn finish_preedit_region(
         &mut self,
         plan: PreeditRegionPlan,
         preedit_text: String,
         cursor: (i32, i32),
-        region: (u32, u32),
+        deleted: (u32, u32),
+        host_cursor: u32,
     ) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
         debug_assert_eq!(plan.had_preedit, self.current_preedit.has_text());
@@ -679,9 +733,12 @@ impl TextInputState {
         // guest has no edit to report.
         if !preedit_text.is_empty() {
             self.unreported_host_edit = true;
-            self.unreported_taken = Some(region);
         }
+        let (before, after) = self.unreported_taken.unwrap_or_default();
+        let taken = (before + deleted.0, after + deleted.1);
+        self.unreported_taken = (taken != (0, 0)).then_some(taken);
         self.current_preedit = ShownPreedit {
+            host_cursor: (!preedit_text.is_empty()).then_some(host_cursor),
             text: preedit_text,
             cursor,
         };
@@ -2620,6 +2677,7 @@ mod tests {
         expected.current_preedit = ShownPreedit {
             text: "각".to_string(),
             cursor: (0, 3),
+            host_cursor: Some(3),
         };
         expected.pending_preedit_selection = None;
         expected.pending_preedit_cursor = None;
