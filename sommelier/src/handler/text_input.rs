@@ -2572,6 +2572,18 @@ pub(super) mod tests {
         f.s.host([f.preedit("", "간")]).await;
         let expected = [no_preedit(), commit("간"), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // The preedit styling the host sent before the enable survives it.
+        let selection = zwp_text_input_v1::PREEDIT_STYLE_SELECTION;
+        f.s.host([v1::preedit_styling(f.host, 0, 3, selection)])
+            .await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.reset(3, Reset::default()));
+        let expected = [V3::Done { serial: 3 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([f.preedit("다", "다")]).await;
+        let expected = [preedit_at("다", 0, 3), V3::Done { serial: 3 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
     /// Each commit forwards the surrounding text it states; offsets that

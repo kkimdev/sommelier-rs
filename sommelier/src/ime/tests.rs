@@ -765,6 +765,15 @@ fn row_G9c_an_enable_while_another_is_enabled_applies_the_rest() {
 fn only_an_enable_that_changes_the_field_closes_its_composition() {
     let mut ime = Ime::enabled();
     ime.compose("가");
+    let select = |ime: &mut Ime| {
+        ime.v1(HostIme::PreeditStyling {
+            index: 0,
+            length: 3,
+            style: zwp_text_input_v1::PREEDIT_STYLE_SELECTION,
+        });
+        ime.v1(HostIme::PreeditCursor(0));
+    };
+    select(&mut ime);
     let out = ime.enable(TI);
     let kept = [
         surrounding(TI, "", 0),
@@ -774,7 +783,11 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
     assert_eq!(out.host, kept);
     assert_eq!(out.guest, [preedit("가"), done(2)]);
     assert_eq!(out.keys, []);
+    // The preedit cursor and styling the host sent before it survive too.
+    let out = ime.compose("나");
+    assert_eq!(out.guest, [preedit_at("나", 0, 3), done(2)]);
 
+    select(&mut ime);
     ime.step(Input::Disable(TI));
     let out = ime.step(Input::Commit(TI));
     let [barrier] = out.barriers()[..] else {
@@ -797,6 +810,7 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
     let out = ime.enable(TI);
     assert_eq!(out.host, activation(TI, 4));
     assert_eq!(out.guest, [done(4)]);
+    assert_eq!(ime.compose("다").guest, [preedit("다"), done(4)]);
 }
 
 /// INVARIANTS "The host gets each content type once it can apply it, and
