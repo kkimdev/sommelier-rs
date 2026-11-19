@@ -521,3 +521,621 @@ pub(crate) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepe
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::text_input::tests::*;
+    use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::Event as V3;
+    use crate::state::GuestKeyOwner;
+
+    #[test]
+    fn ending_one_keyboard_repeat_does_not_cancel_another_held_keyboard() {
+        let mut ime = Ime::with_keyboard();
+        let other = HostId(43);
+        ime.keyboard(44, other);
+        ime.lease_backspace_repeat(TI);
+        let generations = &mut ime.ctx.key_generations;
+        generations.observe_physical_state(other, BACKSPACE, 1);
+
+        end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
+
+        let generations = &ime.ctx.key_generations;
+        assert!(generations.backspace_repeat_cancelled(HOST_KEYBOARD, BACKSPACE));
+        assert!(!generations.backspace_repeat_cancelled(other, BACKSPACE));
+        assert!(generations.physically_held(other, BACKSPACE));
+    }
+
+    /// An IME edit ends the held-Backspace fallback a confirmation leased.
+    #[test]
+    fn ime_edits_end_a_stale_backspace_repeat() {
+        type Event = fn(&mut Ime);
+        let cases: [(&str, Event); 3] = [
+            ("an empty commit", |ime| ime.commit("")),
+            ("a reset preedit", |ime| ime.preedit("", "확정")),
+            ("a preedit region", |ime| ime.preedit_region(-3, 3)),
+        ];
+        for (case, event) in cases {
+            let mut ime = Ime::with_keyboard();
+            let state = ime.state();
+            state.committed.surrounding_text = Some(("가나다".to_string(), 9, 9));
+            state.current_preedit = crate::state::ShownPreedit::at_end("가");
+            ime.lease_backspace_repeat(TI);
+
+            event(&mut ime);
+            assert!(!ime.repeat_active(), "{case}");
+        }
+    }
+
+    #[test]
+    fn input_mode_switch_boundary_clears_stale_repeat_before_empty_confirmation() {
+        let mut ime = Ime::with_keyboard();
+        ime.state().committed.surrounding_text = Some(("english".to_string(), 7, 7));
+        ime.lease_backspace_repeat(TI);
+        end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
+
+        ime.confirm();
+        assert_eq!(
+            ime.events(),
+            [],
+            "a routine empty confirmation must not become a synthetic Backspace"
+        );
+        assert_eq!(
+            ime.state().committed.surrounding_text,
+            Some(("english".to_string(), 7, 7))
+        );
+    }
+
+    /// Exo consumes a held Backspace over committed text and confirms an
+    /// empty preedit for each repeat: each becomes a key pair with the
+    /// serial of the held key's peek, and the repeat stays leased.
+    #[test]
+    fn held_backspace_repeats_over_committed_korean_without_preedit() {
+        let mut ime = Ime::with_keyboard();
+        ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 700, 100);
+        ime.state().committed.surrounding_text = Some(("가나다라".to_string(), 12, 12));
+
+        for _ in 0..3 {
+            ime.confirm();
+            assert_eq!(
+                ime.events(),
+                [
+                    key(KEYBOARD, BACKSPACE, PRESSED, 700, 100),
+                    key(KEYBOARD, BACKSPACE, RELEASED, 700, 100),
+                    uncommitted_done(),
+                ]
+            );
+        }
+        assert!(ime.repeat_active());
+    }
+
+    #[test]
+    fn empty_confirmation_recovers_any_repeatable_ime_consumed_key() {
+        const TAB: u32 = 15;
+        const ENTER: u32 = 28;
+        const SPACE: u32 = 57;
+        for held in [BACKSPACE, TAB, ENTER, SPACE] {
+            let mut ime = Ime::with_keyboard();
+            ime.hold_peeked(HOST_KEYBOARD, held, 700, 100);
+
+            ime.confirm();
+            assert_eq!(
+                ime.events(),
+                [
+                    key(KEYBOARD, held, PRESSED, 700, 100),
+                    key(KEYBOARD, held, RELEASED, 700, 100),
+                    uncommitted_done(),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn empty_confirmation_does_not_fall_back_from_newest_ineligible_key() {
+        const SHIFT: u32 = 42;
+        let mut ime = Ime::with_keyboard();
+        ime.hold_peeked(HOST_KEYBOARD, 57, 700, 100);
+
+        // Shift is newer but XKB does not mark it repeatable. The
+        // confirmation belongs to that newest generation or to no
+        // recoverable key; it must never synthesize the older held Space.
+        let generations = &mut ime.ctx.key_generations;
+        generations.observe_peek_press(HOST_KEYBOARD, SHIFT, 701, 101, true);
+        ime.confirm();
+        assert_eq!(ime.events(), []);
+
+        let generations = &mut ime.ctx.key_generations;
+        generations.observe_physical_state(HOST_KEYBOARD, SHIFT, 0);
+        ime.confirm();
+        assert_eq!(
+            ime.events(),
+            [],
+            "releasing the superseding key must not revive an older generation"
+        );
+    }
+
+    #[test]
+    fn empty_confirmation_prefers_the_keyboard_focused_on_the_current_surface() {
+        let mut ime = Ime::with_keyboard();
+        let stale = HostId(51);
+        ime.keyboard(50, stale);
+        ime.focus(HOST_KEYBOARD);
+        ime.hold_peeked(HOST_KEYBOARD, 57, 700, 100);
+        ime.hold_peeked(stale, 28, 701, 101);
+
+        ime.confirm();
+        assert_eq!(
+            ime.events(),
+            [
+                key(KEYBOARD, 57, PRESSED, 700, 100),
+                key(KEYBOARD, 57, RELEASED, 700, 100),
+                uncommitted_done(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_confirmation_never_uses_a_stale_unfocused_keyboard() {
+        let mut ime = Ime::with_keyboard();
+        ime.focus(HostId(99));
+        ime.hold_peeked(HOST_KEYBOARD, 57, 700, 100);
+
+        ime.confirm();
+        assert_eq!(
+            ime.events(),
+            [],
+            "an active surface without a matching keyboard must not use stale focus"
+        );
+    }
+
+    /// Exo empties the preedit as Backspace deletes it, then confirms each
+    /// repeat over the committed text: each becomes a Backspace pair, until
+    /// the fallback ends.
+    #[test]
+    fn emptied_preedit_enables_held_backspace_fallback_for_committed_text() {
+        let mut ime = Ime::with_keyboard();
+        ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 701, 101);
+        ime.state().set_guest_commits(2);
+        ime.state().committed.surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.preedit("가", "");
+        ime.preedit("", "");
+        ime.events();
+
+        for _ in 0..2 {
+            ime.confirm();
+            assert_eq!(
+                ime.events(),
+                [
+                    key(KEYBOARD, BACKSPACE, PRESSED, 701, 101),
+                    key(KEYBOARD, BACKSPACE, RELEASED, 701, 101),
+                    (TI, V3::Done { serial: 2 }.into()),
+                ]
+            );
+            assert_eq!(
+                ime.state().committed.surrounding_text,
+                Some(("A가".to_string(), 4, 4))
+            );
+        }
+
+        end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
+        ime.confirm();
+        assert_eq!(ime.events(), []);
+    }
+
+    /// A physical Backspace press the guest already got, then the host
+    /// clearing its preedit and confirming: the confirmation closes the
+    /// transaction without another pair.
+    #[test]
+    fn empty_confirmation_does_not_duplicate_forwarded_backspace() {
+        let mut ime = Ime::with_keyboard();
+        ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 1, 100);
+        assert!(ime
+            .ctx
+            .claim_guest_key(HOST_KEYBOARD, BACKSPACE, GuestKeyOwner::Physical));
+        ime.state().current_preedit = crate::state::ShownPreedit::at_end("가");
+        ime.state().committed.surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.preedit("", "");
+        assert!(ime.repeat_active());
+        ime.events();
+
+        ime.confirm();
+        assert_eq!(ime.events(), [uncommitted_done()]);
+        assert!(!ime.repeat_active());
+    }
+
+    #[test]
+    fn held_backspace_fallback_rejects_unmapped_guest_keyboard() {
+        let mut ime = Ime::new();
+        // A stale route can survive a malformed or reordered bind, but
+        // without a host keyboard there is no physical key or compositor
+        // time domain from which a synthetic pair may safely be generated,
+        // even while host keyboards, none of them its own, hold a key.
+        ime.ctx.keyboard_to_seat.insert(KEYBOARD, SEAT);
+        for keyboard in [HOST_KEYBOARD, HostId(KEYBOARD)] {
+            ime.hold_peeked(keyboard, BACKSPACE, 700, 100);
+        }
+
+        ime.confirm();
+        assert!(
+            ime.ctx.host_to_client_queue.is_empty(),
+            "synthetic Backspace must require a mapped host keyboard"
+        );
+    }
+
+    /// Exo sends a keysym's timestamp as its serial and its serial as its
+    /// time; the guest gets them back in their places, as a key pair of
+    /// the text input's that invents no physical key state.
+    #[test]
+    fn on_keysym_translates_exo_timestamp_and_serial_to_wl_keyboard() {
+        use xkbcommon::xkb::keysyms::KEY_BackSpace;
+        let mut ime = Ime::with_keyboard();
+        ime.keysym(KEY_BackSpace, PRESSED, 456, 123);
+        assert_eq!(ime.events(), [key(KEYBOARD, BACKSPACE, PRESSED, 456, 123)]);
+        let generations = &ime.ctx.key_generations;
+        assert!(!generations.physically_held(HOST_KEYBOARD, BACKSPACE));
+        assert_eq!(ime.owner(BACKSPACE), Some(GuestKeyOwner::TextInputKeysym));
+
+        ime.keysym(KEY_BackSpace, RELEASED, 457, 124);
+        assert_eq!(ime.events(), [key(KEYBOARD, BACKSPACE, RELEASED, 457, 124)]);
+        let generations = &ime.ctx.key_generations;
+        assert!(!generations.physically_held(HOST_KEYBOARD, BACKSPACE));
+        assert_eq!(
+            ime.owner(BACKSPACE),
+            Some(GuestKeyOwner::ImeRecovery),
+            "the release leaves a completed-generation tombstone"
+        );
+    }
+
+    /// A keysym of a key another owner holds for the guest, its physical
+    /// press or a pair synthesized for the IME, neither duplicates nor
+    /// steals its press or release.
+    #[test]
+    fn keysyms_leave_a_key_another_owner_holds() {
+        use xkbcommon::xkb::keysyms::KEY_BackSpace;
+        for (owner, state) in [
+            (GuestKeyOwner::Physical, PRESSED),
+            (GuestKeyOwner::Physical, RELEASED),
+            (GuestKeyOwner::ImeRecovery, PRESSED),
+        ] {
+            let mut ime = Ime::with_keyboard();
+            ime.hold_owned(BACKSPACE, owner);
+
+            ime.keysym(KEY_BackSpace, state, 456, 123);
+            let case = format!("{owner:?} {state}");
+            assert_eq!(ime.events(), [], "{case}");
+            assert_eq!(ime.owner(BACKSPACE), Some(owner), "{case}");
+            let generations = &ime.ctx.key_generations;
+            assert!(
+                generations.physically_held(HOST_KEYBOARD, BACKSPACE),
+                "{case}"
+            );
+        }
+    }
+
+    /// A repeated keysym repeats a guest press, and invents none.
+    #[test]
+    fn repeated_keysym_forwards_only_for_an_existing_guest_press() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        for pressed in [true, false] {
+            let mut ime = Ime::with_keyboard();
+            if pressed {
+                ime.hold_owned(a, GuestKeyOwner::Physical);
+            }
+            ime.keysym(KEY_a, REPEATED, 456, 123);
+            let expected = Vec::from_iter(pressed.then(|| key(KEYBOARD, a, REPEATED, 456, 123)));
+            assert_eq!(ime.events(), expected, "pressed: {pressed}");
+        }
+    }
+
+    /// A keysym press whose serial a completed generation had is a delayed
+    /// duplicate, also across the serial's wrap; a newer one opens the next
+    /// generation.
+    #[test]
+    fn keysym_serial_distinguishes_delayed_duplicate_from_next_generation() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        // Each sequence opens and closes two generations; the presses that
+        // repeat serial 1 are dropped.
+        for (keysyms, forwarded) in [
+            (
+                &[
+                    (1, PRESSED),
+                    (2, RELEASED),
+                    (1, PRESSED),
+                    (3, PRESSED),
+                    (4, RELEASED),
+                    (1, PRESSED),
+                ][..],
+                [1, 2, 3, 4],
+            ),
+            (
+                &[
+                    (u32::MAX - 1, PRESSED),
+                    (u32::MAX, RELEASED),
+                    (0, PRESSED),
+                    (1, RELEASED),
+                ],
+                [u32::MAX - 1, u32::MAX, 0, 1],
+            ),
+        ] {
+            let mut ime = Ime::with_keyboard();
+            for &(serial, state) in keysyms {
+                ime.keysym(KEY_a, state, serial, 10);
+            }
+            let states = [PRESSED, RELEASED, PRESSED, RELEASED];
+            let expected = Vec::from_iter(
+                states
+                    .into_iter()
+                    .zip(forwarded)
+                    .map(|(state, serial)| key(KEYBOARD, a, state, serial, 10)),
+            );
+            assert_eq!(ime.events(), expected, "{keysyms:?}");
+        }
+    }
+
+    /// The physical channel's press of a generation that started as a
+    /// keysym is no second press.
+    #[test]
+    fn delayed_peek_and_keyboard_press_keep_keysym_pair_balanced() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.keysym(KEY_a, PRESSED, 1, 10);
+        ime.peek(a, PRESSED, 1, 10);
+        assert_eq!(
+            ime.key(a, PRESSED, 1, 10),
+            Action::Drop,
+            "the delayed keyboard channel must not emit a duplicate press"
+        );
+        ime.keysym(KEY_a, RELEASED, 2, 20);
+        assert_eq!(
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 1, 10),
+                key(KEYBOARD, a, RELEASED, 2, 20)
+            ]
+        );
+        assert_eq!(ime.owner(a), Some(GuestKeyOwner::ImeRecovery));
+    }
+
+    #[test]
+    fn released_tombstone_accepts_new_keysym_before_new_peek() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.peek(a, PRESSED, 0x8000_0010, 1000);
+        ime.keysym(KEY_a, PRESSED, 0x8000_0010, 1000);
+        ime.keysym(KEY_a, RELEASED, 0x8000_0011, 1010);
+        ime.peek(a, RELEASED, 0x8000_0012, 1020);
+
+        ime.keysym(KEY_a, PRESSED, 0x8000_0020, 1100);
+        assert_eq!(
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 0x8000_0010, 1000),
+                key(KEYBOARD, a, RELEASED, 0x8000_0011, 1010),
+                key(KEYBOARD, a, PRESSED, 0x8000_0020, 1100),
+            ]
+        );
+        assert_eq!(ime.owner(a), Some(GuestKeyOwner::TextInputKeysym));
+        ime.peek(a, PRESSED, 0x8000_0020, 1100);
+        assert_eq!(
+            ime.owner(a),
+            Some(GuestKeyOwner::TextInputKeysym),
+            "the delayed physical channel must attach to the keysym-first generation"
+        );
+    }
+
+    #[test]
+    fn released_generation_drops_delayed_keysym_press_before_release_boundary() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.peek(a, PRESSED, u32::MAX - 3, 1000);
+        ime.keysym(KEY_a, PRESSED, u32::MAX - 2, 1000);
+        ime.peek(a, RELEASED, 0, 1010);
+
+        ime.keysym(KEY_a, PRESSED, u32::MAX - 1, 1005);
+        assert_eq!(
+            ime.events(),
+            [key(KEYBOARD, a, PRESSED, u32::MAX - 2, 1000)],
+            "a delayed press before the wrapped release boundary must not reach the guest"
+        );
+        let generations = &ime.ctx.key_generations;
+        assert_eq!(
+            generations.guest_press_serial(HOST_KEYBOARD, a),
+            Some(u32::MAX - 2)
+        );
+
+        ime.keysym(KEY_a, PRESSED, 1, 1100);
+        ime.keysym(KEY_a, RELEASED, u32::MAX, 1010);
+        ime.keysym(KEY_a, RELEASED, 2, 1110);
+        assert_eq!(
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 1, 1100),
+                key(KEYBOARD, a, RELEASED, u32::MAX, 1010),
+                key(KEYBOARD, a, RELEASED, 2, 1110),
+            ],
+            "the old and current generations must each retain one balanced key pair"
+        );
+    }
+
+    #[test]
+    fn delayed_keysym_release_closes_retired_generation_only() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.peek(a, PRESSED, 10, 100);
+        ime.keysym(KEY_a, PRESSED, 10, 100);
+        ime.peek(a, RELEASED, 11, 110);
+        ime.peek(a, PRESSED, 20, 200);
+
+        ime.keysym(KEY_a, RELEASED, 11, 110);
+        assert!(
+            ime.ctx.key_generations.physically_held(HOST_KEYBOARD, a),
+            "the retired release must not close the current physical generation"
+        );
+        assert_eq!(
+            ime.owner(a),
+            None,
+            "the new generation must remain available after the retired release"
+        );
+
+        ime.keysym(KEY_a, PRESSED, 20, 200);
+        ime.keysym(KEY_a, RELEASED, 21, 210);
+        assert_eq!(
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 10, 100),
+                key(KEYBOARD, a, RELEASED, 11, 110),
+                key(KEYBOARD, a, PRESSED, 20, 200),
+                key(KEYBOARD, a, RELEASED, 21, 210),
+            ],
+            "each physical generation must produce one balanced guest pair"
+        );
+    }
+
+    /// The releases of a retired keysym generation and of the current one
+    /// each close their own press, in either order.
+    #[test]
+    fn current_keysym_release_does_not_consume_retired_release() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        let mut ime = Ime::with_extended_keyboard();
+        ime.peek(a, PRESSED, 10, 100);
+        ime.keysym(KEY_a, PRESSED, 10, 100);
+        ime.peek(a, RELEASED, 11, 110);
+        ime.peek(a, PRESSED, 20, 200);
+
+        ime.keysym(KEY_a, PRESSED, 20, 200);
+        ime.keysym(KEY_a, RELEASED, 21, 210);
+        assert_eq!(
+            ime.owner(a),
+            Some(GuestKeyOwner::ImeRecovery),
+            "the current release must complete the current owner"
+        );
+        ime.keysym(KEY_a, RELEASED, 11, 110);
+        assert_eq!(
+            ime.owner(a),
+            Some(GuestKeyOwner::ImeRecovery),
+            "the delayed retired release must not disturb the current tombstone"
+        );
+        assert_eq!(
+            ime.events(),
+            [
+                key(KEYBOARD, a, PRESSED, 10, 100),
+                key(KEYBOARD, a, PRESSED, 20, 200),
+                key(KEYBOARD, a, RELEASED, 21, 210),
+                key(KEYBOARD, a, RELEASED, 11, 110),
+            ],
+            "both guest presses must eventually receive one release"
+        );
+    }
+
+    /// The next keysym press is the first event of its generation: it
+    /// retires the still-open previous keysym owner before the new peek
+    /// catches up, and either release order balances both.
+    #[test]
+    fn keysym_first_generation_retires_open_previous_owner() {
+        use xkbcommon::xkb::keysyms::KEY_a;
+        let a = keysym_to_evdev_keycode(KEY_a).expect("the fallback keymap has KEY_a");
+        for old_release_first in [true, false] {
+            let mut ime = Ime::with_extended_keyboard();
+            ime.peek(a, PRESSED, u32::MAX - 3, 1000);
+            ime.keysym(KEY_a, PRESSED, u32::MAX - 2, 1000);
+            ime.peek(a, RELEASED, u32::MAX - 1, 1010);
+
+            ime.keysym(KEY_a, PRESSED, 0, 1100);
+            assert_eq!(ime.owner(a), Some(GuestKeyOwner::TextInputKeysym));
+            ime.peek(a, PRESSED, 1, 1100);
+
+            let mut releases = [(u32::MAX - 1, 1010), (2, 1200)];
+            if !old_release_first {
+                releases.reverse();
+            }
+            for (serial, time) in releases {
+                ime.keysym(KEY_a, RELEASED, serial, time);
+            }
+            assert_eq!(
+                ime.owner(a),
+                Some(GuestKeyOwner::ImeRecovery),
+                "the current owner must complete regardless of release order"
+            );
+            let mut expected = vec![
+                key(KEYBOARD, a, PRESSED, u32::MAX - 2, 1000),
+                key(KEYBOARD, a, PRESSED, 0, 1100),
+            ];
+            expected
+                .extend(releases.map(|(serial, time)| key(KEYBOARD, a, RELEASED, serial, time)));
+            assert_eq!(
+                ime.events(),
+                expected,
+                "both keysym-first generations must remain balanced"
+            );
+        }
+    }
+
+    /// Without a focused keyboard on the seat, a keysym takes the keyboard
+    /// with the lowest ID, whatever order a map holds them in, but one
+    /// whose Backspace the IME fallback holds only for Backspace.
+    #[test]
+    fn on_keysym_selects_guest_keyboard_deterministically() {
+        use xkbcommon::xkb::keysyms::{KEY_BackSpace, KEY_A};
+        let mut ime = Ime::new();
+        ime.keyboard(999, HostId(888));
+        ime.keyboard(100, HostId(777));
+        ime.keysym(KEY_BackSpace, PRESSED, 456, 123);
+        assert_eq!(ime.events(), [key(100, BACKSPACE, PRESSED, 456, 123)]);
+
+        let mut ime = Ime::new();
+        ime.keyboard(100, HostId(101));
+        ime.keyboard(200, HostId(201));
+        let generations = &mut ime.ctx.key_generations;
+        generations.observe_physical_state(HostId(101), BACKSPACE, 1);
+        ime.keysym(KEY_A, PRESSED, 456, 123);
+        let [(keyboard, _)] = ime.events()[..] else {
+            panic!("the keysym reached no one keyboard");
+        };
+        assert_eq!(
+            keyboard, 200,
+            "an ordinary keysym must not be routed to the keyboard reserved for IME Backspace fallback"
+        );
+    }
+
+    #[test]
+    fn keysym_prefers_keyboard_with_current_surface_focus() {
+        use xkbcommon::xkb::keysyms::KEY_A;
+        let mut ime = Ime::new();
+        ime.keyboard(100, HostId(101));
+        ime.keyboard(200, HostId(201));
+        ime.focus(HostId(201));
+
+        ime.keysym(KEY_A, PRESSED, 456, 123);
+        let [(keyboard, _)] = ime.events()[..] else {
+            panic!("the keysym reached no one keyboard");
+        };
+        assert_eq!(
+            keyboard, 200,
+            "a host keysym must target the keyboard whose surface owns the seat focus"
+        );
+    }
+
+    #[test]
+    fn fallback_keysym_lookup_is_stable_and_reusable() {
+        use xkbcommon::xkb::keysyms::{KEY_BackSpace, KEY_a, KEY_A};
+        for _ in 0..2 {
+            assert_eq!(keysym_to_evdev_keycode(KEY_BackSpace), Some(BACKSPACE));
+        }
+        assert_eq!(keysym_to_evdev_keycode(u32::MAX), None);
+        assert!(
+            keysym_to_evdev_keycode(KEY_A).is_some(),
+            "uppercase keysym events must map to the same physical key"
+        );
+        assert_eq!(
+            keysym_to_evdev_keycode(KEY_a),
+            keysym_to_evdev_keycode(KEY_A)
+        );
+    }
+}
