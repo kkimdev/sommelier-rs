@@ -511,17 +511,17 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
 /// # Returns
 ///
 /// How to dispatch the press. If a composition ended, the press is re-sent
-/// after the guest events that end it, built by `resend`, since a forward
+/// after the guest events that end it, given as `resend`, since a forward
 /// would precede them, and the original is dropped; otherwise it is
 /// forwarded.
 pub(crate) fn end_composition_on_press(
     ctx: &mut Context,
     surface: u32,
-    resend: impl FnOnce() -> Outgoing,
+    resend: Outgoing,
 ) -> Action {
     let press = Input::Press {
         surface: SurfaceId(surface),
-        resend: resend(),
+        resend,
     };
     match ime(ctx, press) {
         true => Action::Forward,

@@ -73,9 +73,11 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
         ) else {
             return Action::Forward;
         };
-        crate::handler::text_input::end_composition_on_press(ctx, surface, || {
-            wl_pointer::evt::button(guest_pointer, serial, time, button, state)
-        })
+        crate::handler::text_input::end_composition_on_press(
+            ctx,
+            surface,
+            wl_pointer::evt::button(guest_pointer, serial, time, button, state),
+        )
     }
 }
 
