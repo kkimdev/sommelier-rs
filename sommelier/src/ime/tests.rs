@@ -682,7 +682,8 @@ fn row_G3_an_enable_waits_for_its_commit() {
 fn row_G4_a_disable_deactivates_behind_a_barrier() {
     let mut ime = Ime::enabled();
     ime.compose("가");
-    ime.step(Input::Disable(TI));
+    let out = ime.step(Input::Disable(TI));
+    assert!(out.host.is_empty() && out.guest.is_empty());
     let out = ime.step(Input::Commit(TI));
     let [barrier] = out.barriers()[..] else {
         panic!("one barrier in {out:?}");
@@ -707,16 +708,18 @@ fn row_G4_a_disable_deactivates_behind_a_barrier() {
 fn row_G5_surrounding_text_is_checked_then_sent_with_its_commit() {
     let mut ime = Ime::enabled();
     ime.report("a가b", 4);
-    // An offset inside a character is ignored.
-    ime.step(Input::SurroundingText(TI, "a가b".into(), 2, 2));
-    let out = ime.step(Input::Commit(TI));
-    assert_eq!(out.host, [commit_state(TI, 3)]);
+    // An offset inside a character, past the text or negative is ignored.
+    for (serial, (cursor, anchor)) in (3..).zip([(2, 2), (4, 7), (-1, 0)]) {
+        ime.step(Input::SurroundingText(TI, "a가b".into(), cursor, anchor));
+        let out = ime.step(Input::Commit(TI));
+        assert_eq!(out.host, [commit_state(TI, serial)], "{cursor}, {anchor}");
+    }
     // Text that is not UTF-8 empties the field's text.
     let not_utf8 = IndexedString::NotUtf8(vec![0xff]);
     ime.step(Input::SurroundingText(TI, not_utf8, 1, 1));
     let out = ime.step(Input::Commit(TI));
-    assert_eq!(out.host, [surrounding(TI, "", 0), commit_state(TI, 4)]);
-    assert_eq!(out.guest, [done(4)]);
+    assert_eq!(out.host, [surrounding(TI, "", 0), commit_state(TI, 6)]);
+    assert_eq!(out.guest, [done(6)]);
 }
 
 #[test]
@@ -740,6 +743,13 @@ fn row_G7_a_content_type_reaches_the_attached_input_method_once() {
     ime.step(Input::ContentType(TI, password));
     let out = ime.step(Input::Commit(TI));
     assert_eq!(out.host, [commit_state(TI, 3)]);
+    // Nor one changed and changed back before the commit: before v8 a
+    // resend resets Exo's composition.
+    let pin = (0, zwp_text_input_v3::CONTENT_PURPOSE_PIN);
+    ime.step(Input::ContentType(TI, pin));
+    ime.step(Input::ContentType(TI, password));
+    let out = ime.step(Input::Commit(TI));
+    assert_eq!(out.host, [commit_state(TI, 4)]);
 }
 
 #[test]
@@ -774,8 +784,11 @@ fn row_G9a_an_unfocused_commit_only_counts() {
     assert_eq!(out.guest, [done(3)]);
 }
 
+/// G9b: a commit whose surrounding text does not fit a message reaches
+/// the host with nothing, and changes nothing but the commit count; the
+/// field stays enabled, so it gets its `done`.
 #[test]
-fn row_G9b_a_commit_whose_text_does_not_fit_only_counts() {
+fn oversized_surrounding_commit_does_not_partially_advance_state() {
     let mut ime = Ime::enabled();
     ime.compose("가");
     let long = "x".repeat(4_084);
@@ -791,10 +804,33 @@ fn row_G9b_a_commit_whose_text_does_not_fit_only_counts() {
     assert_eq!(out.host, []);
     assert_eq!(out.guest, [preedit("가"), done(2)]);
     assert_eq!(out.keys, []);
-    // The commit spent its pending state.
+}
+
+/// G9b: the commit after one whose surrounding text did not fit does not
+/// retry that commit's pending state, which it spent: it reaches the host
+/// with only what the guest set since.
+#[test]
+fn the_commit_after_an_oversized_one_does_not_retry_it() {
+    let mut ime = Ime::enabled();
+    let long = "x".repeat(4_084);
+    ime.step(Input::SurroundingText(
+        TI,
+        long.as_str().into(),
+        4_084,
+        4_084,
+    ));
+    let password = (0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
+    ime.step(Input::ContentType(TI, password));
+    assert_eq!(ime.step(Input::Commit(TI)).host, []);
+    // Neither the text nor the content type is sent again.
     let out = ime.step(Input::Commit(TI));
     assert_eq!(out.host, [commit_state(TI, 3)]);
-    assert_eq!(out.guest, [preedit("가"), done(3)]);
+    assert_eq!(out.guest, [done(3)]);
+    let out = ime.report("ab", 2);
+    let mut expected = vec![surrounding(TI, "ab", 2)];
+    expected.extend(content_type(TI, true));
+    expected.push(commit_state(TI, 4));
+    assert_eq!(out.host, expected);
 }
 
 #[test]
@@ -807,15 +843,13 @@ fn row_G9c_a_commit_of_an_enabled_field_repeats_the_shown_preedit() {
     assert_eq!(out.guest, [preedit_at("가", 0, 0), done(2)]);
 }
 
-/// The old code's `an_answer_that_cannot_repeat_the_preedit_forgets_it`:
-/// an answer that cannot repeat the shown preedit sends its `done` alone,
-/// which clears it, so the core forgets it, as the old code's
-/// `forget_shown_preedit` does. The guest then shows nothing of the
-/// composition Exo holds, so a region over it is dropped. No input reaches
-/// this, since every preedit a plan shows fit a message once, so the test
-/// replaces the shown preedit.
+/// G9c: an answer that cannot repeat the shown preedit sends its `done`
+/// alone, which clears it, so the core forgets it. The guest then shows
+/// nothing of the composition Exo holds, so a region over it is dropped. No
+/// input reaches this, since every preedit a plan shows fit a message once,
+/// so the test replaces the shown preedit.
 #[test]
-fn row_G9c_an_answer_that_cannot_repeat_the_preedit_forgets_it() {
+fn an_answer_that_cannot_repeat_the_preedit_forgets_it() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
@@ -828,7 +862,7 @@ fn row_G9c_an_answer_that_cannot_repeat_the_preedit_forgets_it() {
 }
 
 #[test]
-fn row_G9c_reenabling_an_enabled_field_keeps_its_composition() {
+fn reenabling_an_enabled_field_keeps_its_composition() {
     let mut ime = Ime::enabled();
     ime.compose("가");
     let out = ime.enable(TI);
@@ -843,6 +877,8 @@ fn row_G9c_reenabling_an_enabled_field_keeps_its_composition() {
     );
     assert_eq!(out.guest, [preedit("가"), done(2)]);
     assert_eq!(out.keys, []);
+    // The composition goes on from it.
+    assert_eq!(ime.compose("간").guest, [preedit("간"), done(2)]);
 }
 
 #[test]
@@ -1083,7 +1119,7 @@ fn row_G10_destroy_of_the_enabled_input_lets_another_enable() {
 /// content type (INVARIANTS "`set_input_type` replaces v1
 /// `set_content_type`").
 #[test]
-fn row_G7_a_content_type_takes_one_host_request_per_extension_version() {
+fn content_type_takes_one_host_request_per_extension_version() {
     use zwp_text_input_v3::CONTENT_PURPOSE_PIN as PIN;
     let (hint, purpose, input_type, input_mode, input_flags, learning_mode) =
         map_v3_content_type(0, PIN);
@@ -1292,8 +1328,10 @@ fn row_H7_a_preedit_shows_and_its_clear_arms_the_lease() {
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
 }
 
+/// H7: a preedit the host clears with a reset commit reaches the guest
+/// as that commit.
 #[test]
-fn row_H7_a_cleared_preedit_with_commit_text_commits_it() {
+fn a_reset_commit_waits_for_the_guest_to_report_it() {
     let mut ime = Ime::enabled();
     ime.report("ab", 2);
     ime.compose("가");
@@ -1304,6 +1342,13 @@ fn row_H7_a_cleared_preedit_with_commit_text_commits_it() {
     });
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(2)]);
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    // Exo never sends one, as its commit text is always the preedit's, so
+    // the mirror cannot follow it, and drops Exo's deletes.
+    let delete = HostIme::Delete {
+        index: 1,
+        length: 1,
+    };
+    assert_eq!(ime.v1(delete).guest, []);
 }
 
 #[test]
@@ -1337,8 +1382,9 @@ fn row_H7prime_a_preedit_that_is_not_utf8_is_dropped() {
 fn row_H8_a_commit_ends_the_preedit() {
     let mut ime = Ime::enabled();
     ime.compose("가");
+    // The host's serial is only logged.
     let out = ime.v1(HostIme::Commit {
-        serial: 0,
+        serial: 2945,
         text: "각".into(),
     });
     assert_eq!(out.guest, [no_preedit(), commit("각"), done(1)]);
@@ -1496,13 +1542,11 @@ fn row_X1_a_region_keeps_the_cursor_and_an_empty_one_edits_nothing() {
     assert_eq!(out.guest, [delete(2, 0), done(2)]);
 }
 
-/// The old code's
-/// `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`: a host
-/// preedit replaces the region's preedit, but the guest still lacks the
-/// bytes the region took. Exo holds the new preedit in place of those
-/// bytes, so the region takes it.
+/// X1: a host preedit replaces the region's preedit, but the guest still
+/// lacks the bytes the region took. Exo holds the new preedit in place of
+/// those bytes, so the region takes it.
 #[test]
-fn row_X1_a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
+fn a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
@@ -1518,13 +1562,11 @@ fn row_X1_a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
     assert_eq!(out.guest, expected);
 }
 
-/// The old code's
-/// `a_region_over_a_host_preedit_is_measured_from_exos_cursor`: Exo holds
-/// the preedit the guest shows as text at the guest's cursor, with its own
-/// cursor where the preedit's was, and measures a region from there. With
-/// "a1b|" and "b" shown, region -2+2 is "bb", not "1b".
+/// X1: Exo holds the preedit the guest shows as text at the guest's cursor,
+/// with its own cursor where the preedit's was, and measures a region from
+/// there. With "a1b|" and "b" shown, region -2+2 is "bb", not "1b".
 #[test]
-fn row_X1_a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
+fn a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
     let mut ime = Ime::enabled();
     ime.report("a1b", 3);
     ime.v1(HostIme::PreeditCursor(1));
@@ -1539,13 +1581,12 @@ fn row_X1_a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
     assert_eq!(out.guest, expected);
 }
 
-/// The old code's `a_region_that_does_not_cover_a_host_preedit_is_dropped`:
-/// a non-empty region that does not cover the host preedit the guest
+/// X1: a non-empty region that does not cover the host preedit the guest
 /// shows is dropped, since Exo would leave the rest of that preedit as
 /// text. One that covers it on both sides deletes the bytes beyond it on
 /// each.
 #[test]
-fn row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped() {
+fn a_region_that_does_not_cover_a_host_preedit_is_dropped() {
     let region = |index, length| HostIme::PreeditRegion { index, length };
     // Exo holds "ax|bc".
     let composing = || {
@@ -1566,11 +1607,16 @@ fn row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped() {
     assert_eq!(out.guest, expected);
 }
 
-/// The old code's `an_empty_region_over_a_held_preedit_commits_it`: an
-/// empty region at Exo's cursor ends Exo's composition and leaves the
-/// preedit it held as text, so the guest commits it, as at a confirmation.
+/// X1: an empty region at Exo's cursor ends Exo's composition and leaves
+/// the preedit it held as text: Exo sends `set_preedit_region(0, 0)` for
+/// an empty range (`zwp_text_input_manager.cc`
+/// `SetCompositionFromExistingText`, which nothing before it filters), and
+/// its tracker keeps the text with an empty composition
+/// (`SurroundingTextTracker::OnSetCompositionFromExistingText`). So the
+/// guest commits the preedit, a host preedit or a region's, as at a
+/// confirmation.
 #[test]
-fn row_X1_an_empty_region_over_a_held_preedit_commits_it() {
+fn an_empty_region_over_a_held_preedit_commits_it() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
@@ -1578,11 +1624,18 @@ fn row_X1_an_empty_region_over_a_held_preedit_commits_it() {
     let out = ime.ext(region(0, 0));
     assert_eq!(out.guest, [no_preedit(), commit("x"), done(2)]);
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+
+    // A region's preedit, "x" of Exo's "abcdx|ef".
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("x", 1, 1), done(2)]);
+    let out = ime.ext(region(0, 0));
+    assert_eq!(out.guest, [no_preedit(), commit("x"), done(2)]);
 }
 
-/// The old code's `a_region_equal_to_the_shown_one_sends_only_the_preedit`.
+/// X1: a region equal to the shown one deletes nothing more: only the
+/// preedit is sent again.
 #[test]
-fn row_X1_a_region_equal_to_the_shown_one_sends_only_the_preedit() {
+fn a_region_equal_to_the_shown_one_sends_only_the_preedit() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
@@ -1593,10 +1646,11 @@ fn row_X1_a_region_equal_to_the_shown_one_sends_only_the_preedit() {
     assert_eq!(out.guest, [preedit_at("d", 1, 1), done(2)]);
 }
 
-/// The old code's `a_region_that_does_not_cover_the_shown_one_is_dropped`:
-/// one short of the shown preedit's bytes on either side.
+/// X1: while the guest shows the preedit a region made, a region that does
+/// not cover the shown one is dropped, one short of the shown preedit's
+/// bytes on either side.
 #[test]
-fn row_X1_a_region_that_does_not_cover_the_shown_one_is_dropped() {
+fn a_region_that_does_not_cover_the_shown_one_is_dropped() {
     let region = |index, length| HostIme::PreeditRegion { index, length };
     for (index, length) in [(-2, 2), (0, 2), (-1, 1)] {
         let mut ime = Ime::enabled();
@@ -1610,9 +1664,10 @@ fn row_X1_a_region_that_does_not_cover_the_shown_one_is_dropped() {
     }
 }
 
-/// The old code's `a_region_over_a_region_deletes_the_rest_on_both_sides`.
+/// X1: a region over a region whose bytes lie on both sides of the cursor
+/// deletes the bytes beyond the shown ones on both sides.
 #[test]
-fn row_X1_a_region_over_a_region_deletes_the_rest_on_both_sides() {
+fn a_region_over_a_region_deletes_the_rest_on_both_sides() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 3);
     let region = |index, length| HostIme::PreeditRegion { index, length };
@@ -2198,9 +2253,9 @@ fn row_R2_an_activation_waits_for_a_live_seat() {
     assert_eq!(ime.compose("가").guest, []);
 }
 
-// The Exo mirror (design exo-mirror 3): from v11 of the extension, H9 and
+// The Exo mirror: from v11 of the extension, H9 and
 // X1 are measured in the Exo mirror while the guest is in step with it, and
-// dropped otherwise (design single-exo-model 3.4); below v11 they are
+// dropped otherwise; below v11 they are
 // dropped.
 
 impl Ime {
@@ -2344,10 +2399,10 @@ fn row_X1_a_mirror_that_diverges_warns_once() {
 /// A report without the preedit the guest shows names no state of Exo's,
 /// which holds it inline, so Exo would only drop its composition (E4):
 /// with the composition at the guest's cursor it names one, and the core
-/// withholds it, with no barrier (design exo-mirror 5). The rest of the
+/// withholds it, with no barrier. The rest of the
 /// commit goes out, and the guest is in step with Exo's composition.
 #[test]
-fn row_G9c_a_report_without_the_shown_preedit_is_withheld() {
+fn a_report_without_the_shown_preedit_is_withheld() {
     let mut ime = Ime::enabled();
     ime.report("ab", 2);
     ime.region(-1, 1);
@@ -2461,8 +2516,7 @@ fn row_X1_a_region_made_before_a_report_is_measured_before_it() {
 
 /// The last of `steps` is Exo's delete or region, which the core cannot
 /// measure in the mirror: it drops it, with no guest transaction, and the
-/// guest is out of step with Exo until its next report (design
-/// single-exo-model 3.4).
+/// guest is out of step with Exo until its next report.
 fn drops(steps: impl Fn(&mut Ime) -> Out) {
     let mut ime = Ime::enabled();
     let out = steps(&mut ime);
@@ -2604,9 +2658,9 @@ fn row_H9_after_a_forwarded_key_drops() {
 /// the core drops, below v11 or after a key the guest has not stated,
 /// commits the preedit the guest shows: if Exo had kept it as well, the
 /// text doubles, where sending nothing would lose it to the next preedit,
-/// which replaces it (design single-exo-model 3.4).
+/// which replaces it.
 #[test]
-fn row_X1_an_unmeasured_empty_region_commits_the_shown_preedit() {
+fn an_unmeasured_empty_region_commits_the_shown_preedit() {
     for version in [Some(10), Some(11)] {
         let mut ime = Ime::enabled_at(version);
         ime.report("ab", 2);

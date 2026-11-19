@@ -147,16 +147,8 @@ a content type. Whether an enable reaches the proxy before or after the
 previous activation has drained follows from the seed too: the
 compositor holds its answer to every drain barrier's sync until it
 answers anything else, and the guest sometimes waits with a second
-roundtrip, whose sync releases it. When such a case typed into text
-fields, stayed healthy and had no objects destroyed by the compositor on
-its own, Exo must end, once the proxy has closed the connection, with
-the field the guest last committed on the focused surface: the content
-type as the proxy maps it, the surrounding text and support for it, and
-the cursor rectangle, or no active text input if the field was disabled.
-The expected content type comes from the proxy's own mapping, so this
-check finds ordering and state bugs, not mapping bugs; unit tests pin
-the mapping. The run reports how many fields it checked, how many
-activations the guest's plan deferred, how many input methods
+roundtrip, whose sync releases it. What Exo holds of a field at the end
+is the DST's to check (`sim`, below). The run reports how many input methods
 restarted, how many host activations had their seat end while active,
 and how many deactivates named a destroyed seat.
 

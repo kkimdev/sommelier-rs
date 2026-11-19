@@ -1499,16 +1499,6 @@ pub(super) mod tests {
             text: Some(text.into()),
         }
     }
-    #[tokio::test]
-    async fn enable_is_not_activated_until_commit() {
-        let mut f = Field::disabled().await;
-        f.s.guest([v3::enable(f.ti)]).await;
-        assert_eq!(f.host_received().await, []);
-
-        f.s.guest([v3::commit(f.ti)]).await;
-        assert_eq!(f.host_received().await, f.enable_requests(1));
-        f.answered(1);
-    }
 
     /// A focus change deactivates the host behind a drain barrier: the
     /// host events sent before it reach no one, and the next activation,
@@ -1913,109 +1903,6 @@ pub(super) mod tests {
         assert_eq!(f.host_received().await, []);
     }
 
-    /// A disable invalidates the surrounding text, at the host too, and
-    /// deactivates it, but only at its commit.
-    #[tokio::test]
-    async fn disable_commit_invalidates_surrounding_text_and_deactivates() {
-        let mut f = Field::enabled().await;
-        f.s.guest([
-            v3::set_surrounding_text(f.ti, "가", 3, 3).unwrap(),
-            v3::commit(f.ti),
-        ])
-        .await;
-        assert_eq!(f.host_received().await, {
-            let mut expected = vec![f.surrounding_text("가", 3, 3)];
-            expected.extend(f.content_type((0, 0), true));
-            expected.push(f.commit_state(2));
-            expected
-        });
-        f.answered(2);
-
-        f.s.guest([v3::disable(f.ti)]).await;
-        assert_eq!(f.host_received().await, []);
-        f.s.guest([v3::commit(f.ti)]).await;
-        let host = f.host_received().await;
-        assert_eq!(host, f.disable_requests(barrier(&host), 3));
-    }
-
-    /// GTK3 enables an enabled field again on every click in it
-    /// (`imwayland.c`, `released_cb`). That keeps the field, as mutter and
-    /// KWin keep it: the host's composition runs on, with its content type,
-    /// which before the v8 extension a resend would reset it with, so the
-    /// `done` that answers the commit repeats the preedit, and the
-    /// composition goes on from it. The guest never hides a syllable the
-    /// input method still builds, and the host's reset commit still
-    /// replaces it.
-    #[tokio::test]
-    async fn reenabling_an_enabled_field_keeps_its_composition() {
-        let mut f = Field::enabled().await;
-        f.s.host([
-            v1::preedit_cursor(f.host, 0),
-            f.preedit("가", "가"),
-            v1::cursor_position(f.host, 1, 1),
-        ])
-        .await;
-        let composing = || preedit_at("가", 0, 0);
-        let expected = [composing(), V3::Done { serial: 1 }];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        // The host keeps the field's content type, so none is sent.
-        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.host_received().await, f.reset(2, Reset::default()));
-        let expected = [composing(), V3::Done { serial: 2 }];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        let done = || V3::Done { serial: 2 };
-        f.s.host([f.preedit("간", "간")]).await;
-        assert_eq!(f.s.guest_received(), f.events([preedit("간"), done()]));
-        f.s.host([f.preedit("", "간")]).await;
-        let expected = [no_preedit(), commit("간"), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        // The preedit styling the host sent before the enable survives it.
-        let selection = zwp_text_input_v1::PREEDIT_STYLE_SELECTION;
-        f.s.host([v1::preedit_styling(f.host, 0, 3, selection)])
-            .await;
-        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.host_received().await, f.reset(3, Reset::default()));
-        let expected = [V3::Done { serial: 3 }];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-        f.s.host([f.preedit("다", "다")]).await;
-        let expected = [preedit_at("다", 0, 3), V3::Done { serial: 3 }];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-    }
-
-    /// Each commit forwards the surrounding text it states; offsets that
-    /// are not character boundaries within the text state none.
-    #[tokio::test]
-    async fn invalid_utf8_surrounding_offsets_do_not_replace_pending_state() {
-        let mut f = Field::enabled().await;
-        f.s.guest([
-            v3::set_surrounding_text(f.ti, "가나", 3, 6).unwrap(),
-            v3::commit(f.ti),
-        ])
-        .await;
-        let mut expected = vec![f.surrounding_text("가나", 3, 6)];
-        expected.extend(f.content_type((0, 0), true));
-        expected.push(f.commit_state(2));
-        assert_eq!(f.host_received().await, expected);
-        f.answered(2);
-
-        for (serial, (cursor, anchor)) in (3..).zip([(1, 1), (3, 7), (-1, 0)]) {
-            f.s.guest([
-                v3::set_surrounding_text(f.ti, "가", cursor, anchor).unwrap(),
-                v3::commit(f.ti),
-            ])
-            .await;
-            assert_eq!(
-                f.host_received().await,
-                [f.commit_state(serial)],
-                "{cursor}, {anchor}"
-            );
-            f.answered(serial);
-        }
-    }
-
     /// The cursor and anchor are byte offsets into the surrounding text,
     /// which replacing an invalid sequence would move, so surrounding text
     /// that is not UTF-8 cannot reach the host. It empties the field's
@@ -2172,34 +2059,6 @@ pub(super) mod tests {
         f.answered(2);
     }
 
-    /// GTK resends the unchanged terminal content type after IME events.
-    /// Before v8, replaying `set_content_type` and
-    /// `deprecated_set_input_type` resets Exo's active Korean preedit before
-    /// the next key arrives, so a content type the host has, also one
-    /// changed and changed back before the commit, is not resent.
-    #[tokio::test]
-    async fn repeated_content_type_does_not_reset_active_host_composition() {
-        use zwp_text_input_v3::{CONTENT_PURPOSE_PIN as PIN, CONTENT_PURPOSE_TERMINAL as TERMINAL};
-        for purposes in [&[TERMINAL][..], &[PIN, TERMINAL]] {
-            let mut f = Field::enabled().await;
-            f.s.guest([v3::set_content_type(f.ti, 0, TERMINAL), v3::commit(f.ti)])
-                .await;
-            let mut expected = Vec::from(f.content_type((0, TERMINAL), false));
-            expected.push(f.commit_state(2));
-            assert_eq!(f.host_received().await, expected);
-            f.answered(2);
-
-            let mut requests = purposes
-                .iter()
-                .map(|&purpose| v3::set_content_type(f.ti, 0, purpose))
-                .collect::<Vec<_>>();
-            requests.push(v3::commit(f.ti));
-            f.s.guest(requests).await;
-            assert_eq!(f.host_received().await, [f.commit_state(3)], "{purposes:?}");
-            f.answered(3);
-        }
-    }
-
     #[tokio::test]
     async fn surrounding_text_support_follows_the_field_and_resends_only_on_change() {
         let mut f = Field::enabled().await;
@@ -2289,49 +2148,6 @@ pub(super) mod tests {
             [f.surrounding_text("abc", 3, 3), f.commit_state(2)]
         );
         f.answered(2);
-    }
-
-    /// The host requests of a content type for each extension version.
-    #[tokio::test]
-    async fn content_type_takes_one_host_request_per_extension_version() {
-        use zwp_text_input_v3::CONTENT_PURPOSE_PIN as PIN;
-        let (hint, purpose, input_type, input_mode, input_flags, learning_mode) =
-            map_v3_content_type(0, PIN);
-        for version in [1, 7, 8, 9] {
-            let mut f = Field::new(Some(version)).await;
-            f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-            f.host_received().await;
-            f.answered(1);
-            f.s.guest([v3::set_content_type(f.ti, 0, PIN), v3::commit(f.ti)])
-                .await;
-            let set_content_type = f.v1(V1::SetContentType { hint, purpose });
-            let deprecated_set_input_type = f.ext(Ext::DeprecatedSetInputType {
-                input_type,
-                input_mode,
-                input_flags,
-                learning_mode,
-            });
-            let [support, set_input_type] = f.content_type((0, PIN), false);
-            let expected = match version {
-                // v1 has no extension input-type request.
-                1 => vec![set_content_type],
-                // v2-v7 refine the v1 content type with
-                // deprecated_set_input_type.
-                7 => vec![set_content_type, deprecated_set_input_type],
-                // v8's set_input_type is used in place of v1
-                // set_content_type.
-                8 => vec![set_input_type],
-                // Exo applies surrounding-text support to the next
-                // set_content_type or set_input_type and then resets it, so
-                // nothing may come between.
-                9 => vec![support, set_input_type],
-                version => panic!("uncovered version {version}"),
-            };
-            let mut expected = expected;
-            expected.push(f.commit_state(2));
-            assert_eq!(f.host_received().await, expected, "version {version}");
-            f.answered(2);
-        }
     }
 
     #[tokio::test]
@@ -3613,7 +3429,7 @@ pub(super) mod tests {
             ),
             (
                 // It commits the preedit, an edit, as a confirmation does
-                // ([`an_empty_region_over_a_held_preedit_commits_it`]), so
+                // (`ime::tests::an_empty_region_over_a_held_preedit_commits_it`), so
                 // "c" of Exo's "abcx|" is apart from the cursor.
                 "an empty preedit region over a preedit commits it",
                 Some(("abc", 3, 3)),
@@ -3733,31 +3549,6 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
-    /// From v11 of the extension, a report that leaves out the preedit
-    /// the guest shows, which Exo holds inline, does not reach Exo, which
-    /// would only drop its composition (E4); the rest of the commit does,
-    /// and Exo's next region over that composition reaches the guest.
-    #[tokio::test]
-    async fn a_report_without_the_shown_preedit_is_withheld() {
-        let mut f = Field::with_surrounding_text("ab", 2, 2).await;
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
-        let done = || V3::Done { serial: 2 };
-        let expected = [delete(1, 0), preedit_at("b", 1, 1), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-        f.s.guest([
-            v3::set_surrounding_text(f.ti, "a", 1, 1).unwrap(),
-            v3::commit(f.ti),
-        ])
-        .await;
-        assert_eq!(f.s.host_received(), [f.commit_state(3)]);
-        let done = || V3::Done { serial: 3 };
-        let expected = [preedit_at("b", 1, 1), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
-        let expected = [no_preedit(), delete(1, 0), preedit_at("ab", 2, 2), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-    }
-
     /// A key the guest gets may edit its text where Exo does not see, so
     /// Exo's deletes are dropped until the guest states its text: a commit
     /// with no surrounding text states it is unchanged.
@@ -3792,39 +3583,11 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), []);
     }
 
-    /// An empty region the core cannot measure, here after a key the guest
-    /// has not stated, still ends Exo's composition as text, so the guest
-    /// commits the preedit it shows rather than lose it to Exo's next
-    /// preedit.
-    #[tokio::test]
-    async fn an_unmeasured_empty_region_commits_the_shown_preedit() {
-        let mut f = Field::with_surrounding_text("abc", 3, 3).await;
-        let done = || V3::Done { serial: 2 };
-        f.s.host([f.preedit("가", "가")]).await;
-        assert_eq!(f.s.guest_received(), f.events([preedit("가"), done()]));
-        let space = Stroke {
-            key: SPACE,
-            state: PRESSED,
-            serial: 50,
-            time: 1_000,
-        };
-        f.s.host([f.key(space)]).await;
-        assert_eq!(f.s.guest_received(), [f.guest_key(space)]);
-        f.host_received().await;
-        f.s.host([
-            ext::set_preedit_region(f.host_ext, 0, 0),
-            f.preedit("나", "나"),
-        ])
-        .await;
-        let expected = [no_preedit(), commit("가"), done(), preedit("나"), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-    }
-
     /// #85: a region over the shown region deletes while the guest shows a
     /// preedit, which Chromium drops (C3), so the guest is out of step with
     /// Exo; the next, growing region is dropped, and the input method's
     /// next commit doubles the text until the guest's report puts it in
-    /// step again (design single-exo-model 3.4).
+    /// step again.
     #[tokio::test]
     async fn a_region_over_a_region_drops() {
         let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
@@ -3902,21 +3665,6 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
-    /// A preedit the host clears with a reset commit reaches the guest as
-    /// that commit. Exo never sends one, as its commit text is always the
-    /// preedit's, so the mirror cannot follow it, and drops Exo's deletes.
-    #[tokio::test]
-    async fn a_reset_commit_waits_for_the_guest_to_report_it() {
-        let mut f = Field::with_surrounding_text("abc", 3, 3).await;
-        f.s.host([f.preedit("가", "가"), f.preedit("", "가")]).await;
-        let done = || V3::Done { serial: 2 };
-        let expected = [preedit("가"), done(), no_preedit(), commit("가"), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        f.s.host([f.delete_range(2, 1)]).await;
-        assert_eq!(f.s.guest_received(), []);
-    }
-
     /// An empty preedit reaches the guest only to clear the one it shows.
     /// Over none, the transaction is its `done` alone, since clients tell
     /// an empty preedit from none:
@@ -3980,7 +3728,7 @@ pub(super) mod tests {
     /// shown one ([`an_empty_preedit_reaches_only_a_guest_that_shows_one`],
     /// [`an_empty_preedit_has_no_hidden_cursor`]); one over a preedit Exo
     /// holds commits it
-    /// ([`an_empty_region_over_a_held_preedit_commits_it`]). Chromium
+    /// (`ime::tests::an_empty_region_over_a_held_preedit_commits_it`). Chromium
     /// applies an empty delete too (`ZwpTextInputV3Impl::OnDone`,
     /// `ui/ozone/platform/wayland/host/zwp_text_input_v3.cc` 440, revision
     /// ffb4f13519), and while nothing is composed it deletes the selection
@@ -3997,152 +3745,6 @@ pub(super) mod tests {
         let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
         f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
         assert_eq!(f.s.guest_received(), []);
-    }
-    /// A host `preedit_string` after a region replaces the preedit but not
-    /// what the guest lost: the bytes the region took stay out of its text,
-    /// so a later region deletes only the rest. Exo holds the new preedit
-    /// in place of those bytes, so the region takes it.
-    #[tokio::test]
-    async fn a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
-        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
-        let done = |serial| V3::Done { serial };
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
-        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        f.s.host([f.preedit("x", "x")]).await;
-        let _ = f.s.guest_received();
-
-        // The guest's text is "abc|ef", and Exo's "abcx|ef": of "cx", only
-        // "c" is in the guest's.
-        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
-        let expected = [no_preedit(), delete(1, 0), preedit_at("cx", 2, 2), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-    }
-
-    /// Exo holds the preedit the guest shows as text at the guest's
-    /// cursor, with its own cursor where the preedit's was, and measures a
-    /// region from there (`SurroundingTextTracker::OnSetCompositionText`,
-    /// `TextInput::SetCompositionFromExistingText`). A region over a host
-    /// preedit takes it with the committed bytes around it and deletes
-    /// only those, which the DST found (seed 1008182): with "a1b|" and "b"
-    /// shown, region -2+2 is "bb", not "1b".
-    #[tokio::test]
-    async fn a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
-        let mut f = Field::with_surrounding_text("a1b", 3, 3).await;
-        let done = |serial| V3::Done { serial };
-        f.s.host([v1::preedit_cursor(f.host, 1), f.preedit("b", "b")])
-            .await;
-        let expected = [preedit_at("b", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
-        let expected = [no_preedit(), delete(1, 0), preedit_at("bb", 2, 2), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-    }
-
-    /// A non-empty region that does not cover the host preedit the guest
-    /// shows is dropped: Exo would leave the rest of that preedit as text,
-    /// which only a commit after the region's delete could give the guest.
-    /// One that covers it on both sides deletes the bytes beyond it on
-    /// each.
-    #[tokio::test]
-    async fn a_region_that_does_not_cover_a_host_preedit_is_dropped() {
-        let done = |serial| V3::Done { serial };
-        // Exo holds "ax|bc".
-        for (index, length, covers) in [(-2, 1, false), (0, 1, false), (-2, 3, true)] {
-            let mut f = Field::with_surrounding_text("abc", 1, 1).await;
-            f.s.host([v1::preedit_cursor(f.host, 1), f.preedit("x", "x")])
-                .await;
-            let expected = [preedit_at("x", 1, 1), done(2)];
-            assert_eq!(f.s.guest_received(), f.events(expected));
-            f.s.host([ext::set_preedit_region(f.host_ext, index, length)])
-                .await;
-            let expected = match covers {
-                true => f.events([no_preedit(), delete(1, 1), preedit_at("axb", 2, 2), done(2)]),
-                false => Vec::new(),
-            };
-            assert_eq!(f.s.guest_received(), expected, "region {index}+{length}");
-        }
-    }
-    /// An empty region at Exo's cursor ends Exo's composition and leaves
-    /// the preedit it held as text: Exo sends `set_preedit_region(0, 0)`
-    /// for an empty range (`zwp_text_input_manager.cc`
-    /// `SetCompositionFromExistingText`, which nothing before it filters),
-    /// and its tracker keeps the text with an empty composition
-    /// (`SurroundingTextTracker::OnSetCompositionFromExistingText`). So the
-    /// guest commits the preedit, a host preedit or a region's.
-    #[tokio::test]
-    async fn an_empty_region_over_a_held_preedit_commits_it() {
-        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
-        let done = |serial| V3::Done { serial };
-        let empty = || ext::set_preedit_region(f.host_ext, 0, 0);
-        f.s.host([f.preedit("x", "x"), empty()]).await;
-        let expected = [preedit("x"), done(2), no_preedit(), commit("x"), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        // A region's preedit, "x" of Exo's "abcdx|ef".
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1), empty()])
-            .await;
-        let expected = [
-            delete(1, 0),
-            preedit_at("x", 1, 1),
-            done(2),
-            no_preedit(),
-            commit("x"),
-            done(2),
-        ];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-    }
-    /// A region equal to the shown one deletes nothing more: only the
-    /// preedit is sent again.
-    #[tokio::test]
-    async fn a_region_equal_to_the_shown_one_sends_only_the_preedit() {
-        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
-        let done = |serial| V3::Done { serial };
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
-        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
-        let expected = [preedit_at("d", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-    }
-
-    /// While the guest shows the preedit a region made, a region that does
-    /// not cover the shown one on both sides is dropped.
-    #[tokio::test]
-    async fn a_region_that_does_not_cover_the_shown_one_is_dropped() {
-        let done = |serial| V3::Done { serial };
-        for (index, length) in [(-2, 2), (0, 2), (-1, 1)] {
-            let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
-            // "c" before the cursor and "d" after it.
-            f.s.host([ext::set_preedit_region(f.host_ext, -1, 2)]).await;
-            let expected = [delete(1, 1), preedit_at("cd", 1, 1), done(2)];
-            assert_eq!(f.s.guest_received(), f.events(expected));
-            f.s.host([ext::set_preedit_region(f.host_ext, index, length)])
-                .await;
-            assert_eq!(f.s.guest_received(), [], "region {index}+{length}");
-        }
-    }
-    /// A region over a region whose bytes lie on both sides of the cursor
-    /// deletes the bytes beyond the shown ones on both sides.
-    #[tokio::test]
-    async fn a_region_over_a_region_deletes_the_rest_on_both_sides() {
-        let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
-        let done = |serial| V3::Done { serial };
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 2)]).await;
-        let expected = [delete(1, 1), preedit_at("cd", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        f.s.host([ext::set_preedit_region(f.host_ext, -2, 4)]).await;
-        let expected = [
-            no_preedit(),
-            delete(1, 1),
-            preedit_at("bcde", 2, 2),
-            done(2),
-        ];
-        assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
     /// A preedit region makes text around the cursor the preedit; a region
@@ -4197,37 +3799,6 @@ pub(super) mod tests {
         assert_eq!(f.host_received().await, [f.commit_state(3)]);
         let expected = [preedit_at("가나", 0, 3), V3::Done { serial: 3 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
-    }
-
-    /// Each commit_state carries the guest's commit count, which numbers
-    /// every `done` until the next commit, however many host events with
-    /// whatever serials it answers.
-    #[tokio::test]
-    async fn guest_commit_count_is_sent_to_v1_and_used_by_v3_done() {
-        let mut f = Field::enabled().await;
-        f.s.guest([v3::commit(f.ti)]).await;
-        assert_eq!(f.host_received().await, [f.commit_state(2)]);
-        f.answered(2);
-
-        f.s.host([
-            v1::preedit_string(f.host, 2942, "한", "").unwrap(),
-            v1::preedit_string(f.host, 2944, "한글", "").unwrap(),
-            v1::commit_string(f.host, 2945, "한글").unwrap(),
-        ])
-        .await;
-        let done = || V3::Done { serial: 2 };
-        assert_eq!(
-            f.s.guest_received(),
-            f.events([
-                preedit("한"),
-                done(),
-                preedit("한글"),
-                done(),
-                no_preedit(),
-                commit("한글"),
-                done(),
-            ])
-        );
     }
 
     /// Events of a host text input that is not active belong to no guest
@@ -5398,29 +4969,6 @@ pub(super) mod tests {
         (TI, V3::Done { serial: 0 }.into())
     }
 
-    /// A commit whose surrounding text does not fit a message reaches the
-    /// host with nothing: it consumes its pending state and changes
-    /// nothing else but the commit count.
-    #[test]
-    fn oversized_surrounding_commit_does_not_partially_advance_state() {
-        let mut ime = Ime::new();
-        let oversized = "x".repeat(4_084);
-        let end = oversized.len() as i32;
-        ime.ctx.last_sender_id = TI;
-        let oversized = IndexedString::from(oversized.as_str());
-        TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &oversized, end, end);
-        TextInputV3Handler.on_set_content_type(&mut ime.ctx, 0, 13);
-        let mut expected = ime.state().clone();
-        TextInputV3Handler.on_commit(&mut ime.ctx);
-
-        assert!(ime.ctx.client_to_host_queue.is_empty());
-        expected.set_commits_for_test(1);
-        *expected.pending_mut().expect("a focused field") = crate::ime::V3Pending::default();
-        assert_eq!(ime.state(), &expected);
-        // The field stays enabled, so the commit gets its `done`.
-        assert_eq!(ime.events(), [(TI, V3::Done { serial: 1 }.into())]);
-    }
-
     /// A report and its barrier are one entry of the host queue, which a
     /// submission never splits (`connection::OutgoingMessages`).
     #[test]
@@ -5444,72 +4992,6 @@ pub(super) mod tests {
             (header.sender_id, header.opcode),
             (WL_DISPLAY_ID, wl_display::REQ_SYNC)
         );
-    }
-
-    /// The commit after one whose surrounding text did not fit does not
-    /// retry that commit's pending state: it reaches the host with only
-    /// what the guest set since.
-    #[test]
-    fn the_commit_after_an_oversized_one_does_not_retry_it() {
-        let mut ime = Ime::new();
-        ime.ctx.last_sender_id = TI;
-        // The fixture's host has no content type yet, and the host's
-        // content type says whether the field reports its text: this
-        // commit settles both.
-        let text = IndexedString::from("a");
-        TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &text, 1, 1);
-        TextInputV3Handler.on_commit(&mut ime.ctx);
-        ime.requests();
-        ime.events();
-
-        let oversized = IndexedString::from("x".repeat(4_084).as_str());
-        TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &oversized, 4_084, 4_084);
-        let password = zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD;
-        TextInputV3Handler.on_set_content_type(&mut ime.ctx, 0, password);
-        TextInputV3Handler.on_commit(&mut ime.ctx);
-        assert_eq!(ime.requests(), []);
-        assert_eq!(ime.events(), [(TI, V3::Done { serial: 2 }.into())]);
-
-        // Neither the text nor the content type is sent again.
-        TextInputV3Handler.on_commit(&mut ime.ctx);
-        let commit_state =
-            |serial| -> (u32, AnyRequest) { (HOST, V1::CommitState { serial }.into()) };
-        assert_eq!(ime.requests(), [commit_state(3)]);
-        assert_eq!(ime.events(), [(TI, V3::Done { serial: 3 }.into())]);
-
-        let text = IndexedString::from("ab");
-        TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &text, 2, 2);
-        TextInputV3Handler.on_commit(&mut ime.ctx);
-        let surrounding = V1::SetSurroundingText {
-            text: "ab".into(),
-            cursor: 2,
-            anchor: 2,
-        };
-        let mut requests = ime.requests();
-        let barrier = requests.remove(1);
-        assert!(matches!(
-            barrier,
-            (
-                WL_DISPLAY_ID,
-                AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
-            )
-        ));
-        assert_eq!(requests, [(HOST, surrounding.into()), commit_state(4)]);
-        assert_eq!(ime.events(), [(TI, V3::Done { serial: 4 }.into())]);
-    }
-
-    /// A shown preedit the answer to a commit cannot repeat leaves the
-    /// `done` to clear it, so the proxy forgets it too, and the guest and
-    /// the proxy agree that no composition shows. The proxy shows only
-    /// preedits it has sent, so no host event reaches this.
-    #[test]
-    fn an_answer_that_cannot_repeat_the_preedit_forgets_it() {
-        let mut ime = Ime::new();
-        ime.state().show_for_test(&"x".repeat(4_084));
-        ime.ctx.last_sender_id = TI;
-        TextInputV3Handler.on_commit(&mut ime.ctx);
-        assert_eq!(ime.events(), [(TI, V3::Done { serial: 1 }.into())]);
-        assert_eq!(ime.state().shown_for_test(), None);
     }
 
     /// Host text too long for a message is dropped whole: the guest gets

@@ -23,8 +23,7 @@ limitations under the License.
 use super::{request, Guest, Message};
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{wl_compositor, wl_seat, wl_surface};
-use crate::sim::oracle::V3Field;
-use crate::wire::{MessageBuilder, WireMessage};
+use crate::wire::MessageBuilder;
 
 impl Guest<'_> {
     /// What a client typing into text fields sends: a text input on a seat
@@ -32,8 +31,6 @@ impl Guest<'_> {
     /// surfaces, which the compositor then focuses, wait for the focus with
     /// a roundtrip, as a client waits for `enter`, and edit the field in a
     /// few transactions. Returns nothing if a global is missing.
-    ///
-    /// Records in the guest's view what its typing left ([`Typed`]).
     pub(super) fn type_in_fields(&mut self) -> Vec<Message> {
         let find = |interface: &str| {
             self.globals
@@ -78,7 +75,6 @@ impl Guest<'_> {
                 .map(|&surface| request(compositor, wl_compositor::REQ_CREATE_SURFACE, &[surface])),
         );
         let mut focus = None;
-        let mut plan = Plan::default();
         for _ in 0..1 + self.rng.below(4) {
             let others: Vec<u32> = surfaces
                 .iter()
@@ -90,21 +86,17 @@ impl Guest<'_> {
             messages.push(request(surface, wl_surface::REQ_COMMIT, &[]));
             // The compositor answers the commit with the focus change, and
             // the proxy then deactivates the field, which the new focus
-            // disables. The roundtrip reached the host before that barrier.
-            plan.release();
-            plan.disable();
+            // disables.
+            let mut enabled = false;
             messages.push(self.roundtrip());
-            messages.extend(self.settle(&mut plan));
+            messages.extend(self.settle());
             for _ in 0..1 + self.rng.below(3) {
-                messages.extend(self.edit_field(text_input, &mut plan));
+                messages.extend(self.edit_field(text_input, &mut enabled));
             }
             // Now and then the guest releases the seat of an enabled field,
             // which the proxy can then no longer deactivate. Its typing
-            // ends there, unchecked: Exo keeps the abandoned activation.
-            if plan.field.is_some()
-                && seat_version >= wl_seat::REQ_RELEASE_SINCE
-                && self.rng.one_in(4)
-            {
+            // ends there: Exo keeps the abandoned activation.
+            if enabled && seat_version >= wl_seat::REQ_RELEASE_SINCE && self.rng.one_in(4) {
                 messages.extend(self.release_seat(
                     seat,
                     text_input,
@@ -115,34 +107,25 @@ impl Guest<'_> {
             }
         }
         // The closing sync follows.
-        plan.release();
-        self.view.typed = Some(Typed {
-            field: plan.field,
-            deferred_activations: plan.deferred_activations,
-        });
         messages
     }
 
     /// One transaction on `text_input`, ending with its `commit`, that
-    /// enables the `plan`'s field (always if it is disabled), changes it,
-    /// or disables it.
-    fn edit_field(&mut self, text_input: u32, plan: &mut Plan) -> Vec<Message> {
+    /// enables the field (always if it is disabled), changes it, or
+    /// disables it.
+    fn edit_field(&mut self, text_input: u32, enabled: &mut bool) -> Vec<Message> {
         use zwp_text_input_v3 as v3;
         let mut messages = Vec::new();
         let (enable, disable) = match self.rng.below(4) {
-            _ if plan.field.is_none() => (true, false),
+            _ if !*enabled => (true, false),
             0 => (true, false),
             1 => (false, true),
             _ => (false, false),
         };
+        *enabled = !disable;
         if disable {
             messages.push(request(text_input, v3::REQ_DISABLE, &[]));
-            plan.disable();
         } else {
-            if enable {
-                plan.enable();
-            }
-            let field = plan.field.as_mut().expect("an enabled field");
             if enable {
                 messages.push(request(text_input, v3::REQ_ENABLE, &[]));
             }
@@ -161,27 +144,18 @@ impl Guest<'_> {
                 let mut message = request(text_input, v3::REQ_SET_SURROUNDING_TEXT, &[]);
                 message.payload = payload.into_payload();
                 messages.push(message);
-                field.surrounding_text = Some((text, cursor, anchor));
             }
             // An enabled field without one has the default content type.
             if !self.rng.one_in(4) {
-                let message = self.message(text_input, v3::REQ_SET_CONTENT_TYPE);
-                let mut args = WireMessage::new(text_input, message.opcode, &message.payload);
-                let mut word = || args.read_u32().expect("a content type");
-                field.content_type = (word(), word());
-                messages.push(message);
+                messages.push(self.message(text_input, v3::REQ_SET_CONTENT_TYPE));
             }
             if self.rng.one_in(3) {
-                let message = self.message(text_input, v3::REQ_SET_CURSOR_RECTANGLE);
-                let mut args = WireMessage::new(text_input, message.opcode, &message.payload);
-                let mut int = || args.read_i32().expect("a rectangle");
-                field.cursor_rectangle = Some((int(), int(), int(), int()));
-                messages.push(message);
+                messages.push(self.message(text_input, v3::REQ_SET_CURSOR_RECTANGLE));
             }
         }
         messages.push(request(text_input, v3::REQ_COMMIT, &[]));
         if disable {
-            messages.extend(self.settle(plan));
+            messages.extend(self.settle());
         }
         messages
     }
@@ -216,78 +190,7 @@ impl Guest<'_> {
     /// so the proxy ends the field's host activation before the next enable
     /// arrives and activates that at once. Without it, the barrier's answer
     /// stays held past that enable, whose activation the proxy defers.
-    fn settle(&mut self, plan: &mut Plan) -> Option<Message> {
-        self.rng.one_in(2).then(|| {
-            plan.release();
-            self.roundtrip()
-        })
-    }
-}
-
-/// What the guest's typing into text fields left.
-pub(super) struct Typed {
-    /// The field its text input last committed, if it is enabled.
-    pub field: Option<V3Field>,
-    /// The activations its plan deferred: enables the proxy received while
-    /// it drained the field's previous activation (see [`Plan`]). The count
-    /// comes from the guest's plan, not from what the proxy did, and is
-    /// accurate only while the compositor holds every drain barrier's
-    /// answer, as it now does.
-    pub deferred_activations: u64,
-}
-
-/// The guest's field and, as the guest's plan determines it, the proxy's
-/// host activation of it. A disable or a new focus makes the proxy
-/// deactivate an active field behind a drain barrier, whose answer the
-/// compositor holds until it next answers a request: here a focus change,
-/// a settling roundtrip or the closing sync. An enable sent before that
-/// reaches the proxy while it drains, so the proxy activates the field only
-/// once that answer arrives. This counts the path, whatever the proxy sends
-/// the host meanwhile.
-#[derive(Default)]
-struct Plan {
-    field: Option<V3Field>,
-    host: Host,
-    deferred_activations: u64,
-}
-
-/// The proxy's host activation of the field.
-#[derive(Clone, Copy, Default, PartialEq)]
-enum Host {
-    #[default]
-    Inactive,
-    Active,
-    Draining,
-}
-
-impl Plan {
-    /// Enable a new field, which the proxy activates at once unless it is
-    /// draining the previous activation.
-    fn enable(&mut self) {
-        self.field = Some(V3Field::default());
-        if self.host == Host::Inactive {
-            self.host = Host::Active;
-        }
-    }
-
-    /// Disable the field; an active one starts draining.
-    fn disable(&mut self) {
-        self.field = None;
-        if self.host == Host::Active {
-            self.host = Host::Draining;
-        }
-    }
-
-    /// The held answer to the drain barrier, if any, arrives: the proxy
-    /// activates a field enabled meanwhile, a deferred activation.
-    fn release(&mut self) {
-        if self.host == Host::Draining {
-            self.host = if self.field.is_some() {
-                self.deferred_activations += 1;
-                Host::Active
-            } else {
-                Host::Inactive
-            };
-        }
+    fn settle(&mut self) -> Option<Message> {
+        self.rng.one_in(2).then(|| self.roundtrip())
     }
 }
