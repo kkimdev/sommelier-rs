@@ -85,6 +85,8 @@ assert_eq!(
   text-input state no peer can observe goes through
   `test_support::text_input`, so that the IME core's storage switch
   rewrites one module.
+  The tests in `handler/ime_keys.rs` share the `text_input` test fixture
+  (`text_input::tests`) and need no other setup.
 - Use `MessageBuilder` only for frames no encoder builds, such as
   malformed ones.
 - [INVARIANTS.md](docs/INVARIANTS.md) and [DESIGN.md](docs/DESIGN.md)

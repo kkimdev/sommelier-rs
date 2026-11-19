@@ -1158,16 +1158,18 @@ fn row_X1_a_preedit_region_turns_text_into_the_preedit() {
     assert_eq!(out.guest, [delete(3, 0), preedit_at("가", 3, 3), done(2)]);
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
     // The assembly places its cursor, and the text being ahead does not
-    // stop it.
+    // stop it. The guest no longer has the "가" the first region took.
     ime.v1(HostIme::PreeditCursor(0));
     let out = ime.ext(region(-3, 4));
     assert_eq!(
         out.guest,
-        [no_preedit(), delete(3, 1), preedit_at("가b", 0, 0), done(2)]
+        [no_preedit(), delete(0, 1), preedit_at("가b", 0, 0), done(2)]
     );
-    // An empty one deletes nothing and clears the shown preedit.
+    // Once the guest reports, an empty one deletes nothing and clears the
+    // shown preedit.
+    ime.report("a", 1);
     let out = ime.ext(region(0, 0));
-    assert_eq!(out.guest, [no_preedit(), done(2)]);
+    assert_eq!(out.guest, [no_preedit(), done(3)]);
 }
 
 /// With no assembly, the preedit cursor stays where the text cursor was,
@@ -1188,6 +1190,150 @@ fn row_X1_a_region_keeps_the_cursor_and_an_empty_one_edits_nothing() {
         length: 2,
     });
     assert_eq!(out.guest, [delete(2, 0), done(2)]);
+}
+
+/// The old code's `a_region_over_a_region_deletes_only_what_the_guest_has`:
+/// until the guest reports, its committed text still holds the bytes an
+/// earlier region took, so a new region deletes only the rest, and one
+/// that does not cover them is dropped. A report ends that.
+#[test]
+fn row_X1_a_region_over_a_region_deletes_only_what_the_guest_has() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 4);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
+
+    // The guest's text is "abc|ef": of "cd", only "c" is left.
+    let out = ime.ext(region(-2, 2));
+    let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done(2)];
+    assert_eq!(out.guest, expected);
+
+    // "ef" does not cover the shown "cd".
+    let out = ime.ext(region(0, 2));
+    assert!(out.guest.is_empty() && out.keys.is_empty());
+
+    // The guest reports its text "ab|ef", which no longer holds "cd".
+    let out = ime.report("abef", 2);
+    assert_eq!(out.host, [surrounding(TI, "abef", 2), commit_state(TI, 3)]);
+    assert_eq!(out.guest, [preedit_at("cd", 2, 2), done(3)]);
+    let out = ime.ext(region(-1, 1));
+    let expected = [no_preedit(), delete(1, 0), preedit_at("b", 1, 1), done(3)];
+    assert_eq!(out.guest, expected);
+}
+
+/// The old code's
+/// `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`: a host
+/// preedit replaces the region's preedit, but the guest still lacks the
+/// bytes the region took.
+#[test]
+fn row_X1_a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 4);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
+
+    let out = ime.v1(HostIme::Preedit {
+        serial: 0,
+        text: "x".into(),
+        commit: String::new(),
+    });
+    assert_eq!(out.guest, [preedit("x"), done(2)]);
+
+    // The guest's text is "abc|ef": of "cd", only "c" is left.
+    let out = ime.ext(region(-2, 2));
+    let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done(2)];
+    assert_eq!(out.guest, expected);
+}
+
+/// The old code's `a_region_equal_to_the_shown_one_sends_only_the_preedit`.
+#[test]
+fn row_X1_a_region_equal_to_the_shown_one_sends_only_the_preedit() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 4);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
+
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [preedit_at("d", 1, 1), done(2)]);
+}
+
+/// The old code's `a_region_that_does_not_cover_the_shown_one_is_dropped`:
+/// an empty region, and one short of the taken bytes on either side.
+#[test]
+fn row_X1_a_region_that_does_not_cover_the_shown_one_is_dropped() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 3);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    // "c" before the cursor and "d" after it.
+    let out = ime.ext(region(-1, 2));
+    assert_eq!(out.guest, [delete(1, 1), preedit_at("cd", 1, 1), done(2)]);
+
+    for (index, length) in [(0, 0), (-2, 2), (0, 2), (-1, 1)] {
+        let out = ime.ext(region(index, length));
+        let dropped = out.guest.is_empty() && out.keys.is_empty();
+        assert!(dropped, "region {index}+{length}");
+    }
+}
+
+/// The old code's `a_region_over_a_region_deletes_the_rest_on_both_sides`.
+#[test]
+fn row_X1_a_region_over_a_region_deletes_the_rest_on_both_sides() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 3);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let out = ime.ext(region(-1, 2));
+    assert_eq!(out.guest, [delete(1, 1), preedit_at("cd", 1, 1), done(2)]);
+
+    let out = ime.ext(region(-2, 4));
+    let expected = [
+        no_preedit(),
+        delete(1, 1),
+        preedit_at("bcde", 2, 2),
+        done(2),
+    ];
+    assert_eq!(out.guest, expected);
+}
+
+/// An edit that ends the composition gives the bytes a region took back
+/// as text, as the old code's `clear_host_composition` and
+/// `finish_confirm_preedit` do, so a later region deletes them all again
+/// (the old code's `on_set_preedit_region_translates_correctly`, for a
+/// commit). An empty commit counts too.
+#[test]
+fn row_X1_an_edit_that_ends_the_composition_gives_the_bytes_back() {
+    let commit = |text: &str| HostIme::Commit {
+        serial: 0,
+        text: text.into(),
+    };
+    let ends = [
+        ("a commit", commit("d")),
+        ("an empty commit", commit("")),
+        (
+            "a delete",
+            HostIme::Delete {
+                index: -1,
+                length: 1,
+            },
+        ),
+        ("a confirmation", HostIme::Confirm),
+    ];
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    for (case, end) in ends {
+        let mut ime = Ime::enabled();
+        ime.report("abcdef", 4);
+        ime.ext(region(-1, 1));
+        let out = match end {
+            HostIme::Confirm => ime.ext(end),
+            end => ime.v1(end),
+        };
+        assert!(!out.guest.is_empty(), "{case}");
+        let out = ime.ext(region(-1, 1));
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
+        assert_eq!(out.guest, expected, "{case}");
+    }
 }
 
 #[test]

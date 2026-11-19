@@ -826,7 +826,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             return Action::Drop;
         }
         let backspace_repeat_active = key == EVDEV_KEY_BACKSPACE
-            && crate::handler::text_input::backspace_repeat_active_for_keyboard(
+            && crate::handler::ime_keys::backspace_repeat_active_for_keyboard(
                 ctx,
                 host_keyboard_id,
             );
@@ -895,7 +895,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 if key != EVDEV_KEY_BACKSPACE {
                     Self::cancel_backspace_repeat(ctx, host_keyboard_id);
                     if let Some(guest_seat) = guest_seat {
-                        crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+                        crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
                 // A Sommelier-owned shortcut is not guest input, and neither
@@ -924,7 +924,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     ctx.transition_guest_key(host_keyboard_id, key, GuestKeyEvent::PhysicalRelease);
                 if key == EVDEV_KEY_BACKSPACE && decision.ends_repeat {
                     if let Some(guest_seat) = guest_seat {
-                        crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+                        crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
                 decision
@@ -1129,7 +1129,7 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                 if state == KEY_STATE_PRESSED && key != EVDEV_KEY_BACKSPACE {
                     Self::cancel_backspace_repeat(ctx, host_keyboard_id);
                     if let Some(guest_seat) = guest_seat {
-                        crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+                        crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
             }
@@ -1171,7 +1171,7 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                 // suppressible.
                 if key == EVDEV_KEY_BACKSPACE {
                     if let Some(guest_seat) = guest_seat {
-                        crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+                        crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
             }
@@ -3730,7 +3730,7 @@ mod tests {
             Some(SURFACE.0)
         );
         assert!(
-            !crate::handler::text_input::backspace_pressed_for_seat(&p.ctx, KEYBOARD.seat),
+            !crate::handler::ime_keys::backspace_pressed_for_seat(&p.ctx, KEYBOARD.seat),
             "a dead keyboard must not keep the seat's Backspace fallback armed"
         );
     }
@@ -3752,7 +3752,7 @@ mod tests {
             .key_generations
             .arm_ime_repeat(keyboard, BACKSPACE, TEXT_INPUT.guest));
         let repeating = |p: &Proxy| {
-            crate::handler::text_input::backspace_repeat_active_for_keyboard(&p.ctx, keyboard)
+            crate::handler::ime_keys::backspace_repeat_active_for_keyboard(&p.ctx, keyboard)
         };
 
         // The keyboard reports leaving a surface it no longer focuses.
@@ -3823,7 +3823,7 @@ mod tests {
         assert!(p.held(KEYBOARD, BACKSPACE));
         assert!(p.cancelled(KEYBOARD));
         let repeating = |p: &Proxy| {
-            crate::handler::text_input::backspace_repeat_active_for_keyboard(&p.ctx, keyboard)
+            crate::handler::ime_keys::backspace_repeat_active_for_keyboard(&p.ctx, keyboard)
         };
         assert!(!repeating(&p));
 
@@ -4157,7 +4157,7 @@ mod tests {
             "pressing another key must not falsify the physical Backspace state"
         );
         assert!(
-            !crate::handler::text_input::backspace_repeat_active_for_keyboard(
+            !crate::handler::ime_keys::backspace_repeat_active_for_keyboard(
                 &p.ctx,
                 HostId(KEYBOARD.host)
             )
