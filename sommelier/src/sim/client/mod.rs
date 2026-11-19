@@ -29,9 +29,10 @@ limitations under the License.
 //! - an event from another object, or naming a surface it lacks;
 //! - a string that is not UTF-8;
 //! - a `done` serial past the commits it made;
-//! - a delete that fits none of the surrounding texts it sent since it
-//!   last enabled ([`TextModel::delete_range`]); a delete that fits one is
-//!   applied as the client applies it, clamped to its current text;
+//! - a delete that fits none of the surrounding texts it sent since the
+//!   text input last entered ([`TextModel::delete_range`]); a delete that
+//!   fits one is applied as the client applies it, clamped to its current
+//!   text;
 //! - `enter` while entered, `leave` of a surface not entered, and other
 //!   events outside `enter` and `leave`. The protocol does not forbid
 //!   these, but the proxy never sends them: it sends `leave` before the
@@ -163,8 +164,9 @@ struct Protocol {
     text_input: u32,
     /// The field whose surface the text input entered.
     entered: Option<usize>,
-    /// The surrounding texts the client sent since it last enabled, as
-    /// text and cursor.
+    /// The surrounding texts the client sent since the text input last
+    /// entered, as text and cursor. A delete the proxy measured against
+    /// one can cross the client's next `enable` in flight.
     sent: Vec<(String, usize)>,
 }
 
@@ -195,6 +197,7 @@ impl Protocol {
                     "protocol violation: enter while entered"
                 );
                 self.entered = Some(field_on(fields, surface));
+                self.sent.clear();
             }
             Event::Leave { surface } => {
                 let field = self.entered.take();
@@ -234,9 +237,10 @@ impl Protocol {
     }
 
     /// Checks that `delete_surrounding_text(before, after)` fits a
-    /// surrounding text the client sent since it last enabled. The proxy
-    /// measures each delete against the text the client last committed,
-    /// and a delete may cross a newer one in flight.
+    /// surrounding text the client sent since the text input last entered.
+    /// The proxy measures each delete against the text the client last
+    /// committed, and a delete may cross a newer one, or an `enable`, in
+    /// flight.
     fn check_delete(&self, before: u32, after: u32) {
         let fits = self.sent.iter().any(|(text, cursor)| {
             let sent = TextModel {

@@ -85,6 +85,11 @@ fn action(action: UserAction) -> String {
             format!("UserAction::Tap {{ field: {field}, at: {} }}", target(at))
         }
         UserAction::Focus(field) => format!("UserAction::Focus({field})"),
+        UserAction::KeyDown(key) => format!("UserAction::KeyDown(Key::{key:?})"),
+        UserAction::KeyUp(key) => format!("UserAction::KeyUp(Key::{key:?})"),
+        UserAction::RestartInputMethod => "UserAction::RestartInputMethod".to_owned(),
+        UserAction::AcceptSuggestion => "UserAction::AcceptSuggestion".to_owned(),
+        UserAction::Reconvert => "UserAction::Reconvert".to_owned(),
         UserAction::Settle => "UserAction::Settle".to_owned(),
     }
 }

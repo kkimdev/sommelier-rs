@@ -179,7 +179,6 @@ impl Gtk {
             return Vec::new();
         };
         self.contexts[field].enabled = true;
-        self.protocol.sent.clear();
         let mut out = vec![req::enable(self.text_input())];
         out.extend(self.notify(zwp_text_input_v3::CHANGE_CAUSE_OTHER));
         out

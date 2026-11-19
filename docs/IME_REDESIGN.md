@@ -227,7 +227,10 @@ The DST should find or measure these automatically.
     and the DST counts them.
   - Cases checked against user intent never click inside the window.
 - **P4. A Chromium report crossing an edit in flight** (HANDOVER,
-  deletes). It needs the engine's deletes, which D6 adds.
+  deletes). It needs the engine's deletes, which D6 adds. The DST
+  counts the reports that cross an edit and the absolute deletes the
+  proxy drops while the guest's text is ahead (H9); a region crossing a
+  report is the known issue `RegionOverShownPreedit` (4.8).
 
 ---
 
@@ -1479,13 +1482,44 @@ sees them.
   `Delete { before: last word }` and then a `Commit(replacement)`, only
   while nothing is composed (E10). It also adds a reconversion region
   (X1). This exercises H9, X1 and P4.
+  - Both are `Request`s, which Exo hands the engine with the text before
+    the cursor as it predicts it. The word runs back to a marker or a
+    space, and its replacement is the word and a `~`. A reconversion
+    takes one character, or one more before the region it has, and the
+    next key commits the region as it is. Exo sends the region with
+    `set_preedit_region` from its cursor, only with an extension; without
+    one it composes the region all the same, which the guest never sees,
+    so the next key commits its text a second time; and
+    the engine learns the region's text from the field, since it
+    measured the region in text that can lag.
+  - A free case makes half of these twice at once, for a delete while
+    the guest's text is ahead (P4) and a region over a region (#85). A
+    settled case makes them only right after a key, since GTK3 reports
+    a click's cursor only with its next edit, and never twice, since Exo
+    drops a reported region as a composition (E4).
 - **D7** adds holds: `UserAction::KeyDown(Key)` and `KeyUp(Key)` next to
   #73's atomic `Key`.
-  - The engine gets autorepeats (500 ms delay, 33 Hz). Exo forwards
+  - The engine gets autorepeats (500 ms delay, 20 Hz). Exo forwards
     none of them (E7).
   - IMA precedes every unhandled key, autorepeats included, with an
     empty `confirm_preedit` at v11 (E13, formerly U11). This exercises
     X2' and the Backspace lease.
+  - As built: a free case holds a key one action in 33, mostly Space or
+    Backspace, and may type up to two other keys before it releases it,
+    up to 1.5 s later. The key the user pressed last repeats until it is
+    up or another key is typed. The display gives each keyboard the
+    default keymap, without which the proxy recovers no key, since it
+    recovers only a key the keymap repeats. Exo's keyboard passes a press
+    only of a key it does not hold, the engine's answer included.
+  - `SpecText` follows the keyboard concern as far as X2' needs it: the
+    keys held, in the order of their peeks, which a `wl_keyboard.enter`
+    clears, and the latest peek, which a focus move forgets; which key
+    `wl_keyboard.key` delivered; and the Backspace lease, which H7 and a
+    recovered Backspace arm, and which every other composition edit, a
+    new field, a focus move and another key's press end, cancelling
+    Backspace's repeat for the rest of its press.
+  - Settled cases hold no key: the user's intent for a hold depends on
+    the client's own repeat, which the client models do not have.
 
 ### 4.5 The client models
 
@@ -1562,9 +1596,28 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
 - **Markers.** The generator keeps the markers. It generates a Backspace
   only when the `Reference` has something after the last marker, or
   after the start, to delete.
-- **Mix.** About 65% keys (jamo for syllable patterns, plus Space and
-  Backspace), 15% clicks, 8% taps, 7% focus changes and 5% `Settle`. A
-  case has 10 to 60 actions and two fields.
+- **Mix.** About 59% keys (jamo for syllable patterns, plus Space and
+  Backspace), 2% accepted suggestions, 2% reconversions (4.4), 15%
+  clicks, 8% taps, 7% focus changes, 2% restarts of the input method and
+  5% `Settle`. A case has 10 to 60 actions and two fields.
+- **Restarts.** `UserAction::RestartInputMethod` destroys Exo's input
+  method (`Exo::destroy_input_method`), which confirms and detaches on
+  its own (E2, E6); its confirmation resets the engine only if a text
+  input was attached, and a key in flight never gets its callback. Ash
+  destroys `InputMethodAsh` only at shutdown, so this is a model's
+  trigger, not production's. Production reaches H2 when a keyboard is
+  bound after the text input's `activate`: it registers as the seat's
+  observer after the text input, so the text input's detach comes
+  before the keyboard's `leave` at the next focus move (E12). Half the
+  cases bind their keyboard again once the text input is active (the
+  new one first, the old one's release once it entered, so the seat
+  keeps its focus), which the counter `detaches_before_keyboard` counts.
+  Before that, the restart was the only action
+  that reaches H2: since E12, a focus move always reaches the keyboard
+  first, so the proxy has already deactivated when Exo's `leave` comes
+  (H2'). A surface the guest destroys (F2) cannot reach H2 either: the
+  proxy resets the field and deactivates in the step that forwards the
+  destroy, before Exo learns of it. The DST does not generate F2.
 
 There are two generator modes:
 
@@ -1578,7 +1631,7 @@ There are two generator modes:
     every key.
   - **Every `Focus` is preceded by a `Settle`, and followed by one.**
     The activation needs a round trip, and keys typed inside it go raw
-    (E7).
+    (E7). So is every restart, for the same reason.
 
 Each mode gets half of the cases.
 
@@ -1633,7 +1686,13 @@ Each mode gets half of the cases.
   - late results applied after a fence (P3);
   - text dropped by a fence;
   - raw keys;
-  - dropped deletes, by reason;
+  - deletes and preedit regions, and those dropped, by reason: a delete
+    while the text is ahead, or for its range; a region over a region,
+    over a shown preedit, or dropped;
+  - guest reports that crossed an edit in flight (P4);
+  - autorepeats the engine got; empty confirmations that recovered a held
+    key, skipped its pair as `wl_keyboard.key` had delivered it, or found
+    no eligible key (X2'); Backspace leases armed, and ended;
   - client drops, by reason;
   - one counter per draw.
 
@@ -1679,7 +1738,8 @@ DST FAILURE seed=81321 mode=free client=Gtk{v4:false} ext=11 e6=confirm e8=text-
 
 ### 4.8 The known-issue list
 
-Only P1 remains, since #72 retired P2.
+#72 retired P2. P1 remains; reaching H2 added a second, D6 a third and
+D7 a fourth.
 
 ```rust
 // sim/oracle.rs
@@ -1689,15 +1749,66 @@ enum KnownIssue {
     /// P1: a focus change while the client shows a preedit loses or
     /// keeps the syllable depending on Exo's event order. C5 fixes it.
     FocusWhileComposing,
+    /// H2: below v11 of the extension, Exo's detach confirms only a
+    /// composition it tracks, and a report it cannot match drops that
+    /// (E4); at the leave the proxy clears the preedit the guest shows.
+    /// C5 decides whether H2 commits it. A restart, or a focus move that
+    /// the text input hears of before a keyboard bound after its activate,
+    /// detaches it so.
+    RestartLosesUntrackedComposition,
+    /// X1: a region while the guest shows a preedit whose bytes the
+    /// committed text does not hold (a host preedit, or a region the
+    /// guest has reported) is measured from the guest's cursor, before
+    /// that preedit, while Exo makes it from its own, after the
+    /// composition it holds as text; and Chromium drops such a region's
+    /// delete while it shows a preedit (C3). The core's X1 decides.
+    RegionOverShownPreedit,
+    /// X2': Exo's confirmation before a key the input method did not
+    /// handle (E13) comes before that key's peek (E8), so the proxy takes
+    /// it for a repeat of the key held before, which is still the latest
+    /// peek, and the guest gets one more press of it.
+    RecoveryBeforeAPress,
+    /// X1: a region Exo makes from text older than a guest report the
+    /// proxy has committed, still on its way to Exo, is measured from
+    /// the newer cursor.
+    RegionCrossesReport,
+    /// IMA holds a reconversion's range while a key is in flight and
+    /// sends it after that key's commit, so it composes the committed
+    /// text; the guest's next report, without the preedit, makes Exo drop
+    /// it (E4), and the guest shows a preedit nothing composes.
+    StaleRegionAfterCommit,
 }
 ```
 
-A failure is classified as known only when all three hold:
+A failure is classified as known only when tier 1 passed, every failure
+is of tier 2, and the client shows exactly what a set of known issues
+predicts, the smallest set that does. Each issue's prediction is the
+user's intent with the composition lost, not committed, where the issue
+strikes:
 
-- tier 1 passed;
-- tier 2 failed on the text of a field that a `Focus` (or a click or tap
-  on the other field) left while that field's client showed a preedit;
-- no other check failed.
+- P1, in GTK only, at each `Focus` (or click or tap on the other field)
+  that leaves a field while it composes;
+- the lost detach, at each restart, and each focus move the text input
+  hears of first, where the world recorded that Exo could confirm
+  nothing: the extension is below v11 and Exo tracked no composition. P1
+  does not strike at such a focus move, since Exo's confirmation reaches
+  the proxy while it is attached. It occurs in about 1 settled case in 100 (55 of seeds
+  1,000,001 to 1,009,999, odd), so the run does not require it.
+
+The region over a shown preedit is a free case's issue: it shows as tier
+1's composition check, since Exo composes other bytes than the guest
+shows. It explains a case whose only failures are that check, if the
+case had such a region (`Counts::regions_over_preedits`). It occurs in
+about 1 free case in 1,000 to 5,000 (1 to 5 of seeds 1,000,000 to
+1,009,998, even, as the generator changed).
+
+The recovery before a press is a free case's issue too, as only free
+cases hold keys. The scheduler labels each host event with the press,
+not autorepeat, it answers, so `SpecText` counts each held key it
+recovers for a confirmation before another key's press, and tier 1
+reports a `recovery` check, which the issue then explains if nothing
+else failed. It occurs in about 1 free case in 120 (41 of seeds
+1,000,000 to 1,009,998, even).
 
 Everything else fails the run. The scenario keeps being generated, so
 any other bug on that path stays visible. The summary prints the known

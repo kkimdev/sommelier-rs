@@ -60,8 +60,13 @@ limitations under the License.
 //! - IMA's character composer and password fields, the engine's focus and
 //!   blur on a type change, and a single-character commit sent as a key
 //!   (`NeedInsertChar`), which the Korean engine never makes;
-//! - `preedit_styling`, the keymap and key repeats, which Exo never sends,
-//!   and the release of a keyboard or its extension.
+//! - `preedit_styling` and key repeats, which Exo never sends a client;
+//!   the keys held at a `wl_keyboard.enter`, which the model never lists;
+//!   and the release of a keyboard or its extension. The keymap is the
+//!   display's ([`super::display`]).
+//!
+//! The engine gets the autorepeats of a held key ([`Exo::autorepeat`]),
+//! and IMA confirms before each one it did not handle (E13).
 //!
 //! IMA drops a handled release: it reaches the extension as a `peek_key`
 //! only, as its press did, and no `wl_keyboard.key` follows.
@@ -78,7 +83,7 @@ limitations under the License.
 //! or height to 0.
 
 use super::clock::Micros;
-use super::engine::{EngineIn, EngineOut, TextAction};
+use super::engine::{EngineIn, EngineOut, Request, TextAction};
 use super::hangul::Key;
 use super::keymap;
 use super::sched::Choose;
@@ -194,6 +199,9 @@ struct TextInput {
     /// What Exo predicts the field holds (E4). [`Field::surrounding_text`]
     /// is the last report as sent, for the fuzzer to compare.
     text: Tracker,
+    /// When it registered as the seat's observer: at its first `activate`
+    /// after a `Deactivate`, which unregisters it (E12).
+    registered: Option<u64>,
 }
 
 /// What `SurroundingTextTracker` (`ui/base/ime/surrounding_text_tracker.cc`)
@@ -261,6 +269,33 @@ impl Tracker {
         self.expected.push(self.predicted.clone());
     }
 
+    /// `OnExtendSelectionAndDelete`: the text in `range`, where it lies in
+    /// the prediction, goes, and the cursor goes to its start.
+    fn delete(&mut self, range: Range<usize>) {
+        let predicted = &mut self.predicted;
+        let text = &predicted.text;
+        if range.end > text.len()
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        predicted.text.replace_range(range.clone(), "");
+        predicted.cursor = range.start;
+        predicted.composition = None;
+        self.expected.push(self.predicted.clone());
+    }
+
+    /// `OnSetCompositionFromExistingText`: the text in `range` becomes the
+    /// composition; returns it.
+    fn compose_existing(&mut self, range: Range<usize>) -> String {
+        let predicted = &mut self.predicted;
+        let composed = predicted.text[range.clone()].to_owned();
+        predicted.composition = (!range.is_empty()).then_some(range);
+        self.expected.push(self.predicted.clone());
+        composed
+    }
+
     /// `OnInsertText`.
     fn insert(&mut self, text: &str) {
         self.predicted.replace(text);
@@ -304,6 +339,7 @@ impl TextInput {
             },
             pending_support: true,
             text: Tracker::default(),
+            registered: None,
         }
     }
 
@@ -339,6 +375,9 @@ pub(super) fn draw_extension_version(choices: &mut impl Choose) -> Option<u32> {
 #[derive(Clone, Copy)]
 struct Keyboard {
     id: u32,
+    /// When it registered as the seat's observer, which is when it was
+    /// created (E12).
+    registered: u64,
     /// Its `zcr_extended_keyboard_v1`, which the proxy binds at v2, the
     /// first with `peek_key`.
     extended: Option<u32>,
@@ -357,6 +396,9 @@ struct Ima {
     /// `pending_composition_`: the composition the engine showed for the
     /// key in flight.
     composition: Option<String>,
+    /// The composing range a request set while a key was in flight, in
+    /// UTF-16 units before and after the cursor, which goes out after it.
+    region: Option<(usize, usize)>,
     /// `composing_text_`: whether IMA takes the engine to be composing.
     composing: bool,
 }
@@ -377,11 +419,18 @@ pub(super) enum Answer {
     Dropped,
 }
 
-/// A key handed to the engine that it has not answered.
+/// A key or a request handed to the engine that it has not answered.
 struct PendingKey {
     id: u64,
-    key: Key,
-    pressed: bool,
+    /// The key and whether it was pressed, or `None` for a request, whose
+    /// text goes out at once, as no key is in flight, and which has no key
+    /// events.
+    key: Option<(Key, bool)>,
+    /// The press is an autorepeat, which no key event follows (E7).
+    repeat: bool,
+    /// The input method it went through is gone, so its answer goes
+    /// nowhere.
+    orphaned: bool,
     /// The key's time, in milliseconds.
     time: u32,
     /// Whether the engine sent the key's text.
@@ -430,6 +479,16 @@ pub(crate) struct Exo {
     in_engine: VecDeque<PendingKey>,
     /// The ID of the next key Exo hands the engine.
     next_key: u64,
+    /// The text of the region composed from existing text since the
+    /// engine last learned one.
+    composed_region: Option<String>,
+    /// The seat's observers registered so far (E12).
+    observers: u64,
+    /// The regions composed for a text input without an extension, which
+    /// its client never sees, and the ranges IMA held for a key and sent
+    /// after that key's commit, so that they compose the committed text.
+    pub(super) regions_hidden: u64,
+    pub(super) regions_stale: u64,
 }
 
 impl Exo {
@@ -440,12 +499,17 @@ impl Exo {
     /// Move the seat's focus, as Alt-Tab or a click on another window does:
     /// the keyboard leaves the old surface and enters the new one, and then
     /// the text inputs follow as in [`Exo::set_text_input_focus`]. The seat
-    /// tells its observers in the order they registered, and a case's
-    /// keyboard registers before its text input's first activate (E12).
+    /// tells its observers in the order they registered (E12): a keyboard
+    /// bound after a text input's `activate` hears second
+    /// ([`Exo::text_inputs_hear_first`]).
     pub(super) fn move_focus(&mut self, focus: Option<u32>) {
         let lost = self.focus;
         if lost == focus {
             return;
+        }
+        let text_inputs_first = self.text_inputs_hear_first();
+        if text_inputs_first {
+            self.set_text_input_focus(focus);
         }
         if let Some(Keyboard { id, .. }) = self.keyboard {
             if let Some(surface) = lost {
@@ -457,7 +521,20 @@ impl Exo {
                 self.keyboard_enter(id, surface);
             }
         }
-        self.set_text_input_focus(focus);
+        if !text_inputs_first {
+            self.set_text_input_focus(focus);
+        }
+    }
+
+    /// Whether a text input registered as the seat's observer before the
+    /// keyboard, so that it hears of a focus move first: a keyboard bound
+    /// after the text input's `activate` (E12).
+    pub(super) fn text_inputs_hear_first(&self) -> bool {
+        let Some(keyboard) = self.keyboard else {
+            return false;
+        };
+        let registered = |ti: &TextInput| ti.registered.is_some_and(|r| r < keyboard.registered);
+        self.text_inputs.values().any(registered)
     }
 
     /// The user presses or releases `key` at `now`, as `state` says. While
@@ -492,8 +569,9 @@ impl Exo {
         self.next_key += 1;
         self.in_engine.push_back(PendingKey {
             id,
-            key,
-            pressed,
+            key: Some((key, pressed)),
+            repeat: false,
+            orphaned: false,
             time,
             answered: false,
             late: false,
@@ -518,26 +596,80 @@ impl Exo {
                 let key = self.in_engine.front_mut().expect("a key the engine has");
                 assert_eq!(key.id, *id, "the engine answers in order");
                 key.answered = true;
-                if self.ima.client.is_some() {
-                    self.buffer(actions);
+                if key.orphaned {
+                    return Answer::Normal;
                 }
-                Answer::Normal
+                let (request, late) = (key.key.is_none(), key.late);
+                let Some(client) = self.ima.client else {
+                    return Answer::Normal;
+                };
+                if !request {
+                    self.buffer(actions);
+                    return Answer::Normal;
+                }
+                // While a key is in flight, IMA holds a request's text and
+                // range for that key's callback, as it holds the key's own.
+                let key_in_flight = self.in_engine.iter().any(|p| p.key.is_some());
+                for action in actions {
+                    self.apply(client, action, key_in_flight);
+                }
+                match late {
+                    true => Answer::Late,
+                    false => Answer::Normal,
+                }
             }
             &EngineOut::Done { id, handled } => {
-                let key = self.in_engine.pop_front().expect("a key the engine has");
-                assert_eq!(key.id, id, "the engine answers in order");
-                let PendingKey { key: k, time, .. } = key;
-                if !key.pressed {
+                let pending = self.in_engine.pop_front().expect("a key the engine has");
+                assert_eq!(pending.id, id, "the engine answers in order");
+                let PendingKey {
+                    key,
+                    repeat,
+                    orphaned,
+                    time,
+                    late,
+                    dropped,
+                    ..
+                } = pending;
+                if orphaned {
+                    return Answer::Normal;
+                }
+                let Some((k, pressed)) = key else {
+                    return Answer::Normal;
+                };
+                if repeat {
+                    // An unhandled autorepeat is confirmed before it is
+                    // passed on (E13), and the keyboard then drops it (E7).
+                    let shown = !handled
+                        && self
+                            .ima
+                            .client
+                            .is_some_and(|client| self.confirm_composition(client));
+                    let sent = self.flush() || shown;
+                    return match (dropped, late && sent) {
+                        (true, _) => Answer::Dropped,
+                        (false, true) => Answer::Late,
+                        (false, false) => Answer::Normal,
+                    };
+                }
+                if !pressed {
                     if let Some(consumed) = self.release(k) {
                         self.key_events(k, time, wl_keyboard::KEY_STATE_RELEASED, consumed);
                     }
                     return Answer::Normal;
                 }
+                // `Keyboard::OnKeyEvent` passes a press only of a key it does
+                // not hold, as one pressed raw since the press went to the
+                // engine.
                 let code = keymap::keycode(k).0;
-                self.pressed.insert(code, handled);
+                let held = self.pressed.contains_key(&code);
+                if !held {
+                    self.pressed.insert(code, handled);
+                }
                 let pressed = wl_keyboard::KEY_STATE_PRESSED;
                 let sent = if handled {
-                    self.key_events(k, time, pressed, true);
+                    if !held {
+                        self.key_events(k, time, pressed, true);
+                    }
                     self.flush()
                 } else {
                     let shown = self
@@ -545,18 +677,90 @@ impl Exo {
                         .client
                         .is_some_and(|client| self.confirm_composition(client));
                     let sent = self.flush() || shown;
-                    self.key_events(k, time, pressed, false);
+                    if !held {
+                        self.key_events(k, time, pressed, false);
+                    }
                     sent
                 };
-                if key.dropped {
+                if dropped {
                     Answer::Dropped
-                } else if key.late && sent {
+                } else if late && sent {
                     Answer::Late
                 } else {
                     Answer::Normal
                 }
             }
         }
+    }
+
+    /// The key whose press, not an autorepeat, `out` answers, if it does.
+    pub(super) fn press_of(&self, out: &EngineOut) -> Option<Key> {
+        let pending = self.in_engine.front()?;
+        let id = match *out {
+            EngineOut::Text { id, .. } | EngineOut::Done { id, .. } => id,
+        };
+        match pending.key {
+            Some((key, true)) if pending.id == id && !pending.repeat => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The engine repeats held `key` at `now` (D7). IMA hands it the
+    /// autorepeat as a press while it serves a text input and has an
+    /// engine; the keyboard drops every autorepeat (E7), so otherwise it
+    /// goes nowhere. Returns whether the engine got it.
+    pub(super) fn autorepeat(&mut self, now: Micros, key: Key) -> bool {
+        if self.ima.client.is_none() || self.latin {
+            return false;
+        }
+        let id = self.next_key;
+        self.next_key += 1;
+        self.in_engine.push_back(PendingKey {
+            id,
+            key: Some((key, true)),
+            repeat: true,
+            orphaned: false,
+            time: millis(now),
+            answered: false,
+            late: false,
+            dropped: false,
+        });
+        self.to_engine.push(EngineIn::Key {
+            key,
+            pressed: true,
+            id,
+        });
+        true
+    }
+
+    /// The user makes `request` of the engine (D6). IMA hands it over with
+    /// the text before the cursor of the text input it serves, as Exo
+    /// predicts it, but only while it serves one and has an engine. A
+    /// text input without an extension gets a reconversion too, which Exo
+    /// composes but cannot show it.
+    pub(super) fn ask(&mut self, request: Request) {
+        let Some(client) = self.ima.client.filter(|_| !self.latin) else {
+            return;
+        };
+        let predicted = &self.text_inputs[&client].text.predicted;
+        let before = predicted.text[..predicted.cursor].to_owned();
+        let id = self.next_key;
+        self.next_key += 1;
+        self.in_engine.push_back(PendingKey {
+            id,
+            key: None,
+            repeat: false,
+            orphaned: false,
+            time: 0,
+            answered: false,
+            late: false,
+            dropped: false,
+        });
+        self.to_engine.push(EngineIn::Request {
+            request,
+            id,
+            before,
+        });
     }
 
     /// What Exo handed the engine since the last call, in order. Whoever
@@ -646,7 +850,13 @@ impl Exo {
             AnyRequest::ZwpTextInputV1(request) => self.text_input_request(sender, request),
             AnyRequest::WlSeat(wl_seat::Request::GetKeyboard { id }) => {
                 let id = *id;
-                self.keyboard = Some(Keyboard { id, extended: None });
+                self.observers += 1;
+                let registered = self.observers;
+                self.keyboard = Some(Keyboard {
+                    id,
+                    extended: None,
+                    registered,
+                });
                 // A new keyboard learns the seat's focus at once.
                 if let Some(surface) = self.focus {
                     self.keyboard_enter(id, surface);
@@ -668,11 +878,21 @@ impl Exo {
     /// (`~InputMethodAsh`), and then `TextInput::OnInputMethodDestroyed`
     /// deactivates each text input it was attached to; nothing attaches it
     /// again until the next `activate`. Returns whether one was attached.
+    ///
+    /// The new input method is there for that `activate` at once: the
+    /// model leaves out a window in which an `activate` finds none, which
+    /// would leave Exo unattached until the focus next moves. The engine
+    /// stays: only the confirmation of an attached text input resets it.
+    /// A key or request in flight never gets its callback, as the engine's
+    /// callback held the old input method weakly.
     pub(crate) fn destroy_input_method(&mut self) -> bool {
         if let Some(client) = self.ima.client {
             self.confirm_composition(client);
         }
         self.ima = Ima::default();
+        for pending in &mut self.in_engine {
+            pending.orphaned = true;
+        }
         let mut detached = false;
         for id in self.ids() {
             if self.text_inputs[&id].field.attached {
@@ -832,6 +1052,10 @@ impl Exo {
         if self.text_input(id).surface == Some(surface) {
             return;
         }
+        if self.text_input(id).registered.is_none() {
+            self.observers += 1;
+            self.text_input(id).registered = Some(self.observers);
+        }
         self.detach(id);
         self.text_input(id).surface = Some(surface);
         if self.focus == Some(surface) {
@@ -842,7 +1066,9 @@ impl Exo {
     /// `TextInput::Deactivate`.
     fn deactivate(&mut self, id: u32) {
         self.detach(id);
-        self.text_input(id).surface = None;
+        let text_input = self.text_input(id);
+        text_input.surface = None;
+        text_input.registered = None;
     }
 
     /// `AttachInputMethod` resets the type and mode to text, and keeps the
@@ -920,6 +1146,9 @@ impl Exo {
                     self.ima.composing |= !text.is_empty();
                     self.ima.composition = Some(text.clone());
                 }
+                TextAction::Delete { .. } | TextAction::Region { .. } => {
+                    panic!("only a request deletes or reconverts, and no key is in flight then")
+                }
             }
         }
     }
@@ -941,7 +1170,12 @@ impl Exo {
             self.ima.composing = true;
             self.set_composition(id, text);
         }
-        commit.is_some() || composition.is_some()
+        let region = self.ima.region.take();
+        if let Some((before, after)) = region {
+            self.regions_stale += u64::from(commit.is_some());
+            self.ima.composing |= self.set_composition_from_existing_text(id, before, after);
+        }
+        commit.is_some() || composition.is_some() || region.is_some()
     }
 
     /// `InputMethodAsh::ConfirmComposition(reset_engine = true)` for text
@@ -1005,16 +1239,24 @@ impl Exo {
         if served.is_none_or(|ti| ti.field.content_type.input_type == extended::INPUT_TYPE_NONE) {
             return;
         }
-        let dropped = self.ima.commit.take().is_some() | self.ima.composition.take().is_some();
+        let dropped = self.ima.commit.take().is_some()
+            | self.ima.composition.take().is_some()
+            | self.ima.region.take().is_some();
         if dropped {
             self.mark_dropped();
         }
         if std::mem::take(&mut self.ima.composing) {
-            for key in self.in_engine.iter_mut().filter(|key| !key.answered) {
-                key.late = true;
-            }
-            self.to_engine.push(EngineIn::Reset);
+            self.reset_engine();
         }
+    }
+
+    /// IMA resets the engine, which reaches the reset after the keys in
+    /// flight, so their answers are late.
+    fn reset_engine(&mut self) {
+        for key in self.in_engine.iter_mut().filter(|key| !key.answered) {
+            key.late = true;
+        }
+        self.to_engine.push(EngineIn::Reset);
     }
 
     /// IMA dropped the text it buffered for the key in flight, which is the
@@ -1023,6 +1265,81 @@ impl Exo {
         if let Some(key) = self.in_engine.front_mut().filter(|key| key.answered) {
             key.dropped = true;
         }
+    }
+
+    /// IMA passes on `action` of a request's answer to text input `id`
+    /// (`input_method_ash.cc`). A delete goes out at once, unless IMA takes
+    /// the engine to compose, when it is dropped. A commit and a composing
+    /// range wait for the callback of a key in flight (`key_in_flight`),
+    /// and otherwise go out at once; a commit then leaves IMA's
+    /// `composing_text_` as it is.
+    fn apply(&mut self, id: u32, action: &TextAction, key_in_flight: bool) {
+        match *action {
+            TextAction::Commit(ref text) if key_in_flight => {
+                self.ima
+                    .commit
+                    .get_or_insert_with(String::new)
+                    .push_str(text);
+            }
+            TextAction::Commit(ref text) => self.insert_text(id, text),
+            TextAction::Preedit(ref text) => {
+                self.set_composition(id, text);
+                self.ima.composing = !text.is_empty();
+            }
+            TextAction::Delete { .. } if self.ima.composing => {}
+            TextAction::Delete { before, after } => self.delete_surrounding_text(id, before, after),
+            TextAction::Region { before, after } if key_in_flight => {
+                self.ima.region = Some((before, after));
+            }
+            TextAction::Region { before, after } => {
+                self.ima.composing |= self.set_composition_from_existing_text(id, before, after);
+            }
+        }
+    }
+
+    /// `TextInput::DeleteSurroundingText`: the UTF-16 units `before` the
+    /// cursor of Exo's prediction and `after` it, clamped to it, which it
+    /// deletes, as a `delete_surrounding_text` with the absolute byte
+    /// index of their start and no `commit_string` (E10).
+    fn delete_surrounding_text(&mut self, id: u32, before: usize, after: usize) {
+        let text = &mut self.text_input(id).text;
+        let (range, _) = utf16_span(&text.predicted, before, after);
+        let (index, length) = (range.start, range.len());
+        text.delete(range);
+        let index = i32::try_from(index).expect("a short text");
+        let length = u32::try_from(length).expect("a short text");
+        let event = zwp_text_input_v1::evt::delete_surrounding_text(id, index, length);
+        self.events.push(event);
+    }
+
+    /// `TextInput::SetCompositionFromExistingText`: the UTF-16 units
+    /// `before` the cursor and `after` it become the composition, which the
+    /// extension's `set_preedit_region` shows, in bytes from the cursor. A
+    /// range past the text is refused, before anything is sent
+    /// (`text_input.cc`); the engine then learns nothing.
+    fn set_composition_from_existing_text(&mut self, id: u32, before: usize, after: usize) -> bool {
+        let text = &mut self.text_input(id).text;
+        let (range, within) = utf16_span(&text.predicted, before, after);
+        if !within {
+            return false;
+        }
+        let cursor = text.predicted.cursor;
+        let composed = text.compose_existing(range.clone());
+        self.regions_hidden += u64::from(self.extension_of(id).is_none());
+        if let Some(extension) = self.extension_of(id) {
+            let index = -i32::try_from(cursor - range.start).expect("a short region");
+            let length = u32::try_from(range.len()).expect("a short region");
+            let event = extended::evt::set_preedit_region(extension, index, length);
+            self.events.push(event);
+        }
+        self.composed_region = Some(composed);
+        true
+    }
+
+    /// The text of the region Exo composed last from existing text, if it
+    /// did since the last call, for the engine to learn.
+    pub(super) fn take_composed_region(&mut self) -> Option<String> {
+        self.composed_region.take()
     }
 
     /// `TextInput::InsertText`: a `commit_string`, which ends the
@@ -1057,6 +1374,7 @@ impl Exo {
         let Some(Keyboard {
             id: keyboard,
             extended,
+            ..
         }) = self.keyboard
         else {
             return;
@@ -1158,6 +1476,33 @@ impl Exo {
         let id = *self.extensions.get(&extension)?;
         self.text_inputs.contains_key(&id).then_some(id)
     }
+}
+
+/// The bytes of `predicted`'s text from `before` UTF-16 units before its
+/// cursor to `after` units after it, clamped to the text, and whether they
+/// lay within it.
+fn utf16_span(predicted: &Predicted, before: usize, after: usize) -> (Range<usize>, bool) {
+    let (text, cursor) = (&predicted.text, predicted.cursor);
+    let mut start = cursor;
+    let mut units = 0;
+    for c in text[..cursor].chars().rev() {
+        if units >= before {
+            break;
+        }
+        units += c.len_utf16();
+        start -= c.len_utf8();
+    }
+    let within_before = units >= before;
+    let mut end = cursor;
+    let mut units = 0;
+    for c in text[cursor..].chars() {
+        if units >= after {
+            break;
+        }
+        units += c.len_utf16();
+        end += c.len_utf8();
+    }
+    (start..end, within_before && units >= after)
 }
 
 /// `now` in milliseconds, as a Wayland input event carries it, wrapping as
@@ -1764,6 +2109,221 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_of_the_input_method_resets_the_engine_only_through_its_confirmation() {
+        // Detached by a deactivate, nothing confirms: the engine is not
+        // reset, and the key in flight never gets its callback.
+        let mut exo = active(V10);
+        press(&mut exo, 'r', &[shows("가")], true);
+        exo.key(NOW, k('k'), DOWN);
+        exo.take_engine();
+        send(&mut exo, TI, deactivate());
+        events(&mut exo);
+        assert!(!exo.destroy_input_method());
+        assert_eq!(exo.take_engine(), []);
+        send(&mut exo, TI, activate(A));
+        assert_eq!(events(&mut exo), [enter(A)]);
+        assert_eq!(exo.take_engine(), []);
+        let id = exo.in_engine[0].id;
+        let text = EngineOut::Text {
+            id,
+            actions: vec![shows("가")],
+        };
+        exo.answer(&text);
+        exo.answer(&EngineOut::Done { id, handled: true });
+        assert_eq!(events(&mut exo), []);
+        // Attached, the restart confirms, which resets the engine once.
+        let mut exo = active(V10);
+        press(&mut exo, 'r', &[shows("가")], true);
+        assert!(exo.destroy_input_method());
+        assert_eq!(events(&mut exo), [cursor(3), commit(3, "가"), leave()]);
+        assert_eq!(exo.take_engine(), [EngineIn::Reset]);
+    }
+
+    /// The engine's answer to request `id`: its text `actions`, then its
+    /// callback; returns the verdict on the text.
+    fn answer_request(exo: &mut Exo, id: u64, actions: Vec<TextAction>) -> Answer {
+        let verdict = exo.answer(&EngineOut::Text { id, actions });
+        let done = EngineOut::Done { id, handled: true };
+        assert_eq!(exo.answer(&done), Answer::Normal);
+        verdict
+    }
+
+    #[test]
+    fn e10_a_suggestion_deletes_from_an_absolute_index_then_commits() {
+        let mut exo = active(V11);
+        send(&mut exo, TI, surrounding("0ab가1", 6));
+        exo.ask(Request::AcceptSuggestion);
+        let request = EngineIn::Request {
+            request: Request::AcceptSuggestion,
+            id: 0,
+            before: "0ab가".to_owned(),
+        };
+        assert_eq!(exo.take_engine(), [request]);
+        // Three UTF-16 units, five bytes.
+        let delete = TextAction::Delete {
+            before: 3,
+            after: 0,
+        };
+        let actions = vec![delete, commits("ab가~")];
+        // No key is in flight, so IMA sends the text at once.
+        assert_eq!(answer_request(&mut exo, 0, actions), Answer::Normal);
+        let deleted = zwp_text_input_v1::Event::DeleteSurroundingText {
+            index: 1,
+            length: 5,
+        };
+        assert_eq!(events(&mut exo), [(TI, deleted.into()), commit(1, "ab가~")]);
+        assert_eq!(*predicted(&exo), predicts("0ab가~1", 7, None));
+    }
+
+    #[test]
+    fn a_request_answered_while_a_key_is_in_flight_waits_for_it_but_its_delete() {
+        let mut exo = active(V11);
+        send(&mut exo, TI, surrounding("0ab", 3));
+        exo.ask(Request::AcceptSuggestion);
+        exo.key(NOW, k('r'), DOWN);
+        exo.take_engine();
+        let delete = TextAction::Delete {
+            before: 2,
+            after: 0,
+        };
+        answer_request(&mut exo, 0, vec![delete, commits("ab~")]);
+        let deleted = zwp_text_input_v1::Event::DeleteSurroundingText {
+            index: 1,
+            length: 2,
+        };
+        assert_eq!(events(&mut exo), [(TI, deleted.into())]);
+        // The commit goes out after the key's peek, with its text.
+        let text = EngineOut::Text {
+            id: 1,
+            actions: vec![shows("ㄱ")],
+        };
+        exo.answer(&text);
+        exo.answer(&EngineOut::Done {
+            id: 1,
+            handled: true,
+        });
+        let mut expected = vec![peek(1, 'r', DOWN), commit(2, "ab~")];
+        expected.extend(preedit(3, "ㄱ"));
+        assert_eq!(events(&mut exo), expected);
+        // A range held for a key goes out after the key's commit, which
+        // makes it stale, and counts.
+        exo.ask(Request::Reconvert);
+        exo.key(NOW, k(' '), DOWN);
+        exo.take_engine();
+        let region = TextAction::Region {
+            before: 1,
+            after: 0,
+        };
+        answer_request(&mut exo, 2, vec![region]);
+        assert_eq!(events(&mut exo), []);
+        let text = EngineOut::Text {
+            id: 3,
+            actions: vec![commits("ㄱ")],
+        };
+        exo.answer(&text);
+        exo.answer(&EngineOut::Done {
+            id: 3,
+            handled: true,
+        });
+        events(&mut exo);
+        assert_eq!(exo.regions_stale, 1);
+        // While IMA takes the engine to compose, a delete is dropped.
+        exo.ask(Request::AcceptSuggestion);
+        exo.take_engine();
+        let delete = TextAction::Delete {
+            before: 1,
+            after: 0,
+        };
+        answer_request(&mut exo, 4, vec![delete]);
+        assert_eq!(events(&mut exo), []);
+    }
+
+    #[test]
+    fn a_reconversion_composes_existing_text_through_the_extension() {
+        let mut exo = active(V10);
+        send(&mut exo, TI, surrounding("0a가", 5));
+        exo.ask(Request::Reconvert);
+        exo.take_engine();
+        let region = TextAction::Region {
+            before: 1,
+            after: 0,
+        };
+        answer_request(&mut exo, 0, vec![region]);
+        let event = extended::Event::SetPreeditRegion {
+            index: -3,
+            length: 3,
+        };
+        assert_eq!(events(&mut exo), [(EXT, event.into())]);
+        assert_eq!(*predicted(&exo), predicts("0a가", 5, Some(2..5)));
+        assert_eq!(exo.take_composed_region().as_deref(), Some("가"));
+        assert!(exo.ima.composing);
+        // One past the text is refused before anything is sent, and the
+        // engine learns nothing.
+        exo.ask(Request::Reconvert);
+        exo.take_engine();
+        let region = TextAction::Region {
+            before: 4,
+            after: 0,
+        };
+        answer_request(&mut exo, 1, vec![region]);
+        assert_eq!(events(&mut exo), []);
+        assert_eq!(exo.take_composed_region(), None);
+        assert_eq!(*predicted(&exo), predicts("0a가", 5, Some(2..5)));
+    }
+
+    #[test]
+    fn the_engine_gets_no_request_without_a_text_input_and_a_hidden_region_without_an_extension() {
+        let mut exo = exo();
+        exo.ask(Request::AcceptSuggestion);
+        assert_eq!(exo.take_engine(), [], "no text input attached");
+        exo.extensions.clear();
+        send(&mut exo, TI, activate(A));
+        send(&mut exo, TI, surrounding("0a", 2));
+        events(&mut exo);
+        exo.take_engine();
+        // Without an extension, Exo composes the region, and sends nothing.
+        exo.ask(Request::Reconvert);
+        assert_eq!(exo.take_engine().len(), 1);
+        let region = TextAction::Region {
+            before: 1,
+            after: 0,
+        };
+        answer_request(&mut exo, 0, vec![region]);
+        assert_eq!(events(&mut exo), []);
+        assert_eq!(*predicted(&exo), predicts("0a", 2, Some(1..2)));
+        assert_eq!(exo.take_composed_region().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn e13_an_autorepeat_goes_to_the_engine_and_no_further() {
+        let mut exo = active(V11);
+        let repeat = |exo: &mut Exo, actions: &[TextAction], handled| {
+            assert!(exo.autorepeat(NOW, k(' ')));
+            let [EngineIn::Key {
+                id, pressed: true, ..
+            }] = exo.take_engine()[..]
+            else {
+                panic!("the repeat went to the engine as a press");
+            };
+            if !actions.is_empty() {
+                let actions = actions.to_vec();
+                exo.answer(&EngineOut::Text { id, actions });
+            }
+            exo.answer(&EngineOut::Done { id, handled });
+            events(exo)
+        };
+        // Unhandled, it is confirmed (E13), and the keyboard drops it (E7).
+        assert_eq!(repeat(&mut exo, &[], false), [confirm()]);
+        // Handled, only its text goes out.
+        assert_eq!(repeat(&mut exo, &[shows("ㄱ")], true), preedit(1, "ㄱ"));
+        // With no text input attached, the engine gets none.
+        send(&mut exo, TI, deactivate());
+        events(&mut exo);
+        assert!(!exo.autorepeat(NOW, k(' ')));
+        assert_eq!(exo.take_engine(), []);
+    }
+
+    #[test]
     fn a_text_input_that_ends_leaves_the_engine_alone_too() {
         let mut exo = active(V10);
         press(&mut exo, 'r', &[shows("가")], true);
@@ -1915,6 +2475,18 @@ mod tests {
             key(2, 'r', UP),
         ];
         assert_eq!(events(&mut exo), raw);
+        // Nor does the engine's answer to a press of a key pressed raw
+        // since, though IMA still confirms before it.
+        let mut exo = active(V11);
+        exo.key(NOW, k(' '), DOWN);
+        let [EngineIn::Key { id, .. }] = exo.take_engine()[..] else {
+            panic!("the key went to the engine");
+        };
+        send(&mut exo, TI, deactivate());
+        exo.key(NOW, k(' '), DOWN);
+        events(&mut exo);
+        exo.answer(&EngineOut::Done { id, handled: false });
+        assert_eq!(events(&mut exo), []);
     }
 
     #[test]
@@ -2050,6 +2622,36 @@ mod tests {
             leave(),
         ];
         assert_eq!(events(&mut exo), expected);
+        assert!(!exo.text_inputs_hear_first());
+    }
+
+    #[test]
+    fn e12_a_keyboard_bound_after_the_activate_hears_of_a_focus_move_second() {
+        let mut exo = active(V10);
+        send(
+            &mut exo,
+            SEAT,
+            wl_seat::Request::GetKeyboard { id: KEYBOARD2 },
+        );
+        events(&mut exo);
+        assert!(exo.text_inputs_hear_first());
+        exo.move_focus(Some(B));
+        let got = events(&mut exo);
+        let leave_at = |sender| {
+            got.iter().position(|(s, e)| {
+                *s == sender
+                    && matches!(
+                        e,
+                        AnyEvent::WlKeyboard(wl_keyboard::Event::Leave { .. })
+                            | AnyEvent::ZwpTextInputV1(zwp_text_input_v1::Event::Leave {})
+                    )
+            })
+        };
+        assert!(leave_at(TI) < leave_at(KEYBOARD2), "{got:?}");
+        // The deactivate unregistered the text input; its next activate
+        // registers it after the keyboard.
+        send(&mut exo, TI, activate(B));
+        assert!(!exo.text_inputs_hear_first());
     }
 
     #[test]

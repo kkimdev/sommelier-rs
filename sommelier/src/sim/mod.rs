@@ -58,7 +58,7 @@ use crate::test_support::Rng;
 use editor::{Reference, TextModel, Typing, UserAction};
 use engine::Lag;
 use oracle::{Counts, Failure, KnownIssue, Tier};
-use sched::{Choices, Line, Setup, World};
+use sched::{Choices, Choose, Line, Setup, World};
 
 /// A client model a case types into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,16 +111,21 @@ impl Case {
             texts,
             actions: Vec::new(),
         };
-        case.actions = user::actions(&mut rng, &case.texts, case.typing(), settled);
+        // The user does not know whether the host can show a region.
+        let typing = case.typing(Some(11));
+        case.actions = user::actions(&mut rng, &case.texts, typing, settled);
         case
     }
 
-    /// How keys reach the client's fields: GTK's Backspace leaves a
-    /// syllable's NFD prefix (C14).
-    fn typing(&self) -> Typing {
+    /// How keys reach the client's fields, through a host whose text-input
+    /// extension is `extension`: GTK's Backspace leaves a syllable's NFD
+    /// prefix (C14), and only the extension shows a reconverted region.
+    fn typing(&self, extension: Option<u32>) -> Typing {
         Typing {
             latin: self.latin,
             nfd_backspace: self.client != ClientKind::Chromium,
+            regionless: extension.is_none(),
+            late_cursor: self.client == ClientKind::Gtk3,
         }
     }
 
@@ -129,15 +134,17 @@ impl Case {
         Choices::new(self.seed ^ 0x5eed_5eed)
     }
 
-    /// The reference editor on the case's fields, before any action.
-    fn reference_at_start(&self) -> Reference {
+    /// The reference editor on the case's fields, before any action, for a
+    /// host whose text-input extension is `extension`.
+    fn reference_at_start(&self, extension: Option<u32>) -> Reference {
         let fields = self.texts.iter().map(|text| TextModel::new(text)).collect();
-        Reference::new(fields).typing(self.typing())
+        Reference::new(fields).typing(self.typing(extension))
     }
 
-    /// The user's intent: the reference editor after the case's actions.
-    fn reference(&self) -> Reference {
-        let mut reference = self.reference_at_start();
+    /// The user's intent: the reference editor after the case's actions,
+    /// for a host whose text-input extension is `extension`.
+    fn reference(&self, extension: Option<u32>) -> Reference {
+        let mut reference = self.reference_at_start(extension);
         for &action in &self.actions {
             reference.apply(action);
         }
@@ -150,8 +157,8 @@ impl Case {
 struct Outcome {
     /// The checks that failed, unless a known issue explains them.
     failures: Vec<Failure>,
-    /// The known issue that explains the failures, if one does.
-    known: Option<KnownIssue>,
+    /// The known issues that explain the failures, if any do.
+    known: Vec<KnownIssue>,
     counts: Counts,
     /// The text-input extension the host had, and the engine's lag.
     extension: Option<u32>,
@@ -164,11 +171,15 @@ struct Outcome {
 fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
     let extension = exo::draw_extension_version(&mut choices);
     let lag = Lag::draw(&mut choices);
+    // Half the guests bind their keyboard again once the text input is
+    // active, as a client that rebuilds its seat devices does.
+    let late_keyboard = choices.pick(2) == 1;
     let setup = Setup {
         client: case.client,
         latin: case.latin,
         extension,
         lag,
+        late_keyboard,
         texts: &case.texts,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -180,7 +191,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         world.run(&case.actions).await;
         let mut outcome = Outcome {
             failures: Vec::new(),
-            known: None,
+            known: Vec::new(),
             counts: Counts::default(),
             extension,
             lag,
@@ -200,15 +211,21 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         let (exo, steps) = (&world.exo, &world.steps);
         let mut failures = oracle::exact(steps, spec, shadow, exo, &engine, resets, extension);
         if case.settled {
-            failures.extend(oracle::intended(&case.reference(), world.client()));
+            failures.extend(oracle::intended(&case.reference(extension), world.client()));
         }
         // P1 shows only in GTK, whose blur keeps no composition (C11).
         let gtk = case.client != ClientKind::Chromium;
-        outcome.known = oracle::classify(&failures, || {
-            let (texts, typing, actions) = (&case.texts, case.typing(), &case.actions);
-            gtk && oracle::focus_moves_lose_composition(texts, typing, actions, world.client())
+        let played = oracle::Played {
+            texts: &case.texts,
+            typing: case.typing(extension),
+            actions: &case.actions,
+            detaches: &world.detaches,
+        };
+        outcome.known = oracle::classify(&failures, &spec.counts, |issues| {
+            (gtk || !issues.contains(&KnownIssue::FocusWhileComposing))
+                && oracle::issues_predict(issues, &played, world.client())
         });
-        if outcome.known.is_none() {
+        if outcome.known.is_empty() {
             outcome.failures = failures;
         }
         outcome
@@ -319,7 +336,7 @@ impl Coverage {
             .position(|&l| l == outcome.lag);
         self.lags[lag.expect("a lag")] += 1;
         self.latin += u64::from(case.latin);
-        let mut reference = case.reference_at_start();
+        let mut reference = case.reference_at_start(outcome.extension);
         for &action in &case.actions {
             self.leaves_composing += u64::from(reference.leaves_composition(action));
             if let UserAction::Key(hangul::Key::Backspace) = action {
@@ -327,7 +344,8 @@ impl Coverage {
                 let before = field.text[..field.cursor].chars().next_back();
                 let syllable = before.is_some_and(|c| ('가'..='힣').contains(&c));
                 let passed = reference.engine_passes(hangul::Key::Backspace);
-                self.nfd_backspaces += u64::from(case.typing().nfd_backspace && passed && syllable);
+                let nfd = case.typing(outcome.extension).nfd_backspace;
+                self.nfd_backspaces += u64::from(nfd && passed && syllable);
             }
             reference.apply(action);
         }
@@ -379,7 +397,7 @@ fn run_all(cases: &[Case]) -> Summary {
                 };
                 let outcome = Outcome {
                     failures: Vec::new(),
-                    known: None,
+                    known: Vec::new(),
                     counts: Counts::default(),
                     extension: None,
                     lag: Lag::Fast,
@@ -412,7 +430,7 @@ fn run_all(cases: &[Case]) -> Summary {
         summary.cases += 1;
         summary
             .known
-            .extend(outcome.known.map(|issue| (case.seed, issue)));
+            .extend(outcome.known.iter().map(|&issue| (case.seed, issue)));
         summary.counts += outcome.counts;
         summary.coverage.count(case, &outcome);
         if let Some(first) = outcome.failures.first() {
@@ -448,12 +466,17 @@ fn pinned(test: &str, body: impl FnOnce()) {
     );
 }
 
-/// Runs the cases of one mode ([`pinned`]), and fails with the report of
-/// the first case that failed. A run of the default size or more must also
-/// have met each variant a case draws and each path the mode is there to
-/// reach: in free cases, presses that end a composition, fence drops, late
-/// answers the guest got and raw keys; in settled ones, presses and the
-/// known issue, and no fence drop, which a settled case must not cause.
+/// Runs the cases of one mode ([`pinned`]), prints the failed ones, and
+/// fails with the report of the first. A run of the default size or more
+/// must also have met each variant a case draws and each path the mode is
+/// there to reach: presses that end a composition, Exo's own detaches
+/// (H2), its deletes (H9) and its preedit regions (X1); in free cases,
+/// fence drops, late answers the guest got, raw keys, reports that
+/// crossed an edit (P4), autorepeats of a held key, empty confirmations
+/// that recovered it, skipped its pair or found none (X2'), and Backspace
+/// leases armed and ended; and in a run of 5,000 or more the rarer region
+/// and delete paths; in settled ones, the known issues, and no fence drop,
+/// which a settled case must not cause.
 fn check(test: &str, settled: bool) {
     pinned(test, || {
         let summary = run_all(&cases(settled));
@@ -477,17 +500,49 @@ fn check(test: &str, settled: bool) {
                 issue.tracking()
             );
         }
+        for report in failed {
+            let heading = report.lines().filter(|line| !line.starts_with("    "));
+            heading
+                .take_while(|line| !line.starts_with("  trace"))
+                .for_each(|line| println!("{line}"));
+        }
         let mut reached = coverage.counters(!settled);
+        reached.extend([
+            counts.press_commits,
+            counts.host_detaches,
+            counts.detaches_before_keyboard,
+            counts.deletes,
+            counts.regions,
+        ]);
         match settled {
             false => reached.extend([
-                counts.press_commits,
                 counts.fence_drops,
                 counts.late_shown,
                 counts.raw_keys,
+                counts.crossed_reports,
+                counts.repeats,
+                counts.recovered_keys,
+                counts.recoveries_skipped,
+                counts.confirms_unheld,
+                counts.leases,
+                counts.leases_ended,
             ]),
             // The known issue's count drops to 0 once C5 fixes P1, which
             // then deletes it here.
-            true => reached.extend([counts.press_commits, known.len() as u64]),
+            true => reached.push(known.len() as u64),
+        }
+        // Rarer paths, which a long run must reach: a region over a region
+        // the guest has not reported, or over a preedit the committed text
+        // does not hold, a dropped region, and a delete dropped while the
+        // guest's text is ahead (P4) or for its range.
+        if !settled && *cases >= 5_000 {
+            reached.extend([
+                counts.regions_over_regions,
+                counts.regions_over_preedits,
+                counts.regions_dropped,
+                counts.deletes_ahead,
+                counts.deletes_misplaced,
+            ]);
         }
         if *cases >= 300 {
             let known = known.len();
@@ -500,12 +555,6 @@ fn check(test: &str, settled: bool) {
             !settled || counts.fence_drops == 0,
             "a settled case met the fence: {counts:?}"
         );
-        for report in failed {
-            let heading = report.lines().filter(|line| !line.starts_with("    "));
-            heading
-                .take_while(|line| !line.starts_with("  trace"))
-                .for_each(|line| println!("{line}"));
-        }
         if let Some(first) = failed.first() {
             panic!(
                 "{} of {cases} DST cases failed; the first:\n{first}",
@@ -543,6 +592,21 @@ fn a_case_replays_from_its_recorded_choices() {
     let sequential = run(&case, Choices::replay(Vec::new()), &mut Vec::new());
     assert!(sequential.choices.iter().all(|&choice| choice == 0));
     assert_eq!(sequential.failures, []);
+}
+
+#[test]
+fn a_key_held_to_the_end_of_a_case_stops_repeating() {
+    use hangul::Key;
+    let mut case = Case::new(0, &[ClientKind::Gtk4]);
+    // Twelve settles hold it past the repeat delay, and the case ends
+    // with no release.
+    case.actions = [UserAction::KeyDown(Key::Char(' '))]
+        .into_iter()
+        .chain([UserAction::Settle; 12])
+        .collect();
+    let mut trace = Vec::new();
+    run(&case, Choices::replay(Vec::new()), &mut trace);
+    assert!(trace.iter().any(|line| line.text.starts_with("repeat")));
 }
 
 #[test]
@@ -617,7 +681,7 @@ fn coverage_counts_each_draw_and_the_rare_paths() {
     .collect();
     let outcome = Outcome {
         failures: Vec::new(),
-        known: None,
+        known: Vec::new(),
         counts: Counts::default(),
         extension: Some(10),
         lag: Lag::Slow,

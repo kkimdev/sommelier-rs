@@ -46,21 +46,47 @@ limitations under the License.
 //! Space ending a composition is part of the commit and handled, as the
 //! ChromeOS Korean engine does in the host trace that the proxy's test
 //! `held_space_repeats_after_ime_commit_until_physical_release` records,
-//! and it handles no release. A Latin layout has no engine
+//! and it handles no release.
+//!
+//! The user can also ask the engine for more than keys ([`Request`]): to
+//! accept its suggestion for the word before the cursor, which it deletes
+//! and commits anew, and only while nothing is composed (E10); or to
+//! reconvert the text before the cursor, which becomes a region it
+//! composes, until the next key commits it as it is. It learns the text
+//! from Exo, which hands it the text before the cursor with the request. A Latin layout has no engine
 //! ([`Exo::latin`](super::exo::Exo)), and its keys never come here.
 
 use super::clock::Micros;
+use super::editor::{reconvertible, word_before};
 use super::hangul::{Composer, Key, Output};
 use super::sched::Choose;
 use std::collections::VecDeque;
 
 /// What Exo hands the engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum EngineIn {
     /// A key's press or release, with the ID its answer carries.
     Key { key: Key, pressed: bool, id: u64 },
     /// Drop the composition (`Engine::Reset`).
     Reset,
+    /// A request, with the ID its answer carries and the text before the
+    /// cursor, as Exo predicts it when it hands the request over.
+    Request {
+        request: Request,
+        id: u64,
+        before: String,
+    },
+}
+
+/// What the user asks of the engine besides keys (D6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Request {
+    /// Accept the suggestion for the word before the cursor
+    /// ([`word_before`]): the word and a `~`.
+    AcceptSuggestion,
+    /// Reconvert the character before the cursor, or before the region
+    /// reconverted so far.
+    Reconvert,
 }
 
 /// A part of the engine's answer to a key.
@@ -79,6 +105,13 @@ pub(super) enum TextAction {
     Commit(String),
     /// Show this composition; an empty one ends it.
     Preedit(String),
+    /// Delete the text before and after the cursor, which happens only
+    /// while nothing is composed (E10). The engine counts UTF-16 code
+    /// units, as the IME API does.
+    Delete { before: usize, after: usize },
+    /// Compose the existing text from before the cursor to after it
+    /// (`SetComposingRange`), in UTF-16 code units.
+    Region { before: usize, after: usize },
 }
 
 /// How long the engine takes over a key, drawn once per case.
@@ -129,6 +162,8 @@ struct InService {
 pub(super) struct Engine {
     lag: Lag,
     composer: Composer,
+    /// The reconverted region, which is the composition instead.
+    region: Option<String>,
     /// What the engine has not reached yet, in order.
     queue: VecDeque<EngineIn>,
     busy: Option<InService>,
@@ -139,6 +174,7 @@ impl Engine {
         Self {
             lag,
             composer: Composer::default(),
+            region: None,
             queue: VecDeque::new(),
             busy: None,
         }
@@ -153,7 +189,21 @@ impl Engine {
     /// The engine's composition, as of the last key it reached; empty if
     /// none.
     pub fn composition(&self) -> String {
-        self.composer.preedit()
+        match &self.region {
+            Some(region) => region.clone(),
+            None => self.composer.preedit(),
+        }
+    }
+
+    /// The engine learns the text of the region it reconverted, as the
+    /// field holds it, from the field's text that follows, once Exo
+    /// composed it. Its request measured the region in the text it was
+    /// handed, which can lag behind the field's; a region Exo refused
+    /// leaves what the engine had.
+    pub fn learn_region(&mut self, text: String) {
+        if self.region.is_some() {
+            self.region = (!text.is_empty()).then_some(text);
+        }
     }
 
     /// When the next part of the answer to the key in service is ready;
@@ -183,29 +233,41 @@ impl Engine {
     /// Works through the queue from `now` until a key is in service.
     fn serve(&mut self, now: Micros, choices: &mut impl Choose) {
         while self.busy.is_none() {
-            match self.queue.pop_front() {
+            let (id, (text, handled)) = match self.queue.pop_front() {
                 None => return,
-                Some(EngineIn::Reset) => self.composer.reset(),
-                Some(EngineIn::Key { key, pressed, id }) => {
-                    let (text, handled) = self.answer(key, pressed);
-                    let at = now + self.lag.service(choices);
-                    self.busy = Some(InService {
-                        at,
-                        id,
-                        text,
-                        handled,
-                    });
+                Some(EngineIn::Reset) => {
+                    self.composer.reset();
+                    self.region = None;
+                    continue;
                 }
-            }
+                Some(EngineIn::Key { key, pressed, id }) => (id, self.answer(key, pressed)),
+                Some(EngineIn::Request {
+                    request,
+                    id,
+                    before,
+                }) => (id, (self.request(request, &before), true)),
+            };
+            let at = now + self.lag.service(choices);
+            self.busy = Some(InService {
+                at,
+                id,
+                text,
+                handled,
+            });
         }
     }
 
-    /// The answer to a key: a commit if it finished text, then the
-    /// composition if it differs from the one shown, which a commit ends;
-    /// and whether the engine handled the key.
+    /// The answer to a key: a commit if it finished text, a reconverted
+    /// region included, then the composition if it differs from the one
+    /// shown, which a commit ends; and whether the engine handled the key.
     fn answer(&mut self, key: Key, pressed: bool) -> (Vec<TextAction>, bool) {
         if !pressed {
             return (Vec::new(), false);
+        }
+        if let Some(region) = self.region.take() {
+            let (mut actions, handled) = self.answer(key, pressed);
+            actions.insert(0, TextAction::Commit(region));
+            return (actions, handled);
         }
         let shown = self.composer.preedit();
         let Output {
@@ -228,6 +290,43 @@ impl Engine {
             actions.push(TextAction::Preedit(preedit));
         }
         (actions, consumed)
+    }
+
+    /// The answer to `request`, for a field with `before` before the cursor:
+    /// nothing while it composes jamo, or for a suggestion while it
+    /// composes at all.
+    fn request(&mut self, request: Request, before: &str) -> Vec<TextAction> {
+        if !self.composer.preedit().is_empty() {
+            return Vec::new();
+        }
+        match request {
+            Request::AcceptSuggestion if self.region.is_none() => {
+                let word = word_before(before);
+                if word.is_empty() {
+                    return Vec::new();
+                }
+                vec![
+                    TextAction::Delete {
+                        before: word.encode_utf16().count(),
+                        after: 0,
+                    },
+                    TextAction::Commit(format!("{word}~")),
+                ]
+            }
+            Request::AcceptSuggestion => Vec::new(),
+            Request::Reconvert => {
+                let region = self.region.clone().unwrap_or_default();
+                let rest = before.strip_suffix(region.as_str());
+                let next = rest.and_then(|rest| rest.chars().next_back());
+                let Some(c) = next.filter(|&c| reconvertible(c)) else {
+                    return Vec::new();
+                };
+                let region = format!("{c}{region}");
+                let before = region.encode_utf16().count();
+                self.region = Some(region);
+                vec![TextAction::Region { before, after: 0 }]
+            }
+        }
     }
 }
 
@@ -309,6 +408,119 @@ mod tests {
             ]
         );
         assert_eq!(answers("r⏎")[1], (vec![commit("ㄱ")], false));
+    }
+
+    /// The engine's answer to `request` for a field with `before` before
+    /// the cursor, after it took `script`.
+    fn request(script: &str, request: Request, before: &str) -> Vec<TextAction> {
+        let mut engine = Engine::new(Lag::Fast);
+        let mut inputs: Vec<EngineIn> = (0..)
+            .zip(keys(script))
+            .map(|(id, key)| press(key, id))
+            .collect();
+        let id = inputs.len() as u64;
+        let before = before.to_owned();
+        inputs.push(EngineIn::Request {
+            request,
+            id,
+            before,
+        });
+        for input in inputs {
+            engine.send(Micros(0), input, &mut |_| 0);
+        }
+        let mut last = Vec::new();
+        while engine.ready_at().is_some() {
+            match engine.take(&mut |_| 0) {
+                EngineOut::Text { id: of, actions } if of == id => last = actions,
+                EngineOut::Done { id: of, handled } if of == id => assert!(handled),
+                _ => {}
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn a_suggestion_deletes_the_word_and_commits_it_anew_with_nothing_composed() {
+        let accept = Request::AcceptSuggestion;
+        let replaced = [
+            // In UTF-16 units: two characters.
+            TextAction::Delete {
+                before: 2,
+                after: 0,
+            },
+            commit("a가~"),
+        ];
+        assert_eq!(request("", accept, "0 a가"), replaced);
+        assert_eq!(request("", accept, "0 "), []);
+        assert_eq!(request("rk", accept, "0 a가"), [], "composing");
+    }
+
+    #[test]
+    fn a_reconversion_grows_a_region_that_the_next_key_commits() {
+        let mut engine = Engine::new(Lag::Fast);
+        let mut answers = Vec::new();
+        let inputs = [
+            (Request::Reconvert, "0a가"),
+            // The text before the cursor holds the region, which grows over
+            // one more character, but not over a marker.
+            (Request::Reconvert, "0a가"),
+            (Request::Reconvert, "0a가"),
+            (Request::AcceptSuggestion, "0a가"),
+        ];
+        for (id, (request, before)) in (0..).zip(inputs) {
+            let before = before.to_owned();
+            engine.send(
+                Micros(0),
+                EngineIn::Request {
+                    request,
+                    id,
+                    before,
+                },
+                &mut |_| 0,
+            );
+        }
+        engine.send(Micros(0), press(Key::Char('r'), 4), &mut |_| 0);
+        while engine.ready_at().is_some() {
+            if let EngineOut::Text { actions, .. } = engine.take(&mut |_| 0) {
+                answers.push(actions);
+            }
+        }
+        let region = |before| TextAction::Region { before, after: 0 };
+        let expected = [
+            vec![region(1)],
+            vec![region(2)],
+            vec![commit("a가"), preedit("ㄱ")],
+        ];
+        assert_eq!(answers, expected);
+        assert_eq!(engine.composition(), "ㄱ");
+        // A composition of jamo is not reconverted.
+        assert_eq!(request("r", Request::Reconvert, "0aㄱ"), []);
+    }
+
+    #[test]
+    fn the_engine_learns_the_text_of_its_region_from_the_field() {
+        let mut engine = Engine::new(Lag::Fast);
+        engine.learn_region("가".to_owned());
+        assert_eq!(engine.composition(), "", "it has no region");
+        let before = "0a".to_owned();
+        let request = Request::Reconvert;
+        engine.send(
+            Micros(0),
+            EngineIn::Request {
+                request,
+                id: 0,
+                before,
+            },
+            &mut |_| 0,
+        );
+        while engine.ready_at().is_some() {
+            engine.take(&mut |_| 0);
+        }
+        assert_eq!(engine.composition(), "a");
+        engine.learn_region("가".to_owned());
+        assert_eq!(engine.composition(), "가");
+        engine.learn_region(String::new());
+        assert_eq!(engine.composition(), "");
     }
 
     #[test]

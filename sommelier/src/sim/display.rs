@@ -24,9 +24,11 @@ limitations under the License.
 //! events after each one, before it answers a later sync, so that the
 //! sync's `done` follows every event of earlier requests (E11). It also
 //! plays the seat's pointer and touch, whose presses name their point in a
-//! field by where they land ([`keymap::position`]).
+//! field by where they land ([`keymap::position`]), and gives each keyboard
+//! the default keymap, as Exo does before anything else, so that the proxy
+//! knows which keys repeat.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use super::editor::Target;
 use super::exo::Exo;
@@ -100,6 +102,9 @@ impl Display {
         }
         exo.request(sender, request);
         let mut events = exo.take_events();
+        if let AnyRequest::WlSeat(wl_seat::Request::GetKeyboard { id }) = *request {
+            events.insert(0, keymap(id));
+        }
         match *request {
             AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) => {
                 events.push(wl_callback::evt::done(callback, 0));
@@ -168,8 +173,10 @@ impl Display {
     ///
     /// If it does not decode as sent by an object the host has.
     pub fn decode(&self, (message, fds): &Outgoing) -> (u32, AnyEvent) {
-        assert!(fds.is_empty(), "the host sends no descriptors");
-        let decoded = decode(message, &mut VecDeque::new(), |msg| {
+        let fds = fds
+            .iter()
+            .map(|fd| fd.try_clone().expect("a duplicate descriptor"));
+        let decoded = decode(message, &mut fds.collect(), |msg| {
             let interface = &self.objects[&msg.sender_id];
             AnyEvent::from_wire(interface, msg)
         });
@@ -195,6 +202,17 @@ impl Display {
         self.serial += 1;
         self.serial
     }
+}
+
+/// `wl_keyboard.keymap` of the default keymap for `keyboard`, compiled
+/// once from the pinned XKB defaults.
+fn keymap(keyboard: u32) -> Outgoing {
+    static KEYMAP: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let bytes = KEYMAP.get_or_init(crate::proxy::harness::default_keymap);
+    let file = crate::test_support::shm_pool_file(bytes);
+    let size = u32::try_from(bytes.len()).expect("a keymap that fits");
+    let format = wl_keyboard::KEYMAP_FORMAT_XKB_V1;
+    wl_keyboard::evt::keymap(keyboard, format, file.into(), size)
 }
 
 /// Whether `request` destroys its sender, for each object a case has that
@@ -270,15 +288,22 @@ mod tests {
     fn a_sync_follows_the_events_of_earlier_requests() {
         let mut display = Display::new(Some(11));
         let mut exo = Exo::default();
-        // A keyboard of a seat whose focus is on surface 7: Exo enters it
-        // at once, and the sync that follows answers after.
+        // A keyboard of a seat whose focus is on surface 7: it gets the
+        // keymap first, Exo enters it at once, and the sync that follows
+        // answers after.
         exo.set_text_input_focus(Some(7));
         let keyboard = wl_seat::Request::GetKeyboard { id: 5 };
         let mut events = display.request(4, &keyboard.into(), &mut exo);
         let sync = wl_display::Request::Sync { callback: 8 };
         events.extend(display.request(1, &sync.into(), &mut exo));
-        let senders: Vec<u32> = events.iter().map(|event| display.decode(event).0).collect();
-        assert_eq!(senders, [5, 5, 8, WL_DISPLAY_ID]);
+        let decoded: Vec<(u32, AnyEvent)> =
+            events.iter().map(|event| display.decode(event)).collect();
+        let senders: Vec<u32> = decoded.iter().map(|(sender, _)| *sender).collect();
+        assert_eq!(senders, [5, 5, 5, 8, WL_DISPLAY_ID]);
+        let AnyEvent::WlKeyboard(wl_keyboard::Event::Keymap { size, .. }) = decoded[0].1 else {
+            panic!("the keymap first, not {:?}", decoded[0].1);
+        };
+        assert_eq!(size as usize, crate::proxy::harness::default_keymap().len());
     }
 
     #[test]

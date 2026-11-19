@@ -35,17 +35,19 @@ limitations under the License.
 //! proxy is known to cause is a [`KnownIssue`] ([`classify`]): the client
 //! must then show exactly what the issue predicts.
 //!
-//! The engine makes no deletes or preedit regions before D6, so `SpecText`
-//! does not track whether the guest's text is ahead of what it reported
-//! (H9, X1), and panics on either event. For the same reason no case yet
-//! needs Chromium's prediction to replay Exo's history (the design's
-//! 4.5): the text a client predicts matters only to measure a delete. Nor
-//! does Exo send `preedit_styling` (H4).
+//! `SpecText` tracks whether the guest's text is ahead of what it last
+//! reported, which drops Exo's absolute deletes (H9), and the bytes the
+//! preedit regions took since (X1). Exo sends no `preedit_styling` (H4).
+
+use std::collections::BTreeMap;
 
 use super::client::Client;
 use super::editor::{Reference, Target, TextModel, Txn, Typing, UserAction};
 use super::exo::{self, Exo};
+use super::hangul::Key;
 use super::keymap;
+use super::sched::Detach;
+use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1 as peek;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1 as v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3 as v3;
@@ -83,6 +85,11 @@ pub(super) struct Origin {
     pub late: bool,
     /// How many resets Exo had handed the engine when it sent the event.
     pub resets: u64,
+    /// The key whose press, not an autorepeat, the event answers.
+    pub press: Option<Key>,
+    /// A surrounding text the proxy sent Exo was on its way when Exo sent
+    /// the event, so the proxy's committed text is newer than Exo's.
+    pub crossed: bool,
 }
 
 /// Which oracle a check belongs to.
@@ -225,7 +232,7 @@ impl View {
 
     /// The client applies `txn` at `done`, with the preedit at `cursor`.
     fn apply(&mut self, txn: &Txn, cursor: (i32, i32)) {
-        self.model.apply_txn(txn);
+        self.model.apply_txn(&clamped(&self.model, txn));
         self.preedit_cursor = if txn.preedit.is_empty() {
             (0, 0)
         } else {
@@ -250,6 +257,53 @@ pub(super) struct Counts {
     pub late: u64,
     /// Engine answers whose text a reset dropped (E5's outcome (b)).
     pub dropped: u64,
+    /// Exo's own detaches while attached (H2).
+    pub host_detaches: u64,
+    /// Exo's deletes the guest got (H9).
+    pub deletes: u64,
+    /// Exo's absolute deletes dropped while the guest's text was ahead of
+    /// its report (H9), which guards against P4.
+    pub deletes_ahead: u64,
+    /// Exo's deletes dropped for their range (H9).
+    pub deletes_misplaced: u64,
+    /// Preedit regions the guest got (X1), and those of them over a region
+    /// the guest had not reported.
+    pub regions: u64,
+    pub regions_over_regions: u64,
+    /// Preedit regions the guest got while it showed a preedit whose bytes
+    /// the committed text does not hold (KnownIssue::RegionOverShownPreedit).
+    pub regions_over_preedits: u64,
+    /// Preedit regions dropped for their range or for not covering a
+    /// region the guest had not reported (X1').
+    pub regions_dropped: u64,
+    /// Guest reports that crossed an edit on its way to the guest (P4).
+    pub crossed_reports: u64,
+    /// Preedit regions Exo made while a report the proxy sent it was on
+    /// its way (KnownIssue::RegionCrossesReport).
+    pub regions_crossing_reports: u64,
+    /// Regions Exo composed for a text input without an extension, which
+    /// the guest never sees, and ranges IMA sent after the commit of the
+    /// key it held them for (KnownIssue::StaleRegionAfterCommit).
+    pub regions_hidden: u64,
+    pub regions_stale: u64,
+    /// Focus moves that the text input heard of before the keyboard, bound
+    /// after its activate, so that Exo detached while attached (H2).
+    pub detaches_before_keyboard: u64,
+    /// Empty confirmations that recovered a held key (X2'): its press and
+    /// release reached the guest, or not, as `wl_keyboard.key` had already
+    /// delivered it; and those that found no eligible held key.
+    pub recovered_keys: u64,
+    pub recoveries_skipped: u64,
+    pub confirms_unheld: u64,
+    /// Backspace leases armed, and ended while armed.
+    pub leases: u64,
+    pub leases_ended: u64,
+    /// Autorepeats of a held key that Exo handed the engine (D7).
+    pub repeats: u64,
+    /// Recovered keys whose confirmation is Exo's before the press of
+    /// another key (E13), not an autorepeat's: the guest gets a press of
+    /// the held key that the user did not repeat.
+    pub recoveries_before_a_press: u64,
 }
 
 impl std::ops::AddAssign for Counts {
@@ -260,7 +314,40 @@ impl std::ops::AddAssign for Counts {
         self.raw_keys += other.raw_keys;
         self.late += other.late;
         self.dropped += other.dropped;
+        self.host_detaches += other.host_detaches;
+        self.deletes += other.deletes;
+        self.deletes_ahead += other.deletes_ahead;
+        self.deletes_misplaced += other.deletes_misplaced;
+        self.regions += other.regions;
+        self.regions_over_regions += other.regions_over_regions;
+        self.regions_over_preedits += other.regions_over_preedits;
+        self.regions_dropped += other.regions_dropped;
+        self.crossed_reports += other.crossed_reports;
+        self.regions_crossing_reports += other.regions_crossing_reports;
+        self.regions_hidden += other.regions_hidden;
+        self.regions_stale += other.regions_stale;
+        self.detaches_before_keyboard += other.detaches_before_keyboard;
+        self.recovered_keys += other.recovered_keys;
+        self.recoveries_skipped += other.recoveries_skipped;
+        self.confirms_unheld += other.confirms_unheld;
+        self.leases += other.leases;
+        self.leases_ended += other.leases_ended;
+        self.repeats += other.repeats;
+        self.recoveries_before_a_press += other.recoveries_before_a_press;
     }
+}
+
+/// A key the host holds, as the keyboard concern learns of it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Held {
+    /// The order of its `peek_key` press among all.
+    sequence: u64,
+    /// `wl_keyboard.key` delivered its press to the guest.
+    forwarded: bool,
+    /// Backspace only: the text input holds its IME repeat lease, or the
+    /// lease was cancelled for the rest of the press.
+    leased: bool,
+    cancelled: bool,
 }
 
 /// What the specification says the proxy does: the decisions it asks of
@@ -281,8 +368,19 @@ pub(super) struct SpecText {
     link: Link,
     fence: Fence,
     shown: Option<Shown>,
+    /// The guest's text may hold edits it has not reported (`Ahead`).
+    ahead: bool,
+    /// The bytes before and after the committed cursor that preedit
+    /// regions took since the guest last reported (X1).
+    taken: Option<(usize, usize)>,
     /// The last `preedit_cursor` since a terminal event (H5).
     assembly: Option<i32>,
+    /// The keys the host holds, by keycode, and the peeks so far: the
+    /// sequence of the latest since the focus last moved, and their count.
+    held: BTreeMap<u32, Held>,
+    latest_peek: Option<u64>,
+    peeks: u64,
+
     /// The step's decisions: what the specification asks, and what the
     /// proxy sent, with the callback of each sync after its request.
     expected: Decisions,
@@ -314,7 +412,12 @@ impl SpecText {
             link: Link::Detached,
             fence: Fence::Closed,
             shown: None,
+            ahead: false,
+            taken: None,
             assembly: None,
+            held: BTreeMap::new(),
+            latest_peek: None,
+            peeks: 0,
             expected: Decisions::default(),
             sent: Decisions::default(),
             synced: (None, None),
@@ -413,6 +516,7 @@ impl SpecText {
         let was_enabled = self.committed.is_some();
         let enabled = enabled.unwrap_or(was_enabled);
         if enabled != was_enabled {
+            self.end_lease();
             self.shown = None;
             self.committed = enabled.then(V3Field::default);
         }
@@ -421,6 +525,8 @@ impl SpecText {
         };
         if let Some(text) = surrounding_text {
             field.surrounding_text = text;
+            self.ahead = false;
+            self.taken = None;
         }
         if let Some(content_type) = content_type {
             field.content_type = content_type;
@@ -443,6 +549,9 @@ impl SpecText {
     fn host(&mut self, sender: u32, event: &AnyEvent, origin: Origin) {
         match event {
             AnyEvent::WlKeyboard(event) => self.keyboard(event),
+            &AnyEvent::ZcrExtendedKeyboardV1(peek::Event::PeekKey { key, state, .. }) => {
+                self.peek(key, state);
+            }
             AnyEvent::WlPointer(wl_pointer::Event::Enter {
                 surface, surface_x, ..
             }) => self.pointer = Some((*surface, *surface_x)),
@@ -469,10 +578,14 @@ impl SpecText {
             }
             AnyEvent::ZwpTextInputV1(event) => self.text_input(event, origin),
             AnyEvent::ZcrExtendedTextInputV1(extended::Event::ConfirmPreedit { .. }) => {
-                // X2 confirms the shown preedit; X2' recovers a held key, of
-                // which a case has none.
+                // X2 confirms the shown preedit; X2' recovers a held key.
                 self.composition_event(origin, |spec| {
-                    let commit = spec.shown.take()?.text;
+                    let Some(shown) = spec.shown.take() else {
+                        return spec.recover_held_key(origin);
+                    };
+                    let commit = shown.text;
+                    spec.end_lease();
+                    spec.edited();
                     Some((
                         Txn {
                             commit,
@@ -482,9 +595,10 @@ impl SpecText {
                     ))
                 });
             }
-            AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion { .. }) => {
-                panic!("preedit regions come with D6")
-            }
+            &AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion {
+                index,
+                length,
+            }) => self.composition_event(origin, |spec| spec.region(index, length, origin)),
             _ => {}
         }
     }
@@ -492,11 +606,18 @@ impl SpecText {
     /// The keyboard: its focus, which resets the text input (F1), Shift,
     /// and its keys. The ideal client types every press the host sends.
     /// The keyboard concern may keep a press from the guest only by a rule
-    /// of its own, and no case reaches one before D7: a case holds no key,
-    /// so no press repeats a held one, and Exo sends no keysym (H10).
+    /// of its own, and no case reaches one: Exo sends a key's press on
+    /// `wl_keyboard` only once, and only if the input method did not
+    /// consume it, so no press repeats a key held, leased or recovered
+    /// before it, and Exo sends no keysym (H10).
     fn keyboard(&mut self, event: &wl_keyboard::Event) {
         match *event {
-            wl_keyboard::Event::Enter { surface, .. } => self.move_focus(Some(self.field(surface))),
+            wl_keyboard::Event::Enter { surface, .. } => {
+                // The keys an enter lists are held, but had no peek, so none
+                // is a key to recover; Exo's model lists none.
+                self.held.clear();
+                self.move_focus(Some(self.field(surface)));
+            }
             wl_keyboard::Event::Leave { .. } => self.move_focus(None),
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
                 self.shift = mods_depressed & keymap::SHIFT != 0;
@@ -504,6 +625,12 @@ impl SpecText {
             wl_keyboard::Event::Key { key, state, .. } => {
                 let typed = keymap::key(key, self.shift);
                 let pressed = state == wl_keyboard::KEY_STATE_PRESSED;
+                if pressed {
+                    self.press_key(key);
+                    if let Some(held) = self.held.get_mut(&key) {
+                        held.forwarded = true;
+                    }
+                }
                 if let (true, Some(field), Some(key)) = (pressed, self.focus, typed) {
                     self.counts.raw_keys += u64::from(self.link != Link::Attached);
                     self.views[field].model.insert_key(key);
@@ -513,12 +640,115 @@ impl SpecText {
         }
     }
 
+    /// F5: a `peek_key` of the host's `key` in `state`. A press is the
+    /// latest peek, and a release ends the key's press.
+    fn peek(&mut self, key: u32, state: u32) {
+        if state != wl_keyboard::KEY_STATE_PRESSED {
+            self.held.remove(&key);
+            return;
+        }
+        self.press_key(key);
+        self.peeks += 1;
+        let sequence = self.peeks;
+        self.held.insert(
+            key,
+            Held {
+                sequence,
+                ..Held::default()
+            },
+        );
+        self.latest_peek = Some(sequence);
+    }
+
+    /// A press of any key but Backspace cancels a held Backspace's repeat
+    /// for the rest of its press, lease or not.
+    fn press_key(&mut self, key: u32) {
+        let backspace = keymap::keycode(Key::Backspace).0;
+        if key == backspace {
+            return;
+        }
+        if let Some(held) = self.held.get_mut(&backspace) {
+            self.counts.leases_ended += u64::from(held.leased);
+            held.cancelled = true;
+            held.leased = false;
+        }
+    }
+
+    /// The text input's Backspace lease ends: an armed lease is cancelled
+    /// for the rest of the press.
+    fn end_lease(&mut self) {
+        let backspace = keymap::keycode(Key::Backspace).0;
+        if let Some(held) = self.held.get_mut(&backspace).filter(|held| held.leased) {
+            self.counts.leases_ended += 1;
+            held.cancelled = true;
+            held.leased = false;
+        }
+    }
+
+    /// The text input takes the lease of a held Backspace, unless its
+    /// repeat was cancelled.
+    fn arm_lease(&mut self) {
+        let backspace = keymap::keycode(Key::Backspace).0;
+        if let Some(held) = self.held.get_mut(&backspace).filter(|held| !held.cancelled) {
+            self.counts.leases += u64::from(!held.leased);
+            held.leased = true;
+        }
+    }
+
+    /// X2': an empty confirmation stands for the eligible held key, the
+    /// one with the latest peek, if it is the latest peek since the focus
+    /// moved and not a cancelled Backspace. The guest gets its press and
+    /// release, unless `wl_keyboard.key` delivered it already, and then a
+    /// bare `done`. Recovering Backspace arms its lease; skipping it, or
+    /// recovering another key, ends it, and skipping another key leaves it.
+    /// With no eligible key, nothing goes out, and the lease ends.
+    /// `origin` says which key's press, if any, the confirmation is Exo's
+    /// confirmation before (E13).
+    fn recover_held_key(&mut self, origin: Origin) -> Option<(Txn, (i32, i32))> {
+        let backspace = keymap::keycode(Key::Backspace).0;
+        let latest = self.held.iter().max_by_key(|(_, held)| held.sequence);
+        let eligible = latest.filter(|&(&key, held)| {
+            self.latest_peek
+                .is_none_or(|sequence| sequence == held.sequence)
+                && !(key == backspace && held.cancelled)
+        });
+        let Some((&key, &held)) = eligible else {
+            self.counts.confirms_unheld += 1;
+            self.end_lease();
+            return None;
+        };
+        if held.forwarded {
+            self.counts.recoveries_skipped += 1;
+            if key == backspace {
+                self.end_lease();
+            }
+        } else {
+            self.counts.recovered_keys += 1;
+            let before = origin
+                .press
+                .is_some_and(|press| keymap::keycode(press).0 != key);
+            self.counts.recoveries_before_a_press += u64::from(before);
+            let field = self.focus.expect("a recovery in the focused field");
+            if let Some(typed) = keymap::key(key, self.shift) {
+                self.views[field].model.insert_key(typed);
+            }
+            match key == backspace {
+                true => self.arm_lease(),
+                false => self.end_lease(),
+            }
+        }
+        Some((Txn::default(), (0, 0)))
+    }
+
     /// F1: a focus change resets the text input. The field it leaves ends
     /// its composition, which the guest drops at the text input's `leave`.
+    /// The keyboard ends the seat's lease and forgets its latest peek.
     fn move_focus(&mut self, focus: Option<usize>) {
         if focus == self.focus {
             return;
         }
+        self.end_lease();
+        self.latest_peek = None;
         if let Some(left) = self.focus {
             self.views[left].model.preedit.clear();
             self.views[left].preedit_cursor = (0, 0);
@@ -527,6 +757,8 @@ impl SpecText {
         self.committed = None;
         self.pending = Pending::default();
         self.shown = None;
+        self.ahead = false;
+        self.taken = None;
     }
 
     /// F4: a press on the surface of the enabled, focused field while the
@@ -538,6 +770,8 @@ impl SpecText {
         if self.gate() && self.focus == Some(field) {
             if let Some(shown) = self.shown.take() {
                 self.counts.press_commits += 1;
+                self.end_lease();
+                self.edited();
                 self.assembly = None;
                 self.expected.reset = true;
                 let txn = Txn {
@@ -556,6 +790,7 @@ impl SpecText {
         match event {
             v1::Event::Leave {} if self.link == Link::Attached => {
                 // H2: Exo detached on its own.
+                self.counts.host_detaches += 1;
                 if self.shown.is_some() {
                     self.apply(&Txn::default(), (0, 0));
                 }
@@ -570,8 +805,16 @@ impl SpecText {
                 };
                 self.composition_event(origin, |spec| {
                     let shown = spec.shown.take();
+                    match text.is_empty() && shown.is_some() && commit.is_empty() {
+                        true => spec.arm_lease(),
+                        false => spec.end_lease(),
+                    }
                     if text.is_empty() {
                         let commit = shown.map_or_else(String::new, |_| commit.clone());
+                        // The reset commit is an edit, which leaves the
+                        // bytes regions took alone, as any preedit_string
+                        // does.
+                        spec.ahead |= !commit.is_empty();
                         let txn = Txn {
                             commit,
                             ..Txn::default()
@@ -594,6 +837,9 @@ impl SpecText {
             v1::Event::CommitString { text, .. } => {
                 self.composition_event(origin, |spec| {
                     spec.shown = None;
+                    spec.taken = None;
+                    spec.ahead |= !text.is_empty();
+                    spec.end_lease();
                     let txn = Txn {
                         commit: text.clone(),
                         ..Txn::default()
@@ -601,9 +847,108 @@ impl SpecText {
                     Some((txn, (0, 0)))
                 });
             }
-            v1::Event::DeleteSurroundingText { .. } => panic!("deletes come with D6"),
+            &v1::Event::DeleteSurroundingText { index, length } => {
+                self.composition_event(origin, |spec| spec.delete(index, length));
+            }
             _ => {}
         }
+    }
+
+    /// An edit that ends the composition reached the guest, which has yet
+    /// to report it: the bytes regions took are text again.
+    fn edited(&mut self) {
+        self.ahead = true;
+        self.taken = None;
+    }
+
+    /// The committed surrounding text and cursor, without a selection, if
+    /// the guest stated one.
+    fn surrounding(&self) -> Option<(String, usize)> {
+        let (text, cursor, anchor) = self.committed.as_ref()?.surrounding_text.clone()?;
+        (cursor == anchor).then_some((text, cursor as usize))
+    }
+
+    /// H9: Exo's delete of `length` bytes from `index` of the committed
+    /// surrounding text, or from the cursor if `index` is negative, which
+    /// must hold the cursor and lie on character boundaries; an absolute
+    /// one only while the guest's text is not ahead of its report.
+    fn delete(&mut self, index: i32, length: u32) -> Option<(Txn, (i32, i32))> {
+        let (text, cursor) = self.surrounding()?;
+        if index >= 0 && self.ahead {
+            self.counts.deletes_ahead += 1;
+            return None;
+        }
+        let start = match index {
+            ..0 => cursor as i64 + i64::from(index),
+            _ => i64::from(index),
+        };
+        let Some((before, after)) = around(&text, cursor, start, length) else {
+            self.counts.deletes_misplaced += 1;
+            return None;
+        };
+        if (before, after) == (0, 0) {
+            return None;
+        }
+        self.counts.deletes += 1;
+        self.shown = None;
+        self.end_lease();
+        self.edited();
+        let txn = Txn {
+            delete: (before, after),
+            ..Txn::default()
+        };
+        Some((txn, (0, 0)))
+    }
+
+    /// X1: the bytes from `index` before the committed cursor, `length`
+    /// long, become the preedit, at its cursor (H5) or where the guest's
+    /// cursor was. While the guest has not reported since a region, the
+    /// committed text still holds the bytes regions took, so the region
+    /// must cover them, and deletes only the rest.
+    fn region(&mut self, index: i32, length: u32, origin: Origin) -> Option<(Txn, (i32, i32))> {
+        let (text, cursor) = self.surrounding()?;
+        let start = cursor as i64 + i64::from(index);
+        let region = around(&text, cursor, start, length);
+        let delete = region.and_then(|(before, after)| match self.taken {
+            None => Some((before, after)),
+            Some((taken_before, taken_after)) => Some((
+                before.checked_sub(taken_before)?,
+                after.checked_sub(taken_after)?,
+            )),
+        });
+        // A report Exo has yet to get moves what the proxy measures from.
+        self.counts.regions_crossing_reports += u64::from(origin.crossed);
+        // The committed text holds no byte of the preedit the guest shows,
+        // which Exo holds as text, ahead of its cursor: a region Exo makes
+        // then is measured elsewhere, if it is not dropped for it.
+        let over = self.taken.is_none() && self.shown.is_some();
+        self.counts.regions_over_preedits += u64::from(over);
+        let (Some((before, after)), Some(delete)) = (region, delete) else {
+            self.counts.regions_dropped += 1;
+            return None;
+        };
+        let preedit = text[cursor - before..cursor + after].to_owned();
+        let at = self.assembly.unwrap_or(before as i32);
+        let preedit_cursor = preedit_cursor(&preedit, Some(at));
+        self.shown = None;
+        self.end_lease();
+        if !preedit.is_empty() {
+            self.counts.regions += 1;
+            self.counts.regions_over_regions += u64::from(self.taken.is_some());
+            self.ahead = true;
+            self.taken = Some((before, after));
+            self.shown = Some(Shown {
+                text: preedit.clone(),
+                cursor: preedit_cursor,
+                origin,
+            });
+        }
+        let txn = Txn {
+            delete,
+            preedit,
+            ..Txn::default()
+        };
+        Some((txn, preedit_cursor))
     }
 
     /// A terminal host composition event, which takes the assembly: through
@@ -631,6 +976,7 @@ impl SpecText {
     fn leave_attached(&mut self, link: Link) {
         self.link = link;
         self.shown = None;
+        self.taken = None;
         self.assembly = None;
     }
 
@@ -714,6 +1060,40 @@ impl SpecText {
         let field = self.surfaces.iter().position(|&s| s == surface);
         field.unwrap_or_else(|| panic!("host surface {surface} has no field"))
     }
+}
+
+/// `txn` as a client applies it to `model`: its delete clamped to the
+/// text and shrunk to whole characters. The proxy measures a delete
+/// against the text the guest last reported, which an ideal client, which
+/// does not lag or drop as the client model does, may not have.
+fn clamped(model: &TextModel, txn: &Txn) -> Txn {
+    let (text, cursor) = (&model.text, model.cursor);
+    let (before, after) = txn.delete;
+    let mut start = cursor.saturating_sub(before);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = cursor.saturating_add(after).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Txn {
+        delete: (cursor - start, end - cursor),
+        ..txn.clone()
+    }
+}
+
+/// The bytes before and after `cursor` of the range of `text` from `start`,
+/// `length` long, if it holds the cursor and lies on character boundaries.
+fn around(text: &str, cursor: usize, start: i64, length: u32) -> Option<(usize, usize)> {
+    let start = usize::try_from(start).ok()?;
+    let end = start.checked_add(length as usize)?;
+    let fits = start <= cursor
+        && cursor <= end
+        && end <= text.len()
+        && text.is_char_boundary(start)
+        && text.is_char_boundary(end);
+    fits.then(|| (cursor - start, end - cursor))
 }
 
 /// The cursor of a preedit `text` whose `preedit_cursor` was `index`: there,
@@ -819,14 +1199,9 @@ impl Shadow {
             v3::Event::Done { .. } => {
                 let (txn, cursor) = std::mem::take(&mut self.txn);
                 let view = &mut self.views[self.entered.expect("a done while entered")];
-                let (before, after) = txn.delete;
-                assert!(
-                    view.model.delete_range(before, after).is_some(),
-                    "the proxy sent a delete of ({before}, {after}) that does not fit {view:?}"
-                );
                 // The view keeps the cursor as sent, an empty preedit's
                 // included, which the specification holds to (0, 0).
-                view.model.apply_txn(&txn);
+                view.model.apply_txn(&clamped(&view.model, &txn));
                 view.preedit_cursor = cursor;
                 self.txns.push((txn, cursor));
             }
@@ -883,6 +1258,8 @@ pub(super) fn step(spec: &mut SpecText, shadow: &mut Shadow) -> Option<String> {
 /// resets the engine on its own, as at a content type change. Of such a
 /// preedit, which `resets`, the engine resets so far, tells, Exo may
 /// compose nothing at all.
+/// And a host without the text-input extension may compose a reconverted
+/// region that the guest never shows.
 pub(super) fn exact(
     steps: &[String],
     spec: &SpecText,
@@ -911,12 +1288,22 @@ pub(super) fn exact(
     if !spec.wrong_decisions.is_empty() {
         failures.push(failure("decision", None, spec.wrong_decisions.join("\n")));
     }
+    let recoveries = spec.counts.recoveries_before_a_press;
+    if recoveries > 0 {
+        let detail = format!(
+            "{recoveries} held keys recovered for Exo's confirmation before another key's press"
+        );
+        failures.push(failure("recovery", spec.focus, detail));
+    }
     if let (Some(field), Some(tracked)) = (spec.focus, exo.composition()) {
         let preedit = &spec.views[field].model.preedit;
         let dropped = spec.shown.as_ref().is_some_and(|shown| {
             (shown.origin.late || shown.origin.resets < resets) && engine.is_empty()
         });
-        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) {
+        // Without the extension, Exo composes a reconverted region the
+        // guest never sees, over what it shows or not.
+        let hidden = extension.is_none() && spec.counts.regions_hidden > 0;
+        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) && !hidden {
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
             );
@@ -975,9 +1362,36 @@ pub(super) enum KnownIssue {
     /// P1: a focus move away from a field that composes loses the
     /// composition in a client that does not keep it itself (GTK).
     FocusWhileComposing,
+    /// A restart of the input method while the guest shows a composition
+    /// that Exo no longer tracks loses it, below v11 of the extension.
+    RestartLosesUntrackedComposition,
+    /// A preedit region while the guest shows a preedit whose bytes the
+    /// committed text does not hold takes other bytes than Exo composes.
+    RegionOverShownPreedit,
+    /// An empty confirmation before the press of a key the input method
+    /// did not handle (E13) recovers the key held before it, as if it had
+    /// repeated (X2').
+    RecoveryBeforeAPress,
+    /// A preedit region Exo made from text older than the guest's report
+    /// the proxy already committed is measured from the newer cursor (X1).
+    RegionCrossesReport,
+    /// A range IMA held for a key and sent after that key's commit
+    /// composes the committed text, which the guest shows as a preedit
+    /// that Exo drops at its next report (E4).
+    StaleRegionAfterCommit,
 }
 
 impl KnownIssue {
+    /// The sets of issues a case can show, the smallest first.
+    const SETS: [&'static [Self]; 3] = [
+        &[Self::FocusWhileComposing],
+        &[Self::RestartLosesUntrackedComposition],
+        &[
+            Self::FocusWhileComposing,
+            Self::RestartLosesUntrackedComposition,
+        ],
+    ];
+
     /// Why the proxy fails the user here.
     pub fn reason(self) -> &'static str {
         match self {
@@ -987,6 +1401,40 @@ impl KnownIssue {
                  Exo's detach then confirms the composition, but the link is draining and the \
                  proxy drops the confirmation"
             }
+            Self::StaleRegionAfterCommit => {
+                "IMA holds a reconversion's range while a key is in flight and sends it after \
+                 that key's commit, which ended the region; Exo composes the committed text \
+                 again, the proxy shows it (X1), and the guest's next report, which leaves the \
+                 preedit out, makes Exo drop it (E4), so the guest shows a preedit nothing \
+                 composes"
+            }
+            Self::RegionCrossesReport => {
+                "Exo makes a region from its cursor in the text it had, while a report of the \
+                 guest's, which moved the cursor, was on its way to it; the proxy has already \
+                 committed that report and measures the region from the new cursor (X1), so \
+                 the guest shows other bytes than Exo composes"
+            }
+            Self::RecoveryBeforeAPress => {
+                "at v11 Exo confirms before every key the input method did not handle (E13), \
+                 and that key's peek comes only after its confirmation (E8), so the proxy takes \
+                 the confirmation for one of the key held before, which is still the latest \
+                 peek, and sends the guest a press and release of it (X2'): a held Backspace \
+                 deletes once more, a held Space types once more"
+            }
+            Self::RegionOverShownPreedit => {
+                "Exo makes a region from its own cursor, which follows the composition it holds \
+                 as text, while the proxy measures it from the guest's reported cursor, before \
+                 the preedit the guest shows: a host preedit, or a region the guest reported, \
+                 which clears what the proxy knows of the bytes it took (X1); Chromium, which \
+                 applies a delete before it clears its preedit, also drops the region's delete \
+                 while it shows one (C3)"
+            }
+            Self::RestartLosesUntrackedComposition => {
+                "a report Exo could not match to its prediction dropped the composition Exo \
+                 tracks (E4), and below v11 of the extension Exo's detach confirms only a \
+                 tracked composition (E6), so it confirms nothing; at its `leave` the proxy \
+                 clears the preedit the guest shows (H2)"
+            }
         }
     }
 
@@ -994,35 +1442,119 @@ impl KnownIssue {
     pub fn tracking(self) -> &'static str {
         match self {
             Self::FocusWhileComposing => "docs/IME_REDESIGN.md 1.3 P1; fixed by C5",
+            Self::RestartLosesUntrackedComposition => {
+                "docs/IME_REDESIGN.md 2.2 H2; C5 decides whether H2 commits the shown preedit"
+            }
+            Self::RegionOverShownPreedit => {
+                "docs/IME_REDESIGN.md 2.2 X1; the core's X1 must decide how a region over a \
+                 reported region is measured"
+            }
+            Self::RecoveryBeforeAPress => {
+                "docs/IME_REDESIGN.md 2.2 X2', with REVIEW2's held-key peek sequence"
+            }
+            Self::RegionCrossesReport => {
+                "docs/IME_REDESIGN.md 2.2 X1; the core must measure a region against the text \
+                 Exo had"
+            }
+            Self::StaleRegionAfterCommit => {
+                "docs/IME_REDESIGN.md 2.2 X1; IMA's ordering, made lasting by the proxy's \
+                 reports without the preedit"
+            }
         }
     }
 }
 
-/// The known issue that explains a case's `failures`, if one does: tier 1
-/// passed, and the client shows exactly what the issue predicts
-/// (`predicts`, asked only then).
+/// The known issues that explain a case's `failures`, if any do: tier 1
+/// passed, and the client shows exactly what a set of issues predicts
+/// together (`predicts`, asked of each set, the smallest first, and only
+/// then); or every failure is of tier 1 and a known issue's trigger
+/// explains it: a composition check, in a case with a region over a shown
+/// preedit (`counts`), whose region Exo composes elsewhere, and a recovery
+/// check, of a key recovered for a confirmation before another's press.
 pub(super) fn classify(
     failures: &[Failure],
-    predicts: impl FnOnce() -> bool,
-) -> Option<KnownIssue> {
+    counts: &Counts,
+    mut predicts: impl FnMut(&[KnownIssue]) -> bool,
+) -> Vec<KnownIssue> {
+    // Tier 1 failures that a known issue's trigger explains.
+    let mut known = Vec::new();
+    let mut unexplained = Vec::new();
+    for failure in failures {
+        let issue = match (failure.tier, failure.check) {
+            (Tier::Exact, "composition") if counts.regions_over_preedits > 0 => {
+                KnownIssue::RegionOverShownPreedit
+            }
+            (Tier::Exact, "composition") if counts.regions_crossing_reports > 0 => {
+                KnownIssue::RegionCrossesReport
+            }
+            (Tier::Exact, "composition") if counts.regions_stale > 0 => {
+                KnownIssue::StaleRegionAfterCommit
+            }
+            (Tier::Exact, "recovery") => KnownIssue::RecoveryBeforeAPress,
+            _ => {
+                unexplained.push(failure);
+                continue;
+            }
+        };
+        if !known.contains(&issue) {
+            known.push(issue);
+        }
+    }
+    if !known.is_empty() {
+        return match unexplained.is_empty() {
+            true => known,
+            false => Vec::new(),
+        };
+    }
     let intent_only = !failures.is_empty() && failures.iter().all(|f| f.tier == Tier::Intent);
-    (intent_only && predicts()).then_some(KnownIssue::FocusWhileComposing)
+    let mut sets = KnownIssue::SETS.into_iter();
+    match intent_only {
+        true => sets.find(|set| predicts(set)).unwrap_or_default().to_vec(),
+        false => Vec::new(),
+    }
 }
 
-/// Whether `client` shows exactly what P1 predicts of `actions` on fields
-/// holding `texts`, typed as `typing` says: the user's intent, except that
-/// each focus move away from a composing field loses the composition
-/// instead of committing it.
-pub(super) fn focus_moves_lose_composition(
-    texts: &[String],
-    typing: Typing,
-    actions: &[UserAction],
-    client: &dyn Client,
-) -> bool {
-    let fields = texts.iter().map(|text| TextModel::new(text)).collect();
-    let mut reference = Reference::new(fields).typing(typing);
-    for &action in actions {
-        reference.apply_losing_composition(action);
+/// What the user did in a case, and what the host did of it that a known
+/// issue's prediction needs.
+pub(super) struct Played<'a> {
+    /// The fields' initial texts.
+    pub texts: &'a [String],
+    pub typing: Typing,
+    pub actions: &'a [UserAction],
+    /// For each restart, click, tap and focus move, in order, what Exo's
+    /// own detach did there.
+    pub detaches: &'a [Detach],
+}
+
+/// Whether `client` shows exactly what `issues` predict of `played`: the
+/// user's intent, except that each issue loses the composition where it
+/// strikes instead of committing it. P1 strikes at each focus move away
+/// from a composing field that the keyboard heard of first; the lost
+/// detach at each restart, and each focus move the text input heard of
+/// first, whose detach confirmed nothing.
+pub(super) fn issues_predict(issues: &[KnownIssue], played: &Played, client: &dyn Client) -> bool {
+    let fields = played
+        .texts
+        .iter()
+        .map(|text| TextModel::new(text))
+        .collect();
+    let mut reference = Reference::new(fields).typing(played.typing);
+    let mut detaches = played.detaches.iter();
+    for &action in played.actions {
+        let detach = match action {
+            UserAction::RestartInputMethod
+            | UserAction::Click { .. }
+            | UserAction::Tap { .. }
+            | UserAction::Focus(_) => detaches.next().copied().unwrap_or_default(),
+            _ => Detach::default(),
+        };
+        let lost = detach.before_keyboard
+            && detach.untracked
+            && issues.contains(&KnownIssue::RestartLosesUntrackedComposition);
+        let p1 = !detach.before_keyboard
+            && issues.contains(&KnownIssue::FocusWhileComposing)
+            && reference.leaves_composition(action);
+        reference.apply_losing(action, lost || p1);
     }
     intended(&reference, client).is_empty()
 }
@@ -1339,11 +1871,13 @@ mod tests {
 
     #[test]
     fn exo_or_the_proxy_detaching_or_a_focus_change_drops_the_preedit() {
-        // H2: Exo's own detach clears the preedit, committing nothing.
+        // H2: Exo's own detach clears the preedit, committing nothing, and
+        // counts.
         let mut spec = attached(&["0", "1"]);
         preedit(&mut spec, "가");
         host(&mut spec, v1::Event::Leave {}, &[activate(0)]);
         assert_eq!(spec.views[0], view("0", 1, ""));
+        assert_eq!(spec.counts.host_detaches, 1);
         // F1: the keyboard leaves; the guest drops the preedit at the text
         // input's leave.
         let mut spec = attached(&["0", "1"]);
@@ -1358,6 +1892,192 @@ mod tests {
         preedit(&mut spec, "각");
         host(&mut spec, enter(0), &[]);
         assert_eq!(spec.views[0], view("0", 1, ""));
+        // A leave that answers the proxy's deactivate is not Exo's own
+        // (H2').
+        host(&mut spec, v1::Event::Leave {}, &[]);
+        assert_eq!(spec.counts.host_detaches, 0);
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+    }
+
+    /// The guest reports `text` with the cursor at `cursor`, and commits.
+    fn report(spec: &mut SpecText, text: &str, cursor: i32) {
+        let surrounding = v3::Request::SetSurroundingText {
+            text: IndexedString::Utf8(text.to_owned()),
+            cursor,
+            anchor: cursor,
+        };
+        guest(spec, &[surrounding, v3::Request::Commit {}], &[]);
+    }
+
+    #[test]
+    fn exos_delete_reaches_the_guest_only_from_a_reported_text_around_the_cursor() {
+        let delete = |index, length| v1::Event::DeleteSurroundingText { index, length };
+        let mut spec = attached(&["0ab"]);
+        // No surrounding text: dropped.
+        host(&mut spec, delete(1, 2), &[]);
+        assert_eq!(spec.views[0], view("0ab", 3, ""));
+        // Absolute, of bytes 1 to 3.
+        report(&mut spec, "0ab", 3);
+        host(&mut spec, delete(1, 2), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        // The guest has not reported it: an absolute delete is dropped, one
+        // from the cursor is not.
+        host(&mut spec, delete(0, 1), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        host(&mut spec, delete(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("", 0, ""));
+        // Reported, an empty range, or one past the text, is dropped.
+        report(&mut spec, "0", 1);
+        host(&mut spec, delete(1, 0), &[]);
+        host(&mut spec, delete(1, 1), &[]);
+        let counts = (
+            spec.counts.deletes,
+            spec.counts.deletes_ahead,
+            spec.counts.deletes_misplaced,
+        );
+        assert_eq!(counts, (2, 1, 1));
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_region_over_a_region_deletes_only_what_the_guest_has() {
+        let region = |index, length| extended::Event::SetPreeditRegion { index, length };
+        let mut spec = attached(&["0ab"]);
+        report(&mut spec, "0ab", 3);
+        host(&mut spec, region(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("0a", 2, "b"));
+        // The guest still has "0a": the committed text's "b" is gone.
+        host(&mut spec, region(-2, 2), &[]);
+        assert_eq!(spec.views[0], view("0", 1, "ab"));
+        // One that does not cover the bytes regions took is dropped.
+        host(&mut spec, region(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("0", 1, "ab"));
+        let counts = |spec: &SpecText| {
+            let c = spec.counts;
+            (
+                c.regions,
+                c.regions_over_regions,
+                c.regions_dropped,
+                c.regions_over_preedits,
+            )
+        };
+        assert_eq!(counts(&spec), (2, 1, 1, 0));
+        // Once the guest reports, a region is measured from its cursor, and
+        // counts as over a shown preedit, as one over a host preedit does.
+        report(&mut spec, "0", 1);
+        host(&mut spec, region(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("", 0, "0"));
+        assert_eq!(counts(&spec), (3, 1, 1, 1));
+        // A commit gives the bytes back.
+        host(&mut spec, commit("0"), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+    }
+
+    /// The host's `peek_key` of `key`, pressed or released.
+    fn peek_key(key: Key, state: u32) -> peek::Event {
+        peek::Event::PeekKey {
+            serial: 1,
+            time: 0,
+            key: keymap::keycode(key).0,
+            state,
+        }
+    }
+
+    fn confirm() -> extended::Event {
+        extended::Event::ConfirmPreedit {
+            selection_behavior: 1,
+        }
+    }
+
+    const DOWN: u32 = wl_keyboard::KEY_STATE_PRESSED;
+    const UP: u32 = wl_keyboard::KEY_STATE_RELEASED;
+
+    #[test]
+    fn an_empty_confirmation_recovers_the_latest_held_key_unless_delivered() {
+        let mut spec = attached(&["0"]);
+        spec.txns.clear();
+        let bare = || vec![(Txn::default(), (0, 0))];
+        // Nothing held: nothing goes out.
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.txns, []);
+        // A held Space the input method consumed: its press, then a done.
+        host(&mut spec, peek_key(Key::Char(' '), DOWN), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(
+            (&spec.views[0], std::mem::take(&mut spec.txns)),
+            (&view("0 ", 2, ""), bare())
+        );
+        // One that wl_keyboard delivered: only the done.
+        host(&mut spec, peek_key(Key::Char(' '), UP), &[]);
+        host(&mut spec, peek_key(Key::Char('a'), DOWN), &[]);
+        let key = wl_keyboard::Event::Key {
+            serial: 1,
+            time: 0,
+            key: keymap::keycode(Key::Char('a')).0,
+            state: DOWN,
+        };
+        host(&mut spec, key, &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(
+            (&spec.views[0], std::mem::take(&mut spec.txns)),
+            (&view("0 a", 3, ""), bare())
+        );
+        // A key held but not the latest peek: nothing.
+        host(&mut spec, peek_key(Key::Char('s'), DOWN), &[]);
+        host(&mut spec, peek_key(Key::Char('s'), UP), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.txns, []);
+        let c = spec.counts;
+        let counts = (c.recovered_keys, c.recoveries_skipped, c.confirms_unheld);
+        assert_eq!(counts, (1, 1, 2));
+        // A held Space recovered for Exo's confirmation before Enter's press
+        // stands for no repeat.
+        host(&mut spec, peek_key(Key::Char(' '), DOWN), &[]);
+        let before_enter = Origin {
+            press: Some(Key::Enter),
+            ..Origin::default()
+        };
+        let event = confirm().into();
+        spec.see(Seen::Host {
+            sender: SYNC,
+            event: &event,
+            origin: before_enter,
+        });
+        spec.see(Seen::StepEnd);
+        assert_eq!(spec.views[0], view("0 a ", 4, ""));
+        assert_eq!(spec.counts.recoveries_before_a_press, 1);
+    }
+
+    #[test]
+    fn a_held_backspace_leases_its_repeat_until_an_edit_or_another_key() {
+        let backspace = |state| peek_key(Key::Backspace, state);
+        let cleared = || v1::Event::PreeditString {
+            serial: 0,
+            text: IndexedString::Utf8(String::new()),
+            commit: String::new(),
+        };
+        let mut spec = attached(&["0ab"]);
+        preedit(&mut spec, "가");
+        // Backspace takes back the composition, which arms the lease, and
+        // its repeats are recovered.
+        host(&mut spec, backspace(DOWN), &[]);
+        host(&mut spec, cleared(), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.views[0], view("0a", 2, ""));
+        assert_eq!((spec.counts.leases, spec.counts.leases_ended), (1, 0));
+        // An edit ends it for the rest of the press.
+        host(&mut spec, commit("x"), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.views[0], view("0ax", 3, ""));
+        assert_eq!(spec.counts.leases_ended, 1);
+        // So does another key's press, lease or not.
+        host(&mut spec, backspace(UP), &[]);
+        host(&mut spec, backspace(DOWN), &[]);
+        host(&mut spec, peek_key(Key::Char('a'), DOWN), &[]);
+        host(&mut spec, peek_key(Key::Char('a'), UP), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.views[0], view("0ax", 3, ""));
+        assert_eq!(spec.counts.recovered_keys, 1);
         assert_eq!(spec.wrong_decisions, Vec::<String>::new());
     }
 
@@ -1442,21 +2162,38 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "does not fit")]
-    fn the_shadow_refuses_a_delete_that_does_not_fit() {
-        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["가"]));
-        let events: Vec<AnyEvent> = vec![
-            v3::Event::Enter { surface: GUEST[0] }.into(),
-            v3::Event::DeleteSurroundingText {
-                before_length: 1,
-                after_length: 0,
-            }
-            .into(),
-            v3::Event::Done { serial: 0 }.into(),
-        ];
-        events
-            .iter()
-            .for_each(|event| shadow.see(Seen::ToGuest(event)));
+    fn a_delete_that_does_not_fit_is_clamped_to_whole_characters() {
+        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["a가"]));
+        let delete = |before_length, after_length| -> [AnyEvent; 2] {
+            [
+                v3::Event::DeleteSurroundingText {
+                    before_length,
+                    after_length,
+                }
+                .into(),
+                v3::Event::Done { serial: 0 }.into(),
+            ]
+        };
+        let enter: AnyEvent = v3::Event::Enter { surface: GUEST[0] }.into();
+        shadow.see(Seen::ToGuest(&enter));
+        // Into 가, and past the end: nothing.
+        for event in delete(1, 2) {
+            shadow.see(Seen::ToGuest(&event));
+        }
+        assert_eq!(shadow.views[0], view("a가", 4, ""));
+        // Past the start: what there is.
+        for event in delete(9, 0) {
+            shadow.see(Seen::ToGuest(&event));
+        }
+        assert_eq!(shadow.views[0], view("", 0, ""));
+        let mut spec = attached(&["a가"]);
+        // The specification's ideal client clamps the same way.
+        let txn = Txn {
+            delete: (2, 0),
+            ..Txn::default()
+        };
+        spec.views[0].apply(&txn, (0, 0));
+        assert_eq!(spec.views[0], view("a가", 4, ""));
     }
 
     #[test]
@@ -1495,7 +2232,7 @@ mod tests {
         };
         let origin = Origin {
             late: true,
-            resets: 0,
+            ..Origin::default()
         };
         spec.see(Seen::Host {
             sender: 10,
@@ -1539,36 +2276,181 @@ mod tests {
     }
 
     #[test]
+    fn a_region_made_while_a_report_was_on_its_way_explains_a_composition() {
+        let composition = Failure {
+            tier: Tier::Exact,
+            check: "composition",
+            field: Some(0),
+            detail: String::new(),
+        };
+        let crossing = Counts {
+            regions_crossing_reports: 1,
+            ..Counts::default()
+        };
+        let one = std::slice::from_ref(&composition);
+        assert_eq!(
+            classify(one, &crossing, |_| false),
+            [KnownIssue::RegionCrossesReport]
+        );
+        assert_eq!(classify(one, &Counts::default(), |_| true), []);
+        // The scheduler marks such a region, which SpecText counts.
+        let mut spec = attached(&["0ab"]);
+        report(&mut spec, "0ab", 3);
+        let region = extended::Event::SetPreeditRegion {
+            index: -1,
+            length: 1,
+        };
+        let origin = Origin {
+            crossed: true,
+            ..Origin::default()
+        };
+        spec.see(Seen::Host {
+            sender: SYNC,
+            event: &region.into(),
+            origin,
+        });
+        spec.see(Seen::StepEnd);
+        assert_eq!(spec.counts.regions_crossing_reports, 1);
+        let issue = KnownIssue::RegionCrossesReport;
+        assert!(!issue.reason().is_empty() && issue.tracking().contains("X1"));
+        // So does a range IMA sent after the commit of the key it held it
+        // for.
+        let stale = Counts {
+            regions_stale: 1,
+            ..Counts::default()
+        };
+        let issue = KnownIssue::StaleRegionAfterCommit;
+        assert_eq!(classify(one, &stale, |_| false), [issue]);
+        assert!(!issue.reason().is_empty() && issue.tracking().contains("X1"));
+    }
+
+    #[test]
     fn a_known_issue_must_predict_exactly_what_the_client_shows() {
+        use KnownIssue::{FocusWhileComposing as P1, RestartLosesUntrackedComposition as Lost};
         // The user typed 가 in field 0 and moved to field 1: P1 loses it.
         let actions = [
             UserAction::Key(Key::Char('r')),
             UserAction::Key(Key::Char('k')),
             UserAction::Focus(1),
         ];
-        let fields = texts(&["0", "1"]);
-        let predicts = |client: &Gtk| {
-            focus_moves_lose_composition(&fields, Typing::default(), &actions, client)
+        let texts = texts(&["0", "1"]);
+        let played = Played {
+            texts: &texts,
+            typing: Typing::default(),
+            actions: &actions,
+            detaches: &[],
         };
-        assert!(predicts(&gtk(["0", "1"], 1)));
-        assert!(!predicts(&gtk(["0가", "1"], 1)), "it kept the syllable");
-        assert!(!predicts(&gtk(["0", "1x"], 1)), "and lost something else");
+        let predicts =
+            |issues: &[KnownIssue], client: &Gtk| issues_predict(issues, &played, client);
+        assert!(predicts(&[P1], &gtk(["0", "1"], 1)));
+        assert!(!predicts(&[], &gtk(["0", "1"], 1)), "no issue keeps it");
+        assert!(
+            !predicts(&[P1], &gtk(["0가", "1"], 1)),
+            "it kept the syllable"
+        );
+        assert!(
+            !predicts(&[P1], &gtk(["0", "1x"], 1)),
+            "and lost something else"
+        );
+        // A restart loses 가 only where Exo's detach confirmed nothing.
+        let actions = [
+            UserAction::Key(Key::Char('r')),
+            UserAction::Key(Key::Char('k')),
+            UserAction::RestartInputMethod,
+            UserAction::Focus(1),
+        ];
+        let detach = |untracked| Detach {
+            before_keyboard: true,
+            untracked,
+        };
+        let restarted = [detach(true), Detach::default()];
+        let confirmed = [detach(false), Detach::default()];
+        let first = [detach(true)];
+        let first_confirmed = [detach(false)];
+        let lost = |detaches| Played {
+            detaches,
+            actions: &actions,
+            ..played
+        };
+        let client = gtk(["0", "1"], 1);
+        assert!(issues_predict(&[Lost], &lost(&restarted), &client));
+        assert!(!issues_predict(&[Lost], &lost(&confirmed), &client));
+        assert!(
+            !issues_predict(&[P1], &lost(&restarted), &client),
+            "not P1's"
+        );
+        // So does a focus move the text input hears of first, where P1
+        // cannot strike; one it confirms keeps the syllable.
+        let actions = [
+            UserAction::Key(Key::Char('r')),
+            UserAction::Key(Key::Char('k')),
+            UserAction::Focus(1),
+        ];
+        let moved = |detaches| Played {
+            detaches,
+            actions: &actions,
+            ..played
+        };
+        assert!(issues_predict(&[Lost], &moved(&first), &client));
+        assert!(!issues_predict(&[P1], &moved(&first), &client));
+        let kept = gtk(["0가", "1"], 1);
+        assert!(issues_predict(&[], &moved(&first_confirmed), &kept));
         let lost = Failure {
             tier: Tier::Intent,
             check: "text",
             field: Some(0),
             detail: String::new(),
         };
-        let known = Some(KnownIssue::FocusWhileComposing);
-        assert_eq!(classify(std::slice::from_ref(&lost), || true), known);
-        assert_eq!(classify(std::slice::from_ref(&lost), || false), None);
-        assert_eq!(classify(&[], || true), None);
+        let one = std::slice::from_ref(&lost);
+        let none = Counts::default();
+        assert_eq!(classify(one, &none, |_| true), [P1]);
+        assert_eq!(classify(one, &none, |issues| issues == [Lost]), [Lost]);
+        assert_eq!(classify(one, &none, |issues| issues.len() == 2), [P1, Lost]);
+        assert_eq!(classify(one, &none, |_| false), []);
+        assert_eq!(classify(&[], &none, |_| true), []);
         let exact = Failure {
             tier: Tier::Exact,
             ..lost.clone()
         };
-        assert_eq!(classify(&[lost, exact], || true), None);
-        let issue = KnownIssue::FocusWhileComposing;
-        assert!(!issue.reason().is_empty() && issue.tracking().contains("C5"));
+        assert_eq!(classify(&[lost.clone(), exact], &none, |_| true), []);
+        // Only a composition that Exo composes elsewhere, after a region
+        // over a shown preedit.
+        let composition = Failure {
+            tier: Tier::Exact,
+            check: "composition",
+            ..lost.clone()
+        };
+        let region = Counts {
+            regions_over_preedits: 1,
+            ..Counts::default()
+        };
+        let both = [composition.clone(), lost.clone()];
+        let known = [KnownIssue::RegionOverShownPreedit];
+        assert_eq!(
+            classify(std::slice::from_ref(&composition), &region, |_| false),
+            known
+        );
+        assert_eq!(
+            classify(std::slice::from_ref(&composition), &none, |_| true),
+            []
+        );
+        assert_eq!(classify(&both, &region, |_| true), []);
+        // A key recovered for a confirmation before another's press.
+        let recovery = Failure {
+            tier: Tier::Exact,
+            check: "recovery",
+            ..lost.clone()
+        };
+        let before = KnownIssue::RecoveryBeforeAPress;
+        assert_eq!(
+            classify(std::slice::from_ref(&recovery), &none, |_| false),
+            [before]
+        );
+        let explained = [recovery.clone(), composition];
+        let both = [before, KnownIssue::RegionOverShownPreedit];
+        assert_eq!(classify(&explained, &region, |_| false), both);
+        assert_eq!(classify(&[recovery, lost], &none, |_| true), []);
+        assert!(!P1.reason().is_empty() && P1.tracking().contains("C5"));
+        assert!(!Lost.reason().is_empty() && Lost.tracking().contains("H2"));
     }
 }

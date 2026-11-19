@@ -52,8 +52,9 @@ use super::client::{Client, Field, PressKind};
 use super::clock::Micros;
 use super::display::Display;
 use super::editor::{Target, TextModel, UserAction};
-use super::engine::{Engine, EngineIn, Lag};
+use super::engine::{Engine, EngineIn, Lag, Request};
 use super::exo::{Answer, Exo};
+use super::hangul::Key;
 use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
 use super::ClientKind;
@@ -190,6 +191,12 @@ const HOST_LATENCY: Micros = Micros(3_000);
 const ENGINE_LATENCY: Micros = Micros(1_000);
 /// How long the user waits once everything has settled.
 const SETTLE: Micros = Micros::from_millis(50);
+/// How long a held key waits before it repeats, and then between its
+/// repeats: 500 ms, then 20 Hz, ChromeOS's default.
+const REPEAT_DELAY: Micros = Micros::from_millis(500);
+const REPEAT_INTERVAL: Micros = Micros::from_millis(50);
+/// The longest a user holds a key before the next action.
+const HOLD: u64 = 1_500;
 
 /// Where a line of a case's trace happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,8 +252,22 @@ pub(super) struct Setup<'a> {
     /// The text-input extension's version, if the host has one.
     pub extension: Option<u32>,
     pub lag: Lag,
+    /// The guest releases its keyboard and binds a new one once its text
+    /// input is active, so the new one hears of the next focus move after
+    /// the text input (E12).
+    pub late_keyboard: bool,
     /// The fields' initial texts.
     pub texts: &'a [String],
+}
+
+/// What Exo's own detach did at an action that could make one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Detach {
+    /// Exo detached the text input while the proxy was attached: a restart,
+    /// or a focus move that the text input heard of before the keyboard.
+    pub before_keyboard: bool,
+    /// The detach could confirm no composition.
+    pub untracked: bool,
 }
 
 /// A press the guest got: its surface and the target it lands on.
@@ -262,7 +283,9 @@ pub(super) struct World<'t> {
     pub exo: Exo,
     engine: Engine,
     display: Display,
-    c_to_p: Channel<Outgoing>,
+    /// Each guest request, with the edits the guest had got when it sent
+    /// it.
+    c_to_p: Channel<(Outgoing, u64)>,
     /// Each event to the guest, and the press it is, if it is one: where
     /// the guest's pointer or finger is on which of its surfaces.
     p_to_c: Channel<(u32, AnyEvent, Option<Press>)>,
@@ -277,6 +300,14 @@ pub(super) struct World<'t> {
     pointer: Option<(u32, i32)>,
     /// The resets Exo handed the engine.
     resets: u64,
+    /// The key the user holds, which repeats, and when it next does.
+    repeat: Option<(Key, Micros)>,
+    /// The surrounding texts the proxy sent Exo that Exo has yet to get.
+    reports_to_exo: u64,
+    /// The transactions that edit the text (a delete or a commit) the
+    /// proxy sent the guest, and those the guest got; and whether the
+    /// transaction each is in so far edits.
+    edits: Edits,
     /// The guest's text input.
     text_input: u32,
     /// The fields' guest surfaces.
@@ -288,6 +319,11 @@ pub(super) struct World<'t> {
     pub steps: Vec<String>,
     /// The proxy ended the session.
     pub ended: bool,
+    /// The host's text-input extension, if it has one.
+    extension: Option<u32>,
+    /// For each action that can make Exo detach on its own, in order: a
+    /// restart, a click, a tap or a focus move ([`Detach`]).
+    pub detaches: Vec<Detach>,
     trace: &'t mut Vec<Line>,
 }
 
@@ -295,7 +331,8 @@ impl<'t> World<'t> {
     /// A world set up as `setup` says, its every draw from `choices`, its
     /// trace in `trace`: the guest has bound the globals, created the
     /// fields' surfaces, a keyboard, a pointer, a touch and a text input,
-    /// and the keyboard focus is on field 0. If the proxy ends the session
+    /// and the keyboard focus is on field 0; with a late keyboard, it has
+    /// then bound its keyboard again. If the proxy ends the session
     /// on the way, the world stops there, [`World::ended`].
     pub async fn new(setup: &Setup<'_>, choices: Choices, trace: &'t mut Vec<Line>) -> World<'t> {
         let mut exo = Exo::default();
@@ -317,12 +354,17 @@ impl<'t> World<'t> {
             shift: false,
             pointer: None,
             resets: 0,
+            repeat: None,
+            reports_to_exo: 0,
+            edits: Edits::default(),
             text_input: 0,
             surfaces: Vec::new(),
             spec: None,
             shadow: None,
             steps: Vec::new(),
             ended: false,
+            extension: setup.extension,
+            detaches: Vec::new(),
             trace,
         };
         let registry = world.session.new_id();
@@ -377,6 +419,17 @@ impl<'t> World<'t> {
         world.shadow = Some(Shadow::new(&world.surfaces, setup.texts));
         world.act(UserAction::Focus(0));
         world.run(&[]).await;
+        if setup.late_keyboard && !world.ended {
+            let late = world.session.new_id();
+            // The new keyboard first, and the old one's release once it
+            // has entered, so the seat keeps its focus.
+            world.guest([wl_seat::req::get_keyboard(seat, late)]);
+            world.run(&[]).await;
+            world.guest([wl_keyboard::req::release(keyboard)]);
+            world.run(&[]).await;
+        }
+        // The setup's focus move is none of the case's actions.
+        world.detaches.clear();
         world
     }
 
@@ -418,7 +471,13 @@ impl<'t> World<'t> {
                 Some(_) => Some(next.max(self.now)),
                 None => None,
             };
+            // A held key repeats until it is up, which no settle waits for,
+            // or until the case ends, as a shrunk one may before its release.
+            if actions.peek().is_none() {
+                self.repeat = None;
+            }
             let mut sources = idle.to_vec();
+            sources.push(self.repeat.map(|(_, at)| at));
             sources.push(user);
             let Some(source) = earliest(&sources, &mut self.choices) else {
                 return;
@@ -426,8 +485,8 @@ impl<'t> World<'t> {
             self.now = self.now.max(sources[source].expect("a ready source"));
             match source {
                 0 => {
-                    let request = self.c_to_p.take();
-                    self.deliver_guest_request(request).await;
+                    let (request, edits) = self.c_to_p.take();
+                    self.deliver_guest_request(request, edits).await;
                 }
                 1 => {
                     let (sender, event, press) = self.p_to_c.take();
@@ -435,6 +494,7 @@ impl<'t> World<'t> {
                 }
                 2 => {
                     let (sender, request) = self.p_to_e.take();
+                    self.reports_to_exo -= u64::from(is_report(&request));
                     let events = self.display.request(sender, &request, &mut self.exo);
                     self.host_sends(events, false);
                 }
@@ -447,12 +507,25 @@ impl<'t> World<'t> {
                     self.engine.send(self.now, input, &mut self.choices);
                 }
                 5 => self.engine_answers(),
+                6 => {
+                    let (key, at) = self.repeat.expect("a held key");
+                    self.repeat = Some((key, at + REPEAT_INTERVAL));
+                    self.log(Place::User, format!("repeat {key:?}"));
+                    let handed = self.exo.autorepeat(self.now, key);
+                    if let Some(spec) = &mut self.spec {
+                        spec.counts.repeats += u64::from(handed);
+                    }
+                    self.host_sends(Vec::new(), false);
+                }
                 _ => {
                     let action = actions.next().expect("an action");
                     self.act(action);
                     next = self.now
                         + match action {
                             UserAction::Settle => SETTLE,
+                            UserAction::KeyDown(_) => {
+                                Micros::from_millis(self.choices.between(0, HOLD))
+                            }
                             _ if self.choices.pick(2) == 0 => {
                                 Micros::from_millis(self.choices.between(30, 300))
                             }
@@ -465,7 +538,9 @@ impl<'t> World<'t> {
 
     /// The user acts: Exo takes a key's press and release; a click or a
     /// tap focuses its field's surface, as a click on a window does, and
-    /// then presses there; a focus move moves the seat's focus.
+    /// then presses there; a focus move moves the seat's focus; a restart
+    /// destroys the input method, which Exo replaces; a suggestion or a
+    /// reconversion is a request of the engine's.
     fn act(&mut self, action: UserAction) {
         self.log(Place::User, format!("{action:?}"));
         let time = (self.now.0 / 1_000) as u32;
@@ -479,14 +554,51 @@ impl<'t> World<'t> {
                 ] {
                     self.exo.key(self.now, key, state);
                 }
+                // The key the user typed last repeats, and it is up.
+                self.repeat = None;
+                return self.host_sends(Vec::new(), false);
+            }
+            UserAction::KeyDown(key) => {
+                self.exo.key(self.now, key, wl_keyboard::KEY_STATE_PRESSED);
+                self.repeat = Some((key, self.now + REPEAT_DELAY));
+                return self.host_sends(Vec::new(), false);
+            }
+            UserAction::KeyUp(key) => {
+                self.exo.key(self.now, key, wl_keyboard::KEY_STATE_RELEASED);
+                self.repeat = self.repeat.filter(|&(repeating, _)| repeating != key);
+                return self.host_sends(Vec::new(), false);
+            }
+            UserAction::RestartInputMethod => {
+                let untracked = self.untracked();
+                self.detaches.push(Detach {
+                    before_keyboard: true,
+                    untracked,
+                });
+                self.exo.destroy_input_method();
+                return self.host_sends(Vec::new(), false);
+            }
+            UserAction::AcceptSuggestion | UserAction::Reconvert => {
+                self.exo.ask(match action {
+                    UserAction::AcceptSuggestion => Request::AcceptSuggestion,
+                    _ => Request::Reconvert,
+                });
                 return self.host_sends(Vec::new(), false);
             }
             UserAction::Settle => return,
         };
         let surface = self.display.surfaces()[field];
+        let mut detach = Detach::default();
         if self.exo.focus() != Some(surface) {
+            detach = Detach {
+                before_keyboard: self.exo.text_inputs_hear_first(),
+                untracked: self.untracked(),
+            };
+            if let Some(spec) = self.spec.as_mut().filter(|_| detach.before_keyboard) {
+                spec.counts.detaches_before_keyboard += 1;
+            }
             self.exo.move_focus(Some(surface));
         }
+        self.detaches.push(detach);
         let presses = match action {
             UserAction::Click { at, .. } => self.display.click(surface, at, time),
             UserAction::Tap { at, .. } => self.display.tap(surface, at, time),
@@ -495,14 +607,29 @@ impl<'t> World<'t> {
         self.host_sends(presses, false);
     }
 
+    /// Whether Exo's detach would confirm no composition now: below v11 of
+    /// the extension it confirms only one it tracks (E6), and it tracks
+    /// none.
+    fn untracked(&self) -> bool {
+        let confirms = self.extension >= Some(11);
+        !confirms && self.exo.composition().is_some_and(|text| text.is_empty())
+    }
+
     /// Exo's events since its last input, then `events`, go to the proxy,
     /// and what Exo handed the engine goes to the engine. Exo's events carry
     /// a late answer if `late`, made before the resets this input hands the
     /// engine.
     fn host_sends(&mut self, events: Vec<Outgoing>, late: bool) {
+        self.host_sends_of(events, late, None);
+    }
+
+    /// [`World::host_sends`], of Exo's answer to a press of `press`.
+    fn host_sends_of(&mut self, events: Vec<Outgoing>, late: bool, press: Option<Key>) {
         let origin = Origin {
             late,
             resets: self.resets,
+            press,
+            crossed: self.reports_to_exo > 0,
         };
         for event in self.exo.take_events() {
             self.e_to_p
@@ -520,26 +647,39 @@ impl<'t> World<'t> {
     }
 
     /// The engine answers part of the key in service, and Exo applies it.
+    /// The engine learns the text of a region it reconverted.
     fn engine_answers(&mut self) {
         let answer = self.engine.take(&mut self.choices);
         self.log(Place::Engine, format!("{answer:?}"));
+        let press = self.exo.press_of(&answer);
         let verdict = self.exo.answer(&answer);
+        if let Some(text) = self.exo.take_composed_region() {
+            self.engine.learn_region(text);
+        }
+        if let Some(spec) = &mut self.spec {
+            spec.counts.regions_hidden = self.exo.regions_hidden;
+            spec.counts.regions_stale = self.exo.regions_stale;
+        }
         if let Some(spec) = &mut self.spec {
             spec.counts.late += u64::from(verdict == Answer::Late);
             spec.counts.dropped += u64::from(verdict == Answer::Dropped);
         }
-        self.host_sends(Vec::new(), verdict == Answer::Late);
+        self.host_sends_of(Vec::new(), verdict == Answer::Late, press);
     }
 
     /// The guest sends `requests` at once, on C→P.
     fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
         for request in requests {
-            self.c_to_p.send(self.now, request, &mut self.choices);
+            let edits = self.edits.got.0;
+            self.c_to_p
+                .send(self.now, (request, edits), &mut self.choices);
         }
     }
 
-    /// A guest request reaches the proxy.
-    async fn deliver_guest_request(&mut self, request: Outgoing) {
+    /// A guest request, sent once the guest had got `edits` edits,
+    /// reaches the proxy. A surrounding text sent before the guest got an
+    /// edit the proxy has sent crossed it (P4).
+    async fn deliver_guest_request(&mut self, request: Outgoing, edits: u64) {
         let text_input = self.text_input;
         let decoded = decode(&request.0, &mut VecDeque::new(), |msg| {
             match msg.sender_id == text_input {
@@ -550,6 +690,13 @@ impl<'t> World<'t> {
         match &decoded {
             Ok((_, request)) => {
                 self.log(Place::CToP, format!("{request:?}"));
+                let report = matches!(
+                    request,
+                    zwp_text_input_v3::Request::SetSurroundingText { .. }
+                );
+                if let Some(spec) = self.spec.as_mut().filter(|_| report) {
+                    spec.counts.crossed_reports += u64::from(edits < self.edits.sent.0);
+                }
                 self.see(Seen::Guest(request));
             }
             Err(_) => self.log(Place::CToP, "a setup request".to_owned()),
@@ -562,7 +709,7 @@ impl<'t> World<'t> {
     async fn deliver_host_event(&mut self, event: Outgoing, origin: Origin) {
         let (sender, decoded) = self.display.decode(&event);
         let note = if origin.late { " (late)" } else { "" };
-        self.log(Place::EToP, format!("{sender} {decoded:?}{note}"));
+        self.log(Place::EToP, format!("{sender} {}{note}", shown(&decoded)));
         self.see(Seen::Host {
             sender,
             event: &decoded,
@@ -575,13 +722,15 @@ impl<'t> World<'t> {
     /// What the proxy sent goes out on P→E and P→C.
     fn send_proxy_output(&mut self, goes_on: bool) {
         for (sender, request) in self.session.host_received() {
+            self.reports_to_exo += u64::from(is_report(&request));
             self.log(Place::PToE, format!("{sender} {request:?}"));
             self.see(Seen::ToHost(&request));
             self.p_to_e
                 .send(self.now, (sender, request), &mut self.choices);
         }
         for (sender, event) in self.session.guest_received() {
-            self.log(Place::PToC, format!("{sender} {event:?}"));
+            self.log(Place::PToC, format!("{sender} {}", shown(&event)));
+            self.edits.sent.follow(&event);
             self.see(Seen::ToGuest(&event));
             let press = self.press(&event);
             if let Some((surface, at)) = press {
@@ -627,6 +776,7 @@ impl<'t> World<'t> {
     /// Shift.
     fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>) {
         let now = self.now;
+        self.edits.got.follow(&event);
         if let AnyEvent::WlRegistry(wl_registry::Event::Global {
             name,
             interface,
@@ -696,6 +846,56 @@ impl<'t> World<'t> {
             place,
             text,
         });
+    }
+}
+
+/// Whether `request` to the host reports the guest's surrounding text.
+fn is_report(request: &AnyRequest) -> bool {
+    use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+    matches!(
+        request,
+        AnyRequest::ZwpTextInputV1(zwp_text_input_v1::Request::SetSurroundingText { .. })
+    )
+}
+
+/// `event` as a trace shows it: a keymap without its descriptor, whose
+/// number a replay need not repeat.
+fn shown(event: &AnyEvent) -> String {
+    match event {
+        AnyEvent::WlKeyboard(wl_keyboard::Event::Keymap { format, size, .. }) => {
+            format!("WlKeyboard(Keymap {{ format: {format}, size: {size} }})")
+        }
+        event => format!("{event:?}"),
+    }
+}
+
+/// The transactions that edit the text, which the proxy sent the guest
+/// (`sent`) and the guest got (`got`).
+#[derive(Default)]
+struct Edits {
+    sent: EditCount,
+    got: EditCount,
+}
+
+/// A count of the transactions that edit the text, and whether the one in
+/// progress does.
+#[derive(Default)]
+struct EditCount(u64, bool);
+
+impl EditCount {
+    /// Follows `event`, an event to the guest.
+    fn follow(&mut self, event: &AnyEvent) {
+        use zwp_text_input_v3::Event;
+        match event {
+            AnyEvent::ZwpTextInputV3(Event::DeleteSurroundingText { .. }) => self.1 = true,
+            AnyEvent::ZwpTextInputV3(Event::CommitString { text }) => {
+                self.1 |= text.as_ref().is_some_and(|text| !text.is_empty());
+            }
+            AnyEvent::ZwpTextInputV3(Event::Done { .. }) => {
+                self.0 += u64::from(std::mem::take(&mut self.1));
+            }
+            _ => {}
+        }
     }
 }
 
