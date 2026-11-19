@@ -98,18 +98,33 @@
   `SurroundingTextTracker` would close this; no host has shown it.
 - A preedit region is measured in Exo's text as the proxy knows it: the
   guest's text with the preedit Exo holds at the guest's cursor
-  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). Four cases
-  stay approximate.
-  - A region that does not cover the preedit Exo holds, an empty one
-    included, is dropped: the guest keeps showing the old preedit while
-    Exo composes the new range and keeps the rest of the old one as
-    text. The exact answer commits that rest after the region's delete,
-    and the proxy would then have to track text the guest gained, not
-    only bytes it lost, until the guest reports.
+  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). These cases
+  stay approximate; the DST names the first three as known issues.
+  - A region that does not cover the preedit Exo holds is dropped, but
+    an empty one at Exo's cursor after it, which the guest commits: the
+    guest keeps showing the old preedit while Exo composes the new range
+    and keeps the rest of the old one as text. The exact answer commits
+    that rest after the region's delete, and the proxy would then have
+    to track text the guest gained, not only bytes it lost, until the
+    guest reports.
   - The proxy assumes Exo matched every guest report but one without a
-    region's bytes. A report that changes the text while a host preedit
-    shows, which Exo cannot match either, leaves Exo without the
-    composition the proxy still measures with.
+    region's bytes. A report Exo cannot match otherwise drops Exo's
+    composition (E4), and nothing tells the proxy: it still measures
+    with the preedit the guest shows (`RegionOverUnheldPreedit`; seed
+    18654, a GTK3 report of a tap's cursor that lags behind a late
+    answer). A report still on its way to Exo is the converse
+    (`RegionCrossesReport`).
+  - Ahead: the proxy measures in the text the guest last reported, less
+    the bytes regions took, so a region made while host commits, a
+    press's commit, or a reset commit the guest has not reported yet
+    are in Exo's text lands wrong (`RegionWhileAhead`; seeds 10114 and
+    19176). It probably also feeds `StaleRegionAfterCommit`. Mirroring
+    Exo's tracker (the edits since the last report) would close it.
+  - Selection: Exo's tracker replaces a selection with the composition
+    (`OnSetCompositionText`), while `TextInputState::host_text` inserts
+    the preedit at the guest's cursor and ignores the anchor, so a region
+    while the guest has a selection is measured in other text than
+    Exo's. No DST case makes a selection.
   - A v3 guest states its text without the preedit, while Exo predicts
     it with the composition inline and Chromium's own v1 client sends it
     so (`ZwpTextInputV1Impl::SetSurroundingText`). So a report without a
