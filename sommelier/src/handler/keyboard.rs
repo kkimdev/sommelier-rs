@@ -1074,17 +1074,31 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             return crate::wire::Action::Drop;
         };
         let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
+        // A peek the input method's own detach made stale (H2) describes a
+        // press whose release may have died with it, so a press peek of
+        // the key is its next press, of a generation of its own. The guest
+        // gets the old press's release first if it still holds it, under
+        // the serial and time of the peek, which announces the new press.
+        if state == KEY_STATE_PRESSED
+            && ctx
+                .key_generations
+                .retire_stale_generation(host_keyboard_id, key)
+        {
+            if let Some(guest_keyboard_id) = ctx.shadow_table.get_guest_id(host_keyboard_id.0) {
+                ctx.host_to_client_queue.push(wl_keyboard::evt::key(
+                    guest_keyboard_id,
+                    serial,
+                    time,
+                    key,
+                    KEY_STATE_RELEASED,
+                ));
+            }
+        }
         let pressed_before = ctx
             .key_generations
             .physically_held(host_keyboard_id, key);
-        // A peek the input method's own detach made stale (H2) describes a
-        // press whose release may have died with it, so a press peek of
-        // the key is its next press.
-        let peek_pressed_before = pressed_before
-            && ctx
-                .key_generations
-                .peek(host_keyboard_id, key)
-                .is_some_and(|peek| !peek.stale);
+        let peek_pressed_before =
+            pressed_before && ctx.key_generations.peek(host_keyboard_id, key).is_some();
         match state {
             KEY_STATE_PRESSED | KEY_STATE_REPEATED
                 if state == KEY_STATE_PRESSED || pressed_before =>
@@ -1799,6 +1813,31 @@ mod tests {
                 }
                 ref other => panic!("the host got {other:?}, not a recovery's sync"),
             }
+        }
+
+        /// Exo detaches the input method on its own (H2), as when its
+        /// process restarts: it confirms, then sends `leave`, and attaches
+        /// again once the proxy activates the text input again. The guest
+        /// gets nothing.
+        async fn detach(&mut self, ime: Ime) {
+            self.s
+                .host([
+                    zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0),
+                    zwp_text_input_v1::evt::leave(ime.host),
+                ])
+                .await;
+            for request in self.s.host_received() {
+                if let (_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback })) = request
+                {
+                    self.s.host([wl_callback::evt::done(callback, 0)]).await;
+                }
+            }
+            let surface = self.surface.host;
+            self.s
+                .host([zwp_text_input_v1::evt::enter(ime.host, surface)])
+                .await;
+            self.s.host_received();
+            assert_eq!(self.s.guest_received(), []);
         }
 
         /// The host input method sends a keysym, which Exo stamps with the
@@ -4512,6 +4551,86 @@ mod tests {
         assert_eq!(kb.s.host_received(), [acked(other, 701, HANDLED)]);
         kb.s.host([wl_callback::evt::done(callback, 0)]).await;
         assert_eq!(kb.s.guest_received(), []);
+    }
+
+    /// Exo's own detach (H2) may take a held key's release with the input
+    /// method, so the key's next `peek_key` press is a new press. The
+    /// guest, which still holds the old press that `wl_keyboard` or a
+    /// keysym gave it, gets its release first, with the peek's serial and
+    /// time, and then the new press from either channel.
+    #[tokio::test]
+    async fn a_press_after_a_detach_releases_the_old_press_the_guest_holds() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        for keysym in [false, true] {
+            let mut kb = Kb::new().await;
+            let ime = kb.text_input().await;
+            let k = kb.k;
+            let press = |serial: u32, time: u32| {
+                let peek =
+                    zcr_extended_keyboard_v1::evt::peek_key(k.ext, serial, time, KEY_A, PRESSED);
+                let key = match keysym {
+                    true => {
+                        let sym = keysyms::KEY_a;
+                        zwp_text_input_v1::evt::keysym(ime.host, time, serial, sym, PRESSED, 0)
+                    }
+                    false => wl_keyboard::evt::key(k.host, serial, time, KEY_A, PRESSED),
+                };
+                [peek, key]
+            };
+            let acks = |serial| match keysym {
+                true => Vec::new(),
+                false => vec![acked(k, serial, HANDLED)],
+            };
+
+            kb.s.host(press(700, 1234)).await;
+            assert_eq!(
+                kb.s.guest_received(),
+                [key_event(k, 700, 1234, KEY_A, PRESSED)],
+                "keysym={keysym}"
+            );
+            assert_eq!(kb.s.host_received(), acks(700), "keysym={keysym}");
+            kb.detach(ime).await;
+
+            kb.s.host(press(702, 1400)).await;
+            assert_eq!(
+                kb.s.guest_received(),
+                [
+                    key_event(k, 702, 1400, KEY_A, RELEASED),
+                    key_event(k, 702, 1400, KEY_A, PRESSED),
+                ],
+                "keysym={keysym}"
+            );
+            assert_eq!(kb.s.host_received(), acks(702), "keysym={keysym}");
+        }
+    }
+
+    /// A key the proxy recovered (X2') before Exo's own detach (H2) leaves
+    /// the guest holding nothing, and the key's next press, after the
+    /// detach, is a new press: it reaches the guest, rather than being
+    /// taken for a delayed channel of the recovered one.
+    #[tokio::test]
+    async fn a_recovered_key_pressed_again_after_a_detach_reaches_the_guest() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        let mut kb = Kb::new().await;
+        let ime = kb.text_input().await;
+        kb.peek(700, 1234, KEY_SPACE, PRESSED).await;
+        kb.confirm(ime).await;
+        assert_eq!(
+            kb.s.guest_received(),
+            recovered(ime, kb.k, 700, 1234, KEY_SPACE)
+        );
+        kb.detach(ime).await;
+
+        kb.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(kb.k.ext, 702, 1400, KEY_SPACE, PRESSED),
+            wl_keyboard::evt::key(kb.k.host, 702, 1400, KEY_SPACE, PRESSED),
+        ])
+        .await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [key_event(kb.k, 702, 1400, KEY_SPACE, PRESSED)]
+        );
+        assert_eq!(kb.s.host_received(), [acked(kb.k, 702, HANDLED)]);
     }
 
     #[tokio::test]
