@@ -334,19 +334,20 @@ impl Config {
     }
 }
 
-/// A host `zcr_text_input_extension_v1` version for each way the proxy
-/// sends Exo a content type: v1 `set_content_type` alone, followed by
-/// `deprecated_set_input_type`, `set_input_type` alone, or
-/// `set_surrounding_text_support` and `set_input_type` (the newest).
+/// The host's `zcr_text_input_extension_v1` versions: the newest, which
+/// the proxy creates text inputs with, three cases in four, and the one
+/// before the first it does (`confirm_preedit`'s), whose text inputs have
+/// no input method.
 const TEXT_INPUT_EXTENSION_VERSIONS: [u32; 4] = {
     use crate::protocols::text_input_extension_unstable_v1::{
         zcr_extended_text_input_v1 as extended, zcr_text_input_extension_v1,
     };
+    let newest = zcr_text_input_extension_v1::VERSION;
     [
-        extended::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE - 1,
-        extended::REQ_SET_INPUT_TYPE_SINCE - 1,
-        extended::REQ_SET_INPUT_TYPE_SINCE,
-        zcr_text_input_extension_v1::VERSION,
+        newest,
+        extended::EVT_CONFIRM_PREEDIT_SINCE - 1,
+        newest,
+        newest,
     ]
 };
 

@@ -480,7 +480,6 @@ mod tests {
             Typing {
                 latin: true,
                 nfd_backspace: true,
-                unmeasured: false,
                 late_cursor: false,
             },
         ];

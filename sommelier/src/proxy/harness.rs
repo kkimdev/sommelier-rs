@@ -464,19 +464,22 @@ pub(crate) struct TextInput {
     pub(crate) id: u32,
     /// The host `zwp_text_input_v1`.
     pub(crate) host: u32,
-    /// The host `zcr_extended_text_input_v1`, if the host has the
-    /// extension.
-    pub(crate) ext: Option<u32>,
+    /// The host `zcr_extended_text_input_v1`.
+    pub(crate) ext: u32,
 }
 
 /// Text inputs, which the proxy bridges to the host's
-/// `zwp_text_input_v1`.
+/// `zwp_text_input_v1` and its extension.
 impl Session {
     /// A new `zwp_text_input_v3` of `seat`, from a manager the guest binds
-    /// on first use. What the guest gets for it is kept: an `enter` if the
-    /// seat's keyboard focus is on a surface.
+    /// on first use, when the host also advertises the newest text-input
+    /// extension, which the proxy binds for itself. What the guest gets
+    /// for it is kept: an `enter` if the seat's keyboard focus is on a
+    /// surface.
     pub(crate) async fn text_input(&mut self, seat: u32) -> TextInput {
-        use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1::Request as Extension;
+        use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1::{
+            self, Request as Extension,
+        };
         use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1::{
             self, Request as Manager,
         };
@@ -486,6 +489,11 @@ impl Session {
             None => {
                 let version = zwp_text_input_manager_v1::VERSION;
                 let manager = self.bind("zwp_text_input_manager_v1", version).await;
+                let earlier = self.host.received.len();
+                let version = zcr_text_input_extension_v1::VERSION;
+                self.advertise(zcr_text_input_extension_v1::NAME, version)
+                    .await;
+                self.host.received.truncate(earlier);
                 *self.text_input_manager.insert(manager)
             }
         };
@@ -496,19 +504,17 @@ impl Session {
         )])
         .await;
         let forwarded = self.host.received.split_off(earlier);
-        let (host, ext) = match forwarded[..] {
-            [(_, AnyRequest::ZwpTextInputManagerV1(Manager::CreateTextInput { id: host }))] => {
-                (host, None)
-            }
-            [(_, AnyRequest::ZwpTextInputManagerV1(Manager::CreateTextInput { id: host })), (
-                _,
-                AnyRequest::ZcrTextInputExtensionV1(Extension::GetExtendedTextInput {
-                    id: ext,
-                    text_input,
-                }),
-            )] if text_input == host => (host, Some(ext)),
-            _ => panic!("the host got no text input: {forwarded:?}"),
+        let [(_, AnyRequest::ZwpTextInputManagerV1(Manager::CreateTextInput { id: host })), (
+            _,
+            AnyRequest::ZcrTextInputExtensionV1(Extension::GetExtendedTextInput {
+                id: ext,
+                text_input,
+            }),
+        )] = forwarded[..]
+        else {
+            panic!("the host got no text input: {forwarded:?}");
         };
+        assert_eq!(text_input, host);
         TextInput { id, host, ext }
     }
 

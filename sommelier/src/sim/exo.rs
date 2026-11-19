@@ -33,8 +33,7 @@ limitations under the License.
 //! unhandled one after, confirms the composition before an unhandled press
 //! and when the text input it serves changes or detaches, and drops the
 //! buffer on a reset. A key goes raw while IMA serves no text input. The
-//! extension's version is the one the proxy binds; a case draws the one
-//! the host advertises ([`draw_extension_version`]). Answers that belong to
+//! extension's version is the one the proxy binds. Answers that belong to
 //! the display, a sync's `done` and the `delete_id` of a destroyed object,
 //! are left to whoever plays it, as is the keyboard's focus in the fuzzer.
 //! The model is a test oracle, not a reimplementation: it keeps only the
@@ -83,7 +82,6 @@ use super::clock::Micros;
 use super::engine::{EngineIn, EngineOut, Request, TextAction};
 use super::hangul::Key;
 use super::keymap;
-use super::sched::Choose;
 use crate::protocols::keyboard_extension_unstable_v1::{
     zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
 };
@@ -491,15 +489,6 @@ impl TextInput {
         self.field.surrounding_text_supported = supported;
         changed
     }
-}
-
-/// The `zcr_text_input_extension_v1` version a case's host advertises, if
-/// any. Exo advertises v14, which the proxy binds at v11, its newest, so 11
-/// comes first and stands for Exo; the older versions and none test that
-/// the proxy copes with other hosts, one for each way it sends a content
-/// type or a confirmation.
-pub(super) fn draw_extension_version(choices: &mut impl Choose) -> Option<u32> {
-    [Some(11), None, Some(7), Some(10)][choices.pick(4) as usize]
 }
 
 /// The seat's `wl_keyboard`. A case has one, as a client binds one.
@@ -1664,7 +1653,8 @@ impl Exo {
     /// (`SupportsConfirmPreedit`).
     fn confirming_extension(&self, id: u32) -> Option<u32> {
         let extension = self.extension_of(id)?;
-        (self.extension_version >= Some(11)).then_some(extension)
+        let since = extended::EVT_CONFIRM_PREEDIT_SINCE;
+        (self.extension_version >= Some(since)).then_some(extension)
     }
 
     /// The extension of text input `id`, if it has one.
@@ -1753,8 +1743,8 @@ mod tests {
     const TI2: u32 = 40;
     const REGISTRY: u32 = 6;
     /// Extension versions with `confirm_preedit` and without it.
-    const V11: u32 = 11;
-    const V10: u32 = 10;
+    const V11: u32 = extended::EVT_CONFIRM_PREEDIT_SINCE;
+    const V10: u32 = V11 - 1;
     /// The time of every key, and its milliseconds.
     const NOW: Micros = Micros(7_000);
     const MS: u32 = 7;
@@ -3058,12 +3048,6 @@ mod tests {
         };
         let expected = [modifiers(KEYBOARD2, 1, 0), (KEYBOARD2, enter.into())];
         assert_eq!(events(&mut exo), expected);
-    }
-
-    #[test]
-    fn a_case_draws_the_extension_version() {
-        let versions = [0, 1, 2, 3].map(|choice| draw_extension_version(&mut |_| choice));
-        assert_eq!(versions, [Some(V11), None, Some(7), Some(V10)]);
     }
 
     #[test]

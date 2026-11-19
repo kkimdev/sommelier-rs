@@ -142,8 +142,6 @@ pub(crate) struct Assembly {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Warned {
     seat_missing: bool,
-    /// Exo's deletes and regions are dropped for want of a mirror.
-    no_mirror: bool,
     /// The deferral last logged.
     deferral: Option<Deferral>,
 }
@@ -167,7 +165,7 @@ impl TextInput {
             field: Field::focused_on(surface),
             link: LinkState::Detached,
             fence: None,
-            exo: ExoView::new(host.ext.map(|ext| ext.version)),
+            exo: ExoView::new(),
             composition: Composition::default(),
             warned: Warned::default(),
         }
@@ -435,12 +433,6 @@ impl TextInput {
         !std::mem::replace(&mut self.warned.seat_missing, true)
     }
 
-    /// Whether a delete or region dropped for want of a mirror is warned
-    /// of now: once per text input.
-    pub(super) fn first_no_mirror_warning(&mut self) -> bool {
-        !std::mem::replace(&mut self.warned.no_mirror, true)
-    }
-
     /// The barriers this text input waits for: its drain and its fence.
     #[cfg(test)]
     pub(crate) fn barriers(&self) -> impl Iterator<Item = BarrierToken> {
@@ -551,10 +543,9 @@ impl TextInput {
         self.exo = other.exo.clone();
     }
 
-    /// Whether it warned of a missing seat, and of a delete or region
-    /// dropped for want of a mirror.
-    pub(crate) fn warned_for_test(&self) -> (bool, bool) {
-        (self.warned.seat_missing, self.warned.no_mirror)
+    /// Whether it warned of a missing seat.
+    pub(crate) fn warned_for_test(&self) -> bool {
+        self.warned.seat_missing
     }
 }
 

@@ -22,17 +22,15 @@ limitations under the License.
 use super::state::{ContentType, LinkState, TextInput};
 use super::Env;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
-use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::wire::Outgoing;
 
 /// A content type as the host applies it: the v3 content type, and the
-/// surrounding-text support told with it, or `None` if the host's
-/// extension cannot be told one.
+/// surrounding-text support told with it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostContentType {
     pub(super) content_type: ContentType,
-    pub(super) surrounding_text_support: Option<bool>,
+    pub(super) surrounding_text_support: bool,
 }
 
 /// The host state a text input should have (design 2, "Reconcile").
@@ -83,10 +81,7 @@ pub(super) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
             content_type: committed
                 .map(|committed| committed.content_type)
                 .unwrap_or_default(),
-            surrounding_text_support: takes_surrounding_text_support(
-                t.host().ext.map(|e| e.version),
-            )
-            .then(|| committed.is_some_and(|c| c.surrounding_text.is_some())),
+            surrounding_text_support: committed.is_some_and(|c| c.surrounding_text.is_some()),
         },
     }
 }
@@ -122,94 +117,35 @@ pub(super) fn reconcile(target: &HostTarget, link: LinkState) -> HostSteps {
     }
 }
 
-/// Whether a host extension of `version`, if any, takes
-/// `set_surrounding_text_support`.
-pub(super) fn takes_surrounding_text_support(ext_version: Option<u32>) -> bool {
-    ext_version.is_some_and(|version| version >= ext::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE)
-}
-
-/// The host requests that set `content_type` on host text input `v1`,
-/// whose extension, if any, has the ID and version `ext`, with its
-/// surrounding-text support if it has one (INVARIANTS "`set_input_type`
-/// replaces v1 `set_content_type`").
-pub(super) fn content_type_requests(
-    v1: u32,
-    ext: Option<(u32, u32)>,
-    content_type: HostContentType,
-) -> Vec<Outgoing> {
+/// The host requests that set `content_type` on host extended text input
+/// `ext`, with its surrounding-text support (INVARIANTS "`set_input_type`
+/// replaces v1 `set_content_type`"). Exo applies the pending support to
+/// the next content type and then resets it, so it goes first.
+pub(super) fn content_type_requests(ext: u32, content_type: HostContentType) -> [Outgoing; 2] {
     let (hint, purpose) = content_type.content_type;
-    let (v1_hint, v1_purpose, input_type, input_mode, input_flags, learning_mode) =
-        map_v3_content_type(hint, purpose);
-    match ext {
-        // v8's set_input_type is "used in place of" v1 set_content_type.
-        // Exo applies the pending support to whichever of the two comes
-        // first and then resets it, so sending both would always report
-        // the surrounding text as supported.
-        Some((id, version)) if version >= ext::REQ_SET_INPUT_TYPE_SINCE => {
-            let support = content_type.surrounding_text_support.map(|supported| {
-                let support = match supported {
-                    true => ext::SURROUNDING_TEXT_SUPPORT_SUPPORTED,
-                    false => ext::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
-                };
-                ext::req::set_surrounding_text_support(id, support)
-            });
-            // A text-input-v3 client supports inline preedit by definition.
-            let input_type = ext::req::set_input_type(
-                id,
-                input_type,
-                input_mode,
-                input_flags,
-                learning_mode,
-                ext::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
-            );
-            support.into_iter().chain([input_type]).collect()
-        }
-        // Before v8 the four-argument request follows v1
-        // set_content_type; v8's set_input_type would be a protocol error.
-        _ => {
-            debug_assert_eq!(content_type.surrounding_text_support, None);
-            let deprecated = ext
-                .filter(|&(_, version)| version >= ext::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE)
-                .map(|(id, _)| {
-                    ext::req::deprecated_set_input_type(
-                        id,
-                        input_type,
-                        input_mode,
-                        input_flags,
-                        learning_mode,
-                    )
-                });
-            [zwp_text_input_v1::req::set_content_type(
-                v1, v1_hint, v1_purpose,
-            )]
-            .into_iter()
-            .chain(deprecated)
-            .collect()
-        }
-    }
+    let (input_type, input_mode, input_flags, learning_mode) = map_v3_content_type(hint, purpose);
+    let support = match content_type.surrounding_text_support {
+        true => ext::SURROUNDING_TEXT_SUPPORT_SUPPORTED,
+        false => ext::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
+    };
+    [
+        ext::req::set_surrounding_text_support(ext, support),
+        // A text-input-v3 client supports inline preedit by definition.
+        ext::req::set_input_type(
+            ext,
+            input_type,
+            input_mode,
+            input_flags,
+            learning_mode,
+            ext::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+        ),
+    ]
 }
 
-/// Map a v3 content type to the host's v1 `(hint, purpose)` and the
-/// extension's `(input_type, input_mode, input_flags, learning_mode)`.
-pub(crate) fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u32, u32, u32) {
-    use zwp_text_input_v1 as v1;
+/// Map a v3 content type to the extension's `(input_type, input_mode,
+/// input_flags, learning_mode)`.
+pub(crate) fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u32) {
     use zwp_text_input_v3 as v3;
-
-    // zwp_text_input_v1 has no PIN purpose and its values after PASSWORD are
-    // shifted by one compared with v3.
-    let mut v1_hint = hint;
-    let v1_purpose = match purpose {
-        v3::CONTENT_PURPOSE_NORMAL..=v3::CONTENT_PURPOSE_PASSWORD => purpose,
-        v3::CONTENT_PURPOSE_PIN => {
-            v1_hint |= v1::CONTENT_HINT_SENSITIVE_DATA;
-            v1::CONTENT_PURPOSE_DIGITS
-        }
-        v3::CONTENT_PURPOSE_DATE => v1::CONTENT_PURPOSE_DATE,
-        v3::CONTENT_PURPOSE_TIME => v1::CONTENT_PURPOSE_TIME,
-        v3::CONTENT_PURPOSE_DATETIME => v1::CONTENT_PURPOSE_DATETIME,
-        v3::CONTENT_PURPOSE_TERMINAL => v1::CONTENT_PURPOSE_TERMINAL,
-        _ => v1::CONTENT_PURPOSE_NORMAL, // Unknown values degrade to NORMAL.
-    };
 
     // Chrome's extension uses TextInputType/TextInputMode enums rather than
     // Wayland's content-purpose enum.
@@ -275,12 +211,5 @@ pub(crate) fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u3
     } else {
         ext::LEARNING_MODE_ENABLED
     };
-    (
-        v1_hint,
-        v1_purpose,
-        input_type,
-        input_mode,
-        input_flags,
-        learning_mode,
-    )
+    (input_type, input_mode, input_flags, learning_mode)
 }

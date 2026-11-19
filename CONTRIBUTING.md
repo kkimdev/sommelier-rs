@@ -142,8 +142,9 @@ text and the cursor rectangle regardless, and sends `enter` and `leave`
 as an input method attaches and detaches. Its input method also goes
 away now and then as it answers a sync, as when its process restarts,
 and the proxy must activate the field again. The seed picks the host's
-`zcr_text_input_extension_v1` version, one for each way the proxy sends
-a content type. Whether an enable reaches the proxy before or after the
+`zcr_text_input_extension_v1` version: the newest, or in a quarter of
+the cases one too old for the proxy to give a text input an input
+method. Whether an enable reaches the proxy before or after the
 previous activation has drained follows from the seed too: the
 compositor holds its answer to every drain barrier's sync until it
 answers anything else, and the guest sometimes waits with a second
@@ -211,8 +212,7 @@ end of the trace (`SOMMELIER_DST_TRACE_LINES` sets how much) and the
 case's choices. Rerun it with `SOMMELIER_DST_SEED=<seed>
 SOMMELIER_DST_CASES=1`, which replays it exactly;
 `SOMMELIER_DST_CLIENT=chromium|gtk3|gtk4` and
-`SOMMELIER_DST_MODE=free|settled` narrow a run. The summary counts each
-known issue by the host's text-input extension.
+`SOMMELIER_DST_MODE=free|settled` narrow a run.
 
 The first failed case of a run is shrunk (`sim/shrink.rs`) after its
 report: ddmin over its actions, zeroing runs of its choices (0 is the

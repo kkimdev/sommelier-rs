@@ -24,8 +24,9 @@
   [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
 - The IME core (`sommelier/src/ime`) bridges a guest's text-input-v3 to
   Exo's text-input-v1. Every IME input goes through `ImeCore::step`, and
-  `handler/text_input.rs` is its adapter. From v11 of the text-input
-  extension, the Exo mirror is the one model of Exo's text.
+  `handler/text_input.rs` is its adapter. The Exo mirror is the one
+  model of Exo's text; a host without the text-input extension at v11
+  gives text inputs no input method.
   [`docs/IME.md`](docs/IME.md) holds the behaviour table, the facts about
   Exo and the clients, and the deterministic simulation test (DST);
   [`docs/KEYBOARD.md`](docs/KEYBOARD.md) holds the key states.
@@ -96,8 +97,7 @@
   held across an input-method restart stops repeating until its next
   press.
 - Exo's deletes and preedit regions that the Exo mirror cannot measure
-  are dropped, and below v11 of the extension all of them are
-  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A drop
+  are dropped ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A drop
   never deletes or loses text, but the input method goes on as if it
   applied, so its next commit doubles text once (`word word~`, 한국韓國)
   until the guest's next report resets Exo. The mirror's gaps:
@@ -183,9 +183,6 @@
 - A guest's own reset (`set_text_change_cause`, G6) never resets Exo;
   only a press does (C6, Q3 of
   [IME.md](docs/IME.md#53-open-design-questions)).
-- Re-enabling an enabled field with a changed content type keeps the
-  guest's preedit but re-sends the type, which before v8 can reset Exo's
-  composition.
 - A focus-loss commit too long for one message loses the preedit (Exo's
   confirmation is dropped while the link drains).
 - The keysym channel is unproven (U1): no release follows a keysym

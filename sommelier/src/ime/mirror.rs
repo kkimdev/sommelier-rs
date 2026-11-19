@@ -675,10 +675,10 @@ impl ExoMirror {
     /// a composition holding the selection replaces the composition
     /// wherever the selection is in it. After a `cursor_position(range)`,
     /// it is `SetEditableSelectionRange(range)` (TI 386-403), which keeps
-    /// the composition and sends its text. The mirror exists only from v11
-    /// of the extension, whose confirmations are `confirm_preedit` (ZTIM
-    /// 430-447), so the pair is never `ConfirmCompositionText(true)`'s
-    /// fallback (TI 240-263), which IMA takes only below it.
+    /// the composition and sends its text. The proxy has the extension at
+    /// v11, whose confirmations are `confirm_preedit` (ZTIM 430-447), so the
+    /// pair is never `ConfirmCompositionText(true)`'s fallback (TI
+    /// 240-263), which IMA takes only below it.
     ///
     /// Echo, for a pair: the range is in the text, and `text` is the
     /// composition's.

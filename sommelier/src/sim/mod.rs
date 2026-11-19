@@ -112,21 +112,16 @@ impl Case {
             texts,
             actions: Vec::new(),
         };
-        // The user does not know whether the host can show a region.
-        let typing = case.typing(Some(11));
-        case.actions = user::actions(&mut rng, &case.texts, typing, settled);
+        case.actions = user::actions(&mut rng, &case.texts, case.typing(), settled);
         case
     }
 
-    /// How keys reach the client's fields, through a host whose text-input
-    /// extension is `extension`: GTK's Backspace leaves a syllable's NFD
-    /// prefix (C14), and only the proxy's Exo mirror, from v11, measures
-    /// Exo's deletes and regions.
-    fn typing(&self, extension: Option<u32>) -> Typing {
+    /// How keys reach the client's fields: GTK's Backspace leaves a
+    /// syllable's NFD prefix (C14).
+    fn typing(&self) -> Typing {
         Typing {
             latin: self.latin,
             nfd_backspace: self.client != ClientKind::Chromium,
-            unmeasured: !extension.is_some_and(|version| version >= 11),
             late_cursor: self.client == ClientKind::Gtk3,
         }
     }
@@ -136,17 +131,15 @@ impl Case {
         Choices::new(self.seed ^ 0x5eed_5eed)
     }
 
-    /// The reference editor on the case's fields, before any action, for a
-    /// host whose text-input extension is `extension`.
-    fn reference_at_start(&self, extension: Option<u32>) -> Reference {
+    /// The reference editor on the case's fields, before any action.
+    fn reference_at_start(&self) -> Reference {
         let fields = self.texts.iter().map(|text| TextModel::new(text)).collect();
-        Reference::new(fields).typing(self.typing(extension))
+        Reference::new(fields).typing(self.typing())
     }
 
-    /// The user's intent: the reference editor after the case's actions,
-    /// for a host whose text-input extension is `extension`.
-    fn reference(&self, extension: Option<u32>) -> Reference {
-        let mut reference = self.reference_at_start(extension);
+    /// The user's intent: the reference editor after the case's actions.
+    fn reference(&self) -> Reference {
+        let mut reference = self.reference_at_start();
         for &action in &self.actions {
             reference.apply(action);
         }
@@ -162,8 +155,7 @@ struct Outcome {
     /// The known issues that explain the failures, if any do.
     known: Vec<KnownIssue>,
     counts: Counts,
-    /// The text-input extension the host had, and the engine's lag.
-    extension: Option<u32>,
+    /// The engine's lag.
     lag: Lag,
     /// The choices the case made, which replay it ([`Choices::replay`]).
     choices: Vec<u32>,
@@ -171,7 +163,6 @@ struct Outcome {
 
 /// Runs `case` with `choices`, its trace in `trace`.
 fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
-    let extension = exo::draw_extension_version(&mut choices);
     let lag = Lag::draw(&mut choices);
     // Half the guests bind their keyboard again once the text input is
     // active, as a client that rebuilds its seat devices does.
@@ -179,7 +170,6 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
     let setup = Setup {
         client: case.client,
         latin: case.latin,
-        extension,
         lag,
         late_keyboard,
         texts: &case.texts,
@@ -198,7 +188,6 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
             failures: Vec::new(),
             known: Vec::new(),
             counts: Counts::default(),
-            extension,
             lag,
             choices: world.choices.recorded().to_vec(),
         };
@@ -215,12 +204,12 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         outcome.counts.drops = drops;
         let (engine, resets) = (world.engine_composition(), world.engine_resets());
         let (exo, steps) = (&world.exo, &world.steps);
-        let mut failures = oracle::exact(steps, spec, shadow, exo, &engine, resets, extension);
+        let mut failures = oracle::exact(steps, spec, shadow, exo, &engine, resets);
         if case.settled {
-            let start = case.reference_at_start(extension);
+            let start = case.reference_at_start();
             let (actions, settles) = (&case.actions, &world.settles);
             failures.extend(oracle::lost(start, actions, settles, world.client()));
-            failures.extend(oracle::intended(&case.reference(extension), world.client()));
+            failures.extend(oracle::intended(&case.reference(), world.client()));
         }
         if !world.mirrors.is_empty() {
             failures.push(Failure {
@@ -243,11 +232,10 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
 fn report(case: &Case, outcome: &Outcome, failures: &[Failure], trace: &[Line]) -> String {
     let mode = if case.settled { "settled" } else { "free" };
     let mut report = format!(
-        "DST FAILURE seed={} mode={mode} client={} latin={} ext={:?} lag={:?}\n",
+        "DST FAILURE seed={} mode={mode} client={} latin={} lag={:?}\n",
         case.seed,
         case.client.name(),
         case.latin,
-        outcome.extension,
         outcome.lag,
     );
     for failure in failures {
@@ -315,8 +303,6 @@ fn cases(settled: bool) -> Vec<Case> {
 /// some cases take.
 #[derive(Debug, Default)]
 struct Coverage {
-    /// By the host's text-input extension: none, 7, 10 and 11.
-    extensions: [u64; 4],
     /// By client: Chromium, GTK3 and GTK4.
     clients: [u64; 3],
     /// By the engine's lag: fast, normal and slow.
@@ -332,9 +318,6 @@ struct Coverage {
 impl Coverage {
     /// Counts `case`, which came to `outcome`.
     fn count(&mut self, case: &Case, outcome: &Outcome) {
-        let versions = [None, Some(7), Some(10), Some(11)];
-        let extension = versions.iter().position(|&v| v == outcome.extension);
-        self.extensions[extension.expect("a drawn version")] += 1;
         let client = ClientKind::ALL.iter().position(|&kind| kind == case.client);
         self.clients[client.expect("a client")] += 1;
         let lag = [Lag::Fast, Lag::Normal, Lag::Slow]
@@ -342,7 +325,7 @@ impl Coverage {
             .position(|&l| l == outcome.lag);
         self.lags[lag.expect("a lag")] += 1;
         self.latin += u64::from(case.latin);
-        let mut reference = case.reference_at_start(outcome.extension);
+        let mut reference = case.reference_at_start();
         for &action in &case.actions {
             self.leaves_composing += u64::from(reference.leaves_composition(action));
             if let UserAction::Key(hangul::Key::Backspace) = action {
@@ -350,7 +333,7 @@ impl Coverage {
                 let before = field.text[..field.cursor].chars().next_back();
                 let syllable = before.is_some_and(|c| ('가'..='힣').contains(&c));
                 let passed = reference.engine_passes(hangul::Key::Backspace);
-                let nfd = case.typing(outcome.extension).nfd_backspace;
+                let nfd = case.typing().nfd_backspace;
                 self.nfd_backspaces += u64::from(nfd && passed && syllable);
             }
             reference.apply(action);
@@ -359,7 +342,7 @@ impl Coverage {
 
     /// The counters, each of which a full run must have raised.
     fn counters(&self, free: bool) -> Vec<u64> {
-        let mut counters = [&self.extensions[..], &self.clients, &self.lags].concat();
+        let mut counters = [&self.clients[..], &self.lags].concat();
         counters.extend([self.latin, self.nfd_backspaces]);
         counters.extend(free.then_some(self.leaves_composing));
         counters
@@ -370,9 +353,8 @@ impl Coverage {
 #[derive(Debug, Default)]
 struct Summary {
     cases: u64,
-    /// The cases a known issue explains, with the host's text-input
-    /// extension and the issue.
-    known: Vec<(u64, Option<u32>, KnownIssue)>,
+    /// The cases a known issue explains, with the issue.
+    known: Vec<(u64, KnownIssue)>,
     counts: Counts,
     coverage: Coverage,
     /// The reports of the cases that failed.
@@ -406,7 +388,6 @@ fn run_all(cases: &[Case]) -> Summary {
                     failures: Vec::new(),
                     known: Vec::new(),
                     counts: Counts::default(),
-                    extension: None,
                     lag: Lag::Fast,
                     choices: Vec::new(),
                 };
@@ -435,12 +416,9 @@ fn run_all(cases: &[Case]) -> Summary {
             }
         }
         summary.cases += 1;
-        summary.known.extend(
-            outcome
-                .known
-                .iter()
-                .map(|&issue| (case.seed, outcome.extension, issue)),
-        );
+        summary
+            .known
+            .extend(outcome.known.iter().map(|&issue| (case.seed, issue)));
         summary.counts += outcome.counts;
         summary.coverage.count(case, &outcome);
         if let Some(first) = outcome.failures.first() {
@@ -498,18 +476,13 @@ fn check(test: &str, settled: bool) {
             failed,
         } = &summary;
         println!("{cases} cases, {counts:?}, {coverage:?}");
-        let mut issues: Vec<KnownIssue> = known.iter().map(|&(_, _, issue)| issue).collect();
+        let mut issues: Vec<KnownIssue> = known.iter().map(|&(_, issue)| issue).collect();
         issues.sort();
         issues.dedup();
         for issue in issues {
-            let seeds: Vec<u64> = known.iter().filter(|k| k.2 == issue).map(|k| k.0).collect();
-            let by_extension = [None, Some(7), Some(10), Some(11)].map(|extension| {
-                let cases = known.iter().filter(|k| k.2 == issue && k.1 == extension);
-                (extension, cases.count())
-            });
+            let seeds: Vec<u64> = known.iter().filter(|k| k.1 == issue).map(|k| k.0).collect();
             println!(
-                "known issue {issue:?} in {} cases, by extension {by_extension:?}, seeds \
-                 {seeds:?}: {}; tracked in {}",
+                "known issue {issue:?} in {} cases, seeds {seeds:?}: {}; tracked in {}",
                 seeds.len(),
                 issue.reason(),
                 issue.tracking()
@@ -547,13 +520,12 @@ fn check(test: &str, settled: bool) {
         }
         // Rarer paths, which a long run must reach: a region over a shown
         // preedit, a delete Exo's text measures to nothing, and the drops
-        // of a host with no mirror and of one that cannot measure.
+        // of a mirror that cannot measure.
         if !settled && *cases >= 5_000 {
             reached.extend([
                 counts.regions_over_preedits,
                 counts.deletes_misplaced,
-                counts.drops.no_mirror,
-                counts.drops.mirrored(),
+                counts.drops.total(),
             ]);
         }
         if *cases >= 300 {
@@ -569,7 +541,7 @@ fn check(test: &str, settled: bool) {
         );
         // The mirror measures every delete and region of a settled case.
         assert!(
-            !settled || counts.drops.mirrored() == 0,
+            !settled || counts.drops.total() == 0,
             "a settled case dropped a delete or region it could measure: {counts:?}"
         );
         if let Some(first) = failed.first() {
@@ -700,13 +672,11 @@ fn coverage_counts_each_draw_and_the_rare_paths() {
         failures: Vec::new(),
         known: Vec::new(),
         counts: Counts::default(),
-        extension: Some(10),
         lag: Lag::Slow,
         choices: Vec::new(),
     };
     let mut coverage = Coverage::default();
     coverage.count(&case, &outcome);
-    assert_eq!(coverage.extensions, [0, 0, 1, 0]);
     assert_eq!((coverage.clients, coverage.lags), ([0, 1, 0], [0, 0, 1]));
     assert_eq!((coverage.latin, coverage.nfd_backspaces), (0, 1));
     assert_eq!(coverage.leaves_composing, 1);

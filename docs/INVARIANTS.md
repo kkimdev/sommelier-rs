@@ -874,19 +874,28 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   Chrome's `spellcheck_on` (`1 << 4`); Chrome's `autocorrect_on` (`1 << 2`)
   is a separate flag and is never inferred from it.
   Test: `content_type_mapping_preserves_pin_privacy_and_inline_composition`.
-- **`set_input_type` replaces v1 `set_content_type`.** When the host's
-  `zcr_extended_text_input_v1` has `set_input_type` (v8), a content type
-  reaches Exo through it alone, as the extension XML says ("used in place
-  of"), right after `set_surrounding_text_support` (v9). Exo applies that
-  support to the next of the two requests and resets it, so a v1
-  `set_content_type` in between would report every field without
-  surrounding text as supporting it. Older extensions get
-  `set_content_type`, then `deprecated_set_input_type` (v2). The mapping
-  to `set_input_type` is lossy: the `latin` hint, `multiline` outside the
-  normal, alpha and name purposes, and the `terminal` purpose have no
-  equivalent. They had no effect before either, because `set_input_type`
-  replaced what Exo derived from `set_content_type`.
-  Test: `content_type_takes_one_host_request_per_extension_version`.
+- **A text input needs the host's extension at v11.** The proxy creates
+  the host objects of a guest `zwp_text_input_v3` only when the host has
+  `zwp_text_input_manager_v1` and `zcr_text_input_extension_v1` at v11 or
+  later, the first that confirms with `confirm_preedit` rather than a
+  `cursor_position` and `commit_string` pair the Exo mirror could misread
+  (ChromeOS has advertised it since about M116). Otherwise the text input
+  is a local object with no input method: the guest owns its ID, so it
+  takes every request, sends nothing, and its destructor completes in the
+  proxy; the first such text input of the process warns.
+  Tests: `a_text_input_without_a_v11_extension_has_no_input_method`,
+  `text_input_creation_without_host_manager_does_not_create_broken_state`.
+- **`set_input_type` replaces v1 `set_content_type`.** A content type
+  reaches Exo through the extension's `set_input_type` alone, as the
+  extension XML says ("used in place of"), right after
+  `set_surrounding_text_support`. Exo applies that support to the next
+  content type and resets it, so a v1 `set_content_type` in between would
+  report every field without surrounding text as supporting it. The
+  mapping to `set_input_type` is lossy: the `latin` hint, `multiline`
+  outside the normal, alpha and name purposes, and the `terminal` purpose
+  have no equivalent. They had no effect before either, because
+  `set_input_type` replaced what Exo derived from `set_content_type`.
+  Test: `content_type_mapping_preserves_pin_privacy_and_inline_composition`.
 - **The host gets each content type once it can apply it, and only
   then.** Exo applies a content type only while an input method is
   attached: it drops one after `deactivate` and before `activate`, and
@@ -903,10 +912,7 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   when the field's surrounding text appears or goes, and when an enable
   or a disable starts a new field (an enable of an enabled field does
   not). It sends none while no input method is attached and
-  none the host already has: with a v8 extension Exo ignores an unchanged
-  type, but before v8 `set_content_type` and `deprecated_set_input_type`
-  map flags differently, so a resend changes the type twice, and each
-  change can reset the input method's composition. Exo keeps surrounding
+  none the host already has. Exo keeps surrounding
   text and the cursor rectangle without an input method, so they are
   forwarded as committed and never replayed.
   Exo reports every attach of its input method as
@@ -919,13 +925,11 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   first: the generation ends there without a barrier, its composition
   ends, and reconciling activates again if the guest still wants input.
   Exo's detach confirms first (E6 of
-  [IME.md](IME.md#24-exo-facts-the-models-implement)): `confirm_preedit`
-  from extension v11, and below it a `commit_string` of the composition
-  Exo tracks, which reach the proxy
-  while it is attached and commit the preedit the guest shows. A preedit
-  the guest still shows at the `leave` is one Exo no longer tracked: a
-  report it could not match dropped it (E4), so nothing confirmed it. The
-  guest commits it then, with `preedit_string("")`, `commit_string` and
+  [IME.md](IME.md#24-exo-facts-the-models-implement)) with
+  `confirm_preedit`, which reaches the proxy while it is attached and
+  commits the preedit the guest shows. A preedit the guest still shows at
+  the `leave` is one that confirmation did not commit (the DST reaches it
+  in rare races). The guest commits it then, with `preedit_string("")`, `commit_string` and
   `done`, which keeps the user's text where an input method that restarts
   would lose it, and commits nothing twice. If that `leave` beats the
   `wl_keyboard.leave` of the same focus change, the activation finds Exo
@@ -941,7 +945,6 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   send content types Exo drops or withhold the one it needs.
   Tests: `reconcile_reaches_every_target_with_only_needed_requests`,
   `surrounding_text_support_follows_the_field_and_resends_only_on_change`,
-  `a_host_without_surrounding_text_support_gets_no_resend`,
   `a_deferred_activation_replays_the_committed_content_type`,
   `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type`,
   `the_enter_answering_an_activate_resends_nothing`,
@@ -1184,22 +1187,14 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `an_empty_preedit_region_sends_no_delete`,
   `a_reset_commit_waits_for_the_guest_to_report_it`.
 - **Exo's deletes and regions are measured in the Exo mirror, or
-  dropped.** A text input has a mirror (`ime::exo_view::ExoView`'s
-  `mirror`, an `Option<ime::mirror::ExoMirror>`) exactly when the host's
-  `zcr_extended_text_input_v1` is v11 or later, the first that confirms
-  with `confirm_preedit` rather than a `cursor_position` and
-  `commit_string` pair the mirror could misread; it is fixed when the
-  text input is created. The mirror is a replica of the
+  dropped.** Every text input has a mirror (`ime::exo_view::ExoView`'s
+  `mirror`, an `ime::mirror::ExoMirror`), which the host's extension at
+  v11 makes possible ("A text input needs the host's extension at v11"). The mirror is a
+  replica of the
   `ui::SurroundingTextTracker` Exo keeps for the host text input
   ([IME.md](IME.md#22-host-events) X1 and H9; Chromium `main` 6975bb48a8cd),
   and the core feeds it every event of the text input before the gate,
-  since stale and fenced events changed Exo's tracker too. Without a
-  mirror, every delete and region is dropped
-  (`ime::exo_view::Unmeasured::NoMirror`), and the first drop on each
-  text input warns that the host's extension is older than v11; typing,
-  preedits, commits, confirmations, presses, focus changes and Exo's
-  detach do not need the mirror, every report goes out unchanged, and the
-  extension still carries the content type.
+  since stale and fenced events changed Exo's tracker too.
   - A request applies where Exo processed it. The proxy sends a
     `wl_display.sync` right after each surrounding text it forwards, and
     after the `reset` of a press, glued into one queue entry, which one
@@ -1343,7 +1338,7 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `an_ambiguous_report_stays_unknown`,
   `a_report_unlike_a_vague_selection_heals_it`,
   `a_report_without_the_shown_preedit_is_withheld`.
-  The core's row tests of G1 (the mirror from v11), X1 and H9, and of
+  The core's row tests of X1 and H9, and of
   report suppression, are listed in their rows of
   [IME.md](IME.md#2-behavioural-specification).
 - **Every commit that leaves a field enabled gets a `done`.** The proxy
@@ -1362,8 +1357,7 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   which ends the composition and the Backspace repeat leased to it and
   tells the host its content type again. An enable of an enabled field
   keeps the composition, as mutter and KWin keep the preedit across it,
-  and the host keeps its content type unless the commit changes it,
-  since before the v8 extension a resend would reset its composition; a
+  and the host keeps its content type unless the commit changes it; a
   changed one is sent again, as for any commit. GTK3 sends one on a
   click's release in the field, after its press; a press on the field's
   surface has already ended the composition (next rule), so the

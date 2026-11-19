@@ -523,11 +523,11 @@ transactions, each closed by a `done`. Exo measures its deletes and
 preedit regions in its own prediction of the text, so the core keeps a
 replica of it per text input, `ime/mirror.rs`, which takes every request
 the core sends at the `done` of a `wl_display.sync` glued to it, and every
-event Exo sends. `ime/exo_view.rs` owns the mirror, which a text input
-has from v11 of the extension, and whether the guest is in step with Exo:
-it is the one model of Exo's text. A delete or a region is measured in
-the mirror while the guest is in step, and dropped otherwise, as it is
-always below v11; and a guest report that leaves out the preedit it
+event Exo sends. `ime/exo_view.rs` owns the mirror and whether the guest is in step with
+Exo: it is the one model of Exo's text. The adapter gives a text input
+an input method only with the host's extension at v11, which the mirror
+needs. A delete or a region is measured in the mirror while the guest is
+in step, and dropped otherwise; and a guest report that leaves out the preedit it
 shows, which Exo holds inline, is withheld when the mirror finds that
 preedit the only difference from a state Exo will hold. `ime/state.rs`
 keeps only what the guest is shown. A guest commit that leaves the

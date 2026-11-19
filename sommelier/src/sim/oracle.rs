@@ -38,10 +38,9 @@ limitations under the License.
 //! known issue explains a tier-2 failure.
 //!
 //! Exo's deletes (H9) and preedit regions (X1) reach the guest as
-//! `SpecText` measures them in Exo's real text ([`RegionTruth`]), from v11
-//! of the host's text-input extension, or not at all: the proxy drops what
-//! its Exo mirror cannot measure, and below
-//! v11 every one ([`SpecText::resolve`]). Exo sends no `preedit_styling`
+//! `SpecText` measures them in Exo's real text ([`RegionTruth`]), or not at
+//! all: the proxy drops what its Exo mirror cannot measure
+//! ([`SpecText::resolve`]). Exo sends no `preedit_styling`
 //! (H4).
 
 use std::collections::BTreeMap;
@@ -131,34 +130,24 @@ pub(crate) struct V3Field {
 }
 
 impl V3Field {
-    /// What Exo should hold for this field once the proxy has sent it to
-    /// a host whose `zcr_extended_text_input_v1` has `extension_version`
-    /// (0 for none): the proxy's own mapping of the content type, through
-    /// the extension from v2 on and through v1 `set_content_type` before;
-    /// inline composition, which every v3 client supports; surrounding
-    /// text, supported when the field has it or when the extension cannot
-    /// say otherwise (before v9); and the cursor rectangle, empty when it
-    /// has none.
-    pub(crate) fn on_host(&self, extension_version: u32) -> exo::Field {
+    /// What Exo should hold for this field once the proxy has sent it: the
+    /// proxy's own mapping of the content type; inline composition, which
+    /// every v3 client supports; surrounding text, supported when the
+    /// field has it; and the cursor rectangle, empty when it has none.
+    pub(crate) fn on_host(&self) -> exo::Field {
         let (hint, purpose) = self.content_type;
-        let (v1_hint, v1_purpose, input_type, input_mode, flags, learning_mode) =
+        let (input_type, input_mode, flags, learning_mode) =
             crate::ime::map_v3_content_type(hint, purpose);
-        let content_type = if extension_version >= extended::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE {
-            exo::ContentType {
+        exo::Field {
+            attached: true,
+            content_type: exo::ContentType {
                 input_type,
                 input_mode,
                 flags,
                 learning: learning_mode == extended::LEARNING_MODE_ENABLED,
                 inline_composition: true,
-            }
-        } else {
-            exo::v1_content_type(v1_hint, v1_purpose)
-        };
-        exo::Field {
-            attached: true,
-            content_type,
-            surrounding_text_supported: self.surrounding_text.is_some()
-                || extension_version < extended::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
+            },
+            surrounding_text_supported: self.surrounding_text.is_some(),
             surrounding_text: host_surrounding_text(self.surrounding_text.as_ref()),
             cursor_rectangle: self.cursor_rectangle.unwrap_or_default(),
         }
@@ -189,18 +178,9 @@ fn content_type_matches(
     (hint, purpose): (u32, u32),
     surrounding: bool,
 ) -> Option<bool> {
-    let (v1_hint, v1_purpose, input_type, input_mode, flags, learning_mode) =
+    let (input_type, input_mode, flags, learning_mode) =
         crate::ime::map_v3_content_type(hint, purpose);
     Some(match *request {
-        AnyRequest::ZwpTextInputV1(v1::Request::SetContentType { hint, purpose }) => {
-            (hint, purpose) == (v1_hint, v1_purpose)
-        }
-        AnyRequest::ZcrExtendedTextInputV1(extended::Request::DeprecatedSetInputType {
-            input_type: t,
-            input_mode: m,
-            input_flags: f,
-            learning_mode: l,
-        }) => (t, m, f, l) == (input_type, input_mode, flags, learning_mode),
         AnyRequest::ZcrExtendedTextInputV1(extended::Request::SetInputType {
             input_type: t,
             input_mode: m,
@@ -456,8 +436,8 @@ struct Measured {
 struct Measuring {
     /// The transactions the guest got in the step before it.
     txns: usize,
-    /// What Exo's text measures, if the host has the extension at v11 and
-    /// the guest can be in step with Exo; `None` for none.
+    /// What Exo's text measures, if the guest can be in step with Exo;
+    /// `None` for none.
     measured: Option<Measured>,
     region: bool,
     /// What the guest gets if the proxy cannot measure it: an empty
@@ -489,9 +469,6 @@ pub(super) struct SpecText {
     shown: Option<Shown>,
     /// The last `preedit_cursor` since a terminal event (H5).
     assembly: Option<i32>,
-    /// The host has the text-input extension at v11 or later, so the
-    /// proxy has an Exo mirror.
-    mirrored: bool,
     /// The step's delete or region ([`Measuring`]).
     measuring: Option<Measuring>,
     /// The guest got none of a region Exo composed, so it shows another
@@ -556,7 +533,6 @@ impl SpecText {
             fence: Fence::Closed,
             shown: None,
             assembly: None,
-            mirrored: false,
             measuring: None,
             region_dropped: false,
             held: BTreeMap::new(),
@@ -577,16 +553,6 @@ impl SpecText {
             typed: Vec::new(),
             wrong_reports: Vec::new(),
             counts: Counts::default(),
-        }
-    }
-
-    /// The specification of a text input whose host has the text-input
-    /// extension at `extension`, if at all.
-    pub fn at_extension(self, extension: Option<u32>) -> Self {
-        let v11 = extended::EVT_CONFIRM_PREEDIT_SINCE;
-        Self {
-            mirrored: extension.is_some_and(|version| version >= v11),
-            ..self
         }
     }
 
@@ -1060,10 +1026,9 @@ impl SpecText {
             v1::Event::Leave {} if self.link == Link::Attached => {
                 // H2: Exo detached on its own. The keys in flight died with
                 // the input method, so no key held now is recovered again.
-                // Its detach confirmed the composition it tracked before its
-                // `leave` (E6), so a preedit the guest still shows is one Exo
-                // no longer tracked (E4), below v11 of the extension, which
-                // the guest commits.
+                // Its detach confirmed before its `leave` (E6), so a preedit
+                // the guest still shows is one that confirmation did not
+                // commit, which the guest commits.
                 self.counts.host_detaches += 1;
                 for held in self.held.values_mut() {
                     held.stale = true;
@@ -1134,7 +1099,7 @@ impl SpecText {
 
     /// H9 and X1: the step's delete or region, which Exo's text before it
     /// (`truth`) measures to `measured`, the transaction the guest gets if
-    /// the proxy sends it. Only an Exo mirror measures, and only from v11.
+    /// the proxy sends it, which its Exo mirror measures.
     /// Exo edited its text, unless the event is an empty delete, so the
     /// Backspace lease ends whatever reaches the guest.
     fn measure(
@@ -1154,7 +1119,7 @@ impl SpecText {
         });
         self.measuring = Some(Measuring {
             txns: self.txns.len(),
-            measured: measured.filter(|_| self.mirrored),
+            measured,
             region,
             fallback,
             truth_in_step: truth.is_some_and(|truth| self.truth_in_step(truth)),
@@ -1462,9 +1427,7 @@ impl SpecText {
         let mut wrong = Vec::new();
         let shown = self.shown.as_ref().map(|shown| shown.text.clone());
         let withheld = match (&expected[..], shown) {
-            ([report], Some(shown)) if self.mirrored && reported.is_empty() => {
-                Some((report.clone(), shown))
-            }
+            ([report], Some(shown)) if reported.is_empty() => Some((report.clone(), shown)),
             _ => None,
         };
         if !expected.is_empty() {
@@ -1744,7 +1707,7 @@ pub(super) fn step(spec: &mut SpecText, shadow: &mut Shadow) -> Option<String> {
 /// - the proxy's decisions against the specification's;
 /// - the guest's preedit against what Exo composes;
 /// - Exo's field on the focused surface against what the guest last
-///   committed, for a host whose text-input extension is `extension`.
+///   committed.
 ///
 /// Exo composes in two places that can disagree for a while, so the
 /// preedit must match one of them: the engine's composition (`engine`), or
@@ -1766,7 +1729,6 @@ pub(super) fn exact(
     exo: &Exo,
     engine: &str,
     resets: u64,
-    extension: Option<u32>,
 ) -> Vec<Failure> {
     let mut failures = Vec::new();
     let failure = |check, field, detail| Failure {
@@ -1814,11 +1776,7 @@ pub(super) fn exact(
             failures.push(failure("composition", Some(field), detail));
         }
     }
-    let mut expected: Vec<exo::Field> = spec
-        .committed
-        .iter()
-        .map(|field| field.on_host(extension.unwrap_or(0)))
-        .collect();
+    let mut expected: Vec<exo::Field> = spec.committed.iter().map(V3Field::on_host).collect();
     let held = exo.focused_fields();
     // Exo still has the report before a withheld one, and its tracker holds
     // the withheld one with the preedit the guest showed as its composition
@@ -2436,18 +2394,20 @@ mod tests {
         guest(&mut spec, &[surrounding(2), commit()], &[]);
         host(&mut spec, enter(0), &[reported("0ab", 2)]);
         // A content type that is not the committed one.
-        let typed = v1::Request::SetContentType {
-            hint: 0,
-            purpose: v1::CONTENT_PURPOSE_PASSWORD,
+        let typed = extended::Request::SetInputType {
+            input_type: extended::INPUT_TYPE_PASSWORD,
+            input_mode: extended::INPUT_MODE_DEFAULT,
+            input_flags: extended::INPUT_FLAGS_HAS_BEEN_PASSWORD,
+            learning_mode: extended::LEARNING_MODE_DISABLED,
+            inline_composition_support: extended::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
         };
         guest(&mut spec, &[commit()], &[typed.into()]);
         assert_eq!(spec.wrong_reports.len(), 4, "{:?}", spec.wrong_reports);
     }
 
-    /// From v11 of the extension, Exo's delete or region reaches the guest
-    /// as Exo's text before it measures it, or not at all, a drop; below
-    /// v11 it never does. A dropped region excuses the guest's preedit
-    /// until Exo next composes.
+    /// Exo's delete or region reaches the guest as Exo's text before it
+    /// measures it, or not at all, a drop. A dropped region excuses the
+    /// guest's preedit until Exo next composes.
     #[test]
     fn exos_delete_or_region_reaches_the_guest_as_exos_text_measures_it_or_not_at_all() {
         let delete = || -> AnyEvent {
@@ -2476,34 +2436,17 @@ mod tests {
             preedit: preedit.to_owned(),
             ..Txn::default()
         };
-        /// The host's extension, Exo's event, what the guest got, and the
-        /// text it then has, `None` if the step fails.
-        type Case = (
-            Option<u32>,
-            AnyEvent,
-            Vec<(Txn, (i32, i32))>,
-            Option<&'static str>,
-        );
-        let cases: [Case; 6] = [
-            (
-                Some(11),
-                delete(),
-                vec![(txn((2, 0), ""), (0, 0))],
-                Some("0"),
-            ),
-            (Some(11), delete(), vec![], Some("0ab")),
-            (Some(11), delete(), vec![(txn((1, 0), ""), (0, 0))], None),
-            (
-                Some(11),
-                region(),
-                vec![(txn((1, 0), "b"), (1, 1))],
-                Some("0a"),
-            ),
-            (Some(10), delete(), vec![(txn((2, 0), ""), (0, 0))], None),
-            (Some(10), region(), vec![], Some("0ab")),
+        /// Exo's event, what the guest got, and the text it then has,
+        /// `None` if the step fails.
+        type Case = (AnyEvent, Vec<(Txn, (i32, i32))>, Option<&'static str>);
+        let cases: [Case; 4] = [
+            (delete(), vec![(txn((2, 0), ""), (0, 0))], Some("0")),
+            (delete(), vec![], Some("0ab")),
+            (delete(), vec![(txn((1, 0), ""), (0, 0))], None),
+            (region(), vec![(txn((1, 0), "b"), (1, 1))], Some("0a")),
         ];
-        for (extension, event, got, text) in cases {
-            let mut spec = attached(&["0ab"]).at_extension(extension);
+        for (event, got, text) in cases {
+            let mut spec = attached(&["0ab"]);
             report(&mut spec, "0ab", 3);
             // The steps so far, which no shadow checked.
             spec.txns.clear();
@@ -2517,22 +2460,22 @@ mod tests {
             let mut shadow = Shadow::new(both(1), &texts(&["0ab"]));
             shadow.txns = got.clone();
             let failed = step(&mut spec, &mut shadow).is_some_and(|f| f.contains("transactions"));
-            let case = format!("{extension:?} {event:?} {got:?}");
+            let case = format!("{event:?} {got:?}");
             assert_eq!(failed, text.is_none(), "{case}");
             if let Some(text) = text.filter(|_| !failed) {
                 assert_eq!(spec.views[0].model.text, text, "{case}");
                 let dropped_region =
                     got.is_empty() && matches!(event, AnyEvent::ZcrExtendedTextInputV1(_));
                 assert_eq!(spec.region_dropped, dropped_region, "{case}");
-                let in_step = u64::from(got.is_empty() && extension == Some(11));
+                let in_step = u64::from(got.is_empty());
                 assert_eq!(spec.counts.drops_truth_in_step, in_step, "{case}");
             }
         }
     }
 
     /// An empty region over a preedit the guest shows that the proxy does
-    /// not measure, as with no mirror below v11, must commit that preedit:
-    /// Exo ends its composition as text all the same.
+    /// not measure must commit that preedit: Exo ends its composition as
+    /// text all the same.
     #[test]
     fn an_unmeasured_empty_region_must_commit_the_shown_preedit() {
         let region = || -> AnyEvent {
@@ -2547,7 +2490,7 @@ mod tests {
             ..Txn::default()
         };
         for (got, fails) in [(vec![(commit, (0, 0))], false), (vec![], true)] {
-            let mut spec = attached(&["0ab"]).at_extension(Some(10));
+            let mut spec = attached(&["0ab"]);
             report(&mut spec, "0ab", 3);
             preedit(&mut spec, "가");
             // The steps so far, which no shadow checked.
@@ -2868,7 +2811,7 @@ mod tests {
                 views: spec.views.clone(),
                 ..Shadow::new(both(1), &[])
             };
-            let failures = exact(&[], spec, &shadow, &exo, engine, resets, None);
+            let failures = exact(&[], spec, &shadow, &exo, engine, resets);
             let checks = failures.iter().map(|failure| failure.check);
             checks.filter(|&check| check != "field state").collect()
         };
@@ -2936,7 +2879,7 @@ mod tests {
                 views: spec.views.clone(),
                 ..Shadow::new(both(1), &[])
             };
-            let failures = exact(&[], &spec, &shadow, exo, engine, 0, None);
+            let failures = exact(&[], &spec, &shadow, exo, engine, 0);
             let checks = failures.iter().map(|failure| failure.check);
             checks.filter(|&check| check == "composition").collect()
         };

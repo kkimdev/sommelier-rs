@@ -73,10 +73,9 @@ pub(super) struct Display {
 }
 
 impl Display {
-    /// A display whose text-input extension is at `extension`, or absent,
-    /// and whose surfaces `surfaces` names.
-    pub fn new(extension: Option<u32>, surfaces: Surfaces) -> Self {
-        let mut globals = vec![
+    /// A display whose surfaces `surfaces` names.
+    pub fn new(surfaces: Surfaces) -> Self {
+        let globals = vec![
             (wl_compositor::NAME, wl_compositor::VERSION),
             (wl_seat::NAME, wl_seat::VERSION),
             (
@@ -87,8 +86,12 @@ impl Display {
                 zcr_keyboard_extension_v1::NAME,
                 zcr_keyboard_extension_v1::VERSION,
             ),
+            // Exo advertises v14, which the proxy binds at its newest.
+            (
+                zcr_text_input_extension_v1::NAME,
+                zcr_text_input_extension_v1::VERSION,
+            ),
         ];
-        globals.extend(extension.map(|version| (zcr_text_input_extension_v1::NAME, version)));
         Self {
             globals,
             objects: BTreeMap::from([(WL_DISPLAY_ID, wl_display::NAME.to_owned())]),
@@ -289,7 +292,7 @@ mod tests {
 
     #[test]
     fn a_sync_and_a_destructor_get_their_answers() {
-        let mut display = Display::new(None, Surfaces::new(&[30], &[]));
+        let mut display = Display::new(Surfaces::new(&[30], &[]));
         let surface = AnyRequest::from(wl_compositor::Request::CreateSurface { id: 7 });
         let requests = [
             (1, wl_display::Request::GetRegistry { registry: 2 }.into()),
@@ -319,6 +322,11 @@ mod tests {
                 "zcr_keyboard_extension_v1",
                 zcr_keyboard_extension_v1::VERSION,
             ),
+            global(
+                5,
+                "zcr_text_input_extension_v1",
+                zcr_text_input_extension_v1::VERSION,
+            ),
             delete_id(7),
             (8, wl_callback::Event::Done { callback_data: 0 }.into()),
             delete_id(8),
@@ -330,7 +338,7 @@ mod tests {
     #[test]
     fn a_sync_keeps_a_snapshot_of_the_trackers_it_follows() {
         use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
-        let mut display = Display::new(None, Surfaces::new(&[30], &[]));
+        let mut display = Display::new(Surfaces::new(&[30], &[]));
         let mut exo = Exo::default();
         let report = |text: &str| zwp_text_input_v1::Request::SetSurroundingText {
             text: text.into(),
@@ -361,7 +369,7 @@ mod tests {
     #[test]
     fn a_window_opens_again_on_a_new_surface_that_takes_its_focus() {
         let surfaces = Surfaces::new(&[30, 31], &[]);
-        let mut display = Display::new(None, surfaces.clone());
+        let mut display = Display::new(surfaces.clone());
         let mut exo = Exo::default();
         // The seat's focus after `request` from `sender`.
         let request = |display: &mut Display, exo: &mut Exo, sender, request: AnyRequest| {
@@ -407,7 +415,7 @@ mod tests {
 
     #[test]
     fn a_sync_follows_the_events_of_earlier_requests() {
-        let mut display = Display::new(Some(11), Surfaces::new(&[30], &[]));
+        let mut display = Display::new(Surfaces::new(&[30], &[]));
         let mut exo = Exo::default();
         // A keyboard of a seat whose focus is on surface 7: it gets the
         // keymap first, Exo enters it at once, and the sync that follows
@@ -429,7 +437,7 @@ mod tests {
 
     #[test]
     fn a_press_names_its_target_by_where_it_lands() {
-        let mut display = Display::new(None, Surfaces::new(&[30], &[]));
+        let mut display = Display::new(Surfaces::new(&[30], &[]));
         let pointer = wl_seat::Request::GetPointer { id: 5 };
         let touch = wl_seat::Request::GetTouch { id: 6 };
         answers(&mut display, &[(4, pointer.into()), (4, touch.into())]);

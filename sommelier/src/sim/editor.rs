@@ -78,13 +78,6 @@ pub(super) struct Typing {
     /// ([`TextModel::backspace_to_nfd_prefix`]) rather than a whole
     /// character.
     pub nfd_backspace: bool,
-    /// The proxy has no Exo mirror, as the host's text-input extension is
-    /// older than v11 or missing, so Exo's deletes and regions never reach
-    /// the field. The engine and Exo still compose a reconverted region,
-    /// which the field never shows, and the next key commits it, so its
-    /// text shows twice; a suggestion commits its word without deleting
-    /// the one it replaces.
-    pub unmeasured: bool,
     /// The client reports a cursor that a click moved only with its next
     /// edit, as GTK3 does.
     pub late_cursor: bool,
@@ -389,12 +382,8 @@ impl Reference {
             UserAction::AcceptSuggestion if self.takes_suggestion() => {
                 let field = &mut self.fields[self.focus];
                 let word = word_before(&field.text[..field.cursor]).to_owned();
-                let delete = match self.typing.unmeasured {
-                    true => 0,
-                    false => word.len(),
-                };
                 field.apply_txn(&Txn {
-                    delete: (delete, 0),
+                    delete: (word.len(), 0),
                     commit: format!("{word}~"),
                     ..Txn::default()
                 });
@@ -402,13 +391,11 @@ impl Reference {
             UserAction::Reconvert if self.reconverts() => {
                 let c = self.reconverted().expect("a character to reconvert");
                 let region = format!("{c}{}", self.region.take().unwrap_or_default());
-                if !self.typing.unmeasured {
-                    self.fields[self.focus].apply_txn(&Txn {
-                        delete: (c.len_utf8(), 0),
-                        preedit: region.clone(),
-                        ..Txn::default()
-                    });
-                }
+                self.fields[self.focus].apply_txn(&Txn {
+                    delete: (c.len_utf8(), 0),
+                    preedit: region.clone(),
+                    ..Txn::default()
+                });
                 self.region = Some(region);
             }
             UserAction::Focus(_)
@@ -456,16 +443,11 @@ impl Reference {
         engine && self.composer.preedit().is_empty() && self.reconverted().is_some()
     }
 
-    /// The character a reconversion would take: the one before the region,
-    /// which a host without a region still holds as text, or before the
-    /// cursor; if it can take it.
+    /// The character a reconversion would take: the one before the
+    /// cursor, if it can take it.
     fn reconverted(&self) -> Option<char> {
         let field = &self.fields[self.focus];
-        let hidden = match self.typing.unmeasured {
-            true => self.region.as_ref().map_or(0, String::len),
-            false => 0,
-        };
-        let before = field.text[..field.cursor - hidden].chars().next_back();
+        let before = field.text[..field.cursor].chars().next_back();
         before.filter(|&c| reconvertible(c))
     }
 
@@ -844,18 +826,6 @@ mod tests {
         assert!(editor.leaves_composition(UserAction::Focus(1)));
         editor.apply(UserAction::Focus(1));
         assert_eq!(editor.fields()[0], model("0a가", 5, ""));
-        // A host that cannot show a region shows none, and the next key
-        // commits it again.
-        let unmeasured = Typing {
-            unmeasured: true,
-            ..Typing::default()
-        };
-        let mut editor = Reference::new(vec![TextModel::new("0a가")]).typing(unmeasured);
-        editor.apply(reconvert);
-        editor.apply(reconvert);
-        assert_eq!(editor.fields(), [model("0a가", 5, "")]);
-        editor.apply(UserAction::Key(Key::Char(' ')));
-        assert_eq!(editor.fields(), [model("0a가a가 ", 10, "")]);
     }
 
     #[test]

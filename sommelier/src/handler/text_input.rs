@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::handler::callback::queue_internal_sync;
 use crate::handler::ime_keys::{
     end_backspace_repeat_for_seat, end_backspace_repeat_for_text_input, forget_held_keys_for_seat,
@@ -400,15 +402,20 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
     }
 
     fn on_get_text_input(&mut self, ctx: &mut Context, id: u32, seat: u32) -> Action {
-        let Some(host_manager_id) = ctx.host_text_input_manager_v1_id else {
-            log::error!("Cannot create v3 text input without a host v1 manager");
-            return Action::Drop;
-        };
         // A new object takes its parent's version: the guest text input its
         // guest manager's, and each host object its host manager's.
         let guest_manager_version = ctx
             .shadow_table
             .guest_object_version_or_unknown(ctx.last_sender_id);
+        let managers = host_text_input_managers(ctx);
+        let Some((host_manager_id, host_ext_manager_id)) = managers else {
+            // The guest owns the ID, so its requests must still find an
+            // object: one that has no input method.
+            warn_no_input_method(&NO_INPUT_METHOD_WARNED);
+            ctx.shadow_table
+                .create_local(id, zwp_text_input_v3::NAME, guest_manager_version);
+            return Action::Drop;
+        };
         let host_manager_version = ctx
             .shadow_table
             .host_object_version_or_unknown(host_manager_id);
@@ -419,33 +426,61 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             zwp_text_input_v1::NAME,
             host_manager_version,
         );
-        let host_ext = ctx
-            .host_text_input_extension_v1_id
-            .map(|host_ext_manager_id| {
-                let host_ext_version = ctx
-                    .shadow_table
-                    .host_object_version_or_unknown(host_ext_manager_id);
-                let host_ext_id = ctx
-                    .shadow_table
-                    .create_host_only(zcr_extended_text_input_v1::NAME, host_ext_version);
-                HostExt {
-                    id: host_ext_id,
-                    version: host_ext_version,
-                    manager: host_ext_manager_id,
-                }
-            });
+        let host_ext_version = ctx
+            .shadow_table
+            .host_object_version_or_unknown(host_ext_manager_id);
+        let host_ext_id = ctx
+            .shadow_table
+            .create_host_only(zcr_extended_text_input_v1::NAME, host_ext_version);
         let create = Input::Create {
             ti: TiId(id),
             seat: SeatId(seat),
             host: HostTi {
                 v1: host_v1_id,
-                ext: host_ext,
+                ext: HostExt {
+                    id: host_ext_id,
+                    manager: host_ext_manager_id,
+                },
             },
             manager: host_manager_id,
         };
         ime(ctx, create);
         Action::Drop
     }
+}
+
+/// The host's `zwp_text_input_manager_v1` and `zcr_text_input_extension_v1`
+/// that a text input is created from: `None` unless the host has both, the
+/// extension at v11 or later, the first whose confirmations are
+/// `confirm_preedit`, which the IME core's Exo mirror reads (`docs/IME.md`
+/// E14).
+fn host_text_input_managers(ctx: &Context) -> Option<(u32, u32)> {
+    let manager = ctx.host_text_input_manager_v1_id?;
+    let ext_manager = ctx.host_text_input_extension_v1_id?;
+    let version = ctx.shadow_table.host_object_version_or_unknown(ext_manager);
+    (version >= zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE)
+        .then_some((manager, ext_manager))
+}
+
+/// Whether [`warn_no_input_method`] has warned. Every client connection
+/// binds the same host globals, so one warning per process says it all.
+static NO_INPUT_METHOD_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Warn, once per `warned`, that text inputs get no input method.
+///
+/// # Returns
+///
+/// Whether this call logged the warning.
+fn warn_no_input_method(warned: &AtomicBool) -> bool {
+    if warned.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    log::warn!(
+        "Text inputs get no input method: the host lacks zwp_text_input_manager_v1, or \
+         zcr_text_input_extension_v1 v{} or later",
+        zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE
+    );
+    true
 }
 
 /// The host seat that can carry an `activate` or `deactivate` of a text
@@ -559,6 +594,11 @@ pub struct TextInputV3Handler;
 impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
+        // A text input with no input method is local, and its destructor
+        // completes in the proxy.
+        if ctx.shadow_table.is_local(guest_id) {
+            return Action::Drop;
+        }
         // The v3 object is guest-facing but backed by a v1 host object whose
         // protocol has no destructor, so the host object stays for the
         // connection and the guest lifecycle completes locally. Ending the
@@ -660,7 +700,7 @@ pub(super) mod tests {
         ti: u32,
         /// The host `zwp_text_input_v1` behind it.
         host: u32,
-        /// The host `zcr_extended_text_input_v1` behind it, 0 without one.
+        /// The host `zcr_extended_text_input_v1` behind it.
         host_ext: u32,
         seat: Object,
         keyboard: Object,
@@ -672,15 +712,10 @@ pub(super) mod tests {
         extended_keyboard: u32,
     }
 
-    /// The text-input extension version the proxy binds.
-    const EXTENSION: Option<u32> = Some(zcr_text_input_extension_v1::VERSION);
-
-    /// What the host offers a [`Field`] besides its seat, keyboard and
-    /// text-input manager.
+    /// What the host offers a [`Field`] besides its seat, keyboard,
+    /// text-input manager and the newest text-input extension.
     #[derive(Clone, Copy)]
     struct Host {
-        /// The text-input extension's version, if the host has one.
-        text_input_extension: Option<u32>,
         /// Whether the host advertises the keyboard extension, which
         /// reports each key before the input method takes it (`peek_key`)
         /// and takes the proxy's `ack_key`, and sends the keyboard the
@@ -708,16 +743,6 @@ pub(super) mod tests {
     }
 
     impl Field {
-        /// A disabled text input whose host has the text-input extension at
-        /// version `extension`, if any.
-        async fn new(extension: Option<u32>) -> Self {
-            Self::offered(Host {
-                text_input_extension: extension,
-                keyboard_extension_with_keymap: false,
-            })
-            .await
-        }
-
         /// A disabled text input with what `host` offers.
         async fn offered(host: Host) -> Self {
             let mut s = Session::new();
@@ -742,11 +767,10 @@ pub(super) mod tests {
                     zwp_text_input_manager_v1::VERSION,
                 )
                 .await;
-            if let Some(version) = host.text_input_extension {
-                s.advertise("zcr_text_input_extension_v1", version).await;
-                // The proxy binds it for itself.
-                s.host_received();
-            }
+            let version = zcr_text_input_extension_v1::VERSION;
+            s.advertise("zcr_text_input_extension_v1", version).await;
+            // The proxy binds it for itself.
+            s.host_received();
             let mut f = Self {
                 s,
                 ti: 0,
@@ -798,9 +822,12 @@ pub(super) mod tests {
             f
         }
 
-        /// A disabled text input whose host has the newest extension.
+        /// A disabled text input.
         async fn disabled() -> Self {
-            Self::new(EXTENSION).await
+            Self::offered(Host {
+                keyboard_extension_with_keymap: false,
+            })
+            .await
         }
 
         /// A text input the guest enabled, which the host activated.
@@ -845,7 +872,6 @@ pub(super) mod tests {
         /// ([`Host::keyboard_extension_with_keymap`]).
         async fn typing() -> Self {
             let mut f = Self::offered(Host {
-                text_input_extension: EXTENSION,
                 keyboard_extension_with_keymap: true,
             })
             .await;
@@ -947,7 +973,6 @@ pub(super) mod tests {
             };
             self.host = id;
             self.host_ext = match host[1..] {
-                [] => 0,
                 [(
                     _,
                     AnyRequest::ZcrTextInputExtensionV1(ExtManager::GetExtendedTextInput {
@@ -1045,7 +1070,7 @@ pub(super) mod tests {
             (hint, purpose): (u32, u32),
             support: bool,
         ) -> [(u32, AnyRequest); 2] {
-            let (_, _, input_type, input_mode, input_flags, learning_mode) =
+            let (input_type, input_mode, input_flags, learning_mode) =
                 map_v3_content_type(hint, purpose);
             [
                 self.ext(Ext::SetSurroundingTextSupport {
@@ -1576,7 +1601,7 @@ pub(super) mod tests {
         expected.extend(f.content_type((0, PASSWORD), false));
         expected.push(f.commit_state(3));
         assert_eq!(f.host_received().await, expected);
-        let (_, _, input_type, _, _, learning_mode) = map_v3_content_type(0, PASSWORD);
+        let (input_type, _, _, learning_mode) = map_v3_content_type(0, PASSWORD);
         assert_eq!(input_type, zcr_extended_text_input_v1::INPUT_TYPE_PASSWORD);
         assert_eq!(
             learning_mode,
@@ -1646,8 +1671,7 @@ pub(super) mod tests {
     }
 
     /// Exo detaches while the guest shows a preedit that its detach did
-    /// not confirm, as below v11 of the extension once a report it could
-    /// not match dropped its composition (E4, E6): the guest commits it.
+    /// not confirm (E6): the guest commits it.
     #[tokio::test]
     async fn an_exo_detach_commits_the_guest_preedit() {
         let mut f = attached_password_field().await;
@@ -1793,7 +1817,7 @@ pub(super) mod tests {
         f.answered(1);
         // Only the log shows the warning, so read the flag that makes it
         // once.
-        assert!(f.state().warned_for_test().0);
+        assert!(f.state().warned_for_test());
 
         // Once it has one, the text input activates, and its content type
         // follows the activation.
@@ -1958,54 +1982,34 @@ pub(super) mod tests {
             INPUT_FLAGS_HAS_BEEN_PASSWORD as SECRET, INPUT_FLAGS_SPELLCHECK_ON, INPUT_MODE_NUMERIC,
             INPUT_TYPE_NUMBER, INPUT_TYPE_PASSWORD, INPUT_TYPE_TEXT_AREA, LEARNING_MODE_DISABLED,
         };
-        use zwp_text_input_v1::{CONTENT_HINT_SENSITIVE_DATA, CONTENT_PURPOSE_DIGITS};
         use zwp_text_input_v3::{
-            CONTENT_HINT_MULTILINE, CONTENT_HINT_SPELLCHECK, CONTENT_PURPOSE_PASSWORD,
-            CONTENT_PURPOSE_PIN,
+            CONTENT_HINT_MULTILINE, CONTENT_HINT_SENSITIVE_DATA, CONTENT_HINT_SPELLCHECK,
+            CONTENT_PURPOSE_PASSWORD, CONTENT_PURPOSE_PIN,
         };
         // A text field, a terminal and a password field.
         use zcr_extended_text_input_v1::{
             INPUT_FLAGS_NONE, INPUT_MODE_DEFAULT, INPUT_TYPE_TEXT, LEARNING_MODE_ENABLED,
         };
-        use zwp_text_input_v1 as v1_enum;
         use zwp_text_input_v3::CONTENT_PURPOSE_TERMINAL;
-        let text = |v1_purpose| {
-            let flags = INPUT_FLAGS_NONE;
-            (
-                0,
-                v1_purpose,
-                INPUT_TYPE_TEXT,
-                INPUT_MODE_DEFAULT,
-                flags,
-                LEARNING_MODE_ENABLED,
-            )
-        };
-        assert_eq!(
-            map_v3_content_type(0, 0),
-            text(v1_enum::CONTENT_PURPOSE_NORMAL)
+        let text = (
+            INPUT_TYPE_TEXT,
+            INPUT_MODE_DEFAULT,
+            INPUT_FLAGS_NONE,
+            LEARNING_MODE_ENABLED,
         );
-        assert_eq!(
-            map_v3_content_type(0, CONTENT_PURPOSE_TERMINAL),
-            text(v1_enum::CONTENT_PURPOSE_TERMINAL)
+        assert_eq!(map_v3_content_type(0, 0), text);
+        assert_eq!(map_v3_content_type(0, CONTENT_PURPOSE_TERMINAL), text);
+        let password = (
+            INPUT_TYPE_PASSWORD,
+            INPUT_MODE_DEFAULT,
+            SECRET,
+            LEARNING_MODE_DISABLED,
         );
-        let (mode, purpose) = (INPUT_MODE_DEFAULT, v1_enum::CONTENT_PURPOSE_PASSWORD);
-        assert_eq!(
-            map_v3_content_type(0, CONTENT_PURPOSE_PASSWORD),
-            (
-                0,
-                purpose,
-                INPUT_TYPE_PASSWORD,
-                mode,
-                SECRET,
-                LEARNING_MODE_DISABLED
-            )
-        );
-        // v1 has no PIN purpose: digits, sensitive and never learned.
+        assert_eq!(map_v3_content_type(0, CONTENT_PURPOSE_PASSWORD), password);
+        // A PIN: digits, secret and never learned.
         assert_eq!(
             map_v3_content_type(0, CONTENT_PURPOSE_PIN),
             (
-                CONTENT_HINT_SENSITIVE_DATA,
-                CONTENT_PURPOSE_DIGITS,
                 INPUT_TYPE_NUMBER,
                 INPUT_MODE_NUMERIC,
                 SECRET,
@@ -2014,21 +2018,14 @@ pub(super) mod tests {
         );
         assert_eq!(
             map_v3_content_type(CONTENT_HINT_SENSITIVE_DATA, CONTENT_PURPOSE_PASSWORD),
-            (
-                0x80,
-                8,
-                INPUT_TYPE_PASSWORD,
-                0,
-                SECRET,
-                LEARNING_MODE_DISABLED
-            )
+            password
         );
         assert_eq!(
-            map_v3_content_type(CONTENT_HINT_MULTILINE, 0).2,
+            map_v3_content_type(CONTENT_HINT_MULTILINE, 0).0,
             INPUT_TYPE_TEXT_AREA
         );
         assert_eq!(
-            map_v3_content_type(CONTENT_HINT_SPELLCHECK, 0).4,
+            map_v3_content_type(CONTENT_HINT_SPELLCHECK, 0).2,
             INPUT_FLAGS_SPELLCHECK_ON,
             "v3 spellcheck must map to Chrome spellcheck_on"
         );
@@ -2118,36 +2115,6 @@ pub(super) mod tests {
             )
         );
         f.answered(4);
-    }
-
-    #[tokio::test]
-    async fn a_host_without_surrounding_text_support_gets_no_resend() {
-        // v8 has set_input_type but not set_surrounding_text_support.
-        let mut f = Field::new(Some(8)).await;
-        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        let [_, set_input_type] = f.content_type((0, 0), false);
-        let expected = f.reset(
-            1,
-            Reset {
-                step: vec![f.activate()],
-                content_type: vec![set_input_type],
-            },
-        );
-        assert_eq!(f.host_received().await, expected);
-        f.answered(1);
-
-        // The host was told no support, so gaining surrounding text changes
-        // nothing it knows.
-        f.s.guest([
-            v3::set_surrounding_text(f.ti, "abc", 3, 3).unwrap(),
-            v3::commit(f.ti),
-        ])
-        .await;
-        assert_eq!(
-            f.host_received().await,
-            [f.surrounding_text("abc", 3, 3), f.commit_state(2)]
-        );
-        f.answered(2);
     }
 
     #[tokio::test]
@@ -2256,23 +2223,39 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), []);
     }
 
+    /// A host without the text-input extension at v11 gives a text input
+    /// no input method: the guest's text input is inert, sends nothing,
+    /// and its destructor still completes. One warning per process says
+    /// why.
     #[tokio::test]
-    async fn text_input_creation_works_without_optional_chromeos_extension() {
-        let mut f = Field::new(None).await;
-        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        let content_type = f.v1(V1::SetContentType {
-            hint: 0,
-            purpose: 0,
-        });
-        let expected = f.reset(
-            1,
-            Reset {
-                step: vec![f.activate()],
-                content_type: vec![content_type],
-            },
-        );
-        assert_eq!(f.host_received().await, expected);
-        f.answered(1);
+    async fn a_text_input_without_a_v11_extension_has_no_input_method() {
+        let since = zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE;
+        for extension in [None, Some(since - 1)] {
+            let mut s = Session::new();
+            let (seat, _) = s.keyboard().await;
+            let version = zwp_text_input_manager_v1::VERSION;
+            let manager = s.bind("zwp_text_input_manager_v1", version).await;
+            if let Some(version) = extension {
+                s.advertise("zcr_text_input_extension_v1", version).await;
+                // The proxy binds it for itself.
+                s.host_received();
+            }
+            let ti = s.new_id();
+            s.guest([
+                zwp_text_input_manager_v3::req::get_text_input(manager, ti, seat),
+                v3::enable(ti),
+                v3::set_content_type(ti, 0, 0),
+                v3::commit(ti),
+                v3::destroy(ti),
+            ])
+            .await;
+            assert_eq!(s.host_received(), [], "{extension:?}");
+            let delete_id = wl_display::Event::DeleteId { id: ti };
+            assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
+        }
+        let warned = AtomicBool::new(false);
+        assert!(warn_no_input_method(&warned));
+        assert!(!warn_no_input_method(&warned));
     }
 
     /// A leave is a hard boundary: what the guest requests until the next
@@ -3521,8 +3504,8 @@ pub(super) mod tests {
 
     /// Each surrounding text reaches the host with a `wl_display.sync`
     /// right after it, whose `done` places the report among Exo's events
-    /// for the IME core's Exo mirror; the guest never sees it. From v11 of
-    /// the extension the mirror measures Exo's deletes in Exo's text.
+    /// for the IME core's Exo mirror; the guest never sees it. The mirror
+    /// measures Exo's deletes in Exo's text.
     #[tokio::test]
     async fn a_report_reaches_the_host_with_its_barrier() {
         let mut f = Field::enabled().await;
@@ -4331,7 +4314,6 @@ pub(super) mod tests {
         const KEY_S: u32 = 31;
         const KEY_A: u32 = 30;
         let mut f = Field::offered(Host {
-            text_input_extension: EXTENSION,
             keyboard_extension_with_keymap: true,
         })
         .await;
@@ -4722,12 +4704,6 @@ pub(super) mod tests {
 
     impl Ime {
         pub(in crate::handler) fn new() -> Self {
-            Self::with_extension_version(Some(zcr_extended_text_input_v1::VERSION))
-        }
-
-        /// The fixture whose extension has `version` in the object table,
-        /// or none.
-        pub(in crate::handler) fn with_extension_version(version: Option<u32>) -> Self {
             let mut ctx = Context::new_for_test(false, false, vec![]);
             let table = &mut ctx.shadow_table;
             table.insert_paired_for_test(SEAT, HOST_SEAT, "wl_seat");
@@ -4738,18 +4714,16 @@ pub(super) mod tests {
                 "zwp_text_input_v3",
                 "zwp_text_input_v1",
             );
-            if let Some(version) = version {
-                let interface = "zcr_extended_text_input_v1";
-                ctx.shadow_table
-                    .insert_host_only_for_test(HOST_EXT, interface, version);
-            }
+            let interface = "zcr_extended_text_input_v1";
+            let version = zcr_extended_text_input_v1::VERSION;
+            ctx.shadow_table
+                .insert_host_only_for_test(HOST_EXT, interface, version);
             let host = HostTi {
                 v1: HOST,
-                ext: Some(HostExt {
+                ext: HostExt {
                     id: HOST_EXT,
-                    version: ctx.shadow_table.host_object_version_or_unknown(HOST_EXT),
                     manager: 0,
-                }),
+                },
             };
             let ti = TiId(TI);
             ctx.ime
@@ -4931,27 +4905,6 @@ pub(super) mod tests {
                 })
                 .collect()
         }
-
-        /// The requests queued for the host since the last call.
-        pub(in crate::handler) fn requests(&mut self) -> Vec<(u32, AnyRequest)> {
-            let queue = std::mem::take(&mut self.ctx.client_to_host_queue);
-            let table = &self.ctx.shadow_table;
-            queue
-                .iter()
-                .flat_map(|(bytes, _)| crate::test_support::glued_messages(bytes))
-                .map(|message| {
-                    crate::test_support::decode(message, &mut Default::default(), |msg| {
-                        let interface = match msg.sender_id {
-                            HOST_EXT => "zcr_extended_text_input_v1",
-                            WL_DISPLAY_ID => "wl_display",
-                            host => table.get_host_interface(host).expect("a sender"),
-                        };
-                        AnyRequest::from_wire(interface, msg)
-                    })
-                    .expect("a queued request decodes")
-                })
-                .collect()
-        }
     }
 
     pub(in crate::handler) fn key(
@@ -5054,7 +5007,7 @@ pub(super) mod tests {
         ctx.shadow_table
             .insert_host_only_for_test(2, "zwp_text_input_manager_v1", 4);
         ctx.shadow_table
-            .insert_host_only_for_test(3, "zcr_text_input_extension_v1", 7);
+            .insert_host_only_for_test(3, "zcr_text_input_extension_v1", 12);
         ctx.shadow_table
             .create_local(40, "zwp_text_input_manager_v3", 5);
         ctx.last_sender_id = 40;
@@ -5062,10 +5015,9 @@ pub(super) mod tests {
         let mut handler = TextInputManagerV3Handler;
         assert_eq!(handler.on_get_text_input(&mut ctx, 20, 30), Action::Drop);
         let host = ctx.ime.get(TiId(20)).expect("the text input").host();
-        let child_id = host.ext.expect("extended text input child").id;
         assert_eq!(
-            ctx.shadow_table.host_object_version(child_id),
-            Some(7),
+            ctx.shadow_table.host_object_version(host.ext.id),
+            Some(12),
             "version guards must use the manager's negotiated host version"
         );
         assert_eq!(ctx.shadow_table.host_object_version(host.v1), Some(4));
@@ -5089,7 +5041,10 @@ pub(super) mod tests {
         else {
             panic!("the destroy drains behind a barrier");
         };
-        let replacement = HostTi { v1: 11, ext: None };
+        let replacement = HostTi {
+            v1: 11,
+            ext: HostExt { id: 12, manager: 0 },
+        };
         let create = Input::Create {
             ti,
             seat: SeatId(SEAT),
@@ -5146,41 +5101,8 @@ pub(super) mod tests {
         assert_eq!(commit_state, [(HOST, V1::CommitState { serial: 0 })]);
     }
 
-    /// An extension whose version the object table lacks is taken to have
-    /// every request, as the newest does.
-    #[test]
-    fn an_extension_without_a_version_takes_the_newest_requests() {
-        use zcr_extended_text_input_v1::{
-            INLINE_COMPOSITION_SUPPORT_SUPPORTED, INPUT_FLAGS_HAS_BEEN_PASSWORD,
-            INPUT_MODE_NUMERIC, INPUT_TYPE_NUMBER, LEARNING_MODE_DISABLED,
-            SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
-        };
-        let mut ime = Ime::with_extension_version(None);
-        ime.ctx.last_sender_id = TI;
-        let pin = zwp_text_input_v3::CONTENT_PURPOSE_PIN;
-        TextInputV3Handler.on_set_content_type(&mut ime.ctx, 0, pin);
-        TextInputV3Handler.on_commit(&mut ime.ctx);
-
-        let support = Ext::SetSurroundingTextSupport {
-            support: SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
-        };
-        let set_input_type = Ext::SetInputType {
-            input_type: INPUT_TYPE_NUMBER,
-            input_mode: INPUT_MODE_NUMERIC,
-            input_flags: INPUT_FLAGS_HAS_BEEN_PASSWORD,
-            learning_mode: LEARNING_MODE_DISABLED,
-            inline_composition_support: INLINE_COMPOSITION_SUPPORT_SUPPORTED,
-        };
-        assert_eq!(
-            ime.requests(),
-            [
-                (HOST_EXT, support.into()),
-                (HOST_EXT, set_input_type.into()),
-                (HOST, V1::CommitState { serial: 1 }.into()),
-            ]
-        );
-    }
-
+    /// Without a host v1 manager the text input has no input method,
+    /// like one without the extension.
     #[test]
     fn text_input_creation_without_host_manager_does_not_create_broken_state() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
@@ -5188,6 +5110,7 @@ pub(super) mod tests {
 
         assert_eq!(handler.on_get_text_input(&mut ctx, 20, 7), Action::Drop);
         assert!(ctx.ime.get(TiId(20)).is_none());
+        assert!(ctx.shadow_table.is_local(20));
         assert!(ctx.client_to_host_queue.is_empty());
     }
 }
