@@ -550,7 +550,8 @@ and never twice. Once the key is pressed again, only one older
 generation per path still waits for its release, and a late IME keysym
 release does not close its press; see
 [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
-[KEYBOARD.md](KEYBOARD.md) describes each key's states. Keymaps are
+[KEYBOARD.md](KEYBOARD.md) describes each key's states and the one
+transition each input makes. Keymaps are
 compiled locally with xkbcommon to map keysyms back to keycodes and to
 classify chords; chords listed in
 `SOMMELIER_ACCELERATORS` are acknowledged as not handled through

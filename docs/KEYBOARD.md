@@ -61,6 +61,48 @@ cannot be written:
 | `stale` | `Held { stale }` only: a release ends it |
 | `guest_owner`, `guest_press_serial` | `GuestPress`: a serial only on a keysym press or its tombstone |
 
+## Transitions
+
+Each input has one transition in the registry. The handler decodes the
+event, supplies the facts the registry cannot know (the chord under the
+keyboard's XKB state, focus), and applies the effects on the guest:
+
+| Input | Transition | Handler |
+| --- | --- | --- |
+| `peek_key` press, repeat, release | `peek_key(PeekInput)` → `PeekOutcome` | `on_peek_key` |
+| `wl_keyboard.key` | `admit_key` (physical), then `transition_guest_key` (delivery) | `on_key` |
+| keysym press, repeat, release | `transition_guest_key(TextInput*)` | `ime_keys::on_keysym` |
+| recovered pair | `transition_guest_key(RecoverIme)` | `ime_keys::recover_pending` |
+| `wl_keyboard.enter` | `install_enter_snapshot`: every listed key `Held`, `Physical` | `on_enter` |
+| leave, keyboard end | `clear_keyboard` of each keyboard that lost its focus or ended | `on_leave`, `forget_keyboard` |
+| H2 detach | `mark_held_keys_stale` | `ime_keys::forget_held_keys_for_seat` |
+| Backspace lease | `arm_ime_repeat`, `cancel_backspace_repeat(_for_owner)` | `ime_keys`, `text_input::apply_lease` |
+
+`wl_keyboard.key` has two steps because placing a window, which a
+placement chord does before the key's delivery is decided, needs the
+whole `Context`. `admit_key` settles the events that belong to another
+generation (a late release of a retired generation, a release or press
+under another serial than the key's peek announced) and moves the phase;
+`transition_guest_key` decides the delivery and the `ack_key` from the
+guest owner. `peek_key` retires a stale held generation on a press, owing
+the guest its release, numbers a new peek generation, refreshes the peek
+of a held one, or closes it on a release, unless the release is older
+than the peek.
+
+The phase moves:
+
+- idle → `Unseen`: a keysym press comes first.
+- idle or `Unseen` → `Held`: a press on either channel, or the enter.
+- `Held` → `Released`: a release on either channel; it ends the lease
+  and the detach marker.
+- `Released` → a new `Held` generation: a press. If the guest still
+  holds the old press, its release waits as a retired release.
+- `Held { stale: true }` → a new `Held` generation: a peek press. If the
+  guest still holds the old press, it gets its release first.
+- any → idle: once nothing refers to the generation (not held, no live
+  peek, no guest owner, no suppression), and at an enter, a leave that
+  ends the keyboard's focus, or the keyboard's end.
+
 ## Tests
 
 - `key_generation_registry_matches_the_model_for_all_short_transition_sequences`

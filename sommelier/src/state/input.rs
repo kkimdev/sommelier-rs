@@ -123,6 +123,55 @@ pub struct GuestKeyDecision {
     pub ends_repeat: bool,
 }
 
+/// One `zcr_extended_keyboard_v1.peek_key` of a key
+/// ([`KeyGenerationRegistry::peek_key`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeekInput {
+    /// `guest_input`: under its keyboard's current state the key forms
+    /// neither a host accelerator nor a placement chord.
+    Press {
+        serial: u32,
+        time: u32,
+        guest_input: bool,
+    },
+    /// A protocol v10 repeat.
+    Repeat {
+        serial: u32,
+        time: u32,
+    },
+    Release {
+        serial: u32,
+        time: u32,
+    },
+}
+
+/// What a `peek_key` did to its key's generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PeekOutcome {
+    /// The press retired a generation held across the input method's own
+    /// detach, whose press the guest still holds: the guest is owed its
+    /// release, before anything of the new press.
+    pub owes_release: bool,
+    /// The press numbered a new peek generation with this sequence, which
+    /// its seat records as its latest.
+    pub numbered: Option<u64>,
+    /// The peek changed nothing: a repeat of a key not held, or a release
+    /// older than the key's latest peek.
+    pub ignored: bool,
+}
+
+/// How a `wl_keyboard.key` relates to its key's generation
+/// ([`KeyGenerationRegistry::admit_key`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyAdmission {
+    /// The event is settled without a delivery decision: acknowledge it
+    /// with `handled`, and forward it to the guest or not.
+    Settled { handled: bool, forward: bool },
+    /// The event belongs to the key's current generation: its delivery is
+    /// decided by [`KeyGenerationRegistry::transition_guest_key`].
+    Current,
+}
+
 /// A guest press from a retired physical generation whose release channel has
 /// not arrived yet.
 ///
@@ -935,6 +984,149 @@ impl KeyGenerationRegistry {
         }
         self.prune_key(keyboard, key);
         release.delivery == GuestKeyDelivery::Forward
+    }
+
+    /// The transition for one `peek_key` of `key` on `keyboard`; its
+    /// effects on the guest and the seat are the caller's
+    /// ([`PeekOutcome`]).
+    ///
+    /// A press of a key held across a detach retires that generation
+    /// first ([`Self::retire_stale_generation`]). A press of a key not
+    /// held, or held without a peek press, numbers the generation; it is
+    /// eligible for recovery and keysyms only if it is guest input that no
+    /// host accelerator or compositor shortcut has taken. A press of a key
+    /// already peeked (a legacy duplicate) and a repeat refresh the peek's
+    /// serial and time. A release closes the generation unless it is older
+    /// than the key's latest peek: ChromeOS may reuse one serial across
+    /// several key transitions, so within one serial the time orders them,
+    /// but a newer time alone does not, as an old serial can arrive late
+    /// with an unrelated time.
+    pub(crate) fn peek_key(&mut self, keyboard: HostId, key: u32, input: PeekInput) -> PeekOutcome {
+        match input {
+            PeekInput::Press {
+                serial,
+                time,
+                guest_input,
+            } => {
+                let owes_release = self.retire_stale_generation(keyboard, key);
+                let held = self.physically_held(keyboard, key);
+                if held && self.peek(keyboard, key).is_some() {
+                    self.refresh_peek(keyboard, key, serial, time);
+                    return PeekOutcome {
+                        owes_release,
+                        ..PeekOutcome::default()
+                    };
+                }
+                // peek_key may trail the wl_keyboard press it describes,
+                // which may have found a host accelerator or a compositor
+                // shortcut, even if a reload has since removed its
+                // binding. Only a still-held generation is the one this
+                // peek describes; a released one is retired by the press.
+                let consumed_by_shortcut = held
+                    && self.guest_owner(keyboard, key) == Some(GuestKeyOwner::CompositorShortcut);
+                let eligible = guest_input
+                    && !consumed_by_shortcut
+                    && !self.host_accelerator_suppressed(keyboard, key);
+                let sequence = self.observe_peek_press(keyboard, key, serial, time, eligible);
+                PeekOutcome {
+                    owes_release,
+                    numbered: Some(sequence),
+                    ignored: false,
+                }
+            }
+            PeekInput::Repeat { serial, time } => {
+                if !self.physically_held(keyboard, key) {
+                    return PeekOutcome {
+                        ignored: true,
+                        ..PeekOutcome::default()
+                    };
+                }
+                self.refresh_peek(keyboard, key, serial, time);
+                PeekOutcome::default()
+            }
+            PeekInput::Release { serial, time } => {
+                if let Some(press) = self.peek(keyboard, key) {
+                    let ordered = serial_is_after(serial, press.serial)
+                        || (serial == press.serial && !serial_is_after(press.time, time));
+                    if !ordered {
+                        log::debug!(
+                            "peek_key: dropping stale release serial={serial} time={time} \
+                             before current serial={} time={}",
+                            press.serial,
+                            press.time,
+                        );
+                        return PeekOutcome {
+                            ignored: true,
+                            ..PeekOutcome::default()
+                        };
+                    }
+                }
+                self.observe_peek_release(keyboard, key, serial);
+                PeekOutcome::default()
+            }
+        }
+    }
+
+    /// The physical transition for one `wl_keyboard.key` of `key` on
+    /// `keyboard` with `serial`, which says whether the event still needs
+    /// its delivery decided ([`KeyAdmission`]).
+    ///
+    /// `peek_key` promises that the `wl_keyboard.key` after it has its
+    /// serial, and the extension sends each peek release before the
+    /// matching `wl_keyboard` release. So a release under a retired
+    /// generation's release serial closes only that generation's guest
+    /// press, and leaves the current generation alone; a release of a
+    /// peeked generation under another serial, and a press of a held peeked
+    /// generation under another serial, belong to another generation and
+    /// are dropped. Otherwise a press after a release starts a new
+    /// generation, except the delayed press a released peek announced, and
+    /// a release releases the key.
+    pub(crate) fn admit_key(
+        &mut self,
+        keyboard: HostId,
+        key: u32,
+        state: u32,
+        serial: u32,
+    ) -> KeyAdmission {
+        use crate::protocols::wayland::wl_keyboard::{KEY_STATE_PRESSED, KEY_STATE_RELEASED};
+        let peek_press_serial = self.peek_press_serial(keyboard, key);
+        match state {
+            KEY_STATE_RELEASED => {
+                if self.take_pending_physical_release(keyboard, key, serial) {
+                    return KeyAdmission::Settled {
+                        handled: true,
+                        forward: true,
+                    };
+                }
+                if peek_press_serial.is_some()
+                    && self.physical_release_serial(keyboard, key) != Some(serial)
+                {
+                    return KeyAdmission::Settled {
+                        handled: false,
+                        forward: false,
+                    };
+                }
+                self.observe_physical_event(keyboard, key, state, Some(serial));
+            }
+            KEY_STATE_PRESSED => {
+                if self.physically_held(keyboard, key)
+                    && peek_press_serial.is_some_and(|peek_serial| peek_serial != serial)
+                {
+                    return KeyAdmission::Settled {
+                        handled: false,
+                        forward: false,
+                    };
+                }
+                let delayed_released_peek_press =
+                    self.physical_released(keyboard, key) && peek_press_serial == Some(serial);
+                if !delayed_released_peek_press {
+                    self.observe_physical_event(keyboard, key, state, Some(serial));
+                }
+            }
+            // A repeat changes no physical state.
+            _ => {}
+        }
+        KeyAdmission::Current
     }
 
     /// The held key's repeat lease ends for the rest of the hold.
