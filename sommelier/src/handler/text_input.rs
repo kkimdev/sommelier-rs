@@ -4876,9 +4876,15 @@ pub(super) mod tests {
             serial: u32,
             time: u32,
         ) {
-            self.ctx
-                .key_generations
-                .observe_peek_press(keyboard, key, serial, time, true);
+            self.ctx.key_generations.peek_key(
+                keyboard,
+                key,
+                crate::state::PeekInput::Press {
+                    serial,
+                    time,
+                    guest_input: true,
+                },
+            );
             self.ctx
                 .keyboard_repeatable_keys
                 .entry(keyboard)

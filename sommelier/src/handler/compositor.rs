@@ -3955,7 +3955,17 @@ mod tests {
             .set_for_test(host_keyboard_id, 1, wl_surface_guest_id, SURFACE.host);
         let sequence = ctx
             .key_generations
-            .observe_peek_press(host_keyboard_id, 14, 1, 123, true);
+            .peek_key(
+                host_keyboard_id,
+                14,
+                crate::state::PeekInput::Press {
+                    serial: 1,
+                    time: 123,
+                    guest_input: true,
+                },
+            )
+            .numbered
+            .expect("a new press is numbered");
         ctx.key_generations
             .cancel_backspace_repeat(host_keyboard_id, 14);
         ctx.keyboard_repeatable_keys

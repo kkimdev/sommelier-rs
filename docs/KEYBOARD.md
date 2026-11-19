@@ -81,8 +81,9 @@ keyboard's XKB state, focus), and applies the effects on the guest:
 `wl_keyboard.key` has two steps because placing a window, which a
 placement chord does before the key's delivery is decided, needs the
 whole `Context`. `admit_key` settles the events that belong to another
-generation (a late release of a retired generation, a release or press
-under another serial than the key's peek announced) and moves the phase;
+generation (a late release of a retired generation, a release under
+another serial than the key's peek release, or a press of a held key
+under another serial than its peek announced) and moves the phase;
 `transition_guest_key` decides the delivery and the `ack_key` from the
 guest owner. `peek_key` retires a stale held generation on a press, owing
 the guest its release, numbers a new peek generation, refreshes the peek
@@ -115,7 +116,7 @@ event, read as a `HostSignal`:
 | Waiting for | Event | Step |
 | --- | --- | --- |
 | `NextEvent` | `wl_keyboard.modifiers` | wait |
-| `NextEvent` | peek press of a key the keyboard does not hold, or holds stale | wait for that key's `Press` |
+| `NextEvent` | peek press, on a known host keyboard, of a key that keyboard does not hold, or holds stale | wait for that key's `Press` |
 | `Press` | that key's `wl_keyboard.key` press with the peek's serial | drop |
 | any | the text input's `leave` (E6) | drop |
 | any | anything else | recover, then handle the event |
@@ -123,9 +124,10 @@ event, read as a `HostSignal`:
 ## Tests
 
 - `key_generation_registry_matches_the_model_for_all_short_transition_sequences`
-  checks every sequence of four registry operations, the detach and the
-  retirement of a stale generation included, against a model of the flat
-  fields the states replaced.
+  checks every sequence of four registry operations, `peek_key`,
+  `admit_key`, the enter's snapshot, the detach and the retirement of a
+  stale generation included, against a model of the flat fields the
+  states replaced.
 - `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`
   checks that the delivery reducer never opens two guest presses, nor
   forwards a repeat or release without one.
