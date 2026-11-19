@@ -19,9 +19,10 @@ limitations under the License.
 //! Exo, the ChromeOS compositor, applies a text-input request against state
 //! the proxy cannot see: it drops a content type while no input method is
 //! attached, and spends a pending surrounding-text support on the next
-//! content type. A generic compositor exposes none of that, so the fuzzer's
-//! compositor keeps this model of each host `zwp_text_input_v1` to compare
-//! with what the guest committed, and plays the rest of the host itself.
+//! content type. A generic compositor exposes none of that, so the DST
+//! holds the guest's committed fields to this model of each host
+//! `zwp_text_input_v1`, and the fuzzer's compositor plays the rest of the
+//! host itself around it.
 //!
 //! The simulation also gives the model the seat's keyboard, the user's
 //! keys and the answers of the input method engine ([`super::engine`]), and
@@ -97,7 +98,7 @@ use std::ops::Range;
 
 /// What one Exo `TextInput` holds for its field.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Field {
+pub(super) struct Field {
     /// Whether an input method is attached (`input_method_` is set).
     pub attached: bool,
     pub content_type: ContentType,
@@ -110,7 +111,7 @@ pub(crate) struct Field {
 /// A content type as `SetTypeModeFlags` takes it, in the extension's wire
 /// values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ContentType {
+pub(super) struct ContentType {
     pub input_type: u32,
     pub input_mode: u32,
     pub flags: u32,
@@ -121,7 +122,7 @@ pub(crate) struct ContentType {
 /// The content type `text_input_set_content_type` makes of a v1 `hint`
 /// and `purpose`, with each `ui::` value written as the extension's value
 /// of the same name.
-pub(crate) fn v1_content_type(hint: u32, purpose: u32) -> ContentType {
+pub(super) fn v1_content_type(hint: u32, purpose: u32) -> ContentType {
     use zwp_text_input_v1 as v1;
     let hint_flags = [
         (
@@ -606,9 +607,6 @@ pub(crate) struct Exo {
     region_outcome: Option<RegionOutcome>,
     /// The seat's observers registered so far (E12).
     observers: u64,
-    /// The ranges IMA held for a key and sent after that key's commit, so
-    /// that they compose the committed text.
-    pub(super) regions_stale: u64,
     /// Each text input's tracker when the display answered a
     /// `wl_display.sync`, with the sync's callback, in order
     /// ([`Exo::snapshot_trackers`]).
@@ -1121,7 +1119,7 @@ impl Exo {
     }
 
     /// The fields of the text inputs active on the focused surface.
-    pub(crate) fn focused_fields(&self) -> Vec<Field> {
+    pub(super) fn focused_fields(&self) -> Vec<Field> {
         self.text_inputs
             .values()
             .filter(|text_input| self.focus.is_some() && text_input.surface == self.focus)
@@ -1359,7 +1357,6 @@ impl Exo {
         }
         let region = self.ima.region.take();
         if let Some((before, after)) = region {
-            self.regions_stale += u64::from(commit.is_some());
             self.ima.composing |= self.set_composition_from_existing_text(id, before, after);
         }
         commit.is_some() || composition.is_some() || region.is_some()
@@ -2580,7 +2577,6 @@ mod tests {
             handled: true,
         });
         events(&mut exo);
-        assert_eq!(exo.regions_stale, 1);
         // While IMA takes the engine to compose, a delete is dropped.
         exo.ask(Request::AcceptSuggestion);
         exo.take_engine();

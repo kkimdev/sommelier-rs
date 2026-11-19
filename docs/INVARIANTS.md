@@ -1112,7 +1112,6 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   and nothing else in the crate builds these four events.
   Tests: `guest_txn_encodes_in_canonical_order`, `ime_is_isolated`,
   `host_ime_events_become_v3_transactions`,
-  `a_reset_commit_waits_for_the_guest_to_report_it`,
   `on_set_preedit_region_translates_correctly`,
   `exo_deletes_become_v3_deletes_around_the_cursor`,
   `an_empty_preedit_reaches_only_a_guest_that_shows_one`,
@@ -1184,8 +1183,7 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `a_region_equal_to_the_shown_one_sends_only_the_preedit`,
   `a_region_that_does_not_cover_the_shown_one_is_dropped`,
   `a_region_over_a_region_deletes_the_rest_on_both_sides`,
-  `an_empty_preedit_region_sends_no_delete`,
-  `a_reset_commit_waits_for_the_guest_to_report_it`.
+  `an_empty_preedit_region_sends_no_delete`.
 - **Exo's deletes and regions are measured in the Exo mirror, or
   dropped.** Every text input has a mirror (`ime::exo_view::ExoView`'s
   `mirror`, an `ime::mirror::ExoMirror`), which the host's extension at
@@ -1311,7 +1309,7 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
     stale until the composition ends, never put the preedit in Exo's text.
   The DST holds the mirror to the simulated Exo's tracker at every
   sync, and each delete and region to what that Exo held
-  ([IME.md](IME.md#48-known-issues-and-the-mirror-checks)); it fails a
+  ([IME.md](IME.md#48-the-mirror-checks)); it fails a
   settled case with a drop the mirror could measure.
   Tests: `a_report_reaches_the_host_with_its_barrier`,
   `a_reports_barrier_is_glued_into_its_entry`,

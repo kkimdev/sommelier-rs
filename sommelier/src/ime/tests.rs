@@ -1245,29 +1245,6 @@ fn row_H7_a_preedit_shows_and_its_clear_arms_the_lease() {
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
 }
 
-/// H7: a preedit the host clears with a reset commit reaches the guest
-/// as that commit.
-#[test]
-fn a_reset_commit_waits_for_the_guest_to_report_it() {
-    let mut ime = Ime::enabled();
-    ime.report("ab", 2);
-    ime.compose("가");
-    let out = ime.v1(HostIme::Preedit {
-        serial: 0,
-        text: "".into(),
-        commit: "가".into(),
-    });
-    assert_eq!(out.guest, [no_preedit(), commit("가"), done(2)]);
-    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
-    // Exo never sends one, as its commit text is always the preedit's, so
-    // the mirror cannot follow it, and drops Exo's deletes.
-    let delete = HostIme::Delete {
-        index: 1,
-        length: 1,
-    };
-    assert_eq!(ime.v1(delete).guest, []);
-}
-
 #[test]
 fn row_H7_a_preedit_that_does_not_fit_is_dropped() {
     let mut ime = Ime::enabled();

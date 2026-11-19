@@ -403,9 +403,6 @@ pub(super) struct ExoMirror {
     /// While the prediction is vague, the selections it may have
     /// ([`Selection::Vague`]).
     vague: Vec<Span>,
-    /// The last report reset a non-empty composition (E4), and nothing
-    /// has composed since.
-    dropped: bool,
     /// An echo check failed since [`Self::take_diverged`] last looked.
     diverged: bool,
 }
@@ -424,7 +421,6 @@ impl ExoMirror {
             highlights: Vec::new(),
             cursor_position: None,
             vague: Vec::new(),
-            dropped: false,
             diverged: false,
         };
         mirror.reset_internal("", Span::at(0));
@@ -575,11 +571,6 @@ impl ExoMirror {
         self.health
     }
 
-    #[cfg(test)]
-    pub(super) fn dropped(&self) -> bool {
-        self.dropped
-    }
-
     // The wire. Each event Exo sends is matched to the tracker call that
     // sent it, and applied if it agrees with the mirror (the echo check).
 
@@ -652,7 +643,6 @@ impl ExoMirror {
                 mirror.vague = [Span::at(at)].into_iter().chain(others).collect();
             }
             mirror.health = if vague { Health::Vague } else { Health::Exact };
-            mirror.dropped = false;
             mirror.on_set_composition_text(text, Span::at(cursor));
             Ok(())
         });
@@ -778,7 +768,6 @@ impl ExoMirror {
             if !mirror.predicted.holds_span(Span::new(start, end)) {
                 return Err(Miss::Diverged);
             }
-            mirror.dropped = false;
             mirror.on_set_composition_from_existing_text(start..end);
             Ok(())
         });
@@ -854,7 +843,6 @@ impl ExoMirror {
     /// `TI::SetSurroundingText` calls `Update` (TI 158-175).
     fn report(&mut self, text: &str, cursor: u32, anchor: u32) -> Option<Applied> {
         let selection = report_selection(text, cursor, anchor)?;
-        let composing = self.health != Health::Unknown && !self.predicted.composition.is_empty();
         let cursor = selection.is_empty();
         match self.update(text, selection) {
             UpdateResult::Updated => {
@@ -878,11 +866,7 @@ impl ExoMirror {
                     in_step: found && in_step,
                 })
             }
-            UpdateResult::Reset => {
-                self.dropped |= composing;
-                Some(Applied::Reset { cursor })
-            }
-            UpdateResult::Ambiguous => Some(Applied::Reset { cursor }),
+            UpdateResult::Reset | UpdateResult::Ambiguous => Some(Applied::Reset { cursor }),
         }
     }
 
@@ -1228,7 +1212,6 @@ mod tests {
         assert_eq!(history(&mirror), std::slice::from_ref(&empty));
         assert_pushed(&mirror, &empty);
         assert_eq!(mirror.health(), Health::Exact);
-        assert!(!mirror.dropped());
     }
 
     /// `Update` (STT 131-191), exact match: the first state from the
@@ -1297,8 +1280,7 @@ mod tests {
 
     /// `Update` with no match: `ResetInternal` (STT 374-381) replaces the
     /// prediction, composition included, and the history is the report
-    /// alone. A report that resets a composition sets `dropped` (E4),
-    /// which the next composition clears.
+    /// alone, so a report that resets a composition drops it (E4).
     #[test]
     fn update_with_no_match_resets_and_drops_the_composition() {
         let mut mirror = at(state("가", (3, 3), NO_COMPOSITION));
@@ -1314,22 +1296,14 @@ mod tests {
         mirror.preedit_string("나", "나");
         // `가` with the cursor at 3 is still in the history; at 0 it is not.
         report(&mut mirror, "가", 3, 3);
-        assert!(!mirror.dropped(), "a matched report keeps `나`");
+        let composition = |mirror: &ExoMirror| mirror.predicted().composition.clone();
+        assert_eq!(composition(&mirror), 3..6, "a matched report keeps `나`");
         report(&mut mirror, "가", 0, 0);
-        assert!(mirror.dropped(), "the report dropped `나`");
         assert_eq!(history(&mirror), [state("가", (0, 0), NO_COMPOSITION)]);
         mirror.set_preedit_region(0, 3);
-        assert!(!mirror.dropped(), "a region composes");
-        assert_eq!(mirror.predicted().composition, 0..3);
+        assert_eq!(composition(&mirror), 0..3);
         report(&mut mirror, "가나", 6, 6);
-        assert!(mirror.dropped());
-        mirror.preedit_string("다", "다");
-        assert!(!mirror.dropped(), "a preedit composes");
-
-        // A reset with nothing composed drops nothing.
-        let mut mirror = at(state("가", (3, 3), NO_COMPOSITION));
-        report(&mut mirror, "나", 3, 3);
-        assert!(!mirror.dropped());
+        assert_eq!(composition(&mirror), NO_COMPOSITION);
         assert_eq!(mirror.health(), Health::Exact);
     }
 
@@ -1668,7 +1642,6 @@ mod tests {
             let before = (ignored.predicted().clone(), history(&ignored));
             report(&mut ignored, GANADA, cursor, anchor);
             assert_eq!((ignored.predicted().clone(), history(&ignored)), before);
-            assert!(!ignored.dropped());
         }
     }
 
@@ -1690,7 +1663,6 @@ mod tests {
         // The report then matches nothing and drops the composition.
         mirror.barrier_done(BarrierToken(7));
         assert_eq!(history(&mirror), [state("가", (0, 0), NO_COMPOSITION)]);
-        assert!(mirror.dropped());
         mirror.barrier_done(BarrierToken(8));
         assert!(history(&mirror).is_empty());
         assert_eq!(mirror.predicted(), &state("가", (0, 0), NO_COMPOSITION));
@@ -1701,7 +1673,6 @@ mod tests {
         report(&mut early, "가", 0, 0);
         early.preedit_string("나", "나");
         assert_eq!(early.predicted(), &state("나가", (3, 3), 0..3));
-        assert!(!early.dropped());
     }
 
     /// `cursor_position(range)` + `commit_string(composition)` is
@@ -2140,7 +2111,6 @@ mod tests {
         assert_eq!(history(&mirror)[0], state("한", (3, 3), 0..3));
         assert_eq!(history(&mirror).len(), 3);
         assert_eq!(mirror.predicted(), &state("한ㄱ", (6, 6), 3..6));
-        assert!(!mirror.dropped());
         mirror.preedit_string("글", "글");
         mirror.confirm_preedit(false);
         assert_pushed(&mirror, &state("한글", (6, 6), NO_COMPOSITION));

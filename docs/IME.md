@@ -188,7 +188,7 @@ text input before the gate, as each one changed Exo's text.
 | H4 | `preedit_styling(i, l, style)` | `Attached` (dropped otherwise) | none | Recorded in the assembly when `style == SELECTION`. | n/a | |
 | H5 | `preedit_cursor(i)` | `Attached` | none | Recorded in the assembly. | n/a | |
 | H6 | `cursor_position(i, a)` | `Attached` | none | Logged at debug level as having no v3 equivalent, and not recorded. Exo sends it only before a `commit_string` [F], where the mirror reads the pair as a selection range. | n/a | |
-| H7 | `preedit_string(serial, t, commit)` | Gate; `t` is UTF-8 | If `t` is empty, `shown` was set and `commit` is non-empty: `Txn{commit, preedit: none}` (the reset commit; Exo never sends one, as its commit text is always the preedit's, so the mirror diverges at it). Otherwise: `Txn{preedit: t, with the cursor from the assembly}`. An empty `t` with nothing shown is a bare `done(count)`, whatever `commit` holds. | `shown := t`, or none if `t` is empty. The assembly is taken. **Lease:** `LeaseOutcome::ArmIfBackspaceHeld` if `t` is empty, `shown` was set and `commit` is empty; `End` otherwise. The host serial is only logged. | The event is dropped. The assembly is taken. Nothing else changes. | Exo sends the preedit text as its commit text [F]; tests `a_reset_commit_waits_for_the_guest_to_report_it`, `a_reset_commit_waits_for_the_guest_to_report_it` |
+| H7 | `preedit_string(serial, t, commit)` | Gate; `t` is UTF-8 | `Txn{preedit: t, with the cursor from the assembly}`. `commit` is not read: Exo always sends the preedit's text there [F], and the mirror diverges at any other. An empty `t` with nothing shown is a bare `done(count)`. | `shown := t`, or none if `t` is empty. The assembly is taken. **Lease:** `LeaseOutcome::ArmIfBackspaceHeld` if `t` is empty and `shown` was set; `End` otherwise. The host serial is only logged. | The event is dropped. The assembly is taken. Nothing else changes. | Exo sends the preedit text as its commit text [F]; row tests `row_H7_a_preedit_shows_and_its_clear_arms_the_lease`, `row_H7_a_preedit_that_does_not_fit_is_dropped` |
 | H7' | `preedit_string` | Gate fails, or `t` is not UTF-8 | none | Dropped. The assembly is taken. | n/a | INVARIANTS press rule (the fence); Wire messages (byte-indexed strings) |
 | H8 | `commit_string(serial, t)` | Gate | `Txn{commit: t, preedit: none}` | `shown := none`. An empty commit is not sent, so the guest has no edit to report, whether or not it shows a preedit (row tests `row_H8_an_empty_commit_is_no_edit` and `row_H8_an_empty_commit_over_a_preedit_is_no_edit`). The lease ends. The assembly is taken. | Dropped; the assembly stays (B3). | |
 | H9 | `delete_surrounding_text(index, length)` | Gate | `Txn{delete: (before, after), preedit: none}` | Measured in the Exo mirror's state before the event (`exo_view::Frame`) whenever INVARIANTS "Exo's deletes and regions are measured in the Exo mirror, or dropped" allows it. A range around Exo's cursor, with no composition, becomes `(cursor − start, end − cursor)`; `shown := none`; the lease ends; the assembly is taken. An empty range sends nothing and keeps the guest in step. **Dropped** otherwise, ending the lease as Exo edited (but for an empty range), with a debug log that names why (`exo_view::Unmeasured`). The guest is then out of step until its next report. A negative index, a range not around Exo's cursor and one off its text's char boundaries are none Exo sends, so the mirror diverges at them. Row tests `row_H9_an_absolute_delete_becomes_lengths_around_the_cursor`, `row_H9_a_delete_after_an_unreported_edit_lands_in_exos_text`, `row_H9_after_set_editable_selection_range_drops`, `row_H9_after_an_empty_region_with_exos_cursor_inside_drops`, `row_H9_after_a_dropped_region_drops`, `row_H9_after_a_delete_over_a_shown_preedit_drops`, `row_H9_a_field_that_states_no_text_drops`, `row_H9_after_a_forwarded_key_drops`, `row_H9_in_step_again_after_a_matched_report`, `row_H9_a_delete_that_heals_an_unsure_mirror_drops_as_unsure`. | Dropped; the assembly stays. | INVARIANTS "Exo's deletes are absolute and stand alone". [F] Chromium drops a delete while a composition is shown (`InputMethodAuraLinux::OnDeleteSurroundingText`). |
@@ -307,8 +307,7 @@ enforce this:
 ### 3.1 State
 
 `ImeCore` holds the text inputs of one connection in a `BTreeMap` by
-`TiId`, the map from extension object to text input (`by_ext`), and the
-next barrier number. `BarrierToken` numbers a host `wl_display.sync` the
+`TiId`, and the next barrier number. `BarrierToken` numbers a host `wl_display.sync` the
 core waits for. The core never reuses a number, and the adapter keeps
 the one map from token to host callback (`InternalCallback::TextInput`).
 
@@ -393,7 +392,7 @@ encodes the transaction and makes its change only if the encoding fits.
 So no arm can apply a change whose encoding failed.
 
 **Invariants.** `ImeCore::assert_invariants(&self, env)` checks I1a to
-I4, I6 and I7 after every `step` in tests, and
+I3, I6 and I7 after every `step` in tests, and
 `Context::assert_no_orphans` calls it after every batch (DESIGN
 [Object ends](DESIGN.md#object-ends)).
 
@@ -417,7 +416,6 @@ I4, I6 and I7 after every `step` in tests, and
 - **I2.** `shown.is_some()` or a non-empty assembly implies `Attached`.
   `shown.is_some()` implies `fence.is_none()`.
 - **I3.** At most one text input has `committed.enabled`.
-- **I4.** `by_ext` is exactly the extensions of the text inputs.
 - **I5.** Every token in `Draining{b}` or in `fence` is pending in
   `InternalCallbacks` as `InternalCallback::TextInput { token }`. The
   adapter's side checks this, in `Context::assert_no_orphans`.
@@ -492,9 +490,9 @@ deterministic and does no I/O.
 - At `get_text_input`, the adapter allocates the bridged host IDs
   (`ShadowTable::create_bridged` and `create_host_only`) and passes them
   in `Create`. The core sends `create_text_input` and
-  `get_extended_text_input`, and records the extension in `by_ext`.
+  `get_extended_text_input`.
 - The adapter resolves the sender of a v1 event through the object
-  table; the core resolves an extension's sender through `by_ext`.
+  table; the core resolves an extension's sender among its text inputs.
 - Host surface and seat IDs come from `Env` when a request needs them.
 - The core never sees host callback IDs, only `BarrierToken`s.
 - The guest object's `delete_id` stays with the generated local
@@ -533,8 +531,7 @@ ever at `trace`.
    its encoded `set_surrounding_text` and cursor rectangle, so the wire
    order of the "Reconcile" convention (section 2) is kept.
 3. **Removals.** The Destroy arm marks a text input as ending, and phase
-   2 reconciles it to inactive. It is then removed, with its `by_ext`
-   entry, and its extension's `destroy` and `Retire` are appended.
+   2 reconciles it to inactive. It is then removed, and its extension's `destroy` and `Retire` are appended.
 
 A host composition event first goes to the mirror, then through the
 gate: without a `Current`, it is stale and dropped. With one, the arm
@@ -842,7 +839,8 @@ There are two generator modes, half of the cases each:
   proxy's drops by cause, reports that crossed an edit (P4), autorepeats
   and what each empty confirmation became (X2'), Backspace leases,
   surfaces destroyed (F2), client drops by reason, and one counter per
-  draw. A counter that stays at zero over a full run fails the run.
+  draw. A counter `check` (`sim/mod.rs`) lists that stays at zero over a
+  full run fails the run; the summary prints the rest.
 
 **Tier 2: the user-intent oracle. Settled cases only.**
 
@@ -858,13 +856,7 @@ There are two generator modes, half of the cases each:
   cursor as the length of the normalised text before it, so the
   comparison does not depend on which form a client keeps.
 
-### 4.8 Known issues and the mirror checks
-
-A tier-1 failure that the proxy is known to cause is a `KnownIssue`
-(`sim/oracle.rs`). It is counted, not failed, and the summary lists its
-seeds. No known issue may excuse a tier-2 failure. The list is empty
-now. A pull request that finds an issue adds its variant and its trigger
-to `classify`, and the pull request that fixes it deletes both.
+### 4.8 The mirror checks
 
 The DST also holds the proxy to Exo's real text:
 

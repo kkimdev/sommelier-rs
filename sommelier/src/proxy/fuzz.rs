@@ -88,7 +88,7 @@ use crate::protocols::wayland::{
 use crate::protocols::AnyRequest;
 use crate::sim::exo::Exo;
 use crate::state::Context;
-use crate::test_support::{frames, msg_opcode, Rng};
+use crate::test_support::{env_u64, frames, msg_opcode, Rng};
 use crate::wire::{Framing, MessageBuilder, MessageHeader, Outgoing, WireMessage, WL_DISPLAY_ID};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::{BTreeMap, BTreeSet};
@@ -260,14 +260,6 @@ fn install_logger() {
 
 fn take_proxy_errors() -> (usize, Vec<String>) {
     std::mem::take(&mut *PROXY_ERRORS.lock().expect("the error list"))
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).map_or(default, |value| {
-        value
-            .parse()
-            .unwrap_or_else(|_| panic!("{name}={value} is not a number"))
-    })
 }
 
 /// Run `cases` in a child copy of this test binary that runs only this

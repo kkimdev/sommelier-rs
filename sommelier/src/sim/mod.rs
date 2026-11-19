@@ -46,7 +46,7 @@ mod engine;
 pub(crate) mod exo;
 mod hangul;
 mod keymap;
-pub(crate) mod oracle;
+mod oracle;
 mod regressions;
 mod sched;
 mod shrink;
@@ -55,10 +55,10 @@ mod user;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use crate::test_support::Rng;
+use crate::test_support::{env_u64, Rng};
 use editor::{Reference, TextModel, Typing, UserAction};
 use engine::Lag;
-use oracle::{Counts, Failure, KnownIssue, Tier};
+use oracle::{Counts, Failure, Tier};
 use sched::{Choices, Choose, Line, Setup, World};
 
 /// A client model a case types into.
@@ -150,10 +150,8 @@ impl Case {
 /// What a case came to.
 #[derive(Debug)]
 struct Outcome {
-    /// The checks that failed, unless a known issue explains them.
+    /// The checks that failed.
     failures: Vec<Failure>,
-    /// The known issues that explain the failures, if any do.
-    known: Vec<KnownIssue>,
     counts: Counts,
     /// The engine's lag.
     lag: Lag,
@@ -186,12 +184,11 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         let drops = crate::ime::take_drops_for_test();
         let mut outcome = Outcome {
             failures: Vec::new(),
-            known: Vec::new(),
             counts: Counts::default(),
             lag,
             choices: world.choices.recorded().to_vec(),
         };
-        let (Some(spec), Some(shadow), false) = (&world.spec, &world.shadow, world.ended) else {
+        let (Some(spec), Some(_), false) = (&world.spec, &world.shadow, world.ended) else {
             outcome.failures.push(Failure {
                 tier: Tier::Exact,
                 check: "session",
@@ -204,7 +201,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         outcome.counts.drops = drops;
         let (engine, resets) = (world.engine_composition(), world.engine_resets());
         let (exo, steps) = (&world.exo, &world.steps);
-        let mut failures = oracle::exact(steps, spec, shadow, exo, &engine, resets);
+        let mut failures = oracle::exact(steps, spec, exo, &engine, resets);
         if case.settled {
             let start = case.reference_at_start();
             let (actions, settles) = (&case.actions, &world.settles);
@@ -219,10 +216,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
                 detail: world.mirrors.join("\n"),
             });
         }
-        outcome.known = oracle::classify(&failures, &spec.counts);
-        if outcome.known.is_empty() {
-            outcome.failures = failures;
-        }
+        outcome.failures = failures;
         outcome
     })
 }
@@ -267,15 +261,6 @@ fn report(case: &Case, outcome: &Outcome, failures: &[Failure], trace: &[Line]) 
         case.seed
     );
     report
-}
-
-/// The value of environment variable `name`, or `default`.
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).map_or(default, |value| {
-        value
-            .parse()
-            .unwrap_or_else(|_| panic!("{name}={value} is not a number"))
-    })
 }
 
 /// The cases of the run the environment asks for, of one mode.
@@ -353,8 +338,6 @@ impl Coverage {
 #[derive(Debug, Default)]
 struct Summary {
     cases: u64,
-    /// The cases a known issue explains, with the issue.
-    known: Vec<(u64, KnownIssue)>,
     counts: Counts,
     coverage: Coverage,
     /// The reports of the cases that failed.
@@ -386,7 +369,6 @@ fn run_all(cases: &[Case]) -> Summary {
                 };
                 let outcome = Outcome {
                     failures: Vec::new(),
-                    known: Vec::new(),
                     counts: Counts::default(),
                     lag: Lag::Fast,
                     choices: Vec::new(),
@@ -416,9 +398,6 @@ fn run_all(cases: &[Case]) -> Summary {
             }
         }
         summary.cases += 1;
-        summary
-            .known
-            .extend(outcome.known.iter().map(|&issue| (case.seed, issue)));
         summary.counts += outcome.counts;
         summary.coverage.count(case, &outcome);
         if let Some(first) = outcome.failures.first() {
@@ -459,10 +438,12 @@ fn pinned(test: &str, body: impl FnOnce()) {
 /// must also have met each variant a case draws and each path the mode is
 /// there to reach: presses that end a composition, Exo's own detaches
 /// (H2), its deletes (H9) and its preedit regions (X1); in free cases,
-/// fence drops, late answers the guest got, raw keys, reports that
-/// crossed an edit (P4), autorepeats of a held key, empty confirmations
-/// that recovered it, skipped its pair or found none (X2'), and Backspace
-/// leases armed and ended; and in a run of 5,000 or more the rarer region
+/// fence drops, late answers the guest got, engine answers a reset made
+/// late or dropped (E5), raw keys, reports that crossed an edit (P4),
+/// autorepeats of a held key, empty confirmations that recovered it,
+/// skipped its pair, found none or turned out to be Exo's before a press
+/// or a detach (X2'), Backspace leases armed and ended, and destroyed
+/// surfaces; and in a run of 5,000 or more the rarer region
 /// and delete paths; in settled ones, no fence drop, which a settled case
 /// must not cause.
 fn check(test: &str, settled: bool) {
@@ -470,24 +451,11 @@ fn check(test: &str, settled: bool) {
         let summary = run_all(&cases(settled));
         let Summary {
             cases,
-            known,
             counts,
             coverage,
             failed,
         } = &summary;
         println!("{cases} cases, {counts:?}, {coverage:?}");
-        let mut issues: Vec<KnownIssue> = known.iter().map(|&(_, issue)| issue).collect();
-        issues.sort();
-        issues.dedup();
-        for issue in issues {
-            let seeds: Vec<u64> = known.iter().filter(|k| k.1 == issue).map(|k| k.0).collect();
-            println!(
-                "known issue {issue:?} in {} cases, seeds {seeds:?}: {}; tracked in {}",
-                seeds.len(),
-                issue.reason(),
-                issue.tracking()
-            );
-        }
         for report in failed {
             let heading = report.lines().filter(|line| !line.starts_with("    "));
             heading
@@ -516,6 +484,10 @@ fn check(test: &str, settled: bool) {
                 counts.leases_ended,
                 counts.surface_destroys,
                 counts.focused_surface_destroys,
+                counts.late,
+                counts.dropped,
+                counts.confirms_before_a_press,
+                counts.confirms_before_a_detach,
             ]);
         }
         // Rarer paths, which a long run must reach: a region over a shown
@@ -529,10 +501,9 @@ fn check(test: &str, settled: bool) {
             ]);
         }
         if *cases >= 300 {
-            let known = known.len();
             assert!(
                 !reached.contains(&0),
-                "a counter stayed at 0: {counts:?}, {coverage:?}, {known} known"
+                "a counter stayed at 0: {counts:?}, {coverage:?}"
             );
         }
         assert!(
@@ -670,7 +641,6 @@ fn coverage_counts_each_draw_and_the_rare_paths() {
     .collect();
     let outcome = Outcome {
         failures: Vec::new(),
-        known: Vec::new(),
         counts: Counts::default(),
         lag: Lag::Slow,
         choices: Vec::new(),

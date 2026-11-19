@@ -30,6 +30,15 @@ pub type RawMessage = (Vec<u8>, Vec<RawFd>);
 /// Set in the child process [`in_own_process`] runs a test in.
 const OWN_PROCESS_ENV: &str = "SOMMELIER_TEST_OWN_PROCESS";
 
+/// The value of environment variable `name`, or `default`.
+pub fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name).map_or(default, |value| {
+        value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}={value} is not a number"))
+    })
+}
+
 /// Run `body`, the body of test `test_path` (its path in the test binary,
 /// such as `proxy::fuzz::guest_streams_cannot_crash_hang_or_leak`), in a
 /// child copy of the test binary that runs only that test, for a test that

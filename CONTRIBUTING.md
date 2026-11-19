@@ -190,10 +190,7 @@ guest as the specification measures them in the simulated Exo's text,
 or not at all; the summary counts the proxy's drops by cause
 (`Counts::drops`) and those of a guest that held Exo's text
 (`drops_truth_in_step`), and a settled case with a drop the Exo mirror
-could have measured fails. A specification failure that a known issue's
-trigger explains is counted, not failed, and the summary lists its
-seeds; none is known now, and no known issue may excuse a failure of the
-user's intent. Each test runs in a
+could have measured fails. Each test runs in a
 process of its own, with the XKB defaults pinned.
 
 The suite runs 600 seeds from seed 0, an even seed free and an odd one

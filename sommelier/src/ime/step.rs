@@ -102,8 +102,8 @@ impl ImeCore {
             Input::Destroy { ti, host_deleted } => ending = self.destroy(ti, host_deleted, &mut fx),
             Input::HostLeave(ti) => self.host_leave(ti, &mut fx),
             Input::V1(ti, event) => self.host_event(ti, event, &mut fx),
-            Input::Ext { ext, event } => match self.by_ext.get(&ext) {
-                Some(&ti) => self.host_event(ti, event, &mut fx),
+            Input::Ext { ext, event } => match self.by_ext(ext) {
+                Some(ti) => self.host_event(ti, event, &mut fx),
                 None => log::debug!("Ignoring an event of retired extension {ext}"),
             },
             // W1 and W2: a token is one text input's drain or fence, or a
@@ -279,7 +279,7 @@ impl ImeCore {
 
     /// The end of G10: forget the text input and destroy its extension.
     fn remove(&mut self, ti: TiId, fx: &mut Effects) {
-        let Some(ext) = self.forget(ti).map(|t| t.host().ext) else {
+        let Some(ext) = self.inputs.remove(&ti).map(|t| t.host().ext) else {
             return;
         };
         fx.to_host.extend([
@@ -572,11 +572,7 @@ fn composition_event(
     // A region dropped, whose empty range commits the shown preedit.
     let mut dropped = None;
     let (planned, takes) = match event {
-        HostIme::Preedit {
-            serial,
-            text,
-            commit,
-        } => {
+        HostIme::Preedit { serial, text, .. } => {
             log_host_serial(serial, count);
             let assembly = cur.take_assembly();
             // The assembly's offsets index the text, which replacing
@@ -585,7 +581,7 @@ fn composition_event(
                 log::debug!("Ignoring a host preedit that is not UTF-8");
                 return None;
             };
-            (cur.preedit(text, commit, assembly), Takes::Before)
+            (cur.preedit(text, assembly), Takes::Before)
         }
         HostIme::Commit { serial, text } => {
             log_host_serial(serial, count);

@@ -304,7 +304,8 @@ impl TextInput {
                 ti.0
             );
             self.composition.shown = None;
-            vec![bare_done(ti, serial)]
+            let done = GuestTxn::default().encode(ti, false, serial);
+            done.expect("a bare done has no string")
         })
     }
 
@@ -561,15 +562,6 @@ impl Field {
     }
 }
 
-/// A lone `done`: the transaction of a recovered key (X2').
-fn bare_done(ti: TiId, serial: Serial) -> Outgoing {
-    let mut txn = GuestTxn::default()
-        .encode(ti, false, serial)
-        .expect("a bare done has no string");
-    debug_assert_eq!(txn.len(), 1);
-    txn.remove(0)
-}
-
 /// Proof that a text input's composition is current (the gate of
 /// [`TextInput::current`]). Its fields are private to this file, so no
 /// other module can make one. Each method plans the transaction of one
@@ -625,17 +617,9 @@ impl<'a> Current<'a> {
         }
     }
 
-    /// H7. A cleared preedit with a commit text is Exo's reset commit.
-    pub(super) fn preedit(self, text: String, commit: String, assembly: Assembly) -> Planned<'a> {
-        let shown = self.shown().is_some();
-        if text.is_empty() && shown && !commit.is_empty() {
-            let txn = GuestTxn {
-                commit: Some(commit),
-                ..GuestTxn::default()
-            };
-            return self.plan(txn, LeaseOutcome::End);
-        }
-        let lease = match text.is_empty() && shown {
+    /// H7. Exo's commit text is always the preedit's, so it is not read.
+    pub(super) fn preedit(self, text: String, assembly: Assembly) -> Planned<'a> {
+        let lease = match text.is_empty() && self.shown().is_some() {
             true => LeaseOutcome::ArmIfBackspaceHeld,
             false => LeaseOutcome::End,
         };

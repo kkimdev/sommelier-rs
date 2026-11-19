@@ -168,11 +168,8 @@ impl zwp_text_input_manager_v1::ZwpTextInputManagerV1Handler for TextInputManage
 pub struct TextInputV1Handler;
 impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     /// H7. The v1 `commit` argument is the text to commit if this preedit
-    /// is reset, not text to insert alongside every live preedit: Exo
-    /// commonly sends the same non-empty `text` and `commit` while
-    /// composing Korean, and forwarding both would insert every
-    /// intermediate syllable. The core commits it only when the host
-    /// clears the preedit.
+    /// is reset, which Exo always sends equal to `text`: it is not text to
+    /// insert alongside the preedit.
     fn on_preedit_string(
         &mut self,
         ctx: &mut Context,
@@ -3100,21 +3097,6 @@ pub(super) mod tests {
                 "a preedit",
                 |f| vec![v1::preedit_string(f.host, 42, "こんにちは", "").unwrap()],
                 vec![preedit("こんにちは"), DONE],
-            ),
-            (
-                "a live preedit keeps its fallback",
-                |f| vec![f.preedit("가", ""), f.preedit("간", "reset fallback")],
-                vec![preedit("가"), DONE, preedit("간"), DONE],
-            ),
-            (
-                "a preedit reset commits its fallback",
-                |f| vec![f.preedit("미완성", ""), f.preedit("", "확정")],
-                vec![preedit("미완성"), DONE, no_preedit(), commit("확정"), DONE],
-            ),
-            (
-                "a reset without a preedit commits nothing",
-                |f| vec![f.preedit("", "stale fallback")],
-                vec![DONE],
             ),
             (
                 // GTK emits `commit` for an empty commit_string too

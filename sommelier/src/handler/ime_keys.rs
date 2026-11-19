@@ -988,9 +988,8 @@ mod tests {
     #[test]
     fn ime_edits_end_a_stale_backspace_repeat() {
         type Event = fn(&mut Ime);
-        let cases: [(&str, Event); 4] = [
+        let cases: [(&str, Event); 3] = [
             ("an empty commit", |ime| ime.commit("")),
-            ("a reset preedit", |ime| ime.preedit("", "확정")),
             ("a new preedit", |ime| ime.preedit("나", "나")),
             // Out of step with Exo's mirror, the core drops it.
             ("a dropped preedit region", |ime| ime.preedit_region(-3, 3)),
