@@ -965,7 +965,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `done`, then the keyboard events that moved the focus, then the text
   input's `leave` and `enter`. The keyboard handler hands those events to
   the IME core (`ime::Input::FocusChanged`'s `keyboard`) rather than
-  forwarding them, since a forward would precede the commit. mutter and
+  forwarding them, since a forward would precede the commit. A host sends
+  each keyboard of a seat its `leave` in turn, so the first keyboard's
+  `leave` of the seat's surface moves the seat's focus off it, though
+  the seat's other keyboards still focus it
+  (`KeyboardFocusRegistry::leave` retires them, each still owed its own
+  `leave`): the commit goes before every keyboard's `leave`. mutter and
   ibus commit a preedit at a focus-out, and Exo's detach confirms the
   composition (E6 of [IME_REDESIGN.md](IME_REDESIGN.md) 2.4), so Exo keeps
   the text too. But the keyboard hears of a focus move before the text
@@ -979,6 +984,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   would go into, which is why the IME core hears of the destroy before
   the focus change it causes (previous rule).
   Tests: `a_focus_loss_commits_the_shown_preedit_before_leave`,
+  `the_first_keyboard_leave_of_a_seat_commits_the_preedit_before_it`,
+  `leave_from_one_keyboard_ends_the_seats_focus_on_the_surface`,
   `keyboard_release_ends_focus_when_no_other_keyboard_owns_the_seat`,
   `release_does_not_end_child_text_input_focus`,
   `wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave`,

@@ -1225,7 +1225,8 @@ pub struct KeyboardFocusUpdate {
 ///
 /// Every keyboard on one seat must own the same surface. Entering a different
 /// surface retires older keyboard generations for that seat instead of
-/// retaining a fallback focus that a delayed leave could revive.
+/// retaining a fallback focus that a delayed leave could revive, and so does
+/// one keyboard's leave of the seat's surface ([`Self::leave`]).
 #[derive(Default)]
 pub struct KeyboardFocusRegistry {
     keyboards: BTreeMap<HostId, KeyboardFocus>,
@@ -1376,7 +1377,31 @@ impl KeyboardFocusRegistry {
         if focus.host_surface != host_surface {
             return KeyboardFocusUpdate::default();
         }
-        self.remove_keyboard(host_keyboard, focus)
+        // A host sends every keyboard of the seat its leave in turn, so the
+        // first one moves the seat's focus off the surface, and the field's
+        // preedit is committed before any keyboard leaves it (F1). The
+        // seat's other keyboards, all on that surface, are retired, each
+        // still owed its own leave, as at an enter of another surface.
+        let mut update = self.remove_keyboard(host_keyboard, focus);
+        let mut others = self
+            .keyboards
+            .iter()
+            .filter(|(_, other)| other.guest_seat == focus.guest_seat)
+            .map(|(&keyboard, &other)| (keyboard, other))
+            .collect::<Vec<_>>();
+        others.sort_unstable_by_key(|(keyboard, _)| keyboard.0);
+        for (keyboard, other) in others {
+            self.keyboards.remove(&keyboard);
+            self.retired_guest_enters
+                .insert((keyboard, other.host_surface), other);
+            update.retired_keyboards.push(keyboard);
+        }
+        update.seat_changes = vec![SeatFocusChange {
+            guest_seat: focus.guest_seat,
+            previous_surface: Some(focus.guest_surface),
+            current_surface: None,
+        }];
+        update
     }
 
     pub fn release(&mut self, host_keyboard: HostId) -> KeyboardFocusUpdate {
@@ -1605,27 +1630,30 @@ mod tests {
         }
     }
 
+    /// The first keyboard's leave of a shared surface moves the seat's
+    /// focus off it and retires the other keyboard, whose own leave then
+    /// balances its enter and moves nothing.
     #[test]
-    fn keyboard_focus_registry_keeps_shared_surface_until_last_owner() {
+    fn keyboard_focus_registry_ends_a_shared_surface_at_its_first_leave() {
         let mut registry = KeyboardFocusRegistry::default();
         registry.enter(KEYBOARD_A, ON_20);
         registry.enter(KEYBOARD_B, ON_20);
 
         assert_eq!(
             registry.leave(KEYBOARD_A, ON_20.host_surface),
-            accepted(Vec::new(), vec![KEYBOARD_A])
-        );
-        assert_eq!(registry.surface_for_seat(1), Some(20));
-        assert_eq!(
-            registry.leave(KEYBOARD_B, ON_20.host_surface),
             accepted(
                 vec![SeatFocusChange {
                     guest_seat: 1,
                     previous_surface: Some(20),
                     current_surface: None,
                 }],
-                vec![KEYBOARD_B]
+                vec![KEYBOARD_A, KEYBOARD_B]
             )
+        );
+        assert_eq!(registry.surface_for_seat(1), None);
+        assert_eq!(
+            registry.leave(KEYBOARD_B, ON_20.host_surface),
+            accepted(Vec::new(), Vec::new())
         );
         assert_eq!(registry.surface_for_seat(1), None);
     }

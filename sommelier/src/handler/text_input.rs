@@ -5033,7 +5033,7 @@ pub(super) mod tests {
     /// Each keyboard of a seat gets one `enter` and one `leave` for each
     /// focus it is given, whatever order the host's events take, and the
     /// seat's focus, which its text input follows, is the focus of the
-    /// keyboard that entered last.
+    /// keyboard that entered last, until a keyboard leaves it.
     #[tokio::test]
     async fn each_keyboard_focus_is_entered_and_left_once() {
         // Keyboard `a` has entered the surface with serial 1.
@@ -5075,15 +5075,17 @@ pub(super) mod tests {
         // A second keyboard needs its own enter; a duplicate is dropped.
         f.s.host([enter(b, 2, surface), enter(b, 3, surface)]).await;
         assert_eq!(f.s.guest_received(), entered(b, 2, surface));
-        // The seat keeps its focus through `b`.
+        // The first leave moves the seat's focus off the surface, which
+        // the host leaves on every keyboard; `b`'s own leave balances its
+        // enter.
         f.s.host([leave(a, 4, surface), leave(a, 5, surface)]).await;
-        assert_eq!(f.s.guest_received(), [left(a, 4, surface)]);
-        f.s.host([leave(b, 6, surface)]).await;
-        let mut expected = vec![left(b, 6, surface)];
+        let mut expected = vec![left(a, 4, surface)];
         expected.extend(f.events([V3::Leave {
             surface: surface.id,
         }]));
         assert_eq!(f.s.guest_received(), expected);
+        f.s.host([leave(b, 6, surface)]).await;
+        assert_eq!(f.s.guest_received(), [left(b, 6, surface)]);
 
         // `b` takes the seat's focus elsewhere before `a` leaves: that
         // leave still balances `a`'s enter, once, and moves no focus.
