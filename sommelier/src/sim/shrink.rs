@@ -18,8 +18,11 @@ limitations under the License.
 //! fails the same check.
 //!
 //! It tries three reductions, each kept only if a re-run still fails the
-//! check ([`Check`]), and stops at its budget ([`Limits`]):
-//! 1. ddmin over the case's actions;
+//! check ([`Check`]), and stops at its budget ([`Limits`]). A candidate the
+//! generator could not have made ([`user::valid`]: a click without its
+//! `Settle`, a key released while later keys are pressed held) is skipped
+//! without a re-run:
+//! 1. ddmin over the case's actions, then each `KeyDown` with its `KeyUp`;
 //! 2. zeroing runs of the choices, longest first, from the end: choice 0 is
 //!    the minimum latency or the first variant (`Choose`);
 //! 3. dropping the zeros that end the choices, which a replay takes to be
@@ -32,10 +35,12 @@ use std::time::{Duration, Instant};
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use super::editor::UserAction;
 use super::oracle::{Failure, Tier};
 use super::regressions::Regression;
 use super::sched::Choices;
 use super::sched::Line;
+use super::user;
 use super::{report, run, Case, Outcome};
 
 /// A check that failed: its tier, name and field.
@@ -87,7 +92,7 @@ impl Shrinker<'_, '_> {
 
     /// Keeps `case` and `choices` if they still fail.
     fn attempt(&mut self, case: Case, choices: Vec<u32>) -> bool {
-        if self.exhausted() {
+        if self.exhausted() || !user::valid(&case.actions, case.settled) {
             return false;
         }
         self.runs += 1;
@@ -125,6 +130,25 @@ impl Shrinker<'_, '_> {
                 parts = (parts * 2).min(len);
             } else {
                 break;
+            }
+        }
+        // A held key goes with its release, or not at all.
+        let mut at = 0;
+        while at < self.case.actions.len() {
+            let down = matches!(self.case.actions[at], UserAction::KeyDown(_));
+            let up = self.case.actions[at..]
+                .iter()
+                .position(|a| matches!(a, UserAction::KeyUp(_)));
+            match (down, up) {
+                (true, Some(up)) => {
+                    let mut case = self.case.clone();
+                    case.actions.remove(at + up);
+                    case.actions.remove(at);
+                    if !self.attempt(case, self.choices.clone()) {
+                        at += 1;
+                    }
+                }
+                _ => at += 1,
             }
         }
         // One action may be left that still fails without it.
@@ -240,7 +264,6 @@ pub(super) fn shrunk_report(case: &Case, choices: &[u32], check: Check) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::editor::UserAction;
     use crate::sim::ClientKind;
 
     /// The injected fault: a key, and later a focus move. It lives here, in
@@ -355,5 +378,113 @@ mod tests {
         let mut broken = case.clone();
         broken.actions = vec![UserAction::Focus(99)];
         assert!(try_run(&broken, &[], &mut trace).is_none());
+    }
+
+    /// The shrinker's `failing` that accepts every candidate: only validity
+    /// can stop a reduction.
+    fn always(_: &Case, choices: &[u32]) -> Option<Vec<u32>> {
+        Some(choices.to_vec())
+    }
+
+    #[test]
+    fn a_settled_case_keeps_the_settles_around_its_clicks() {
+        let click = UserAction::Click {
+            field: 0,
+            at: crate::sim::editor::Target::End,
+        };
+        let mut case = Case::new(1, &ClientKind::ALL);
+        assert!(case.settled);
+        case.actions = vec![
+            UserAction::Settle,
+            click,
+            UserAction::Settle,
+            UserAction::Key(crate::sim::hangul::Key::Char(' ')),
+            UserAction::Settle,
+            click,
+            UserAction::Settle,
+        ];
+        assert!(user::settled(&case.actions));
+        // A check that needs a key before the click and one after it: the
+        // click is then in the middle, and keeps its Settles.
+        let key = UserAction::Key(crate::sim::hangul::Key::Char(' '));
+        case.actions = vec![key, UserAction::Settle, click, UserAction::Settle, key];
+        let mut keys_around = |case: &Case, _: &[u32]| {
+            let at = case
+                .actions
+                .iter()
+                .position(|a| matches!(a, UserAction::Click { .. }))?;
+            (case.actions[..at].contains(&key) && case.actions[at..].contains(&key)).then(Vec::new)
+        };
+        let shrunk = shrink(&case, &[], Limits::default(), &mut keys_around);
+        assert_eq!(shrunk.case.actions, case.actions);
+        case.actions = vec![
+            UserAction::Settle,
+            click,
+            UserAction::Settle,
+            key,
+            UserAction::Settle,
+            click,
+            UserAction::Settle,
+        ];
+        let shrunk = shrink(&case, &[], Limits::default(), &mut always);
+        assert!(shrunk.case.actions.is_empty());
+        // A candidate that drops a Settle is skipped, not run.
+        let mut dropped = case.clone();
+        dropped.actions.remove(2);
+        let mut runs = 0;
+        let mut count = |_: &Case, _: &[u32]| {
+            runs += 1;
+            None
+        };
+        let mut shrinker = Shrinker {
+            case: case.clone(),
+            choices: Vec::new(),
+            runs: 0,
+            limits: Limits::default(),
+            start: Instant::now(),
+            failing: &mut count,
+        };
+        assert!(!shrinker.attempt(dropped, Vec::new()));
+        assert_eq!(shrinker.runs, 0);
+    }
+
+    #[test]
+    fn a_held_key_is_dropped_with_its_release_or_kept() {
+        use crate::sim::hangul::Key;
+        let mut case = Case::new(0, &ClientKind::ALL);
+        assert!(!case.settled);
+        let hold = Key::Backspace;
+        case.actions = vec![
+            UserAction::KeyDown(hold),
+            UserAction::Key(Key::Char(' ')),
+            UserAction::KeyUp(hold),
+            UserAction::Key(hold),
+        ];
+        assert!(user::valid(&case.actions, false));
+        // A check that needs the final `Key`: the hold can all go.
+        let mut needs_key = |case: &Case, _: &[u32]| {
+            (case.actions.last() == Some(&UserAction::Key(hold))).then(Vec::new)
+        };
+        let shrunk = shrink(&case, &[], Limits::default(), &mut needs_key);
+        assert_eq!(shrunk.case.actions, [UserAction::Key(hold)]);
+        // A check that needs the release alone cannot get it without its press.
+        let mut needs_up = |case: &Case, _: &[u32]| {
+            case.actions
+                .contains(&UserAction::KeyUp(hold))
+                .then(Vec::new)
+        };
+        let shrunk = shrink(&case, &[], Limits::default(), &mut needs_up);
+        assert!(user::valid(&shrunk.case.actions, false));
+        assert!(shrunk.case.actions.contains(&UserAction::KeyDown(hold)));
+        // A press of the held key while it is held is not a case.
+        assert!(!user::valid(
+            &[
+                UserAction::KeyDown(hold),
+                UserAction::Key(hold),
+                UserAction::KeyUp(hold)
+            ],
+            false
+        ));
+        assert!(!user::valid(&[UserAction::KeyDown(hold)], false));
     }
 }
