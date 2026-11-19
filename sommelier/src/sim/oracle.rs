@@ -1987,6 +1987,62 @@ pub(super) fn classify(failures: &[Failure], counts: &Counts) -> Vec<KnownIssue>
     known
 }
 
+/// The no-loss check, tier 1, of a settled case: at each `Settle` of
+/// `actions` and at the end, each of the client's fields shows every
+/// character the user intends there, in order, preedit included at the
+/// cursor. A field may show more, as a doubled commit does, which tier 2
+/// judges; never less. `reference` is the intent before the actions,
+/// `settles` the client's fields at each `Settle`, and `client` the
+/// client at the end. Only a settled case: the reference does not describe
+/// a free case's timing, where a key can reach a field raw, or another
+/// field than the user meant.
+pub(super) fn lost(
+    mut reference: Reference,
+    actions: &[UserAction],
+    settles: &[Vec<TextModel>],
+    client: &dyn Client,
+) -> Vec<Failure> {
+    let shown = |model: &TextModel| {
+        let (before, after) = model.text.split_at(model.cursor);
+        format!("{before}{}{after}", model.preedit)
+    };
+    let check = |at: &str, reference: &Reference, fields: &[TextModel]| -> Vec<Failure> {
+        let pairs = reference.fields().iter().zip(fields).enumerate();
+        pairs
+            .filter(|(_, (intended, got))| !is_subsequence(&shown(intended), &shown(got)))
+            .map(|(i, (intended, got))| Failure {
+                tier: Tier::Exact,
+                check: "no loss",
+                field: Some(i),
+                detail: format!(
+                    "{at}: intended: {}\nclient:   {}",
+                    show_model(intended),
+                    show_model(got)
+                ),
+            })
+            .collect()
+    };
+    let mut settles = settles.iter();
+    for (i, &action) in actions.iter().enumerate() {
+        if action == UserAction::Settle {
+            let fields = settles.next().expect("the client's fields at each settle");
+            let failures = check(&format!("at action {i}, a settle"), &reference, fields);
+            if !failures.is_empty() {
+                return failures;
+            }
+        }
+        reference.apply(action);
+    }
+    let fields: Vec<TextModel> = client.fields().iter().map(|f| f.model.clone()).collect();
+    check("at the end", &reference, &fields)
+}
+
+/// Whether `text` holds every character of `part`, in order.
+fn is_subsequence(part: &str, text: &str) -> bool {
+    let mut text = text.chars();
+    part.chars().all(|c| text.any(|t| t == c))
+}
+
 /// A field as `"text with | at the cursor" preedit "…" at (begin, end)`.
 fn show(view: &View) -> String {
     format!("{} at {:?}", show_model(&view.model), view.preedit_cursor)
@@ -3000,6 +3056,28 @@ mod tests {
         let mut gtk = Gtk::new(true, 10, fields);
         gtk.keyboard_focus(Micros(0), Some(GUEST[focus]));
         gtk
+    }
+
+    #[test]
+    fn no_loss_needs_each_intended_character_in_order_at_each_settle() {
+        let start = || Reference::new(vec![TextModel::new("ab"), TextModel::new("1")]);
+        let fields = |texts: [&str; 2]| texts.map(TextModel::new).to_vec();
+        let lost_at = |settle: [&str; 2], end: [&str; 2]| -> Vec<(Option<usize>, String)> {
+            let settles = [fields(settle)];
+            let failures = lost(start(), &[UserAction::Settle], &settles, &gtk(end, 0));
+            let at = |f: Failure| (f.field, f.detail.split(':').next().unwrap().to_owned());
+            failures.into_iter().map(at).collect()
+        };
+        // More is no loss; less, or out of order, is.
+        assert_eq!(lost_at(["xaby", "1"], ["ab", "21"]), []);
+        assert_eq!(
+            lost_at(["a", "1"], ["ab", "1"]),
+            [(Some(0), "at action 0, a settle".to_owned())]
+        );
+        assert_eq!(
+            lost_at(["ab", "1"], ["ba", "1"]),
+            [(Some(0), "at the end".to_owned())]
+        );
     }
 
     #[test]

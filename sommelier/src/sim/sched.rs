@@ -332,6 +332,9 @@ pub(super) struct World<'t> {
     pub steps: Vec<String>,
     /// The proxy ended the session.
     pub ended: bool,
+    /// The client's fields at each `Settle`, in order, for the no-loss
+    /// check ([`oracle::lost`]).
+    pub settles: Vec<Vec<TextModel>>,
     trace: &'t mut Vec<Line>,
 }
 
@@ -375,6 +378,7 @@ impl<'t> World<'t> {
             shadow: None,
             steps: Vec::new(),
             ended: false,
+            settles: Vec::new(),
             trace,
         };
         let registry = world.session.new_id();
@@ -590,7 +594,11 @@ impl<'t> World<'t> {
                 return self.host_sends(Vec::new(), false);
             }
             UserAction::Reopen(field) => return self.reopen(field),
-            UserAction::Settle => return,
+            UserAction::Settle => {
+                let fields = self.client().fields().iter();
+                let fields = fields.map(|field| field.model.clone()).collect();
+                return self.settles.push(fields);
+            }
         };
         // A window that is opening again, after a replay or a shrink drops
         // the `Settle` behind its reopen, cannot be clicked yet.

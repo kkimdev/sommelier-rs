@@ -212,6 +212,9 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         let (exo, steps) = (&world.exo, &world.steps);
         let mut failures = oracle::exact(steps, spec, shadow, exo, &engine, resets, extension);
         if case.settled {
+            let start = case.reference_at_start(extension);
+            let (actions, settles) = (&case.actions, &world.settles);
+            failures.extend(oracle::lost(start, actions, settles, world.client()));
             failures.extend(oracle::intended(&case.reference(extension), world.client()));
         }
         outcome.known = oracle::classify(&failures, &spec.counts);
