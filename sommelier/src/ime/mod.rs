@@ -277,7 +277,11 @@ impl ImeCore {
         host: HostTi,
         surface: Option<SurfaceId>,
     ) {
-        debug_assert!(!self.inputs.contains_key(&ti), "{ti:?} exists already");
+        // The guest cannot reuse a live text input's ID. Should one be
+        // replaced anyway, its extension goes with it, so that `by_ext`
+        // names only live text inputs (I4).
+        let replaced = self.forget(ti);
+        debug_assert!(replaced.is_none(), "{ti:?} exists already");
         if let Some(ext) = host.ext {
             self.by_ext.insert(ext.id, ti);
         }
