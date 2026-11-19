@@ -192,29 +192,51 @@ pub fn decode<M>(
 }
 
 /// Each message of a proxy message queue, with its sender, decoded by
-/// `decode`, such as `wl_keyboard::Event::from_wire`. The decoded
-/// descriptors are duplicates, so the queue keeps its own. Panics if a
-/// message does not decode whole, or leaves a descriptor unread.
+/// `decode`, such as `wl_keyboard::Event::from_wire`; an entry that glues
+/// several messages gives each. The decoded descriptors are duplicates, so
+/// the queue keeps its own. Panics if a message does not decode whole, or
+/// leaves a descriptor unread.
 pub fn decoded<M>(
     queue: &[Outgoing],
     decode: fn(&mut WireMessage) -> Result<M, ProtocolError>,
 ) -> Vec<(u32, M)> {
     queue
         .iter()
-        .map(|(message, fds)| {
+        .flat_map(|(bytes, fds)| {
             let mut fds: VecDeque<OwnedFd> = fds
                 .iter()
                 .map(|fd| fd.try_clone().expect("duplicate a queued descriptor"))
                 .collect();
-            let decoded = self::decode(message, &mut fds, decode)
-                .unwrap_or_else(|error| panic!("a queued message does not decode: {error}"));
+            let messages = glued_messages(bytes)
+                .into_iter()
+                .map(|message| {
+                    self::decode(message, &mut fds, decode)
+                        .unwrap_or_else(|error| panic!("a queued message does not decode: {error}"))
+                })
+                .collect::<Vec<_>>();
             assert!(
                 fds.is_empty(),
                 "a queued message carries unread descriptors"
             );
-            decoded
+            messages
         })
         .collect()
+}
+
+/// The messages of a queue entry, which may glue several into one
+/// submission; an incomplete rest is one more, which fails to decode.
+pub fn glued_messages(mut bytes: &[u8]) -> Vec<&[u8]> {
+    let mut messages = Vec::new();
+    while !bytes.is_empty() {
+        let len = match MessageHeader::frame(bytes) {
+            Framing::Complete(header) => header.len,
+            _ => bytes.len(),
+        };
+        let (message, rest) = bytes.split_at(len);
+        messages.push(message);
+        bytes = rest;
+    }
+    messages
 }
 
 /// Whether `a` and `b` refer to the same file, by device and inode, which

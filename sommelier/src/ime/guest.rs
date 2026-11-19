@@ -47,7 +47,7 @@ impl Preedit {
 /// delete, the commit, then the preedit. `preedit: None` clears a preedit
 /// the guest shows; what tells "clear" from "omit" is whether it showed
 /// one (`shown_before` of [`Self::encode`]).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct GuestTxn {
     /// The bytes to delete before and after the cursor.
     pub(super) delete: Option<(u32, u32)>,

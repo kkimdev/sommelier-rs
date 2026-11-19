@@ -37,11 +37,14 @@ limitations under the License.
 //! ([`classify`]), which only the check its trigger names can show. No
 //! known issue explains a tier-2 failure.
 //!
-//! `SpecText` tracks whether the guest's text is ahead of what it last
-//! reported, which drops Exo's absolute deletes (H9), and the bytes the
-//! preedit regions took since, which with the preedit Exo holds give
-//! Exo's text, which Exo measures a region in (X1). Exo sends no
-//! `preedit_styling` (H4).
+//! In Legacy mode (`ime::ImeMode`), `SpecText` tracks whether the guest's
+//! text is ahead of what it last reported, which drops Exo's absolute
+//! deletes (H9), and the bytes the preedit regions took since, which with
+//! the preedit Exo holds give Exo's text, which Exo measures a region in
+//! (X1). In Mirror mode it also measures both in Exo's real text, and the
+//! proxy must send either that transaction or Legacy mode's, which it falls
+//! back to whenever it cannot tell the guest is in step with Exo
+//! ([`SpecText::alternative`]). Exo sends no `preedit_styling` (H4).
 
 use std::collections::BTreeMap;
 
@@ -363,6 +366,12 @@ pub(super) struct Counts {
     /// Preedit regions dropped for their range or for not covering a
     /// region the guest had not reported (X1').
     pub regions_dropped: u64,
+    /// Mirror mode: deletes and regions the proxy measured in Exo's text
+    /// and dropped, and those it measured as Legacy mode does, which it
+    /// falls back to while it cannot tell the guest is in step with Exo,
+    /// where the two differ.
+    pub mirror_drops: u64,
+    pub mirror_fallbacks: u64,
     /// Guest reports that crossed an edit on its way to the guest (P4).
     pub crossed_reports: u64,
     /// Preedit regions Exo made before it got a report the proxy had sent
@@ -427,6 +436,8 @@ impl std::ops::AddAssign for Counts {
         self.regions_over_preedits += other.regions_over_preedits;
         self.regions_ended += other.regions_ended;
         self.regions_dropped += other.regions_dropped;
+        self.mirror_drops += other.mirror_drops;
+        self.mirror_fallbacks += other.mirror_fallbacks;
         self.crossed_reports += other.crossed_reports;
         self.regions_crossing_reports += other.regions_crossing_reports;
         self.regions_stale += other.regions_stale;
@@ -475,6 +486,38 @@ struct Waiting {
     press: Option<u32>,
 }
 
+/// Mirror mode's transaction for a delete or a region measured in Exo's
+/// text (H9, X1), which the guest gets only if the proxy sends it.
+#[derive(Clone, Debug)]
+struct Measured {
+    txn: Txn,
+    cursor: (i32, i32),
+    origin: Origin,
+    /// The preedit the guest shows after it.
+    shown: Option<Shown>,
+    /// A delete, a region, or an empty region that ends the composition.
+    kind: &'static str,
+}
+
+/// Mirror mode: what Legacy mode's delete or region changed of the
+/// specification, and what Exo's text measures instead: `None` if no guest
+/// can be in step with it, a selection's; or else the transaction, `None`
+/// for a drop ([`SpecText::alternative`]).
+#[derive(Debug)]
+struct Alternative {
+    views: Vec<View>,
+    shown: Option<Shown>,
+    taken: Option<(usize, usize)>,
+    ahead: bool,
+    edits: u64,
+    diverged: Option<&'static str>,
+    wrong_regions: Vec<(&'static str, String)>,
+    counts: Counts,
+    held: BTreeMap<u32, Held>,
+    txns: usize,
+    measured: Option<Option<Measured>>,
+}
+
 /// What the specification says the proxy does: the decisions it asks of
 /// the host, and what an ideal client then shows. The case has one guest
 /// text input on one seat, which follows the keyboard focus.
@@ -517,6 +560,11 @@ pub(super) struct SpecText {
     region_model: Option<RegionModel>,
     /// The last `preedit_cursor` since a terminal event (H5).
     assembly: Option<i32>,
+    /// The text input is in Mirror mode (`ime::ImeMode`).
+    mirror: bool,
+    /// Mirror mode: the step's delete or region, measured in Exo's text,
+    /// and what Legacy mode's measurement changed ([`Alternative`]).
+    alternative: Option<Alternative>,
     /// The keys the host holds, by keycode, and the peeks so far: the
     /// sequence of the latest since the focus last moved, and their count.
     held: BTreeMap<u32, Held>,
@@ -579,6 +627,8 @@ impl SpecText {
             taken: None,
             region_model: None,
             assembly: None,
+            mirror: false,
+            alternative: None,
             held: BTreeMap::new(),
             latest_peek: None,
             peeks: 0,
@@ -596,6 +646,14 @@ impl SpecText {
             typed: Vec::new(),
             wrong_reports: Vec::new(),
             counts: Counts::default(),
+        }
+    }
+
+    /// The specification of a text input in `mode`.
+    pub fn in_mode(self, mode: crate::ime::ImeMode) -> Self {
+        Self {
+            mirror: mode == crate::ime::ImeMode::Mirror,
+            ..self
         }
     }
 
@@ -781,12 +839,28 @@ impl SpecText {
                     self.fence = Fence::Closed; // W2
                 }
             }
-            AnyEvent::ZwpTextInputV1(event) => self.text_input(event, origin),
+            AnyEvent::ZwpTextInputV1(event) => self.text_input(event, origin, truth),
             AnyEvent::ZcrExtendedTextInputV1(extended::Event::ConfirmPreedit { .. }) => {
                 // X2 confirms the shown preedit; X2' recovers a held key.
                 self.composition_event(origin, |spec| match spec.commit_shown() {
                     Some(txn) => Some((txn, (0, 0))),
                     None => spec.recover_held_key(origin),
+                });
+            }
+            &AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion {
+                index,
+                length,
+            }) if self.mirror => {
+                let rollback = self.rollback();
+                self.composition_event(origin, |spec| {
+                    let measured = spec.measure_region(truth, index, length, origin);
+                    spec.alternative = Some(Alternative {
+                        measured,
+                        ..rollback
+                    });
+                    let edit = spec.region(index, length, origin);
+                    spec.judge_region(truth, edit.as_ref(), origin);
+                    edit
                 });
             }
             &AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion {
@@ -1082,7 +1156,7 @@ impl SpecText {
     }
 
     /// H2, H5, H7 and H8.
-    fn text_input(&mut self, event: &v1::Event, origin: Origin) {
+    fn text_input(&mut self, event: &v1::Event, origin: Origin, truth: Option<&RegionTruth>) {
         match event {
             v1::Event::Leave {} if self.link == Link::Attached => {
                 // H2: Exo detached on its own. The keys in flight died with
@@ -1162,6 +1236,18 @@ impl SpecText {
                         ..Txn::default()
                     };
                     Some((txn, (0, 0)))
+                });
+            }
+            // A negative index keeps the v1 XML's reading in Mirror mode.
+            &v1::Event::DeleteSurroundingText { index, length } if self.mirror && index >= 0 => {
+                let rollback = self.rollback();
+                self.composition_event(origin, |spec| {
+                    let measured = spec.measure_delete(truth, index, length, origin);
+                    spec.alternative = Some(Alternative {
+                        measured,
+                        ..rollback
+                    });
+                    spec.delete(index, length)
                 });
             }
             &v1::Event::DeleteSurroundingText { index, length } => {
@@ -1303,6 +1389,204 @@ impl SpecText {
             ..Txn::default()
         };
         Some((txn, preedit_cursor))
+    }
+
+    /// Mirror mode: what Legacy mode's measurement of a delete or a region
+    /// may change, so that it can be undone.
+    fn rollback(&self) -> Alternative {
+        Alternative {
+            views: self.views.clone(),
+            shown: self.shown.clone(),
+            taken: self.taken,
+            ahead: self.ahead,
+            edits: self.edits,
+            diverged: self.diverged,
+            wrong_regions: self.wrong_regions.clone(),
+            counts: self.counts,
+            held: self.held.clone(),
+            txns: self.txns.len(),
+            measured: None,
+        }
+    }
+
+    /// Mirror mode: the guest got the transactions `got` for the step's
+    /// delete or region, after the step's earlier ones. They must be Legacy
+    /// mode's, which the specification applied, or the measurement in Exo's
+    /// text, which then replaces Legacy mode's.
+    fn resolve(&mut self, alternative: Alternative, got: &[(Txn, (i32, i32))]) {
+        let legacy = &self.txns[alternative.txns.min(self.txns.len())..];
+        let measured = alternative.measured.clone().map(|measured| {
+            let txn = measured.as_ref().map(|m| (m.txn.clone(), m.cursor));
+            (measured, txn.into_iter().collect::<Vec<_>>())
+        });
+        let Some(after) = got.get(alternative.txns..) else {
+            return;
+        };
+        match measured {
+            Some((measured, txns)) if after == txns && after != legacy => {
+                let Alternative {
+                    views,
+                    shown,
+                    taken,
+                    ahead,
+                    edits,
+                    diverged,
+                    wrong_regions,
+                    counts,
+                    held,
+                    txns,
+                    ..
+                } = alternative;
+                (self.views, self.shown, self.taken, self.ahead) = (views, shown, taken, ahead);
+                (self.edits, self.diverged, self.wrong_regions) = (edits, diverged, wrong_regions);
+                (self.counts, self.held) = (counts, held);
+                self.txns.truncate(txns);
+                match measured {
+                    Some(measured) => self.accept(measured),
+                    None => self.counts.mirror_drops += 1,
+                }
+            }
+            Some((_, txns)) if txns != legacy && after == legacy => {
+                self.counts.mirror_fallbacks += 1
+            }
+            None if !legacy.is_empty() && after == legacy => self.counts.mirror_fallbacks += 1,
+            _ => {}
+        }
+    }
+
+    /// Mirror mode: where a guest in step with Exo's text before the
+    /// event, `truth`, has its preedit: the composition, which it shows,
+    /// with the rest of Exo's text and its cursor at the composition's
+    /// start; or else, with no selection, empty at Exo's cursor, the
+    /// guest's, whatever preedit it shows, which no one holds. `None` with
+    /// a selection, in which no guest is in step.
+    ///
+    /// Whether the guest is in step is the proxy's to tell, and an ideal
+    /// client's text is no guide: a client model's can differ, as GTK's
+    /// Backspace leaves a syllable's first jamo (C14). The specification
+    /// holds the proxy only to a measurement in Exo's text, if it makes
+    /// one, or else to Legacy mode's.
+    fn held(truth: &RegionTruth) -> Option<std::ops::Range<usize>> {
+        match &truth.composition {
+            Some(composition) => Some(composition.clone()),
+            None => {
+                let selection = truth.selection;
+                (selection.start == selection.end).then_some(selection.end..selection.end)
+            }
+        }
+    }
+
+    /// Mirror mode, X1: the bytes from `index` past Exo's cursor, `length`
+    /// long, in Exo's text (`truth`), become the preedit, if they cover the
+    /// preedit Exo holds, or are dropped; an empty region leaves that
+    /// preedit as text, which the guest commits.
+    fn measure_region(
+        &self,
+        truth: Option<&RegionTruth>,
+        index: i32,
+        length: u32,
+        origin: Origin,
+    ) -> Option<Option<Measured>> {
+        let (truth, held) = truth.and_then(|truth| Some((truth, Self::held(truth)?)))?;
+        let measured = (|| {
+            let start = usize::try_from(truth.cursor as i64 + i64::from(index)).ok()?;
+            let end = start + length as usize;
+            let text = truth.text.get(start..end)?;
+            if text.is_empty() {
+                let commit = truth.text[held.clone()].to_owned();
+                let kind = if commit.is_empty() { "region" } else { "ended" };
+                let txn = Txn {
+                    commit,
+                    ..Txn::default()
+                };
+                return Some((txn, (0, 0), None, kind));
+            }
+            if held.start < start || end < held.end {
+                return None;
+            }
+            let before = truth.cursor.clamp(start, end) - start;
+            let cursor = preedit_cursor(text, Some(self.assembly.unwrap_or(before as i32)));
+            let shown = Shown {
+                text: text.to_owned(),
+                cursor,
+                origin,
+                host_cursor: Some(before),
+            };
+            let txn = Txn {
+                delete: (held.start - start, end - held.end),
+                preedit: text.to_owned(),
+                ..Txn::default()
+            };
+            Some((txn, cursor, Some(shown), "region"))
+        })();
+        Some(measured.map(|(txn, cursor, shown, kind)| Measured {
+            txn,
+            cursor,
+            origin,
+            shown,
+            kind,
+        }))
+    }
+
+    /// Mirror mode, H9: Exo deletes `length` bytes from `index` of its text
+    /// (`truth`), which holds no composition, around its cursor, the
+    /// guest's, or the delete is dropped.
+    fn measure_delete(
+        &self,
+        truth: Option<&RegionTruth>,
+        index: i32,
+        length: u32,
+        origin: Origin,
+    ) -> Option<Option<Measured>> {
+        let (truth, held) = truth.and_then(|truth| Some((truth, Self::held(truth)?)))?;
+        let start = usize::try_from(index).ok();
+        let lengths = start.and_then(|start| around(&truth.text, held.start, start as i64, length));
+        let measured = lengths.filter(|&lengths| held.is_empty() && lengths != (0, 0));
+        Some(measured.map(|(before, after)| Measured {
+            txn: Txn {
+                delete: (before, after),
+                ..Txn::default()
+            },
+            cursor: (0, 0),
+            origin,
+            shown: None,
+            kind: "delete",
+        }))
+    }
+
+    /// Mirror mode: the guest got `measured`, the transaction of the
+    /// step's delete or region, which changes what Legacy mode keeps as
+    /// the core's does.
+    fn accept(&mut self, measured: Measured) {
+        let Measured {
+            txn,
+            cursor,
+            origin,
+            shown,
+            kind,
+        } = measured;
+        self.end_lease();
+        self.shown = shown;
+        match kind {
+            "delete" => {
+                self.counts.deletes += 1;
+                self.edited();
+            }
+            "ended" => {
+                self.counts.regions_ended += 1;
+                self.edited();
+            }
+            _ if !txn.preedit.is_empty() => {
+                self.counts.regions += 1;
+                self.forward_edit();
+                let (before, after) = self.taken.unwrap_or_default();
+                let taken = (before + txn.delete.0, after + txn.delete.1);
+                self.taken = (taken != (0, 0)).then_some(taken);
+            }
+            _ => {}
+        }
+        self.counts.late_shown += u64::from(origin.late);
+        self.apply(&txn, cursor);
     }
 
     /// X1, judged by what Exo did of the region (`truth`): the preedit the
@@ -1727,6 +2011,11 @@ impl Shadow {
 /// and preedit cursor included. Returns the difference, if any, and starts
 /// the next step.
 pub(super) fn step(spec: &mut SpecText, shadow: &mut Shadow) -> Option<String> {
+    // Mirror mode: the guest gets Legacy mode's delete or region, or the
+    // one measured in Exo's text.
+    if let Some(alternative) = spec.alternative.take() {
+        spec.resolve(alternative, &shadow.txns);
+    }
     let (expected, got) = (
         std::mem::take(&mut spec.txns),
         std::mem::take(&mut shadow.txns),
@@ -1822,7 +2111,12 @@ pub(super) fn exact(
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
             );
-            failures.push(failure("composition", Some(field), detail));
+            // In Mirror mode, a report Exo could not match dropped it (E4).
+            let check = match spec.mirror && tracked.is_empty() && exo.composition_dropped() {
+                true => "composition a report dropped",
+                false => "composition",
+            };
+            failures.push(failure(check, Some(field), detail));
         }
     }
     let expected: Vec<exo::Field> = spec
@@ -1893,6 +2187,9 @@ pub(super) enum KnownIssue {
     /// method the guest has yet to report is measured in the text it last
     /// reported (X1, P4).
     RegionWhileAhead,
+    /// Mirror mode: the guest's report leaves out the preedit it shows, so
+    /// Exo cannot match it and drops the composition (E4).
+    ReportDropsComposition,
 }
 
 impl KnownIssue {
@@ -1919,6 +2216,12 @@ impl KnownIssue {
                  report crossed, or a press's commit; the proxy measures it in the text the \
                  guest last reported, which tracks only the bytes regions took, so the guest \
                  shows other bytes than Exo composes (X1, P4)"
+            }
+            Self::ReportDropsComposition => {
+                "a text-input-v3 guest reports its text without the preedit it shows, as \
+                 the protocol has it, which names no state Exo predicted, as each holds the \
+                 composition inline; Exo drops its composition (E4), and the guest shows a \
+                 preedit Exo no longer holds, until the engine's next preedit replaces it"
             }
             Self::RegionCrossesReport => {
                 "Exo makes a region in the text it had before a report of the guest's, which \
@@ -1949,6 +2252,9 @@ impl KnownIssue {
                 "docs/IME_REDESIGN.md 2.2 X1 and HANDOVER; needs the proxy to track the text the \
                  guest gained, not only the bytes it lost"
             }
+            Self::ReportDropsComposition => {
+                "docs/IME_REDESIGN.md 4.8; report suppression (PR M4 of the Exo mirror plan)"
+            }
         }
     }
 }
@@ -1959,10 +2265,17 @@ impl KnownIssue {
 /// was stale (`counts`); and a region check that says why Exo made the
 /// region in other text than the proxy knew
 /// ([`SpecText::judge_region`]).
-pub(super) fn classify(failures: &[Failure], counts: &Counts) -> Vec<KnownIssue> {
+pub(super) fn classify(failures: &[Failure], counts: &Counts, mirror: bool) -> Vec<KnownIssue> {
+    // Legacy mode's issues reach Mirror mode only where it fell back.
+    let legacy = !mirror || counts.mirror_fallbacks > 0;
     let mut known = Vec::new();
     for failure in failures {
         let issue = match (failure.tier, failure.check) {
+            (Tier::Exact, "composition a report dropped") if mirror => {
+                KnownIssue::ReportDropsComposition
+            }
+            // The rest are Legacy mode's: Mirror mode measures in Exo's text.
+            _ if !legacy => return Vec::new(),
             (Tier::Exact, "composition") if counts.regions_crossing_reports > 0 => {
                 KnownIssue::RegionCrossesReport
             }
@@ -2630,6 +2943,7 @@ mod tests {
             held: held.to_owned(),
             dropped,
             composed: composed.to_owned(),
+            ..RegionTruth::default()
         };
         let start = || {
             let mut spec = attached(&["0ab"]);
@@ -3110,8 +3424,13 @@ mod tests {
             ..Counts::default()
         };
         let one = std::slice::from_ref(&composition);
-        assert_eq!(classify(one, &crossing), [KnownIssue::RegionCrossesReport]);
-        assert_eq!(classify(one, &Counts::default()), []);
+        assert_eq!(
+            classify(one, &crossing, false),
+            [KnownIssue::RegionCrossesReport]
+        );
+        // Each is Legacy mode's.
+        assert_eq!(classify(one, &crossing, true), []);
+        assert_eq!(classify(one, &Counts::default(), false), []);
         // The scheduler marks such a region, which SpecText counts.
         let mut spec = attached(&["0ab"]);
         report(&mut spec, "0ab", 3);
@@ -3140,7 +3459,7 @@ mod tests {
             ..Counts::default()
         };
         let issue = KnownIssue::StaleRegionAfterCommit;
-        assert_eq!(classify(one, &stale), [issue]);
+        assert_eq!(classify(one, &stale, false), [issue]);
         assert!(!issue.reason().is_empty() && issue.tracking().contains("X1"));
     }
 
@@ -3154,13 +3473,13 @@ mod tests {
         };
         let one = std::slice::from_ref(&lost);
         let none = Counts::default();
-        assert_eq!(classify(one, &none), []);
-        assert_eq!(classify(&[], &none), []);
+        assert_eq!(classify(one, &none, false), []);
+        assert_eq!(classify(&[], &none, false), []);
         let exact = Failure {
             tier: Tier::Exact,
             ..lost.clone()
         };
-        assert_eq!(classify(&[lost.clone(), exact], &none), []);
+        assert_eq!(classify(&[lost.clone(), exact], &none, false), []);
         // No issue explains a composition that Exo composes elsewhere
         // without a region that crossed a report or was stale.
         let composition = Failure {
@@ -3169,7 +3488,7 @@ mod tests {
             ..lost.clone()
         };
         let one = std::slice::from_ref(&composition);
-        assert_eq!(classify(one, &none), []);
+        assert_eq!(classify(one, &none, false), []);
         // A region measured in a report that crossed it, alone or not.
         let crossing = Failure {
             tier: Tier::Exact,
@@ -3177,9 +3496,12 @@ mod tests {
             ..lost.clone()
         };
         let crosses = KnownIssue::RegionCrossesReport;
-        assert_eq!(classify(std::slice::from_ref(&crossing), &none), [crosses]);
-        assert_eq!(classify(&[crossing.clone(), composition], &none), []);
-        assert_eq!(classify(&[crossing, lost.clone()], &none), []);
+        assert_eq!(
+            classify(std::slice::from_ref(&crossing), &none, false),
+            [crosses]
+        );
+        assert_eq!(classify(&[crossing.clone(), composition], &none, false), []);
+        assert_eq!(classify(&[crossing, lost.clone()], &none, false), []);
         // No issue explains a key recovered for Exo's confirmation before
         // another key's press (X2').
         let recovery = Failure {
@@ -3187,6 +3509,6 @@ mod tests {
             check: "recovery",
             ..lost
         };
-        assert_eq!(classify(&[recovery], &none), []);
+        assert_eq!(classify(&[recovery], &none, false), []);
     }
 }

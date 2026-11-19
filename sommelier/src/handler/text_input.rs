@@ -92,6 +92,10 @@ pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
             HostOut::Barrier(token) => {
                 queue_internal_sync(ctx, InternalCallback::TextInput { token });
             }
+            HostOut::GluedBarrier(token) => {
+                queue_internal_sync(ctx, InternalCallback::TextInput { token });
+                glue_last_two(&mut ctx.client_to_host_queue);
+            }
             HostOut::Retire(id) => ctx.retire_destroyed_host_object(id),
         }
     }
@@ -99,6 +103,32 @@ pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
         apply_key_effect(ctx, key);
     }
     fx.forward
+}
+
+/// Make the last two messages of `queue` one entry, which a submission
+/// never splits (`connection::OutgoingMessages`).
+fn glue_last_two(queue: &mut Vec<Outgoing>) {
+    let (Some((bytes, fds)), Some((into, into_fds))) = (queue.pop(), queue.last_mut()) else {
+        unreachable!("a glued barrier follows its request");
+    };
+    into.extend_from_slice(&bytes);
+    into_fds.extend(fds);
+}
+
+/// Whether the kill switch `SOMMELIER_IME_MIRROR=shadow` keeps every text
+/// input in Legacy mode, with the Exo mirror only logging
+/// ([`ime::ImeMode`]). Read once, so the IME core stays free of I/O.
+pub(crate) fn mirror_shadowed() -> bool {
+    static SHADOW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("SOMMELIER_IME_MIRROR").is_some_and(|value| value == "shadow")
+    });
+    *SHADOW
+}
+
+/// The keyboard concern forwarded a key press or repeat to the guest on
+/// guest seat `seat`, which may edit its text where Exo does not see.
+pub(crate) fn guest_key(ctx: &mut Context, seat: u32) {
+    ime(ctx, Input::GuestKey(SeatId(seat)));
 }
 
 /// Apply what the IME core asks of the keyboard concern.
@@ -355,8 +385,10 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         Action::Drop
     }
     /// X2, and X2' with no preedit shown.
-    fn on_confirm_preedit(&mut self, ctx: &mut Context, _selection_behavior: u32) -> Action {
-        host_ext_event(ctx, HostIme::Confirm)
+    fn on_confirm_preedit(&mut self, ctx: &mut Context, selection_behavior: u32) -> Action {
+        let keep_selection = selection_behavior
+            == zcr_extended_text_input_v1::CONFIRM_PREEDIT_SELECTION_BEHAVIOR_UNCHANGED;
+        host_ext_event(ctx, HostIme::Confirm { keep_selection })
     }
 }
 
@@ -664,6 +696,10 @@ pub(super) mod tests {
         /// and takes the proxy's `ack_key`, and sends the keyboard the
         /// default keymap, whose keys repeat.
         keyboard_extension_with_keymap: bool,
+        /// Whether the proxy runs under the kill switch
+        /// `SOMMELIER_IME_MIRROR=shadow`, which keeps its text inputs in
+        /// Legacy mode ([`ime::ImeMode`]).
+        shadow: bool,
     }
 
     /// A guest text input and the host objects behind it, which a
@@ -692,6 +728,7 @@ pub(super) mod tests {
             Self::offered(Host {
                 text_input_extension: extension,
                 keyboard_extension_with_keymap: false,
+                shadow: false,
             })
             .await
         }
@@ -743,7 +780,7 @@ pub(super) mod tests {
             assert_eq!(f.enter_surface().await, []);
             if let Some(extension) = keyboard_extension {
                 // The keyboard's first enter gets it its extended keyboard.
-                let host = f.s.host_received();
+                let host = f.host_received().await;
                 let [(
                     sender,
                     AnyRequest::ZcrKeyboardExtensionV1(KeyboardExtension::GetExtendedKeyboard {
@@ -756,6 +793,10 @@ pub(super) mod tests {
                 };
                 assert_eq!((sender, keyboard), (extension, f.keyboard.host));
                 f.extended_keyboard = id;
+            }
+            if host.shadow {
+                // The kill switch, which only the proxy's environment sets.
+                f.s.ctx().ime = ime::ImeCore::new(true);
             }
             let ti = f.s.new_id();
             f.create_text_input(ti).await;
@@ -781,11 +822,30 @@ pub(super) mod tests {
             Self::new(EXTENSION).await
         }
 
+        /// [`Self::disabled`] in Legacy mode, as under the kill switch.
+        async fn legacy() -> Self {
+            Self::offered(Host {
+                text_input_extension: EXTENSION,
+                keyboard_extension_with_keymap: false,
+                shadow: true,
+            })
+            .await
+        }
+
         /// A text input the guest enabled, which the host activated.
         async fn enabled() -> Self {
-            let mut f = Self::disabled().await;
+            Self::enable(Self::disabled().await).await
+        }
+
+        /// [`Self::enabled`] in Legacy mode.
+        async fn legacy_enabled() -> Self {
+            Self::enable(Self::legacy().await).await
+        }
+
+        /// `f` once the guest enabled it and the host activated it.
+        async fn enable(mut f: Self) -> Self {
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-            assert_eq!(f.s.host_received(), f.enable_requests(1));
+            assert_eq!(f.host_received().await, f.enable_requests(1));
             f.answered(1);
             f
         }
@@ -794,7 +854,17 @@ pub(super) mod tests {
         /// surrounding text `text` with `cursor` and `anchor`, so that each
         /// `done` is numbered 2.
         async fn with_surrounding_text(text: &str, cursor: i32, anchor: i32) -> Self {
-            let mut f = Self::enabled().await;
+            Self::report(Self::enabled().await, text, cursor, anchor).await
+        }
+
+        /// [`Self::with_surrounding_text`] in Legacy mode.
+        async fn legacy_with_surrounding_text(text: &str, cursor: i32, anchor: i32) -> Self {
+            Self::report(Self::legacy_enabled().await, text, cursor, anchor).await
+        }
+
+        /// `f`, enabled, once its guest committed the surrounding text
+        /// `text` with `cursor` and `anchor`.
+        async fn report(mut f: Self, text: &str, cursor: i32, anchor: i32) -> Self {
             f.s.guest([
                 v3::set_surrounding_text(f.ti, text, cursor, anchor).unwrap(),
                 v3::commit(f.ti),
@@ -803,7 +873,7 @@ pub(super) mod tests {
             let mut expected = vec![f.surrounding_text(text, cursor as u32, anchor as u32)];
             expected.extend(f.content_type((0, 0), true));
             expected.push(f.commit_state(2));
-            assert_eq!(f.s.host_received(), expected);
+            assert_eq!(f.host_received().await, expected);
             f.answered(2);
             f
         }
@@ -816,6 +886,7 @@ pub(super) mod tests {
             let mut f = Self::offered(Host {
                 text_input_extension: EXTENSION,
                 keyboard_extension_with_keymap: true,
+                shadow: false,
             })
             .await;
             f.start_typing().await;
@@ -850,7 +921,7 @@ pub(super) mod tests {
                 f.no_cursor_rectangle(),
                 f.commit_state(1),
             ];
-            assert_eq!(f.s.host_received(), expected);
+            assert_eq!(f.host_received().await, expected);
             f.answered(1);
         }
 
@@ -864,7 +935,7 @@ pub(super) mod tests {
                     zcr_keyboard_extension_v1::VERSION,
                 )
                 .await;
-            let host = self.s.host_received();
+            let host = self.host_received().await;
             let [(
                 _,
                 AnyRequest::WlRegistry(wl_registry::Request::Bind {
@@ -909,7 +980,7 @@ pub(super) mod tests {
                     self.seat.id,
                 )])
                 .await;
-            let host = self.s.host_received();
+            let host = self.host_received().await;
             let (_, AnyRequest::ZwpTextInputManagerV1(V1Manager::CreateTextInput { id })) = host[0]
             else {
                 panic!("the host got no text input: {host:?}");
@@ -1086,7 +1157,7 @@ pub(super) mod tests {
         async fn release_seat(&mut self) {
             self.s.guest([wl_seat::req::release(self.seat.id)]).await;
             assert_eq!(
-                self.s.host_received(),
+                self.host_received().await,
                 [(self.seat.host, wl_seat::Request::Release {}.into())]
             );
             self.s
@@ -1113,7 +1184,7 @@ pub(super) mod tests {
             };
             let bind = wl_registry::req::bind(registry.id, name, "wl_seat", version, self.seat.id);
             self.s.guest([bind.unwrap()]).await;
-            let mut host = self.s.host_received();
+            let mut host = self.host_received().await;
             let (
                 _,
                 AnyRequest::WlRegistry(wl_registry::Request::Bind {
@@ -1247,8 +1318,38 @@ pub(super) mod tests {
         /// of held keys that waited, the only requests it got: the `done`
         /// decides the one that still waits, if any, as an autorepeat's
         /// ([`crate::handler::ime_keys::PendingRecovery`]).
+        /// What the host received, with each surrounding text's barrier,
+        /// the `wl_display.sync` right after it, answered as Exo's display
+        /// answers it, and left out: the IME core's Exo mirror waits for
+        /// it, and no test of this file is about it but
+        /// `a_report_reaches_the_host_with_its_barrier`.
+        async fn host_received(&mut self) -> Vec<(u32, AnyRequest)> {
+            let mut received = self.s.host_received();
+            let mut glued = Vec::new();
+            let mut i = 1;
+            while i < received.len() {
+                let report = matches!(
+                    received[i - 1].1,
+                    AnyRequest::ZwpTextInputV1(V1::SetSurroundingText { .. })
+                );
+                match received[i].1 {
+                    AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) if report => {
+                        glued.push(callback);
+                        received.remove(i);
+                    }
+                    _ => i += 1,
+                }
+            }
+            for callback in glued {
+                let done = wl_callback::evt::done(callback, 0);
+                let delete = wl_display::evt::delete_id(WL_DISPLAY_ID, callback);
+                self.s.host([done, delete]).await;
+            }
+            received
+        }
+
         async fn answer_recovery_syncs(&mut self) {
-            for (sender, request) in self.s.host_received() {
+            for (sender, request) in self.host_received().await {
                 let AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) = request else {
                     panic!("the host got {request:?} from {sender}, not a recovery's sync");
                 };
@@ -1442,10 +1543,10 @@ pub(super) mod tests {
     async fn enable_is_not_activated_until_commit() {
         let mut f = Field::disabled().await;
         f.s.guest([v3::enable(f.ti)]).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
 
         f.s.guest([v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        assert_eq!(f.host_received().await, f.enable_requests(1));
         f.answered(1);
     }
 
@@ -1456,7 +1557,7 @@ pub(super) mod tests {
     async fn focus_generation_barrier_drops_old_events_before_reactivation() {
         let mut f = Field::enabled().await;
         f.keyboard_leave().await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, [f.deactivate(), sync(callback)]);
 
@@ -1475,7 +1576,7 @@ pub(super) mod tests {
         ])
         .await;
         assert_eq!(
-            f.s.host_received(),
+            f.host_received().await,
             [
                 f.surrounding_text("new", 3, 3),
                 f.no_cursor_rectangle(),
@@ -1489,7 +1590,7 @@ pub(super) mod tests {
         let mut expected = vec![f.activate()];
         expected.extend(f.content_type((0, 0), true));
         expected.push(f.commit_state(2));
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
 
         f.s.host([f.preedit("new", "")]).await;
         assert_eq!(
@@ -1507,7 +1608,7 @@ pub(super) mod tests {
         use zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD as PASSWORD;
         let mut f = Field::enabled().await;
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, f.disable_requests(callback, 2));
 
@@ -1517,14 +1618,14 @@ pub(super) mod tests {
             v3::commit(f.ti),
         ])
         .await;
-        assert_eq!(f.s.host_received(), f.reset(3, Reset::default()));
+        assert_eq!(f.host_received().await, f.reset(3, Reset::default()));
         f.answered(3);
 
         f.drain(callback).await;
         let mut expected = vec![f.activate()];
         expected.extend(f.content_type((0, PASSWORD), false));
         expected.push(f.commit_state(3));
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         let (_, _, input_type, _, _, learning_mode) = map_v3_content_type(0, PASSWORD);
         assert_eq!(input_type, zcr_extended_text_input_v1::INPUT_TYPE_PASSWORD);
         assert_eq!(
@@ -1545,7 +1646,7 @@ pub(super) mod tests {
         .await;
         let content_type = f.password_content_type().into();
         assert_eq!(
-            f.s.host_received(),
+            f.host_received().await,
             f.reset(
                 1,
                 Reset {
@@ -1562,7 +1663,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn the_enter_answering_an_activate_resends_nothing() {
         let mut f = attached_password_field().await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
 
         // The content type sent after the activate is the one Exo applied.
         f.s.guest([
@@ -1570,7 +1671,7 @@ pub(super) mod tests {
             v3::commit(f.ti),
         ])
         .await;
-        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+        assert_eq!(f.host_received().await, [f.commit_state(2)]);
         f.answered(2);
     }
 
@@ -1581,11 +1682,11 @@ pub(super) mod tests {
     async fn an_exo_detach_activates_again_with_the_content_type() {
         let mut f = attached_password_field().await;
         f.s.host([v1::leave(f.host)]).await;
-        assert_eq!(f.s.host_received(), f.password_after_activate(1));
+        assert_eq!(f.host_received().await, f.password_after_activate(1));
 
         // The enter answering that activate resends nothing.
         f.s.host([v1::enter(f.host, f.surface.host)]).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         // The new generation takes host events.
         f.s.host([f.commit("가")]).await;
         assert_eq!(
@@ -1605,7 +1706,7 @@ pub(super) mod tests {
         f.s.host([v1::leave(f.host), v1::enter(f.host, f.surface.host)])
             .await;
         assert_eq!(f.s.guest_received(), []);
-        assert_eq!(f.s.host_received(), f.password_after_activate(1));
+        assert_eq!(f.host_received().await, f.password_after_activate(1));
 
         // The input method's process restarts mid-composition.
         f.s.host([f.preedit("가", "가")]).await;
@@ -1618,7 +1719,7 @@ pub(super) mod tests {
             f.s.guest_received(),
             f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }])
         );
-        assert_eq!(f.s.host_received(), f.password_after_activate(1));
+        assert_eq!(f.host_received().await, f.password_after_activate(1));
 
         // The composition went with it: a commit clears no preedit.
         f.s.host([f.commit("나")]).await;
@@ -1650,14 +1751,14 @@ pub(super) mod tests {
         expected.push((f.keyboard.id, leave.into()));
         expected.extend(f.events([V3::Leave { surface }]));
         assert_eq!(f.s.guest_received(), expected);
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, [f.deactivate(), sync(callback)]);
 
         f.s.host([f.confirm(), v1::leave(f.host)]).await;
         assert_eq!(f.s.guest_received(), []);
         f.drain(callback).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
     }
 
     /// Exo's text input hears of a focus change before the keyboard: its
@@ -1667,18 +1768,18 @@ pub(super) mod tests {
     async fn an_exo_detach_before_the_keyboard_leave_activates_then_drains() {
         let mut f = attached_password_field().await;
         f.s.host([v1::leave(f.host)]).await;
-        assert_eq!(f.s.host_received(), f.password_after_activate(1));
+        assert_eq!(f.host_received().await, f.password_after_activate(1));
 
         // The keyboard leave then deactivates it behind a barrier.
         f.keyboard_leave().await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, [f.deactivate(), sync(callback)]);
 
         // Exo never attached, so it sends no leave, and the drain ends with
         // nothing more to send.
         f.drain(callback).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         // The host is inactive: it neither forwards nor takes its events.
         f.s.host([f.commit("가")]).await;
         assert_eq!(f.s.guest_received(), []);
@@ -1691,14 +1792,14 @@ pub(super) mod tests {
         let mut f = attached_password_field().await;
         f.release_seat().await;
         f.s.host([v1::leave(f.host)]).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
 
         f.s.guest([
             v3::set_content_type(f.ti, 0, zwp_text_input_v3::CONTENT_PURPOSE_NORMAL),
             v3::commit(f.ti),
         ])
         .await;
-        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+        assert_eq!(f.host_received().await, [f.commit_state(2)]);
         f.answered(2);
     }
 
@@ -1706,21 +1807,21 @@ pub(super) mod tests {
     async fn the_leave_answering_a_deactivate_is_ignored() {
         let mut f = attached_password_field().await;
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, f.disable_requests(callback, 2));
 
         f.s.host([v1::leave(f.host)]).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         // The barrier still drains the generation: an enable waits for it.
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.reset(3, Reset::default()));
+        assert_eq!(f.host_received().await, f.reset(3, Reset::default()));
         f.answered(3);
         f.drain(callback).await;
         let mut expected = vec![f.activate()];
         expected.extend(f.content_type((0, 0), false));
         expected.push(f.commit_state(3));
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
     }
 
     /// The text input's seat ends, and the guest binds a new `wl_seat`
@@ -1738,7 +1839,7 @@ pub(super) mod tests {
             v3::commit(f.ti),
         ])
         .await;
-        assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
+        assert_eq!(f.host_received().await, f.reset(1, Reset::default()));
         f.answered(1);
         // Only the log shows the warning, so read the flag that makes it
         // once.
@@ -1759,7 +1860,7 @@ pub(super) mod tests {
     async fn activation_barrier_coalesces_changes_and_honors_final_disabled_target() {
         let mut f = Field::enabled().await;
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, f.disable_requests(callback, 2));
 
@@ -1769,14 +1870,14 @@ pub(super) mod tests {
             f.keyboard_leave().await;
             f.keyboard_enter_new_surface().await;
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-            assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
+            assert_eq!(f.host_received().await, f.reset(serial, Reset::default()));
             f.answered(serial);
         }
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.reset(5, Reset::default()));
+        assert_eq!(f.host_received().await, f.reset(5, Reset::default()));
 
         f.drain(callback).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
     }
 
     /// Exo has one seat and gives its input method to the text input that
@@ -1797,7 +1898,7 @@ pub(super) mod tests {
             // A rejected enable still counts: its commit is the first.
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
             assert_eq!(
-                f.s.host_received(),
+                f.host_received().await,
                 f.reset(1, Reset::default()),
                 "another seat: {other_seat}"
             );
@@ -1805,7 +1906,7 @@ pub(super) mod tests {
             // Its disable takes nothing from the first, which Exo still
             // gives its input method.
             f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-            assert_eq!(f.s.host_received(), f.reset(2, Reset::default()));
+            assert_eq!(f.host_received().await, f.reset(2, Reset::default()));
             f.select(first);
             f.s.host([f.commit("가")]).await;
             assert_eq!(
@@ -1840,7 +1941,7 @@ pub(super) mod tests {
         )];
         expected.extend(ids.iter().map(|&ti| (ti, V3::Leave { surface }.into())));
         assert_eq!(f.s.guest_received(), expected);
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, [f.deactivate(), sync(callback)]);
 
@@ -1849,7 +1950,7 @@ pub(super) mod tests {
             .map(|&ti| (ti, V3::Enter { surface }.into()))
             .collect();
         assert_eq!(f.enter_surface().await, entered);
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
     }
 
     /// A disable invalidates the surrounding text, at the host too, and
@@ -1862,7 +1963,7 @@ pub(super) mod tests {
             v3::commit(f.ti),
         ])
         .await;
-        assert_eq!(f.s.host_received(), {
+        assert_eq!(f.host_received().await, {
             let mut expected = vec![f.surrounding_text("가", 3, 3)];
             expected.extend(f.content_type((0, 0), true));
             expected.push(f.commit_state(2));
@@ -1871,9 +1972,9 @@ pub(super) mod tests {
         f.answered(2);
 
         f.s.guest([v3::disable(f.ti)]).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         f.s.guest([v3::commit(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         assert_eq!(host, f.disable_requests(barrier(&host), 3));
     }
 
@@ -1900,7 +2001,7 @@ pub(super) mod tests {
 
         // The host keeps the field's content type, so none is sent.
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.reset(2, Reset::default()));
+        assert_eq!(f.host_received().await, f.reset(2, Reset::default()));
         let expected = [composing(), V3::Done { serial: 2 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
@@ -1916,7 +2017,7 @@ pub(super) mod tests {
         f.s.host([v1::preedit_styling(f.host, 0, 3, selection)])
             .await;
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.reset(3, Reset::default()));
+        assert_eq!(f.host_received().await, f.reset(3, Reset::default()));
         let expected = [V3::Done { serial: 3 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([f.preedit("다", "다")]).await;
@@ -1937,7 +2038,7 @@ pub(super) mod tests {
         let mut expected = vec![f.surrounding_text("가나", 3, 6)];
         expected.extend(f.content_type((0, 0), true));
         expected.push(f.commit_state(2));
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.answered(2);
 
         for (serial, (cursor, anchor)) in (3..).zip([(1, 1), (3, 7), (-1, 0)]) {
@@ -1947,7 +2048,7 @@ pub(super) mod tests {
             ])
             .await;
             assert_eq!(
-                f.s.host_received(),
+                f.host_received().await,
                 [f.commit_state(serial)],
                 "{cursor}, {anchor}"
             );
@@ -1973,7 +2074,7 @@ pub(super) mod tests {
         let mut expected = vec![f.surrounding_text("가", 3, 3)];
         expected.extend(f.content_type((0, 0), true));
         expected.push(f.commit_state(2));
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.answered(2);
 
         let latin1 = v3::set_surrounding_text(f.ti, "Cafe", 3, 3).unwrap();
@@ -1984,7 +2085,7 @@ pub(super) mod tests {
         ])
         .await;
         assert_eq!(
-            f.s.host_received(),
+            f.host_received().await,
             [f.surrounding_text("", 0, 0), f.commit_state(3)]
         );
         f.answered(3);
@@ -1995,7 +2096,7 @@ pub(super) mod tests {
         ])
         .await;
         assert_eq!(
-            f.s.host_received(),
+            f.host_received().await,
             [f.surrounding_text("Café", 5, 5), f.commit_state(4)]
         );
         f.answered(4);
@@ -2092,7 +2193,7 @@ pub(super) mod tests {
         ])
         .await;
         assert_eq!(
-            f.s.host_received(),
+            f.host_received().await,
             [
                 f.ext(Ext::SetSurroundingTextSupport {
                     support: zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
@@ -2125,7 +2226,7 @@ pub(super) mod tests {
                 .await;
             let mut expected = Vec::from(f.content_type((0, TERMINAL), false));
             expected.push(f.commit_state(2));
-            assert_eq!(f.s.host_received(), expected);
+            assert_eq!(f.host_received().await, expected);
             f.answered(2);
 
             let mut requests = purposes
@@ -2134,7 +2235,7 @@ pub(super) mod tests {
                 .collect::<Vec<_>>();
             requests.push(v3::commit(f.ti));
             f.s.guest(requests).await;
-            assert_eq!(f.s.host_received(), [f.commit_state(3)], "{purposes:?}");
+            assert_eq!(f.host_received().await, [f.commit_state(3)], "{purposes:?}");
             f.answered(3);
         }
     }
@@ -2159,7 +2260,7 @@ pub(super) mod tests {
         .await;
         let mut expected = vec![f.surrounding_text("abc", 3, 3)];
         expected.extend(edits(&f, 2, true));
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.answered(2);
 
         // While the support holds, the content type is not resent: before
@@ -2172,7 +2273,7 @@ pub(super) mod tests {
         ])
         .await;
         assert_eq!(
-            f.s.host_received(),
+            f.host_received().await,
             [f.surrounding_text("abcd", 4, 4), f.commit_state(3)]
         );
         f.answered(3);
@@ -2188,7 +2289,7 @@ pub(super) mod tests {
         .await;
         let content_type = f.content_type((0, 0), false).into();
         assert_eq!(
-            f.s.host_received(),
+            f.host_received().await,
             f.reset(
                 4,
                 Reset {
@@ -2213,7 +2314,7 @@ pub(super) mod tests {
                 content_type: vec![set_input_type],
             },
         );
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.answered(1);
 
         // The host was told no support, so gaining surrounding text changes
@@ -2224,7 +2325,7 @@ pub(super) mod tests {
         ])
         .await;
         assert_eq!(
-            f.s.host_received(),
+            f.host_received().await,
             [f.surrounding_text("abc", 3, 3), f.commit_state(2)]
         );
         f.answered(2);
@@ -2239,7 +2340,7 @@ pub(super) mod tests {
         for version in [1, 7, 8, 9] {
             let mut f = Field::new(Some(version)).await;
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-            f.s.host_received();
+            f.host_received().await;
             f.answered(1);
             f.s.guest([v3::set_content_type(f.ti, 0, PIN), v3::commit(f.ti)])
                 .await;
@@ -2268,7 +2369,7 @@ pub(super) mod tests {
             };
             let mut expected = expected;
             expected.push(f.commit_state(2));
-            assert_eq!(f.s.host_received(), expected, "version {version}");
+            assert_eq!(f.host_received().await, expected, "version {version}");
             f.answered(2);
         }
     }
@@ -2280,7 +2381,7 @@ pub(super) mod tests {
         let expected = [preedit("가"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.guest([v3::destroy(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         // The destroy is the final disable: the host extension goes after
         // the generation's barrier.
         let callback = barrier(&host);
@@ -2306,12 +2407,12 @@ pub(super) mod tests {
         assert!(![old_host, old_host_ext].contains(&f.host));
         assert!(![old_host, old_host_ext].contains(&f.host_ext));
         f.drain(callback).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
 
         // A late confirm of the destroyed extension reaches no one, not even
         // the new text input's composition.
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        assert_eq!(f.host_received().await, f.enable_requests(1));
         f.answered(1);
         f.s.host([f.preedit("나", ""), ext::confirm_preedit(old_host_ext, 0)])
             .await;
@@ -2338,12 +2439,12 @@ pub(super) mod tests {
             } else {
                 f.s.guest([wl_seat::req::release(f.seat.id)]).await;
                 let release = (f.seat.host, wl_seat::Request::Release {}.into());
-                assert_eq!(f.s.host_received(), [release]);
+                assert_eq!(f.host_received().await, [release]);
             }
 
             f.s.guest([v3::destroy(f.ti)]).await;
             assert_eq!(
-                f.s.host_received(),
+                f.host_received().await,
                 [f.ext(Ext::Destroy {})],
                 "deleted: {deleted}"
             );
@@ -2371,7 +2472,7 @@ pub(super) mod tests {
         // each commit sends only its edits.
         for (serial, request) in [(2, v3::disable(f.ti)), (3, v3::enable(f.ti))] {
             f.s.guest([request, v3::commit(f.ti)]).await;
-            assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
+            assert_eq!(f.host_received().await, f.reset(serial, Reset::default()));
         }
         f.answered(3);
         // The disable ended the host's generation: its events reach no one.
@@ -2394,7 +2495,7 @@ pub(super) mod tests {
                 content_type: vec![content_type],
             },
         );
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.answered(1);
     }
 
@@ -2415,7 +2516,7 @@ pub(super) mod tests {
             v3::commit(f.ti),
         ])
         .await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         // The next enter resets the pending state, so no peer can see it;
         // read it to pin that the leave bounds what the requests change.
         assert_eq!(
@@ -2433,17 +2534,17 @@ pub(super) mod tests {
 
         // Focus leaves; the client disables and commits while unfocused.
         f.keyboard_leave().await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
 
         // Focus enters again; the client enables and commits.
         f.keyboard_enter().await;
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
         f.answered(3);
         f.drain(callback).await;
-        f.s.host_received();
+        f.host_received().await;
 
         // The IME commits text; `done` carries the client's commit count.
         f.s.host([f.commit("가")]).await;
@@ -2518,7 +2619,7 @@ pub(super) mod tests {
         let mut f = Field::disabled().await;
         let mut client = DoneCountingClient::new();
         f.s.guest([v3::enable(f.ti), client.commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        assert_eq!(f.host_received().await, f.enable_requests(1));
         let events = f.s.guest_received();
         assert_eq!(events, f.events([V3::Done { serial: 1 }]));
         client.receive(events);
@@ -2533,14 +2634,14 @@ pub(super) mod tests {
             width: 1,
             height: 16,
         });
-        assert_eq!(f.s.host_received(), [rect, f.commit_state(2)]);
+        assert_eq!(f.host_received().await, [rect, f.commit_state(2)]);
         let events = f.s.guest_received();
         assert_eq!(events, f.events([V3::Done { serial: 2 }]));
         client.receive(events);
         assert!(client.may_send());
 
         f.s.guest([v3::disable(f.ti), client.commit(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         assert_eq!(host, f.disable_requests(barrier(&host), 3));
         assert_eq!(f.s.guest_received(), []);
     }
@@ -2555,7 +2656,7 @@ pub(super) mod tests {
         let mut f = Field::disabled().await;
         let mut client = DoneCountingClient::new();
         f.s.guest([v3::enable(f.ti), client.commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        assert_eq!(f.host_received().await, f.enable_requests(1));
         client.receive(f.s.guest_received());
 
         f.s.host([v1::preedit_cursor(f.host, 3), f.preedit("가나", "가나")])
@@ -2569,7 +2670,7 @@ pub(super) mod tests {
 
         let rect = v3::set_cursor_rectangle(f.ti, 10, 20, 1, 16);
         f.s.guest([rect, client.commit(f.ti)]).await;
-        f.s.host_received();
+        f.host_received().await;
         let events = f.s.guest_received();
         let expected = [composing(), V3::Done { serial: 2 }];
         assert_eq!(events, f.events(expected));
@@ -2601,7 +2702,7 @@ pub(super) mod tests {
         f.s.host([Field::button(pointer, pressed)]).await;
         // The reset goes behind a fence: Exo's events sent before it
         // handled the reset belong to the dropped composition.
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
@@ -2641,7 +2742,7 @@ pub(super) mod tests {
             wl_pointer::evt::frame(pointer.host),
         ])
         .await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         let frame = || -> (u32, AnyEvent) { (pointer.id, wl_pointer::Event::Frame {}.into()) };
@@ -2687,7 +2788,7 @@ pub(super) mod tests {
         f.s.host([cursor, f.commit("각"), f.commit("갂")]).await;
         assert_eq!(f.s.guest_received(), []);
 
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         f.drain(fence).await;
@@ -2723,7 +2824,7 @@ pub(super) mod tests {
             [Field::guest_button(pointer, pressed)]
         );
 
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         // The dropped preedit's cursor went with it.
@@ -2745,7 +2846,7 @@ pub(super) mod tests {
         let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 2 }]);
         expected.push(Field::guest_button(pointer, pressed));
         assert_eq!(f.s.guest_received(), expected);
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         (pointer, fence)
@@ -2800,7 +2901,7 @@ pub(super) mod tests {
         let mut expected = f.events([no_preedit(), commit("각"), DONE]);
         expected.push(Field::guest_button(pointer, pressed));
         assert_eq!(f.s.guest_received(), expected);
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
 
@@ -2820,7 +2921,7 @@ pub(super) mod tests {
         let mut expected = f.events([no_preedit(), commit("가"), DONE]);
         expected.push(Field::guest_button(pointer, pressed));
         assert_eq!(f.s.guest_received(), expected);
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         fence
@@ -2834,7 +2935,7 @@ pub(super) mod tests {
         let mut f = Field::enabled().await;
         let fence = press_during_ga(&mut f).await;
         f.keyboard_leave().await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let drain = barrier(&host);
         assert_eq!(host, [f.deactivate(), sync(drain)]);
         f.drain(fence).await;
@@ -2842,7 +2943,7 @@ pub(super) mod tests {
 
         f.keyboard_enter().await;
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(2));
+        assert_eq!(f.host_received().await, f.enable_requests(2));
         f.answered(2);
         f.s.host([f.preedit("나", "나")]).await;
         let expected = [preedit("나"), V3::Done { serial: 2 }];
@@ -2857,7 +2958,7 @@ pub(super) mod tests {
         let mut f = Field::enabled().await;
         let fence = press_during_ga(&mut f).await;
         f.s.guest([v3::destroy(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let drain = barrier(&host);
         assert_eq!(host, [f.deactivate(), sync(drain), f.ext(Ext::Destroy {})]);
         let delete_id = wl_display::Event::DeleteId { id: f.ti };
@@ -2866,7 +2967,7 @@ pub(super) mod tests {
         let ti = f.ti;
         f.create_text_input(ti).await;
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        assert_eq!(f.host_received().await, f.enable_requests(1));
         f.answered(1);
         f.drain(fence).await;
         f.drain(drain).await;
@@ -2928,7 +3029,7 @@ pub(super) mod tests {
         );
 
         // The host was told nothing, and the composition goes on.
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         f.s.host([f.commit("각")]).await;
         let expected = [no_preedit(), commit("각"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
@@ -2947,7 +3048,7 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         f.s.host([Field::down(touch, f.surface, 1)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
@@ -2985,7 +3086,7 @@ pub(super) mod tests {
             host_frame(),
         ])
         .await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         let frame = || -> (u32, AnyEvent) { (touch.id, wl_touch::Event::Frame {}.into()) };
@@ -3038,7 +3139,7 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), [Field::guest_down(touch, other, 2)]);
 
         // The host was told nothing, and the composition goes on.
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         f.s.host([f.commit("각")]).await;
         let expected = [no_preedit(), commit("각"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
@@ -3056,7 +3157,7 @@ pub(super) mod tests {
         let expected = [preedit("가"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([Field::down(touch, f.surface, 1)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
@@ -3071,7 +3172,7 @@ pub(super) mod tests {
             f.s.guest_received(),
             [Field::guest_down(touch, f.surface, 2)]
         );
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         f.drain(fence).await;
     }
 
@@ -3115,7 +3216,7 @@ pub(super) mod tests {
         let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
         expected.push(Field::guest_button(pointer, pressed));
         assert_eq!(f.s.guest_received(), expected);
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         f.drain(fence).await;
@@ -3131,7 +3232,7 @@ pub(super) mod tests {
     /// repeats none.
     #[tokio::test]
     async fn a_client_that_waits_for_done_reports_the_text_an_edit_leaves() {
-        let mut f = Field::disabled().await;
+        let mut f = Field::legacy().await;
         let mut client = DoneCountingClient::new();
         f.s.guest([
             v3::enable(f.ti),
@@ -3139,7 +3240,7 @@ pub(super) mod tests {
             client.commit(f.ti),
         ])
         .await;
-        f.s.host_received();
+        f.host_received().await;
         client.receive(f.s.guest_received());
         assert!(client.may_send());
         let report = |f: &Field, text: &str| {
@@ -3159,7 +3260,7 @@ pub(super) mod tests {
         f.s.guest([report(&f, "see you "), client.commit(f.ti)])
             .await;
         let expected = [f.surrounding_text("see you ", 8, 8), f.commit_state(2)];
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         client.receive(commit_transaction);
         assert!(!client.may_send());
         let events = f.s.guest_received();
@@ -3172,7 +3273,7 @@ pub(super) mod tests {
             f.surrounding_text("see you tomorrow", 16, 16),
             f.commit_state(3),
         ];
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.answered(3);
 
         // The input method composes, and the caret moves.
@@ -3180,7 +3281,7 @@ pub(super) mod tests {
         client.receive(f.s.guest_received());
         let rect = v3::set_cursor_rectangle(f.ti, 10, 20, 1, 16);
         f.s.guest([rect, client.commit(f.ti)]).await;
-        f.s.host_received();
+        f.host_received().await;
         let events = f.s.guest_received();
         assert_eq!(events, f.events([preedit("x"), done(4)]));
         client.receive(events);
@@ -3195,7 +3296,7 @@ pub(super) mod tests {
         assert!(client.may_send());
         f.s.guest([report(&f, "see you "), client.commit(f.ti)])
             .await;
-        f.s.host_received();
+        f.host_received().await;
         f.answered(5);
     }
 
@@ -3644,9 +3745,9 @@ pub(super) mod tests {
         for (case, surrounding_text, events, expected) in cases {
             let mut f = match surrounding_text {
                 Some((text, cursor, anchor)) => {
-                    Field::with_surrounding_text(text, cursor, anchor).await
+                    Field::legacy_with_surrounding_text(text, cursor, anchor).await
                 }
-                None => Field::enabled().await,
+                None => Field::legacy_enabled().await,
             };
             let events = events(&f);
             f.s.host(events).await;
@@ -3720,7 +3821,7 @@ pub(super) mod tests {
     /// waits for the guest's report is expected, and is not.
     #[tokio::test]
     async fn an_unconvertible_delete_is_warned_of_once() {
-        let mut f = Field::with_surrounding_text("abc", 3, 3).await;
+        let mut f = Field::legacy_with_surrounding_text("abc", 3, 3).await;
         // Only the log shows the warning, so read the flag that makes it
         // once.
         let warned = |f: &mut Field| f.state().warned_for_test().1;
@@ -3735,11 +3836,160 @@ pub(super) mod tests {
         ])
         .await;
         let expected = [f.surrounding_text("abcX", 4, 4), f.commit_state(3)];
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.answered(3);
         f.s.host([f.delete_range(0, 1)]).await;
         assert_eq!(f.s.guest_received(), []);
         assert!(warned(&mut f));
+    }
+
+    /// Each surrounding text reaches the host with a `wl_display.sync`
+    /// right after it, whose `done` places the report among Exo's events
+    /// for the IME core's Exo mirror; the guest never sees it. From v11 of
+    /// the extension the mirror measures Exo's deletes in Exo's text.
+    #[tokio::test]
+    async fn a_report_reaches_the_host_with_its_barrier() {
+        let mut f = Field::enabled().await;
+        let report = v3::set_surrounding_text(f.ti, "ab", 2, 2).unwrap();
+        f.s.guest([report, v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        let Some((
+            report,
+            (WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback })),
+        )) = host.first().zip(host.get(1))
+        else {
+            panic!("no report and barrier in {host:?}");
+        };
+        let callback = *callback;
+        assert_eq!(*report, f.surrounding_text("ab", 2, 2));
+        f.answered(2);
+        let delete_id = wl_display::evt::delete_id(WL_DISPLAY_ID, callback);
+        f.s.host([wl_callback::evt::done(callback, 0), delete_id])
+            .await;
+        assert_eq!(f.s.guest_received(), []);
+        // Exo deletes "b" of its "ab|".
+        f.s.host([f.delete_range(1, 1)]).await;
+        let expected = [delete(1, 0), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A key the guest gets may edit its text where Exo does not see, so
+    /// Exo's deletes are dropped until the guest states its text: a commit
+    /// with no surrounding text states it is unchanged.
+    #[tokio::test]
+    async fn a_forwarded_key_holds_back_exos_delete_until_the_guest_commits() {
+        let mut f = Field::with_surrounding_text("abc", 3, 3).await;
+        let space = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 50,
+            time: 1_000,
+        };
+        f.s.host([f.key(space)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(space)]);
+        f.host_received().await;
+        f.s.guest([v3::commit(f.ti)]).await;
+        f.host_received().await;
+        f.answered(3);
+        f.s.host([f.delete_range(2, 1)]).await;
+        let expected = [delete(1, 0), V3::Done { serial: 3 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        // Another key, and the delete after it is dropped.
+        let a = Stroke {
+            key: 30,
+            serial: 51,
+            ..space
+        };
+        f.s.host([f.key(a)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(a)]);
+        f.host_received().await;
+        f.s.host([f.delete_range(1, 1)]).await;
+        assert_eq!(f.s.guest_received(), []);
+    }
+
+    /// #85 in Mirror mode: a region over the shown region deletes while
+    /// the guest shows a preedit, which Chromium drops (C3), so the guest
+    /// is out of step with Exo; the next, growing region falls back to
+    /// Legacy mode, which measures it from the bytes the regions took,
+    /// rather than drop it, which would leave the input method's next
+    /// commit to double the text.
+    #[tokio::test]
+    async fn a_region_over_a_region_falls_back_in_mirror_mode() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = || V3::Done { serial: 2 };
+        let region = |f: &Field, index, length| ext::set_preedit_region(f.host_ext, index, length);
+        f.s.host([region(&f, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([region(&f, -2, 2)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([region(&f, -3, 3)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("bcd", 3, 3), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// Mirror mode measures a region over a host preedit with Exo's cursor
+    /// inside it from that cursor, the preedit at the guest's.
+    #[tokio::test]
+    async fn a_region_over_a_host_preedit_with_exos_cursor_inside_it() {
+        let mut f = Field::with_surrounding_text("a1", 2, 2).await;
+        let done = || V3::Done { serial: 2 };
+        f.s.host([v1::preedit_cursor(f.host, 3), f.preedit("가나", "가나")])
+            .await;
+        let expected = [preedit_at("가나", 3, 3), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        // Exo's "a1가|나": "1가나".
+        f.s.host([ext::set_preedit_region(f.host_ext, -4, 7)]).await;
+        let expected = [
+            no_preedit(),
+            delete(1, 0),
+            preedit_at("1가나", 4, 4),
+            done(),
+        ];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// At v11 Exo confirms before each press its input method does not
+    /// handle, so a field that never reports, or a held key, makes the
+    /// mirror evict a history state Exo may still have: it is unsure, and
+    /// Mirror mode falls back to Legacy mode rather than drop Exo's delete.
+    #[tokio::test]
+    async fn an_unsure_mirror_falls_back_to_legacy_mode() {
+        let mut f = Field::with_surrounding_text("abc", 3, 3).await;
+        for _ in 0..65 {
+            f.s.host([f.confirm()]).await;
+        }
+        f.answer_recovery_syncs().await;
+        f.s.guest_received();
+        f.s.host([f.delete_range(2, 1)]).await;
+        let expected = [delete(1, 0), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A modifier the guest gets edits no text, so it does not hold back
+    /// Exo's next delete: one after a commit the guest has yet to report,
+    /// which only the mirror measures, as Legacy mode waits for the
+    /// report.
+    #[tokio::test]
+    async fn a_modifier_key_does_not_hold_back_exos_delete() {
+        let mut f = Field::typing().await;
+        f.s.host([f.commit("X")]).await;
+        let expected = [commit("X"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let shift = Stroke {
+            key: 42,
+            state: PRESSED,
+            serial: 60,
+            time: 1_000,
+        };
+        f.s.host([f.peek(shift), f.key(shift)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(shift)]);
+        assert_eq!(f.host_received().await, [f.ack(60, true)]);
+        // Exo's "가X|".
+        f.s.host([f.delete_range(0, 4)]).await;
+        let expected = [delete(4, 0), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
     /// After an edit of the input method, Exo measures deletes against
@@ -3747,7 +3997,7 @@ pub(super) mod tests {
     /// surrounding text, and only such a commit, catches the proxy up.
     #[tokio::test]
     async fn a_delete_waits_for_the_guest_to_report_the_input_methods_edits() {
-        let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
+        let mut f = Field::legacy_with_surrounding_text("abcdef", 3, 3).await;
         f.s.host([f.commit("X"), f.delete_range(2, 2)]).await;
         let done = |serial| V3::Done { serial };
         assert_eq!(f.s.guest_received(), f.events([commit("X"), done(2)]));
@@ -3761,7 +4011,7 @@ pub(super) mod tests {
             width: 3,
             height: 4,
         });
-        assert_eq!(f.s.host_received(), [rectangle, f.commit_state(3)]);
+        assert_eq!(f.host_received().await, [rectangle, f.commit_state(3)]);
         f.answered(3);
         f.s.host([f.delete_range(2, 2)]).await;
         assert_eq!(f.s.guest_received(), []);
@@ -3772,7 +4022,7 @@ pub(super) mod tests {
         ])
         .await;
         let expected = [f.surrounding_text("abcXdef", 4, 4), f.commit_state(4)];
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.answered(4);
         f.s.host([f.delete_range(2, 2)]).await;
         assert_eq!(f.s.guest_received(), f.events([delete(2, 0), done(4)]));
@@ -3839,7 +4089,7 @@ pub(super) mod tests {
     /// `ui/base/ime/linux/input_method_auralinux.cc` 325-328).
     #[tokio::test]
     async fn an_empty_preedit_has_no_hidden_cursor() {
-        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
+        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 2).await;
         let done = || V3::Done { serial: 2 };
         let expected = f.events([preedit("가"), done(), no_preedit(), done()]);
         f.s.host([
@@ -3866,7 +4116,7 @@ pub(super) mod tests {
         ])
         .await;
         let expected = [f.surrounding_text("abcef", 3, 3), f.commit_state(3)];
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         let done = || V3::Done { serial: 3 };
         let expected = [preedit_at("d", -1, -1), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
@@ -3889,7 +4139,7 @@ pub(super) mod tests {
     /// selected text would go.
     #[tokio::test]
     async fn an_empty_preedit_region_sends_no_delete() {
-        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
+        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 2).await;
         let done = || V3::Done { serial: 2 };
         f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
         assert_eq!(f.s.guest_received(), f.events([done()]));
@@ -3903,7 +4153,7 @@ pub(super) mod tests {
     /// Once the guest reports, its text is measured as it is.
     #[tokio::test]
     async fn a_region_over_a_region_deletes_only_what_the_guest_has() {
-        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 4).await;
         let done = |serial| V3::Done { serial };
         f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
         let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
@@ -3925,7 +4175,7 @@ pub(super) mod tests {
         ])
         .await;
         let expected = [f.surrounding_text("abef", 2, 2), f.commit_state(3)];
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         let expected = [preedit_at("cd", 2, 2), done(3)];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
@@ -3940,7 +4190,7 @@ pub(super) mod tests {
     /// takes it.
     #[tokio::test]
     async fn a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
-        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 4).await;
         let done = |serial| V3::Done { serial };
         f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
         let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
@@ -3961,7 +4211,7 @@ pub(super) mod tests {
     /// them again.
     #[tokio::test]
     async fn a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back() {
-        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 4).await;
         let done = |serial| V3::Done { serial };
         f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
         let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
@@ -4005,7 +4255,7 @@ pub(super) mod tests {
     /// each.
     #[tokio::test]
     async fn a_region_that_does_not_cover_a_host_preedit_is_dropped() {
-        let mut f = Field::with_surrounding_text("abc", 1, 1).await;
+        let mut f = Field::legacy_with_surrounding_text("abc", 1, 1).await;
         let done = |serial| V3::Done { serial };
         // Exo holds "ax|bc".
         f.s.host([v1::preedit_cursor(f.host, 1), f.preedit("x", "x")])
@@ -4034,7 +4284,7 @@ pub(super) mod tests {
     /// no commit leaves the guest's, the region is dropped.
     #[tokio::test]
     async fn an_empty_region_over_a_held_preedit_commits_it() {
-        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 4).await;
         let done = |serial| V3::Done { serial };
         let empty = || ext::set_preedit_region(f.host_ext, 0, 0);
         f.s.host([f.preedit("x", "x"), empty()]).await;
@@ -4087,7 +4337,7 @@ pub(super) mod tests {
     /// one on both sides are dropped.
     #[tokio::test]
     async fn a_region_that_does_not_cover_the_shown_one_is_dropped() {
-        let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
+        let mut f = Field::legacy_with_surrounding_text("abcdef", 3, 3).await;
         let done = |serial| V3::Done { serial };
         // "c" before the cursor and "d" after it.
         f.s.host([ext::set_preedit_region(f.host_ext, -1, 2)]).await;
@@ -4126,7 +4376,7 @@ pub(super) mod tests {
     /// from the cursor, cannot be.
     #[tokio::test]
     async fn on_set_preedit_region_translates_correctly() {
-        let mut f = Field::enabled().await;
+        let mut f = Field::legacy_enabled().await;
         f.s.guest([v3::set_surrounding_text(f.ti, "가나다", 6, 6).unwrap()])
             .await;
         f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
@@ -4136,7 +4386,7 @@ pub(super) mod tests {
         let mut expected = vec![f.surrounding_text("가나다", 6, 6)];
         expected.extend(f.content_type((0, 0), true));
         expected.push(f.commit_state(2));
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.answered(2);
         // A region apart from the cursor takes the pending cursor with it.
         f.s.host([
@@ -4182,7 +4432,7 @@ pub(super) mod tests {
         // The `done` of the guest's next commit repeats the region's
         // preedit ([`answer_guest_commit`]).
         f.s.guest([v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), [f.commit_state(3)]);
+        assert_eq!(f.host_received().await, [f.commit_state(3)]);
         let expected = [preedit_at("가나", 0, 3), V3::Done { serial: 3 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
@@ -4194,7 +4444,7 @@ pub(super) mod tests {
     async fn guest_commit_count_is_sent_to_v1_and_used_by_v3_done() {
         let mut f = Field::enabled().await;
         f.s.guest([v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+        assert_eq!(f.host_received().await, [f.commit_state(2)]);
         f.answered(2);
 
         f.s.host([
@@ -4227,7 +4477,7 @@ pub(super) mod tests {
         let mut f = Field::disabled().await;
         f.release_seat().await;
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
+        assert_eq!(f.host_received().await, f.reset(1, Reset::default()));
         f.answered(1);
         f.s.host([
             f.preedit("가", ""),
@@ -4325,7 +4575,7 @@ pub(super) mod tests {
             f.s.host(events).await;
             expected.push(f.guest_key(space));
             assert_eq!(f.s.guest_received(), expected, "shifted: {shifted}");
-            let host = f.s.host_received();
+            let host = f.host_received().await;
             let callback = barrier(&host);
             assert_eq!(host, [sync(callback), f.ack(701, true)]);
             f.s.host([wl_callback::evt::done(callback, 0)]).await;
@@ -4378,13 +4628,13 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([f.confirm(), v1::leave(f.host)]).await;
         assert_eq!(f.s.guest_received(), []);
-        let callback = barrier(&f.s.host_received());
+        let callback = barrier(&f.host_received().await);
         let answer = wl_callback::evt::done(callback, 0);
         f.s.host([answer, v1::enter(f.host, f.surface.host)]).await;
         assert_eq!(f.s.guest_received(), []);
 
         f.s.host([f.confirm()]).await;
-        assert_eq!(f.s.host_received(), [], "no recovery waits");
+        assert_eq!(f.host_received().await, [], "no recovery waits");
         assert_eq!(f.s.guest_received(), []);
 
         let release = Stroke {
@@ -4426,7 +4676,7 @@ pub(super) mod tests {
         };
         f.s.host([f.peek(one), f.peek(space), f.confirm(), v1::leave(f.host)])
             .await;
-        let callback = barrier(&f.s.host_received());
+        let callback = barrier(&f.host_received().await);
         let answer = wl_callback::evt::done(callback, 0);
         f.s.host([answer, v1::enter(f.host, f.surface.host)]).await;
         assert_eq!(f.s.guest_received(), []);
@@ -4465,7 +4715,7 @@ pub(super) mod tests {
             let mut f = Field::typing().await;
             f.lease_backspace_repeat().await;
             f.s.host([f.confirm()]).await;
-            let callback = barrier(&f.s.host_received());
+            let callback = barrier(&f.host_received().await);
             let request = match end {
                 End::Disable => v3::disable(f.ti),
                 End::Destroy => v3::destroy(f.ti),
@@ -4475,7 +4725,7 @@ pub(super) mod tests {
             if !matches!(end, End::Destroy) {
                 f.s.guest([v3::commit(f.ti)]).await;
             }
-            f.s.host_received();
+            f.host_received().await;
             f.s.guest_received();
             f.s.host([wl_callback::evt::done(callback, 0)]).await;
             assert_eq!(f.s.guest_received(), [], "{end:?}");
@@ -4532,10 +4782,10 @@ pub(super) mod tests {
             if enables {
                 f.s.guest([v3::enable(sibling.ti), v3::commit(sibling.ti)])
                     .await;
-                assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
+                assert_eq!(f.host_received().await, f.reset(1, Reset::default()));
             }
             f.s.guest([v3::destroy(sibling.ti)]).await;
-            assert_eq!(f.s.host_received(), [f.ext(Ext::Destroy {})]);
+            assert_eq!(f.host_received().await, [f.ext(Ext::Destroy {})]);
             let deleted = wl_display::Event::DeleteId { id: sibling.ti };
             assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
         }
@@ -4554,7 +4804,7 @@ pub(super) mod tests {
         let mut f = Field::typing().await;
         f.lease_backspace_repeat().await;
         f.s.guest([v3::destroy(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(
             host,
@@ -4569,7 +4819,7 @@ pub(super) mod tests {
         assert_ne!(f.host, old_host);
         assert_eq!(f.repeat_owner(BACKSPACE), None);
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        assert_eq!(f.host_received().await, f.enable_requests(1));
         f.answered(1);
 
         let release = Stroke {
@@ -4635,7 +4885,7 @@ pub(super) mod tests {
             f.s.guest_received(),
             [f.guest_key(space), f.guest_key(keysym_release)]
         );
-        assert_eq!(f.s.host_received(), [f.ack(700, false)]);
+        assert_eq!(f.host_received().await, [f.ack(700, false)]);
 
         f.s.host([f.confirm(), f.confirm(), f.confirm()]).await;
         f.answer_recovery_syncs().await;
@@ -4710,7 +4960,7 @@ pub(super) mod tests {
         ])
         .await;
         assert_eq!(f.s.guest_received(), []);
-        assert_eq!(f.s.host_received(), [f.ack(800, false)]);
+        assert_eq!(f.host_received().await, [f.ack(800, false)]);
 
         // Its release reaches the proxy on both channels.
         let release = Stroke {
@@ -4722,7 +4972,7 @@ pub(super) mod tests {
         f.s.host([f.peek(release), f.key(release), f.confirm()])
             .await;
         assert_eq!(f.s.guest_received(), []);
-        assert_eq!(f.s.host_received(), [f.ack(801, false)]);
+        assert_eq!(f.host_received().await, [f.ack(801, false)]);
 
         let backspace = Stroke {
             serial: 810,
@@ -4750,6 +5000,7 @@ pub(super) mod tests {
         let mut f = Field::offered(Host {
             text_input_extension: EXTENSION,
             keyboard_extension_with_keymap: true,
+            shadow: false,
         })
         .await;
         f.keyboard_leave().await;
@@ -4781,7 +5032,7 @@ pub(super) mod tests {
         ];
         expected.extend(f.events([V3::Enter { surface }]));
         assert_eq!(f.s.guest_received(), expected);
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         f.start_typing().await;
 
         let s = Stroke {
@@ -4809,11 +5060,11 @@ pub(super) mod tests {
     async fn a_text_input_destroyed_while_draining_ends_its_barrier_unseen() {
         let mut f = Field::enabled().await;
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, f.disable_requests(callback, 2));
         f.s.guest([v3::destroy(f.ti)]).await;
-        assert_eq!(f.s.host_received(), [f.ext(Ext::Destroy {})]);
+        assert_eq!(f.host_received().await, [f.ext(Ext::Destroy {})]);
         let deleted = wl_display::Event::DeleteId { id: f.ti };
         assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
 
@@ -4856,13 +5107,13 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.recovered(space));
 
         f.keyboard_leave().await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, [f.deactivate(), sync(callback)]);
         f.keyboard_enter_new_surface().await;
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
         assert_eq!(
-            f.s.host_received(),
+            f.host_received().await,
             [
                 f.surrounding_text("", 0, 0),
                 f.no_cursor_rectangle(),
@@ -4885,7 +5136,7 @@ pub(super) mod tests {
         let mut expected = vec![f.activate()];
         expected.extend(f.content_type((0, 0), false));
         expected.push(f.commit_state(2));
-        assert_eq!(f.s.host_received(), expected);
+        assert_eq!(f.host_received().await, expected);
         f.s.host([f.preedit("새 조합", "")]).await;
         let expected = [preedit("새 조합"), V3::Done { serial: 2 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
@@ -4898,11 +5149,11 @@ pub(super) mod tests {
     async fn a_text_input_recreated_under_its_id_ignores_the_old_barrier() {
         let mut f = Field::enabled().await;
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, f.disable_requests(callback, 2));
         f.s.guest([v3::destroy(f.ti)]).await;
-        assert_eq!(f.s.host_received(), [f.ext(Ext::Destroy {})]);
+        assert_eq!(f.host_received().await, [f.ext(Ext::Destroy {})]);
         let deleted = wl_display::Event::DeleteId { id: f.ti };
         assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
 
@@ -4910,11 +5161,11 @@ pub(super) mod tests {
         f.create_text_input(f.ti).await;
         assert_ne!(f.host, old_host);
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        assert_eq!(f.host_received().await, f.enable_requests(1));
         f.answered(1);
 
         f.drain(callback).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         assert_eq!(f.s.guest_received(), []);
         f.s.host([f.preedit("새 객체", "")]).await;
         let expected = [preedit("새 객체"), DONE];
@@ -4922,7 +5173,7 @@ pub(super) mod tests {
         // The replacement keeps its own host text input, which its disable
         // deactivates.
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         assert_eq!(host, f.disable_requests(barrier(&host), 2));
     }
 
@@ -4933,28 +5184,28 @@ pub(super) mod tests {
     async fn an_uncommitted_enable_or_disable_dies_with_its_focus() {
         let mut f = Field::enabled().await;
         f.s.guest([v3::disable(f.ti)]).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         f.keyboard_leave().await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         let callback = barrier(&host);
         assert_eq!(host, [f.deactivate(), sync(callback)]);
         f.keyboard_enter_new_surface().await;
         f.drain(callback).await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         // No peer sees whether the proxy still waits on its own callback.
         assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
         f.s.guest([v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+        assert_eq!(f.host_received().await, [f.commit_state(2)]);
 
         f.s.guest([v3::enable(f.ti)]).await;
         f.keyboard_leave().await;
-        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.host_received().await, []);
         f.keyboard_enter_new_surface().await;
         // No peer sees that the enter dropped the pending enable before
         // the commit below shows it.
         assert_eq!(f.state().pending_for_test().enabled, None);
         f.s.guest([v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), [f.commit_state(3)]);
+        assert_eq!(f.host_received().await, [f.commit_state(3)]);
     }
 
     /// A release delayed past a wrapped serial's next press ends only its
@@ -4984,15 +5235,15 @@ pub(super) mod tests {
         };
         f.s.host([f.peek(old_press), f.key(old_press)]).await;
         assert_eq!(f.s.guest_received(), [f.guest_key(old_press)]);
-        assert_eq!(f.s.host_received(), [f.ack(old_press.serial, true)]);
+        assert_eq!(f.host_received().await, [f.ack(old_press.serial, true)]);
         f.s.host([f.peek(old_release), f.peek(new_press), f.key(new_press)])
             .await;
         assert_eq!(f.s.guest_received(), [f.guest_key(new_press)]);
-        assert_eq!(f.s.host_received(), [f.ack(new_press.serial, true)]);
+        assert_eq!(f.host_received().await, [f.ack(new_press.serial, true)]);
 
         f.s.host([f.key(old_release)]).await;
         assert_eq!(f.s.guest_received(), [f.guest_key(old_release)]);
-        assert_eq!(f.s.host_received(), [f.ack(old_release.serial, true)]);
+        assert_eq!(f.host_received().await, [f.ack(old_release.serial, true)]);
         assert!(f.held(SPACE));
         assert_eq!(f.owner(SPACE), Some(GuestKeyOwner::Physical));
 
@@ -5004,7 +5255,7 @@ pub(super) mod tests {
         };
         f.s.host([f.key(repeat)]).await;
         assert_eq!(f.s.guest_received(), [f.guest_key(repeat)]);
-        assert_eq!(f.s.host_received(), [f.ack(repeat.serial, true)]);
+        assert_eq!(f.host_received().await, [f.ack(repeat.serial, true)]);
         let new_release = Stroke {
             state: RELEASED,
             serial: 3,
@@ -5013,7 +5264,7 @@ pub(super) mod tests {
         };
         f.s.host([f.peek(new_release), f.key(new_release)]).await;
         assert_eq!(f.s.guest_received(), [f.guest_key(new_release)]);
-        assert_eq!(f.s.host_received(), [f.ack(new_release.serial, true)]);
+        assert_eq!(f.host_received().await, [f.ack(new_release.serial, true)]);
         assert!(!f.held(SPACE));
         assert_eq!(f.owner(SPACE), None);
 
@@ -5024,7 +5275,7 @@ pub(super) mod tests {
         };
         f.s.host([f.peek(held)]).await;
         f.keyboard_leave().await;
-        let host = f.s.host_received();
+        let host = f.host_received().await;
         assert_eq!(host, [f.deactivate(), sync(barrier(&host))]);
         f.s.host([f.confirm()]).await;
         assert_eq!(f.s.guest_received(), []);
@@ -5349,10 +5600,12 @@ pub(super) mod tests {
             let table = &self.ctx.shadow_table;
             queue
                 .iter()
-                .map(|(message, _)| {
+                .flat_map(|(bytes, _)| crate::test_support::glued_messages(bytes))
+                .map(|message| {
                     crate::test_support::decode(message, &mut Default::default(), |msg| {
                         let interface = match msg.sender_id {
                             HOST_EXT => "zcr_extended_text_input_v1",
+                            WL_DISPLAY_ID => "wl_display",
                             host => table.get_host_interface(host).expect("a sender"),
                         };
                         AnyRequest::from_wire(interface, msg)
@@ -5407,6 +5660,31 @@ pub(super) mod tests {
         assert_eq!(ime.events(), [(TI, V3::Done { serial: 1 }.into())]);
     }
 
+    /// A report and its barrier are one entry of the host queue, which a
+    /// submission never splits (`connection::OutgoingMessages`).
+    #[test]
+    fn a_reports_barrier_is_glued_into_its_entry() {
+        let mut ime = Ime::new();
+        ime.ctx.last_sender_id = TI;
+        let text = IndexedString::from("ab");
+        TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &text, 2, 2);
+        TextInputV3Handler.on_commit(&mut ime.ctx);
+        let report = ime.ctx.client_to_host_queue.iter().find(|(bytes, _)| {
+            crate::test_support::msg_header(bytes).opcode
+                == zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT
+        });
+        let (bytes, _) = report.expect("a report");
+        let messages = crate::test_support::glued_messages(bytes);
+        let [_, sync] = messages[..] else {
+            panic!("{} messages in the report's entry", messages.len());
+        };
+        let header = crate::test_support::msg_header(sync);
+        assert_eq!(
+            (header.sender_id, header.opcode),
+            (WL_DISPLAY_ID, wl_display::REQ_SYNC)
+        );
+    }
+
     /// The commit after one whose surrounding text did not fit does not
     /// retry that commit's pending state: it reaches the host with only
     /// what the guest set since.
@@ -5446,10 +5724,16 @@ pub(super) mod tests {
             cursor: 2,
             anchor: 2,
         };
-        assert_eq!(
-            ime.requests(),
-            [(HOST, surrounding.into()), commit_state(4)]
-        );
+        let mut requests = ime.requests();
+        let barrier = requests.remove(1);
+        assert!(matches!(
+            barrier,
+            (
+                WL_DISPLAY_ID,
+                AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
+            )
+        ));
+        assert_eq!(requests, [(HOST, surrounding.into()), commit_state(4)]);
         assert_eq!(ime.events(), [(TI, V3::Done { serial: 4 }.into())]);
     }
 
@@ -5504,6 +5788,8 @@ pub(super) mod tests {
 
             event(&mut ime, &oversized);
             assert_eq!(ime.events(), [], "{case}");
+            // The Exo mirror takes every event, whatever becomes of it.
+            expected.copy_exo_for_test(ime.state());
             assert_eq!(ime.state(), &expected, "{case}");
             assert!(ime.repeat_active(), "{case}");
         }

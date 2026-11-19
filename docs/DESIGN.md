@@ -496,8 +496,10 @@ end, the events of the host's `zwp_text_input_v1` and its extension, the
 `done` of the core's drain barriers and reset fences, each seat's
 keyboard focus change (`keyboard.rs`), a surface's end (`compositor.rs`),
 a `wl_seat` bind (`registry.rs`) and a pointer press or touch-down
-(`pointer.rs`, `touch.rs`). Nothing outside `ime` changes a text input,
-and only `ime/guest.rs` builds the v3 transaction events.
+(`pointer.rs`, `touch.rs`), and each key press the keyboard concern
+forwards to the guest (`keyboard.rs`, `ime_keys.rs`). Nothing outside
+`ime` changes a text input, and only `ime/guest.rs` builds the v3
+transaction events.
 
 The bridge reconciles state rather than translating requests, because Exo
 applies a request against state the proxy cannot see: it drops a content
@@ -514,9 +516,17 @@ The surrounding text and cursor rectangle are not reconciled: Exo keeps
 both regardless and edits its copy of the text as the input method
 commits, so each guest commit forwards the ones it states. In the other
 direction, the edits of Exo's input method reach the guest as v3
-transactions, each closed by a `done`; a delete, which Exo counts from the
-start of the surrounding text, is measured against the text the guest last
-committed. A guest commit that leaves the field enabled is answered
+transactions, each closed by a `done`. Exo measures its deletes and
+preedit regions in its own prediction of the text, so the core keeps a
+replica of it per text input, `ime/mirror.rs`, which takes every request
+the core sends at the `done` of a `wl_display.sync` glued to it, and every
+event Exo sends. `ime/exo_view.rs` owns the mirror, the text input's mode
+(`ime::ImeMode`), and whether the guest is in step with Exo; from v11 of
+the extension (Mirror mode) a delete or a region is measured in the
+mirror while it is, and as Legacy mode does otherwise. Below v11, or under the kill
+switch `SOMMELIER_IME_MIRROR=shadow`, Legacy mode measures them in the
+text the guest last committed, as `ime/legacy.rs` does, and the mirror
+only logs. A guest commit that leaves the field enabled is answered
 with a `done`, which Chromium waits for before it sends more. A pointer
 press or a touch-down on the surface of a composition ends it before the
 guest gets the press, as mutter and KWin do: `pointer.rs` follows each

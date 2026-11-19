@@ -380,6 +380,11 @@ pub(super) fn on_keysym(ctx: &mut Context, serial: u32, time: u32, sym: u32, sta
                 keycode,
                 state,
             ));
+            if state != wl_keyboard::KEY_STATE_RELEASED
+                && !crate::handler::keyboard::is_modifier_keysym(sym)
+            {
+                crate::handler::text_input::guest_key(ctx, guest_seat);
+            }
         } else {
             log::warn!(
                 "  -> could not find keycode for sym=0x{:x} ({:?})",

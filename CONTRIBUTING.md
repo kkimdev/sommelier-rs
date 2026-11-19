@@ -213,7 +213,19 @@ end of the trace (`SOMMELIER_DST_TRACE_LINES` sets how much) and the
 case's choices. Rerun it with `SOMMELIER_DST_SEED=<seed>
 SOMMELIER_DST_CASES=1`, which replays it exactly;
 `SOMMELIER_DST_CLIENT=chromium|gtk3|gtk4` and
-`SOMMELIER_DST_MODE=free|settled` narrow a run.
+`SOMMELIER_DST_MODE=free|settled` narrow a run. The summary counts each
+known issue by the host's text-input extension.
+
+The IME's kill switch, `SOMMELIER_IME_MIRROR=shadow`, keeps every text
+input in Legacy mode, as below v11 of the extension (`ime::ImeMode`):
+the Exo mirror only logs at debug what it would have sent. The proxy
+reads it once, and the DST honours it too, so a run under it checks
+Legacy mode at every extension:
+
+```bash
+SOMMELIER_IME_MIRROR=shadow SOMMELIER_DST_CASES=20000 \
+  cargo test --release -p sommelier --bins sim::ime_reaches
+```
 
 The first failed case of a run is shrunk (`sim/shrink.rs`) after its
 report: ddmin over its actions, zeroing runs of its choices (0 is the

@@ -53,15 +53,17 @@ use super::clock::Micros;
 use super::display::Display;
 use super::editor::{Target, TextModel, UserAction};
 use super::engine::{Engine, EngineIn, Lag, Request};
-use super::exo::{Answer, Exo, RegionOutcome, RegionTruth};
+use super::exo::{Answer, Exo, Predicted, RegionOutcome, RegionTruth};
 use super::hangul::Key;
 use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
 use super::surfaces::Surfaces;
 use super::ClientKind;
+use crate::ime::{ImeCore, ImeMode};
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{
-    wl_compositor, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_surface, wl_touch,
+    wl_callback, wl_compositor, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat,
+    wl_surface, wl_touch,
 };
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::Session;
@@ -290,7 +292,10 @@ pub(super) struct World<'t> {
     /// guest's pointer or finger is on which of its surfaces; and whether
     /// it is a key that reaches no window ([`World::keyboard_gone`]).
     p_to_c: Channel<(u32, AnyEvent, Option<Press>, bool)>,
-    p_to_e: Channel<(u32, AnyRequest)>,
+    /// Each run of requests Exo's display dispatches in one read: one
+    /// request, or a surrounding text or a `reset` and the barrier glued
+    /// to it.
+    p_to_e: Channel<Vec<(u32, AnyRequest)>>,
     /// Each host event, what engine text it carries, and how many of the
     /// proxy's surrounding texts Exo had got when it sent the event.
     e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>, u64)>,
@@ -330,6 +335,9 @@ pub(super) struct World<'t> {
     pub shadow: Option<Shadow>,
     /// The first steps whose output tier 1 failed ([`oracle::step`]).
     pub steps: Vec<String>,
+    /// The first answered syncs at which an exact Exo mirror of the proxy's
+    /// differed from Exo's tracker ([`World::check_mirrors`]).
+    pub mirrors: Vec<String>,
     /// The proxy ended the session.
     pub ended: bool,
     /// The client's fields at each `Settle`, in order, for the no-loss
@@ -377,10 +385,15 @@ impl<'t> World<'t> {
             spec: None,
             shadow: None,
             steps: Vec::new(),
+            mirrors: Vec::new(),
             ended: false,
             settles: Vec::new(),
             trace,
         };
+        // The IME's kill switch, which `Context::new` reads and a test
+        // context does not: no peer sets it.
+        let shadow = crate::handler::text_input::mirror_shadowed();
+        world.session.ctx().ime = ImeCore::new(shadow);
         let registry = world.session.new_id();
         world.guest([wl_display::req::get_registry(WL_DISPLAY_ID, registry)]);
         world.run(&[]).await;
@@ -427,7 +440,8 @@ impl<'t> World<'t> {
             ClientKind::Gtk3 => Box::new(Gtk::new(false, text_input, fields)),
             ClientKind::Gtk4 => Box::new(Gtk::new(true, text_input, fields)),
         });
-        world.spec = Some(SpecText::new(world.surfaces.clone(), setup.texts));
+        let mode = ImeMode::of(setup.extension, shadow);
+        world.spec = Some(SpecText::new(world.surfaces.clone(), setup.texts).in_mode(mode));
         world.shadow = Some(Shadow::new(world.surfaces.clone(), setup.texts));
         world.act(UserAction::Focus(0));
         world.run(&[]).await;
@@ -503,10 +517,11 @@ impl<'t> World<'t> {
                     self.deliver_to_guest(sender, event, press, gone);
                 }
                 2 => {
-                    let (sender, request) = self.p_to_e.take();
-                    self.reports_got += u64::from(is_report(&request));
-                    let events = self.display.request(sender, &request, &mut self.exo);
-                    self.host_sends(events, false);
+                    for (sender, request) in self.p_to_e.take() {
+                        self.reports_got += u64::from(is_report(&request));
+                        let events = self.display.request(sender, &request, &mut self.exo);
+                        self.host_sends(events, false);
+                    }
                 }
                 3 => {
                     let (event, mut origin, truth, reports) = self.e_to_p.take();
@@ -777,17 +792,75 @@ impl<'t> World<'t> {
             region: truth.as_ref(),
         });
         let goes_on = self.session.try_host([event]).await;
+        if let AnyEvent::WlCallback(wl_callback::Event::Done { .. }) = decoded {
+            self.check_mirrors(sender);
+        }
         self.send_proxy_output(goes_on);
     }
 
-    /// What the proxy sent goes out on P→E and P→C.
+    /// The proxy has handled the `done` of the sync with callback
+    /// `callback`: each of its Exo mirrors that says it is exact must hold
+    /// what Exo's tracker did when the display answered the sync, as every
+    /// request before the sync and every event before its `done` has
+    /// reached it, and nothing after them has.
+    fn check_mirrors(&mut self, callback: u32) {
+        let Some(at) = self.exo.synced.iter().position(|(c, _)| *c == callback) else {
+            return;
+        };
+        let (_, trackers) = self.exo.synced.remove(at);
+        for (id, tracker) in trackers {
+            // The mirror is the proxy's own state, which no peer sees.
+            let Some((predicted, history)) = self.session.ctx().ime.exact_mirror_for_test(id)
+            else {
+                continue;
+            };
+            let state = |state: &Predicted| {
+                let selection = (state.selection.start, state.selection.end);
+                (
+                    state.text.clone(),
+                    selection,
+                    state.composition.clone().unwrap_or(0..0),
+                )
+            };
+            let exo = (
+                state(&tracker.predicted),
+                tracker.expected.iter().map(state).collect(),
+            );
+            if (predicted, history) != exo && self.mirrors.len() < 3 {
+                let at = self.now.0 as f64 / 1_000.0;
+                let mirror = self.session.ctx().ime.exact_mirror_for_test(id);
+                self.mirrors.push(format!(
+                    "{at:.3} ms, at the done of sync {callback}: the exact mirror of host text \
+                     input {id} holds {mirror:?}, Exo's tracker {exo:?}"
+                ));
+            }
+        }
+    }
+
+    /// What the proxy sent goes out on P→E and P→C. A surrounding text or a
+    /// `reset` and the barrier right after it go together, as one
+    /// submission, which Exo's display dispatches in one read
+    /// (`HostOut::GluedBarrier`).
     fn send_proxy_output(&mut self, goes_on: bool) {
+        let mut batch: Vec<(u32, AnyRequest)> = Vec::new();
         for (sender, request) in self.session.host_received() {
             self.reports_sent += u64::from(is_report(&request));
             self.log(Place::PToE, format!("{sender} {request:?}"));
             self.see(Seen::ToHost(&request));
-            self.p_to_e
-                .send(self.now, (sender, request), &mut self.choices);
+            let glued = matches!(
+                request,
+                AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
+            ) && batch
+                .last()
+                .is_some_and(|(_, last)| is_report(last) || is_reset(last));
+            if !glued && !batch.is_empty() {
+                let run = std::mem::take(&mut batch);
+                self.p_to_e.send(self.now, run, &mut self.choices);
+            }
+            batch.push((sender, request));
+        }
+        if !batch.is_empty() {
+            self.p_to_e.send(self.now, batch, &mut self.choices);
         }
         for (sender, event) in self.session.guest_received() {
             self.log(Place::PToC, format!("{sender} {}", shown(&event)));
@@ -942,6 +1015,14 @@ fn is_report(request: &AnyRequest) -> bool {
     matches!(
         request,
         AnyRequest::ZwpTextInputV1(zwp_text_input_v1::Request::SetSurroundingText { .. })
+    )
+}
+
+fn is_reset(request: &AnyRequest) -> bool {
+    use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+    matches!(
+        request,
+        AnyRequest::ZwpTextInputV1(zwp_text_input_v1::Request::Reset {})
     )
 }
 

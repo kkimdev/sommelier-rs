@@ -34,7 +34,13 @@
   optional guest-initiated host `reset`) and C7 (test slimming) remain.
   Whether a composition should survive a blur, as native Chrome keeps
   it, is open (U5, U13, U14 of the design's 6.2); C5 commits it, as
-  mutter and ibus do.
+  mutter and ibus do. The Exo mirror's M2 and M3 are done: the core keeps
+  a replica of Exo's text tracker per text input, and from v11 of the
+  text-input extension measures Exo's deletes and preedit regions in it
+  (Mirror mode; INVARIANTS "From v11 of the extension, Exo's deletes and
+  regions are measured in the Exo mirror"). `SOMMELIER_IME_MIRROR=shadow`
+  keeps every text input in Legacy mode for one release (CONTRIBUTING).
+  M4, report suppression, remains.
 
 ## Known issues and debt
 
@@ -93,7 +99,8 @@
   bytes still ends the session as too large
   ([Wire messages](docs/INVARIANTS.md#wire-messages)). No client is known
   to send one.
-- Exo measures a `delete_surrounding_text` against its predicted text,
+- In Legacy mode (below v11 of the extension, or under the kill switch):
+  Exo measures a `delete_surrounding_text` against its predicted text,
   which includes input-method edits the guest has not yet reported. The
   proxy drops deletes until the guest commits its surrounding text after
   such an edit, but a guest commit that crosses an edit in flight still
@@ -104,8 +111,8 @@
   which clears the gate, before it applies the commit. The `done` that
   answers that report lets it report the text after the commit at once
   (`a_client_that_waits_for_done_reports_the_text_an_edit_leaves`), so
-  only a delete within that round trip can land wrong. Mirroring Exo's
-  `SurroundingTextTracker` would close this; no host has shown it.
+  only a delete within that round trip can land wrong. Mirror mode closes
+  it from v11; no host has shown it.
 - An empty IME confirmation while a key the input method took is held
   recovers that key only once the host's next event shows it repeated,
   one round trip later at most
@@ -118,10 +125,12 @@
   Exo's own detach of the input method ends the recovery of the keys held
   then, whose releases may have died with it, so a key held across an
   input-method restart stops repeating until its next press.
-- A preedit region is measured in Exo's text as the proxy knows it: the
-  guest's text with the preedit Exo holds at the guest's cursor
-  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). These cases
-  stay approximate; the DST names the first three as known issues.
+- In Legacy mode, a preedit region is measured in Exo's text as the
+  proxy knows it: the guest's text with the preedit Exo holds at the
+  guest's cursor ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)).
+  These cases stay approximate; the DST names the first three as known
+  issues. At v11 Mirror mode measures in Exo's text instead while it can,
+  and falls back to this otherwise (see below).
   - A region that does not cover the preedit Exo holds is dropped, but
     an empty one at Exo's cursor after it, which the guest commits: the
     guest keeps showing the old preedit while Exo composes the new range
@@ -148,8 +157,8 @@
     the bytes regions took, so a region made while host commits, a
     press's commit, or a reset commit the guest has not reported yet
     are in Exo's text lands wrong (`RegionWhileAhead`; seeds 10114 and
-    10174). It probably also feeds `StaleRegionAfterCommit`. Mirroring
-    Exo's tracker (the edits since the last report) would close it.
+    10174). It probably also feeds `StaleRegionAfterCommit`. Mirror mode
+    closes it.
   - Selection: Exo's tracker replaces a selection with the composition
     (`OnSetCompositionText`), while `ime::Current::predicted` inserts
     the preedit at the guest's cursor and ignores the anchor, so a region
@@ -181,6 +190,37 @@
     of its own first would serve Chromium, but the report Chromium
     answers it with lacks the preedit, so Exo would drop its
     composition (E4).
+- Mirror mode (from v11) measures in the Exo mirror only while the guest
+  is in step with Exo, the mirror is exact and no report crosses the
+  event, and falls back to Legacy mode's measurement otherwise. It must
+  not drop instead: the input method's next commit would double the text.
+  In 20,000 DST cases from seed 0, 14 events of the free cases fell back
+  where the two measurements differ, none in settled cases; the Legacy
+  issues then appear at v11 in a few cases (4.8 of the design). Its
+  gaps:
+  - A silent edit the proxy does not see breaks the guest model: GTK3
+    reports a click's new cursor only with its next edit, so a region
+    right after the click is measured at Exo's old cursor, as Legacy mode
+    measures it. The DST's tier 1 holds the proxy to Exo's real text, not
+    to the guest's, so it does not see it; tier 2 sees it only in free
+    cases, which it does not judge.
+  - A forwarded key or press suspends measuring until the guest states
+    its text: a report it made after it, or a commit with no surrounding
+    text, which the proxy reads as "unchanged" (Chromium reports its text
+    only when it changed, C1). A client that commits without stating its
+    changed text would break that.
+  - The guest's report without its preedit still makes Exo drop its
+    composition (E4; `ReportDropsComposition`, 1 of 20,000); M4 suppresses
+    such reports.
+  - The mirror is only as right as its reading of Chromium
+    (`6975bb48a8cd`). A host check, with `RUST_LOG=sommelier::ime=debug`,
+    in gedit, a GTK4 app, and Chrome or VS Code with
+    `--enable-wayland-ime --wayland-text-input-version=3`: type Korean;
+    reconvert with the hanja key inside a word, then press Esc and
+    Backspace; click while composing; paste a long paragraph and keep
+    typing. No `Diverged` health should show; with
+    `SOMMELIER_IME_MIRROR=shadow`, the debug log shows where the mirror
+    would have measured otherwise.
 - The pointer press or touch-down that ends a composition
   ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)) has not been
   checked on a host. In VS Code or Chrome started with

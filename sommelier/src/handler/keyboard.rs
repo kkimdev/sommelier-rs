@@ -280,6 +280,21 @@ impl KeyboardHandler {
         })
     }
 
+    /// Whether `key` is a modifier in the keyboard's keymap, which edits no
+    /// text. A key of a keyboard with no keymap yet may be anything.
+    fn is_modifier(ctx: &Context, host_keyboard_id: HostId, key: u32) -> bool {
+        let Some(state) = ctx.keyboard_xkb_states.get(&host_keyboard_id) else {
+            return false;
+        };
+        let Some(xkb_raw_keycode) = key.checked_add(8) else {
+            return false;
+        };
+        let keycode = xkb::Keycode::new(xkb_raw_keycode);
+        let keymap = state.get_keymap();
+        let syms = keymap.key_get_syms_by_level(keycode, 0, 0);
+        !syms.is_empty() && syms.iter().all(|&sym| is_modifier_keysym(sym.raw()))
+    }
+
     /// The modifiers `state` holds, as `accelerator.rs` masks: Control,
     /// Alt, Shift and Super, depressed or latched.
     ///
@@ -961,6 +976,14 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             }
         };
 
+        if action == Action::Forward
+            && state != KEY_STATE_RELEASED
+            && !Self::is_modifier(ctx, host_keyboard_id, key)
+        {
+            if let Some(guest_seat) = guest_seat {
+                crate::handler::text_input::guest_key(ctx, guest_seat);
+            }
+        }
         log::debug!("  -> action={:?}", action);
         action
     }
@@ -1220,6 +1243,16 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
         }
         crate::wire::Action::Drop
     }
+}
+
+/// X11's `IsModifierKey`: Shift to Hyper, the ISO lock and level keys,
+/// Mode_switch and Num_Lock.
+pub(crate) fn is_modifier_keysym(sym: u32) -> bool {
+    use xkb::keysyms::*;
+    (KEY_Shift_L..=KEY_Hyper_R).contains(&sym)
+        || (KEY_ISO_Lock..=KEY_ISO_Level5_Lock).contains(&sym)
+        || sym == KEY_Mode_switch
+        || sym == KEY_Num_Lock
 }
 
 #[cfg(test)]

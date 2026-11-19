@@ -110,6 +110,7 @@ impl Env for World {
 enum Host {
     Req(u32, AnyRequest),
     Barrier(BarrierToken),
+    GluedBarrier(BarrierToken),
     Retire(u32),
 }
 
@@ -130,12 +131,25 @@ struct Out {
 }
 
 impl Out {
-    /// The barriers among the host output.
+    /// The barriers glued to a report among the host output.
+    fn glued(&self) -> Vec<BarrierToken> {
+        self.host
+            .windows(2)
+            .filter_map(|pair| match pair {
+                [Host::Req(_, AnyRequest::ZwpTextInputV1(V1::SetSurroundingText { .. })), Host::GluedBarrier(token)] => {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The barriers among the host output, glued or not.
     fn barriers(&self) -> Vec<BarrierToken> {
         self.host
             .iter()
             .filter_map(|out| match out {
-                Host::Barrier(token) => Some(*token),
+                Host::Barrier(token) | Host::GluedBarrier(token) => Some(*token),
                 _ => None,
             })
             .collect()
@@ -160,6 +174,7 @@ fn decode(fx: Effects) -> Out {
                 Host::Req(id, request)
             }
             HostOut::Barrier(token) => Host::Barrier(token),
+            HostOut::GluedBarrier(token) => Host::GluedBarrier(token),
             HostOut::Retire(id) => Host::Retire(id),
         })
         .collect();
@@ -193,6 +208,23 @@ struct Ime {
 }
 
 impl Ime {
+    /// [`Self::new`] under the kill switch: every text input in Legacy
+    /// mode.
+    fn legacy() -> Self {
+        Self {
+            core: ImeCore::new(true),
+            ..Self::new()
+        }
+    }
+
+    /// [`Self::enabled`] in Legacy mode.
+    fn legacy_enabled() -> Self {
+        let mut ime = Self::legacy();
+        ime.create(TI);
+        ime.enable(TI);
+        ime
+    }
+
     fn new() -> Self {
         let world = World {
             surfaces: BTreeMap::from([(SURFACE, HOST_SURFACE), (OTHER, HOST_OTHER)]),
@@ -205,8 +237,21 @@ impl Ime {
         }
     }
 
-    /// Step, then check the invariants.
+    /// [`Self::step_unanswered`], then Exo processes each report it sent:
+    /// the barrier glued to it, which the output leaves out, is done.
     fn step(&mut self, input: Input) -> Out {
+        let mut out = self.step_unanswered(input);
+        let glued = out.glued();
+        for &token in &glued {
+            self.step_unanswered(Input::BarrierDone(token));
+        }
+        out.host
+            .retain(|out| !matches!(out, Host::GluedBarrier(token) if glued.contains(token)));
+        out
+    }
+
+    /// Step, then check the invariants.
+    fn step_unanswered(&mut self, input: Input) -> Out {
         let fx = self.core.step(input, &self.world);
         self.core.assert_invariants(&self.world);
         decode(fx)
@@ -260,6 +305,35 @@ impl Ime {
     fn report(&mut self, text: &str, cursor: i32) -> Out {
         self.step(Input::SurroundingText(TI, text.into(), cursor, cursor));
         self.step(Input::Commit(TI))
+    }
+
+    /// [`Self::report`] that Exo has yet to process: returns the barrier
+    /// whose `done` says it has.
+    fn report_unanswered(&mut self, text: &str, cursor: i32) -> BarrierToken {
+        self.step(Input::SurroundingText(TI, text.into(), cursor, cursor));
+        let [barrier] = self.step_unanswered(Input::Commit(TI)).glued()[..] else {
+            panic!("a report glued to its barrier");
+        };
+        barrier
+    }
+
+    /// Exo commits `text`.
+    fn host_commit(&mut self, text: &str) -> Out {
+        let text = text.to_owned();
+        self.v1(HostIme::Commit { serial: 0, text })
+    }
+
+    fn region(&mut self, index: i32, length: u32) -> Out {
+        self.ext(HostIme::PreeditRegion { index, length })
+    }
+
+    fn delete(&mut self, index: i32, length: u32) -> Out {
+        self.v1(HostIme::Delete { index, length })
+    }
+
+    /// Whether [`TI`]'s next delete or region is measured in the mirror.
+    fn in_step(&self) -> bool {
+        self.core.get(TI).expect("a text input").exo().in_step()
     }
 
     /// A pointer press on `surface`.
@@ -455,10 +529,12 @@ fn guest_txn_encodes_in_canonical_order() {
 }
 
 /// The production sources of the core.
-const SOURCES: [(&str, &str); 7] = [
+const SOURCES: [(&str, &str); 9] = [
     ("mod.rs", include_str!("mod.rs")),
+    ("exo_view.rs", include_str!("exo_view.rs")),
     ("guest.rs", include_str!("guest.rs")),
     ("host.rs", include_str!("host.rs")),
+    ("legacy.rs", include_str!("legacy.rs")),
     ("mirror.rs", include_str!("mirror.rs")),
     ("serial.rs", include_str!("serial.rs")),
     ("state.rs", include_str!("state.rs")),
@@ -481,8 +557,9 @@ fn count_bumps_only_in_the_commit_arm() {
 }
 
 /// B5 and the core's isolation: one builder of the v3 transaction events
-/// in the crate, and no import from the rest of the proxy but the wire and
-/// the generated protocols.
+/// in the crate, and no import from the rest of the proxy but the wire, the
+/// generated protocols, and the size of a host submission, which tells
+/// whether a report and its barrier reach Exo in one read.
 #[test]
 fn ime_is_isolated() {
     const BUILDERS: [&str; 4] = [
@@ -511,7 +588,9 @@ fn ime_is_isolated() {
             let rest = &source[start + "use crate::".len()..];
             let end = rest.find(';').expect("a use ends");
             let path: String = rest[..end].split_whitespace().collect();
-            let allowed = path.starts_with("protocols::") || path.starts_with("wire::");
+            let allowed = path.starts_with("protocols::")
+                || path.starts_with("wire::")
+                || path == "connection::MAX_BYTES_PER_SEND";
             assert!(allowed, "{file} uses crate::{path}");
             source = rest;
         }
@@ -754,7 +833,7 @@ fn row_G9c_a_commit_of_an_enabled_field_repeats_the_shown_preedit() {
 /// shows fit a message once, so the test replaces the shown preedit.
 #[test]
 fn row_G9c_an_answer_that_cannot_repeat_the_preedit_forgets_it() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     ime.ext(region(-1, 1));
@@ -999,7 +1078,9 @@ fn row_G10_destroy_deactivates_and_destroys_the_extension() {
     // Its barrier's done, and its extension's events, find nothing.
     let out = ime.step(Input::BarrierDone(barrier));
     assert!(out.host.is_empty() && out.guest.is_empty());
-    let out = ime.ext(HostIme::Confirm);
+    let out = ime.ext(HostIme::Confirm {
+        keep_selection: true,
+    });
     assert!(out.guest.is_empty() && out.keys.is_empty());
 }
 
@@ -1131,7 +1212,9 @@ fn row_H2_an_exo_detach_commits_the_preedit_and_activates_again() {
 fn row_H2_a_confirmed_composition_is_committed_once() {
     let mut ime = Ime::enabled();
     ime.compose("가");
-    let out = ime.ext(HostIme::Confirm);
+    let out = ime.ext(HostIme::Confirm {
+        keep_selection: true,
+    });
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
     let out = ime.step(Input::HostLeave(TI));
     assert!(out.guest.is_empty() && out.keys.is_empty());
@@ -1229,7 +1312,7 @@ fn row_H7_a_preedit_shows_and_its_clear_arms_the_lease() {
 
 #[test]
 fn row_H7_a_cleared_preedit_with_commit_text_commits_it() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("ab", 2);
     ime.compose("가");
     let out = ime.v1(HostIme::Preedit {
@@ -1261,7 +1344,7 @@ fn row_H7_a_cleared_preedit_with_commit_text_commits_it() {
 /// again.
 #[test]
 fn row_H7_a_reset_commit_gives_back_the_bytes_a_region_took() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     let out = ime.ext(region(-1, 1));
@@ -1365,7 +1448,7 @@ fn row_H8_an_empty_commit_over_a_preedit_is_no_edit() {
 
 #[test]
 fn row_H9_an_absolute_delete_becomes_lengths_around_the_cursor() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abcd", 2);
     let out = ime.v1(HostIme::Delete {
         index: 1,
@@ -1429,7 +1512,7 @@ fn row_H10_keysyms_go_to_an_attached_input_whatever_its_fence() {
 
 #[test]
 fn row_X1_a_preedit_region_turns_text_into_the_preedit() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("a가b", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     let out = ime.ext(region(-3, 3));
@@ -1476,7 +1559,7 @@ fn row_X1_a_region_keeps_the_cursor_and_an_empty_one_edits_nothing() {
 /// that does not cover them is dropped. A report ends that.
 #[test]
 fn row_X1_a_region_over_a_region_deletes_only_what_the_guest_has() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     let out = ime.ext(region(-1, 1));
@@ -1507,7 +1590,7 @@ fn row_X1_a_region_over_a_region_deletes_only_what_the_guest_has() {
 /// bytes, so the region takes it.
 #[test]
 fn row_X1_a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     let out = ime.ext(region(-1, 1));
@@ -1555,7 +1638,7 @@ fn row_X1_a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
 /// each.
 #[test]
 fn row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abc", 1);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     // Exo holds "ax|bc".
@@ -1581,7 +1664,7 @@ fn row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped() {
 /// region is dropped.
 #[test]
 fn row_X1_an_empty_region_over_a_held_preedit_commits_it() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     assert_eq!(ime.compose("x").guest, [preedit("x"), done(2)]);
@@ -1609,7 +1692,7 @@ fn row_X1_an_empty_region_over_a_held_preedit_commits_it() {
 /// clears the preedit it no longer holds.
 #[test]
 fn row_X1_a_report_without_a_regions_bytes_ends_exos_composition() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     ime.v1(HostIme::PreeditCursor(-1));
@@ -1639,7 +1722,7 @@ fn row_X1_a_region_equal_to_the_shown_one_sends_only_the_preedit() {
 /// an empty region, and one short of the taken bytes on either side.
 #[test]
 fn row_X1_a_region_that_does_not_cover_the_shown_one_is_dropped() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abcdef", 3);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     // "c" before the cursor and "d" after it.
@@ -1693,15 +1776,20 @@ fn row_X1_an_edit_that_ends_the_composition_gives_the_bytes_back() {
                 length: 1,
             },
         ),
-        ("a confirmation", HostIme::Confirm),
+        (
+            "a confirmation",
+            HostIme::Confirm {
+                keep_selection: true,
+            },
+        ),
     ];
     let region = |index, length| HostIme::PreeditRegion { index, length };
     for (case, end) in ends {
-        let mut ime = Ime::enabled();
+        let mut ime = Ime::legacy_enabled();
         ime.report("abcdef", 4);
         ime.ext(region(-1, 1));
         let out = match end {
-            HostIme::Confirm => ime.ext(end),
+            HostIme::Confirm { .. } => ime.ext(end),
             end => ime.v1(end),
         };
         assert!(!out.guest.is_empty(), "{case}");
@@ -1727,7 +1815,9 @@ fn row_X1prime_a_region_the_text_cannot_hold_is_dropped() {
 fn row_X2_a_confirmation_commits_the_shown_preedit() {
     let mut ime = Ime::enabled();
     ime.compose("가");
-    let out = ime.ext(HostIme::Confirm);
+    let out = ime.ext(HostIme::Confirm {
+        keep_selection: true,
+    });
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
 }
@@ -1735,7 +1825,9 @@ fn row_X2_a_confirmation_commits_the_shown_preedit() {
 #[test]
 fn row_X2prime_an_empty_confirmation_recovers_the_held_key() {
     let mut ime = Ime::enabled();
-    let out = ime.ext(HostIme::Confirm);
+    let out = ime.ext(HostIme::Confirm {
+        keep_selection: true,
+    });
     assert_eq!(out.guest, []);
     assert_eq!(out.keys, [Key::Recover(TI)]);
 }
@@ -1747,7 +1839,9 @@ fn row_X2prime_an_empty_confirmation_recovers_the_held_key() {
 #[test]
 fn row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery() {
     let mut ime = Ime::enabled();
-    ime.ext(HostIme::Confirm);
+    ime.ext(HostIme::Confirm {
+        keep_selection: true,
+    });
     let done_now = |ime: &mut Ime| {
         let done = ime.core.recovery_done(TI);
         done.map(|done| guest_events(&done))
@@ -1786,8 +1880,22 @@ fn row_H8_H9_X2_only_an_edit_that_reaches_the_guest_takes_the_assembly() {
             },
             false,
         ),
-        ("an empty confirmation", false, || HostIme::Confirm, false),
-        ("a confirmation", true, || HostIme::Confirm, true),
+        (
+            "an empty confirmation",
+            false,
+            || HostIme::Confirm {
+                keep_selection: true,
+            },
+            false,
+        ),
+        (
+            "a confirmation",
+            true,
+            || HostIme::Confirm {
+                keep_selection: true,
+            },
+            true,
+        ),
     ];
     for (case, composing, event, takes) in cases {
         let mut ime = Ime::enabled();
@@ -1801,7 +1909,9 @@ fn row_H8_H9_X2_only_an_edit_that_reaches_the_guest_takes_the_assembly() {
         });
         ime.v1(HostIme::PreeditCursor(0));
         let out = match event() {
-            HostIme::Confirm => ime.ext(HostIme::Confirm),
+            HostIme::Confirm { .. } => ime.ext(HostIme::Confirm {
+                keep_selection: true,
+            }),
             event => ime.v1(event),
         };
         assert_eq!(out.guest.is_empty(), !takes, "{case}");
@@ -1957,7 +2067,9 @@ fn row_F1_a_focus_change_commits_the_shown_preedit_before_leave() {
         ]
     );
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
-    let confirm = ime.ext(HostIme::Confirm);
+    let confirm = ime.ext(HostIme::Confirm {
+        keep_selection: true,
+    });
     assert!(confirm.guest.is_empty() && confirm.keys.is_empty());
     // The commit ended the composition: a focus that comes back shows
     // nothing.
@@ -2068,7 +2180,10 @@ fn row_F4_a_press_commits_the_preedit_then_resends_the_press() {
     let [fence] = out.barriers()[..] else {
         panic!("one barrier in {out:?}");
     };
-    assert_eq!(out.host, [req(v1(TI), V1::Reset {}), Host::Barrier(fence)]);
+    assert_eq!(
+        out.host,
+        [req(v1(TI), V1::Reset {}), Host::GluedBarrier(fence)]
+    );
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
     assert!(!out.forward);
     // The press took the assembly.
@@ -2081,7 +2196,7 @@ fn row_F4_a_press_commits_the_preedit_then_resends_the_press() {
 /// region deletes them again.
 #[test]
 fn row_F4_a_press_gives_back_the_bytes_a_region_took() {
-    let mut ime = Ime::enabled();
+    let mut ime = Ime::legacy_enabled();
     ime.report("abcdef", 4);
     let region = |index, length| HostIme::PreeditRegion { index, length };
     ime.ext(region(-1, 1));
@@ -2168,7 +2283,9 @@ fn row_F4_events_in_flight_at_a_press_are_dropped() {
         }),
         ("confirm", || Input::Ext {
             ext: ext_id(TI),
-            event: HostIme::Confirm,
+            event: HostIme::Confirm {
+                keep_selection: true,
+            },
         }),
     ];
     for (event, input) in events {
@@ -2265,4 +2382,299 @@ fn row_R2_an_activation_waits_for_a_live_seat() {
         assert!(out.host.is_empty());
     }
     assert_eq!(ime.compose("가").guest, []);
+}
+
+// Mirror mode (design exo-mirror 3): from v11 of the extension, H9 and X1
+// are measured in the Exo mirror while the guest is in step with it, and
+// dropped otherwise.
+
+#[test]
+fn row_G1_the_mode_is_mirror_from_v11_unless_shadowed() {
+    let mode = |shadow, version: Option<u32>| {
+        let mut ime = Ime {
+            core: ImeCore::new(shadow),
+            ..Ime::new()
+        };
+        let ext = version.map(|version| HostExt {
+            id: ext_id(TI),
+            version,
+            manager: 3,
+        });
+        let host = HostTi { v1: v1(TI), ext };
+        ime.step(Input::Create {
+            ti: TI,
+            seat: SEAT,
+            host,
+            manager: MANAGER,
+        });
+        ime.core.get(TI).expect("a text input").exo().mode()
+    };
+    assert_eq!(mode(false, Some(11)), ImeMode::Mirror);
+    assert_eq!(mode(false, Some(10)), ImeMode::Legacy);
+    assert_eq!(mode(false, None), ImeMode::Legacy);
+    assert_eq!(mode(true, Some(11)), ImeMode::Legacy);
+}
+
+/// The mirror takes a report at its barrier, which reaches Exo with it.
+#[test]
+fn row_G9c_a_forwarded_report_is_glued_to_a_barrier() {
+    let mut ime = Ime::enabled();
+    ime.step(Input::SurroundingText(TI, "ab".into(), 2, 2));
+    let out = ime.step_unanswered(Input::Commit(TI));
+    let [barrier] = out.glued()[..] else {
+        panic!("one glued barrier in {out:?}");
+    };
+    // The content type and `commit_state` follow.
+    assert_eq!(
+        out.host[..2],
+        [surrounding(TI, "ab", 2), Host::GluedBarrier(barrier)]
+    );
+    let text = |ime: &Ime| {
+        let exo = ime.core.get(TI).expect("a text input").exo();
+        exo.mirror().predicted().text.clone()
+    };
+    assert_eq!(text(&ime), "");
+    ime.step(Input::BarrierDone(barrier));
+    assert_eq!(text(&ime), "ab");
+}
+
+/// A report that does not fit a message sends nothing, a barrier
+/// included (G9b); one that fits but may reach Exo in two reads leaves
+/// the mirror unsure where it applied.
+#[test]
+fn row_G9b_a_report_that_does_not_fit_queues_no_barrier() {
+    let mut ime = Ime::enabled();
+    ime.report("", 0);
+    let long = "x".repeat(4_084);
+    ime.step(Input::SurroundingText(TI, long.as_str().into(), 0, 0));
+    assert_eq!(ime.step_unanswered(Input::Commit(TI)).host, []);
+    assert!(ime.in_step());
+
+    let long = "x".repeat(4_000);
+    let barrier = ime.report_unanswered(&long, 0);
+    ime.step(Input::BarrierDone(barrier));
+    let exo = ime.core.get(TI).expect("a text input").exo();
+    assert_eq!(exo.mirror().health(), mirror::Health::Uncertain);
+    assert!(!ime.in_step());
+}
+
+#[test]
+fn row_X1_a_region_after_an_unreported_commit_is_measured_in_exos_text() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.host_commit("c");
+    // Exo's "abc|": "bc" around the guest's cursor.
+    let out = ime.region(-2, 2);
+    assert_eq!(out.guest, [delete(2, 0), preedit_at("bc", 2, 2), done(2)]);
+    // Legacy mode measures it in the reported "ab|".
+    let mut ime = Ime::legacy_enabled();
+    ime.report("ab", 2);
+    ime.host_commit("c");
+    let out = ime.region(-2, 2);
+    assert_eq!(out.guest, [delete(2, 0), preedit_at("ab", 2, 2), done(2)]);
+}
+
+#[test]
+fn row_H9_a_delete_after_an_unreported_edit_lands_in_exos_text() {
+    let mut ime = Ime::enabled();
+    ime.report("abc", 3);
+    ime.host_commit("X");
+    // Exo deletes "cX" of its "abcX|", which the guest has before its
+    // cursor.
+    assert_eq!(ime.delete(2, 2).guest, [delete(2, 0), done(2)]);
+    // Legacy mode waits for the guest to report the commit.
+    let mut ime = Ime::legacy_enabled();
+    ime.report("abc", 3);
+    ime.host_commit("X");
+    assert_eq!(ime.delete(2, 2).guest, []);
+}
+
+/// A report Exo cannot match drops its composition (E4): the preedit the
+/// guest shows is no one's text, and a region is measured around the
+/// guest's cursor.
+#[test]
+fn row_X1_a_region_after_an_e4_drop_holds_no_preedit() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.compose("가");
+    ime.report("ab", 1);
+    let out = ime.region(-1, 1);
+    let expected = [no_preedit(), delete(1, 0), preedit_at("a", 1, 1), done(3)];
+    assert_eq!(out.guest, expected);
+}
+
+/// Exo made the region before it got the guest's report, which the
+/// region's state names: the guest caught up with Exo.
+#[test]
+fn row_X1_a_region_made_before_a_report_is_measured_before_it() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.host_commit("c");
+    let barrier = ime.report_unanswered("abc", 3);
+    let out = ime.region(-1, 1);
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("c", 1, 1), done(3)]);
+    ime.step(Input::BarrierDone(barrier));
+    assert!(ime.in_step());
+}
+
+/// Mirror mode's guest output for the last of `steps`, which must be
+/// Legacy mode's: out of step with Exo, it falls back to Legacy mode,
+/// rather than drop what Legacy mode would measure.
+fn falls_back(steps: impl Fn(&mut Ime) -> Out) -> Vec<(u32, AnyEvent)> {
+    let mut mirror = Ime::enabled();
+    let out = steps(&mut mirror);
+    assert!(!mirror.in_step(), "the guest is in step");
+    let mut legacy = Ime::legacy_enabled();
+    assert_eq!(out.guest, steps(&mut legacy).guest, "not Legacy mode's");
+    out.guest
+}
+
+/// A report on its way to Exo that names no state of Exo's holds an
+/// edit of the guest's that Exo made the region without.
+#[test]
+fn row_X1_a_region_crossing_a_guest_edit_falls_back() {
+    let out = falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.report_unanswered("abX", 3);
+        ime.region(-1, 1)
+    });
+    assert_eq!(out, [delete(1, 0), preedit_at("X", 1, 1), done(3)]);
+}
+
+/// An event the mirror finds Exo could not have sent leaves it diverged
+/// until it heals.
+#[test]
+fn row_X1_a_mirror_that_is_not_exact_falls_back() {
+    let out = falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.region(-5, 1);
+        ime.region(-1, 1)
+    });
+    assert_eq!(out, [delete(1, 0), preedit_at("b", 1, 1), done(2)]);
+}
+
+/// A v11 confirmation keeps Exo's selection, inside the composition, while
+/// the guest's cursor goes after the preedit it commits.
+#[test]
+fn row_X1_after_a_confirm_inside_the_composition_falls_back() {
+    let out = falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.v1(HostIme::PreeditCursor(3));
+        ime.compose("가나");
+        let confirmed = ime.ext(HostIme::Confirm {
+            keep_selection: true,
+        });
+        assert_eq!(confirmed.guest, [no_preedit(), commit("가나"), done(2)]);
+        ime.region(-2, 2)
+    });
+    assert_eq!(out, [delete(2, 0), preedit_at("ab", 2, 2), done(2)]);
+}
+
+/// v11's `SetEditableSelectionRange` moves Exo's selection and keeps its
+/// composition, while the guest commits it.
+#[test]
+fn row_H9_after_set_editable_selection_range_falls_back() {
+    falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.compose("가");
+        ime.v1(HostIme::CursorPosition {
+            index: 0,
+            anchor: 0,
+        });
+        let out = ime.host_commit("가");
+        assert_eq!(out.guest, [no_preedit(), commit("가"), done(2)]);
+        ime.delete(-1, 1)
+    });
+}
+
+/// An empty region ends Exo's composition as text, which the guest
+/// commits, but leaves Exo's cursor inside it.
+#[test]
+fn row_H9_after_an_empty_region_with_exos_cursor_inside_falls_back() {
+    falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.v1(HostIme::PreeditCursor(3));
+        ime.compose("가나");
+        // Mirror mode commits "가나"; Legacy mode drops the region.
+        ime.region(0, 0);
+        ime.delete(2, 3)
+    });
+}
+
+/// A region dropped for not covering the preedit Exo holds leaves Exo
+/// composing what the guest does not show.
+#[test]
+fn row_H9_after_a_dropped_region_falls_back() {
+    falls_back(|ime| {
+        ime.report("abc", 3);
+        ime.compose("가");
+        assert_eq!(ime.region(-4, 1).guest, []);
+        ime.ext(HostIme::Confirm {
+            keep_selection: true,
+        });
+        ime.delete(3, 3)
+    });
+}
+
+/// Chromium applies a delete before it clears the preedit it shows, and
+/// drops it (C3).
+#[test]
+fn row_H9_after_a_delete_over_a_shown_preedit_falls_back() {
+    falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.compose("가");
+        // Exo drops its composition (E4); the guest still shows it.
+        ime.report("ab", 1);
+        let out = ime.delete(0, 1);
+        assert_eq!(out.guest, [no_preedit(), delete(1, 0), done(3)]);
+        ime.delete(0, 1)
+    });
+}
+
+/// A field that states no surrounding text, as a terminal's, gets the
+/// proxy's empty stand-in, which tells nothing of the guest's text: Mirror
+/// mode falls back to Legacy mode, which has no text to measure in.
+#[test]
+fn row_H9_a_field_that_states_no_text_falls_back() {
+    let out = falls_back(|ime| {
+        ime.host_commit("X");
+        ime.delete(0, 1)
+    });
+    assert_eq!(out, []);
+}
+
+/// A key the guest gets may edit its text where Exo does not see, and so
+/// may a press: Exo's delete of "cX" after a commit the guest has yet to
+/// report, which the mirror would measure, falls back to Legacy mode,
+/// which waits for the report.
+#[test]
+fn row_H9_after_a_forwarded_key_falls_back() {
+    for press in [false, true] {
+        let out = falls_back(|ime| {
+            ime.report("abc", 3);
+            ime.host_commit("X");
+            match press {
+                false => ime.step(Input::GuestKey(SEAT)),
+                true => ime.press(SURFACE),
+            };
+            ime.delete(2, 2)
+        });
+        assert_eq!(out, []);
+    }
+}
+
+/// A report after the key states what it did, and a commit without one
+/// that it changed nothing.
+#[test]
+fn row_H9_in_step_again_after_a_matched_report() {
+    let mut ime = Ime::enabled();
+    ime.report("abc", 3);
+    ime.step(Input::GuestKey(SEAT));
+    ime.report("abc", 3);
+    assert_eq!(ime.delete(2, 1).guest, [delete(1, 0), done(3)]);
+
+    ime.step(Input::GuestKey(SEAT));
+    let out = ime.step(Input::Commit(TI));
+    assert_eq!(out.guest, [done(4)]);
+    assert_eq!(ime.delete(1, 1).guest, [delete(1, 0), done(4)]);
 }
