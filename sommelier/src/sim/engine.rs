@@ -164,6 +164,9 @@ pub(super) struct Engine {
     composer: Composer,
     /// The reconverted region, which is the composition instead.
     region: Option<String>,
+    /// The region before the last reconversion, which the field keeps if
+    /// Exo refuses that reconversion's range.
+    unreconverted: Option<String>,
     /// What the engine has not reached yet, in order.
     queue: VecDeque<EngineIn>,
     busy: Option<InService>,
@@ -175,6 +178,7 @@ impl Engine {
             lag,
             composer: Composer::default(),
             region: None,
+            unreconverted: None,
             queue: VecDeque::new(),
             busy: None,
         }
@@ -199,11 +203,20 @@ impl Engine {
     /// field holds it, from the field's text that follows, once Exo
     /// composed it. Its request measured the region in the text it was
     /// handed, which can lag behind the field's; a region Exo refused
-    /// leaves what the engine had.
+    /// leaves what the engine had ([`Engine::refused_region`]).
     pub fn learn_region(&mut self, text: String) {
         if self.region.is_some() {
             self.region = (!text.is_empty()).then_some(text);
         }
+    }
+
+    /// Exo refused the range of the last reconversion, which lay past its
+    /// text when the range came, as a report that moved the cursor can
+    /// leave it: IMA's `SetComposingRange` returns false before it changes
+    /// anything (`input_method_ash.cc`, `text_range.Contains`), so the
+    /// field composes what it did, and the engine keeps the region it had.
+    pub fn refused_region(&mut self) {
+        self.region = self.unreconverted.take();
     }
 
     /// When the next part of the answer to the key in service is ready;
@@ -323,7 +336,7 @@ impl Engine {
                 };
                 let region = format!("{c}{region}");
                 let before = region.encode_utf16().count();
-                self.region = Some(region);
+                self.unreconverted = self.region.replace(region);
                 vec![TextAction::Region { before, after: 0 }]
             }
         }
@@ -521,6 +534,37 @@ mod tests {
         assert_eq!(engine.composition(), "가");
         engine.learn_region(String::new());
         assert_eq!(engine.composition(), "");
+    }
+
+    #[test]
+    fn a_reconversion_exo_refused_leaves_the_region_the_engine_had() {
+        let mut engine = Engine::new(Lag::Fast);
+        let reconvert = |engine: &mut Engine, id| {
+            let before = "0a가".to_owned();
+            let request = Request::Reconvert;
+            let input = EngineIn::Request {
+                request,
+                id,
+                before,
+            };
+            engine.send(Micros(0), input, &mut |_| 0);
+            while engine.ready_at().is_some() {
+                engine.take(&mut |_| 0);
+            }
+        };
+        reconvert(&mut engine, 0);
+        engine.refused_region();
+        assert_eq!(engine.composition(), "", "no region before the first");
+        reconvert(&mut engine, 1);
+        assert_eq!(engine.composition(), "가");
+        reconvert(&mut engine, 2);
+        assert_eq!(engine.composition(), "a가");
+        engine.refused_region();
+        assert_eq!(
+            engine.composition(),
+            "가",
+            "the region before the refused one"
+        );
     }
 
     #[test]
