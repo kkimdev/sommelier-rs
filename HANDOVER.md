@@ -112,13 +112,15 @@
     composition (E4), and nothing tells the proxy: it still measures
     with the preedit the guest shows (`RegionOverUnheldPreedit`; seed
     18654, a GTK3 report of a tap's cursor that lags behind a late
-    answer). A report still on its way to Exo is the converse
-    (`RegionCrossesReport`).
+    answer). A report Exo has yet to get, on its way to Exo or sent
+    while the region is on its way back, is the converse
+    (`RegionCrossesReport`; seeds 2452 and 8116 cross the region on the
+    wire).
   - Ahead: the proxy measures in the text the guest last reported, less
     the bytes regions took, so a region made while host commits, a
     press's commit, or a reset commit the guest has not reported yet
     are in Exo's text lands wrong (`RegionWhileAhead`; seeds 10114 and
-    19176). It probably also feeds `StaleRegionAfterCommit`. Mirroring
+    10174). It probably also feeds `StaleRegionAfterCommit`. Mirroring
     Exo's tracker (the edits since the last report) would close it.
   - Selection: Exo's tracker replaces a selection with the composition
     (`OnSetCompositionText`), while `TextInputState::host_text` inserts

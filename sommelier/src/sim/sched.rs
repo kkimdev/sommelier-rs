@@ -296,24 +296,35 @@ pub(super) struct World<'t> {
     /// Each guest request, with the edits the guest had got when it sent
     /// it.
     c_to_p: Channel<(Outgoing, u64)>,
-    /// Each event to the guest, and the press it is, if it is one: where
-    /// the guest's pointer or finger is on which of its surfaces.
-    p_to_c: Channel<(u32, AnyEvent, Option<Press>)>,
+    /// Each event to the guest, the press it is, if it is one: where the
+    /// guest's pointer or finger is on which of its surfaces; and whether
+    /// it is a key that reaches no window ([`World::keyboard_gone`]).
+    p_to_c: Channel<(u32, AnyEvent, Option<Press>, bool)>,
     p_to_e: Channel<(u32, AnyRequest)>,
-    /// Each host event, and what engine text it carries.
-    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>)>,
+    /// Each host event, what engine text it carries, and how many of the
+    /// proxy's surrounding texts Exo had got when it sent the event.
+    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>, u64)>,
     to_engine: Channel<EngineIn>,
     /// The guest's view of what the client models do not take: the
     /// globals, Shift and where its pointer is, as the proxy tells it.
     globals: BTreeMap<String, (u32, u32)>,
     shift: bool,
     pointer: Option<Pointer>,
+    /// The proxy dropped the last keyboard enter Exo sent, which named a
+    /// surface the guest destroyed (F2), so the guest's keyboard focus is
+    /// on none of its windows: the keys Exo sent with that focus, which
+    /// the proxy passes on, reach no window, as they would reach no window
+    /// of a client of Exo's own (GTK's and Chromium's seats drop a key
+    /// while no surface has the keyboard focus).
+    keyboard_gone: bool,
     /// The resets Exo handed the engine.
     resets: u64,
     /// The key the user holds, which repeats, and when it next does.
     repeat: Option<(Key, Micros)>,
-    /// The surrounding texts the proxy sent Exo that Exo has yet to get.
-    reports_to_exo: u64,
+    /// How many surrounding texts the proxy sent Exo, and how many of them
+    /// Exo got.
+    reports_sent: u64,
+    reports_got: u64,
     /// The transactions that edit the text (a delete or a commit) the
     /// proxy sent the guest, and those the guest got; and whether the
     /// transaction each is in so far edits.
@@ -366,9 +377,11 @@ impl<'t> World<'t> {
             globals: BTreeMap::new(),
             shift: false,
             pointer: None,
+            keyboard_gone: false,
             resets: 0,
             repeat: None,
-            reports_to_exo: 0,
+            reports_sent: 0,
+            reports_got: 0,
             edits: Edits::default(),
             text_input: 0,
             compositor: 0,
@@ -501,17 +514,21 @@ impl<'t> World<'t> {
                     self.deliver_guest_request(request, edits).await;
                 }
                 1 => {
-                    let (sender, event, press) = self.p_to_c.take();
-                    self.deliver_to_guest(sender, event, press);
+                    let (sender, event, press, gone) = self.p_to_c.take();
+                    self.deliver_to_guest(sender, event, press, gone);
                 }
                 2 => {
                     let (sender, request) = self.p_to_e.take();
-                    self.reports_to_exo -= u64::from(is_report(&request));
+                    self.reports_got += u64::from(is_report(&request));
                     let events = self.display.request(sender, &request, &mut self.exo);
                     self.host_sends(events, false);
                 }
                 3 => {
-                    let (event, origin, truth) = self.e_to_p.take();
+                    let (event, mut origin, truth, reports) = self.e_to_p.take();
+                    // A report the proxy sent before the event reached it,
+                    // which Exo had yet to get when it sent the event,
+                    // crossed it: on its way to Exo then, or sent since.
+                    origin.crossed = self.reports_sent > reports;
                     self.deliver_host_event(event, origin, truth).await;
                 }
                 4 => {
@@ -664,16 +681,17 @@ impl<'t> World<'t> {
             late,
             resets: self.resets,
             press,
-            crossed: self.reports_to_exo > 0,
+            crossed: false,
         };
+        let reports = self.reports_got;
         for (event, truth) in self.exo.take_events_with_truths() {
             self.e_to_p
-                .send(self.now, (event, origin, truth), &mut self.choices);
+                .send(self.now, (event, origin, truth, reports), &mut self.choices);
         }
         for event in events {
             let origin = Origin::default();
             self.e_to_p
-                .send(self.now, (event, origin, None), &mut self.choices);
+                .send(self.now, (event, origin, None, reports), &mut self.choices);
         }
         for input in self.exo.take_engine() {
             self.resets += u64::from(input == EngineIn::Reset);
@@ -773,6 +791,10 @@ impl<'t> World<'t> {
                 self.pointer = Some(Pointer::Gone);
             }
         }
+        // And a keyboard enter, so the keys that follow reach no window.
+        if let AnyEvent::WlKeyboard(wl_keyboard::Event::Enter { surface, .. }) = decoded {
+            self.keyboard_gone = self.surfaces.host_destroyed(surface);
+        }
         let note = if origin.late { " (late)" } else { "" };
         self.log(Place::EToP, format!("{sender} {}{note}", shown(&decoded)));
         self.see(Seen::Host {
@@ -788,7 +810,7 @@ impl<'t> World<'t> {
     /// What the proxy sent goes out on P→E and P→C.
     fn send_proxy_output(&mut self, goes_on: bool) {
         for (sender, request) in self.session.host_received() {
-            self.reports_to_exo += u64::from(is_report(&request));
+            self.reports_sent += u64::from(is_report(&request));
             self.log(Place::PToE, format!("{sender} {request:?}"));
             self.see(Seen::ToHost(&request));
             self.p_to_e
@@ -802,8 +824,10 @@ impl<'t> World<'t> {
             if let Some((surface, at)) = press {
                 self.see(Seen::GuestPress { surface, at });
             }
+            let gone = self.keyboard_gone
+                && matches!(event, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }));
             self.p_to_c
-                .send(self.now, (sender, event, press), &mut self.choices);
+                .send(self.now, (sender, event, press, gone), &mut self.choices);
         }
         self.see(Seen::StepEnd);
         self.ended |= !goes_on;
@@ -843,9 +867,15 @@ impl<'t> World<'t> {
     }
 
     /// An event reaches the guest: the client model takes what it models,
-    /// a press as `press` resolved it, and the guest keeps the globals and
-    /// Shift.
-    fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>) {
+    /// a press as `press` resolved it, but no key that is `gone` to no
+    /// window, and the guest keeps the globals and Shift.
+    ///
+    /// # Panics
+    ///
+    /// If a key gone to no window reaches a client with the keyboard
+    /// focus: the proxy kept from it the `leave` that came before the enter
+    /// it dropped.
+    fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>, gone: bool) {
         let now = self.now;
         self.edits.got.follow(&event);
         if let AnyEvent::WlRegistry(wl_registry::Event::Global {
@@ -882,6 +912,15 @@ impl<'t> World<'t> {
             }
             (AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { mods_depressed, .. }), _) => {
                 self.shift = mods_depressed & keymap::SHIFT != 0;
+                Vec::new()
+            }
+            (AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }), _) if gone => {
+                assert_eq!(
+                    client.focused_field(),
+                    None,
+                    "protocol violation: a key to a destroyed surface while a field has the \
+                     keyboard focus"
+                );
                 Vec::new()
             }
             (AnyEvent::WlKeyboard(wl_keyboard::Event::Key { key, state, .. }), _)
