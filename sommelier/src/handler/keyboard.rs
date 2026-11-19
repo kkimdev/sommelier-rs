@@ -1077,8 +1077,14 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
         let pressed_before = ctx
             .key_generations
             .physically_held(host_keyboard_id, key);
-        let peek_pressed_before =
-            pressed_before && ctx.key_generations.peek(host_keyboard_id, key).is_some();
+        // A peek the input method's own detach made stale (H2) describes a
+        // press whose release may have died with it, so a press peek of
+        // the key is its next press.
+        let peek_pressed_before = pressed_before
+            && ctx
+                .key_generations
+                .peek(host_keyboard_id, key)
+                .is_some_and(|peek| !peek.stale);
         match state {
             KEY_STATE_PRESSED | KEY_STATE_REPEATED
                 if state == KEY_STATE_PRESSED || pressed_before =>

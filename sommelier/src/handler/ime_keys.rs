@@ -462,17 +462,19 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
     if !is_latest_generation
         || !physically_held
         || !press.eligible
+        || press.stale
         || !repeatable
         || backspace_cancelled
     {
         log::debug!(
             "Ignoring empty IME confirmation for ineligible held key {} \
              (latest_generation={}, physically_held={}, generation_eligible={}, \
-             repeatable={}, backspace_cancelled={})",
+             stale={}, repeatable={}, backspace_cancelled={})",
             key,
             is_latest_generation,
             physically_held,
             press.eligible,
+            press.stale,
             repeatable,
             backspace_cancelled
         );
@@ -746,7 +748,8 @@ pub(crate) fn recover_pending(ctx: &mut Context) {
 /// callbacks never come, so a held key's release may never reach the
 /// keyboard, and the keys it took are no longer its to confirm. No key a
 /// keyboard of `guest_seat` holds now is recovered again; its next press
-/// starts a generation that can be.
+/// starts a generation that can be. This ends only the recovery: the keys
+/// are still guest input, so their keysyms reach the guest.
 pub(super) fn forget_held_keys_for_seat(ctx: &mut Context, guest_seat: u32) {
     let host_keyboards: Vec<_> = ctx
         .keyboard_to_seat
@@ -755,7 +758,7 @@ pub(super) fn forget_held_keys_for_seat(ctx: &mut Context, guest_seat: u32) {
         .filter_map(|(&guest, _)| ctx.shadow_table.get_host_id(guest).map(HostId))
         .collect();
     for keyboard in host_keyboards {
-        ctx.key_generations.invalidate_peeks(keyboard);
+        ctx.key_generations.mark_peeks_stale(keyboard);
     }
 }
 

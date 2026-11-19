@@ -25,10 +25,17 @@ pub struct PeekKeyProvenance {
     pub serial: u32,
     pub time: u32,
     pub sequence: u64,
-    /// The generation may recover an IME-consumed repeat. Host accelerators
-    /// and placement chords permanently clear this bit for the lifetime of
-    /// the generation.
+    /// The generation is guest input, which may recover an IME-consumed
+    /// repeat or reach the guest as a keysym. Host accelerators and
+    /// placement chords permanently clear this bit for the lifetime of the
+    /// generation.
     pub eligible: bool,
+    /// The input method detached on its own while the key was held (H2),
+    /// so the key's release may have died with it: the generation recovers
+    /// no IME-consumed repeat, and the key's next `peek_key` press starts a
+    /// new one. It concerns only that recovery; the key is still guest
+    /// input.
+    pub stale: bool,
 }
 
 /// Causal watermark for the newest physical generation in one seat/focus
@@ -621,6 +628,7 @@ impl KeyGenerationRegistry {
             time,
             sequence,
             eligible,
+            stale: false,
         });
         sequence
     }
@@ -654,12 +662,13 @@ impl KeyGenerationRegistry {
         }
     }
 
-    /// No key `keyboard` holds now may recover an IME-consumed repeat.
-    pub(crate) fn invalidate_peeks(&mut self, keyboard: HostId) {
+    /// No key `keyboard` holds now may recover an IME-consumed repeat
+    /// ([`PeekKeyProvenance::stale`]).
+    pub(crate) fn mark_peeks_stale(&mut self, keyboard: HostId) {
         let generations = self.entries.get_mut(&keyboard).into_iter().flatten();
         for (_, generation) in generations {
             if let Some(peek) = generation.peek.as_mut() {
-                peek.eligible = false;
+                peek.stale = true;
             }
         }
     }
@@ -2459,6 +2468,7 @@ mod tests {
                     time,
                     sequence,
                     eligible,
+                    stale: false,
                 });
             }
 

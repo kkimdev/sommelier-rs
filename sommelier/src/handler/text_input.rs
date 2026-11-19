@@ -4403,6 +4403,53 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.recovered(again));
     }
 
+    /// Exo's own detach (H2) ends only the recovery of the keys held
+    /// across it, which stay the guest's keys: the keysym of `1` reaches
+    /// the guest. Their releases died with the input method, so a
+    /// `peek_key` press of a key still held is its next press, which an
+    /// empty confirmation recovers.
+    #[tokio::test]
+    async fn a_key_held_across_a_detach_is_typed_and_recovered_again() {
+        const KEY_1: u32 = 2;
+        let mut f = Field::typing().await;
+        let one = Stroke {
+            key: KEY_1,
+            state: PRESSED,
+            serial: 700,
+            time: 1_234,
+        };
+        let space = Stroke {
+            key: SPACE,
+            serial: 701,
+            time: 1_240,
+            ..one
+        };
+        f.s.host([f.peek(one), f.peek(space), f.confirm(), v1::leave(f.host)])
+            .await;
+        let callback = barrier(&f.s.host_received());
+        let answer = wl_callback::evt::done(callback, 0);
+        f.s.host([answer, v1::enter(f.host, f.surface.host)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        let one_again = Stroke {
+            serial: 702,
+            time: 1_400,
+            ..one
+        };
+        f.s.host([f.peek(one_again), f.keysym(u32::from(b'1'), one_again)])
+            .await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(one_again)]);
+
+        let space_again = Stroke {
+            serial: 703,
+            time: 1_500,
+            ..space
+        };
+        f.s.host([f.peek(space_again), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
+        assert_eq!(f.s.guest_received(), f.recovered(space_again));
+    }
+
     /// A recovery that waits goes only to a text input that still passes
     /// the gate: once the guest disabled or destroyed it, or the key's
     /// keyboard, the host's next event recovers nothing.
