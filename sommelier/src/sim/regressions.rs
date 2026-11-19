@@ -90,6 +90,7 @@ fn action(action: UserAction) -> String {
         UserAction::RestartInputMethod => "UserAction::RestartInputMethod".to_owned(),
         UserAction::AcceptSuggestion => "UserAction::AcceptSuggestion".to_owned(),
         UserAction::Reconvert => "UserAction::Reconvert".to_owned(),
+        UserAction::Reopen(field) => format!("UserAction::Reopen({field})"),
         UserAction::Settle => "UserAction::Settle".to_owned(),
     }
 }

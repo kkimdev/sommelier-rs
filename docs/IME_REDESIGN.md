@@ -357,7 +357,7 @@ This is the contract.
 | G7 | `set_content_type(h, p)` | `Focused` | none | none | pending `content_type` | n/a | `on_set_content_type` |
 | G8 | `set_cursor_rectangle` | `Focused` | none | none | pending `cursor_rect` | n/a | `on_set_cursor_rectangle` |
 | G9a | `commit` | `Unfocused` | none | none | Count += 1. Nothing else. | n/a | INVARIANTS "Every v3 commit counts" |
-| G9b | `commit` whose pending surrounding text does not fit a v1 message | `Focused` | **none at all**: no activation step and no content type for this commit | If the field was already enabled: `Txn{preedit: shown}` (the answer) | Count += 1. **The pending state is consumed and nothing else changes**: the committed state, the link and the composition stay. *The old code keeps the pending state instead, so every later commit retries the same text and fails again. #82 consumes it, and the old code is fixed to match before C3-pre (5.1).* | *(this row is the failure case)*. If the answer's repeated preedit does not fit either, the shown preedit is forgotten and a bare `done(count)` goes out. | `on_commit` (the `queue_or_drop` early return); `answer_guest_commit`; tests `oversized_surrounding_commit_does_not_partially_advance_state` and `an_answer_that_cannot_repeat_the_preedit_forgets_it` |
+| G9b | `commit` whose pending surrounding text does not fit a v1 message | `Focused` | **none at all**: no activation step and no content type for this commit | If the field was already enabled: `Txn{preedit: shown}` (the answer) | Count += 1. **The pending state is consumed and nothing else changes**: the committed state, the link and the composition stay. *The old code kept the pending state, so every later commit retried the same text and failed again; it is fixed to match #82 (5.1).* | *(this row is the failure case)*. If the answer's repeated preedit does not fit either, the shown preedit is forgotten and a bare `done(count)` goes out. | `on_commit` (the `queue_or_drop` early return); `answer_guest_commit`; tests `oversized_surrounding_commit_does_not_partially_advance_state`, `the_commit_after_an_oversized_one_does_not_retry_it` and `an_answer_that_cannot_repeat_the_preedit_forgets_it` |
 | G9c | `commit` | `Focused` | The reconcile, with this commit's `set_surrounding_text` and `set_cursor_rectangle`, then `commit_state(count)` | If the field is enabled after the commit: `Txn{preedit: shown}` | See the four steps below this table. | If the repeated preedit does not fit, the shown preedit is forgotten and a bare `done` goes out (as in G9b). | INVARIANTS "One text input on a connection is enabled at a time", "Every commit that leaves a field enabled gets a done" and "The host gets each content type…"; mutter (`text_input_commit_state` in `meta-wayland-text-input.c`) and KWin (`textinput_v3.cpp`, "Gtk … expect done to be sent after every commit") [F] |
 | G10 | `zwp_text_input_v3.destroy` | any | The reconcile to inactive: `deactivate` and a barrier while attached with a live seat; otherwise nothing. Then the extension's `destroy`, and the extension is retired. Nothing goes to a v1 object the host deleted. | `delete_id`, from the generated path | The text input is removed, **with its `enabled` flag** (B7, C-1). The lease ends. A later completion of its barrier or fence is ignored. | n/a | INVARIANTS Object lifetimes; `forget_text_input`; `TextInputState::begin_destroy` |
 
@@ -1162,7 +1162,7 @@ describe the result.
 | `Effects::forward` is true only for a press that ended no composition. | The core consumes every other input's message. | 3.2 |
 | An R2 deferral is logged when it starts or changes. | Not at every step that finds it waiting. | 2.3 R2 |
 | `ime` shares `HostContentType`, `V3Committed` and `V3Pending` with `state`. It keeps a copy of `resolve_preedit_cursor` until #80 merges. | C1 moves only stateless helpers (M-1), and #80 edits the old copy. | 3.0, 5.1 |
-| **G9b**: the core consumes an oversized commit's pending state, as the table says. The old code keeps it. | The old code's retry loop is a bug. It is fixed on the old code before C3-pre, so the goldens agree. | G9b, 5.1 |
+| **G9b**: the core consumes an oversized commit's pending state, as the table says. The old code kept it. | The old code's retry loop was a bug. The old code is now fixed to match, so the goldens agree. | G9b, 5.1 |
 | **Reconcile timing**: a dead seat is noticed at the next input to any text input of the connection. | This follows from reconciling every text input at the end of every step. No DST case releases a seat. | 2.3, after R2 |
 | **The assembly**: every terminal event takes it, and `cursor_position` is only logged. | The old code differs only where no client can tell. | H6, H9 |
 | **X1 over a shown preedit** is not measured in Exo's text, and a reset commit keeps `taken`. | The fixes landed on the old code after the core matched #85. | X1, 5.1 |
@@ -1245,6 +1245,7 @@ sommelier/src/sim/            #[cfg(test)]
   user.rs        The user action generator, free and settled modes     ~150
   display.rs     The display D4 plays: syncs, delete_id and globals    ~100
   oracle.rs      The exact oracle (SpecText) and the user-intent oracle  ~300
+  surfaces.rs    Each field's surfaces, a generation each (F2)         ~170
   golden.rs      Golden trace hashes for the staged switch (C3-pre to C3c)  ~80
   shrink.rs      Minimizing a failing case                             ~150
   regressions.rs Replays: minimized cases and from_log                 grows
@@ -1599,8 +1600,9 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
   after the start, to delete.
 - **Mix.** About 59% keys (jamo for syllable patterns, plus Space and
   Backspace), 2% accepted suggestions, 2% reconversions (4.4), 15%
-  clicks, 8% taps, 7% focus changes, 2% restarts of the input method and
-  5% `Settle`. A case has 10 to 60 actions and two fields.
+  clicks, 8% taps, 7% focus changes, 2% restarts of the input method,
+  2% windows that open again (free cases only, below) and the rest
+  `Settle`. A case has 10 to 60 actions and two fields.
 - **Restarts.** `UserAction::RestartInputMethod` destroys Exo's input
   method (`Exo::destroy_input_method`), which confirms and detaches on
   its own (E2, E6); its confirmation resets the engine only if a text
@@ -1618,7 +1620,30 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
   first, so the proxy has already deactivated when Exo's `leave` comes
   (H2'). A surface the guest destroys (F2) cannot reach H2 either: the
   proxy resets the field and deactivates in the step that forwards the
-  destroy, before Exo learns of it. The DST does not generate F2.
+  destroy, before Exo learns of it.
+- **Windows that open again (F2).** `UserAction::Reopen` closes a
+  field's window and opens it again on a new surface, with the same
+  text, as a client recreates a window. The client model blurs if the
+  field had the focus, forgets what it reported, and moves the field to
+  the new surface (`Client::reopen`); it destroys the old surface and
+  creates the new one. Exo drops the destroyed surface's focus with no
+  keyboard `leave` and deactivates its text inputs; the pointer leaves
+  it. If the field had the seat's focus, the new surface takes it at
+  its first commit, as a window manager focuses a new window once
+  mapped: the display has no shell roles or buffers, so that commit
+  stands for the map. Input that Exo sent to the old surface before it
+  learned of the destroy reaches the proxy, which drops what names that
+  surface; a press whose pointer is on it lands nowhere. What the proxy
+  sent before it got the destroy reaches the client after it and goes
+  nowhere, as libwayland hands the client a null surface; after the
+  proxy's `delete_id`, an event that names the surface fails the case,
+  as does one the proxy sends after it got the destroy. A `Settle` follows each reopen. One map,
+  `sim::surfaces::Surfaces`, holds every field's guest and host
+  surfaces, a generation each, and the host surfaces the guest
+  destroyed until the proxy reuses their IDs; the display, the world,
+  `SpecText` and the shadow share it. Reopens run in free cases only:
+  the reference has no window to close, and the focus the new window
+  takes is the window manager's, not the user's.
 
 There are two generator modes:
 
@@ -1669,7 +1694,16 @@ Each mode gets half of the cases.
   - forwarded `wl_keyboard.key`, through `insert_key` (raw keys
     included);
   - F1 and F2 on focus changes, as the specification says today. C5
-    changes the reference with the proxy.
+    changes the reference with the proxy. At F2, `SpecText` sees the
+    guest's `wl_surface.destroy`: a text input focused on that surface
+    must leave it in the same step, while it is valid, and the field
+    detaches, since the seat's focus projected again is no surface. It
+    then skips the keyboard `enter` and `leave`, the pointer `enter` and
+    the touch `down` that name a destroyed host surface, which the proxy
+    drops; a press with no pointer surface lands nowhere. A repair that
+    stays on the same surface cannot happen at F2: the focus registry
+    retires every keyboard on the destroyed surface before the repair
+    reads the seat's focus.
 - **Shadow.** `oracle::Shadow` is an ideal `TextModel` per field fed the
   proxy's **actual** `P→C` output: transactions at `done`, keys and
   presses. It has no client drops.
@@ -1694,6 +1728,7 @@ Each mode gets half of the cases.
   - autorepeats the engine got; empty confirmations that recovered a held
     key, skipped its pair as `wl_keyboard.key` had delivered it, or found
     no eligible key (X2'); Backspace leases armed, and ended;
+  - surfaces the guest destroyed, and those that had the focus (F2);
   - client drops, by reason;
   - one counter per draw.
 
@@ -1971,7 +2006,7 @@ land before C3-pre blesses the goldens. The core must match each one.
 | Keys held at an enter are numbered in the host's order. | #75 (6cfb121) | merged | KeyEffect handling, unchanged |
 | No event that changes nothing: no empty preedit over none, no `delete(0, 0)`, no `commit_string("")`. An empty preedit is `(0, 0)`. A shown preedit is cleared before a region's delete. An empty region or commit is not an edit. | #80 | in review | matches (#82) |
 | A region over a region deletes only what the guest has. | `kkimdev/ime-region-over-region`, stacked on #80 | ready, no PR number yet | #82 follow-up |
-| G9b: an oversized surrounding text consumes the pending state, instead of being retried by every later commit. Updates `oversized_surrounding_commit_does_not_partially_advance_state`. | to do | after region-over-region | matches (#82) |
+| G9b: an oversized surrounding text consumes the pending state, instead of being retried by every later commit. Updates `oversized_surrounding_commit_does_not_partially_advance_state`. | `kkimdev/old-g9b` | ready, no PR number yet | matches (#82) |
 | The empty confirm's eligible key is chosen by peek order (X2'). | to do, in K1 or before it | — | KeyEffect handling |
 
 The other PRs merged since revision 2 do not touch the IME: #77 (small

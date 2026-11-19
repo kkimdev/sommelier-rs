@@ -893,11 +893,15 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
 - **Every v3 commit counts.** A text-input-v3 `done` serial is the number
   of `commit` requests the guest made on the object, including commits made
   while unfocused or whose state could not be encoded; those are still not
-  forwarded to the host. The count is a private field of
+  forwarded to the host. A commit whose surrounding text does not fit a
+  v1 message consumes its pending state and changes nothing else, so no
+  later commit retries that text. The count is a private field of
   `TextInputState`, so only code in `state/input.rs` can change it, and
   outside tests it does so only in `TextInputState::count_guest_commit`.
   Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
-  `v3_requests_after_leave_are_ignored_until_next_enter`.
+  `v3_requests_after_leave_are_ignored_until_next_enter`,
+  `oversized_surrounding_commit_does_not_partially_advance_state`,
+  `the_commit_after_an_oversized_one_does_not_retry_it`.
 - **A v3 transaction's events go in one order.** Every transaction the
   proxy sends a guest text input puts its events in this order, each one
   it has:

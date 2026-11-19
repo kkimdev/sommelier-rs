@@ -28,11 +28,12 @@ limitations under the License.
 //! the default keymap, as Exo does before anything else, so that the proxy
 //! knows which keys repeat.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use super::editor::Target;
 use super::exo::Exo;
 use super::keymap;
+use super::surfaces::Surfaces;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
 use crate::protocols::text_input_extension_unstable_v1::{
     zcr_extended_text_input_v1, zcr_text_input_extension_v1,
@@ -55,8 +56,13 @@ pub(super) struct Display {
     globals: Vec<(&'static str, u32)>,
     /// The interface of each host object, by ID, to decode what it sends.
     objects: BTreeMap<u32, String>,
-    /// The host surfaces, in the order the proxy created them.
-    surfaces: Vec<u32>,
+    /// Which field each surface is, shared with the world.
+    surfaces: Surfaces,
+    /// The fields whose windows open again, in order, each with whether
+    /// it had the seat's focus, which the new surface then takes (F2).
+    reopening: VecDeque<(usize, bool)>,
+    /// The new surfaces that take the seat's focus once mapped.
+    mapping: Vec<u32>,
     /// The surface the pointer is on.
     pointer_on: Option<u32>,
     /// The last serial an input event of the pointer or touch took. Exo
@@ -65,8 +71,9 @@ pub(super) struct Display {
 }
 
 impl Display {
-    /// A display whose text-input extension is at `extension`, or absent.
-    pub fn new(extension: Option<u32>) -> Self {
+    /// A display whose text-input extension is at `extension`, or absent,
+    /// and whose surfaces `surfaces` names.
+    pub fn new(extension: Option<u32>, surfaces: Surfaces) -> Self {
         let mut globals = vec![
             (wl_compositor::NAME, wl_compositor::VERSION),
             (wl_seat::NAME, wl_seat::VERSION),
@@ -83,15 +90,23 @@ impl Display {
         Self {
             globals,
             objects: BTreeMap::from([(WL_DISPLAY_ID, wl_display::NAME.to_owned())]),
-            surfaces: Vec::new(),
+            surfaces,
+            reopening: VecDeque::new(),
+            mapping: Vec::new(),
             pointer_on: None,
             serial: 1 << 20,
         }
     }
 
-    /// The host surfaces, in the order the proxy created them.
-    pub fn surfaces(&self) -> &[u32] {
-        &self.surfaces
+    /// The window of `field` opens again (F2): the next surface the proxy
+    /// creates is its; if it had the seat's focus, `refocus`, the new one
+    /// takes it once mapped, as a window manager gives it to a new window.
+    ///
+    /// Exo maps a window at the commit that gives a surface with a shell
+    /// role its first buffer; the display has neither roles nor buffers, so
+    /// the new surface's first commit stands for that one.
+    pub fn reopen(&mut self, field: usize, refocus: bool) {
+        self.reopening.push_back((field, refocus));
     }
 
     /// The proxy sends `request` from host object `sender`: `exo` applies
@@ -101,6 +116,34 @@ impl Display {
             self.objects.insert(id, interface.to_owned());
         }
         exo.request(sender, request);
+        match *request {
+            // A destroyed surface loses the seat's and the pointer's
+            // focus, with no leave; Exo deactivates its text inputs.
+            AnyRequest::WlSurface(wl_surface::Request::Destroy {}) => {
+                exo.forget(|id| id != sender);
+                if self.pointer_on == Some(sender) {
+                    self.pointer_on = None;
+                }
+            }
+            AnyRequest::WlCompositor(wl_compositor::Request::CreateSurface { id }) => {
+                match self.reopening.pop_front() {
+                    Some((field, refocus)) => {
+                        self.surfaces.add_host(Some(field), id);
+                        if refocus {
+                            self.mapping.push(id);
+                        }
+                    }
+                    None => self.surfaces.add_host(None, id),
+                }
+            }
+            AnyRequest::WlSurface(wl_surface::Request::Commit {}) => {
+                if let Some(i) = self.mapping.iter().position(|&id| id == sender) {
+                    self.mapping.remove(i);
+                    exo.move_focus(Some(sender));
+                }
+            }
+            _ => {}
+        }
         let mut events = exo.take_events();
         if let AnyRequest::WlSeat(wl_seat::Request::GetKeyboard { id }) = *request {
             events.insert(0, keymap(id));
@@ -115,9 +158,6 @@ impl Display {
                     let global = wl_registry::evt::global(registry, name, interface, version);
                     events.push(global.expect("a global fits a message"));
                 }
-            }
-            AnyRequest::WlCompositor(wl_compositor::Request::CreateSurface { id }) => {
-                self.surfaces.push(id);
             }
             _ if destructor(request) => events.push(self.delete(sender)),
             _ => {}
@@ -246,7 +286,7 @@ mod tests {
 
     #[test]
     fn a_sync_and_a_destructor_get_their_answers() {
-        let mut display = Display::new(None);
+        let mut display = Display::new(None, Surfaces::new(&[30], &[]));
         let surface = AnyRequest::from(wl_compositor::Request::CreateSurface { id: 7 });
         let requests = [
             (1, wl_display::Request::GetRegistry { registry: 2 }.into()),
@@ -281,12 +321,59 @@ mod tests {
             delete_id(8),
         ];
         assert_eq!(answers(&mut display, &requests), expected);
-        assert_eq!(display.surfaces(), [7]);
+        assert_eq!(display.surfaces.host(0), Some(7));
+    }
+
+    #[test]
+    fn a_window_opens_again_on_a_new_surface_that_takes_its_focus() {
+        let surfaces = Surfaces::new(&[30, 31], &[]);
+        let mut display = Display::new(None, surfaces.clone());
+        let mut exo = Exo::default();
+        // The seat's focus after `request` from `sender`.
+        let request = |display: &mut Display, exo: &mut Exo, sender, request: AnyRequest| {
+            display.request(sender, &request, exo);
+            exo.focus()
+        };
+        let create = |id| wl_compositor::Request::CreateSurface { id }.into();
+        let destroy = || wl_surface::Request::Destroy {}.into();
+        let commit = || wl_surface::Request::Commit {}.into();
+        request(
+            &mut display,
+            &mut exo,
+            4,
+            wl_seat::Request::GetPointer { id: 5 }.into(),
+        );
+        request(&mut display, &mut exo, 3, create(7));
+        request(&mut display, &mut exo, 3, create(8));
+        assert_eq!((surfaces.host(0), surfaces.host(1)), (Some(7), Some(8)));
+        exo.set_text_input_focus(Some(7));
+        display.click(7, Target::Start, 9);
+        // F2: the focused window closes and opens again; its new surface
+        // takes the focus once mapped.
+        display.reopen(0, true);
+        assert_eq!(request(&mut display, &mut exo, 7, destroy()), None);
+        assert_eq!(request(&mut display, &mut exo, 3, create(9)), None);
+        assert_eq!(request(&mut display, &mut exo, 9, commit()), Some(9));
+        assert_eq!(surfaces.host(0), Some(9));
+        assert_eq!(surfaces.field_of_host(7), Some(0));
+        // The pointer left the destroyed surface, so a click enters anew.
+        let click = display.click(9, Target::Start, 9);
+        let (_, first) = display.decode(&click[0]);
+        assert!(matches!(
+            first,
+            AnyEvent::WlPointer(wl_pointer::Event::Enter { surface: 9, .. })
+        ));
+        // An unfocused one leaves the focus where it is.
+        display.reopen(1, false);
+        assert_eq!(request(&mut display, &mut exo, 8, destroy()), Some(9));
+        assert_eq!(request(&mut display, &mut exo, 3, create(10)), Some(9));
+        assert_eq!(request(&mut display, &mut exo, 10, commit()), Some(9));
+        assert_eq!(surfaces.host(1), Some(10));
     }
 
     #[test]
     fn a_sync_follows_the_events_of_earlier_requests() {
-        let mut display = Display::new(Some(11));
+        let mut display = Display::new(Some(11), Surfaces::new(&[30], &[]));
         let mut exo = Exo::default();
         // A keyboard of a seat whose focus is on surface 7: it gets the
         // keymap first, Exo enters it at once, and the sync that follows
@@ -308,7 +395,7 @@ mod tests {
 
     #[test]
     fn a_press_names_its_target_by_where_it_lands() {
-        let mut display = Display::new(None);
+        let mut display = Display::new(None, Surfaces::new(&[30], &[]));
         let pointer = wl_seat::Request::GetPointer { id: 5 };
         let touch = wl_seat::Request::GetTouch { id: 6 };
         answers(&mut display, &[(4, pointer.into()), (4, touch.into())]);

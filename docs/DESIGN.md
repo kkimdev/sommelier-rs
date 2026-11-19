@@ -375,7 +375,8 @@ becomes an unused variable, which CI rejects. There is no generic
 - `V3Pending` (`input.rs`) follows it for a text-input-v3 object's
   enable, surrounding text, content type and cursor rectangle, which
   `TextInputState::commit` applies to `V3Committed`, except the cursor
-  rectangle, which only the host keeps and the commit forwards.
+  rectangle, which only the host keeps and the commit forwards. A commit
+  whose surrounding text does not fit a v1 message resets it unapplied.
 - `OutputRecord` (`outputs.rs`) is a deliberate exception: an output event
   edits a copy-on-write `Option<OutputState>` of the whole state, which
   `wl_output.done` publishes.
