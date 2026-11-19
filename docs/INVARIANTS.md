@@ -67,9 +67,10 @@ always consumed; a configuration problem never stops the proxy) is owned by
   ioctls add latency and regress input throughput. Introduce
   message-granular sends only for a transport constraint that a regression
   test or device contract demonstrates.
-- **A submission carries at most 28 descriptors.** That is the VirtWL
-  transaction limit (`VIRTWL_SEND_MAX_ALLOCS`) and libwayland's
-  `MAX_FDS_OUT`, and `MAX_FDS_PER_SEND` applies it to both transports.
+- **A submission carries at most 28 descriptors and ends at a message
+  boundary.** 28 is the VirtWL transaction limit
+  (`VIRTWL_SEND_MAX_ALLOCS`) and libwayland's `MAX_FDS_OUT`, and
+  `MAX_FDS_PER_SEND` applies it to both transports.
   `WaylandConnection::send_messages` is the only way to send, and splits a
   batch only between messages, so each message's descriptors travel with
   its bytes and the receiver never meets a message whose descriptors have
@@ -77,8 +78,16 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `send_messages` refuses one that carries more, in every build, and the
   session ends without an error, like a failed send (see the transport
   exception under [Wire messages](#wire-messages)).
+  A submission also holds at most `MAX_BYTES_PER_SEND` bytes, a VirtWL
+  transaction's payload (3,980), unless it is one longer message.
+  `VirtWaylandChannel::send` cuts a longer submission by bytes, and Exo's
+  libwayland reads at most 4 KiB per dispatch, so a cut inside a message
+  could let Exo dispatch its two parts in different reads, with other
+  work between them. A message longer than the bound goes alone, and only
+  such a message is cut.
   Tests: `batches_send_at_most_the_transport_descriptor_limit_at_once`,
   `send_messages_splits_only_between_messages`,
+  `send_messages_ends_submissions_at_message_boundaries_within_the_byte_limit`,
   `a_message_with_more_descriptors_than_a_submission_is_not_sent`.
 - **VirtWL ioctl errors still own their descriptors.** Every descriptor
   returned in a transaction buffer belongs to the proxy, even when the
