@@ -168,6 +168,41 @@ that passes prints only its summary. The seed fixes the case's
 input, not its timing (how the pieces arrive, which side the proxy serves
 first), so replay a failing seed a few times before concluding it passes.
 
+## Simulation test
+
+`sim` is a deterministic simulation test (DST) of the IME bridge. It
+types into models of Chromium's and GTK's text-input-v3 clients through
+a whole proxy client (`proxy::harness::Session`), with a model of Exo
+and its Korean input method behind it. Every message travels a FIFO
+channel with a drawn latency on one virtual clock, so a seed fixes the
+whole case, timing included; `docs/IME_REDESIGN.md` section 4 describes
+it. `ime_reaches_the_specified_text` holds the proxy to the
+specification, whatever the timing: the text, keys, preedit and its
+cursor that the guest gets, and the activations and resets the proxy
+asks of the host. `ime_reaches_the_intended_text` also holds the client
+to the user's intent, in cases that settle around every click, tap and
+focus move, and after every key the input method passes. A failure that
+a known issue explains exactly, such as focus loss while composing, is
+counted, not failed, and the summary lists its seeds. Each test runs in
+a process of its own, with the XKB defaults pinned.
+
+The suite runs 600 seeds from seed 0, an even seed free and an odd one
+settled, in about 5 s; two cases in 50 run twice and must leave the same
+trace, and a run fails if it never met a variant a case draws. Run more
+after changing the IME code or a model:
+
+```bash
+SOMMELIER_DST_CASES=100000 SOMMELIER_DST_SEED=1000000 \
+  cargo test -p sommelier --bins sim::
+```
+
+A failure prints its seed, each failed check with its tier and field, the
+end of the trace (`SOMMELIER_DST_TRACE_LINES` sets how much) and the
+case's choices. Rerun it with `SOMMELIER_DST_SEED=<seed>
+SOMMELIER_DST_CASES=1`, which replays it exactly;
+`SOMMELIER_DST_CLIENT=chromium|gtk3|gtk4` and
+`SOMMELIER_DST_MODE=free|settled` narrow a run.
+
 ## End-to-end test
 
 `sommelier/tests/weston_e2e.rs` runs real clients through

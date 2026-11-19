@@ -26,7 +26,7 @@ limitations under the License.
 
 use std::ops::Range;
 
-use super::hangul::{Composer, Key};
+use super::hangul::{Composer, Key, Output};
 
 /// A text field's content. Offsets are UTF-8 byte offsets into `text`, as
 /// `zwp_text_input_v3` counts them.
@@ -66,6 +66,18 @@ pub(super) enum Target {
     /// has none. A generator must not type digits, so that each marker
     /// stays one place.
     BeforeMarker(u8),
+}
+
+/// How keys reach a field, which varies by input method and client.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Typing {
+    /// The input method is a Latin layout: it composes nothing, and every
+    /// key reaches the field.
+    pub latin: bool,
+    /// A Backspace that reaches the field deletes as GTK's does
+    /// ([`TextModel::backspace_to_nfd_prefix`]) rather than a whole
+    /// character.
+    pub nfd_backspace: bool,
 }
 
 /// What the user does.
@@ -145,6 +157,38 @@ impl TextModel {
         }
     }
 
+    /// Applies a Backspace as GTK's entries do (C14): it deletes the
+    /// grapheme cluster before the cursor and, where Pango sets
+    /// `backspace_deletes_character` (on every boundary except after a
+    /// Latin, Cyrillic or Greek base character), re-inserts all but the
+    /// last character of its NFD decomposition (`gtk_entry_backspace` in
+    /// GTK3's `gtkentry.c`, `gtk_text_backspace` in GTK4's `gtktext.c`). So
+    /// 가 becomes the conjoining jamo ᄀ, and 각 the conjoining 가 (ᄀ and
+    /// ᅡ). The preedit stays.
+    ///
+    /// Only Hangul is modelled. A precomposed syllable decomposes
+    /// algorithmically. A cluster of conjoining jamo is its own
+    /// decomposition, so it loses its last jamo, as deleting that character
+    /// alone does. Any other character is deleted whole, as the simulation
+    /// types no other script that decomposes.
+    ///
+    /// # Panics
+    ///
+    /// If nothing is before the cursor.
+    pub fn backspace_to_nfd_prefix(&mut self) {
+        let last = self.text[..self.cursor]
+            .chars()
+            .next_back()
+            .expect("a character before the cursor");
+        let decomposed = decompose_hangul(last);
+        let kept: String = decomposed[..decomposed.len() - 1].iter().collect();
+        self.apply_txn(&Txn {
+            delete: (last.len_utf8(), 0),
+            commit: kept,
+            preedit: self.preedit.clone(),
+        });
+    }
+
     /// Moves the cursor to `target`. The preedit moves with the cursor.
     pub fn click(&mut self, target: Target) {
         let at = match target {
@@ -180,6 +224,21 @@ impl TextModel {
     }
 }
 
+/// The NFD decomposition of `c` if it is a precomposed Hangul syllable:
+/// its leading consonant, vowel and any trailing consonant as conjoining
+/// jamo; otherwise `c` alone.
+fn decompose_hangul(c: char) -> Vec<char> {
+    let Some(index) = u32::from(c).checked_sub(0xAC00).filter(|&i| i < 11_172) else {
+        return vec![c];
+    };
+    let jamo = |code: u32| char::from_u32(code).expect("a conjoining jamo");
+    let mut out = vec![jamo(0x1100 + index / 588), jamo(0x1161 + index % 588 / 28)];
+    if index % 28 != 0 {
+        out.push(jamo(0x11A7 + index % 28));
+    }
+    out
+}
+
 /// The reference editor: what a correct system shows after the user's
 /// actions, typed through an ideal input method that handles each key at
 /// once.
@@ -194,7 +253,9 @@ impl TextModel {
 ///   leaves, as Exo's confirm on detach intends. A focus move to the
 ///   focused field changes nothing.
 ///
-/// Field 0 has the focus at the start.
+/// Field 0 has the focus at the start. [`Typing`] says how keys reach a
+/// field; by default the input method composes Korean and a Backspace
+/// deletes a whole character.
 ///
 /// This is the user's intent only for actions the system can follow in
 /// order: each `Click` and `Tap` must have a `Settle` before and after it,
@@ -210,6 +271,7 @@ pub(super) struct Reference {
     focus: usize,
     /// The input method's composition, which is in the focused field.
     composer: Composer,
+    typing: Typing,
 }
 
 impl Reference {
@@ -220,22 +282,37 @@ impl Reference {
             fields,
             focus: 0,
             composer: Composer::default(),
+            typing: Typing::default(),
         }
+    }
+
+    /// The editor, typing as `typing` says.
+    pub fn typing(self, typing: Typing) -> Self {
+        Self { typing, ..self }
     }
 
     /// Applies one user action.
     pub fn apply(&mut self, action: UserAction) {
         match action {
             UserAction::Key(key) => {
-                let out = self.composer.key(key);
+                let out = match self.typing.latin {
+                    true => Output::default(),
+                    false => self.composer.key(key),
+                };
                 let field = &mut self.fields[self.focus];
                 field.apply_txn(&Txn {
                     commit: out.commit,
                     preedit: out.preedit,
                     ..Txn::default()
                 });
-                if !out.consumed {
-                    field.insert_key(key);
+                match key {
+                    _ if out.consumed => {}
+                    Key::Backspace if self.typing.nfd_backspace => {
+                        if field.cursor > 0 {
+                            field.backspace_to_nfd_prefix();
+                        }
+                    }
+                    _ => field.insert_key(key),
                 }
             }
             UserAction::Click { field, at } | UserAction::Tap { field, at } => {
@@ -249,6 +326,37 @@ impl Reference {
             }
             UserAction::Focus(_) | UserAction::Settle => {}
         }
+    }
+
+    /// Whether `action` moves the focus away from the focused field while
+    /// it composes.
+    pub fn leaves_composition(&self, action: UserAction) -> bool {
+        let field = match action {
+            UserAction::Click { field, .. } | UserAction::Tap { field, .. } => field,
+            UserAction::Focus(field) => field,
+            UserAction::Key(_) | UserAction::Settle => return false,
+        };
+        field != self.focus && !self.composer.preedit().is_empty()
+    }
+
+    /// Applies `action` as [`Reference::apply`] does, except that a move of
+    /// the focus away from a composing field loses the composition rather
+    /// than committing it, as the proxy's known issue P1 does.
+    pub fn apply_losing_composition(&mut self, action: UserAction) {
+        if self.leaves_composition(action) {
+            self.composer.reset();
+            self.fields[self.focus].preedit.clear();
+        }
+        self.apply(action);
+    }
+
+    /// Whether the input method's engine would pass `key` to the field
+    /// rather than consume it; a Latin layout has no engine. The ChromeOS
+    /// Korean engine takes a Space that ends a composition, with it (E15).
+    pub fn engine_passes(&self, key: Key) -> bool {
+        let out = self.composer.clone().key(key);
+        let ends_with_space = key == Key::Char(' ') && !out.commit.is_empty();
+        !self.typing.latin && !out.consumed && !ends_with_space
     }
 
     /// The fields' models.
@@ -493,6 +601,60 @@ mod tests {
         let editor = reference(&["0", "1"], &actions);
         assert_eq!(editor.fields(), [model("0가", 4, ""), model("1", 1, "나")]);
         assert_eq!(editor.focus(), 1);
+    }
+
+    #[test]
+    fn a_focus_move_may_lose_the_composition_instead() {
+        let mut editor = reference(&["0", "1"], &typing("rk"));
+        let tap = UserAction::Tap {
+            field: 0,
+            at: Target::Start,
+        };
+        assert!(!editor.leaves_composition(tap), "a tap in the same field");
+        assert!(editor.leaves_composition(UserAction::Focus(1)));
+        editor.apply_losing_composition(UserAction::Focus(1));
+        assert_eq!(editor.fields(), [model("0", 1, ""), model("1", 1, "")]);
+        // The next syllable starts afresh.
+        for action in typing("sk") {
+            editor.apply_losing_composition(action);
+        }
+        assert_eq!(editor.fields()[1], model("1", 1, "나"));
+        assert!(!editor.leaves_composition(UserAction::Focus(1)));
+    }
+
+    #[test]
+    fn a_latin_layout_types_every_key_into_the_field() {
+        let latin = Typing {
+            latin: true,
+            ..Typing::default()
+        };
+        let mut editor = Reference::new(vec![TextModel::new("0")]).typing(latin);
+        for action in typing("rk Rk⌫") {
+            editor.apply(action);
+        }
+        assert_eq!(editor.fields(), [model("0rk R", 5, "")]);
+    }
+
+    #[test]
+    fn an_nfd_backspace_leaves_the_start_of_a_hangul_syllable() {
+        let gtk = Typing {
+            nfd_backspace: true,
+            ..Typing::default()
+        };
+        let mut editor = Reference::new(vec![TextModel::new("a각")]).typing(gtk);
+        // The composer takes back the jamo it composes; a Backspace with
+        // nothing composed reaches the field and leaves 각's NFD prefix.
+        for action in typing("rk⌫⌫⌫") {
+            editor.apply(action);
+        }
+        assert_eq!(editor.fields(), [model("a\u{1100}\u{1161}", 7, "")]);
+        // At the start of the text, a Backspace deletes nothing.
+        let mut field = model("가", 3, "ㄴ");
+        field.backspace_to_nfd_prefix();
+        assert_eq!(field, model("\u{1100}", 3, "ㄴ"));
+        let mut editor = Reference::new(vec![TextModel::new("")]).typing(gtk);
+        editor.apply(UserAction::Key(Key::Backspace));
+        assert_eq!(editor.fields(), [model("", 0, "")]);
     }
 
     #[test]

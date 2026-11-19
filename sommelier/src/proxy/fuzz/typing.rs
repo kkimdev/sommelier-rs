@@ -20,10 +20,10 @@ limitations under the License.
 //! fields, so the text-input focus and host activation paths, and the drain
 //! barrier that can defer an activation, are reached this way instead.
 
-use super::{exo, request, Guest, Message};
-use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
+use super::{request, Guest, Message};
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{wl_compositor, wl_seat, wl_surface};
+use crate::sim::oracle::V3Field;
 use crate::wire::{MessageBuilder, WireMessage};
 
 impl Guest<'_> {
@@ -288,51 +288,6 @@ impl Plan {
             } else {
                 Host::Inactive
             };
-        }
-    }
-}
-
-/// A text-input-v3 field as the guest committed it.
-#[derive(Clone, Default)]
-pub(super) struct V3Field {
-    /// `(hint, purpose)`.
-    content_type: (u32, u32),
-    surrounding_text: Option<(String, u32, u32)>,
-    cursor_rectangle: Option<(i32, i32, i32, i32)>,
-}
-
-impl V3Field {
-    /// What Exo should hold for this field once the proxy has sent it to
-    /// a host whose `zcr_extended_text_input_v1` has `extension_version`:
-    /// the proxy's own mapping of the content type, through the extension
-    /// from v2 on and through v1 `set_content_type` before; inline
-    /// composition, which every v3 client supports; surrounding text,
-    /// supported when the field has it or when the extension cannot say
-    /// otherwise (before v9); and the cursor rectangle, empty when it has
-    /// none.
-    pub(super) fn on_host(&self, extension_version: u32) -> exo::Field {
-        use zcr_extended_text_input_v1 as extended;
-        let (hint, purpose) = self.content_type;
-        let (v1_hint, v1_purpose, input_type, input_mode, flags, learning_mode) =
-            crate::ime::map_v3_content_type(hint, purpose);
-        let content_type = if extension_version >= extended::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE {
-            exo::ContentType {
-                input_type,
-                input_mode,
-                flags,
-                learning: learning_mode == extended::LEARNING_MODE_ENABLED,
-                inline_composition: true,
-            }
-        } else {
-            exo::v1_content_type(v1_hint, v1_purpose)
-        };
-        exo::Field {
-            attached: true,
-            content_type,
-            surrounding_text_supported: self.surrounding_text.is_some()
-                || extension_version < extended::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
-            surrounding_text: self.surrounding_text.clone().unwrap_or_default(),
-            cursor_rectangle: self.cursor_rectangle.unwrap_or_default(),
         }
     }
 }

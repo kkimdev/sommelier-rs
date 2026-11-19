@@ -888,7 +888,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   delayed host keyboard leave cannot be relied on, since it may be rejected
   as stale once the surface mapping is gone. Teardown is explicit and
   idempotent: the later delayed leave does not duplicate the event.
-  Test: `wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave`.
+  Tests: `wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave`,
+  `ime_reaches_the_specified_text`.
 - **Every v3 commit counts.** A text-input-v3 `done` serial is the number
   of `commit` requests the guest made on the object, including commits made
   while unfocused or whose state could not be encoded; those are still not
@@ -1092,7 +1093,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_client_that_waits_for_done_reports_the_text_an_edit_leaves`,
   `on_set_preedit_region_translates_correctly`,
   `second_text_input_enable_on_the_connection_is_ignored`,
-  `oversized_surrounding_commit_does_not_partially_advance_state`.
+  `oversized_surrounding_commit_does_not_partially_advance_state`,
+  `ime_reaches_the_specified_text`, `ime_reaches_the_intended_text`.
 - **A press ends the composition on its surface.** When a host
   `wl_pointer.button` press comes from a pointer whose `enter` named the
   surface an active text input is focused on, or a host `wl_touch.down`
@@ -1220,7 +1222,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_touch_down_on_the_composing_surface_commits_the_preedit`,
   `a_touch_down_elsewhere_or_without_a_composition_changes_nothing`,
   `a_touch_down_during_a_reset_fence_sends_no_second_reset`,
-  `a_touch_down_keeps_its_place_in_its_batch`.
+  `a_touch_down_keeps_its_place_in_its_batch`,
+  `ime_reaches_the_specified_text`, `ime_reaches_the_intended_text`.
 
 ## Process
 

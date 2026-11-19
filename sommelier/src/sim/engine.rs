@@ -150,6 +150,12 @@ impl Engine {
         self.serve(now, choices);
     }
 
+    /// The engine's composition, as of the last key it reached; empty if
+    /// none.
+    pub fn composition(&self) -> String {
+        self.composer.preedit()
+    }
+
     /// When the next part of the answer to the key in service is ready;
     /// `None` while the engine has nothing to do.
     pub fn ready_at(&self) -> Option<Micros> {
