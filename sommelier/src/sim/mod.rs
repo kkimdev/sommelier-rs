@@ -27,7 +27,8 @@ limitations under the License.
 //! ([`oracle`]): tier 1, every case, holds the proxy to the specification
 //! of `docs/IME_REDESIGN.md`, section 2, whatever the timing; tier 2,
 //! settled cases only, holds the client to the user's intent. The design's
-//! section 4 describes it whole.
+//! section 4 describes it whole. [`golden`] holds the proxy to the bytes it
+//! sent on the first 2,000 seeds, through the staged switch of the IME core.
 //!
 //! - `SOMMELIER_DST_SEED` (0) and `SOMMELIER_DST_CASES` (600) choose the
 //!   seeds. An even seed is a free case, which tier 1 judges in
@@ -44,6 +45,7 @@ mod display;
 mod editor;
 mod engine;
 pub(crate) mod exo;
+mod golden;
 mod hangul;
 mod keymap;
 pub(crate) mod oracle;
@@ -59,7 +61,7 @@ use crate::test_support::Rng;
 use editor::{Reference, TextModel, Typing, UserAction};
 use engine::Lag;
 use oracle::{Counts, Failure, KnownIssue, Tier};
-use sched::{Choices, Choose, Line, Setup, World};
+use sched::{Choices, Choose, Line, Setup, Wire, World};
 
 /// A client model a case types into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +168,8 @@ struct Outcome {
     lag: Lag,
     /// The choices the case made, which replay it ([`Choices::replay`]).
     choices: Vec<u32>,
+    /// What the proxy sent, byte for byte ([`golden`]).
+    wire: Wire,
 }
 
 /// Runs `case` with `choices`, its trace in `trace`.
@@ -197,6 +201,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
             extension,
             lag,
             choices: world.choices.recorded().to_vec(),
+            wire: world.wire(),
         };
         let (Some(spec), Some(shadow), false) = (&world.spec, &world.shadow, world.ended) else {
             outcome.failures.push(Failure {
@@ -403,6 +408,7 @@ fn run_all(cases: &[Case]) -> Summary {
                     extension: None,
                     lag: Lag::Fast,
                     choices: Vec::new(),
+                    wire: Wire::default(),
                 };
                 summary.cases += 1;
                 summary
@@ -689,6 +695,7 @@ fn coverage_counts_each_draw_and_the_rare_paths() {
         extension: Some(10),
         lag: Lag::Slow,
         choices: Vec::new(),
+        wire: Wire::default(),
     };
     let mut coverage = Coverage::default();
     coverage.count(&case, &outcome);

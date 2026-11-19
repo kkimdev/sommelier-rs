@@ -283,6 +283,10 @@ enum Pointer {
     Gone,
 }
 
+/// Every message the proxy sent the guest and the host, in that order, as
+/// its bytes and the number of descriptors it carried.
+pub(super) type Wire = [Vec<(Vec<u8>, usize)>; 2];
+
 /// One case's client, proxy, Exo, engine and display, joined by channels.
 pub(super) struct World<'t> {
     now: Micros,
@@ -466,6 +470,11 @@ impl<'t> World<'t> {
     /// The resets Exo handed the engine.
     pub fn engine_resets(&self) -> u64 {
         self.resets
+    }
+
+    /// Every message the proxy sent ([`Session::wire`]).
+    pub fn wire(&self) -> Wire {
+        self.session.wire().map(<[_]>::to_vec)
     }
 
     /// The client model.
