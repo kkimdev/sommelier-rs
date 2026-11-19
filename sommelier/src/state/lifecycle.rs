@@ -320,6 +320,12 @@ impl Context {
                 keyboard.0
             );
         }
+        if let Some(pending) = self.pending_recovery {
+            let (text_input, keyboard, host_keyboard) = pending.objects_for_test();
+            guest("pending recovery", text_input, "zwp_text_input_v3");
+            guest("pending recovery", keyboard, "wl_keyboard");
+            host("pending recovery", host_keyboard.0, "wl_keyboard");
+        }
         for (pointer, surface) in self.pointer_focus.focuses_for_test() {
             host("pointer focus", pointer.0, "wl_pointer");
             guest("pointer focus", surface, "wl_surface");

@@ -17,7 +17,7 @@ limitations under the License.
 use crate::handler::callback::queue_internal_sync;
 use crate::handler::ime_keys::{
     end_backspace_repeat_for_seat, end_backspace_repeat_for_text_input,
-    held_backspace_keyboard_for_seat, held_repeat_key_for_seat, synthesize_ime_consumed_key_pair,
+    forget_recovery_of_text_input, held_backspace_keyboard_for_seat, hold_recovery,
 };
 use crate::ime::{
     self, Env, HostExt, HostIme, HostOut, HostTi, Input, KeyEffect, LeaseOutcome, SeatId,
@@ -105,41 +105,8 @@ pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
 fn apply_key_effect(ctx: &mut Context, effect: KeyEffect) {
     match effect {
         KeyEffect::Lease { .. } => apply_lease(ctx, effect),
-        KeyEffect::RecoverHeldKey { ti, seat, done } => recover_held_key(ctx, ti, seat, done),
+        KeyEffect::RecoverHeldKey { ti, seat } => hold_recovery(ctx, ti, seat),
     }
-}
-
-/// X2': recover the seat's latest eligible held key, which the input
-/// method took and confirmed with nothing composed ([`KeyEffect`]).
-fn recover_held_key(ctx: &mut Context, ti: TiId, seat: SeatId, done: Outgoing) {
-    let (guest_id, guest_seat) = (ti.0, seat.0);
-    let Some(held) = held_repeat_key_for_seat(ctx, guest_seat) else {
-        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-        log::debug!("Ignoring confirm_preedit without an active preedit for guest {guest_id}");
-        return;
-    };
-    let backspace_repeat = held.key == crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
-    if synthesize_ime_consumed_key_pair(ctx, held) {
-        if backspace_repeat {
-            let armed =
-                ctx.key_generations
-                    .arm_ime_repeat(held.host_keyboard_id, held.key, guest_id);
-            debug_assert!(armed, "recovered held key disappeared within one event");
-        } else {
-            end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-        }
-        log::debug!(
-            "Recovered empty IME confirmation as held key {} press/release",
-            held.key
-        );
-    } else if backspace_repeat {
-        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-    }
-    // GTK waits for the matching text-input transaction to finish before
-    // applying a key that passed through the active IME. A v1 confirm with
-    // no preedit has no text mutation, so its v3 equivalent is an empty
-    // done.
-    ctx.host_to_client_queue.push(done);
 }
 
 /// The guest text input of host text input `host_id`, and its guest seat,
@@ -497,6 +464,7 @@ pub(crate) fn apply_keyboard_focus_changes(ctx: &mut Context, changes: &[SeatFoc
 /// has deleted it (`host_deleted`, F6).
 pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: bool) {
     let ti = TiId(guest_id);
+    forget_recovery_of_text_input(ctx, ti);
     ime(ctx, Input::Destroy { ti, host_deleted });
 }
 
@@ -1248,6 +1216,19 @@ pub(super) mod tests {
         /// The host completes the drain barrier `callback`.
         async fn drain(&mut self, callback: u32) {
             self.s.host([wl_callback::evt::done(callback, 0)]).await;
+        }
+
+        /// The host answers the syncs the proxy sent with the recoveries
+        /// of held keys that waited, the only requests it got: the `done`
+        /// decides the one that still waits, if any, as an autorepeat's
+        /// ([`crate::handler::ime_keys::PendingRecovery`]).
+        async fn answer_recovery_syncs(&mut self) {
+            for (sender, request) in self.s.host_received() {
+                let AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) = request else {
+                    panic!("the host got {request:?} from {sender}, not a recovery's sync");
+                };
+                self.s.host([wl_callback::evt::done(callback, 0)]).await;
+            }
         }
 
         /// The host input method's `preedit_string`.
@@ -4243,7 +4224,108 @@ pub(super) mod tests {
                 f.s.host([f.peek(held)]).await;
             }
             f.s.host([f.confirm()]).await;
+            f.answer_recovery_syncs().await;
             assert_eq!(f.s.guest_received(), f.recovered(held), "{held:?}");
+        }
+    }
+
+    /// At extension v11 Exo confirms before every press its input method
+    /// does not handle (E13), and sends the press's peek and key after the
+    /// confirmation (E8), the modifiers it carries first. While Backspace,
+    /// which the input method took, is held, that confirmation is the new
+    /// press's, not a repeat of Backspace: the guest gets the new key and
+    /// no Backspace (DST seed 456, shrunk). The press ends the Backspace
+    /// lease.
+    #[tokio::test]
+    async fn a_confirmation_before_an_unhandled_press_recovers_no_held_key() {
+        for shifted in [false, true] {
+            let mut f = Field::typing().await;
+            f.lease_backspace_repeat().await;
+            let space = Stroke {
+                key: SPACE,
+                state: PRESSED,
+                serial: 701,
+                time: 1_300,
+            };
+            let mut events = vec![f.confirm()];
+            let mut expected = Vec::new();
+            if shifted {
+                let shift = wl_keyboard::evt::modifiers(f.keyboard.host, 701, 1, 0, 0, 0);
+                events.push(shift);
+                let shift = wl_keyboard::Event::Modifiers {
+                    serial: 701,
+                    mods_depressed: 1,
+                    mods_latched: 0,
+                    mods_locked: 0,
+                    group: 0,
+                };
+                expected.push((f.keyboard.id, shift.into()));
+            }
+            events.extend([f.peek(space), f.key(space)]);
+            f.s.host(events).await;
+            expected.push(f.guest_key(space));
+            assert_eq!(f.s.guest_received(), expected, "shifted: {shifted}");
+            let host = f.s.host_received();
+            let callback = barrier(&host);
+            assert_eq!(host, [sync(callback), f.ack(701, true)]);
+            f.s.host([wl_callback::evt::done(callback, 0)]).await;
+            assert_eq!(f.s.guest_received(), [], "shifted: {shifted}");
+            assert_eq!(f.repeat_owner(BACKSPACE), None);
+        }
+    }
+
+    /// An empty confirmation while Backspace, which the input method took,
+    /// is held, then the peek of a press the input method handles and
+    /// that press's text: the confirmation was Backspace's autorepeat. The
+    /// guest gets Backspace before the new press's text.
+    #[tokio::test]
+    async fn a_confirmation_before_a_handled_press_recovers_the_held_key() {
+        let mut f = Field::typing().await;
+        let backspace = f.lease_backspace_repeat().await;
+        let r = Stroke {
+            key: 19,
+            state: PRESSED,
+            serial: 701,
+            time: 1_300,
+        };
+        f.s.host([f.confirm(), f.peek(r), f.preedit("ㄱ", "")])
+            .await;
+        let mut expected = f.recovered(backspace);
+        expected.extend(f.events([preedit("ㄱ"), DONE]));
+        assert_eq!(f.s.guest_received(), expected);
+        f.answer_recovery_syncs().await;
+        assert_eq!(f.s.guest_received(), []);
+    }
+
+    /// A recovery that waits goes only to a text input that still passes
+    /// the gate: once the guest disabled or destroyed it, or the key's
+    /// keyboard, the host's next event recovers nothing.
+    #[tokio::test]
+    async fn a_waiting_recovery_ends_with_its_text_input_or_keyboard() {
+        #[derive(Clone, Copy, Debug)]
+        enum End {
+            Disable,
+            Destroy,
+            ReleaseKeyboard,
+        }
+        for end in [End::Disable, End::Destroy, End::ReleaseKeyboard] {
+            let mut f = Field::typing().await;
+            f.lease_backspace_repeat().await;
+            f.s.host([f.confirm()]).await;
+            let callback = barrier(&f.s.host_received());
+            let request = match end {
+                End::Disable => v3::disable(f.ti),
+                End::Destroy => v3::destroy(f.ti),
+                End::ReleaseKeyboard => wl_keyboard::req::release(f.keyboard.id),
+            };
+            f.s.guest([request]).await;
+            if !matches!(end, End::Destroy) {
+                f.s.guest([v3::commit(f.ti)]).await;
+            }
+            f.s.host_received();
+            f.s.guest_received();
+            f.s.host([wl_callback::evt::done(callback, 0)]).await;
+            assert_eq!(f.s.guest_received(), [], "{end:?}");
         }
     }
 
@@ -4271,6 +4353,7 @@ pub(super) mod tests {
 
         let again = Stroke { time: 120, ..press };
         f.s.host([f.peek(again), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
         assert_eq!(f.s.guest_received(), f.recovered(again));
         assert_eq!(f.repeat_owner(BACKSPACE), Some(f.ti));
     }
@@ -4283,6 +4366,7 @@ pub(super) mod tests {
         let mut f = Field::typing().await;
         let backspace = f.lease_backspace_repeat().await;
         f.s.host([f.confirm()]).await;
+        f.answer_recovery_syncs().await;
         assert_eq!(f.s.guest_received(), f.recovered(backspace));
 
         // A sibling whose enable is rejected, then one that never commits.
@@ -4305,6 +4389,7 @@ pub(super) mod tests {
         f.select(field);
 
         f.s.host([f.confirm()]).await;
+        f.answer_recovery_syncs().await;
         assert_eq!(f.s.guest_received(), f.recovered(backspace));
     }
 
@@ -4400,6 +4485,7 @@ pub(super) mod tests {
         assert_eq!(f.s.host_received(), [f.ack(700, false)]);
 
         f.s.host([f.confirm(), f.confirm(), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
         let mut expected = f.recovered(space);
         expected.extend(f.recovered(space));
         expected.extend(f.recovered(space));
@@ -4426,6 +4512,7 @@ pub(super) mod tests {
         let expected = [preedit("나"), DONE, no_preedit(), commit("나 "), DONE];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([f.confirm(), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
         let mut expected = f.recovered(space);
         expected.extend(f.recovered(space));
         assert_eq!(f.s.guest_received(), expected);
@@ -4453,6 +4540,7 @@ pub(super) mod tests {
         let expected = [preedit("가"), DONE, no_preedit(), DONE];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([f.confirm(), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
         let mut expected = f.recovered(backspace);
         expected.extend(f.recovered(backspace));
         assert_eq!(f.s.guest_received(), expected);
@@ -4489,6 +4577,7 @@ pub(super) mod tests {
             ..backspace
         };
         f.s.host([f.peek(backspace), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
         assert_eq!(f.s.guest_received(), f.recovered(backspace));
     }
 
@@ -4555,6 +4644,7 @@ pub(super) mod tests {
             ..s
         };
         f.s.host([f.peek(s), f.peek(a), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
         assert_eq!(f.s.guest_received(), f.events([DONE]));
     }
 
@@ -4609,6 +4699,7 @@ pub(super) mod tests {
         let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([f.confirm()]).await;
+        f.answer_recovery_syncs().await;
         assert_eq!(f.s.guest_received(), f.recovered(space));
 
         f.keyboard_leave().await;
@@ -5004,9 +5095,14 @@ pub(super) mod tests {
             ExtendedTextInputV1Handler.on_set_preedit_region(&mut self.ctx, index, length);
         }
 
+        /// The host input method's empty confirmation, then a host event
+        /// that shows it to be an autorepeat's, such as the `done` of the
+        /// sync the proxy sends with a recovery that waits
+        /// ([`crate::handler::ime_keys::PendingRecovery`]).
         pub(in crate::handler) fn confirm(&mut self) {
             self.ctx.last_sender_id = HOST_EXT;
             ExtendedTextInputV1Handler.on_confirm_preedit(&mut self.ctx, 0);
+            crate::handler::ime_keys::recover_pending(&mut self.ctx);
         }
 
         /// The host's `keysym` of key `serial` at `time`, which Exo sends

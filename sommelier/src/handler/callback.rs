@@ -64,6 +64,9 @@ impl WlCallbackHandler for CallbackHandler {
                 InternalCallback::TextInput { token } => {
                     crate::handler::text_input::ime(ctx, crate::ime::Input::BarrierDone(token));
                 }
+                // Every host event, this `done` included, has decided the
+                // pending recovery before it is handled.
+                InternalCallback::KeyRecovery => {}
                 InternalCallback::WindowBoundsBarrier { zaura_toplevel } => {
                     crate::handler::window_placement::complete_barrier(
                         ctx,
