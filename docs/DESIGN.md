@@ -66,7 +66,8 @@ events behind several frames on the single thread. A parked guest stream
 (see [Message effects](#message-effects)) is never offered.
 32 messages still amortize a send while bounding the wait to about one
 frame. Translated messages of one batch are sent in as few transport
-submissions as the 28-descriptor limit allows, usually one; per-message
+submissions as the 28-descriptor and VirtWL transaction-size limits
+allow, usually one, each ending at a message boundary; per-message
 VirtWL ioctls would add latency without changing the byte and descriptor
 order (see
 [transport invariants](INVARIANTS.md#transport-and-file-descriptors)).

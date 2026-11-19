@@ -39,7 +39,8 @@ const DEFAULT_BUFFER_SIZE: usize = 4096;
 // virtwl_ioctl_txn lives at the beginning of the ioctl buffer, so the data
 // payload must leave room for its FD array and length field. ChromiumOS uses
 // this exact bound in VirtWaylandChannel::max_send_size().
-const MAX_SEND_SIZE: usize = DEFAULT_BUFFER_SIZE - std::mem::size_of::<virtwl_ioctl_txn>();
+pub(crate) const MAX_SEND_SIZE: usize =
+    DEFAULT_BUFFER_SIZE - std::mem::size_of::<virtwl_ioctl_txn>();
 
 /// Layout returned by `VIRTWL_IOCTL_NEW_DMABUF`.
 ///
@@ -362,10 +363,11 @@ impl VirtWaylandChannel {
             ));
         }
 
-        // A Unix socket read may contain several complete Wayland messages.
-        // Keep the stream intact while splitting it into virtwl-sized
-        // transactions. SCM_RIGHTS belongs to the beginning of the byte
-        // stream, so pass the descriptors only with the first chunk.
+        // `WaylandConnection::send_messages` keeps a submission within
+        // MAX_SEND_SIZE unless it is one longer message (up to
+        // `MessageHeader::MAX_LEN`). Only that one is cut here, by bytes,
+        // and its descriptors go with its first chunk, ahead of the bytes
+        // that take them.
         let chunks: Vec<&[u8]> = if data.is_empty() {
             vec![data]
         } else {

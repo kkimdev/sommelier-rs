@@ -52,12 +52,26 @@ const MAX_PENDING_FDS: usize = 1024;
 /// sockets is the behavior on the device.
 pub(crate) const MAX_FDS_PER_SEND: usize = crate::virtwl::VIRTWL_SEND_MAX_ALLOCS;
 
+/// The most bytes one transport submission carries, unless it is a single
+/// longer message.
+///
+/// It is the data payload of a VirtWL transaction
+/// (`virtwl_channel::MAX_SEND_SIZE`), which cuts a longer submission by
+/// bytes. Exo's libwayland reads at most 4 KiB per dispatch, so a message
+/// cut in two can be dispatched in two reads, apart from the messages
+/// sent with it. Like [`MAX_FDS_PER_SEND`], both transports apply it.
+pub(crate) const MAX_BYTES_PER_SEND: usize = crate::virtwl_channel::MAX_SEND_SIZE;
+
 /// An ordered run of outgoing Wayland messages and their descriptors.
 ///
 /// Sent by [`WaylandConnection::send_messages`], which coalesces messages
-/// into as few submissions as [`MAX_FDS_PER_SEND`] allows. It owns the
-/// descriptors: a send passes copies to the peer, and dropping the run
-/// closes them, sent or not.
+/// into as few submissions as [`MAX_FDS_PER_SEND`] and
+/// [`MAX_BYTES_PER_SEND`] allow. It owns the descriptors: a send passes
+/// copies to the peer, and dropping the run closes them, sent or not.
+///
+/// A submission ends only at an entry of `ends`. To keep two messages in
+/// one submission ("glued", such as a surrounding-text report and its
+/// `wl_display.sync`), a push would record no end after the first.
 #[derive(Debug, Default)]
 pub(crate) struct OutgoingMessages {
     bytes: Vec<u8>,
@@ -414,11 +428,13 @@ impl WaylandConnection {
     }
 
     /// Send `messages` in order, in as few submissions as
-    /// [`MAX_FDS_PER_SEND`] allows.
+    /// [`MAX_FDS_PER_SEND`] and [`MAX_BYTES_PER_SEND`] allow.
     ///
     /// A submission ends only between messages, so every message's
     /// descriptors travel with its bytes: a receiver must never meet a
-    /// message whose descriptors have not arrived yet.
+    /// message whose descriptors have not arrived yet. Nor does the VirtWL
+    /// channel cut a message by bytes, unless it is longer than
+    /// [`MAX_BYTES_PER_SEND`] on its own; such a message goes alone.
     ///
     /// # Errors
     ///
@@ -429,7 +445,9 @@ impl WaylandConnection {
         let mut start = (0, 0);
         let mut end = start;
         for &message_end in &messages.ends {
-            if message_end.1 - start.1 > MAX_FDS_PER_SEND {
+            if message_end.0 - start.0 > MAX_BYTES_PER_SEND
+                || message_end.1 - start.1 > MAX_FDS_PER_SEND
+            {
                 // This message starts the next submission.
                 if start != end {
                     self.send(
@@ -531,7 +549,7 @@ impl AsRawFd for WaylandConnection {
 mod tests {
     use super::{
         decode_unix_control_fds, recv_unix_message, OutgoingMessages, WaylandConnection,
-        MAX_FDS_PER_SEND,
+        MAX_BYTES_PER_SEND, MAX_FDS_PER_SEND,
     };
     use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
     use crate::wire::MessageBuilder;
@@ -655,6 +673,54 @@ mod tests {
             submissions.push((bytes, fds.len()));
         }
         assert_eq!(submissions, vec![(8, 20), (48, 15)]);
+    }
+
+    /// A VirtWL transaction holds at most `MAX_BYTES_PER_SEND` bytes, and
+    /// the channel cuts a longer submission by bytes. A submission must
+    /// therefore end at a message boundary within that bound, so no cut
+    /// falls inside a message: Exo could dispatch its two parts in
+    /// different reads. A message longer than the bound goes alone.
+    #[tokio::test]
+    async fn send_messages_ends_submissions_at_message_boundaries_within_the_byte_limit() {
+        let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
+        let name = CString::new("sommelier-split-bytes").unwrap();
+        let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+
+        // (bytes, descriptors) per message. A cut every `limit` bytes would
+        // fall 8 bytes into the second message, sync-sized. Each submission
+        // starts with a descriptor, so the receiver reads each one on its
+        // own.
+        let limit = MAX_BYTES_PER_SEND;
+        let longest = crate::wire::MessageHeader::MAX_LEN;
+        let mut messages = OutgoingMessages::default();
+        for (len, fds) in [(limit - 8, 1), (12, 0), (12, 1), (longest, 1), (8, 1)] {
+            let fds = (0..fds)
+                .map(|_| memfd.try_clone().expect("dup the memfd"))
+                .collect();
+            messages.push((vec![0; len], fds));
+        }
+        connection
+            .send_messages(&messages)
+            .await
+            .expect("send the batch");
+        drop(connection);
+
+        let mut submissions = Vec::new();
+        loop {
+            let mut data = [0u8; 4 * 4096];
+            let mut control = vec![0u8; 4096];
+            let (bytes, fds) =
+                recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
+            if bytes == 0 {
+                break;
+            }
+            submissions.push((bytes, fds.len()));
+        }
+        assert_eq!(
+            submissions,
+            vec![(limit - 8, 1), (24, 1), (longest, 1), (8, 1)]
+        );
     }
 
     #[tokio::test]
