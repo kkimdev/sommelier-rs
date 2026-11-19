@@ -35,24 +35,7 @@ use crate::state::GuestKeyOwner;
 use crate::state::{
     Context, InternalCallback, KeyboardFocusRegistry, Link, SeatFocusChange, ShadowTable,
 };
-#[cfg(test)]
-use crate::wire::queue_or_drop;
 use crate::wire::{Action, IndexedString, Outgoing};
-
-/// Queue `zwp_text_input_v3.commit_string`, or drop host text that does not
-/// fit a message (see [`queue_or_drop`]).
-///
-/// # Returns
-///
-/// Whether the event was queued.
-#[cfg(test)]
-fn push_commit_string_to(queue: &mut Vec<Outgoing>, guest_id: u32, text: &str) -> bool {
-    queue_or_drop(
-        queue,
-        zwp_text_input_v3::evt::commit_string(guest_id, Some(text)),
-        format_args!("the commit of text input {guest_id}"),
-    )
-}
 
 /// The facts the IME core reads and does not own: the object table's and
 /// the keyboard focus's. It borrows only those, so that the core can step
@@ -5148,13 +5131,6 @@ pub(super) mod tests {
     /// The fixture's `done`, before any guest commit.
     pub(in crate::handler) fn uncommitted_done() -> (u32, AnyEvent) {
         (TI, V3::Done { serial: 0 }.into())
-    }
-
-    #[test]
-    fn oversized_host_text_is_dropped_without_panicking() {
-        let mut queue = Vec::new();
-        assert!(!push_commit_string_to(&mut queue, 7, &"x".repeat(4_084)));
-        assert!(queue.is_empty());
     }
 
     /// A commit whose surrounding text does not fit a message reaches the

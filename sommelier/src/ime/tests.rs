@@ -479,23 +479,30 @@ fn count_bumps_only_in_the_commit_arm() {
     assert_eq!(occurrences(".count_commit()"), ["step.rs"]);
 }
 
-/// B5 and the core's isolation: one builder of the v3 transaction
-/// events, and no import from the rest of the proxy but the wire and the
-/// generated protocols.
+/// B5 and the core's isolation: one builder of the v3 transaction events
+/// in the crate, and no import from the rest of the proxy but the wire and
+/// the generated protocols.
 #[test]
 fn ime_is_isolated() {
-    for event in [
-        "evt::preedit_string(",
-        "evt::delete_surrounding_text(",
-        "evt::commit_string(",
-        "evt::done(",
-    ] {
-        let files = occurrences(event);
+    const BUILDERS: [&str; 4] = [
+        "preedit_string",
+        "delete_surrounding_text",
+        "commit_string",
+        "done",
+    ];
+    for builder in BUILDERS {
+        let files = occurrences(&format!("evt::{builder}("));
         assert!(
             !files.is_empty() && files.iter().all(|&file| file == "guest.rs"),
-            "{event}"
+            "{builder}"
         );
     }
+    let builders = crate_sources()
+        .into_iter()
+        .filter(|(_, source)| builds_v3_transactions(source))
+        .map(|(file, _)| file)
+        .collect::<Vec<_>>();
+    assert_eq!(builders, ["ime/guest.rs"]);
     assert_eq!(occurrences("crate::handler"), [] as [&str; 0]);
     for (file, source) in SOURCES {
         let mut source = source;
@@ -508,6 +515,55 @@ fn ime_is_isolated() {
             source = rest;
         }
     }
+}
+
+/// Every Rust source of the crate, by its path below `src/`, in path
+/// order.
+fn crate_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a source directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let name = path.strip_prefix(&root).expect("below src");
+            let source = std::fs::read_to_string(&path).expect("a readable source");
+            (name.to_string_lossy().into_owned(), source)
+        })
+        .collect()
+}
+
+/// Whether `source` can build a `zwp_text_input_v3` `preedit_string`,
+/// `delete_surrounding_text`, `commit_string` or `done`: it names the
+/// interface's event encoders for anything but `enter` and `leave`, or
+/// imports them.
+fn builds_v3_transactions(source: &str) -> bool {
+    let source: String = source.split_whitespace().collect();
+    // Split, so that this file does not name them.
+    let encoders = ["zwp_text_input_v3", "::evt"].concat();
+    let named = source.match_indices(&encoders).any(|(at, _)| {
+        let rest = &source[at + encoders.len()..];
+        !(rest.starts_with("::enter(") || rest.starts_with("::leave("))
+    });
+    let imported = source.match_indices("zwp_text_input_v3::{").any(|(at, _)| {
+        let group = &source[at..];
+        let group = &group[..group.find('}').unwrap_or(group.len())];
+        group
+            .split([',', '{'])
+            .any(|name| name == "evt" || name.starts_with("evtas") || name.starts_with("evt::"))
+    });
+    named || imported
 }
 
 // 2.1 Guest requests.

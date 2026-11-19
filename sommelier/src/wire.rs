@@ -633,6 +633,17 @@ mod tests {
     use std::collections::VecDeque;
     use std::os::fd::{AsRawFd, OwnedFd};
 
+    /// A message the proxy builds itself that does not fit, here host text
+    /// it forwards in an event of its own, is dropped, and the session
+    /// goes on.
+    #[test]
+    fn oversized_host_text_is_dropped_without_panicking() {
+        let mut queue = Vec::new();
+        let offer = wl_data_offer::evt::offer(7, &"x".repeat(4_084));
+        assert!(!super::queue_or_drop(&mut queue, offer, "an offer"));
+        assert!(queue.is_empty());
+    }
+
     /// Decoding holds for arbitrary bytes: a frame never claims more bytes
     /// than the stream has, no read moves past the payload, and what
     /// `MessageBuilder` writes decodes unchanged.
