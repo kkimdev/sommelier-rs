@@ -514,7 +514,9 @@ whose activation no live seat can carry, and an attached one whose seat
 has ended (design 3.1, I1b).
 The surrounding text and cursor rectangle are not reconciled: Exo keeps
 both regardless and edits its copy of the text as the input method
-commits, so each guest commit forwards the ones it states. In the other
+commits, so each guest commit forwards the ones it states, but for a
+surrounding text that would only make Exo drop its composition, which
+Mirror mode withholds (below). In the other
 direction, the edits of Exo's input method reach the guest as v3
 transactions, each closed by a `done`. Exo measures its deletes and
 preedit regions in its own prediction of the text, so the core keeps a
@@ -523,7 +525,10 @@ the core sends at the `done` of a `wl_display.sync` glued to it, and every
 event Exo sends. `ime/exo_view.rs` owns the mirror, the text input's mode
 (`ime::ImeMode`), and whether the guest is in step with Exo; from v11 of
 the extension (Mirror mode) a delete or a region is measured in the
-mirror while it is, and as Legacy mode does otherwise. Below v11, or under the kill
+mirror while it is, and as Legacy mode does otherwise; and a guest
+report that leaves out the preedit it shows, which Exo holds inline, is
+withheld when the mirror finds that preedit the only difference from a
+state Exo will hold. Below v11, or under the kill
 switch `SOMMELIER_IME_MIRROR=shadow`, Legacy mode measures them in the
 text the guest last committed, as `ime/legacy.rs` does, and the mirror
 only logs. A guest commit that leaves the field enabled is answered

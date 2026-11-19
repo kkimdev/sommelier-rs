@@ -40,7 +40,12 @@
   (Mirror mode; INVARIANTS "From v11 of the extension, Exo's deletes and
   regions are measured in the Exo mirror"). `SOMMELIER_IME_MIRROR=shadow`
   keeps every text input in Legacy mode for one release (CONTRIBUTING).
-  M4, report suppression, remains.
+  M4 is done too: in Mirror mode a report that would only drop Exo's
+  composition is withheld (same rule, "In Mirror mode, a guest report
+  that would only drop Exo's composition is withheld"). M5 needed no
+  change: C5 already commits at Exo's detach a preedit Exo did not hold
+  (H2, every mode), which retired `RestartLosesUntrackedComposition`.
+  M6, removing the kill switch, waits a release.
 
 ## Known issues and debt
 
@@ -181,7 +186,8 @@
     145 of 5,000 settled cases from seed 1,000,001; C5 has since
     retired that issue). The fix needs the
     preedit each transaction left, matched to the report as Exo's
-    `SurroundingTextTracker::Update` matches its history.
+    `SurroundingTextTracker::Update` matches its history, which Mirror
+    mode does: it withholds such a report (M4).
   - Chromium applies a transaction's delete before its preedit clear and
     drops a delete while it shows a composition (C3 of
     [IME_REDESIGN](docs/IME_REDESIGN.md)), so a region over a shown
@@ -194,8 +200,8 @@
   is in step with Exo, the mirror is exact and no report crosses the
   event, and falls back to Legacy mode's measurement otherwise. It must
   not drop instead: the input method's next commit would double the text.
-  In 20,000 DST cases from seed 0, 14 events of the free cases fell back
-  where the two measurements differ, none in settled cases; the Legacy
+  In 20,000 DST cases from seed 0, 6 events of the free cases fell back
+  where the two measurements differ (14 before M4), none in settled cases; the Legacy
   issues then appear at v11 in a few cases (4.8 of the design). Its
   gaps:
   - A silent edit the proxy does not see breaks the guest model: GTK3
@@ -209,9 +215,11 @@
     text, which the proxy reads as "unchanged" (Chromium reports its text
     only when it changed, C1). A client that commits without stating its
     changed text would break that.
-  - The guest's report without its preedit still makes Exo drop its
-    composition (E4; `ReportDropsComposition`, 1 of 20,000); M4 suppresses
-    such reports.
+  - A withheld report hides a guest edit that happens to equal Exo's
+    state without the composition the guest shows, as from a client that
+    drops its preedit without a word (C4 of the design): Exo keeps
+    composing until the composition ends and the next report goes out.
+    Exo's own clients share that hazard whenever a report matches.
   - The mirror is only as right as its reading of Chromium
     (`6975bb48a8cd`). A host check, with `RUST_LOG=sommelier::ime=debug`,
     in gedit, a GTK4 app, and Chrome or VS Code with
