@@ -214,18 +214,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         if case.settled {
             failures.extend(oracle::intended(&case.reference(extension), world.client()));
         }
-        // P1 shows only in GTK, whose blur keeps no composition (C11).
-        let gtk = case.client != ClientKind::Chromium;
-        let played = oracle::Played {
-            texts: &case.texts,
-            typing: case.typing(extension),
-            actions: &case.actions,
-            detaches: &world.detaches,
-        };
-        outcome.known = oracle::classify(&failures, &spec.counts, |issues| {
-            (gtk || !issues.contains(&KnownIssue::FocusWhileComposing))
-                && oracle::issues_predict(issues, &played, world.client())
-        });
+        outcome.known = oracle::classify(&failures, &spec.counts);
         if outcome.known.is_empty() {
             outcome.failures = failures;
         }

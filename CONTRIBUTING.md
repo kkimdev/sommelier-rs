@@ -191,10 +191,11 @@ of the host. `ime_reaches_the_intended_text` also holds the client to
 the user's intent, in cases that settle around every click, tap, focus
 move and restart of the input method, and after a key the input method
 passes while it takes the engine to compose, whose confirmation then
-resets the engine. A failure that a known issue explains exactly, such
-as focus loss while composing, is counted, not failed, and the summary
-lists its seeds. Each test runs in a process of its own, with the XKB
-defaults pinned.
+resets the engine. A specification failure that a known issue's
+trigger explains, such as a region Exo made in text the proxy had not
+yet seen, is counted, not failed, and the summary lists its seeds; no
+known issue excuses a failure of the user's intent. Each test runs in a
+process of its own, with the XKB defaults pinned.
 
 The suite runs 600 seeds from seed 0, an even seed free and an odd one
 settled, in about 5 s; two cases in 50 run twice and must leave the same
