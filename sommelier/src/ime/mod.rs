@@ -28,6 +28,9 @@ use crate::wire::{IndexedString, Outgoing};
 
 mod guest;
 mod host;
+// Exo's tracker, not wired in yet: PR M2 of the mirror plan does that.
+#[cfg_attr(not(test), expect(dead_code))]
+mod mirror;
 mod serial;
 mod state;
 mod step;
