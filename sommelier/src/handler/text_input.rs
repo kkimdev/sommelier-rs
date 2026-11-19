@@ -5627,39 +5627,39 @@ pub(super) mod tests {
     }
 
     /// The fixture's guest text input, its host text input and extension.
-    pub(crate) const TI: u32 = 20;
-    pub(crate) const HOST: u32 = 10;
-    pub(crate) const HOST_EXT: u32 = 30;
+    pub(in crate::handler) const TI: u32 = 20;
+    pub(in crate::handler) const HOST: u32 = 10;
+    pub(in crate::handler) const HOST_EXT: u32 = 30;
     /// The fixture's guest seat and focused surface, and their host objects.
-    pub(crate) const SEAT: u32 = 5;
-    pub(crate) const SURFACE: u32 = 900;
-    pub(crate) const HOST_SEAT: u32 = 6;
-    pub(crate) const HOST_SURFACE: u32 = 901;
+    pub(in crate::handler) const SEAT: u32 = 5;
+    pub(in crate::handler) const SURFACE: u32 = 900;
+    pub(in crate::handler) const HOST_SEAT: u32 = 6;
+    pub(in crate::handler) const HOST_SURFACE: u32 = 901;
     /// The guest keyboard [`Ime::with_keyboard`] adds, its host keyboard
     /// and that keyboard's extended keyboard.
-    pub(crate) const KEYBOARD: u32 = 40;
-    pub(crate) const HOST_KEYBOARD: HostId = HostId(41);
-    pub(crate) const HOST_EXTENDED_KEYBOARD: u32 = 42;
-    pub(crate) const BACKSPACE: u32 = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
-    pub(crate) const PRESSED: u32 = wl_keyboard::KEY_STATE_PRESSED;
-    pub(crate) const RELEASED: u32 = wl_keyboard::KEY_STATE_RELEASED;
-    pub(crate) const REPEATED: u32 = wl_keyboard::KEY_STATE_REPEATED;
+    pub(in crate::handler) const KEYBOARD: u32 = 40;
+    pub(in crate::handler) const HOST_KEYBOARD: HostId = HostId(41);
+    pub(in crate::handler) const HOST_EXTENDED_KEYBOARD: u32 = 42;
+    pub(in crate::handler) const BACKSPACE: u32 = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
+    pub(in crate::handler) const PRESSED: u32 = wl_keyboard::KEY_STATE_PRESSED;
+    pub(in crate::handler) const RELEASED: u32 = wl_keyboard::KEY_STATE_RELEASED;
+    pub(in crate::handler) const REPEATED: u32 = wl_keyboard::KEY_STATE_REPEATED;
 
     /// Handler tests of key and IME state that the peers of a [`Session`]
     /// cannot set up exactly: the guest text input [`TI`] of seat [`SEAT`]
     /// is enabled and its host active on surface [`SURFACE`].
-    pub(crate) struct Ime {
-        pub(crate) ctx: Context,
+    pub(in crate::handler) struct Ime {
+        pub(in crate::handler) ctx: Context,
     }
 
     impl Ime {
-        pub(crate) fn new() -> Self {
+        pub(in crate::handler) fn new() -> Self {
             Self::with_extension_version(Some(zcr_extended_text_input_v1::VERSION))
         }
 
         /// The fixture whose extension has `version` in the object table,
         /// or none.
-        pub(crate) fn with_extension_version(version: Option<u32>) -> Self {
+        pub(in crate::handler) fn with_extension_version(version: Option<u32>) -> Self {
             let mut ctx = Context::new_for_test(false, false, vec![]);
             let table = &mut ctx.shadow_table;
             table.insert_paired_for_test(SEAT, HOST_SEAT, "wl_seat");
@@ -5683,7 +5683,7 @@ pub(super) mod tests {
         }
 
         /// The fixture with guest keyboard [`KEYBOARD`] on the seat.
-        pub(crate) fn with_keyboard() -> Self {
+        pub(in crate::handler) fn with_keyboard() -> Self {
             let mut ime = Self::new();
             ime.keyboard(KEYBOARD, HOST_KEYBOARD);
             ime
@@ -5691,7 +5691,7 @@ pub(super) mod tests {
 
         /// Add guest keyboard `guest`, whose host keyboard is `host`, to the
         /// seat.
-        pub(crate) fn keyboard(&mut self, guest: u32, host: HostId) {
+        pub(in crate::handler) fn keyboard(&mut self, guest: u32, host: HostId) {
             self.ctx
                 .shadow_table
                 .insert_paired_for_test(guest, host.0, "wl_keyboard");
@@ -5700,7 +5700,7 @@ pub(super) mod tests {
 
         /// Give [`HOST_KEYBOARD`] its extended keyboard, which sends
         /// `peek_key`.
-        pub(crate) fn with_extended_keyboard() -> Self {
+        pub(in crate::handler) fn with_extended_keyboard() -> Self {
             let mut ime = Self::with_keyboard();
             let extended = HostId(HOST_EXTENDED_KEYBOARD);
             ime.ctx
@@ -5713,58 +5713,70 @@ pub(super) mod tests {
         }
 
         /// Give the seat's keyboard focus on the surface to `keyboard`.
-        pub(crate) fn focus(&mut self, keyboard: HostId) {
+        pub(in crate::handler) fn focus(&mut self, keyboard: HostId) {
             self.ctx
                 .keyboard_focus
                 .set_for_test(keyboard, SEAT, SURFACE, HOST_SURFACE);
         }
 
-        pub(crate) fn state(&mut self) -> &mut TextInputState {
+        pub(in crate::handler) fn state(&mut self) -> &mut TextInputState {
             self.ctx.text_inputs.get_mut(&TI).expect("the text input")
         }
 
-        pub(crate) fn preedit(&mut self, text: &str, commit: &str) {
+        pub(in crate::handler) fn preedit(&mut self, text: &str, commit: &str) {
             self.ctx.last_sender_id = HOST;
             let (text, commit) = (IndexedString::from(text), commit.to_string());
             TextInputV1Handler.on_preedit_string(&mut self.ctx, 0, &text, &commit);
         }
 
-        pub(crate) fn commit(&mut self, text: &str) {
+        pub(in crate::handler) fn commit(&mut self, text: &str) {
             self.ctx.last_sender_id = HOST;
             TextInputV1Handler.on_commit_string(&mut self.ctx, 0, &text.to_string());
         }
 
-        pub(crate) fn preedit_region(&mut self, index: i32, length: u32) {
+        pub(in crate::handler) fn preedit_region(&mut self, index: i32, length: u32) {
             self.ctx.last_sender_id = HOST_EXT;
             ExtendedTextInputV1Handler.on_set_preedit_region(&mut self.ctx, index, length);
         }
 
-        pub(crate) fn confirm(&mut self) {
+        pub(in crate::handler) fn confirm(&mut self) {
             self.ctx.last_sender_id = HOST_EXT;
             ExtendedTextInputV1Handler.on_confirm_preedit(&mut self.ctx, 0);
         }
 
         /// The host's `keysym` of key `serial` at `time`, which Exo sends
         /// in each other's arguments.
-        pub(crate) fn keysym(&mut self, sym: u32, state: u32, serial: u32, time: u32) {
+        pub(in crate::handler) fn keysym(&mut self, sym: u32, state: u32, serial: u32, time: u32) {
             self.ctx.last_sender_id = HOST;
             TextInputV1Handler.on_keysym(&mut self.ctx, time, serial, sym, state, 0);
         }
 
-        pub(crate) fn peek(&mut self, key: u32, state: u32, serial: u32, time: u32) {
+        pub(in crate::handler) fn peek(&mut self, key: u32, state: u32, serial: u32, time: u32) {
             self.ctx.last_sender_id = HOST_EXTENDED_KEYBOARD;
             KeyboardHandler::new().on_peek_key(&mut self.ctx, serial, time, key, state);
         }
 
         /// The host keyboard's `key`; returns whether it reaches the guest.
-        pub(crate) fn key(&mut self, key: u32, state: u32, serial: u32, time: u32) -> Action {
+        pub(in crate::handler) fn key(
+            &mut self,
+            key: u32,
+            state: u32,
+            serial: u32,
+            time: u32,
+        ) -> Action {
             self.ctx.last_sender_id = HOST_KEYBOARD.0;
             KeyboardHandler::new().on_key(&mut self.ctx, serial, time, key, state)
         }
 
         /// Hold repeatable `key` on `keyboard`, whose press `peek_key`
         /// reported with `serial` at `time`.
-        pub(crate) fn hold_peeked(&mut self, keyboard: HostId, key: u32, serial: u32, time: u32) {
+        pub(in crate::handler) fn hold_peeked(
+            &mut self,
+            keyboard: HostId,
+            key: u32,
+            serial: u32,
+            time: u32,
+        ) {
             self.ctx
                 .key_generations
                 .observe_peek_press(keyboard, key, serial, time, true);
@@ -5777,7 +5789,7 @@ pub(super) mod tests {
 
         /// Hold Backspace on [`HOST_KEYBOARD`], with its IME repeat leased
         /// to `text_input`.
-        pub(crate) fn lease_backspace_repeat(&mut self, text_input: u32) {
+        pub(in crate::handler) fn lease_backspace_repeat(&mut self, text_input: u32) {
             let generations = &mut self.ctx.key_generations;
             generations.observe_physical_state(HOST_KEYBOARD, BACKSPACE, 1);
             assert!(generations.arm_ime_repeat(HOST_KEYBOARD, BACKSPACE, text_input));
@@ -5785,22 +5797,22 @@ pub(super) mod tests {
 
         /// Hold `key` on [`HOST_KEYBOARD`], with its guest press owned by
         /// `owner`.
-        pub(crate) fn hold_owned(&mut self, key: u32, owner: GuestKeyOwner) {
+        pub(in crate::handler) fn hold_owned(&mut self, key: u32, owner: GuestKeyOwner) {
             let generations = &mut self.ctx.key_generations;
             generations.observe_physical_state(HOST_KEYBOARD, key, 1);
             assert!(self.ctx.claim_guest_key(HOST_KEYBOARD, key, owner));
         }
 
-        pub(crate) fn repeat_active(&self) -> bool {
+        pub(in crate::handler) fn repeat_active(&self) -> bool {
             backspace_repeat_active_for_keyboard(&self.ctx, HOST_KEYBOARD)
         }
 
-        pub(crate) fn owner(&self, key: u32) -> Option<GuestKeyOwner> {
+        pub(in crate::handler) fn owner(&self, key: u32) -> Option<GuestKeyOwner> {
             self.ctx.guest_key_owner(HOST_KEYBOARD, key)
         }
 
         /// The events queued for the guest since the last call.
-        pub(crate) fn events(&mut self) -> Vec<(u32, AnyEvent)> {
+        pub(in crate::handler) fn events(&mut self) -> Vec<(u32, AnyEvent)> {
             let queue = std::mem::take(&mut self.ctx.host_to_client_queue);
             let table = &self.ctx.shadow_table;
             queue
@@ -5816,7 +5828,7 @@ pub(super) mod tests {
         }
 
         /// The requests queued for the host since the last call.
-        pub(crate) fn requests(&mut self) -> Vec<(u32, AnyRequest)> {
+        pub(in crate::handler) fn requests(&mut self) -> Vec<(u32, AnyRequest)> {
             let queue = std::mem::take(&mut self.ctx.client_to_host_queue);
             let table = &self.ctx.shadow_table;
             queue
@@ -5835,7 +5847,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn key(
+    pub(in crate::handler) fn key(
         keyboard: u32,
         key: u32,
         state: u32,
@@ -5852,7 +5864,7 @@ pub(super) mod tests {
     }
 
     /// The fixture's `done`, before any guest commit.
-    pub(crate) fn uncommitted_done() -> (u32, AnyEvent) {
+    pub(in crate::handler) fn uncommitted_done() -> (u32, AnyEvent) {
         (TI, V3::Done { serial: 0 }.into())
     }
 

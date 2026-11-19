@@ -33,7 +33,7 @@ pub(crate) fn backspace_repeat_active_for_keyboard(
     )
 }
 
-pub(crate) fn held_backspace_keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<HostId> {
+pub(super) fn held_backspace_keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<HostId> {
     keyboard_for_seat(ctx, guest_seat)
         .map(|(_, host_keyboard_id)| host_keyboard_id)
         .filter(|host_keyboard_id| {
@@ -108,7 +108,7 @@ pub(crate) fn end_backspace_repeat_for_seat(ctx: &mut Context, guest_seat: u32) 
     }
 }
 
-pub(crate) fn end_backspace_repeat_for_text_input(
+pub(super) fn end_backspace_repeat_for_text_input(
     ctx: &mut Context,
     guest_seat: u32,
     guest_text_input: u32,
@@ -131,7 +131,7 @@ pub(crate) fn end_backspace_repeat_for_text_input(
     }
 }
 
-pub(crate) fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
+fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
     static KEYCODES: std::sync::OnceLock<std::collections::BTreeMap<u32, u32>> =
         std::sync::OnceLock::new();
     KEYCODES
@@ -285,7 +285,7 @@ fn keyboard_for_keysym(ctx: &Context, guest_seat: u32, sym: u32) -> Option<(u32,
 
 /// Forward host `zwp_text_input_v1.keysym` as a `wl_keyboard.key` of the
 /// seat's keyboard (see the call in `TextInputV1Handler::on_keysym`).
-pub(crate) fn on_keysym(ctx: &mut Context, serial: u32, time: u32, sym: u32, state: u32) -> Action {
+pub(super) fn on_keysym(ctx: &mut Context, serial: u32, time: u32, sym: u32, state: u32) -> Action {
     // Exo intentionally sends these two fields contrary to the unstable
     // protocol names for compatibility with Lacros: `serial` contains the
     // event timestamp and `time` contains the Wayland serial. Translate
@@ -393,7 +393,7 @@ pub(crate) fn on_keysym(ctx: &mut Context, serial: u32, time: u32, sym: u32, sta
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HeldRepeatKey {
+pub(super) struct HeldRepeatKey {
     guest_keyboard_id: u32,
     pub(super) host_keyboard_id: HostId,
     pub(super) key: u32,
@@ -411,7 +411,7 @@ pub(crate) struct HeldRepeatKey {
 /// `wl_keyboard` delivery. `peek_key` provides both. Select the newest
 /// generation, preferring the keyboard focused on the seat's current surface,
 /// then validate that exact generation without falling back to an older key.
-pub(crate) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option<HeldRepeatKey> {
+pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option<HeldRepeatKey> {
     let active_surface = ctx.keyboard_focus.surface_for_seat(guest_seat);
     let mut candidates = Vec::new();
 
@@ -493,7 +493,7 @@ pub(crate) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
 /// Both carry the serial and time of the key's latest `peek_key`, which
 /// are those of the `wl_keyboard.key` Exo would have sent; see
 /// INVARIANTS "A recovered key carries the host's serial".
-pub(crate) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> bool {
+pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> bool {
     let decision =
         ctx.transition_guest_key(held.host_keyboard_id, held.key, GuestKeyEvent::RecoverIme);
     if decision.delivery != GuestKeyDelivery::EmitBalancedPair {

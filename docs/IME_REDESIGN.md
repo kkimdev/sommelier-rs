@@ -529,7 +529,7 @@ sommelier/src/ime/
 handler/text_input.rs   Adapters: decode, build an Input, call step,
                         apply the Effects.                             ~300
 handler/ime_keys.rs     Keysym routing, held-key recovery and Backspace
-                        leases, moved out of text_input.rs (PR K1).    ~400 (moved)
+                        leases, moved out of text_input.rs (PR K1).    ~400 (moved, production only)
 ```
 
 `ime` imports nothing from `handler`. From the rest of the crate it uses
