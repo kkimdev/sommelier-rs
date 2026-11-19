@@ -2481,6 +2481,39 @@ fn row_G9c_a_report_without_the_shown_preedit_is_withheld() {
     assert_eq!(out.guest, expected);
 }
 
+/// A withheld report leaves Exo's composition where it was, so Legacy
+/// mode, which measures once a forwarded key suspends the mirror's
+/// measuring, still takes Exo to hold the preedit: Exo's region over it
+/// only shows it again, and deletes none of the guest's text.
+#[test]
+fn row_G9c_after_a_withheld_report_legacy_mode_holds_the_composition() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.region(-1, 1);
+    let out = ime.report("a", 1);
+    assert_eq!(out.host, [commit_state(TI, 3)]);
+    ime.step(Input::GuestKey(SEAT));
+    assert!(!ime.in_step());
+    let out = ime.region(-1, 1);
+    assert_eq!(out.guest, [preedit_at("b", 1, 1), done(3)]);
+}
+
+/// A report on its way to Exo when the guest's next is withheld can only
+/// take the guest out of step by resetting Exo: matching an older state,
+/// here one with the composition inline, changes nothing of Exo's.
+#[test]
+fn row_G9c_an_older_report_matched_after_a_withheld_one_keeps_it_in_step() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.compose("가");
+    let barrier = ime.report_unanswered("ab가", 5);
+    let out = ime.report("ab", 2);
+    assert_eq!(out.host, [commit_state(TI, 4)]);
+    assert!(ime.in_step());
+    ime.step(Input::BarrierDone(barrier));
+    assert!(ime.in_step());
+}
+
 /// A report that names a state of Exo's goes out: Exo matches it and
 /// keeps its composition. That one would also be the composition's state
 /// without it does not matter.

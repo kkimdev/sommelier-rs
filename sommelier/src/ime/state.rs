@@ -259,8 +259,17 @@ impl TextInput {
 
     /// Whether the core withholds the guest's report `report`
     /// (`ExoView::withholds`).
+    /// The commit has already taken the report to make Exo drop the
+    /// composition of a region (`apply_commit`), but Exo keeps it, so
+    /// Legacy mode, which measures wherever Mirror mode cannot, holds the
+    /// shown preedit again, with Exo's cursor in it.
     pub(super) fn withholds_report(&mut self, report: &(String, u32, u32)) -> bool {
-        self.exo.withholds(report, self.composition.shown.as_ref())
+        let shown = self.composition.shown.as_ref();
+        if !self.exo.withholds(report, shown) {
+            return false;
+        }
+        self.composition.held = shown.and_then(|shown| self.exo.cursor_in(shown));
+        true
     }
 
     /// After a tracker-changing host event, with `frame` the one taken

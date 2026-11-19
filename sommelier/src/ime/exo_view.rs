@@ -59,7 +59,7 @@ pub(super) struct ExoView {
     /// for the empty stand-in of a guest that stated no text, which tells
     /// nothing of the guest's; and whether a later report the core withheld
     /// has already said where the guest is, so that this one can only take
-    /// it out of step.
+    /// it out of step, by resetting Exo.
     reports: VecDeque<(BarrierToken, Option<Edits>, bool)>,
 }
 
@@ -275,6 +275,15 @@ impl ExoView {
         true
     }
 
+    /// Where Exo's cursor is in its composition, if that is `shown`.
+    pub(super) fn cursor_in(&self, shown: &Preedit) -> Option<u32> {
+        let state = self.mirror.predicted();
+        let composition = &state.composition;
+        let cursor = state.selection.end.checked_sub(composition.start)?;
+        let holds = state.composition_text() == shown.text() && cursor <= composition.len();
+        holds.then_some(cursor as u32)
+    }
+
     /// The core sent a `reset`, then its fence `token`.
     pub(super) fn cancel_sent(&mut self, token: BarrierToken) {
         self.mirror.sent(token, Sent::Cancel);
@@ -305,11 +314,16 @@ impl ExoView {
             self.mirror.mark(false);
             return self.health_changed(ti, health);
         };
-        let was = self.in_step || !superseded;
         match applied {
-            Some(Applied::Matched { in_step }) => self.in_step = was && exact && in_step,
+            // A later report the core withheld placed the guest, and a
+            // report Exo matches changes nothing of Exo's.
+            Some(Applied::Matched { .. }) if superseded => {}
+            Some(Applied::Matched { in_step }) => self.in_step = exact && in_step,
             Some(Applied::Reset { cursor }) => {
-                self.in_step = was && exact && cursor && self.edits.from_exo == since.from_exo;
+                // Exo dropped the composition a later withheld report took
+                // it to hold.
+                self.in_step =
+                    !superseded && exact && cursor && self.edits.from_exo == since.from_exo;
                 self.mirror.mark(self.in_step);
             }
             Some(Applied::Cancel) | None => {}

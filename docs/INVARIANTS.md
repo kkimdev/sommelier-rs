@@ -1291,11 +1291,15 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     cursor rectangle and `commit_state` of the commit still are. A report
     Exo matches changes only its history, so Exo is where the report with
     the preedit would have left it, and the guest is in step as after a
-    matched report, at that state. Every other report goes out unchanged:
-    one that names a state is a no-op, and one that names none resets Exo
-    to the guest's text. Nothing is ever inserted into a report, so a
-    wrong mirror can only leave Exo stale until the composition ends,
-    never put the preedit in Exo's text.
+    matched report, at that state. Legacy mode, which measures wherever
+    Mirror mode cannot, takes Exo to hold the shown preedit still, with
+    Exo's cursor in it, although the commit stated text without it; and a
+    report on its way to Exo before the withheld one can take the guest
+    out of step only by resetting Exo, not by matching an older state.
+    Every other report goes out unchanged: one that names a state is a
+    no-op, and one that names none resets Exo to the guest's text. Nothing
+    is ever inserted into a report, so a wrong mirror can only leave Exo
+    stale until the composition ends, never put the preedit in Exo's text.
   The DST checks at every `done` of a sync that an exact mirror equals the
   simulated Exo's tracker, and that Exo's tracker holds each report the
   proxy withheld with the shown preedit as its composition.

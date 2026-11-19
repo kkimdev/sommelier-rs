@@ -395,13 +395,18 @@ A report Exo matches changes nothing but its history, so withholding
 one that matches only with the preedit leaves Exo where it would be had
 the guest reported the preedit. The content type, the cursor rectangle
 and `commit_state` still go out, and the guest is in step as after a
-matched report, at that state. Any other report goes out unchanged: one
+matched report, at that state; Legacy mode, which measures wherever
+Mirror mode cannot, holds the shown preedit again (`held`, Exo's cursor
+in it), and an older report still in flight can take the guest out of
+step only by resetting Exo. Any other report goes out unchanged: one
 that names a state is a no-op, and one that names none resets Exo to the
 guest's text. A wrong mirror can only leave Exo stale, never inject
 text, until the composition ends and the next report goes out. Row tests
 `row_G9c_a_report_without_the_shown_preedit_is_withheld`,
 `row_G9c_an_exact_report_goes_out_unchanged`,
-`row_G9c_an_unmatched_report_goes_out_unchanged`.
+`row_G9c_an_unmatched_report_goes_out_unchanged`,
+`row_G9c_after_a_withheld_report_legacy_mode_holds_the_composition`,
+`row_G9c_an_older_report_matched_after_a_withheld_one_keeps_it_in_step`.
 
 If the field's support for surrounding text flips, the content type is
 re-sent with the new support (test
