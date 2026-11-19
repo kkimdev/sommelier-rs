@@ -283,21 +283,14 @@ impl Tracker {
         self.expected.push(self.predicted.clone());
     }
 
-    /// `OnSetCompositionFromExistingText`: the bytes `before` the cursor
-    /// and `after` it, where they lie in the prediction, become the
-    /// composition.
-    fn compose_existing(&mut self, before: usize, after: usize) {
+    /// `OnSetCompositionFromExistingText`: the text in `range` becomes the
+    /// composition; returns it.
+    fn compose_existing(&mut self, range: Range<usize>) -> String {
         let predicted = &mut self.predicted;
-        let range = predicted.cursor.saturating_sub(before)..predicted.cursor + after;
-        let text = &predicted.text;
-        if range.end > text.len()
-            || !text.is_char_boundary(range.start)
-            || !text.is_char_boundary(range.end)
-        {
-            return;
-        }
+        let composed = predicted.text[range.clone()].to_owned();
         predicted.composition = (!range.is_empty()).then_some(range);
         self.expected.push(self.predicted.clone());
+        composed
     }
 
     /// `OnInsertText`.
@@ -473,6 +466,9 @@ pub(crate) struct Exo {
     in_engine: VecDeque<PendingKey>,
     /// The ID of the next key Exo hands the engine.
     next_key: u64,
+    /// The text of the region composed from existing text since the
+    /// engine last learned one.
+    composed_region: Option<String>,
 }
 
 impl Exo {
@@ -867,15 +863,6 @@ impl Exo {
         Some(tracker.predicted.composition().to_owned())
     }
 
-    /// The composition Exo tracks for the text input the input method
-    /// serves; empty if it composes nothing or serves none.
-    pub(super) fn served_composition(&self) -> String {
-        let served = self.ima.client.and_then(|id| self.text_inputs.get(&id));
-        served.map_or_else(String::new, |text_input| {
-            text_input.text.predicted.composition().to_owned()
-        })
-    }
-
     /// The host text inputs an input method is attached to on the focused
     /// surface: the ones whose preedits and presses matter.
     pub(crate) fn composing_text_inputs(&self) -> Vec<u32> {
@@ -1231,14 +1218,13 @@ impl Exo {
         }
     }
 
-    /// `TextInput::DeleteSurroundingText`: the bytes `before` the cursor of
-    /// Exo's prediction and `after` it, which it deletes, as a
-    /// `delete_surrounding_text` with the absolute index of their start
-    /// and no `commit_string` (E10).
+    /// `TextInput::DeleteSurroundingText`: the UTF-16 units `before` the
+    /// cursor of Exo's prediction and `after` it, clamped to it, which it
+    /// deletes, as a `delete_surrounding_text` with the absolute byte
+    /// index of their start and no `commit_string` (E10).
     fn delete_surrounding_text(&mut self, id: u32, before: usize, after: usize) {
         let text = &mut self.text_input(id).text;
-        let cursor = text.predicted.cursor;
-        let range = cursor.saturating_sub(before)..cursor + after;
+        let (range, _) = utf16_span(&text.predicted, before, after);
         let (index, length) = (range.start, range.len());
         text.delete(range);
         let index = i32::try_from(index).expect("a short text");
@@ -1247,17 +1233,32 @@ impl Exo {
         self.events.push(event);
     }
 
-    /// `TextInput::SetCompositionFromExistingText`: the bytes `before` the
-    /// cursor and `after` it become the composition, which the extension's
-    /// `set_preedit_region` shows, its start relative to the cursor.
+    /// `TextInput::SetCompositionFromExistingText`: the UTF-16 units
+    /// `before` the cursor and `after` it become the composition, which the
+    /// extension's `set_preedit_region` shows, in bytes from the cursor. A
+    /// range past the text is refused, before anything is sent
+    /// (`text_input.cc`); the engine then learns nothing.
     fn set_composition_from_existing_text(&mut self, id: u32, before: usize, after: usize) {
-        self.text_input(id).text.compose_existing(before, after);
+        let text = &mut self.text_input(id).text;
+        let (range, within) = utf16_span(&text.predicted, before, after);
+        if !within {
+            return;
+        }
+        let cursor = text.predicted.cursor;
+        let composed = text.compose_existing(range.clone());
         if let Some(extension) = self.extension_of(id) {
-            let index = -i32::try_from(before).expect("a short region");
-            let length = u32::try_from(before + after).expect("a short region");
+            let index = -i32::try_from(cursor - range.start).expect("a short region");
+            let length = u32::try_from(range.len()).expect("a short region");
             let event = extended::evt::set_preedit_region(extension, index, length);
             self.events.push(event);
         }
+        self.composed_region = Some(composed);
+    }
+
+    /// The text of the region Exo composed last from existing text, if it
+    /// did since the last call, for the engine to learn.
+    pub(super) fn take_composed_region(&mut self) -> Option<String> {
+        self.composed_region.take()
     }
 
     /// `TextInput::InsertText`: a `commit_string`, which ends the
@@ -1393,6 +1394,33 @@ impl Exo {
         let id = *self.extensions.get(&extension)?;
         self.text_inputs.contains_key(&id).then_some(id)
     }
+}
+
+/// The bytes of `predicted`'s text from `before` UTF-16 units before its
+/// cursor to `after` units after it, clamped to the text, and whether they
+/// lay within it.
+fn utf16_span(predicted: &Predicted, before: usize, after: usize) -> (Range<usize>, bool) {
+    let (text, cursor) = (&predicted.text, predicted.cursor);
+    let mut start = cursor;
+    let mut units = 0;
+    for c in text[..cursor].chars().rev() {
+        if units >= before {
+            break;
+        }
+        units += c.len_utf16();
+        start -= c.len_utf8();
+    }
+    let within_before = units >= before;
+    let mut end = cursor;
+    let mut units = 0;
+    for c in text[cursor..].chars() {
+        if units >= after {
+            break;
+        }
+        units += c.len_utf16();
+        end += c.len_utf8();
+    }
+    (start..end, within_before && units >= after)
 }
 
 /// `now` in milliseconds, as a Wayland input event carries it, wrapping as
@@ -2045,8 +2073,9 @@ mod tests {
             before: "0ab가".to_owned(),
         };
         assert_eq!(exo.take_engine(), [request]);
+        // Three UTF-16 units, five bytes.
         let delete = TextAction::Delete {
-            before: 5,
+            before: 3,
             after: 0,
         };
         let actions = vec![delete, commits("ab가~")];
@@ -2067,7 +2096,7 @@ mod tests {
         exo.ask(Request::Reconvert);
         exo.take_engine();
         let region = TextAction::Region {
-            before: 3,
+            before: 1,
             after: 0,
         };
         answer_request(&mut exo, 0, vec![region]);
@@ -2077,8 +2106,20 @@ mod tests {
         };
         assert_eq!(events(&mut exo), [(EXT, event.into())]);
         assert_eq!(*predicted(&exo), predicts("0a가", 5, Some(2..5)));
-        assert_eq!(exo.served_composition(), "가");
+        assert_eq!(exo.take_composed_region().as_deref(), Some("가"));
         assert!(exo.ima.composing);
+        // One past the text is refused before anything is sent, and the
+        // engine learns nothing.
+        exo.ask(Request::Reconvert);
+        exo.take_engine();
+        let region = TextAction::Region {
+            before: 4,
+            after: 0,
+        };
+        answer_request(&mut exo, 1, vec![region]);
+        assert_eq!(events(&mut exo), []);
+        assert_eq!(exo.take_composed_region(), None);
+        assert_eq!(*predicted(&exo), predicts("0a가", 5, Some(2..5)));
     }
 
     #[test]

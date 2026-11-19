@@ -105,11 +105,12 @@ pub(super) enum TextAction {
     Commit(String),
     /// Show this composition; an empty one ends it.
     Preedit(String),
-    /// Delete the bytes before and after the cursor, which happens only
-    /// while nothing is composed (E10).
+    /// Delete the text before and after the cursor, which happens only
+    /// while nothing is composed (E10). The engine counts UTF-16 code
+    /// units, as the IME API does.
     Delete { before: usize, after: usize },
-    /// Compose the existing text from the bytes before the cursor to those
-    /// after it (`SetCompositionFromExistingText`).
+    /// Compose the existing text from before the cursor to after it
+    /// (`SetComposingRange`), in UTF-16 code units.
     Region { before: usize, after: usize },
 }
 
@@ -195,9 +196,10 @@ impl Engine {
     }
 
     /// The engine learns the text of the region it reconverted, as the
-    /// field holds it, from the field's text that follows: an empty one if
-    /// none was composed. Its request measured the region in the text it
-    /// was handed, which can lag behind the field's.
+    /// field holds it, from the field's text that follows, once Exo
+    /// composed it. Its request measured the region in the text it was
+    /// handed, which can lag behind the field's; a region Exo refused
+    /// leaves what the engine had.
     pub fn learn_region(&mut self, text: String) {
         if self.region.is_some() {
             self.region = (!text.is_empty()).then_some(text);
@@ -305,7 +307,7 @@ impl Engine {
                 }
                 vec![
                     TextAction::Delete {
-                        before: word.len(),
+                        before: word.encode_utf16().count(),
                         after: 0,
                     },
                     TextAction::Commit(format!("{word}~")),
@@ -320,7 +322,7 @@ impl Engine {
                     return Vec::new();
                 };
                 let region = format!("{c}{region}");
-                let before = region.len();
+                let before = region.encode_utf16().count();
                 self.region = Some(region);
                 vec![TextAction::Region { before, after: 0 }]
             }
@@ -441,8 +443,9 @@ mod tests {
     fn a_suggestion_deletes_the_word_and_commits_it_anew_with_nothing_composed() {
         let accept = Request::AcceptSuggestion;
         let replaced = [
+            // In UTF-16 units: two characters.
             TextAction::Delete {
-                before: 4,
+                before: 2,
                 after: 0,
             },
             commit("a가~"),
@@ -484,8 +487,8 @@ mod tests {
         }
         let region = |before| TextAction::Region { before, after: 0 };
         let expected = [
-            vec![region(3)],
-            vec![region(4)],
+            vec![region(1)],
+            vec![region(2)],
             vec![commit("a가"), preedit("ㄱ")],
         ];
         assert_eq!(answers, expected);

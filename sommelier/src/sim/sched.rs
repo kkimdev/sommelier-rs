@@ -52,7 +52,7 @@ use super::client::{Client, Field, PressKind};
 use super::clock::Micros;
 use super::display::Display;
 use super::editor::{Target, TextModel, UserAction};
-use super::engine::{Engine, EngineIn, EngineOut, Lag, Request, TextAction};
+use super::engine::{Engine, EngineIn, Lag, Request};
 use super::exo::{Answer, Exo};
 use super::hangul::Key;
 use super::keymap;
@@ -605,13 +605,8 @@ impl<'t> World<'t> {
         self.log(Place::Engine, format!("{answer:?}"));
         let press = self.exo.press_of(&answer);
         let verdict = self.exo.answer(&answer);
-        if let EngineOut::Text { actions, .. } = &answer {
-            if actions
-                .iter()
-                .any(|a| matches!(a, TextAction::Region { .. }))
-            {
-                self.engine.learn_region(self.exo.served_composition());
-            }
+        if let Some(text) = self.exo.take_composed_region() {
+            self.engine.learn_region(text);
         }
         if let Some(spec) = &mut self.spec {
             spec.counts.late += u64::from(verdict == Answer::Late);
