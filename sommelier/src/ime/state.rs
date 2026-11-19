@@ -257,6 +257,12 @@ impl TextInput {
         self.composition.shown.as_ref()
     }
 
+    /// Whether the core withholds the guest's report `report`
+    /// (`ExoView::withholds`).
+    pub(super) fn withholds_report(&mut self, report: &(String, u32, u32)) -> bool {
+        self.exo.withholds(report, self.composition.shown.as_ref())
+    }
+
     /// After a tracker-changing host event, with `frame` the one taken
     /// before it and `edit` what reached the guest (`ExoView::after`).
     pub(super) fn exo_after(&mut self, frame: Option<&Frame>, edit: Option<Edit>) {

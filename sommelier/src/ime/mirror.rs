@@ -364,6 +364,71 @@ impl ExoMirror {
         false
     }
 
+    /// Report suppression (design exo-mirror 5): whether an exact mirror
+    /// finds that the guest's report `(text, cursor, anchor)`, from a guest
+    /// that shows the preedit `shown`, would only make Exo drop its
+    /// composition. It names no state of the history Exo will hold once it
+    /// has processed every request in flight, but one such state is the
+    /// guest's text with the composition `shown` inline, at the cursor.
+    /// Then `Some` of whether every transaction since that state kept a
+    /// guest in step. A report that names a state is a no-op for Exo, and
+    /// any other resets it to the guest's text, so both go out.
+    pub(super) fn withholds(
+        &self,
+        text: &str,
+        cursor: u32,
+        anchor: u32,
+        shown: &str,
+    ) -> Option<bool> {
+        let selection = report_selection(text, cursor, anchor)?;
+        if self.health != Health::Exact || !selection.is_empty() {
+            return None;
+        }
+        let from = self.projected_from()?;
+        let mut states = self.expected.iter().skip(from);
+        if states
+            .clone()
+            .any(|(state, _)| state.selection == selection && state.text == text)
+        {
+            return None;
+        }
+        let cursor = selection.start;
+        states.find(|(state, _)| {
+            let composition = &state.composition;
+            !composition.is_empty()
+                && composition.start == cursor
+                && state.composition_text() == shown
+                && text.get(..cursor) == Some(&state.text[..cursor])
+                && text.get(cursor..) == Some(&state.text[composition.end..])
+        })?;
+        Some(states.all(|&(_, in_step)| in_step))
+    }
+
+    /// Where the history Exo will hold once it has processed every request
+    /// in flight starts in `expected`, of which it is a suffix: every event
+    /// so far came before them. `None` if one of them will reset it or
+    /// empty it.
+    fn projected_from(&self) -> Option<usize> {
+        let mut from = 0;
+        for (_, sent) in &self.in_flight {
+            let Sent::Report {
+                text,
+                cursor,
+                anchor,
+            } = sent
+            else {
+                return None;
+            };
+            let Some(selection) = report_selection(text, *cursor, *anchor) else {
+                continue;
+            };
+            let matches =
+                |(state, _): &(ExoState, bool)| state.selection == selection && state.text == *text;
+            from += self.expected.iter().skip(from).position(matches)?;
+        }
+        Some(from)
+    }
+
     pub(super) fn health(&self) -> Health {
         self.health
     }

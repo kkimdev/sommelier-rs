@@ -44,7 +44,8 @@ pub(super) struct ExoView {
     /// The guest's text is Exo's predicted text without the composition
     /// Exo holds, which the guest shows as its preedit, with its cursor
     /// where Exo predicts it (design exo-mirror 3.1), but for `unseen`.
-    /// Only a report Exo has processed sets it.
+    /// Only a report sets it: one Exo has processed, or one the core
+    /// withheld.
     in_step: bool,
     /// The proxy forwarded the guest a key or a press since the guest last
     /// stated its text, which may have edited it where Exo does not see.
@@ -54,10 +55,12 @@ pub(super) struct ExoView {
     at_commit: Edits,
     /// Each report's barrier, with the edits the report may not hold: Exo's
     /// since the guest's commit before it, which the guest may not have got
-    /// when it made the report, and the others since the report; `None`
+    /// when it made the report, and the others since the report, `None`
     /// for the empty stand-in of a guest that stated no text, which tells
-    /// nothing of the guest's.
-    reports: VecDeque<(BarrierToken, Option<Edits>)>,
+    /// nothing of the guest's; and whether a later report the core withheld
+    /// has already said where the guest is, so that this one can only take
+    /// it out of step.
+    reports: VecDeque<(BarrierToken, Option<Edits>, bool)>,
 }
 
 /// What reached the guest of one host event.
@@ -241,7 +244,35 @@ impl ExoView {
             from_exo: self.at_commit.from_exo,
             unseen: self.edits.unseen,
         };
-        self.reports.push_back((token, stated.then_some(since)));
+        self.reports
+            .push_back((token, stated.then_some(since), false));
+    }
+
+    /// Report suppression (design exo-mirror 5): in Mirror mode, whether
+    /// the core withholds the guest's report `report`, from a guest that
+    /// shows `shown`, which Exo could not match only for the composition
+    /// the guest shows outside its text, so that it would only drop that
+    /// composition (E4). A withheld report puts the guest in step as a
+    /// matched one does, at the state with that composition, and states
+    /// every key and press before it.
+    pub(super) fn withholds(
+        &mut self,
+        (text, cursor, anchor): &(String, u32, u32),
+        shown: Option<&Preedit>,
+    ) -> bool {
+        let withheld = (self.mode == ImeMode::Mirror)
+            .then_some(shown)
+            .flatten()
+            .and_then(|shown| self.mirror.withholds(text, *cursor, *anchor, shown.text()));
+        let Some(in_step) = withheld else {
+            return false;
+        };
+        self.in_step = in_step;
+        self.unseen = false;
+        for (_, _, superseded) in &mut self.reports {
+            *superseded = true;
+        }
+        true
     }
 
     /// The core sent a `reset`, then its fence `token`.
@@ -258,14 +289,14 @@ impl ExoView {
         let health = self.mirror.health();
         let applied = self.mirror.barrier_done(token);
         let since = match self.reports.front() {
-            Some(&(front, since)) if front == token => {
+            Some(&(front, since, superseded)) if front == token => {
                 self.reports.pop_front();
-                Some(since)
+                Some((since, superseded))
             }
             _ => None,
         };
         let exact = self.mirror.health() == Health::Exact;
-        let Some(since) = since else {
+        let Some((since, superseded)) = since else {
             return self.health_changed(ti, health);
         };
         let Some(since) = since else {
@@ -274,10 +305,11 @@ impl ExoView {
             self.mirror.mark(false);
             return self.health_changed(ti, health);
         };
+        let was = self.in_step || !superseded;
         match applied {
-            Some(Applied::Matched { in_step }) => self.in_step = exact && in_step,
+            Some(Applied::Matched { in_step }) => self.in_step = was && exact && in_step,
             Some(Applied::Reset { cursor }) => {
-                self.in_step = exact && cursor && self.edits.from_exo == since.from_exo;
+                self.in_step = was && exact && cursor && self.edits.from_exo == since.from_exo;
                 self.mirror.mark(self.in_step);
             }
             Some(Applied::Cancel) | None => {}

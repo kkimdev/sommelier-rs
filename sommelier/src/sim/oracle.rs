@@ -596,6 +596,12 @@ pub(super) struct SpecText {
     /// handles one request, so at most one commit.
     report: Option<(String, u32, u32)>,
     reported: Vec<(String, u32, u32)>,
+    /// Mirror mode: the report the proxy withheld in the step, with the
+    /// preedit the guest shows, for the caller to hold to Exo's tracker
+    /// ([`SpecText::take_withheld`]); and whether the proxy withheld the
+    /// field's latest report, so that Exo still has an older one.
+    withheld: Option<((String, u32, u32), String)>,
+    pub report_withheld: bool,
     /// The content-type requests the proxy sent in the step that are not
     /// the committed field's.
     typed: Vec<String>,
@@ -643,6 +649,8 @@ impl SpecText {
             wrong_regions: Vec::new(),
             report: None,
             reported: Vec::new(),
+            withheld: None,
+            report_withheld: false,
             typed: Vec::new(),
             wrong_reports: Vec::new(),
             counts: Counts::default(),
@@ -1785,11 +1793,27 @@ impl SpecText {
     /// guest committed in it: the surrounding text a commit stated, once,
     /// and every content type and surrounding-text support as the committed
     /// field's.
+    ///
+    /// In Mirror mode the proxy may withhold a report while the guest shows
+    /// a preedit (design exo-mirror 5), if Exo's tracker holds the report
+    /// with that preedit as its composition, which the caller checks.
     fn check_reports(&mut self) {
         let reported = std::mem::take(&mut self.reported);
         let expected: Vec<_> = self.report.take().into_iter().collect();
         let mut wrong = Vec::new();
-        if reported != expected {
+        let shown = self.shown.as_ref().map(|shown| shown.text.clone());
+        let withheld = match (&expected[..], shown) {
+            ([report], Some(shown)) if self.mirror && reported.is_empty() => {
+                Some((report.clone(), shown))
+            }
+            _ => None,
+        };
+        if !expected.is_empty() {
+            self.report_withheld = withheld.is_some();
+        }
+        if withheld.is_some() {
+            self.withheld = withheld;
+        } else if reported != expected {
             wrong.push(format!(
                 "the surrounding text {reported:?}, the specification asks {expected:?}"
             ));
@@ -1799,6 +1823,23 @@ impl SpecText {
             let wrong = wrong.join("; ");
             self.wrong_reports
                 .push(format!("after {}: the proxy reported {wrong}", self.input));
+        }
+    }
+
+    /// The report the proxy withheld in the step just ended, with the
+    /// preedit the guest shows, which Exo's tracker must hold as a state
+    /// with that composition at the report's cursor; the caller says
+    /// whether it does.
+    pub fn take_withheld(&mut self, held: impl FnOnce(&(String, u32, u32), &str) -> bool) {
+        let Some((report, shown)) = self.withheld.take() else {
+            return;
+        };
+        if !held(&report, &shown) && self.wrong_reports.len() < 5 {
+            self.wrong_reports.push(format!(
+                "after {}: the proxy withheld the surrounding text {report:?}, which Exo's \
+                 tracker does not hold with the composition {shown:?}",
+                self.input
+            ));
         }
     }
 
@@ -2111,20 +2152,22 @@ pub(super) fn exact(
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
             );
-            // In Mirror mode, a report Exo could not match dropped it (E4).
-            let check = match spec.mirror && tracked.is_empty() && exo.composition_dropped() {
-                true => "composition a report dropped",
-                false => "composition",
-            };
-            failures.push(failure(check, Some(field), detail));
+            failures.push(failure("composition", Some(field), detail));
         }
     }
-    let expected: Vec<exo::Field> = spec
+    let mut expected: Vec<exo::Field> = spec
         .committed
         .iter()
         .map(|field| field.on_host(extension.unwrap_or(0)))
         .collect();
     let held = exo.focused_fields();
+    // Exo still has the report before a withheld one, which its tracker
+    // held when the proxy withheld it ([`SpecText::take_withheld`]).
+    if spec.report_withheld {
+        for (expected, held) in expected.iter_mut().zip(&held) {
+            expected.surrounding_text = held.surrounding_text.clone();
+        }
+    }
     if held != expected {
         let detail = format!("committed: {expected:?}\nExo holds: {held:?}");
         failures.push(failure("field state", spec.focus, detail));
@@ -2168,6 +2211,8 @@ pub(super) fn intended(reference: &Reference, client: &dyn Client) -> Vec<Failur
 /// PR that fixes one deletes its variant. C5 deleted the last two of tier
 /// 2, the focus loss (P1) and the restart that lost a composition Exo no
 /// longer tracked (H2), by committing the shown preedit at both.
+/// Report suppression (M4 of the Exo mirror plan) deleted Mirror mode's
+/// one, the report that left out the shown preedit (E4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum KnownIssue {
     /// A preedit region Exo made from text older than the guest's report
@@ -2187,9 +2232,6 @@ pub(super) enum KnownIssue {
     /// method the guest has yet to report is measured in the text it last
     /// reported (X1, P4).
     RegionWhileAhead,
-    /// Mirror mode: the guest's report leaves out the preedit it shows, so
-    /// Exo cannot match it and drops the composition (E4).
-    ReportDropsComposition,
 }
 
 impl KnownIssue {
@@ -2216,12 +2258,6 @@ impl KnownIssue {
                  report crossed, or a press's commit; the proxy measures it in the text the \
                  guest last reported, which tracks only the bytes regions took, so the guest \
                  shows other bytes than Exo composes (X1, P4)"
-            }
-            Self::ReportDropsComposition => {
-                "a text-input-v3 guest reports its text without the preedit it shows, as \
-                 the protocol has it, which names no state Exo predicted, as each holds the \
-                 composition inline; Exo drops its composition (E4), and the guest shows a \
-                 preedit Exo no longer holds, until the engine's next preedit replaces it"
             }
             Self::RegionCrossesReport => {
                 "Exo makes a region in the text it had before a report of the guest's, which \
@@ -2252,9 +2288,6 @@ impl KnownIssue {
                 "docs/IME_REDESIGN.md 2.2 X1 and HANDOVER; needs the proxy to track the text the \
                  guest gained, not only the bytes it lost"
             }
-            Self::ReportDropsComposition => {
-                "docs/IME_REDESIGN.md 4.8; report suppression (PR M4 of the Exo mirror plan)"
-            }
         }
     }
 }
@@ -2271,10 +2304,8 @@ pub(super) fn classify(failures: &[Failure], counts: &Counts, mirror: bool) -> V
     let mut known = Vec::new();
     for failure in failures {
         let issue = match (failure.tier, failure.check) {
-            (Tier::Exact, "composition a report dropped") if mirror => {
-                KnownIssue::ReportDropsComposition
-            }
-            // The rest are Legacy mode's: Mirror mode measures in Exo's text.
+            // The rest are Legacy mode's: Mirror mode measures in Exo's text,
+            // and withholds a report that would only drop Exo's composition.
             _ if !legacy => return Vec::new(),
             (Tier::Exact, "composition") if counts.regions_crossing_reports > 0 => {
                 KnownIssue::RegionCrossesReport
