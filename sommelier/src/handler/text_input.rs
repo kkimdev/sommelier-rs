@@ -533,26 +533,42 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             return drop_host_preedit(ctx, guest_id);
         };
 
-        let text = &plan.surrounding_text;
-        let cursor = plan.surrounding_cursor;
-        let start = i64::from(cursor) + i64::from(index);
-        let Some((before_length, after_length)) =
-            lengths_around_cursor(text, cursor, start, length)
-        else {
+        // Exo measures the region from its cursor in its own text, which
+        // holds the preedit it composes as text.
+        let lengths = plan.host_text.as_ref().and_then(|host| {
+            let cursor = i32::try_from(host.cursor).ok()?;
+            let start = i64::from(cursor) + i64::from(index);
+            let lengths = lengths_around_cursor(&host.text, cursor, start, length)?;
+            Some((host, lengths))
+        });
+        let Some((host, (before_length, after_length))) = lengths else {
+            let host = plan.host_text.as_ref();
             log::warn!(
-                "on_set_preedit_region: range {}+{} is invalid, non-adjacent to cursor {}, or out of bounds for text length {}",
-                start,
+                "on_set_preedit_region: region {}+{} is invalid, non-adjacent to the host's cursor {:?}, or out of bounds for its text length {:?}",
+                index,
                 length,
-                cursor,
-                text.len()
+                host.map(|host| host.cursor),
+                host.map(|host| host.text.len()),
             );
             return drop_host_preedit(ctx, guest_id);
         };
 
-        // The cursor is a character boundary of `text`, at most its length.
-        let cursor = cursor as usize;
-        let preedit_text =
-            text[cursor - before_length as usize..cursor + after_length as usize].to_string();
+        let region = host.cursor - before_length as usize..host.cursor + after_length as usize;
+        // An empty region ends Exo's composition and leaves the preedit it
+        // held as text (`SurroundingTextTracker::
+        // OnSetCompositionFromExistingText` with an empty range), as a
+        // confirmation does, so the guest commits it. Only with Exo's
+        // cursor after that preedit, where the guest's is after a commit.
+        let composition = &host.composition;
+        if region.is_empty() && !composition.is_empty() && composition.end == host.cursor {
+            let confirmed = ctx.text_inputs[&guest_id].prepare_confirm_preedit();
+            let confirmed = confirmed.expect("the region's plan found the composition current");
+            if !commit_shown_preedit(ctx, guest_id, confirmed) {
+                return drop_host_preedit(ctx, guest_id);
+            }
+            return Action::Drop;
+        }
+        let preedit_text = host.text[region.clone()].to_string();
         let default_cursor = before_length as i32;
         let pending_cursor = plan.cursor.or(Some(default_cursor));
         let (cursor_begin, cursor_end) =
@@ -565,25 +581,23 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         // The region's preedit is the text it takes.
         let empty = preedit_text.is_empty();
         debug_assert_eq!(empty, (before_length, after_length) == (0, 0));
-        // The guest no longer has the bytes earlier regions took, if it has
-        // not reported its text since: they are not deleted again. A region
-        // that does not cover them would leave them lost or shown twice, so
-        // it is dropped.
-        let deleted = match plan.unreported_taken {
-            None => (before_length, after_length),
-            Some((shown_before, shown_after)) => match (
-                before_length.checked_sub(shown_before),
-                after_length.checked_sub(shown_after),
-            ) {
-                (Some(before), Some(after)) => (before, after),
-                _ => {
-                    log::debug!(
-                        "Ignoring a preedit region of text input {guest_id} that does not \
-                         cover the region it shows"
-                    );
-                    return drop_host_preedit(ctx, guest_id);
-                }
-            },
+        // The guest no longer has the preedit Exo holds, whose bytes are
+        // not in its text: they are not deleted. A region that does not
+        // cover them would leave them lost or shown twice, so it is
+        // dropped.
+        let deleted = match (
+            composition.start.checked_sub(region.start),
+            region.end.checked_sub(composition.end),
+        ) {
+            // Both are at most the region's length.
+            (Some(before), Some(after)) => (before as u32, after as u32),
+            _ => {
+                log::debug!(
+                    "Ignoring a preedit region of text input {guest_id} that does not \
+                     cover the preedit it shows"
+                );
+                return drop_host_preedit(ctx, guest_id);
+            }
         };
         let deletes = deleted != (0, 0);
         let mut transaction = Vec::new();
@@ -616,8 +630,8 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             .get_mut(&guest_id)
             .expect("active text input disappeared while installing preedit region");
         let guest_seat = plan.guest_seat;
-        let region = (before_length, after_length);
-        state.finish_preedit_region(plan, preedit_text, (cursor_begin, cursor_end), region);
+        let cursor = (cursor_begin, cursor_end);
+        state.finish_preedit_region(plan, preedit_text, cursor, deleted, before_length);
         end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         ctx.host_to_client_queue.extend(transaction);
 
@@ -4415,7 +4429,9 @@ pub(super) mod tests {
                 ],
             ),
             (
-                "an empty preedit region over a preedit edits nothing",
+                // It commits the preedit, an edit, as a confirmation does
+                // ([`an_empty_region_over_a_held_preedit_commits_it`]).
+                "an empty preedit region over a preedit commits it",
                 Some(("abc", 3, 3)),
                 |f| {
                     vec![
@@ -4424,14 +4440,7 @@ pub(super) mod tests {
                         f.delete_range(2, 1),
                     ]
                 },
-                vec![
-                    preedit("x"),
-                    DONE_2,
-                    no_preedit(),
-                    DONE_2,
-                    delete(1, 0),
-                    DONE_2,
-                ],
+                vec![preedit("x"), DONE_2, no_preedit(), commit("x"), DONE_2],
             ),
             (
                 // The guest gets only a `done`, so it has no edit to report.
@@ -4700,18 +4709,37 @@ pub(super) mod tests {
         .await;
         assert_eq!(f.s.guest_received(), expected);
 
+        // An empty region clears a preedit Exo no longer holds the same
+        // way: a region's, with its cursor hidden, whose bytes the guest
+        // has reported without.
         f.s.host([
-            f.preedit("가", ""),
             v1::preedit_cursor(f.host, -1),
-            ext::set_preedit_region(f.host_ext, 0, 0),
+            ext::set_preedit_region(f.host_ext, -1, 1),
         ])
         .await;
-        assert_eq!(f.s.guest_received(), expected);
+        let expected = [delete(1, 0), preedit_at("d", -1, -1), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "abcef", 3, 3).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let expected = [f.surrounding_text("abcef", 3, 3), f.commit_state(3)];
+        assert_eq!(f.s.host_received(), expected);
+        let done = || V3::Done { serial: 3 };
+        let expected = [preedit_at("d", -1, -1), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
+        assert_eq!(f.s.guest_received(), f.events([no_preedit(), done()]));
     }
 
     /// An empty preedit region deletes nothing, so it sends no
     /// `delete_surrounding_text`, only the empty preedit that clears a
-    /// shown one ([`an_empty_preedit_reaches_only_a_guest_that_shows_one`]). Chromium
+    /// shown one Exo no longer holds
+    /// ([`an_empty_preedit_reaches_only_a_guest_that_shows_one`],
+    /// [`an_empty_preedit_has_no_hidden_cursor`]); one over a preedit Exo
+    /// holds commits it
+    /// ([`an_empty_region_over_a_held_preedit_commits_it`]). Chromium
     /// applies an empty delete too (`ZwpTextInputV3Impl::OnDone`,
     /// `ui/ozone/platform/wayland/host/zwp_text_input_v3.cc` 440, revision
     /// ffb4f13519), and while nothing is composed it deletes the selection
@@ -4724,14 +4752,6 @@ pub(super) mod tests {
         let done = || V3::Done { serial: 2 };
         f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
         assert_eq!(f.s.guest_received(), f.events([done()]));
-
-        f.s.host([
-            f.preedit("가", ""),
-            ext::set_preedit_region(f.host_ext, 0, 0),
-        ])
-        .await;
-        let expected = [preedit("가"), done(), no_preedit(), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
     /// A region over the preedit an earlier region made deletes only the
@@ -4775,6 +4795,8 @@ pub(super) mod tests {
     /// A host `preedit_string` after a region replaces the preedit but not
     /// what the guest lost: the bytes the region took stay out of its text
     /// until it reports, so a later region still deletes only the rest.
+    /// Exo holds the new preedit in place of those bytes, so the region
+    /// takes it.
     #[tokio::test]
     async fn a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
         let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
@@ -4786,9 +4808,121 @@ pub(super) mod tests {
         f.s.host([f.preedit("x", "")]).await;
         let _ = f.s.guest_received();
 
-        // The guest's text is "abc|ef": of "cd", only "c" is left.
+        // The guest's text is "abc|ef", and Exo's "abcx|ef": of "cx", only
+        // "c" is in the guest's.
         f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
-        let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done(2)];
+        let expected = [no_preedit(), delete(1, 0), preedit_at("cx", 2, 2), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A preedit cleared with a reset commit gives the guest the region's
+    /// bytes back as text, as a commit does, so a later region deletes
+    /// them again.
+    #[tokio::test]
+    async fn a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // The guest's text is "abcd|ef" again.
+        f.s.host([f.preedit("", "d")]).await;
+        let expected = [no_preedit(), commit("d"), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
+        let expected = [delete(2, 0), preedit_at("cd", 2, 2), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// Exo holds the preedit the guest shows as text at the guest's
+    /// cursor, with its own cursor where the preedit's was, and measures a
+    /// region from there (`SurroundingTextTracker::OnSetCompositionText`,
+    /// `TextInput::SetCompositionFromExistingText`). A region over a host
+    /// preedit takes it with the committed bytes around it and deletes
+    /// only those, which the DST found (seed 1008182): with "a1b|" and "b"
+    /// shown, region -2+2 is "bb", not "1b".
+    #[tokio::test]
+    async fn a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
+        let mut f = Field::with_surrounding_text("a1b", 3, 3).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([v1::preedit_cursor(f.host, 1), f.preedit("b", "b")])
+            .await;
+        let expected = [preedit_at("b", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("bb", 2, 2), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A non-empty region that does not cover the host preedit the guest
+    /// shows is dropped: Exo would leave the rest of that preedit as text,
+    /// which only a commit after the region's delete could give the guest.
+    /// One that covers it on both sides deletes the bytes beyond it on
+    /// each.
+    #[tokio::test]
+    async fn a_region_that_does_not_cover_a_host_preedit_is_dropped() {
+        let mut f = Field::with_surrounding_text("abc", 1, 1).await;
+        let done = |serial| V3::Done { serial };
+        // Exo holds "ax|bc".
+        f.s.host([v1::preedit_cursor(f.host, 1), f.preedit("x", "x")])
+            .await;
+        let expected = [preedit_at("x", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        for (index, length) in [(-2, 1), (0, 1)] {
+            f.s.host([ext::set_preedit_region(f.host_ext, index, length)])
+                .await;
+            assert_eq!(f.s.guest_received(), [], "region {index}+{length}");
+        }
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 3)]).await;
+        let expected = [no_preedit(), delete(1, 1), preedit_at("axb", 2, 2), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// An empty region at Exo's cursor ends Exo's composition and leaves
+    /// the preedit it held as text: Exo sends `set_preedit_region(0, 0)`
+    /// for an empty range (`zwp_text_input_manager.cc`
+    /// `SetCompositionFromExistingText`, which nothing before it filters),
+    /// and its tracker keeps the text with an empty composition
+    /// (`SurroundingTextTracker::OnSetCompositionFromExistingText`). So the
+    /// guest commits the preedit, a host preedit or a region's, which gives
+    /// the region's bytes back. With Exo's cursor inside the preedit, where
+    /// no commit leaves the guest's, the region is dropped.
+    #[tokio::test]
+    async fn an_empty_region_over_a_held_preedit_commits_it() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = |serial| V3::Done { serial };
+        let empty = || ext::set_preedit_region(f.host_ext, 0, 0);
+        f.s.host([f.preedit("x", "x"), empty()]).await;
+        let expected = [preedit("x"), done(2), no_preedit(), commit("x"), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // A region's preedit, "d" of "abcd|ef".
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1), empty()])
+            .await;
+        let expected = [
+            delete(1, 0),
+            preedit_at("d", 1, 1),
+            done(2),
+            no_preedit(),
+            commit("d"),
+            done(2),
+        ];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
+        let expected = [delete(2, 0), preedit_at("cd", 2, 2), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([
+            v1::preedit_cursor(f.host, 1),
+            f.preedit("xy", "xy"),
+            empty(),
+        ])
+        .await;
+        let expected = [preedit_at("xy", 1, 1), done(2)];
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 

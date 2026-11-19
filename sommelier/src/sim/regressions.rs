@@ -98,21 +98,56 @@ fn action(action: UserAction) -> String {
 /// The regressions, each replayed against the oracle. The first is a
 /// placeholder that shows the form and smoke-tests the replay: no bug
 /// produced it. Real ones come from a shrunk failure.
-const CASES: &[Regression] = &[Regression {
-    name: "placeholder: a syllable, a Backspace and a focus move, on the sequential schedule",
-    client: ClientKind::Gtk4,
-    settled: false,
-    latin: false,
-    texts: &["가", "1"],
-    actions: &[
-        UserAction::Key(Key::Char('r')),
-        UserAction::Key(Key::Char('k')),
-        UserAction::Key(Key::Backspace),
-        UserAction::Focus(1),
-        UserAction::Settle,
-    ],
-    choices: &[],
-}];
+const CASES: &[Regression] = &[
+    Regression {
+        name: "placeholder: a syllable, a Backspace and a focus move, on the sequential schedule",
+        client: ClientKind::Gtk4,
+        settled: false,
+        latin: false,
+        texts: &["가", "1"],
+        actions: &[
+            UserAction::Key(Key::Char('r')),
+            UserAction::Key(Key::Char('k')),
+            UserAction::Key(Key::Backspace),
+            UserAction::Focus(1),
+            UserAction::Settle,
+        ],
+        choices: &[],
+    },
+    Regression {
+        // Seed 1000050, shrunk. The guest shows a host preedit, which Exo
+        // holds before its cursor, when the input method reconverts it.
+        name: "a region over a host preedit is measured from Exo's cursor",
+        client: ClientKind::Chromium,
+        settled: false,
+        latin: false,
+        texts: &["01닭2", "0닭1bb2b"],
+        actions: &[
+            UserAction::Key(Key::Char('e')),
+            UserAction::Click {
+                field: 0,
+                at: Target::BeforeMarker(1),
+            },
+            UserAction::Key(Key::Char('z')),
+            UserAction::Tap {
+                field: 0,
+                at: Target::BeforeMarker(2),
+            },
+            UserAction::Reconvert,
+            UserAction::Key(Key::Char('o')),
+        ],
+        choices: &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1291, 0, 0, 0, 0, 0, 0, 589, 0, 126, 0, 0, 0, 0, 0, 0, 0,
+            1298, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 2, 0, 0, 602, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 290,
+            0, 0, 0, 0, 1,
+        ],
+    },
+];
 
 #[test]
 fn every_regression_passes_the_oracle() {

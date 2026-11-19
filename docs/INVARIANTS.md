@@ -1033,21 +1033,51 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   land wrong (see HANDOVER). Preedit regions are deliberately not gated
   by `unreported_host_edit`: dropping one would leave Exo composing text
   the guest does not show, so a region right after an unreported edit may
-  take its text from the guest's last report. One such edit is accounted
-  for: the bytes around the cursor that preedit regions took since the
-  guest last reported (`TextInputState::unreported_taken`; only the
-  guest's committed surrounding text, or an edit that ends the composition
-  and gives the bytes back as text, clears it, and a host `preedit_string`
-  does not). While it is set, a new region deletes only the bytes around it
-  that the guest still has, including after a `preedit_string` replaced
-  the region's preedit. A region that does not cover those bytes, an empty
-  region and a region short on either side included, is dropped with a
-  debug log while a region-made preedit is unreported: it would lose them
-  or show them twice. A guest report that crosses the transaction clears
-  it early, the same race as above.
+  take its text from the guest's last report.
+
+  Exo makes a region of the bytes around its own cursor in the text it
+  predicts (`TextInput::SetCompositionFromExistingText`,
+  `components/exo/text_input.cc`; `zwp_text_input_manager.cc` sends the
+  index relative to the cursor), and that text holds its composition
+  inline, with its cursor where the composition's is
+  (`SurroundingTextTracker::OnSetCompositionText`,
+  `ui/base/ime/surrounding_text_tracker.cc`), while the guest shows its
+  preedit outside its text. So the proxy measures a region in Exo's text
+  as far as it knows it (`TextInputState::host_text`): the guest's text,
+  with the preedit Exo holds at the guest's cursor and Exo's cursor in it
+  (`ShownPreedit::host_cursor`, where Exo sent that preedit's cursor, or
+  its end). The guest's text is the committed surrounding text without
+  the bytes around its cursor that preedit regions took since the guest
+  last reported (`TextInputState::unreported_taken`; only the guest's
+  committed surrounding text, or an edit that ends the composition and
+  gives the bytes back as text, a preedit cleared with a reset commit
+  included, clears it, and any other host `preedit_string` does not). Exo
+  holds every preedit the proxy showed but a region's whose bytes the
+  guest has since reported without: no state Exo predicted names that
+  report, so Exo drops its composition (E4 of `docs/IME_REDESIGN.md`).
+
+  A region must cover the preedit Exo holds; it deletes only the bytes
+  beyond it on each side, which the guest has, and shows them with that
+  preedit. An empty region at Exo's cursor after that preedit ends Exo's
+  composition and leaves the preedit as text, since nothing filters an
+  empty range (`InputMethodAsh::SetCompositionRange` and
+  `SetComposingRange`,
+  `TextInput::SetCompositionFromExistingText`) and the tracker keeps an
+  empty composition (`OnSetCompositionFromExistingText`): the guest
+  commits the preedit, as at a confirmation. Any other region that does
+  not cover it, an empty one with Exo's cursor inside the preedit and a
+  region short on either side included, is dropped with a debug log: Exo
+  would leave the rest of that preedit as text, which only a commit after
+  the region's delete could give the guest. A guest report that crosses the
+  transaction clears `unreported_taken` early, the same race as above.
   Tests: `exo_deletes_become_v3_deletes_around_the_cursor`,
   `a_region_over_a_region_deletes_only_what_the_guest_has`,
   `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`,
+  `a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back`,
+  `a_region_over_a_host_preedit_is_measured_from_exos_cursor`,
+  `a_region_that_does_not_cover_a_host_preedit_is_dropped`,
+  `an_empty_region_over_a_held_preedit_commits_it`,
+  `an_empty_preedit_has_no_hidden_cursor`,
   `a_region_equal_to_the_shown_one_sends_only_the_preedit`,
   `a_region_that_does_not_cover_the_shown_one_is_dropped`,
   `a_region_over_a_region_deletes_the_rest_on_both_sides`,

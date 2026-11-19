@@ -37,13 +37,15 @@ limitations under the License.
 //!
 //! `SpecText` tracks whether the guest's text is ahead of what it last
 //! reported, which drops Exo's absolute deletes (H9), and the bytes the
-//! preedit regions took since (X1). Exo sends no `preedit_styling` (H4).
+//! preedit regions took since, which with the preedit Exo holds give
+//! Exo's text, which Exo measures a region in (X1). Exo sends no
+//! `preedit_styling` (H4).
 
 use std::collections::BTreeMap;
 
 use super::client::Client;
 use super::editor::{Reference, Target, TextModel, Txn, Typing, UserAction};
-use super::exo::{self, Exo};
+use super::exo::{self, Exo, RegionTruth};
 use super::hangul::Key;
 use super::keymap;
 use super::sched::Detach;
@@ -66,6 +68,8 @@ pub(super) enum Seen<'a> {
         sender: u32,
         event: &'a AnyEvent,
         origin: Origin,
+        /// What Exo did of it, if it is a `set_preedit_region`.
+        region: Option<&'a RegionTruth>,
     },
     /// The proxy sent the host a request.
     ToHost(&'a AnyRequest),
@@ -265,12 +269,28 @@ enum After {
     Other,
 }
 
+/// What the specification takes Exo's text to be when it makes a region
+/// (X1): the guest's text with the preedit Exo holds at the guest's
+/// cursor, Exo's cursor in it; and whether the guest's text is ahead of its
+/// report.
+#[derive(Clone, Debug)]
+struct RegionModel {
+    text: String,
+    cursor: usize,
+    held: String,
+    ahead: bool,
+}
+
 /// The preedit the guest shows, as the proxy tracks it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Shown {
     text: String,
     cursor: (i32, i32),
     origin: Origin,
+    /// Where Exo's cursor is in `text`, while Exo holds `text` at the
+    /// guest's cursor (X1); `None` for a region's once the guest reported
+    /// text without its bytes, which Exo cannot match (E4).
+    host_cursor: Option<usize>,
 }
 
 /// A field as a client shows it: its model, and the cursor of its preedit,
@@ -329,9 +349,12 @@ pub(super) struct Counts {
     /// the guest had not reported.
     pub regions: u64,
     pub regions_over_regions: u64,
-    /// Preedit regions the guest got while it showed a preedit whose bytes
-    /// the committed text does not hold (KnownIssue::RegionOverShownPreedit).
+    /// Preedit regions the guest got over a preedit Exo holds whose bytes
+    /// the committed text does not hold, a host preedit's (X1).
     pub regions_over_preedits: u64,
+    /// Empty preedit regions that ended the composition Exo held, which the
+    /// guest committed (X1).
+    pub regions_ended: u64,
     /// Preedit regions dropped for their range or for not covering a
     /// region the guest had not reported (X1').
     pub regions_dropped: u64,
@@ -343,6 +366,13 @@ pub(super) struct Counts {
     /// Ranges IMA sent after the commit of the key it held them for
     /// (KnownIssue::StaleRegionAfterCommit).
     pub regions_stale: u64,
+    /// Regions after which the guest shows another preedit than Exo
+    /// composed, as Exo made them over a composition it no longer held
+    /// (KnownIssue::RegionOverUnheldPreedit), or in text holding edits the
+    /// guest had yet to report (KnownIssue::RegionWhileAhead).
+    pub regions_unheld: u64,
+    pub regions_ahead: u64,
+
     /// Focus moves that the text input heard of before the keyboard, bound
     /// after its activate, so that Exo detached while attached (H2).
     pub detaches_before_keyboard: u64,
@@ -382,10 +412,13 @@ impl std::ops::AddAssign for Counts {
         self.regions += other.regions;
         self.regions_over_regions += other.regions_over_regions;
         self.regions_over_preedits += other.regions_over_preedits;
+        self.regions_ended += other.regions_ended;
         self.regions_dropped += other.regions_dropped;
         self.crossed_reports += other.crossed_reports;
         self.regions_crossing_reports += other.regions_crossing_reports;
         self.regions_stale += other.regions_stale;
+        self.regions_unheld += other.regions_unheld;
+        self.regions_ahead += other.regions_ahead;
         self.detaches_before_keyboard += other.detaches_before_keyboard;
         self.recovered_keys += other.recovered_keys;
         self.recoveries_skipped += other.recoveries_skipped;
@@ -432,9 +465,26 @@ pub(super) struct SpecText {
     shown: Option<Shown>,
     /// The guest's text may hold edits it has not reported (`Ahead`).
     ahead: bool,
+    /// The surrounding text the guest last committed crossed an edit on
+    /// its way to the guest (P4), so Exo's text may hold edits the proxy
+    /// takes the guest to have reported; and whether the one pending did.
+    stale_report: bool,
+    pending_report_crossed: bool,
+    /// A region the guest shows other than Exo composed, for a known
+    /// reason, since the guest last reported: later regions then differ
+    /// for that reason ([`SpecText::judge_region`]).
+    diverged: Option<&'static str>,
+    /// The edits that reached the guest so far, and when the pending
+    /// surrounding text was stated: a commit that applies it after an edit
+    /// crossed that edit too (P4).
+    edits: u64,
+    edits_at_report: u64,
     /// The bytes before and after the committed cursor that preedit
     /// regions took since the guest last reported (X1).
     taken: Option<(usize, usize)>,
+    /// Exo's text as the last region found it, for
+    /// [`SpecText::judge_region`].
+    region_model: Option<RegionModel>,
     /// The last `preedit_cursor` since a terminal event (H5).
     assembly: Option<i32>,
     /// The keys the host holds, by keycode, and the peeks so far: the
@@ -457,6 +507,9 @@ pub(super) struct SpecText {
     input: String,
     /// The steps whose decisions were not the specification's.
     pub wrong_decisions: Vec<String>,
+    /// The regions after which the guest shows another preedit than Exo
+    /// composed, with the check that failed ([`SpecText::judge_region`]).
+    pub wrong_regions: Vec<(&'static str, String)>,
     /// The surrounding text the proxy must report to the host in the step,
     /// if a commit stated one, and the reports it sent. An `Option`: a step
     /// handles one request, so at most one commit.
@@ -485,7 +538,13 @@ impl SpecText {
             fence: Fence::Closed,
             shown: None,
             ahead: false,
+            stale_report: false,
+            pending_report_crossed: false,
+            diverged: None,
+            edits: 0,
+            edits_at_report: 0,
             taken: None,
+            region_model: None,
             assembly: None,
             held: BTreeMap::new(),
             latest_peek: None,
@@ -497,12 +556,19 @@ impl SpecText {
             txns: Vec::new(),
             input: String::new(),
             wrong_decisions: Vec::new(),
+            wrong_regions: Vec::new(),
             report: None,
             reported: Vec::new(),
             typed: Vec::new(),
             wrong_reports: Vec::new(),
             counts: Counts::default(),
         }
+    }
+
+    /// The guest's next surrounding text crossed an edit on its way to the
+    /// guest (P4), if `crossed`.
+    pub fn report_crossed(&mut self, crossed: bool) {
+        self.pending_report_crossed = crossed;
     }
 
     /// Follows one message at the proxy.
@@ -516,9 +582,10 @@ impl SpecText {
                 sender,
                 event,
                 origin,
+                region,
             } => {
                 self.input = format!("{sender} {event:?}");
-                self.host(sender, event, origin);
+                self.host(sender, event, origin, region);
             }
             Seen::ToHost(request) => self.decision(request),
             Seen::SurfaceDestroyed { field } => {
@@ -567,6 +634,7 @@ impl SpecText {
                 };
                 let at = |offset: &i32| u32::try_from(*offset).expect("an offset in the text");
                 pending.surrounding_text = Some(Some((text.clone(), at(cursor), at(anchor))));
+                self.edits_at_report = self.edits;
             }
             &Request::SetContentType { hint, purpose } => {
                 pending.content_type = Some((hint, purpose));
@@ -611,7 +679,14 @@ impl SpecText {
         if let Some(text) = surrounding_text {
             field.surrounding_text = text;
             self.ahead = false;
-            self.taken = None;
+            self.diverged = None;
+            let crossed = std::mem::take(&mut self.pending_report_crossed);
+            self.stale_report = crossed || self.edits != self.edits_at_report;
+            if self.taken.take().is_some() {
+                if let Some(shown) = &mut self.shown {
+                    shown.host_cursor = None;
+                }
+            }
         }
         if let Some(content_type) = content_type {
             field.content_type = content_type;
@@ -631,7 +706,7 @@ impl SpecText {
     }
 
     /// What reached the proxy from the host.
-    fn host(&mut self, sender: u32, event: &AnyEvent, origin: Origin) {
+    fn host(&mut self, sender: u32, event: &AnyEvent, origin: Origin, truth: Option<&RegionTruth>) {
         match event {
             AnyEvent::WlKeyboard(event) => self.keyboard(event),
             &AnyEvent::ZcrExtendedKeyboardV1(peek::Event::PeekKey { key, state, .. }) => {
@@ -693,7 +768,11 @@ impl SpecText {
             &AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion {
                 index,
                 length,
-            }) => self.composition_event(origin, |spec| spec.region(index, length, origin)),
+            }) => self.composition_event(origin, |spec| {
+                let edit = spec.region(index, length, origin);
+                spec.judge_region(truth, edit.as_ref(), origin);
+                edit
+            }),
             _ => {}
         }
     }
@@ -911,10 +990,12 @@ impl SpecText {
                     }
                     if text.is_empty() {
                         let commit = shown.map_or_else(String::new, |_| commit.clone());
-                        // The reset commit is an edit, which leaves the
-                        // bytes regions took alone, as any preedit_string
-                        // does.
-                        spec.ahead |= !commit.is_empty();
+                        // The reset commit is an edit that ends the
+                        // composition, which gives the bytes regions took
+                        // back as text.
+                        if !commit.is_empty() {
+                            spec.edited();
+                        }
                         let txn = Txn {
                             commit,
                             ..Txn::default()
@@ -922,10 +1003,18 @@ impl SpecText {
                         return Some((txn, (0, 0)));
                     }
                     let cursor = preedit_cursor(text, spec.assembly);
+                    // Exo's cursor is where it sent the preedit's, or at
+                    // its end.
+                    let host_cursor = spec
+                        .assembly
+                        .and_then(|at| usize::try_from(at).ok())
+                        .filter(|&at| text.is_char_boundary(at))
+                        .unwrap_or(text.len());
                     spec.shown = Some(Shown {
                         text: text.clone(),
                         cursor,
                         origin,
+                        host_cursor: Some(host_cursor),
                     });
                     let txn = Txn {
                         preedit: text.clone(),
@@ -938,7 +1027,9 @@ impl SpecText {
                 self.composition_event(origin, |spec| {
                     spec.shown = None;
                     spec.taken = None;
-                    spec.ahead |= !text.is_empty();
+                    if !text.is_empty() {
+                        spec.forward_edit();
+                    }
                     spec.end_lease();
                     let txn = Txn {
                         commit: text.clone(),
@@ -957,8 +1048,15 @@ impl SpecText {
     /// An edit that ends the composition reached the guest, which has yet
     /// to report it: the bytes regions took are text again.
     fn edited(&mut self) {
-        self.ahead = true;
+        self.forward_edit();
         self.taken = None;
+    }
+
+    /// An edit of the input method reached the guest, which has yet to
+    /// report it.
+    fn forward_edit(&mut self) {
+        self.ahead = true;
+        self.edits += 1;
     }
 
     /// The committed surrounding text and cursor, without a selection, if
@@ -1000,34 +1098,62 @@ impl SpecText {
         Some((txn, (0, 0)))
     }
 
-    /// X1: the bytes from `index` before the committed cursor, `length`
-    /// long, become the preedit, at its cursor (H5) or where the guest's
-    /// cursor was. While the guest has not reported since a region, the
-    /// committed text still holds the bytes regions took, so the region
-    /// must cover them, and deletes only the rest.
+    /// X1: the bytes from `index` before Exo's cursor, `length` long,
+    /// become the preedit, at its cursor (H5) or where Exo's cursor was.
+    /// Exo's text is the guest's, which is the committed text without the
+    /// bytes regions took since the guest last reported, with the preedit
+    /// Exo holds at the guest's cursor, Exo's cursor in it. The region
+    /// must cover that preedit, and deletes only the rest.
     fn region(&mut self, index: i32, length: u32, origin: Origin) -> Option<(Txn, (i32, i32))> {
         let (text, cursor) = self.surrounding()?;
-        let start = cursor as i64 + i64::from(index);
-        let region = around(&text, cursor, start, length);
-        let delete = region.and_then(|(before, after)| match self.taken {
-            None => Some((before, after)),
-            Some((taken_before, taken_after)) => Some((
-                before.checked_sub(taken_before)?,
-                after.checked_sub(taken_after)?,
-            )),
+        let (taken_before, taken_after) = self.taken.unwrap_or_default();
+        let held = self.shown.as_ref().and_then(|shown| {
+            let at = shown.host_cursor?;
+            Some((shown.text.clone(), at))
+        });
+        let (held, at) = held.unwrap_or_default();
+        let start = cursor.checked_sub(taken_before)?;
+        let end = cursor + taken_after;
+        let exo_text = [text.get(..start)?, &held, text.get(end..)?].concat();
+        let exo_cursor = start + at;
+        self.region_model = Some(RegionModel {
+            text: exo_text.clone(),
+            cursor: exo_cursor,
+            held: held.clone(),
+            ahead: self.ahead || self.stale_report,
+        });
+        let region_start = exo_cursor as i64 + i64::from(index);
+        let region = around(&exo_text, exo_cursor, region_start, length);
+        let delete = region.and_then(|(before, after)| {
+            Some((
+                start.checked_sub(exo_cursor - before)?,
+                (exo_cursor + after).checked_sub(start + held.len())?,
+            ))
         });
         // A report Exo has yet to get moves what the proxy measures from.
         self.counts.regions_crossing_reports += u64::from(origin.crossed);
-        // The committed text holds no byte of the preedit the guest shows,
-        // which Exo holds as text, ahead of its cursor: a region Exo makes
-        // then is measured elsewhere, if it is not dropped for it.
-        let over = self.taken.is_none() && self.shown.is_some();
-        self.counts.regions_over_preedits += u64::from(over);
+        // An empty region at Exo's cursor after the preedit it holds ends
+        // the composition and leaves that preedit as text: the guest
+        // commits it, as at X2.
+        if region == Some((0, 0)) && !held.is_empty() && at == held.len() {
+            self.counts.regions_ended += 1;
+            self.shown = None;
+            self.end_lease();
+            self.edited();
+            let txn = Txn {
+                commit: held,
+                ..Txn::default()
+            };
+            return Some((txn, (0, 0)));
+        }
         let (Some((before, after)), Some(delete)) = (region, delete) else {
             self.counts.regions_dropped += 1;
             return None;
         };
-        let preedit = text[cursor - before..cursor + after].to_owned();
+        let preedit = exo_text[exo_cursor - before..exo_cursor + after].to_owned();
+        // The committed text holds no byte of the preedit Exo holds.
+        let over = self.taken.is_none() && !held.is_empty();
+        self.counts.regions_over_preedits += u64::from(over);
         let at = self.assembly.unwrap_or(before as i32);
         let preedit_cursor = preedit_cursor(&preedit, Some(at));
         self.shown = None;
@@ -1035,12 +1161,14 @@ impl SpecText {
         if !preedit.is_empty() {
             self.counts.regions += 1;
             self.counts.regions_over_regions += u64::from(self.taken.is_some());
-            self.ahead = true;
-            self.taken = Some((before, after));
+            self.forward_edit();
+            let taken = (taken_before + delete.0, taken_after + delete.1);
+            self.taken = (taken != (0, 0)).then_some(taken);
             self.shown = Some(Shown {
                 text: preedit.clone(),
                 cursor: preedit_cursor,
                 origin,
+                host_cursor: Some(before),
             });
         }
         let txn = Txn {
@@ -1049,6 +1177,70 @@ impl SpecText {
             ..Txn::default()
         };
         Some((txn, preedit_cursor))
+    }
+
+    /// X1, judged by what Exo did of the region (`truth`): the preedit the
+    /// guest shows after `edit`, which the specification gives it, must be
+    /// the text Exo composed. A region the specification drops is judged by
+    /// the composition check. Where Exo made the region in another text
+    /// than the one the specification takes Exo to hold, for a reason the
+    /// proxy cannot know, the failure says which, so that only its known
+    /// issue explains it: a report Exo could not match dropped the
+    /// composition the specification takes Exo to hold (E4,
+    /// `RegionOverUnheldPreedit`); a report was on its way to Exo
+    /// (`RegionCrossesReport`); or, Exo holding the composition
+    /// the specification takes it to, Exo's text holds edits of the input
+    /// method the guest has yet to report (P4, `RegionWhileAhead`). Until the guest
+    /// reports, later regions differ for the same reason. Any other
+    /// difference is the specification's.
+    fn judge_region(
+        &mut self,
+        truth: Option<&RegionTruth>,
+        edit: Option<&(Txn, (i32, i32))>,
+        origin: Origin,
+    ) {
+        let model = self.region_model.take();
+        let (Some(truth), Some((txn, _)), Some(model)) = (truth, edit, model) else {
+            return;
+        };
+        if txn.preedit == truth.composed {
+            return;
+        }
+        let check = if let Some(check) = self.diverged {
+            check
+        } else if truth.dropped && truth.held.is_empty() && !model.held.is_empty() {
+            "region over an unheld preedit"
+        } else if origin.crossed {
+            "region crossing a report"
+        } else if model.held != truth.held
+            || (&model.text, model.cursor) == (&truth.text, truth.cursor)
+        {
+            "region"
+        } else if model.ahead {
+            "region while ahead"
+        } else {
+            "region"
+        };
+        self.counts.regions_unheld += u64::from(check == "region over an unheld preedit");
+        self.counts.regions_ahead += u64::from(check == "region while ahead");
+        // The guest shows other text than Exo holds until it reports.
+        self.diverged = (check != "region").then_some(check);
+        let detail = format!(
+            "after {}: the guest shows {:?}; Exo composed {:?} in {:?} at {} over {:?}, which the \
+             proxy took for {:?} at {} over {:?}",
+            self.input,
+            txn.preedit,
+            truth.composed,
+            truth.text,
+            truth.cursor,
+            truth.held,
+            model.text,
+            model.cursor,
+            model.held
+        );
+        if self.wrong_regions.len() < 5 {
+            self.wrong_regions.push((check, detail));
+        }
     }
 
     /// A terminal host composition event, which takes the assembly: through
@@ -1466,6 +1658,9 @@ pub(super) fn exact(
     if !spec.wrong_decisions.is_empty() {
         failures.push(failure("decision", None, spec.wrong_decisions.join("\n")));
     }
+    for (check, detail) in &spec.wrong_regions {
+        failures.push(failure(check, spec.focus, detail.clone()));
+    }
     if !spec.wrong_reports.is_empty() {
         failures.push(failure("report", None, spec.wrong_reports.join("\n")));
     }
@@ -1551,9 +1746,6 @@ pub(super) enum KnownIssue {
     /// A restart of the input method while the guest shows a composition
     /// that Exo no longer tracks loses it, below v11 of the extension.
     RestartLosesUntrackedComposition,
-    /// A preedit region while the guest shows a preedit whose bytes the
-    /// committed text does not hold takes other bytes than Exo composes.
-    RegionOverShownPreedit,
     /// An empty confirmation before the press of a key the input method
     /// did not handle (E13) recovers the key held before it, as if it had
     /// repeated (X2').
@@ -1565,6 +1757,14 @@ pub(super) enum KnownIssue {
     /// composes the committed text, which the guest shows as a preedit
     /// that Exo drops at its next report (E4).
     StaleRegionAfterCommit,
+    /// A preedit region over a composition Exo dropped on a report it
+    /// could not match (E4), which the proxy still takes Exo to hold, is
+    /// measured as if Exo held it (X1).
+    RegionOverUnheldPreedit,
+    /// A preedit region Exo made in text that holds edits of the input
+    /// method the guest has yet to report is measured in the text it last
+    /// reported (X1, P4).
+    RegionWhileAhead,
 }
 
 impl KnownIssue {
@@ -1594,6 +1794,20 @@ impl KnownIssue {
                  preedit out, makes Exo drop it (E4), so the guest shows a preedit nothing \
                  composes"
             }
+            Self::RegionOverUnheldPreedit => {
+                "a report Exo could not match to its prediction, as a GTK3 report of a tap's \
+                 cursor that lags behind a late answer, dropped the composition Exo held (E4), \
+                 which nothing tells the proxy; it still measures a region over the preedit the \
+                 guest shows, which Exo no longer holds, so the guest shows other bytes than Exo \
+                 composes (X1)"
+            }
+            Self::RegionWhileAhead => {
+                "Exo makes a region in its prediction, which holds the input method's edits \
+                 that the guest has yet to report, as a commit after a delete the guest's \
+                 report crossed, or a press's commit; the proxy measures it in the text the \
+                 guest last reported, which tracks only the bytes regions took, so the guest \
+                 shows other bytes than Exo composes (X1, P4)"
+            }
             Self::RegionCrossesReport => {
                 "Exo makes a region from its cursor in the text it had, while a report of the \
                  guest's, which moved the cursor, was on its way to it; the proxy has already \
@@ -1606,14 +1820,6 @@ impl KnownIssue {
                  the confirmation for one of the key held before, which is still the latest \
                  peek, and sends the guest a press and release of it (X2'): a held Backspace \
                  deletes once more, a held Space types once more"
-            }
-            Self::RegionOverShownPreedit => {
-                "Exo makes a region from its own cursor, which follows the composition it holds \
-                 as text, while the proxy measures it from the guest's reported cursor, before \
-                 the preedit the guest shows: a host preedit, or a region the guest reported, \
-                 which clears what the proxy knows of the bytes it took (X1); Chromium, which \
-                 applies a delete before it clears its preedit, also drops the region's delete \
-                 while it shows one (C3)"
             }
             Self::RestartLosesUntrackedComposition => {
                 "a report Exo could not match to its prediction dropped the composition Exo \
@@ -1631,10 +1837,6 @@ impl KnownIssue {
             Self::RestartLosesUntrackedComposition => {
                 "docs/IME_REDESIGN.md 2.2 H2; C5 decides whether H2 commits the shown preedit"
             }
-            Self::RegionOverShownPreedit => {
-                "docs/IME_REDESIGN.md 2.2 X1; the core's X1 must decide how a region over a \
-                 reported region is measured"
-            }
             Self::RecoveryBeforeAPress => {
                 "docs/IME_REDESIGN.md 2.2 X2', with REVIEW2's held-key peek sequence"
             }
@@ -1646,6 +1848,14 @@ impl KnownIssue {
                 "docs/IME_REDESIGN.md 2.2 X1; IMA's ordering, made lasting by the proxy's \
                  reports without the preedit"
             }
+            Self::RegionOverUnheldPreedit => {
+                "docs/IME_REDESIGN.md 2.2 X1 and HANDOVER; needs the proxy to tell which \
+                 reports Exo matched"
+            }
+            Self::RegionWhileAhead => {
+                "docs/IME_REDESIGN.md 2.2 X1 and HANDOVER; needs the proxy to track the text the \
+                 guest gained, not only the bytes it lost"
+            }
         }
     }
 }
@@ -1654,9 +1864,11 @@ impl KnownIssue {
 /// passed, and the client shows exactly what a set of issues predicts
 /// together (`predicts`, asked of each set, the smallest first, and only
 /// then); or every failure is of tier 1 and a known issue's trigger
-/// explains it: a composition check, in a case with a region over a shown
-/// preedit (`counts`), whose region Exo composes elsewhere, and a recovery
-/// check, of a key recovered for a confirmation before another's press.
+/// explains it: a recovery check, of a key recovered for a confirmation
+/// before another's press; a composition check, in a case with a region
+/// that crossed a report or was stale (`counts`); and a region check that
+/// says why Exo made the region in other text than the proxy knew
+/// ([`SpecText::judge_region`]).
 pub(super) fn classify(
     failures: &[Failure],
     counts: &Counts,
@@ -1667,15 +1879,21 @@ pub(super) fn classify(
     let mut unexplained = Vec::new();
     for failure in failures {
         let issue = match (failure.tier, failure.check) {
-            (Tier::Exact, "composition") if counts.regions_over_preedits > 0 => {
-                KnownIssue::RegionOverShownPreedit
-            }
             (Tier::Exact, "composition") if counts.regions_crossing_reports > 0 => {
                 KnownIssue::RegionCrossesReport
             }
             (Tier::Exact, "composition") if counts.regions_stale > 0 => {
                 KnownIssue::StaleRegionAfterCommit
             }
+            (Tier::Exact, "composition") if counts.regions_unheld > 0 => {
+                KnownIssue::RegionOverUnheldPreedit
+            }
+            (Tier::Exact, "composition") if counts.regions_ahead > 0 => {
+                KnownIssue::RegionWhileAhead
+            }
+            (Tier::Exact, "region over an unheld preedit") => KnownIssue::RegionOverUnheldPreedit,
+            (Tier::Exact, "region crossing a report") => KnownIssue::RegionCrossesReport,
+            (Tier::Exact, "region while ahead") => KnownIssue::RegionWhileAhead,
             (Tier::Exact, "recovery") => KnownIssue::RecoveryBeforeAPress,
             _ => {
                 unexplained.push(failure);
@@ -1791,6 +2009,7 @@ mod tests {
             sender: SYNC,
             event: &event,
             origin: Origin::default(),
+            region: None,
         });
         decisions
             .iter()
@@ -2282,15 +2501,27 @@ mod tests {
             )
         };
         assert_eq!(counts(&spec), (2, 1, 1, 0));
-        // Once the guest reports, a region is measured from its cursor, and
-        // counts as over a shown preedit, as one over a host preedit does.
+        // Once the guest reports its text, which lacks the region's bytes,
+        // Exo drops its composition (E4): a region is measured from the
+        // guest's cursor.
         report(&mut spec, "0", 1);
         host(&mut spec, region(-1, 1), &[]);
         assert_eq!(spec.views[0], view("", 0, "0"));
-        assert_eq!(counts(&spec), (3, 1, 1, 1));
+        assert_eq!(counts(&spec), (3, 1, 1, 0));
         // A commit gives the bytes back.
         host(&mut spec, commit("0"), &[]);
         assert_eq!(spec.views[0], view("0", 1, ""));
+        // Exo holds a host preedit at the guest's cursor, its own cursor
+        // after it: a region over it takes it with the bytes before it.
+        report(&mut spec, "0", 1);
+        preedit(&mut spec, "b");
+        host(&mut spec, region(-2, 2), &[]);
+        assert_eq!(spec.views[0], view("", 0, "0b"));
+        assert_eq!(counts(&spec), (4, 1, 1, 1));
+        // One that does not cover it is dropped.
+        host(&mut spec, region(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("", 0, "0b"));
+        assert_eq!(counts(&spec), (4, 1, 2, 1));
     }
 
     /// The host's `peek_key` of `key`, pressed or released.
@@ -2362,6 +2593,7 @@ mod tests {
             sender: SYNC,
             event: &event,
             origin: before_enter,
+            region: None,
         });
         spec.see(Seen::StepEnd);
         assert_eq!(spec.views[0], view("0 a ", 4, ""));
@@ -2586,6 +2818,7 @@ mod tests {
             sender: 10,
             event: &late.into(),
             origin,
+            region: None,
         });
         assert_eq!(checks(&spec, "", 0), Vec::<&str>::new());
         assert_eq!(spec.counts.late_shown, 1);
@@ -2704,6 +2937,7 @@ mod tests {
             sender: SYNC,
             event: &region.into(),
             origin,
+            region: None,
         });
         spec.see(Seen::StepEnd);
         assert_eq!(spec.counts.regions_crossing_reports, 1);
@@ -2809,28 +3043,15 @@ mod tests {
             ..lost.clone()
         };
         assert_eq!(classify(&[lost.clone(), exact], &none, |_| true), []);
-        // Only a composition that Exo composes elsewhere, after a region
-        // over a shown preedit.
+        // No issue explains a composition that Exo composes elsewhere
+        // without a region that crossed a report or was stale.
         let composition = Failure {
             tier: Tier::Exact,
             check: "composition",
             ..lost.clone()
         };
-        let region = Counts {
-            regions_over_preedits: 1,
-            ..Counts::default()
-        };
-        let both = [composition.clone(), lost.clone()];
-        let known = [KnownIssue::RegionOverShownPreedit];
-        assert_eq!(
-            classify(std::slice::from_ref(&composition), &region, |_| false),
-            known
-        );
-        assert_eq!(
-            classify(std::slice::from_ref(&composition), &none, |_| true),
-            []
-        );
-        assert_eq!(classify(&both, &region, |_| true), []);
+        let one = std::slice::from_ref(&composition);
+        assert_eq!(classify(one, &none, |_| true), []);
         // A key recovered for a confirmation before another's press.
         let recovery = Failure {
             tier: Tier::Exact,
@@ -2842,9 +3063,10 @@ mod tests {
             classify(std::slice::from_ref(&recovery), &none, |_| false),
             [before]
         );
-        let explained = [recovery.clone(), composition];
-        let both = [before, KnownIssue::RegionOverShownPreedit];
-        assert_eq!(classify(&explained, &region, |_| false), both);
+        assert_eq!(
+            classify(&[recovery.clone(), composition], &none, |_| false),
+            []
+        );
         assert_eq!(classify(&[recovery, lost], &none, |_| true), []);
         assert!(!P1.reason().is_empty() && P1.tracking().contains("C5"));
         assert!(!Lost.reason().is_empty() && Lost.tracking().contains("H2"));
