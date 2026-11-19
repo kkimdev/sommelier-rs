@@ -296,9 +296,10 @@ pub(super) struct World<'t> {
     /// Each guest request, with the edits the guest had got when it sent
     /// it.
     c_to_p: Channel<(Outgoing, u64)>,
-    /// Each event to the guest, and the press it is, if it is one: where
-    /// the guest's pointer or finger is on which of its surfaces.
-    p_to_c: Channel<(u32, AnyEvent, Option<Press>)>,
+    /// Each event to the guest, the press it is, if it is one: where the
+    /// guest's pointer or finger is on which of its surfaces; and whether
+    /// it is a key that reaches no window ([`World::keyboard_gone`]).
+    p_to_c: Channel<(u32, AnyEvent, Option<Press>, bool)>,
     p_to_e: Channel<(u32, AnyRequest)>,
     /// Each host event, what engine text it carries, and how many of the
     /// proxy's surrounding texts Exo had got when it sent the event.
@@ -309,6 +310,13 @@ pub(super) struct World<'t> {
     globals: BTreeMap<String, (u32, u32)>,
     shift: bool,
     pointer: Option<Pointer>,
+    /// The proxy dropped the last keyboard enter Exo sent, which named a
+    /// surface the guest destroyed (F2), so the guest's keyboard focus is
+    /// on none of its windows: the keys Exo sent with that focus, which
+    /// the proxy passes on, reach no window, as they would reach no window
+    /// of a client of Exo's own (GTK's and Chromium's seats drop a key
+    /// while no surface has the keyboard focus).
+    keyboard_gone: bool,
     /// The resets Exo handed the engine.
     resets: u64,
     /// The key the user holds, which repeats, and when it next does.
@@ -369,6 +377,7 @@ impl<'t> World<'t> {
             globals: BTreeMap::new(),
             shift: false,
             pointer: None,
+            keyboard_gone: false,
             resets: 0,
             repeat: None,
             reports_sent: 0,
@@ -505,8 +514,8 @@ impl<'t> World<'t> {
                     self.deliver_guest_request(request, edits).await;
                 }
                 1 => {
-                    let (sender, event, press) = self.p_to_c.take();
-                    self.deliver_to_guest(sender, event, press);
+                    let (sender, event, press, gone) = self.p_to_c.take();
+                    self.deliver_to_guest(sender, event, press, gone);
                 }
                 2 => {
                     let (sender, request) = self.p_to_e.take();
@@ -782,6 +791,10 @@ impl<'t> World<'t> {
                 self.pointer = Some(Pointer::Gone);
             }
         }
+        // And a keyboard enter, so the keys that follow reach no window.
+        if let AnyEvent::WlKeyboard(wl_keyboard::Event::Enter { surface, .. }) = decoded {
+            self.keyboard_gone = self.surfaces.host_destroyed(surface);
+        }
         let note = if origin.late { " (late)" } else { "" };
         self.log(Place::EToP, format!("{sender} {}{note}", shown(&decoded)));
         self.see(Seen::Host {
@@ -811,8 +824,10 @@ impl<'t> World<'t> {
             if let Some((surface, at)) = press {
                 self.see(Seen::GuestPress { surface, at });
             }
+            let gone = self.keyboard_gone
+                && matches!(event, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }));
             self.p_to_c
-                .send(self.now, (sender, event, press), &mut self.choices);
+                .send(self.now, (sender, event, press, gone), &mut self.choices);
         }
         self.see(Seen::StepEnd);
         self.ended |= !goes_on;
@@ -852,9 +867,15 @@ impl<'t> World<'t> {
     }
 
     /// An event reaches the guest: the client model takes what it models,
-    /// a press as `press` resolved it, and the guest keeps the globals and
-    /// Shift.
-    fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>) {
+    /// a press as `press` resolved it, but no key that is `gone` to no
+    /// window, and the guest keeps the globals and Shift.
+    ///
+    /// # Panics
+    ///
+    /// If a key gone to no window reaches a client with the keyboard
+    /// focus: the proxy kept from it the `leave` that came before the enter
+    /// it dropped.
+    fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>, gone: bool) {
         let now = self.now;
         self.edits.got.follow(&event);
         if let AnyEvent::WlRegistry(wl_registry::Event::Global {
@@ -891,6 +912,15 @@ impl<'t> World<'t> {
             }
             (AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { mods_depressed, .. }), _) => {
                 self.shift = mods_depressed & keymap::SHIFT != 0;
+                Vec::new()
+            }
+            (AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }), _) if gone => {
+                assert_eq!(
+                    client.focused_field(),
+                    None,
+                    "protocol violation: a key to a destroyed surface while a field has the \
+                     keyboard focus"
+                );
                 Vec::new()
             }
             (AnyEvent::WlKeyboard(wl_keyboard::Event::Key { key, state, .. }), _)
