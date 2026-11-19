@@ -1001,6 +1001,31 @@ fn row_H7_a_cleared_preedit_with_commit_text_commits_it() {
     assert_eq!(out.guest, [delete(3, 0), done(3)]);
 }
 
+/// The old code's
+/// `a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back`: a
+/// preedit cleared with a reset commit gives the guest the bytes a region
+/// took back as text, as a commit does, so a later region deletes them
+/// again.
+#[test]
+fn row_H7_a_reset_commit_gives_back_the_bytes_a_region_took() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 4);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
+
+    // The guest's text is "abcd|ef" again.
+    let out = ime.v1(HostIme::Preedit {
+        serial: 0,
+        text: "".into(),
+        commit: "d".into(),
+    });
+    assert_eq!(out.guest, [no_preedit(), commit("d"), done(2)]);
+
+    let out = ime.ext(region(-2, 2));
+    assert_eq!(out.guest, [delete(2, 0), preedit_at("cd", 2, 2), done(2)]);
+}
+
 #[test]
 fn row_H7_a_preedit_that_does_not_fit_is_dropped() {
     let mut ime = Ime::enabled();

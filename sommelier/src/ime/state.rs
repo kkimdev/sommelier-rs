@@ -93,8 +93,8 @@ struct Composition {
     /// (X1). The committed text still holds them, but the guest no longer
     /// does. `Some` only while the text is `Ahead`: a report clears it
     /// ([`TextInput::apply_commit`]), and so does every end of the
-    /// composition, which gives the bytes back as text. A host preedit
-    /// (H7) keeps it.
+    /// composition, which gives the bytes back as text, a reset commit
+    /// (H7) included. Any other host preedit keeps it.
     taken: Option<(u32, u32)>,
     assembly: Assembly,
 }
@@ -520,18 +520,19 @@ impl<'a> Current<'a> {
         }
     }
 
-    /// H7. A cleared preedit with a commit text is Exo's reset commit.
-    /// Either keeps the bytes regions took, as the old code does.
+    /// H7. A cleared preedit with a commit text is Exo's reset commit,
+    /// which gives the bytes regions took back as text, as every edit
+    /// that ends the composition does. A preedit keeps them.
     pub(super) fn preedit(self, text: String, commit: String, assembly: Assembly) -> Planned<'a> {
         let shown = self.shown().is_some();
-        let taken = self.composition.taken;
         if text.is_empty() && shown && !commit.is_empty() {
             let txn = GuestTxn {
                 commit: Some(commit),
                 ..GuestTxn::default()
             };
-            return self.plan(txn, true, taken, LeaseOutcome::End);
+            return self.plan(txn, true, None, LeaseOutcome::End);
         }
+        let taken = self.composition.taken;
         let lease = match text.is_empty() && shown {
             true => LeaseOutcome::ArmIfBackspaceHeld,
             false => LeaseOutcome::End,
