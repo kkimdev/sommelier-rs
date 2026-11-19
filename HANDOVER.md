@@ -98,7 +98,7 @@
   `SurroundingTextTracker` would close this; no host has shown it.
 - A preedit region is measured in Exo's text as the proxy knows it: the
   guest's text with the preedit Exo holds at the guest's cursor
-  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). Three cases
+  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). Four cases
   stay approximate.
   - A region that does not cover the preedit Exo holds, an empty one
     included, is dropped: the guest keeps showing the old preedit while
@@ -110,6 +110,23 @@
     region's bytes. A report that changes the text while a host preedit
     shows, which Exo cannot match either, leaves Exo without the
     composition the proxy still measures with.
+  - A v3 guest states its text without the preedit, while Exo predicts
+    it with the composition inline and Chromium's own v1 client sends it
+    so (`ZwpTextInputV1Impl::SetSurroundingText`). So a report without a
+    region's bytes names no state Exo predicted, and Exo drops its
+    composition (E4): the guest keeps a preedit nothing composes. Sending
+    Exo each report with the preedit the guest shows *now* inserted at
+    its cursor is not the fix: every transaction since the guest's last
+    commit carries the same `done` serial, so the proxy cannot tell which
+    one a report reflects, and a report that lags (Chromium's, or GTK3's
+    after each of two transactions) gets a preedit it never showed, which
+    names no state either and leaves the preedit in Exo as text. Tried on
+    the DST, it regressed seed 537 (settled, Chromium), did not retire
+    `StaleRegionAfterCommit` (seed 1008752) or `RegionCrossesReport`
+    (seed 474), and doubled `RestartLosesUntrackedComposition` (63 to
+    145 of 5,000 settled cases from seed 1,000,001). The fix needs the
+    preedit each transaction left, matched to the report as Exo's
+    `SurroundingTextTracker::Update` matches its history.
   - Chromium applies a transaction's delete before its preedit clear and
     drops a delete while it shows a composition (C3 of
     [IME_REDESIGN](docs/IME_REDESIGN.md)), so a region over a shown
