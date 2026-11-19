@@ -17,9 +17,10 @@ limitations under the License.
 //! The proxy's text-input state, for handler tests outside
 //! `handler/text_input.rs` that set up or read state no peer can observe.
 //!
-//! This is the only test code outside that file which touches the
-//! text-input storage, so the IME core's storage switch
-//! (docs/IME_REDESIGN.md, C3a) rewrites only this module. A test that can
+//! This is the only handler test code outside that file which touches the
+//! text-input storage, so of the handler tests, the IME core's storage
+//! switch (docs/IME_REDESIGN.md, C3a) rewrites only this module; it also
+//! rewrites the storage's own tests in `state/input.rs`. A test that can
 //! pin what the peers receive uses `proxy::harness::Session` instead.
 
 use crate::state::{Context, HostApplied, HostId, ShownPreedit, TextInputState, V3Pending};

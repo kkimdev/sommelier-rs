@@ -501,10 +501,10 @@ impl Session {
         TextInput { id, host, ext }
     }
 
-    /// The guest enables `text_input`, focused, with its first commit, and
-    /// the host activates it; the guest gets the commit's `done`. What
+    /// The guest enables `text_input`, focused, with its commit `serial`,
+    /// and the host activates it; the guest gets the commit's `done`. What
     /// the proxy sends the host besides the activation is not kept.
-    pub(crate) async fn enable(&mut self, text_input: TextInput) {
+    pub(crate) async fn enable(&mut self, text_input: TextInput, serial: u32) {
         use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::Request as V1;
         use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
         let id = text_input.id;
@@ -523,7 +523,7 @@ impl Session {
             )),
             "the host did not activate the text input: {forwarded:?}"
         );
-        let done = zwp_text_input_v3::Event::Done { serial: 1 };
+        let done = zwp_text_input_v3::Event::Done { serial };
         assert_eq!(self.guest_received(), [(id, done.into())]);
     }
 }

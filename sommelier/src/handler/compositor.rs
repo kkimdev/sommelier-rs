@@ -4002,7 +4002,7 @@ mod tests {
             surface: surface.id,
         };
         assert_eq!(s.guest_received(), [(ti, enter.into())]);
-        s.enable(text_input).await;
+        s.enable(text_input, 1).await;
         let done = || (ti, zwp_text_input_v3::Event::Done { serial: 1 }.into());
         let preedit = zwp_text_input_v1::evt::preedit_string(text_input.host, 0, "한", "");
         s.host([preedit.unwrap()]).await;
@@ -4109,6 +4109,11 @@ mod tests {
                 .record_latest_peek(guest_seat, Some(surface), keyboard, sequence);
         }
 
+        let state = text_input::view(&ctx, 720);
+        assert_eq!(state.focus, Some(live_surface));
+        assert!(state.enabled);
+        assert_eq!(state.host, Host::Active);
+        assert_eq!(state.preedit.as_deref(), Some("한"));
         let unaffected = text_input::snapshot(&ctx, 720);
         ctx.last_sender_id = destroyed_surface;
         assert_eq!(
@@ -4250,6 +4255,11 @@ mod tests {
             "one stale projection must have no remaining keyboard owner"
         );
 
+        let state = text_input::view(&ctx, healthy_on_replacement);
+        assert_eq!(state.focus, Some(replacement_surface));
+        assert!(state.enabled);
+        assert_eq!(state.host, Host::Active);
+        assert_eq!(state.preedit.as_deref(), Some("한"));
         let healthy = text_input::snapshot(&ctx, healthy_on_replacement);
         ctx.last_sender_id = destroyed_surface;
         assert_eq!(

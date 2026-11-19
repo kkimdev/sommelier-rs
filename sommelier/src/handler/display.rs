@@ -368,7 +368,7 @@ mod tests {
             surface: surface.id,
         };
         assert_eq!(s.guest_received(), [(text_input.id, enter.into())]);
-        s.enable(text_input).await;
+        s.enable(text_input, 1).await;
 
         // The session's check that no state outlives its object pins that
         // the proxy forgets the text input.

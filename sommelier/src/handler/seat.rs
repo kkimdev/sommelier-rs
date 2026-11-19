@@ -163,7 +163,7 @@ mod tests {
     #[tokio::test]
     async fn release_does_not_end_child_text_input_focus() {
         let mut f = Focused::new().await;
-        f.s.enable(f.text_input).await;
+        f.s.enable(f.text_input, 1).await;
         f.preedit("한").await;
 
         f.s.guest([wl_seat::req::release(f.seat.id)]).await;
