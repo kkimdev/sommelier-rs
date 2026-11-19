@@ -696,6 +696,26 @@ fn row_G9c_a_commit_of_an_enabled_field_repeats_the_shown_preedit() {
     assert_eq!(out.guest, [preedit_at("가", 0, 0), done(2)]);
 }
 
+/// The old code's `an_answer_that_cannot_repeat_the_preedit_forgets_it`:
+/// an answer that cannot repeat the shown preedit sends its `done` alone,
+/// which clears it, so the core forgets it, and with it the bytes a region
+/// took, as the old code's `forget_shown_preedit` does. A later region
+/// deletes them again. No input reaches this, since every preedit a plan
+/// shows fit a message once, so the test replaces the shown preedit.
+#[test]
+fn row_G9c_an_answer_that_cannot_repeat_the_preedit_forgets_it() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 4);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    ime.ext(region(-1, 1));
+    let long = Preedit::new("x".repeat(4_084), (1, 1)).unwrap();
+    ime.core.inputs.get_mut(&TI).unwrap().replace_shown(long);
+    let out = ime.step(Input::Commit(TI));
+    assert_eq!(out.guest, [done(3)]);
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(3)]);
+}
+
 #[test]
 fn row_G9c_reenabling_an_enabled_field_keeps_its_composition() {
     let mut ime = Ime::enabled();
@@ -1590,6 +1610,22 @@ fn row_F4_a_press_commits_the_preedit_then_resends_the_press() {
     // The press took the assembly.
     ime.step(Input::BarrierDone(fence));
     assert_eq!(ime.compose("나").guest, [preedit("나"), done(1)]);
+}
+
+/// A press commits the preedit a region made, which gives its bytes back
+/// as text, as the old code's `finish_confirm_preedit` does, so a later
+/// region deletes them again.
+#[test]
+fn row_F4_a_press_gives_back_the_bytes_a_region_took() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 4);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    ime.ext(region(-1, 1));
+    let out = ime.press(SURFACE);
+    assert_eq!(out.guest[..3], [no_preedit(), commit("d"), done(2)]);
+    ime.step(Input::BarrierDone(out.barriers()[0]));
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
 }
 
 #[test]

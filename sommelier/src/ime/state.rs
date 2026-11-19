@@ -253,6 +253,15 @@ impl TextInput {
         })
     }
 
+    /// Show `preedit` in place of the shown one, as no input can: every
+    /// preedit a plan shows fit a message once, so only this reaches the
+    /// answer that forgets one (G9c).
+    #[cfg(test)]
+    pub(super) fn replace_shown(&mut self, preedit: Preedit) {
+        assert!(self.composition.shown.is_some(), "a preedit shows");
+        self.composition.shown = Some(preedit);
+    }
+
     /// F1, F2 and G10: the field ends, and a new one starts on `surface`,
     /// if any, disabled and with nothing pending. Returns the old field's
     /// surface. The new field is disabled, so the step's reconcile leaves
