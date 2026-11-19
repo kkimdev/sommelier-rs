@@ -261,16 +261,6 @@ pub(super) struct Setup<'a> {
     pub texts: &'a [String],
 }
 
-/// What Exo's own detach did at an action that could make one.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Detach {
-    /// Exo detached the text input while the proxy was attached: a restart,
-    /// or a focus move that the text input heard of before the keyboard.
-    pub before_keyboard: bool,
-    /// The detach could confirm no composition.
-    pub untracked: bool,
-}
-
 /// A press the guest got: its surface and the target it lands on.
 type Press = (u32, Target);
 
@@ -342,11 +332,6 @@ pub(super) struct World<'t> {
     pub steps: Vec<String>,
     /// The proxy ended the session.
     pub ended: bool,
-    /// The host's text-input extension, if it has one.
-    extension: Option<u32>,
-    /// For each action that can make Exo detach on its own, in order: a
-    /// restart, a click, a tap or a focus move ([`Detach`]).
-    pub detaches: Vec<Detach>,
     trace: &'t mut Vec<Line>,
 }
 
@@ -390,8 +375,6 @@ impl<'t> World<'t> {
             shadow: None,
             steps: Vec::new(),
             ended: false,
-            extension: setup.extension,
-            detaches: Vec::new(),
             trace,
         };
         let registry = world.session.new_id();
@@ -453,8 +436,6 @@ impl<'t> World<'t> {
             world.guest([wl_keyboard::req::release(keyboard)]);
             world.run(&[]).await;
         }
-        // The setup's focus move is none of the case's actions.
-        world.detaches.clear();
         world
     }
 
@@ -598,11 +579,6 @@ impl<'t> World<'t> {
                 return self.host_sends(Vec::new(), false);
             }
             UserAction::RestartInputMethod => {
-                let untracked = self.untracked();
-                self.detaches.push(Detach {
-                    before_keyboard: true,
-                    untracked,
-                });
                 self.exo.destroy_input_method();
                 return self.host_sends(Vec::new(), false);
             }
@@ -621,18 +597,13 @@ impl<'t> World<'t> {
         let Some(surface) = self.surfaces.host(field) else {
             return;
         };
-        let mut detach = Detach::default();
         if self.exo.focus() != Some(surface) {
-            detach = Detach {
-                before_keyboard: self.exo.text_inputs_hear_first(),
-                untracked: self.untracked(),
-            };
-            if let Some(spec) = self.spec.as_mut().filter(|_| detach.before_keyboard) {
+            let before_keyboard = self.exo.text_inputs_hear_first();
+            if let Some(spec) = self.spec.as_mut().filter(|_| before_keyboard) {
                 spec.counts.detaches_before_keyboard += 1;
             }
             self.exo.move_focus(Some(surface));
         }
-        self.detaches.push(detach);
         let presses = match action {
             UserAction::Click { at, .. } => self.display.click(surface, at, time),
             UserAction::Tap { at, .. } => self.display.tap(surface, at, time),
@@ -657,14 +628,6 @@ impl<'t> World<'t> {
         requests.push(wl_compositor::req::create_surface(self.compositor, new));
         requests.push(wl_surface::req::commit(new));
         self.guest(requests);
-    }
-
-    /// Whether Exo's detach would confirm no composition now: below v11 of
-    /// the extension it confirms only one it tracks (E6), and it tracks
-    /// none.
-    fn untracked(&self) -> bool {
-        let confirms = self.extension >= Some(11);
-        !confirms && self.exo.composition().is_some_and(|text| text.is_empty())
     }
 
     /// Exo's events since its last input, then `events`, go to the proxy,

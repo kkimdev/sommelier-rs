@@ -441,11 +441,18 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
     // Surface destruction can race the host's wl_keyboard.leave event.
     // Transition the authoritative registry first, then emit the mandatory
     // v3 leave while the guest surface ID is still valid. A later host leave
-    // matches no live generation and is idempotent.
+    // matches no live generation and is idempotent. The IME core hears of
+    // the destroy before the focus changes it caused, so that no field
+    // commits its preedit into the destroyed surface, as one the focus
+    // leaves does.
     let focus_update = ctx.keyboard_focus.destroy_surface(wl_surface_guest_id);
-    crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
     let surface = crate::ime::SurfaceId(wl_surface_guest_id);
     crate::handler::text_input::ime(ctx, crate::ime::Input::SurfaceDestroyed(surface));
+    crate::handler::text_input::apply_keyboard_focus_changes(
+        ctx,
+        &focus_update.seat_changes,
+        Vec::new(),
+    );
     for keyboard_id in focus_update.retired_keyboards {
         ctx.key_generations.clear_keyboard(keyboard_id);
     }

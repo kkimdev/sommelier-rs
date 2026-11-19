@@ -425,18 +425,6 @@ impl Reference {
         field != self.focus && !self.composition().is_empty()
     }
 
-    /// Applies `action` as [`Reference::apply`] does, except that if `lose`
-    /// the composition is lost first rather than committed, as the proxy's
-    /// known issues lose it.
-    pub fn apply_losing(&mut self, action: UserAction, lose: bool) {
-        if lose {
-            self.composer.reset();
-            self.region = None;
-            self.fields[self.focus].preedit.clear();
-        }
-        self.apply(action);
-    }
-
     /// Whether the input method's engine would pass `key` to the field
     /// rather than consume it; a Latin layout has no engine. The ChromeOS
     /// Korean engine takes a Space that ends a composition, with it (E15).
@@ -731,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn a_focus_move_may_lose_the_composition_instead() {
+    fn only_a_move_to_another_field_leaves_the_composition() {
         let mut editor = reference(&["0", "1"], &typing("rk"));
         let tap = UserAction::Tap {
             field: 0,
@@ -740,13 +728,8 @@ mod tests {
         assert!(!editor.leaves_composition(tap), "a tap in the same field");
         assert!(editor.leaves_composition(UserAction::Focus(1)));
         assert!(!editor.leaves_composition(UserAction::RestartInputMethod));
-        editor.apply_losing(UserAction::Focus(1), true);
-        assert_eq!(editor.fields(), [model("0", 1, ""), model("1", 1, "")]);
-        // The next syllable starts afresh.
-        for action in typing("sk") {
-            editor.apply_losing(action, false);
-        }
-        assert_eq!(editor.fields()[1], model("1", 1, "나"));
+        editor.apply(UserAction::Focus(1));
+        assert_eq!(editor.fields(), [model("0가", 4, ""), model("1", 1, "")]);
         assert!(!editor.leaves_composition(UserAction::Focus(1)));
     }
 
@@ -761,11 +744,6 @@ mod tests {
         let editor = reference(&["0", "1"], &actions);
         assert_eq!(editor.fields(), [model("0가", 4, "ㅏ"), model("1", 1, "")]);
         assert_eq!(editor.focus(), 0);
-        // Or it loses the composition, which the next jamo does not join.
-        let mut editor = reference(&["0", "1"], &typing("rk"));
-        editor.apply_losing(UserAction::RestartInputMethod, true);
-        editor.apply(UserAction::Key(Key::Char('k')));
-        assert_eq!(editor.fields(), [model("0", 1, "ㅏ"), model("1", 1, "")]);
     }
 
     #[test]
@@ -855,14 +833,11 @@ mod tests {
         // A jamo composition is not reconverted.
         editor.apply(reconvert);
         assert_eq!(editor.fields(), [model("0a가", 5, "ㄱ")]);
-        // A press commits a region; a lost one takes its text.
-        let mut editor = reference(&["0a가", "1"], &[reconvert]);
-        editor.apply(UserAction::Focus(1));
-        assert_eq!(editor.fields()[0], model("0a가", 5, ""));
+        // A focus move commits a region.
         let mut editor = reference(&["0a가", "1"], &[reconvert]);
         assert!(editor.leaves_composition(UserAction::Focus(1)));
-        editor.apply_losing(UserAction::Focus(1), true);
-        assert_eq!(editor.fields()[0], model("0a", 2, ""));
+        editor.apply(UserAction::Focus(1));
+        assert_eq!(editor.fields()[0], model("0a가", 5, ""));
         // A host that cannot show a region shows none, and the next key
         // commits it again.
         let regionless = Typing {

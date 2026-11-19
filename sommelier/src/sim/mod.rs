@@ -214,18 +214,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         if case.settled {
             failures.extend(oracle::intended(&case.reference(extension), world.client()));
         }
-        // P1 shows only in GTK, whose blur keeps no composition (C11).
-        let gtk = case.client != ClientKind::Chromium;
-        let played = oracle::Played {
-            texts: &case.texts,
-            typing: case.typing(extension),
-            actions: &case.actions,
-            detaches: &world.detaches,
-        };
-        outcome.known = oracle::classify(&failures, &spec.counts, |issues| {
-            (gtk || !issues.contains(&KnownIssue::FocusWhileComposing))
-                && oracle::issues_predict(issues, &played, world.client())
-        });
+        outcome.known = oracle::classify(&failures, &spec.counts);
         if outcome.known.is_empty() {
             outcome.failures = failures;
         }
@@ -476,8 +465,8 @@ fn pinned(test: &str, body: impl FnOnce()) {
 /// crossed an edit (P4), autorepeats of a held key, empty confirmations
 /// that recovered it, skipped its pair or found none (X2'), and Backspace
 /// leases armed and ended; and in a run of 5,000 or more the rarer region
-/// and delete paths; in settled ones, the known issues, and no fence drop,
-/// which a settled case must not cause.
+/// and delete paths; in settled ones, no fence drop, which a settled case
+/// must not cause.
 fn check(test: &str, settled: bool) {
     pinned(test, || {
         let summary = run_all(&cases(settled));
@@ -515,8 +504,8 @@ fn check(test: &str, settled: bool) {
             counts.deletes,
             counts.regions,
         ]);
-        match settled {
-            false => reached.extend([
+        if !settled {
+            reached.extend([
                 counts.fence_drops,
                 counts.late_shown,
                 counts.raw_keys,
@@ -529,10 +518,7 @@ fn check(test: &str, settled: bool) {
                 counts.leases_ended,
                 counts.surface_destroys,
                 counts.focused_surface_destroys,
-            ]),
-            // The known issue's count drops to 0 once C5 fixes P1, which
-            // then deletes it here.
-            true => reached.push(known.len() as u64),
+            ]);
         }
         // Rarer paths, which a long run must reach: a region over a region
         // the guest has not reported, or over a preedit the committed text
