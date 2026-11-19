@@ -1249,11 +1249,14 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     restores it: one that matched a state, at the first equal state
     without a composition, if every transaction since kept the guest in
     step; one that reset Exo, if no edit of Exo's reached the guest since
-    the guest's commit before the report. A key or a press the proxy
-    forwards, or a recovered key, suspends it until a report the guest
-    made after it, or a guest commit that states no surrounding text and
-    so no change. A new field, a refocus, and a commit of the shown
-    preedit with no event of Exo's end it.
+    the guest's commit before the report; the proxy's empty stand-in for
+    a field that states no text, at an enable or a disable, restores
+    nothing. A key or a press the proxy forwards, or a recovered key,
+    suspends it until a report the guest made after it, or a guest
+    commit that states no surrounding text and so no change; a modifier
+    key, which edits no text by the keyboard's keymap (X11's
+    `IsModifierKey`), does not. A new field, a refocus, and a commit of
+    the shown preedit with no event of Exo's end it.
   - In Mirror mode, while the guest is in step, the mirror is exact, and
     no report on its way to Exo will name no state of Exo's (which would
     mean an edit of the guest's that Exo made the event without), a delete
@@ -1262,16 +1265,28 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     the guest's; a region from Exo's cursor that covers the composition,
     or Exo's cursor, deletes the rest around the guest's cursor and shows
     the region; an empty one commits the composition, or with none edits
-    nothing. Any other delete or region is dropped, with a debug log,
-    which costs a reconversion or a suggestion but never deletes text the
-    guest does not have; a negative delete index keeps the v1 XML's
-    reading, from the guest's cursor. Legacy mode logs at debug where the
+    nothing. A region that does not cover the composition is dropped, as
+    in Legacy mode. Otherwise, and for a negative delete index, Mirror mode
+    falls back to Legacy mode's measurement (previous rule), with a debug
+    log, never dropping what Legacy mode applies: a dropped delete or
+    region is not harmless, as the input method goes on as if it applied,
+    and its next commit doubles the text (a reconverted 한국 committed as
+    韓國 shows 한국韓國; an accepted suggestion shows `word word~`). Each
+    transaction Mirror mode measures changes what Legacy mode keeps as its
+    own would (`Composition::taken`, `ExoText`), so Legacy mode can take
+    over at any event: an unsure mirror (a field that never reports
+    evicts history at v11's empty confirmation per unhandled key), a guest
+    out of step, or a crossing report. Legacy mode logs at trace where the
     mirror would have sent another transaction.
   The DST checks at every `done` of a sync that an exact mirror equals the
   simulated Exo's tracker.
   Tests: `a_report_reaches_the_host_with_its_barrier`,
   `a_reports_barrier_is_glued_into_its_entry`,
   `a_forwarded_key_holds_back_exos_delete_until_the_guest_commits`,
+  `a_modifier_key_does_not_hold_back_exos_delete`,
+  `a_region_over_a_region_falls_back_in_mirror_mode`,
+  `a_region_over_a_host_preedit_with_exos_cursor_inside_it`,
+  `an_unsure_mirror_falls_back_to_legacy_mode`,
   `a_composition_selection_makes_it_uncertain`,
   `a_report_crosses_when_it_will_name_no_state`,
   `a_matched_report_finds_the_guest_without_a_composition`,

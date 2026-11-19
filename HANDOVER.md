@@ -129,8 +129,8 @@
   proxy knows it: the guest's text with the preedit Exo holds at the
   guest's cursor ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)).
   These cases stay approximate; the DST names the first three as known
-  issues, which Mirror mode retires at v11 (0 of 20,000 cases, against
-  15 of the 20,000 under the kill switch).
+  issues. At v11 Mirror mode measures in Exo's text instead while it can,
+  and falls back to this otherwise (see below).
   - A region that does not cover the preedit Exo holds is dropped, but
     an empty one at Exo's cursor after it, which the guest commits: the
     guest keeps showing the old preedit while Exo composes the new range
@@ -190,10 +190,14 @@
     of its own first would serve Chromium, but the report Chromium
     answers it with lacks the preedit, so Exo would drop its
     composition (E4).
-- Mirror mode (from v11) measures only while the guest is in step with
-  Exo, and drops a delete or a region otherwise, which costs a
-  reconversion or a suggestion but deletes no text the guest lacks (53 of
-  20,000 cases' events, all free cases). Its gaps:
+- Mirror mode (from v11) measures in the Exo mirror only while the guest
+  is in step with Exo, the mirror is exact and no report crosses the
+  event, and falls back to Legacy mode's measurement otherwise. It must
+  not drop instead: the input method's next commit would double the text.
+  In 20,000 DST cases from seed 0, 14 events of the free cases fell back
+  where the two measurements differ, none in settled cases; the Legacy
+  issues then appear at v11 in a few cases (4.8 of the design). Its
+  gaps:
   - A silent edit the proxy does not see breaks the guest model: GTK3
     reports a click's new cursor only with its next edit, so a region
     right after the click is measured at Exo's old cursor, as Legacy mode

@@ -523,7 +523,7 @@ the core sends at the `done` of a `wl_display.sync` glued to it, and every
 event Exo sends. `ime/exo_view.rs` owns the mirror, the text input's mode
 (`ime::ImeMode`), and whether the guest is in step with Exo; from v11 of
 the extension (Mirror mode) a delete or a region is measured in the
-mirror while it is, and dropped otherwise. Below v11, or under the kill
+mirror while it is, and as Legacy mode does otherwise. Below v11, or under the kill
 switch `SOMMELIER_IME_MIRROR=shadow`, Legacy mode measures them in the
 text the guest last committed, as `ime/legacy.rs` does, and the mirror
 only logs. A guest commit that leaves the field enabled is answered
