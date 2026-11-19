@@ -15,14 +15,11 @@ limitations under the License.
 */
 
 //! The state of one text input (design 3.1). Its fields are private to
-//! this file: every change is a named method, and a host composition event
+//! this file and its child `legacy`: every change is a named method, and a host composition event
 //! or a press can change what the guest is shown only through
 //! [`Current`], which only [`TextInput::current`] makes.
 
-use std::ops::Range;
-
-use super::guest::{delete_lengths, lengths_around_cursor, resolve_preedit_cursor};
-use super::guest::{GuestTxn, Preedit, TooLong};
+use super::guest::{resolve_preedit_cursor, GuestTxn, Preedit, TooLong};
 #[cfg(test)]
 use super::host;
 use super::host::HostContentType;
@@ -31,6 +28,12 @@ use super::serial::{CommitCount, Serial};
 use super::Env;
 use super::{BarrierToken, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
 use crate::wire::Outgoing;
+use legacy::ExoText;
+
+// Legacy mode's H9 and X1, which measure in the committed text: a child
+// module, as it plans through the private fields of `Current`.
+#[path = "legacy.rs"]
+mod legacy;
 
 /// A text-input-v3 content type: `(hint, purpose)`.
 pub(super) type ContentType = (u32, u32);
@@ -101,14 +104,6 @@ struct FocusedField {
     /// refocusing the field clears it by construction (B7).
     committed: V3Committed,
     text: ExoText,
-}
-
-/// Whether Exo's prediction of the text may hold input-method edits the
-/// guest has not yet reported in a surrounding text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExoText {
-    Synced,
-    Ahead,
 }
 
 /// What the host text input has applied, by Exo's rules (INVARIANTS "The
@@ -626,17 +621,6 @@ pub(super) enum RegionDrop {
     Uncovered,
 }
 
-/// Exo's prediction of a field's text, in which it measures a region
-/// (X1).
-struct Predicted {
-    text: String,
-    /// Exo's cursor.
-    cursor: usize,
-    /// Where the preedit Exo holds lies in `text`; empty, at the guest's
-    /// cursor, if none.
-    held: Range<usize>,
-}
-
 /// What a confirmation (X2, X2') does.
 pub(super) enum Confirm<'a> {
     Commit(Planned<'a>),
@@ -712,117 +696,6 @@ impl<'a> Current<'a> {
             ..GuestTxn::default()
         };
         self.plan(txn, ahead, None, LeaseOutcome::End)
-    }
-
-    /// H9: a delete measured against the surrounding text the guest last
-    /// committed (INVARIANTS "Exo's deletes are absolute and stand alone").
-    pub(super) fn delete(self, index: i32, length: u32) -> Result<Planned<'a>, DeleteDrop> {
-        let Some((text, cursor, anchor)) = &self.committed.surrounding_text else {
-            return Err(DeleteDrop::NoSurroundingText);
-        };
-        if cursor != anchor {
-            return Err(DeleteDrop::Selection);
-        }
-        if index >= 0 && *self.text == ExoText::Ahead {
-            return Err(DeleteDrop::TextAhead);
-        }
-        let lengths =
-            delete_lengths(text, *cursor, index, length).ok_or(DeleteDrop::NotAroundCursor)?;
-        if lengths == (0, 0) {
-            return Err(DeleteDrop::Empty);
-        }
-        let txn = GuestTxn {
-            delete: Some(lengths),
-            ..GuestTxn::default()
-        };
-        Ok(self.plan(txn, true, None, LeaseOutcome::End))
-    }
-
-    /// X1: Exo's cursor-relative region of its text becomes the preedit.
-    /// It is not gated by the text being ahead, on purpose (INVARIANTS
-    /// "Exo's deletes are absolute and stand alone"). The region must
-    /// cover the preedit Exo holds, which the guest does not have as text,
-    /// and deletes only the bytes beyond it; an empty one at Exo's cursor
-    /// after that preedit commits it.
-    pub(super) fn region(
-        self,
-        index: i32,
-        length: u32,
-        assembly: Assembly,
-    ) -> Result<Planned<'a>, RegionDrop> {
-        let Some((text, cursor, _)) = &self.committed.surrounding_text else {
-            return Err(RegionDrop::NoSurroundingText);
-        };
-        let exo = self
-            .predicted(text, *cursor)
-            .ok_or(RegionDrop::NotAroundCursor)?;
-        let exo_cursor = i32::try_from(exo.cursor).map_err(|_| RegionDrop::NotAroundCursor)?;
-        let start = i64::from(exo_cursor) + i64::from(index);
-        let (before, after) = lengths_around_cursor(&exo.text, exo_cursor, start, length)
-            .ok_or(RegionDrop::NotAroundCursor)?;
-        let region = exo.cursor - before as usize..exo.cursor + after as usize;
-        let held = &exo.held;
-        // An empty region ends Exo's composition and leaves the preedit it
-        // held as text, as a confirmation does, so the guest commits it.
-        // Only with Exo's cursor after that preedit, where the guest's is
-        // after a commit.
-        if region.is_empty() && !held.is_empty() && held.end == exo.cursor {
-            return Ok(self.commit_shown());
-        }
-        // The guest does not have the preedit Exo holds as text, so it is
-        // not deleted. A region that does not cover it would leave its
-        // rest lost or shown twice.
-        let (Some(delete_before), Some(delete_after)) = (
-            held.start.checked_sub(region.start),
-            region.end.checked_sub(held.end),
-        ) else {
-            return Err(RegionDrop::Uncovered);
-        };
-        // Both are at most the region's length.
-        let deleted = (delete_before as u32, delete_after as u32);
-        let preedit_text = exo.text[region].to_string();
-        let cursor = assembly.cursor.or(Some(before as i32));
-        let cursor = resolve_preedit_cursor(&preedit_text, assembly.selection, cursor);
-        // An empty region deletes nothing and leaves no preedit, so the
-        // guest has no edit to report. The guest no longer has the bytes
-        // a region deletes, which the committed text still holds.
-        let ahead = !preedit_text.is_empty();
-        let (taken_before, taken_after) = self.composition.taken.unwrap_or_default();
-        let taken = (taken_before + deleted.0, taken_after + deleted.1);
-        let taken = (taken != (0, 0)).then_some(taken);
-        let preedit = Preedit::new(preedit_text, cursor);
-        let held = preedit.as_ref().map(|_| before);
-        let txn = GuestTxn {
-            delete: Some(deleted),
-            preedit,
-            ..GuestTxn::default()
-        };
-        let mut planned = self.plan(txn, ahead, taken, LeaseOutcome::End);
-        planned.held = held;
-        Ok(planned)
-    }
-
-    /// Exo's prediction of the text, given the committed surrounding
-    /// `text` and `cursor`, as far as the core knows it: the guest's text,
-    /// which is the committed one without the bytes regions took, with the
-    /// preedit Exo holds at the guest's cursor. `None` if the cursor, or
-    /// the bytes taken around it, do not split `text` on character
-    /// boundaries.
-    fn predicted(&self, text: &str, cursor: i32) -> Option<Predicted> {
-        let (before, after) = self.composition.taken.unwrap_or_default();
-        let cursor = usize::try_from(cursor).ok()?;
-        let start = cursor.checked_sub(before as usize)?;
-        let end = cursor.checked_add(after as usize)?;
-        let (head, tail) = (text.get(..start)?, text.get(end..)?);
-        let (held, at) = match (&self.composition.shown, self.composition.held) {
-            (Some(shown), Some(at)) => (shown.text(), at as usize),
-            _ => ("", 0),
-        };
-        Some(Predicted {
-            text: [head, held, tail].concat(),
-            cursor: start + at,
-            held: start..start + held.len(),
-        })
     }
 
     /// X2 commits the shown preedit; X2', with none shown, recovers the
