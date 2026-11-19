@@ -117,7 +117,7 @@ enum Host {
 #[derive(Debug, PartialEq)]
 enum Key {
     Lease(TiId, LeaseOutcome),
-    Recover(TiId, Vec<(u32, AnyEvent)>),
+    Recover(TiId),
 }
 
 /// The effects of one step, decoded.
@@ -171,9 +171,9 @@ fn decode(fx: Effects) -> Out {
                 assert_eq!(seat, SEAT);
                 Key::Lease(ti, outcome)
             }
-            KeyEffect::RecoverHeldKey { ti, seat, done } => {
+            KeyEffect::RecoverHeldKey { ti, seat } => {
                 assert_eq!(seat, SEAT);
-                Key::Recover(ti, guest_events(&[done]))
+                Key::Recover(ti)
             }
         })
         .collect();
@@ -1736,7 +1736,28 @@ fn row_X2prime_an_empty_confirmation_recovers_the_held_key() {
     let mut ime = Ime::enabled();
     let out = ime.ext(HostIme::Confirm);
     assert_eq!(out.guest, []);
-    assert_eq!(out.keys, [Key::Recover(TI, vec![done(1)])]);
+    assert_eq!(out.keys, [Key::Recover(TI)]);
+}
+
+/// X2': the keyboard concern recovers the held key at the host's next
+/// event, after guest requests the core has handled since the
+/// confirmation. The transaction that follows the key is the guest's state
+/// under the serial of then; with the gate closed there is none.
+#[test]
+fn row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery() {
+    let mut ime = Ime::enabled();
+    ime.ext(HostIme::Confirm);
+    let done_now = |ime: &mut Ime| {
+        let done = ime.core.recovery_done(TI);
+        done.map(|done| guest_events(&done))
+    };
+    assert_eq!(done_now(&mut ime), Some(vec![done(1)]));
+    ime.report("ab", 1);
+    assert_eq!(done_now(&mut ime), Some(vec![done(2)]));
+    ime.step(Input::Disable(TI));
+    ime.step(Input::Commit(TI));
+    assert_eq!(done_now(&mut ime), None);
+    assert!(ime.core.recovery_done(TiId(TI.0 + 1)).is_none());
 }
 
 /// B3, as the old handlers did it: a commit or a delete that reaches no

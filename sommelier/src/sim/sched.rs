@@ -53,7 +53,7 @@ use super::clock::Micros;
 use super::display::Display;
 use super::editor::{Target, TextModel, UserAction};
 use super::engine::{Engine, EngineIn, Lag, Request};
-use super::exo::{Answer, Exo, RegionTruth};
+use super::exo::{Answer, Exo, RegionOutcome, RegionTruth};
 use super::hangul::Key;
 use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
@@ -669,8 +669,10 @@ impl<'t> World<'t> {
         self.log(Place::Engine, format!("{answer:?}"));
         let press = self.exo.press_of(&answer);
         let verdict = self.exo.answer(&answer);
-        if let Some(text) = self.exo.take_composed_region() {
-            self.engine.learn_region(text);
+        match self.exo.take_region_outcome() {
+            Some(RegionOutcome::Composed(text)) => self.engine.learn_region(text),
+            Some(RegionOutcome::Refused) => self.engine.refused_region(),
+            None => {}
         }
         if let Some(spec) = &mut self.spec {
             spec.counts.regions_stale = self.exo.regions_stale;

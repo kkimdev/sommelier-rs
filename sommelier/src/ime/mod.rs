@@ -74,7 +74,8 @@ pub struct HostTi {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostExt {
     pub id: u32,
-    /// Its version; an unknown one is the largest, which allows every
+    /// Its version, cached when the extension is created and never
+    /// updated. An unknown one is the largest, which allows every
     /// request.
     pub version: u32,
     /// The host `zcr_text_input_extension_v1` it is created from.
@@ -186,7 +187,7 @@ pub struct Effects {
     pub to_guest: Vec<Outgoing>,
     /// Host requests and barriers.
     pub to_host: Vec<HostOut>,
-    /// Requests to the keyboard concern, applied after `to_guest`.
+    /// Requests to the keyboard concern, applied after `to_guest` and `to_host`.
     pub keys: Vec<KeyEffect>,
     /// Whether the press of an [`Input::Press`] is to be forwarded: it
     /// ended no composition. The core consumes every other input's
@@ -221,20 +222,19 @@ pub enum KeyEffect {
         outcome: LeaseOutcome,
     },
     /// X2': recover the seat's latest eligible held key, which the input
-    /// method took. If one is held, send its press and release unless
-    /// another channel already delivered it, then `done`, whether or not
-    /// the pair went. The lease:
+    /// method took, if the confirmation turns out to be its autorepeat and
+    /// not Exo's confirmation before a new press (E13). The keyboard
+    /// concern decides at the host's next event; if it recovers the key,
+    /// it sends its press and release unless another channel already
+    /// delivered it, then the transaction of [`ImeCore::recovery_done`],
+    /// whether or not the pair went. The lease:
     /// - a held Backspace whose pair is sent arms it;
     /// - a held Backspace whose pair is skipped ends it;
     /// - another held key whose pair is sent ends it;
     /// - another held key whose pair is skipped leaves it alone;
-    /// - with no held key, it ends, and nothing is sent.
-    RecoverHeldKey {
-        ti: TiId,
-        seat: SeatId,
-        /// The bare transaction, a lone `done`.
-        done: Outgoing,
-    },
+    /// - with no held key, or a new press's confirmation, it ends, and
+    ///   nothing is sent.
+    RecoverHeldKey { ti: TiId, seat: SeatId },
 }
 
 /// Read-only facts the core needs and does not own. The adapter answers
@@ -332,9 +332,22 @@ impl ImeCore {
             .map(|t| t.seat())
     }
 
+    /// X2': the transaction that closes text input `ti`'s empty
+    /// confirmation once the keyboard concern has recovered the held key
+    /// it stood for ([`KeyEffect::RecoverHeldKey`]): G9c's answer, what the
+    /// guest shows under the current serial. `None` if the text input no
+    /// longer passes the gate, in which case nothing is recovered.
+    pub fn recovery_done(&mut self, ti: TiId) -> Option<Vec<Outgoing>> {
+        let input = self.inputs.get_mut(&ti)?;
+        input.current(ti)?;
+        Some(input.answer(ti))
+    }
+
     /// Check the invariants of design 3.1 (I1a to I4) that hold between
     /// steps, and that every pending barrier is one the core numbered,
-    /// once. I5 is the adapter's.
+    /// once. I5 is the adapter's. Test-only, so that a panicking check
+    /// cannot be wired into production.
+    #[cfg(test)]
     pub fn assert_invariants(&self, env: &impl Env) {
         let mut enabled = Vec::new();
         let mut barriers = Vec::new();

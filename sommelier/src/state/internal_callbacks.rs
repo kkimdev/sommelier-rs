@@ -40,6 +40,11 @@ pub(crate) enum InternalCallback {
     /// request this barrier of the IME core follows: the `deactivate` of
     /// its drain, or the `reset` of a press's fence.
     TextInput { token: BarrierToken },
+    /// The host has sent every event of the task that sent an empty IME
+    /// confirmation, whose recovery of a held key waits
+    /// ([`crate::handler::ime_keys::PendingRecovery`]). The `done` decides
+    /// it, as any host event that comes before it would.
+    KeyRecovery,
     /// Exo has processed the `set_window_bounds` that placement sent to this
     /// host `zaura_toplevel`.
     WindowBoundsBarrier { zaura_toplevel: u32 },

@@ -220,6 +220,17 @@ pub(super) struct RegionTruth {
     pub composed: String,
 }
 
+/// What became of a region the engine asked for, which the engine learns
+/// from the field (D6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RegionOutcome {
+    /// Exo composed this text.
+    Composed(String),
+    /// IMA refused the range at once, as it lay past the text, and the
+    /// field composes what it did.
+    Refused,
+}
+
 /// What `SurroundingTextTracker` (`ui/base/ime/surrounding_text_tracker.cc`)
 /// predicts a field holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -518,9 +529,9 @@ pub(crate) struct Exo {
     in_engine: VecDeque<PendingKey>,
     /// The ID of the next key Exo hands the engine.
     next_key: u64,
-    /// The text of the region composed from existing text since the
-    /// engine last learned one.
-    composed_region: Option<String>,
+    /// What became of the last region the engine asked for, since the
+    /// engine last learned it.
+    region_outcome: Option<RegionOutcome>,
     /// The seat's observers registered so far (E12).
     observers: u64,
     /// The ranges IMA held for a key and sent after that key's commit, so
@@ -1355,7 +1366,11 @@ impl Exo {
                 self.ima.region = Some((before, after));
             }
             TextAction::Region { before, after } => {
-                self.ima.composing |= self.set_composition_from_existing_text(id, before, after);
+                let composed = self.set_composition_from_existing_text(id, before, after);
+                if !composed {
+                    self.region_outcome = Some(RegionOutcome::Refused);
+                }
+                self.ima.composing |= composed;
             }
         }
     }
@@ -1379,7 +1394,9 @@ impl Exo {
     /// `before` the cursor and `after` it become the composition, which the
     /// extension's `set_preedit_region` shows, in bytes from the cursor. A
     /// range past the text is refused, before anything is sent
-    /// (`text_input.cc`); the engine then learns nothing.
+    /// (`text_input.cc`), as IMA's `SetComposingRange` refuses it when it
+    /// comes (`input_method_ash.cc`); the engine hears only of IMA's
+    /// refusal, not of one when IMA sends a range it held for a key.
     fn set_composition_from_existing_text(&mut self, id: u32, before: usize, after: usize) -> bool {
         let text = &mut self.text_input(id).text;
         let (range, within) = utf16_span(&text.predicted, before, after);
@@ -1410,14 +1427,14 @@ impl Exo {
             self.region_truths.push((self.events.len(), truth));
             self.events.push(event);
         }
-        self.composed_region = Some(composed);
+        self.region_outcome = Some(RegionOutcome::Composed(composed));
         true
     }
 
-    /// The text of the region Exo composed last from existing text, if it
-    /// did since the last call, for the engine to learn.
-    pub(super) fn take_composed_region(&mut self) -> Option<String> {
-        self.composed_region.take()
+    /// What became of the region the engine asked for last, if Exo composed
+    /// or refused one since the last call, for the engine to learn.
+    pub(super) fn take_region_outcome(&mut self) -> Option<RegionOutcome> {
+        self.region_outcome.take()
     }
 
     /// `TextInput::InsertText`: a `commit_string`, which ends the
@@ -2355,10 +2372,13 @@ mod tests {
         };
         assert_eq!(events(&mut exo), [(EXT, event.into())]);
         assert_eq!(*predicted(&exo), predicts("0a가", 5, Some(2..5)));
-        assert_eq!(exo.take_composed_region().as_deref(), Some("가"));
+        assert_eq!(
+            exo.take_region_outcome(),
+            Some(RegionOutcome::Composed("가".to_owned()))
+        );
         assert!(exo.ima.composing);
-        // One past the text is refused before anything is sent, and the
-        // engine learns nothing.
+        // One past the text is refused before anything is sent, which the
+        // engine hears.
         exo.ask(Request::Reconvert);
         exo.take_engine();
         let region = TextAction::Region {
@@ -2367,7 +2387,7 @@ mod tests {
         };
         answer_request(&mut exo, 1, vec![region]);
         assert_eq!(events(&mut exo), []);
-        assert_eq!(exo.take_composed_region(), None);
+        assert_eq!(exo.take_region_outcome(), Some(RegionOutcome::Refused));
         assert_eq!(*predicted(&exo), predicts("0a가", 5, Some(2..5)));
     }
 
@@ -2391,7 +2411,10 @@ mod tests {
         answer_request(&mut exo, 0, vec![region]);
         assert_eq!(events(&mut exo), []);
         assert_eq!(*predicted(&exo), predicts("0a", 2, Some(1..2)));
-        assert_eq!(exo.take_composed_region().as_deref(), Some("a"));
+        assert_eq!(
+            exo.take_region_outcome(),
+            Some(RegionOutcome::Composed("a".to_owned()))
+        );
         assert_eq!(exo.composition_shown_instead().as_deref(), Some(""));
         // Its commit ends it.
         exo.ask(Request::AcceptSuggestion);
