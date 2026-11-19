@@ -565,15 +565,72 @@ pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepe
 /// A recovery that waits also syncs with the host, whose `done` follows
 /// every event of the confirmation's task (E11), so that one round trip
 /// decides it at the latest. No timer is involved.
+///
+/// [`Self::decide`] is its transition function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingRecovery {
     ti: TiId,
     seat: SeatId,
     /// The seat's eligible held key when the confirmation came.
     held: HeldRepeatKey,
-    /// The `peek_key` press of a key not held before, or held only across
-    /// a detach, since the confirmation: its host keyboard, key and serial.
-    press: Option<(HostId, u32, u32)>,
+    wait: RecoveryWait,
+}
+
+/// What a [`PendingRecovery`] waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryWait {
+    /// The host's next event: no `peek_key` press has come since the
+    /// confirmation.
+    NextEvent,
+    /// The `wl_keyboard.key` press of the `peek_key` press of a key not
+    /// held before, or held only across a detach, since the confirmation:
+    /// its host keyboard, key and serial.
+    Press {
+        keyboard: HostId,
+        key: u32,
+        serial: u32,
+    },
+}
+
+/// A host event, as far as a [`PendingRecovery`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostSignal {
+    /// A `wl_keyboard.modifiers`.
+    Modifiers,
+    /// A `peek_key` press of `key` under `serial` on `keyboard`, the host
+    /// keyboard of its extended keyboard if the proxy knows it. `new`: the
+    /// keyboard does not hold the key, or holds it only across a detach
+    /// ([`crate::state::KeyGenerationRegistry::peek_press_is_new`]).
+    PeekPress {
+        keyboard: Option<HostId>,
+        key: u32,
+        serial: u32,
+        new: bool,
+    },
+    /// A `wl_keyboard.key` press of `key` under `serial` on `keyboard`.
+    KeyPress {
+        keyboard: HostId,
+        key: u32,
+        serial: u32,
+    },
+    /// A `zwp_text_input_v1.leave` of the host text input of guest text
+    /// input `ti`, if it has one.
+    TextInputLeave { ti: Option<u32> },
+    /// Any other event.
+    Other,
+}
+
+/// What a [`HostSignal`] makes of a [`PendingRecovery`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryStep {
+    /// It waits on, for this.
+    Wait(RecoveryWait),
+    /// The confirmation was the host's before a new press or a detach: no
+    /// key is recovered.
+    Drop,
+    /// The confirmation was an autorepeat: the held key is recovered
+    /// before the event is handled.
+    Recover,
 }
 
 impl PendingRecovery {
@@ -582,6 +639,106 @@ impl PendingRecovery {
     pub(crate) fn objects_for_test(&self) -> (u32, u32, HostId) {
         let held = self.held;
         (self.ti.0, held.guest_keyboard_id, held.host_keyboard_id)
+    }
+
+    /// The recovery's transition for the host's next event.
+    fn decide(&self, signal: HostSignal) -> RecoveryStep {
+        match (self.wait, signal) {
+            (RecoveryWait::NextEvent, HostSignal::Modifiers) => {
+                RecoveryStep::Wait(RecoveryWait::NextEvent)
+            }
+            (
+                RecoveryWait::NextEvent,
+                HostSignal::PeekPress {
+                    keyboard: Some(keyboard),
+                    key,
+                    serial,
+                    new: true,
+                },
+            ) => RecoveryStep::Wait(RecoveryWait::Press {
+                keyboard,
+                key,
+                serial,
+            }),
+            (
+                press @ RecoveryWait::Press { .. },
+                HostSignal::KeyPress {
+                    keyboard,
+                    key,
+                    serial,
+                },
+            ) if press
+                == (RecoveryWait::Press {
+                    keyboard,
+                    key,
+                    serial,
+                }) =>
+            {
+                RecoveryStep::Drop
+            }
+            (_, HostSignal::TextInputLeave { ti: Some(ti) }) if ti == self.ti.0 => {
+                RecoveryStep::Drop
+            }
+            _ => RecoveryStep::Recover,
+        }
+    }
+}
+
+/// Read the host event of `interface` (none for an untracked sender),
+/// whose sender is `sender`, `opcode` and `payload` as a [`HostSignal`].
+fn host_signal(
+    ctx: &Context,
+    sender: u32,
+    interface: Option<&str>,
+    opcode: u16,
+    payload: &[u8],
+) -> HostSignal {
+    let mut msg = crate::wire::WireMessage::new(sender, opcode, payload);
+    match interface {
+        Some(wl_keyboard::NAME) if opcode == wl_keyboard::EVT_MODIFIERS => HostSignal::Modifiers,
+        Some(wl_keyboard::NAME) if opcode == wl_keyboard::EVT_KEY => {
+            match wl_keyboard::Event::from_wire(&mut msg) {
+                Ok(wl_keyboard::Event::Key {
+                    serial, key, state, ..
+                }) if state == wl_keyboard::KEY_STATE_PRESSED => HostSignal::KeyPress {
+                    keyboard: HostId(sender),
+                    key,
+                    serial,
+                },
+                _ => HostSignal::Other,
+            }
+        }
+        Some(zcr_extended_keyboard_v1::NAME) => {
+            match zcr_extended_keyboard_v1::Event::from_wire(&mut msg) {
+                Ok(zcr_extended_keyboard_v1::Event::PeekKey {
+                    serial, key, state, ..
+                }) if state == wl_keyboard::KEY_STATE_PRESSED => {
+                    // Any keyboard of the connection: Exo has one seat,
+                    // which sends each keyboard of every guest seat the
+                    // press in turn. A key held only across a detach is
+                    // pressed anew too.
+                    let keyboard = ctx
+                        .extended_keyboard_to_keyboard
+                        .get(&HostId(sender))
+                        .copied();
+                    HostSignal::PeekPress {
+                        keyboard,
+                        key,
+                        serial,
+                        new: keyboard.is_some_and(|keyboard| {
+                            ctx.key_generations.peek_press_is_new(keyboard, key)
+                        }),
+                    }
+                }
+                _ => HostSignal::Other,
+            }
+        }
+        Some(zwp_text_input_v1::NAME) if opcode == zwp_text_input_v1::EVT_LEAVE => {
+            HostSignal::TextInputLeave {
+                ti: ctx.shadow_table.get_guest_id(sender),
+            }
+        }
+        _ => HostSignal::Other,
     }
 }
 
@@ -606,7 +763,7 @@ pub(super) fn hold_recovery(ctx: &mut Context, ti: TiId, seat: SeatId) {
         ti,
         seat,
         held,
-        press: None,
+        wait: RecoveryWait::NextEvent,
     });
     queue_internal_sync(ctx, InternalCallback::KeyRecovery);
 }
@@ -625,58 +782,13 @@ pub(crate) fn before_host_event(
     let Some(pending) = ctx.pending_recovery else {
         return;
     };
-    let mut msg = crate::wire::WireMessage::new(sender, opcode, payload);
-    match (interface, pending.press) {
-        (Some(wl_keyboard::NAME), None) if opcode == wl_keyboard::EVT_MODIFIERS => {}
-        (Some(zcr_extended_keyboard_v1::NAME), None) => {
-            let peek = zcr_extended_keyboard_v1::Event::from_wire(&mut msg);
-            let Ok(zcr_extended_keyboard_v1::Event::PeekKey {
-                serial, key, state, ..
-            }) = peek
-            else {
-                return recover_pending(ctx);
-            };
-            let keyboard = ctx
-                .extended_keyboard_to_keyboard
-                .get(&HostId(sender))
-                .copied();
-            // Any keyboard of the connection: Exo has one seat, which
-            // sends each keyboard of every guest seat the press in turn.
-            // A key held only across a detach is pressed anew too.
-            let press = keyboard.filter(|&keyboard| {
-                state == wl_keyboard::KEY_STATE_PRESSED
-                    && ctx.key_generations.peek_press_is_new(keyboard, key)
-            });
-            match press {
-                Some(keyboard) => {
-                    let pending = ctx.pending_recovery.as_mut().expect("checked above");
-                    pending.press = Some((keyboard, key, serial));
-                }
-                None => recover_pending(ctx),
-            }
+    let signal = host_signal(ctx, sender, interface, opcode, payload);
+    match pending.decide(signal) {
+        RecoveryStep::Wait(wait) => {
+            ctx.pending_recovery = Some(PendingRecovery { wait, ..pending });
         }
-        (Some(wl_keyboard::NAME), Some(press)) if opcode == wl_keyboard::EVT_KEY => {
-            let own_press = match wl_keyboard::Event::from_wire(&mut msg) {
-                Ok(wl_keyboard::Event::Key {
-                    serial, key, state, ..
-                }) => {
-                    state == wl_keyboard::KEY_STATE_PRESSED
-                        && press == (HostId(sender), key, serial)
-                }
-                _ => false,
-            };
-            match own_press {
-                true => drop_pending(ctx),
-                false => recover_pending(ctx),
-            }
-        }
-        (Some(zwp_text_input_v1::NAME), _)
-            if opcode == zwp_text_input_v1::EVT_LEAVE
-                && ctx.shadow_table.get_guest_id(sender) == Some(pending.ti.0) =>
-        {
-            drop_pending(ctx);
-        }
-        _ => recover_pending(ctx),
+        RecoveryStep::Drop => drop_pending(ctx),
+        RecoveryStep::Recover => recover_pending(ctx),
     }
 }
 
@@ -794,6 +906,65 @@ mod tests {
     use crate::handler::text_input::tests::*;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::Event as V3;
     use crate::state::GuestKeyOwner;
+
+    /// The recovery's transition, for each host event it can meet in each
+    /// of its states.
+    #[test]
+    fn a_waiting_recovery_is_decided_by_the_hosts_next_event() {
+        use HostSignal::{KeyPress, Modifiers, Other, PeekPress, TextInputLeave};
+        use RecoveryStep::{Drop, Recover, Wait};
+        use RecoveryWait::NextEvent;
+        let held = HeldRepeatKey {
+            guest_keyboard_id: 5,
+            host_keyboard_id: HostId(50),
+            key: 14,
+            serial: 7,
+            time: 70,
+        };
+        let (other_keyboard, key, serial) = (HostId(51), 30, 8);
+        let press = RecoveryWait::Press {
+            keyboard: other_keyboard,
+            key,
+            serial,
+        };
+        let peek = |keyboard, new| PeekPress {
+            keyboard,
+            key,
+            serial,
+            new,
+        };
+        let key_press = |keyboard, serial| KeyPress {
+            keyboard,
+            key,
+            serial,
+        };
+        for (wait, signal, step) in [
+            (NextEvent, Modifiers, Wait(NextEvent)),
+            (NextEvent, peek(Some(other_keyboard), true), Wait(press)),
+            (NextEvent, peek(Some(other_keyboard), false), Recover),
+            (NextEvent, peek(None, true), Recover),
+            (NextEvent, key_press(other_keyboard, serial), Recover),
+            (NextEvent, TextInputLeave { ti: Some(9) }, Drop),
+            (NextEvent, TextInputLeave { ti: Some(10) }, Recover),
+            (NextEvent, TextInputLeave { ti: None }, Recover),
+            (NextEvent, Other, Recover),
+            (press, key_press(other_keyboard, serial), Drop),
+            (press, key_press(other_keyboard, serial + 1), Recover),
+            (press, key_press(HostId(50), serial), Recover),
+            (press, Modifiers, Recover),
+            (press, peek(Some(other_keyboard), true), Recover),
+            (press, TextInputLeave { ti: Some(9) }, Drop),
+            (press, Other, Recover),
+        ] {
+            let pending = PendingRecovery {
+                ti: TiId(9),
+                seat: SeatId(1),
+                held,
+                wait,
+            };
+            assert_eq!(pending.decide(signal), step, "{wait:?} {signal:?}");
+        }
+    }
 
     #[test]
     fn ending_one_keyboard_repeat_does_not_cancel_another_held_keyboard() {

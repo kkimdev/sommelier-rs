@@ -103,6 +103,23 @@ The phase moves:
   peek, no guest owner, no suppression), and at an enter, a leave that
   ends the keyboard's focus, or the keyboard's end.
 
+## The recovery decision
+
+An empty confirmation at extension v11 is either a held key's autorepeat
+or the confirmation Exo sends before a press its input method does not
+handle (INVARIANTS: "An empty confirmation recovers a held key only once
+the host shows it repeated"). `ime_keys::PendingRecovery` holds the
+recovery, and `PendingRecovery::decide` is its transition for each host
+event, read as a `HostSignal`:
+
+| Waiting for | Event | Step |
+| --- | --- | --- |
+| `NextEvent` | `wl_keyboard.modifiers` | wait |
+| `NextEvent` | peek press of a key the keyboard does not hold, or holds stale | wait for that key's `Press` |
+| `Press` | that key's `wl_keyboard.key` press with the peek's serial | drop |
+| any | the text input's `leave` (E6) | drop |
+| any | anything else | recover, then handle the event |
+
 ## Tests
 
 - `key_generation_registry_matches_the_model_for_all_short_transition_sequences`
@@ -112,5 +129,7 @@ The phase moves:
 - `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`
   checks that the delivery reducer never opens two guest presses, nor
   forwards a repeat or release without one.
+- `a_waiting_recovery_is_decided_by_the_hosts_next_event` pins the
+  recovery's transition table.
 - The handler tests in `keyboard.rs`, `ime_keys.rs` and `text_input.rs`
   and the DST pin the wire behaviour.
