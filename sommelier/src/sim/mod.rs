@@ -125,6 +125,7 @@ impl Case {
             latin: self.latin,
             nfd_backspace: self.client != ClientKind::Chromium,
             regionless: extension.is_none(),
+            late_cursor: self.client == ClientKind::Gtk3,
         }
     }
 

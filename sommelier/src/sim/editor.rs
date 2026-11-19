@@ -83,6 +83,9 @@ pub(super) struct Typing {
     /// field never shows, and the next key commits it, so its text shows
     /// twice.
     pub regionless: bool,
+    /// The client reports a cursor that a click moved only with its next
+    /// edit, as GTK3 does.
+    pub late_cursor: bool,
 }
 
 /// What the user does.
