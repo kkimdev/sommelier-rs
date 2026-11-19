@@ -19,6 +19,8 @@ limitations under the License.
 //! or a press can change what the guest is shown only through
 //! [`Current`], which only [`TextInput::current`] makes.
 
+use std::ops::Range;
+
 use super::guest::{delete_lengths, lengths_around_cursor, resolve_preedit_cursor};
 use super::guest::{GuestTxn, Preedit, TooLong};
 use super::host;
@@ -93,9 +95,15 @@ struct Composition {
     /// (X1). The committed text still holds them, but the guest no longer
     /// does. `Some` only while the text is `Ahead`: a report clears it
     /// ([`TextInput::apply_commit`]), and so does every end of the
-    /// composition, which gives the bytes back as text. A host preedit
-    /// (H7) keeps it.
+    /// composition, which gives the bytes back as text, a reset commit
+    /// (H7) included. Any other host preedit keeps it.
     taken: Option<(u32, u32)>,
+    /// Where Exo's cursor is in `shown`, while Exo holds it as its
+    /// composition, inline in its text at the guest's cursor (X1). `None`
+    /// with nothing shown, and for a region's preedit once the guest
+    /// reported text without the region's bytes, which Exo cannot match,
+    /// so it drops its composition (E4).
+    held: Option<u32>,
     assembly: Assembly,
 }
 
@@ -222,7 +230,11 @@ impl TextInput {
         if let Some(surrounding_text) = surrounding_text {
             f.committed.surrounding_text = surrounding_text;
             f.text = ExoText::Synced;
-            self.composition.taken = None;
+            // A text without the bytes regions took names no state Exo
+            // predicted, so Exo drops its composition (E4).
+            if self.composition.taken.take().is_some() {
+                self.composition.held = None;
+            }
         }
         if let Some(content_type) = content_type {
             f.committed.content_type = content_type;
@@ -249,8 +261,18 @@ impl TextInput {
             );
             self.composition.shown = None;
             self.composition.taken = None;
+            self.composition.held = None;
             vec![bare_done(ti, serial)]
         })
+    }
+
+    /// Show `preedit` in place of the shown one, as no input can: every
+    /// preedit a plan shows fit a message once, so only this reaches the
+    /// answer that forgets one (G9c).
+    #[cfg(test)]
+    pub(super) fn replace_shown(&mut self, preedit: Preedit) {
+        assert!(self.composition.shown.is_some(), "a preedit shows");
+        self.composition.shown = Some(preedit);
     }
 
     /// F1, F2 and G10: the field ends, and a new one starts on `surface`,
@@ -409,6 +431,7 @@ impl TextInput {
         let Composition {
             shown,
             taken,
+            held,
             assembly,
         } = &self.composition;
         if shown.is_some() || taken.is_some() || *assembly != Assembly::default() {
@@ -420,6 +443,13 @@ impl TextInput {
                 ahead,
                 "I2: {ti:?} keeps taken bytes past a report: {self:?}"
             );
+        }
+        if let Some(at) = held {
+            let at = *at as usize;
+            let holds = shown
+                .as_ref()
+                .is_some_and(|p| p.text().is_char_boundary(at));
+            assert!(holds, "I2: {ti:?} holds no preedit at {at}: {self:?}");
         }
         if shown.is_some() {
             assert!(
@@ -486,9 +516,20 @@ pub(super) enum DeleteDrop {
 pub(super) enum RegionDrop {
     NoSurroundingText,
     NotAroundCursor,
-    /// The region does not cover the bytes earlier regions took, which it
-    /// would lose or show twice.
+    /// The region does not cover the preedit Exo holds, whose rest Exo
+    /// would leave as text.
     Uncovered,
+}
+
+/// Exo's prediction of a field's text, in which it measures a region
+/// (X1).
+struct Predicted {
+    text: String,
+    /// Exo's cursor.
+    cursor: usize,
+    /// Where the preedit Exo holds lies in `text`; empty, at the guest's
+    /// cursor, if none.
+    held: Range<usize>,
 }
 
 /// What a confirmation (X2, X2') does.
@@ -515,34 +556,46 @@ impl<'a> Current<'a> {
             txn,
             ahead,
             taken,
+            held: None,
             lease,
             fence: None,
         }
     }
 
-    /// H7. A cleared preedit with a commit text is Exo's reset commit.
-    /// Either keeps the bytes regions took, as the old code does.
+    /// H7. A cleared preedit with a commit text is Exo's reset commit,
+    /// which gives the bytes regions took back as text, as every edit
+    /// that ends the composition does. A preedit keeps them.
     pub(super) fn preedit(self, text: String, commit: String, assembly: Assembly) -> Planned<'a> {
         let shown = self.shown().is_some();
-        let taken = self.composition.taken;
         if text.is_empty() && shown && !commit.is_empty() {
             let txn = GuestTxn {
                 commit: Some(commit),
                 ..GuestTxn::default()
             };
-            return self.plan(txn, true, taken, LeaseOutcome::End);
+            return self.plan(txn, true, None, LeaseOutcome::End);
         }
+        let taken = self.composition.taken;
         let lease = match text.is_empty() && shown {
             true => LeaseOutcome::ArmIfBackspaceHeld,
             false => LeaseOutcome::End,
         };
+        // Exo's cursor is where it sent the preedit's, or else, as no
+        // cursor of its own converted, at the end.
+        let held = assembly
+            .cursor
+            .and_then(|at| u32::try_from(at).ok())
+            .filter(|&at| text.is_char_boundary(at as usize))
+            .unwrap_or(text.len() as u32);
         let cursor = resolve_preedit_cursor(&text, assembly.selection, assembly.cursor);
         let preedit = Preedit::new(text, cursor);
+        let held = preedit.as_ref().map(|_| held);
         let txn = GuestTxn {
             preedit,
             ..GuestTxn::default()
         };
-        self.plan(txn, false, taken, lease)
+        let mut planned = self.plan(txn, false, taken, lease);
+        planned.held = held;
+        planned
     }
 
     /// H8. An empty commit is no edit, whether or not a preedit shows, so
@@ -580,11 +633,12 @@ impl<'a> Current<'a> {
         Ok(self.plan(txn, true, None, LeaseOutcome::End))
     }
 
-    /// X1: Exo's cursor-relative region of the committed surrounding text
-    /// becomes the preedit. It is not gated by the text being ahead, on
-    /// purpose (INVARIANTS "Exo's deletes are absolute and stand alone").
-    /// The guest no longer has the bytes earlier regions took, so they are
-    /// not deleted again; a region that does not cover them is dropped.
+    /// X1: Exo's cursor-relative region of its text becomes the preedit.
+    /// It is not gated by the text being ahead, on purpose (INVARIANTS
+    /// "Exo's deletes are absolute and stand alone"). The region must
+    /// cover the preedit Exo holds, which the guest does not have as text,
+    /// and deletes only the bytes beyond it; an empty one at Exo's cursor
+    /// after that preedit commits it.
     pub(super) fn region(
         self,
         index: i32,
@@ -594,32 +648,76 @@ impl<'a> Current<'a> {
         let Some((text, cursor, _)) = &self.committed.surrounding_text else {
             return Err(RegionDrop::NoSurroundingText);
         };
-        let start = i64::from(*cursor) + i64::from(index);
-        let (before, after) = lengths_around_cursor(text, *cursor, start, length)
+        let exo = self
+            .predicted(text, *cursor)
             .ok_or(RegionDrop::NotAroundCursor)?;
-        // The cursor is a character boundary of `text`, at most its length.
-        let cursor = *cursor as usize;
-        let region = &text[cursor - before as usize..cursor + after as usize];
-        let cursor = assembly.cursor.or(Some(before as i32));
-        let cursor = resolve_preedit_cursor(region, assembly.selection, cursor);
-        let (taken_before, taken_after) = self.composition.taken.unwrap_or_default();
+        let exo_cursor = i32::try_from(exo.cursor).map_err(|_| RegionDrop::NotAroundCursor)?;
+        let start = i64::from(exo_cursor) + i64::from(index);
+        let (before, after) = lengths_around_cursor(&exo.text, exo_cursor, start, length)
+            .ok_or(RegionDrop::NotAroundCursor)?;
+        let region = exo.cursor - before as usize..exo.cursor + after as usize;
+        let held = &exo.held;
+        // An empty region ends Exo's composition and leaves the preedit it
+        // held as text, as a confirmation does, so the guest commits it.
+        // Only with Exo's cursor after that preedit, where the guest's is
+        // after a commit.
+        if region.is_empty() && !held.is_empty() && held.end == exo.cursor {
+            return Ok(self.commit_shown());
+        }
+        // The guest does not have the preedit Exo holds as text, so it is
+        // not deleted. A region that does not cover it would leave its
+        // rest lost or shown twice.
         let (Some(delete_before), Some(delete_after)) = (
-            before.checked_sub(taken_before),
-            after.checked_sub(taken_after),
+            held.start.checked_sub(region.start),
+            region.end.checked_sub(held.end),
         ) else {
             return Err(RegionDrop::Uncovered);
         };
+        // Both are at most the region's length.
+        let deleted = (delete_before as u32, delete_after as u32);
+        let preedit_text = exo.text[region].to_string();
+        let cursor = assembly.cursor.or(Some(before as i32));
+        let cursor = resolve_preedit_cursor(&preedit_text, assembly.selection, cursor);
         // An empty region deletes nothing and leaves no preedit, so the
-        // guest has no edit to report. A region that is not empty takes
-        // its bytes, which cover those earlier regions took.
-        let ahead = !region.is_empty();
-        let taken = ahead.then_some((before, after));
+        // guest has no edit to report. The guest no longer has the bytes
+        // a region deletes, which the committed text still holds.
+        let ahead = !preedit_text.is_empty();
+        let (taken_before, taken_after) = self.composition.taken.unwrap_or_default();
+        let taken = (taken_before + deleted.0, taken_after + deleted.1);
+        let taken = (taken != (0, 0)).then_some(taken);
+        let preedit = Preedit::new(preedit_text, cursor);
+        let held = preedit.as_ref().map(|_| before);
         let txn = GuestTxn {
-            delete: Some((delete_before, delete_after)),
-            preedit: Preedit::new(region.to_string(), cursor),
+            delete: Some(deleted),
+            preedit,
             ..GuestTxn::default()
         };
-        Ok(self.plan(txn, ahead, taken, LeaseOutcome::End))
+        let mut planned = self.plan(txn, ahead, taken, LeaseOutcome::End);
+        planned.held = held;
+        Ok(planned)
+    }
+
+    /// Exo's prediction of the text, given the committed surrounding
+    /// `text` and `cursor`, as far as the core knows it: the guest's text,
+    /// which is the committed one without the bytes regions took, with the
+    /// preedit Exo holds at the guest's cursor. `None` if the cursor, or
+    /// the bytes taken around it, do not split `text` on character
+    /// boundaries.
+    fn predicted(&self, text: &str, cursor: i32) -> Option<Predicted> {
+        let (before, after) = self.composition.taken.unwrap_or_default();
+        let cursor = usize::try_from(cursor).ok()?;
+        let start = cursor.checked_sub(before as usize)?;
+        let end = cursor.checked_add(after as usize)?;
+        let (head, tail) = (text.get(..start)?, text.get(end..)?);
+        let (held, at) = match (&self.composition.shown, self.composition.held) {
+            (Some(shown), Some(at)) => (shown.text(), at as usize),
+            _ => ("", 0),
+        };
+        Some(Predicted {
+            text: [head, held, tail].concat(),
+            cursor: start + at,
+            held: start..start + held.len(),
+        })
     }
 
     /// X2 commits the shown preedit; X2', with none shown, recovers the
@@ -650,7 +748,7 @@ impl<'a> Current<'a> {
         planned
     }
 
-    /// The commit of the shown preedit (X2, F4).
+    /// The commit of the shown preedit (X1, X2, F4).
     fn commit_shown(self) -> Planned<'a> {
         let text = self.shown().map(|shown| shown.text().to_string());
         let txn = GuestTxn {
@@ -671,6 +769,8 @@ pub(super) struct Planned<'a> {
     ahead: bool,
     /// The bytes regions have taken after the transaction.
     taken: Option<(u32, u32)>,
+    /// Exo's cursor in the transaction's preedit, if Exo holds it.
+    held: Option<u32>,
     lease: LeaseOutcome,
     /// The press's reset fence (F4).
     fence: Option<BarrierToken>,
@@ -686,12 +786,14 @@ impl Planned<'_> {
             txn,
             ahead,
             taken,
+            held,
             lease,
             fence,
         } = self;
         let events = txn.encode(cur.ti, cur.composition.shown.is_some(), cur.serial)?;
         cur.composition.shown = txn.preedit;
         cur.composition.taken = taken;
+        cur.composition.held = held;
         if ahead {
             *cur.text = ExoText::Ahead;
         }
