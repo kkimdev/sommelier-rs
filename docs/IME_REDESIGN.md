@@ -203,8 +203,9 @@ tested.
 The DST should find or measure these automatically.
 [4.8](#48-the-known-issue-list) covers how a known one is handled.
 
-- **P1. Focus loss while composing** (user-intent oracle; known issue
-  until C5).
+- **P1. Focus loss while composing** (user-intent oracle; a known issue
+  until C5, which fixed it: the guest commits the preedit before the
+  keyboard's `leave`, F1).
   - The guest shows "가", and the user switches windows.
   - Exo's detach makes its input method confirm the composition, and
     that confirmation comes before the text-input `leave` (E6) [F].
@@ -396,7 +397,7 @@ reconcile that ends every step.
 | ID | Event | Precondition | Guest events | Next state / notes | On encode failure | Sources |
 |---|---|---|---|---|---|---|
 | H1 | v1 `enter(surface)` | any | none | No change. While attached, it answers the proxy's own `activate`. | n/a | INVARIANTS "The host gets each content type…"; `TextInputV1Handler::on_enter` |
-| H2 | v1 `leave` | `Attached` | If `shown`: `Txn{preedit: none}` | Link → `Detached` (Exo's own detach). The composition and the assembly are cleared. The fence stays. The reconcile then activates again if the field still wants input. | n/a (no strings) | INVARIANTS same rule; Exo `TextInput::OnSurfaceFocused`, `OnSurfaceDestroying` and `OnInputMethodDestroyed` [F]; `on_leave`, `end_on_host_detach` |
+| H2 | v1 `leave` | `Attached` | If `shown = Some(p)`: `Txn{commit: p, preedit: none}` (**C5, done**; it was `Txn{preedit: none}`). Exo's detach confirms first (E6), which commits the shown preedit at v11 or later, and below v11 if Exo tracks the composition, so a preedit still shown is one Exo no longer tracked (E4): nothing confirmed it, and the guest commits it, so a restart of the input method keeps the user's text. Nothing is committed twice. | Link → `Detached` (Exo's own detach). The commit, as at X2, ends the lease and makes the text `Ahead`; the composition and the assembly are cleared. The fence stays. The reconcile then activates again if the field still wants input. | A commit that does not fit clears the preedit as before C5. | INVARIANTS same rule; Exo `TextInput::OnSurfaceFocused`, `OnSurfaceDestroying` and `OnInputMethodDestroyed` [F]; `host_leave`; tests `row_H2_an_exo_detach_commits_the_preedit_and_activates_again`, `row_H2_a_confirmed_composition_is_committed_once`, `an_exo_detach_commits_the_guest_preedit` |
 | H2' | v1 `leave` | `Draining` or `Detached` | none | Ignored: it answers the proxy's own `deactivate`. | n/a | same |
 | H3 | `modifiers_map`, `input_panel_state`, `language`, `text_direction` | any | none | Ignored. | n/a | the handlers of the same names |
 | H4 | `preedit_styling(i, l, style)` | `Attached` (dropped otherwise, as today) | none | Recorded in the assembly when `style == SELECTION`. | n/a | `on_preedit_styling` (records only while `host_is_active`) |
@@ -419,8 +420,8 @@ reconcile that ends every step.
 
 | ID | Input (owner that sends it) | Precondition | Host requests | Guest events | Next state / notes | Sources |
 |---|---|---|---|---|---|---|
-| F1 | Seat focus change: `wl_keyboard.enter` of another surface, `wl_keyboard.leave`, or a keyboard's end (`KeyboardFocusRegistry`, via `KeyboardHandler::on_enter`, `on_leave` and `forget_keyboard`) | Per text input on that seat, in `TiId` order | Through the reconcile: `deactivate` and a barrier, or `activate` | `leave(old)`, then `enter(new)`, each if it changed. **Proposed (C5):** first, `Txn{commit: p, preedit: none}` if `shown = Some(p)` and the old surface is still live. | The field is reset: a new `FocusedField{surface, enabled: false, text: Synced}`, or `Unfocused`, with an empty pending state. The composition and the assembly are cleared. The keyboard ends the seat's leases and peek watermarks, as today. | INVARIANTS "Focus teardown sends `leave` itself"; `apply_keyboard_focus_changes`, `apply_text_input_focus_updates`; C5 is P1 |
-| F2 | Surface destroyed (`forget_surface` in `compositor.rs`) | A text input focused on that surface | as F1 | `leave(s)`, while `s` is still valid. | The focus is projected again from `Env::keyboard_focus`. `compositor::forget_surface` sends F1 for each seat whose keyboard focused `s` first, so F2 finds only a field that F1 did not reset, focused on `s` while its seat's keyboard was not; the keyboard focus has left `s` by then, so F2 always sends `leave`. Old INVARIANTS described a repair that stays on the same surface, which `forget_surface` cannot produce (REVIEW2). | INVARIANTS "Focus teardown…"; `repair_destroyed_surface_focus` until C3c; tests `row_F2_a_destroyed_surface_is_left_while_it_is_valid`, `wl_surface_destroy_repairs_only_text_inputs_on_the_stale_surface` |
+| F1 | Seat focus change: `wl_keyboard.enter` of another surface, `wl_keyboard.leave`, or a keyboard's end (`KeyboardFocusRegistry`, via `KeyboardHandler::on_enter`, `on_leave` and `forget_keyboard`) | Per text input on that seat, in `TiId` order | Through the reconcile: `deactivate` and a barrier, or `activate` | **C5, done:** first `Txn{commit: p, preedit: none}` if `shown = Some(p)` and the composition is current, then the keyboard events that moved the focus (`Input::FocusChanged::keyboard`: the guest's `wl_keyboard.leave`, or `enter` and its `modifiers`, which the keyboard handler hands the core rather than forwarding), then `leave(old)` and `enter(new)`, each if it changed. The commit goes before the keyboard events because both client models drop input-method events for a window that has lost the keyboard focus (C11, C12). | The field is reset: a new `FocusedField{surface, enabled: false, text: Synced}`, or `Unfocused`, with an empty pending state. The composition and the assembly are cleared. The keyboard ends the seat's leases and peek watermarks, as today. Exo's own confirmation of its detach comes after the keyboard's `leave` (E12), while the link drains, and is dropped. | INVARIANTS "Focus teardown sends `leave` itself", "A field the focus leaves commits its preedit first"; mutter and ibus commit a preedit at a focus-out; `apply_keyboard_focus_changes`; tests `row_F1_a_focus_change_commits_the_shown_preedit_before_leave`, `a_focus_loss_commits_the_shown_preedit_before_leave`; C5 fixes P1 |
+| F2 | Surface destroyed (`forget_surface` in `compositor.rs`) | A text input focused on that surface | as F1 | `leave(s)`, while `s` is still valid. **No commit** (C5): the guest destroyed the window the text would go into. | The focus is projected again from `Env::keyboard_focus`, which the destroy has already moved off `s`. Since C5, `compositor::forget_surface` sends F2 before the F1 of each seat whose keyboard focused `s`, so that F1, which would commit, finds the field reset; F2 always sends `leave`. Old INVARIANTS described a repair that stays on the same surface, which `forget_surface` cannot produce (REVIEW2). | INVARIANTS "Focus teardown…"; `repair_destroyed_surface_focus` until C3c; tests `row_F2_a_destroyed_surface_is_left_while_it_is_valid`, `wl_surface_destroy_repairs_only_text_inputs_on_the_stale_surface` |
 | F3 | `wl_seat` bound under a guest ID (`registry.rs`, `wl_seat` bind) | The text inputs of that seat | Through the reconcile: the deferred `activate`, with its content type | none | | INVARIANTS Object lifetimes "Releasing a parent does not end its children"; test `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type` |
 | F4 | Press: a `wl_pointer.button` press from a pointer whose `enter` named `s`, or a `wl_touch.down` on `s` (#72: `PointerHandler::on_button` and `TouchHandler::on_down`, both through `end_composition_on_press(ctx, surface, resend)`) | The enabled text input is focused on `s`; gate; `shown = Some(p)` | `zwp_text_input_v1.reset`, then a barrier (the fence) | `Txn{commit: p, preedit: none}`, then the press or down itself, re-sent by the core | `shown := none`; the assembly is taken; `fence := Some(f)`; the text becomes `Ahead`; the lease ends. A press whose commit does not fit changes nothing and is forwarded, and leaves the assembly (B3, below H9). A release, another surface (subsurfaces included), no composition, or an open fence changes nothing, and the press is forwarded. | INVARIANTS "A press ends the composition on its surface"; mutter (`meta_wayland_text_input_handle_event`), KWin (`InputMethodEventFilter::pointerButton` and `touchDown`, `InputMethod::commitPendingText`) [F]; Exo `TextInput::Reset` sends nothing back [F] |
 | F5 | Key activity (`wl_keyboard.key`, `peek_key`) | n/a | n/a | n/a | **Not a core input.** Leases are keyboard state (`KeyGenerationRegistry::ime_repeat_owner`). The keyboard ends them on a non-Backspace press and on a Backspace release, as today. The core only emits `KeyEffect`s. | INVARIANTS "IME state is scoped to its keyboard or seat" |
@@ -1709,17 +1710,18 @@ Each mode gets half of the cases.
     preedit, then move the cursor to the target;
   - forwarded `wl_keyboard.key`, through `insert_key` (raw keys
     included);
-  - F1 and F2 on focus changes, as the specification says today. C5
-    changes the reference with the proxy. At F2, `SpecText` sees the
-    guest's `wl_surface.destroy`: a text input focused on that surface
-    must leave it in the same step, while it is valid, and the field
-    detaches, since the seat's focus projected again is no surface. It
-    then skips the keyboard `enter` and `leave`, the pointer `enter` and
-    the touch `down` that name a destroyed host surface, which the proxy
-    drops; a press with no pointer surface lands nowhere. A repair that
-    stays on the same surface cannot happen at F2: the focus registry
-    retires every keyboard on the destroyed surface before the repair
-    reads the seat's focus.
+  - F1 and F2 on focus changes. Since C5, F1 commits the shown preedit
+    before the field resets, as does Exo's own detach (H2) with a
+    preedit its confirmation left. At F2, which commits nothing,
+    `SpecText` sees the guest's `wl_surface.destroy`: a text input
+    focused on that surface must leave it in the same step, while it is
+    valid, and the field detaches, since the seat's focus projected
+    again is no surface. It then skips the keyboard `enter` and `leave`,
+    the pointer `enter` and the touch `down` that name a destroyed host
+    surface, which the proxy drops; a press with no pointer surface
+    lands nowhere. A repair that stays on the same surface cannot happen
+    at F2: the focus registry retires every keyboard on the destroyed
+    surface before the repair reads the seat's focus.
 - **Shadow.** `oracle::Shadow` is an ideal `TextModel` per field fed the
   proxy's **actual** `P→C` output: transactions at `done`, keys and
   presses. It has no client drops.
@@ -1790,25 +1792,19 @@ DST FAILURE seed=81321 mode=free client=Gtk{v4:false} ext=11 e6=confirm e8=text-
 
 ### 4.8 The known-issue list
 
-#72 retired P2. P1 remains; reaching H2 added a second, D6 a third and
-D7 a fourth. Measuring a region in Exo's text (X1) retired the third,
-the region over a shown preedit.
+#72 retired P2. Reaching H2 added a second issue, D6 a third and D7 a
+fourth. Measuring a region in Exo's text (X1) retired the third, the
+region over a shown preedit. C5 retired P1 (`FocusWhileComposing`) and
+the lost detach (`RestartLosesUntrackedComposition`): the guest commits
+the shown preedit at a focus loss (F1) and at Exo's own detach (H2).
+They were the only issues of tier 2, so the classifier lost its
+prediction path, and every failure of the user's intent fails the run.
 
 ```rust
 // sim/oracle.rs
-/// A tier-2 failure the proxy is known to cause. It is counted, not
+/// A tier-1 failure the proxy is known to cause. It is counted, not
 /// failed. The PR that fixes it deletes its variant.
 enum KnownIssue {
-    /// P1: a focus change while the client shows a preedit loses or
-    /// keeps the syllable depending on Exo's event order. C5 fixes it.
-    FocusWhileComposing,
-    /// H2: below v11 of the extension, Exo's detach confirms only a
-    /// composition it tracks, and a report it cannot match drops that
-    /// (E4); at the leave the proxy clears the preedit the guest shows.
-    /// C5 decides whether H2 commits it. A restart, or a focus move that
-    /// the text input hears of before a keyboard bound after its activate,
-    /// detaches it so.
-    RestartLosesUntrackedComposition,
     /// X2': Exo's confirmation before a key the input method did not
     /// handle (E13) comes before that key's peek (E8), so the proxy takes
     /// it for a repeat of the key held before, which is still the latest
@@ -1849,20 +1845,18 @@ report, a report that crossed one included
 that reason. Only that issue explains such a check. In 20,000 cases from
 seed 0 they explain 1, 13 and 11 cases.
 
-A failure is classified as known only when tier 1 passed, every failure
-is of tier 2, and the client shows exactly what a set of known issues
-predicts, the smallest set that does. Each issue's prediction is the
-user's intent with the composition lost, not committed, where the issue
-strikes:
+A failure is classified as known only when every failure is of tier 1
+and the trigger of a known issue explains it: a `recovery` check, a
+`region` check that names its reason, or a `composition` check in a case
+whose counters show such a region.
 
-- P1, in GTK only, at each `Focus` (or click or tap on the other field)
-  that leaves a field while it composes;
-- the lost detach, at each restart, and each focus move the text input
-  hears of first, where the world recorded that Exo could confirm
-  nothing: the extension is below v11 and Exo tracked no composition. P1
-  does not strike at such a focus move, since Exo's confirmation reaches
-  the proxy while it is attached. It occurs in about 1 settled case in 100 (55 of seeds
-  1,000,001 to 1,009,999, odd), so the run does not require it.
+Before C5, a tier-2 failure was known when the client showed exactly
+what a set of known issues predicted: the user's intent with the
+composition lost, not committed, at each focus move away from a
+composing GTK field (P1), and at each restart, or focus move the text
+input heard of first, whose detach confirmed nothing (the lost detach).
+In 20,000 cases from seed 0 they explained 4,391 and 115 settled cases.
+Since C5 the run meets neither.
 
 The recovery before a press is a free case's issue, as only free cases
 hold keys. The scheduler labels each host event with the press,
@@ -2016,7 +2010,7 @@ in review.
 | **C3a** | **The storage switch.** `Context::text_inputs` becomes `Context::ime: ImeCore`. `TextInputState`, `HostApplied`, `ShownPreedit`, the plan structs, `prepare_*`/`finish_*` and the old `reconcile` are deleted. The old handler bodies keep their shape, but call `ImeCore`'s state methods, made `pub(crate)` for this window only, and the core's `reconcile`. `InternalCallback` merges to `TextInput { token }`. The fixture module is rewritten. `Context::assert_no_orphans` calls `ImeCore::assert_invariants`. | #82, C3-pre | ≈ −650 / ±200 |
 | **C3b** | Host events (H, X and W rows) go through `step`. The old v1, extension and callback handler bodies are deleted. **Done:** `text_input::ime` steps the core and applies its effects; first the core takes the preedit cursor and styling where the old code does (B3, below H9), and the reconcile of every text input is shown to send nothing (3.7, "Reconcile timing"). | C3a | ≈ −700 / 0 |
 | **C3c** | Guest requests and cross-concern inputs go through `step`. The rest of the old code is deleted, the window's `pub(crate)` items go private, and the crate-wide form of `ime_is_isolated` holds. The three shared state types move into `ime`. INVARIANTS and DESIGN are updated (Appendix A). `golden.txt` and its test are deleted. **Done:** first the core's press takes the assembly only once its commit applies (B3, below H9); the test fixtures set up only states the core can reach; the core answers a guest commit before its reconcile, which is shown to change nothing (3.7, "Answer order"). | C3b | ≈ −450 / −80 |
-| **C5** | Focus loss commits the shown preedit before `leave` (F1, proposed). `KnownIssue::FocusWhileComposing` goes, and `SpecText` changes with the proxy. INVARIANTS is amended with its reasons (E6, E12; mutter and ibus commit on focus-out). E6 and E12 are now facts, so it no longer waits for a host check of the order. U5 (should the composition survive blur, as native Chrome keeps it?) and U13 decide only whether it is wanted. | C3c | +40 / +80 |
+| **C5** | Focus loss commits the shown preedit before `leave` (F1). `KnownIssue::FocusWhileComposing` goes, and `SpecText` changes with the proxy. INVARIANTS is amended with its reasons (E6, E12; mutter and ibus commit on focus-out). E6 and E12 are now facts, so it no longer waits for a host check of the order. U5 (should the composition survive blur, as native Chrome keeps it?) and U13 decide only whether it is wanted. **Done**, with three findings. The commit must reach the guest before the keyboard's `leave`, since both client models drop input-method events once their window has lost the keyboard focus (C11, C12): the keyboard handler hands its `leave` and `enter` to the core, which sends them after the commit. A destroyed surface commits nothing (F2), so `forget_surface` sends F2 before F1. And H2 commits the preedit Exo's detach left unconfirmed (E4, E6), which retires `RestartLosesUntrackedComposition` too; Exo's confirmation precedes its `leave`, so nothing is committed twice. Tier 2 has no known issue left. | C3c | ≈ +120 / +150, −290 in `sim/` |
 | **C6** | Optional: a guest-initiated reset sends a host `reset` behind a fence (G6, Q3), if the DST shows that GTK's `cause=other` reset leaves Exo composing. C13's key-binding resets make this more likely to show. | C5 | +40 / +60 |
 | **C7** | Test slimming. Session wire-trace tests that a row test covers are deleted. The PR body carries a mapping table, "cited name → where it lives", for all INVARIANTS-cited IME tests, #72's three and those #80 and region-over-region add. A cited name survives as a Session test or as a row test of the same name. The merge criterion is that the table is complete and `check-cited-tests.py` passes. The fuzzer's `typing.rs` drops its Exo end-state check, which the DST owns. | C3c (after C5 and C6 if they are open) | 0 / ≈ −2,500 |
 
@@ -2179,15 +2173,15 @@ Use `RUST_LOG=sommelier::ime=trace`, which feeds `from_log` (3.3), and
 |---|---|---|---|
 | U1 | Does Exo ever send `zwp_text_input_v1.keysym`? | Log a week of Korean and English typing. | H10, K1's size |
 | U4 | Does the Korean engine commit a confirmable composition with `commit_string` or with `confirm_preedit`? E15's Space commits "가 " with `commit_string`, but that text is not the composition. | Type "가", then Enter, or click elsewhere. | E9 |
-| U5 | Should the composition be kept on blur? Native Chrome keeps it. | Type "가" in a native Chrome field, Alt-Tab, and compare with the guest. | C5 |
+| U5 | Should the composition be kept on blur? Native Chrome keeps it. C5 commits it instead, as mutter and ibus do; keeping it would need Exo to keep its composition across the detach, which E6 rules out. | Type "가" in a native Chrome field, Alt-Tab, and compare with the guest. | C5 |
 | U6 | How often does an engine commit for a key pressed just before a click arrive after the fence (P3), and what are real engine latencies? | HANDOVER's "Space and click at the same instant", counted, with timestamps. | Q1; the lag profiles |
 | U7 | Does Exo send `wl_touch` to Crostini clients, and in what order relative to text-input events? | Tablet mode. | F4 for touch (#72) |
 | U8 | Does the `done` that answers each commit move the candidate window with the caret? | HANDOVER's existing check. | G9c |
 | U9 | Does the ARC placement policy turn off the IME for placed windows? | RESEARCH Q3. | Out of scope; document only. |
 | U10 | In GTK3, does `GtkEntry` update its cursor location before the click's release? This decides whether C7's release-time enable happens. | `WAYLAND_DEBUG` on gedit while clicking. | The GTK3 model's C7 |
 | U12 | Does the ChromeOS Korean engine combine two lone consonants (ㄱ + ㅅ → ㄳ), as libhangul's default does and #73's composer does? | Type ㄱ then ㅅ with no vowel. | The `Composer`'s lone-consonant rule |
-| U13 | Does Chromium's blur follow the keyboard focus or the xdg `activated` state? | `WAYLAND_DEBUG` on a Chromium guest while Alt-Tabbing, and while focusing another guest window. | C11; P1 |
-| U14 | Does Chromium's blur call `ResetContext`, and so confirm a composition locally? | Type "가" in a Chromium guest, Alt-Tab, and come back. | C11; P1; C5 |
+| U13 | Does Chromium's blur follow the keyboard focus or the xdg `activated` state? If it follows `activated`, which can come before the keyboard's `leave`, Chromium blurs before C5's commit reaches it and drops that commit (C11), so it keeps the syllable only if its blur confirms it (U14). | `WAYLAND_DEBUG` on a Chromium guest while Alt-Tabbing, and while focusing another guest window. | C11; P1; C5 |
+| U14 | Does Chromium's blur call `ResetContext`, and so confirm a composition locally? Since C5 the proxy's commit reaches it before the blur, so a local confirmation finds nothing composed; a double commit would mean the commit came after it. | Type "가" in a Chromium guest, Alt-Tab, and come back. | C11; P1; C5 |
 | U15 | Does a Chromium tap-down finish the composition, or only the tap's lift? | Tablet mode: type "가", then touch the field and hold. | C4 for touch |
 
 **Settled in revision 3, from Chromium's source** (2.4):
@@ -2240,7 +2234,7 @@ C3c applied this table to INVARIANTS and DESIGN.
 | Content hints come from the v3 XML; `set_input_type` replaces v1 `set_content_type` | `ime/host.rs` (moved) | none |
 | The host gets each content type once it can apply it, and only then | `LinkState`, the end-of-step reconcile, H2, W1, R1, R2 | Names: `HostApplied` becomes `LinkState`; reconcile runs after every input |
 | One text input on a connection is enabled at a time | `FocusedField.committed.enabled`, the Commit arm, I3 | Text updated; staleness now impossible |
-| Focus teardown sends `leave` itself | F1, F2 | none |
+| Focus teardown sends `leave` itself | F1, F2 | C5: F2 goes before F1 in `forget_surface`; a new rule, "A field the focus leaves commits its preedit first" (F1, H2's commit in "The host gets each content type…") |
 | Every v3 commit counts | `CommitCount`, G9 | Names: `TextInputState::count_guest_commit` becomes `CommitCount::bump`, called in the Commit arm |
 | Exo's deletes are absolute and stand alone | H9, `ExoText` | `unreported_host_edit` becomes `ExoText::Ahead` |
 | Every commit that leaves a field enabled gets a `done` | G9b, G9c | Wording: GTK3 sends its enable on the click's release, not right after the press [F]. The reasoning is unchanged, because the release follows the press, so the press has already ended the composition |

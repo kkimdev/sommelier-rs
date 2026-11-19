@@ -27,8 +27,14 @@
   core that replaced the old text-input handlers in staged,
   golden-trace-gated PRs. The switch (C3a to C3c) is done: every IME
   input goes through `ImeCore::step`, and `handler/text_input.rs` is its
-  adapter. Behaviour changes come next, one per PR, starting with C5
-  (focus loss commits the shown preedit).
+  adapter. The first behaviour change, C5, is done: a field the focus
+  leaves commits the preedit the guest shows before the keyboard's
+  `leave`, and so does Exo's own detach with a preedit its confirmation
+  left, so the DST knows no failure of the user's intent. C6 (an
+  optional guest-initiated host `reset`) and C7 (test slimming) remain.
+  Whether a composition should survive a blur, as native Chrome keeps
+  it, is open (U5, U13, U14 of the design's 6.2); C5 commits it, as
+  mutter and ibus do.
 
 ## Known issues and debt
 
@@ -119,7 +125,15 @@
     answer). A report Exo has yet to get, on its way to Exo or sent
     while the region is on its way back, is the converse
     (`RegionCrossesReport`; seeds 2452 and 8116 cross the region on the
-    wire).
+    wire). The judge cannot name every such case: in seed 12364 (free,
+    GTK3, extension v10), an engine answer made before a focus move
+    shows a preedit in the newly focused field that Exo drops at the
+    guest's next report; the proxy then drops Exo's first region as not
+    covering it, and Exo composes from that region, so the next region,
+    which the proxy measures over the dropped preedit, fails as a plain
+    `region` check. C5 made this seed reach it (its trajectory changed);
+    seed 50166, which failed in the same family before C5 (a preedit Exo
+    no longer tracked), passes since.
   - Ahead: the proxy measures in the text the guest last reported, less
     the bytes regions took, so a region made while host commits, a
     press's commit, or a reset commit the guest has not reported yet
@@ -145,7 +159,8 @@
     the DST, it regressed seed 537 (settled, Chromium), did not retire
     `StaleRegionAfterCommit` (seed 1008752) or `RegionCrossesReport`
     (seed 474), and doubled `RestartLosesUntrackedComposition` (63 to
-    145 of 5,000 settled cases from seed 1,000,001). The fix needs the
+    145 of 5,000 settled cases from seed 1,000,001; C5 has since
+    retired that issue). The fix needs the
     preedit each transaction left, matched to the report as Exo's
     `SurroundingTextTracker::Update` matches its history.
   - Chromium applies a transaction's delete before its preedit clear and
