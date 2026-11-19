@@ -809,11 +809,6 @@ impl<'t> World<'t> {
         };
         let (_, trackers) = self.exo.synced.remove(at);
         for (id, tracker) in trackers {
-            // The mirror is the proxy's own state, which no peer sees.
-            let Some((predicted, history)) = self.session.ctx().ime.exact_mirror_for_test(id)
-            else {
-                continue;
-            };
             let state = |state: &Predicted| {
                 let selection = (state.selection.start, state.selection.end);
                 (
@@ -822,16 +817,19 @@ impl<'t> World<'t> {
                     state.composition.clone().unwrap_or(0..0),
                 )
             };
-            let exo = (
-                state(&tracker.predicted),
-                tracker.expected.iter().map(state).collect(),
-            );
-            if (predicted, history) != exo && self.mirrors.len() < 3 {
+            let predicted = state(&tracker.predicted);
+            let history: Vec<_> = tracker.expected.iter().map(state).collect();
+            // The mirror is the proxy's own state, which no peer sees.
+            let ime = &self.session.ctx().ime;
+            let Some(mirror) = ime.mirror_differs_for_test(id, &predicted, &history) else {
+                continue;
+            };
+            if self.mirrors.len() < 3 {
                 let at = self.now.0 as f64 / 1_000.0;
-                let mirror = self.session.ctx().ime.exact_mirror_for_test(id);
                 self.mirrors.push(format!(
                     "{at:.3} ms, at the done of sync {callback}: the exact mirror of host text \
-                     input {id} holds {mirror:?}, Exo's tracker {exo:?}"
+                     input {id} holds {mirror}, Exo's tracker {:?}",
+                    (predicted, history)
                 ));
             }
         }

@@ -374,21 +374,44 @@ impl ImeCore {
         self.inputs.iter().map(|(&ti, t)| (ti, t))
     }
 
-    /// The Exo mirror of host text input `v1`, if it says it is exact: its
-    /// prediction and its history, oldest first, each a text, a directed
-    /// selection and a composition, empty for none.
-    pub(crate) fn exact_mirror_for_test(&self, v1: u32) -> Option<MirrorForTest> {
+    /// Where the Exo mirror of host text input `v1`, if it says it is
+    /// exact, differs from Exo's tracker, which predicts `predicted` and
+    /// holds `history`, oldest first: what the mirror holds. A known
+    /// history entry fits a state whose fingerprint it is, with no
+    /// selection if it is vague; an unknown one fits any state, and a
+    /// leading one, which stands for the states the mirror lost (evicted,
+    /// or matched by an ambiguous report), fits one or more.
+    pub(crate) fn mirror_differs_for_test(
+        &self,
+        v1: u32,
+        predicted: &StateForTest,
+        history: &[StateForTest],
+    ) -> Option<String> {
         let t = self.inputs.values().find(|t| t.host().v1 == v1)?;
         let mirror = t.exo().mirror();
-        if mirror.health() != mirror::Health::Exact {
-            return None;
-        }
-        let state = |state: &mirror::ExoState| {
-            let selection = (state.selection.start, state.selection.end);
-            (state.text.clone(), selection, state.composition.clone())
+        let exact = mirror.exact()?;
+        let state = |(text, (start, end), composition): &StateForTest| mirror::ExoState {
+            text: text.clone(),
+            selection: mirror::Span::new(*start, *end),
+            composition: composition.clone(),
         };
-        let history = mirror.expected().iter().map(|(s, _)| state(s)).collect();
-        Some((state(mirror.predicted()), history))
+        let fits = |entry: &mirror::Entry, exo: &StateForTest| match entry {
+            mirror::Entry::Known { print, .. } => *print == print.of_alike(&state(exo)),
+            mirror::Entry::Unknown => true,
+        };
+        let entries = mirror.expected();
+        let lost = matches!(entries.front(), Some(mirror::Entry::Unknown));
+        let known = entries.len() - usize::from(lost);
+        let fit = match (lost, history.len().checked_sub(known)) {
+            (true, Some(skipped)) => skipped >= 1,
+            (false, Some(skipped)) => skipped == 0,
+            (_, None) => false,
+        } && entries
+            .iter()
+            .skip(usize::from(lost))
+            .zip(&history[history.len().saturating_sub(known)..])
+            .all(|(entry, exo)| fits(entry, exo));
+        (*exact != state(predicted) || !fit).then(|| format!("{exact:?}, {entries:?}"))
     }
 }
 
@@ -396,10 +419,6 @@ impl ImeCore {
 /// composition, empty for none.
 #[cfg(test)]
 pub(crate) type StateForTest = (String, (usize, usize), std::ops::Range<usize>);
-
-/// An Exo mirror for tests: its prediction and its history.
-#[cfg(test)]
-pub(crate) type MirrorForTest = (StateForTest, Vec<StateForTest>);
 
 impl ImeCore {
     /// H10: the seat of the text input whose host keysyms reach the

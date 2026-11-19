@@ -226,7 +226,7 @@
     `--enable-wayland-ime --wayland-text-input-version=3`: type Korean;
     reconvert with the hanja key inside a word, then press Esc and
     Backspace; click while composing; paste a long paragraph and keep
-    typing. No `Diverged` health should show; with
+    typing. No "Exo mirror ... diverged" warning should show; with
     `SOMMELIER_IME_MIRROR=shadow`, the debug log shows where the mirror
     would have measured otherwise.
 - The pointer press or touch-down that ends a composition

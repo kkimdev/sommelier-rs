@@ -18,7 +18,7 @@ limitations under the License.
 //! reconcile of every text input, then removals. Each arm decides, which
 //! includes encoding, before it changes anything (design 3.5).
 
-use super::exo_view::{Edit, Frame};
+use super::exo_view::{Edit, Frame, Unmeasured};
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
 use super::state::{
@@ -358,8 +358,9 @@ impl ImeCore {
             | HostIme::PreeditRegion { .. }
             | HostIme::Confirm { .. } => {}
         }
-        let measuring = frame.clone().filter(|_| t.exo().measures());
-        let edit = composition_event(ti, t, event, measuring.as_ref(), fx);
+        let measuring = t.exo().measuring(frame.clone());
+        let measuring = measuring.as_ref().map_err(|&why| why);
+        let edit = composition_event(ti, t, event, measuring, fx);
         t.exo_after(frame.as_ref(), edit);
     }
 
@@ -551,15 +552,16 @@ impl ImeCore {
 }
 
 /// H7 to H9, X1 and X2 through the gate: plan the event's transaction and
-/// send it. In Mirror mode a delete and a region are measured in `frame`,
-/// Exo's text before the event, and dropped without one; Legacy mode
-/// measures them in the committed text, and logs where the mirror would
-/// differ. Returns what reached the guest, if the event did.
+/// send it. In Mirror mode a delete and a region are measured in the frame
+/// `measuring` holds, Exo's text before the event, and measured as Legacy
+/// mode does without one; Legacy mode measures them in the committed text,
+/// and logs where the mirror would differ. Returns what reached the guest,
+/// if the event did.
 fn composition_event(
     ti: TiId,
     t: &mut TextInput,
     event: HostIme,
-    frame: Option<&Frame>,
+    measuring: Result<&Frame, Unmeasured>,
     fx: &mut Effects,
 ) -> Option<Edit> {
     let count = t.serial().get();
@@ -599,20 +601,27 @@ fn composition_event(
         HostIme::Delete { index, length } => {
             // A negative index keeps the v1 XML's reading, from the guest's
             // cursor, which Legacy mode measures.
-            let planned = match (mode, frame.filter(|_| index >= 0)) {
-                (ImeMode::Mirror, Some(frame)) => frame.delete(index, length).map(|lengths| {
+            // The mirror diverges at one.
+            let measuring = measuring.and_then(|frame| match index >= 0 {
+                true => Ok(frame),
+                false => Err(Unmeasured::Unsure),
+            });
+            let planned = match (mode, measuring) {
+                (ImeMode::Mirror, Ok(frame)) => frame.delete(index, length).map(|lengths| {
                     let txn = GuestTxn {
                         delete: Some(lengths),
                         ..GuestTxn::default()
                     };
                     cur.measured(txn, None)
                 }),
-                (ImeMode::Mirror, None) => {
-                    log_fallback(ti, "delete");
+                (ImeMode::Mirror, Err(why)) => {
+                    log_fallback(ti, "delete", why);
                     cur.delete(index, length)
                 }
                 (ImeMode::Legacy, frame) => {
-                    let mirror = frame.and_then(|frame| frame.delete(index, length).ok());
+                    let mirror = frame
+                        .ok()
+                        .and_then(|frame| frame.delete(index, length).ok());
                     let mirror = mirror.map(|lengths| GuestTxn {
                         delete: Some(lengths),
                         ..GuestTxn::default()
@@ -632,16 +641,18 @@ fn composition_event(
         }
         HostIme::PreeditRegion { index, length } => {
             let assembly = cur.take_assembly();
-            let planned = match (mode, frame) {
-                (ImeMode::Mirror, Some(frame)) => frame
+            let planned = match (mode, measuring) {
+                (ImeMode::Mirror, Ok(frame)) => frame
                     .region(index, length, assembly)
                     .map(|(txn, held)| cur.measured(txn, held)),
-                (ImeMode::Mirror, None) => {
-                    log_fallback(ti, "region");
+                (ImeMode::Mirror, Err(why)) => {
+                    log_fallback(ti, "region", why);
                     cur.region(index, length, assembly)
                 }
-                (ImeMode::Legacy, _) => {
-                    let mirror = frame.and_then(|frame| frame.region(index, length, assembly).ok());
+                (ImeMode::Legacy, frame) => {
+                    let mirror = frame
+                        .ok()
+                        .and_then(|frame| frame.region(index, length, assembly).ok());
                     let legacy = cur.region(index, length, assembly);
                     log_decision_diff(ti, "region", mirror.map(|(txn, _)| txn), &legacy);
                     legacy
@@ -702,11 +713,12 @@ fn composition_event(
     }
 }
 
-/// Mirror mode: the core cannot tell the guest is in step with Exo, or the
-/// mirror is unsure, so a host `what` is measured as Legacy mode does.
-fn log_fallback(ti: TiId, what: &str) {
+/// Mirror mode: the core cannot measure a host `what` in the Exo mirror,
+/// for `why`, so it is measured as Legacy mode does.
+fn log_fallback(ti: TiId, what: &str, why: Unmeasured) {
     log::debug!(
-        "Text input {}: measuring a {what} as Legacy mode does, out of step with the Exo mirror",
+        "Text input {}: measuring a {what} as Legacy mode does, as the Exo mirror cannot: \
+         {why:?}",
         ti.0
     );
 }

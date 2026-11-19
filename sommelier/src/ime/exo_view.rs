@@ -61,6 +61,22 @@ pub(super) struct ExoView {
     /// has already said where the guest is, so that this one can only take
     /// it out of step, by resetting Exo.
     reports: VecDeque<(BarrierToken, Option<Edits>, bool)>,
+    /// The mirror has diverged from Exo once, which warned.
+    warned: bool,
+}
+
+/// Why Mirror mode cannot measure an event of Exo's in the mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unmeasured {
+    /// The mirror does not know Exo's state exactly.
+    Unsure,
+    /// The proxy forwarded the guest a key or a press it has not yet
+    /// stated the effect of.
+    Unseen,
+    /// A report on its way to Exo will name no state Exo has, or may not.
+    Crossing,
+    /// The guest is not in step with Exo's state before the event.
+    OutOfStep,
 }
 
 /// What reached the guest of one host event.
@@ -95,6 +111,7 @@ impl ExoView {
             edits: Edits::default(),
             at_commit: Edits::default(),
             reports: VecDeque::new(),
+            warned: false,
         }
     }
 
@@ -113,10 +130,16 @@ impl ExoView {
         &self.mirror
     }
 
+    /// The mirror diverged, which only the log shows.
+    #[cfg(test)]
+    pub(super) fn warned(&self) -> bool {
+        self.warned
+    }
+
     /// The frame of the next host event, before the mirror takes it: Exo's
     /// state, if a guest that shows `shown` can be in step with it.
     pub(super) fn frame(&self, shown: Option<&Preedit>) -> Option<Frame> {
-        let state = self.mirror.predicted();
+        let state = self.mirror.exact()?;
         let held = held(state, shown)?;
         Some(Frame {
             state: state.clone(),
@@ -124,15 +147,22 @@ impl ExoView {
         })
     }
 
-    /// Whether the frame taken before the event just observed measures
-    /// it: the guest was in step with it, the mirror stayed exact, and no
-    /// report on its way to Exo crossed the event (design exo-mirror 3.3,
-    /// "Crossings").
-    pub(super) fn measures(&self) -> bool {
-        self.in_step
-            && !self.unseen
-            && self.mirror.health() == Health::Exact
-            && !self.mirror.report_crosses()
+    /// The frame `frame` taken before the event just observed, if it
+    /// measures the event: the mirror stayed exact, the guest has stated
+    /// every key and press, no report on its way to Exo crossed the event
+    /// (design exo-mirror 3.3, "Crossings"), and the guest was in step
+    /// with the frame.
+    pub(super) fn measuring(&self, frame: Option<Frame>) -> Result<Frame, Unmeasured> {
+        if self.mirror.health() != Health::Exact {
+            return Err(Unmeasured::Unsure);
+        }
+        if self.unseen {
+            return Err(Unmeasured::Unseen);
+        }
+        if self.mirror.report_crosses() {
+            return Err(Unmeasured::Crossing);
+        }
+        frame.filter(|_| self.in_step).ok_or(Unmeasured::OutOfStep)
     }
 
     /// The mirror takes host event `event`, before the gate: stale events
@@ -150,12 +180,25 @@ impl ExoView {
             &HostIme::CursorPosition { index, anchor } => mirror.cursor_position(index, anchor),
             HostIme::Preedit { text, commit, .. } => match text {
                 IndexedString::Utf8(text) => mirror.preedit_string(text, commit),
-                IndexedString::NotUtf8(_) => mirror.uncertain(),
+                IndexedString::NotUtf8(_) => mirror.unreadable(),
             },
             HostIme::Commit { text, .. } => mirror.commit_string(text),
             &HostIme::Delete { index, length } => mirror.delete_surrounding_text(index, length),
             &HostIme::PreeditRegion { index, length } => mirror.set_preedit_region(index, length),
             &HostIme::Confirm { keep_selection } => mirror.confirm_preedit(keep_selection),
+        }
+        if self.mirror.take_diverged() {
+            // A misreading of Chromium's: a bug to report, and the same one
+            // each time.
+            let level = match std::mem::replace(&mut self.warned, true) {
+                false => log::Level::Warn,
+                true => log::Level::Debug,
+            };
+            log::log!(
+                level,
+                "The Exo mirror of text input {} diverged: an event of Exo's did not agree with it",
+                ti.0
+            );
         }
         self.health_changed(ti, health);
     }
@@ -181,10 +224,8 @@ impl ExoView {
             let cursor = frame.held.start.checked_sub(edit.deleted_before as usize)?;
             Some(cursor + edit.committed)
         });
-        let state = self.mirror.predicted();
-        let keeps = self.mirror.health() == Health::Exact
-            && cursor
-                .is_some_and(|cursor| held(state, shown).map(|held| held.start) == Some(cursor));
+        let held = self.mirror.exact().and_then(|state| held(state, shown));
+        let keeps = cursor.is_some_and(|cursor| held.map(|held| held.start) == Some(cursor));
         self.in_step &= keeps;
         if let Some(edit) = edit {
             self.edits.from_exo += u64::from(edit.deleted || edit.committed > 0);
@@ -221,7 +262,8 @@ impl ExoView {
 
     /// The core forwarded the guest's surrounding text `text` with
     /// `cursor` and `anchor`, then barrier `token`. If the two may reach
-    /// Exo in separate reads, Exo may process an event between them.
+    /// Exo in separate reads, Exo may process an event between them, which
+    /// the mirror then cannot place.
     pub(super) fn report_sent(
         &mut self,
         token: BarrierToken,
@@ -229,15 +271,13 @@ impl ExoView {
         one_read: bool,
         stated: bool,
     ) {
-        if !one_read {
-            self.mirror.uncertain();
-        }
         self.mirror.sent(
             token,
             Sent::Report {
                 text,
                 cursor,
                 anchor,
+                split: !one_read,
             },
         );
         let since = Edits {
@@ -277,7 +317,7 @@ impl ExoView {
 
     /// Where Exo's cursor is in its composition, if that is `shown`.
     pub(super) fn cursor_in(&self, shown: &Preedit) -> Option<u32> {
-        let state = self.mirror.predicted();
+        let state = self.mirror.exact()?;
         let composition = &state.composition;
         let cursor = state.selection.end.checked_sub(composition.start)?;
         let holds = state.composition_text() == shown.text() && cursor <= composition.len();
