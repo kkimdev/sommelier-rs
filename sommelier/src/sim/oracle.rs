@@ -336,10 +336,8 @@ pub(super) struct Counts {
     /// Preedit regions Exo made while a report the proxy sent it was on
     /// its way (KnownIssue::RegionCrossesReport).
     pub regions_crossing_reports: u64,
-    /// Regions Exo composed for a text input without an extension, which
-    /// the guest never sees, and ranges IMA sent after the commit of the
-    /// key it held them for (KnownIssue::StaleRegionAfterCommit).
-    pub regions_hidden: u64,
+    /// Ranges IMA sent after the commit of the key it held them for
+    /// (KnownIssue::StaleRegionAfterCommit).
     pub regions_stale: u64,
     /// Focus moves that the text input heard of before the keyboard, bound
     /// after its activate, so that Exo detached while attached (H2).
@@ -379,7 +377,6 @@ impl std::ops::AddAssign for Counts {
         self.regions_dropped += other.regions_dropped;
         self.crossed_reports += other.crossed_reports;
         self.regions_crossing_reports += other.regions_crossing_reports;
-        self.regions_hidden += other.regions_hidden;
         self.regions_stale += other.regions_stale;
         self.detaches_before_keyboard += other.detaches_before_keyboard;
         self.recovered_keys += other.recovered_keys;
@@ -1419,9 +1416,14 @@ pub(super) fn exact(
             (shown.origin.late || shown.origin.resets < resets) && engine.is_empty()
         });
         // Without the extension, Exo composes a reconverted region the
-        // guest never sees, over what it shows or not.
-        let hidden = extension.is_none() && spec.counts.regions_hidden > 0;
-        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) && !hidden {
+        // guest never sees: while it stands uncommitted, Exo composes
+        // nothing the guest can show.
+        let tracked = if exo.composition_hidden() {
+            String::new()
+        } else {
+            tracked
+        };
+        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) {
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
             );
@@ -2399,6 +2401,57 @@ mod tests {
         });
         assert_eq!(checks(&spec, "", 0), Vec::<&str>::new());
         assert_eq!(spec.counts.late_shown, 1);
+    }
+
+    #[test]
+    fn a_hidden_region_excuses_a_composition_only_while_it_stands() {
+        use crate::sim::engine::{EngineOut, Request, TextAction};
+        // Exo, with no extension, composes a region of "0a" that the guest
+        // never sees.
+        let mut exo = Exo::default();
+        exo.set_text_input_focus(Some(HOST[0]));
+        exo.request(3, &manager::Request::CreateTextInput { id: 10 }.into());
+        exo.request(10, &activate(0));
+        exo.request(10, &reported("0a", 2));
+        exo.take_events();
+        exo.take_engine();
+        exo.ask(Request::Reconvert);
+        exo.take_engine();
+        let region = TextAction::Region {
+            before: 1,
+            after: 0,
+        };
+        exo.answer(&EngineOut::Text {
+            id: 0,
+            actions: vec![region],
+        });
+        exo.answer(&EngineOut::Done {
+            id: 0,
+            handled: true,
+        });
+        let spec = attached(&["0a"]);
+        let checks = |exo: &Exo, engine: &str| -> Vec<&'static str> {
+            let shadow = Shadow {
+                views: spec.views.clone(),
+                ..Shadow::new(&GUEST[..1], &[])
+            };
+            let failures = exact(&[], &spec, &shadow, exo, engine, 0, None);
+            let checks = failures.iter().map(|failure| failure.check);
+            checks.filter(|&check| check == "composition").collect()
+        };
+        assert_eq!(checks(&exo, ""), Vec::<&str>::new());
+        // Once a key composes over it, the guest must show that.
+        exo.key(Micros(0), Key::Char('r'), wl_keyboard::KEY_STATE_PRESSED);
+        exo.take_engine();
+        exo.answer(&EngineOut::Text {
+            id: 1,
+            actions: vec![TextAction::Preedit("ㄱ".to_owned())],
+        });
+        exo.answer(&EngineOut::Done {
+            id: 1,
+            handled: true,
+        });
+        assert_eq!(checks(&exo, "ㄱ"), ["composition"]);
     }
 
     /// GTK4 showing `texts`, the keyboard on field `focus`.
