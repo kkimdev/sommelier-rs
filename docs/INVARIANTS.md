@@ -793,7 +793,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   the input method, so a held key's release may never come, and only the
   key's next press can be recovered. The detach ends nothing else: such a
   key is still guest input, so its keysym reaches the guest, which a flag
-  of its own on the key's generation (`KeyGeneration::stale`) keeps apart
+  of its own on the key's held phase (`KeyPhase::Held`'s `stale`) keeps apart
   from the one that marks an accelerator's key. Otherwise a key typed
   while Backspace or Space is held would also repeat the held key, and so
   would a restart. A `peek_key` press of a key the proxy still counts held

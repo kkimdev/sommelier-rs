@@ -36,8 +36,8 @@ use crate::protocols::wayland::wl_keyboard::{
     KEY_STATE_REPEATED,
 };
 use crate::state::{
-    Context, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
-    KeyboardModifiers,
+    Context, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyAdmission, KeyboardFocus,
+    KeyboardModifiers, PeekInput,
 };
 use crate::window_layout::WindowLayoutAction;
 use crate::wire::Action;
@@ -197,17 +197,6 @@ impl KeyboardHandler {
 
     fn invalidate_peek_key_press(ctx: &mut Context, host_keyboard_id: HostId, key: u32) {
         ctx.key_generations.invalidate_peek(host_keyboard_id, key);
-    }
-
-    pub(crate) fn update_host_keyboard_key_state(
-        ctx: &mut Context,
-        host_keyboard_id: HostId,
-        key: u32,
-        state: u32,
-        serial: u32,
-    ) {
-        ctx.key_generations
-            .observe_physical_event(host_keyboard_id, key, state, Some(serial));
     }
 
     fn cancel_backspace_repeat(ctx: &mut Context, host_keyboard_id: HostId) {
@@ -818,70 +807,23 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             key,
             state
         );
-        let peek_press_serial = ctx.key_generations.peek_press_serial(host_keyboard_id, key);
-        if state == KEY_STATE_RELEASED
-            && ctx
-                .key_generations
-                .take_pending_physical_release(host_keyboard_id, key, serial)
-        {
-            // A newer physical generation may already be current while the
-            // release paired with an older peek arrives late. Close only the
-            // retired guest press and leave current physical state untouched.
-            Self::send_ack_key(ctx, host_keyboard_id, serial, true);
-            return Action::Forward;
-        }
-        if state == KEY_STATE_RELEASED
-            && peek_press_serial.is_some()
-            && ctx
-                .key_generations
-                .physical_release_serial(host_keyboard_id, key)
-                != Some(serial)
-        {
-            // The extension delivers each peek release before the matching
-            // wl_keyboard release with the same serial. A non-matching release
-            // belongs to another generation and must not close this one.
-            Self::send_ack_key(ctx, host_keyboard_id, serial, false);
-            return Action::Drop;
-        }
-        if state == KEY_STATE_PRESSED
-            && ctx.key_generations.physically_held(host_keyboard_id, key)
-            && peek_press_serial.is_some_and(|peek_serial| peek_serial != serial)
-        {
-            // peek_key promises that the following wl_keyboard event has the
-            // same serial. A different press while this peek generation is
-            // held belongs to an older/stale channel and cannot open another
-            // guest press.
-            Self::send_ack_key(ctx, host_keyboard_id, serial, false);
-            return Action::Drop;
-        }
+        // Read before the physical transition: a press that starts a new
+        // generation of Backspace holds no lease.
         let backspace_repeat_active = key == EVDEV_KEY_BACKSPACE
             && crate::handler::ime_keys::backspace_repeat_active_for_keyboard(
                 ctx,
                 host_keyboard_id,
             );
-        if state == KEY_STATE_PRESSED {
-            let delayed_released_peek_press =
-                ctx.key_generations.physical_released(host_keyboard_id, key)
-                    && peek_press_serial == Some(serial);
-            if !delayed_released_peek_press {
-                // A press after an observed release starts a new generation.
-                // The matching press for an earlier peek is a delayed channel,
-                // not a new physical boundary.
-                Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state, serial);
-            }
-        }
-        if state == KEY_STATE_RELEASED
-            || (state == KEY_STATE_REPEATED
-                && matches!(
-                    ctx.guest_key_owner(host_keyboard_id, key),
-                    Some(
-                        GuestKeyOwner::Physical
-                            | GuestKeyOwner::TextInputKeysym
-                            | GuestKeyOwner::CompositorShortcut
-                    )
-                ))
+        if let KeyAdmission::Settled { handled, forward } =
+            ctx.key_generations
+                .admit_key(host_keyboard_id, key, state, serial)
         {
-            Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state, serial);
+            Self::send_ack_key(ctx, host_keyboard_id, serial, handled);
+            return if forward {
+                Action::Forward
+            } else {
+                Action::Drop
+            };
         }
 
         let guest_owner = ctx.guest_key_owner(host_keyboard_id, key);
@@ -1097,16 +1039,33 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             return crate::wire::Action::Drop;
         };
         let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
-        // A peek the input method's own detach made stale (H2) describes a
-        // press whose release may have died with it, so a press peek of
-        // the key is its next press, of a generation of its own. The guest
-        // gets the old press's release first if it still holds it, under
-        // the serial and time of the peek, which announces the new press.
-        if state == KEY_STATE_PRESSED
-            && ctx
-                .key_generations
-                .retire_stale_generation(host_keyboard_id, key)
-        {
+        // Only guest input may be recovered or delivered through the IME
+        // channel. Host accelerators and placement chords belong to the
+        // host and to Sommelier: if text-input claimed one first, the
+        // wl_keyboard press that follows would find the guest already
+        // owning it.
+        let key_class =
+            (state == KEY_STATE_PRESSED).then(|| Self::classify_key(ctx, host_keyboard_id, key));
+        let input = match state {
+            KEY_STATE_PRESSED => PeekInput::Press {
+                serial,
+                time,
+                guest_input: key_class == Some(KeyClass::Guest),
+            },
+            KEY_STATE_REPEATED => PeekInput::Repeat { serial, time },
+            KEY_STATE_RELEASED => PeekInput::Release { serial, time },
+            other => {
+                log::warn!("peek_key: received unknown key state {}, ignoring", other);
+                return crate::wire::Action::Drop;
+            }
+        };
+        let outcome = ctx.key_generations.peek_key(host_keyboard_id, key, input);
+        if outcome.owes_release {
+            // A peek the input method's own detach made stale (H2) describes
+            // a press whose release may have died with it, so a press peek
+            // of the key is its next press, of a generation of its own. The
+            // guest gets the old press's release first, under the serial and
+            // time of the peek, which announces the new press.
             if let Some(guest_keyboard_id) = ctx.shadow_table.get_guest_id(host_keyboard_id.0) {
                 ctx.host_to_client_queue.push(wl_keyboard::evt::key(
                     guest_keyboard_id,
@@ -1117,129 +1076,56 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                 ));
             }
         }
-        let pressed_before = ctx
-            .key_generations
-            .physically_held(host_keyboard_id, key);
-        let peek_pressed_before =
-            pressed_before && ctx.key_generations.peek(host_keyboard_id, key).is_some();
-        match state {
-            KEY_STATE_PRESSED | KEY_STATE_REPEATED
-                if state == KEY_STATE_PRESSED || pressed_before =>
-            {
-                if state == KEY_STATE_PRESSED && !peek_pressed_before {
-                    let already_dropped_as_accelerator = ctx
-                        .key_generations
-                        .host_accelerator_suppressed(host_keyboard_id, key);
-                    // peek_key may trail the wl_keyboard press it describes.
-                    // A generation already consumed by a compositor shortcut
-                    // must not become an IME recovery candidate, even if a
-                    // reload has since removed its binding.
-                    // Only a still-held generation is the one this peek
-                    // describes; a released one is retired by the new press.
-                    let consumed_by_shortcut = pressed_before
-                        && ctx.guest_key_owner(host_keyboard_id, key)
-                            == Some(GuestKeyOwner::CompositorShortcut);
-                    // Only guest input may be recovered or delivered through
-                    // the IME channel. Host accelerators and placement chords
-                    // belong to the host and to Sommelier: if text-input
-                    // claimed one first, the wl_keyboard press that follows
-                    // would find the guest already owning it.
-                    let key_class = Self::classify_key(ctx, host_keyboard_id, key);
-                    if let KeyClass::Placement(action) = key_class {
-                        log::debug!(
-                            "peek_key: placement chord {:?} on keyboard {}; it is placed only \
-                             by the matching wl_keyboard.key, so if the host IME consumes it \
-                             the chord is neither placed nor delivered",
-                            action,
-                            host_keyboard_id.0
-                        );
-                    }
-                    let eligible = !already_dropped_as_accelerator
-                        && !consumed_by_shortcut
-                        && key_class == KeyClass::Guest;
-                    let sequence = ctx.key_generations.observe_peek_press(
-                        host_keyboard_id,
-                        key,
-                        serial,
-                        time,
-                        eligible,
-                    );
-                    if let Some(guest_seat) = guest_seat {
-                        let focused_surface = ctx
-                            .keyboard_focus
-                            .surface_for_seat(guest_seat)
-                            .filter(|surface| {
-                                ctx.keyboard_focus
-                                    .keyboard_owns_surface(host_keyboard_id, *surface)
-                            });
-                        ctx.key_generations.record_latest_peek(
-                            guest_seat,
-                            focused_surface,
-                            host_keyboard_id,
-                            sequence,
-                        );
-                    }
-                } else if state == KEY_STATE_REPEATED
-                    || (state == KEY_STATE_PRESSED && peek_pressed_before)
-                {
-                    // Both protocol v10 repeated and legacy duplicate pressed
-                    // events describe the existing generation.
-                    ctx.key_generations
-                        .refresh_peek(host_keyboard_id, key, serial, time);
-                }
-                Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state, serial);
-                if state == KEY_STATE_PRESSED && key != EVDEV_KEY_BACKSPACE {
-                    Self::cancel_backspace_repeat(ctx, host_keyboard_id);
-                    if let Some(guest_seat) = guest_seat {
-                        crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
-                    }
-                }
+        if let Some(sequence) = outcome.numbered {
+            if let Some(KeyClass::Placement(action)) = key_class {
+                log::debug!(
+                    "peek_key: placement chord {:?} on keyboard {}; it is placed only \
+                     by the matching wl_keyboard.key, so if the host IME consumes it \
+                     the chord is neither placed nor delivered",
+                    action,
+                    host_keyboard_id.0
+                );
             }
-            KEY_STATE_REPEATED => {
+            if let Some(guest_seat) = guest_seat {
+                let focused_surface = ctx
+                    .keyboard_focus
+                    .surface_for_seat(guest_seat)
+                    .filter(|surface| {
+                        ctx.keyboard_focus
+                            .keyboard_owns_surface(host_keyboard_id, *surface)
+                    });
+                ctx.key_generations.record_latest_peek(
+                    guest_seat,
+                    focused_surface,
+                    host_keyboard_id,
+                    sequence,
+                );
+            }
+        }
+        match input {
+            PeekInput::Repeat { .. } if outcome.ignored => {
                 log::warn!(
                     "peek_key: ignoring repeated key {} without a preceding press",
                     key
                 );
             }
-            KEY_STATE_RELEASED => {
-                if let Some(press) = ctx.key_generations.peek(host_keyboard_id, key) {
-                    // ChromeOS may reuse one Wayland serial across many
-                    // physical key transitions. A newer serial is sufficient
-                    // to order the release; when the serial is reused, the
-                    // compositor timestamp orders events within that serial.
-                    // Do not accept a release merely because its timestamp is
-                    // newer: an old serial can arrive late with an unrelated
-                    // timestamp.
-                    let valid_release = crate::state::serial_is_after(serial, press.serial)
-                        || (serial == press.serial
-                            && !crate::state::serial_is_after(press.time, time));
-                    if !valid_release {
-                        log::debug!(
-                            "peek_key: dropping stale release serial={} time={} before \
-                             current serial={} time={}",
-                            serial,
-                            time,
-                            press.serial,
-                            press.time,
-                        );
-                        return crate::wire::Action::Drop;
-                    }
-                }
-                ctx.key_generations
-                    .observe_peek_release(host_keyboard_id, key, serial);
-                // Keep an IME-recovery owner as a completed-generation
-                // tombstone until the next physical press. Text-input keysym
-                // events may lag behind this release and must remain
-                // suppressible.
-                if key == EVDEV_KEY_BACKSPACE {
-                    if let Some(guest_seat) = guest_seat {
-                        crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
-                    }
+            // The press of another key ends the Backspace repeat lease.
+            PeekInput::Press { .. } if key != EVDEV_KEY_BACKSPACE => {
+                Self::cancel_backspace_repeat(ctx, host_keyboard_id);
+                if let Some(guest_seat) = guest_seat {
+                    crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
                 }
             }
-            other => {
-                log::warn!("peek_key: received unknown key state {}, ignoring", other);
+            // An IME-recovery owner stays as a completed-generation
+            // tombstone until the next physical press: text-input keysym
+            // events may lag behind this release and must remain
+            // suppressible.
+            PeekInput::Release { .. } if !outcome.ignored && key == EVDEV_KEY_BACKSPACE => {
+                if let Some(guest_seat) = guest_seat {
+                    crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
+                }
             }
+            _ => {}
         }
         crate::wire::Action::Drop
     }
