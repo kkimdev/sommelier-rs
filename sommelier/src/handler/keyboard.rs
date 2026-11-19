@@ -4672,6 +4672,118 @@ mod tests {
         assert_eq!(kb.s.guest_received(), []);
     }
 
+    /// A key held since `wl_keyboard.enter` has no peek, but the detach
+    /// (H2) may take its release too, so its next `peek_key` press is a
+    /// new press as well: it keeps a waiting recovery waiting, and the
+    /// guest, which the enter told the key is held, gets its release
+    /// before the new press.
+    #[tokio::test]
+    async fn a_key_held_since_enter_is_pressed_anew_after_a_detach() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+        let keys = KEY_A.to_ne_bytes();
+        let enter = wl_keyboard::evt::enter(kb.k.host, 1, kb.surface.host, &keys).unwrap();
+        kb.s.host([enter]).await;
+        kb.k.ext = extended_keyboard_of(kb.k, &kb.s.host_received());
+        assert_eq!(
+            kb.s.guest_received(),
+            [
+                entered(kb.k, 1, kb.surface.id, &[KEY_A]),
+                modifiers(kb.k, 1, 0)
+            ]
+        );
+        let ime = kb.text_input().await;
+        kb.detach(ime).await;
+        kb.peek(701, 1300, KEY_SPACE, PRESSED).await;
+
+        let confirm = zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0);
+        kb.s.host([confirm]).await;
+        let [(_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            kb.s.host_received()[..]
+        else {
+            panic!("no recovery waits");
+        };
+        kb.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(kb.k.ext, 702, 1400, KEY_A, PRESSED),
+            wl_keyboard::evt::key(kb.k.host, 702, 1400, KEY_A, PRESSED),
+        ])
+        .await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [
+                key_event(kb.k, 702, 1400, KEY_A, RELEASED),
+                key_event(kb.k, 702, 1400, KEY_A, PRESSED),
+            ]
+        );
+        assert_eq!(kb.s.host_received(), [acked(kb.k, 702, HANDLED)]);
+        kb.s.host([wl_callback::evt::done(callback, 0)]).await;
+        assert_eq!(kb.s.guest_received(), []);
+    }
+
+    /// The guest never got the press of a held accelerator's key, so a
+    /// press of that key after a detach (H2) gives it no release; and the
+    /// new press, without Control, is no longer the accelerator's, so the
+    /// suppression does not carry over to it.
+    #[tokio::test]
+    async fn a_press_after_a_detach_ends_an_accelerators_suppression() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        let mut kb = Kb::with_accelerators("<Control>a").await;
+        let ime = kb.text_input().await;
+        kb.modifiers(CONTROL).await;
+        kb.peek(700, 700, KEY_A, PRESSED).await;
+        assert_eq!(kb.key(700, KEY_A, PRESSED).await, Route::Host);
+        kb.detach(ime).await;
+        kb.modifiers(0).await;
+
+        kb.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(kb.k.ext, 702, 1400, KEY_A, PRESSED),
+            wl_keyboard::evt::key(kb.k.host, 702, 1400, KEY_A, PRESSED),
+        ])
+        .await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [key_event(kb.k, 702, 1400, KEY_A, PRESSED)]
+        );
+        assert_eq!(kb.s.host_received(), [acked(kb.k, 702, HANDLED)]);
+    }
+
+    /// Once a press after a detach (H2) retired the old press, a late
+    /// release of the old one, under a serial before the new press's, ends
+    /// nothing: the guest keeps the new press until its own release.
+    #[tokio::test]
+    async fn a_late_release_of_a_press_retired_by_a_detach_is_dropped() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        let mut kb = Kb::new().await;
+        let ime = kb.text_input().await;
+        kb.peek(700, 700, KEY_A, PRESSED).await;
+        assert_eq!(kb.key(700, KEY_A, PRESSED).await, Route::Guest);
+        kb.detach(ime).await;
+        kb.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(kb.k.ext, 702, 1400, KEY_A, PRESSED),
+            wl_keyboard::evt::key(kb.k.host, 702, 1400, KEY_A, PRESSED),
+        ])
+        .await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [
+                key_event(kb.k, 702, 1400, KEY_A, RELEASED),
+                key_event(kb.k, 702, 1400, KEY_A, PRESSED),
+            ]
+        );
+        assert_eq!(kb.s.host_received(), [acked(kb.k, 702, HANDLED)]);
+
+        kb.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(kb.k.ext, 701, 1300, KEY_A, RELEASED),
+            wl_keyboard::evt::key(kb.k.host, 701, 1300, KEY_A, RELEASED),
+        ])
+        .await;
+        assert_eq!(kb.s.guest_received(), []);
+        assert_eq!(kb.s.host_received(), [acked(kb.k, 701, NOT_HANDLED)]);
+
+        kb.peek(703, 1500, KEY_A, RELEASED).await;
+        assert_eq!(kb.key(703, KEY_A, RELEASED).await, Route::Guest);
+    }
+
     #[tokio::test]
     async fn held_space_repeats_after_ime_commit_until_physical_release() {
         let mut kb = Kb::new().await;

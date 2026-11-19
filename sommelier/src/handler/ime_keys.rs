@@ -450,6 +450,7 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
         .latest_peek_sequence(guest_seat, active_surface);
     let is_latest_generation = latest_sequence.is_none_or(|sequence| sequence == press.sequence);
     let physically_held = ctx.key_generations.physically_held(host_keyboard_id, key);
+    let stale = ctx.key_generations.held_key_is_stale(host_keyboard_id, key);
     let repeatable = ctx
         .keyboard_repeatable_keys
         .get(&host_keyboard_id)
@@ -462,7 +463,7 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
     if !is_latest_generation
         || !physically_held
         || !press.eligible
-        || press.stale
+        || stale
         || !repeatable
         || backspace_cancelled
     {
@@ -474,7 +475,7 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
             is_latest_generation,
             physically_held,
             press.eligible,
-            press.stale,
+            stale,
             repeatable,
             backspace_cancelled
         );
@@ -759,7 +760,7 @@ pub(super) fn forget_held_keys_for_seat(ctx: &mut Context, guest_seat: u32) {
         .filter_map(|(&guest, _)| ctx.shadow_table.get_host_id(guest).map(HostId))
         .collect();
     for keyboard in host_keyboards {
-        ctx.key_generations.mark_peeks_stale(keyboard);
+        ctx.key_generations.mark_held_keys_stale(keyboard);
     }
 }
 
