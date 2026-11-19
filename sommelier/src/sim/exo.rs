@@ -421,6 +421,9 @@ struct PendingKey {
     key: Option<(Key, bool)>,
     /// The press is an autorepeat, which no key event follows (E7).
     repeat: bool,
+    /// The input method it went through is gone, so its answer goes
+    /// nowhere.
+    orphaned: bool,
     /// The key's time, in milliseconds.
     time: u32,
     /// Whether the engine sent the key's text.
@@ -536,6 +539,7 @@ impl Exo {
             id,
             key: Some((key, pressed)),
             repeat: false,
+            orphaned: false,
             time,
             answered: false,
             late: false,
@@ -560,6 +564,9 @@ impl Exo {
                 let key = self.in_engine.front_mut().expect("a key the engine has");
                 assert_eq!(key.id, *id, "the engine answers in order");
                 key.answered = true;
+                if key.orphaned {
+                    return Answer::Normal;
+                }
                 let (request, late) = (key.key.is_none(), key.late);
                 let Some(client) = self.ima.client else {
                     return Answer::Normal;
@@ -585,11 +592,15 @@ impl Exo {
                 let PendingKey {
                     key,
                     repeat,
+                    orphaned,
                     time,
                     late,
                     dropped,
                     ..
                 } = pending;
+                if orphaned {
+                    return Answer::Normal;
+                }
                 let Some((k, pressed)) = key else {
                     return Answer::Normal;
                 };
@@ -676,6 +687,7 @@ impl Exo {
             id,
             key: Some((key, true)),
             repeat: true,
+            orphaned: false,
             time: millis(now),
             answered: false,
             late: false,
@@ -709,6 +721,7 @@ impl Exo {
             id,
             key: None,
             repeat: false,
+            orphaned: false,
             time: 0,
             answered: false,
             late: false,
@@ -833,15 +846,17 @@ impl Exo {
     ///
     /// The new input method is there for that `activate` at once: the
     /// model leaves out a window in which an `activate` finds none, which
-    /// would leave Exo unattached until the focus next moves. Its engine
-    /// starts afresh, reset as the next attach would have reset it had the
-    /// old one stayed, so a key in flight is late.
+    /// would leave Exo unattached until the focus next moves. The engine
+    /// stays: only the confirmation of an attached text input resets it.
+    /// A key or request in flight never gets its callback, as the engine's
+    /// callback held the old input method weakly.
     pub(crate) fn destroy_input_method(&mut self) -> bool {
         if let Some(client) = self.ima.client {
             self.confirm_composition(client);
         }
-        if std::mem::take(&mut self.ima).composing {
-            self.reset_engine();
+        self.ima = Ima::default();
+        for pending in &mut self.in_engine {
+            pending.orphaned = true;
         }
         let mut detached = false;
         for id in self.ids() {
@@ -2050,10 +2065,9 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_of_the_input_method_starts_its_engine_afresh() {
-        // Detached by a deactivate, IMA still takes the engine to compose,
-        // and its next attach would reset it. A restart replaces IMA, so it
-        // resets the engine itself, and the key in flight is late.
+    fn a_restart_of_the_input_method_resets_the_engine_only_through_its_confirmation() {
+        // Detached by a deactivate, nothing confirms: the engine is not
+        // reset, and the key in flight never gets its callback.
         let mut exo = active(V10);
         press(&mut exo, 'r', &[shows("가")], true);
         exo.key(NOW, k('k'), DOWN);
@@ -2061,13 +2075,18 @@ mod tests {
         send(&mut exo, TI, deactivate());
         events(&mut exo);
         assert!(!exo.destroy_input_method());
-        assert_eq!(exo.take_engine(), [EngineIn::Reset]);
-        assert!(exo.in_engine[0].late);
-        // The next activate attaches the new input method, which composes
-        // nothing.
+        assert_eq!(exo.take_engine(), []);
         send(&mut exo, TI, activate(A));
         assert_eq!(events(&mut exo), [enter(A)]);
         assert_eq!(exo.take_engine(), []);
+        let id = exo.in_engine[0].id;
+        let text = EngineOut::Text {
+            id,
+            actions: vec![shows("가")],
+        };
+        exo.answer(&text);
+        exo.answer(&EngineOut::Done { id, handled: true });
+        assert_eq!(events(&mut exo), []);
         // Attached, the restart confirms, which resets the engine once.
         let mut exo = active(V10);
         press(&mut exo, 'r', &[shows("가")], true);

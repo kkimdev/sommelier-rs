@@ -192,9 +192,9 @@ const ENGINE_LATENCY: Micros = Micros(1_000);
 /// How long the user waits once everything has settled.
 const SETTLE: Micros = Micros::from_millis(50);
 /// How long a held key waits before it repeats, and then between its
-/// repeats: 500 ms, then 33 Hz (the design's section 4.4).
+/// repeats: 500 ms, then 20 Hz, ChromeOS's default.
 const REPEAT_DELAY: Micros = Micros::from_millis(500);
-const REPEAT_INTERVAL: Micros = Micros(30_303);
+const REPEAT_INTERVAL: Micros = Micros::from_millis(50);
 /// The longest a user holds a key before the next action.
 const HOLD: u64 = 1_500;
 

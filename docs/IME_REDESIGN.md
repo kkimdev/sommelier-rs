@@ -1489,7 +1489,7 @@ sees them.
     drops a reported region as a composition (E4).
 - **D7** adds holds: `UserAction::KeyDown(Key)` and `KeyUp(Key)` next to
   #73's atomic `Key`.
-  - The engine gets autorepeats (500 ms delay, 33 Hz). Exo forwards
+  - The engine gets autorepeats (500 ms delay, 20 Hz). Exo forwards
     none of them (E7).
   - IMA precedes every unhandled key, autorepeats included, with an
     empty `confirm_preedit` at v11 (E13, formerly U11). This exercises
@@ -1592,7 +1592,10 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
   5% `Settle`. A case has 10 to 60 actions and two fields.
 - **Restarts.** `UserAction::RestartInputMethod` destroys Exo's input
   method (`Exo::destroy_input_method`), which confirms and detaches on
-  its own (E2, E6), and starts its engine afresh. It is the only action
+  its own (E2, E6); its confirmation resets the engine only if a text
+  input was attached, and a key in flight never gets its callback. Ash
+  destroys `InputMethodAsh` only at shutdown, so this is a model's
+  trigger, not production's. It is the only action
   that reaches H2: since E12, a focus move always reaches the keyboard
   first, so the proxy has already deactivated when Exo's `leave` comes
   (H2'). A surface the guest destroys (F2) cannot reach H2 either: the
