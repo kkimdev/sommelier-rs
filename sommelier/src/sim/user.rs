@@ -97,7 +97,10 @@ pub(super) fn actions(
         let asks = typed || !settled;
         // A settled case asks so rarely right after a key that it asks then
         // one time in eight, where it can.
-        let (takes, reconverts) = (reference.takes_suggestion(), reference.reconverts());
+        // IMA drops a suggestion's delete while it takes the engine to
+        // compose, so a settled case asks only while it does not.
+        let takes = reference.takes_suggestion() && !(settled && ima.composing);
+        let reconverts = reference.reconverts();
         let more = settled && typed && (takes || reconverts) && rng.one_in(8);
         let action = match rng.below(100) {
             _ if again.is_some() => again.take().expect("a request to repeat"),

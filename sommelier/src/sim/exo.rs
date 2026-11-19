@@ -389,6 +389,9 @@ struct Ima {
     /// `pending_composition_`: the composition the engine showed for the
     /// key in flight.
     composition: Option<String>,
+    /// The composing range a request set while a key was in flight, in
+    /// UTF-16 units before and after the cursor, which goes out after it.
+    region: Option<(usize, usize)>,
     /// `composing_text_`: whether IMA takes the engine to be composing.
     composing: bool,
 }
@@ -565,8 +568,11 @@ impl Exo {
                     self.buffer(actions);
                     return Answer::Normal;
                 }
+                // While a key is in flight, IMA holds a request's text and
+                // range for that key's callback, as it holds the key's own.
+                let key_in_flight = self.in_engine.iter().any(|p| p.key.is_some());
                 for action in actions {
-                    self.apply(client, action);
+                    self.apply(client, action, key_in_flight);
                 }
                 match late {
                     true => Answer::Late,
@@ -1108,7 +1114,11 @@ impl Exo {
             self.ima.composing = true;
             self.set_composition(id, text);
         }
-        commit.is_some() || composition.is_some()
+        let region = self.ima.region.take();
+        if let Some((before, after)) = region {
+            self.ima.composing |= self.set_composition_from_existing_text(id, before, after);
+        }
+        commit.is_some() || composition.is_some() || region.is_some()
     }
 
     /// `InputMethodAsh::ConfirmComposition(reset_engine = true)` for text
@@ -1172,7 +1182,9 @@ impl Exo {
         if served.is_none_or(|ti| ti.field.content_type.input_type == extended::INPUT_TYPE_NONE) {
             return;
         }
-        let dropped = self.ima.commit.take().is_some() | self.ima.composition.take().is_some();
+        let dropped = self.ima.commit.take().is_some()
+            | self.ima.composition.take().is_some()
+            | self.ima.region.take().is_some();
         if dropped {
             self.mark_dropped();
         }
@@ -1199,21 +1211,31 @@ impl Exo {
     }
 
     /// IMA passes on `action` of a request's answer to text input `id`
-    /// at once, as no key is in flight.
-    fn apply(&mut self, id: u32, action: &TextAction) {
+    /// (`input_method_ash.cc`). A delete goes out at once, unless IMA takes
+    /// the engine to compose, when it is dropped. A commit and a composing
+    /// range wait for the callback of a key in flight (`key_in_flight`),
+    /// and otherwise go out at once; a commit then leaves IMA's
+    /// `composing_text_` as it is.
+    fn apply(&mut self, id: u32, action: &TextAction, key_in_flight: bool) {
         match *action {
-            TextAction::Commit(ref text) => {
-                self.insert_text(id, text);
-                self.ima.composing = false;
+            TextAction::Commit(ref text) if key_in_flight => {
+                self.ima
+                    .commit
+                    .get_or_insert_with(String::new)
+                    .push_str(text);
             }
+            TextAction::Commit(ref text) => self.insert_text(id, text),
             TextAction::Preedit(ref text) => {
                 self.set_composition(id, text);
                 self.ima.composing = !text.is_empty();
             }
+            TextAction::Delete { .. } if self.ima.composing => {}
             TextAction::Delete { before, after } => self.delete_surrounding_text(id, before, after),
+            TextAction::Region { before, after } if key_in_flight => {
+                self.ima.region = Some((before, after));
+            }
             TextAction::Region { before, after } => {
-                self.set_composition_from_existing_text(id, before, after);
-                self.ima.composing = true;
+                self.ima.composing |= self.set_composition_from_existing_text(id, before, after);
             }
         }
     }
@@ -1238,11 +1260,11 @@ impl Exo {
     /// extension's `set_preedit_region` shows, in bytes from the cursor. A
     /// range past the text is refused, before anything is sent
     /// (`text_input.cc`); the engine then learns nothing.
-    fn set_composition_from_existing_text(&mut self, id: u32, before: usize, after: usize) {
+    fn set_composition_from_existing_text(&mut self, id: u32, before: usize, after: usize) -> bool {
         let text = &mut self.text_input(id).text;
         let (range, within) = utf16_span(&text.predicted, before, after);
         if !within {
-            return;
+            return false;
         }
         let cursor = text.predicted.cursor;
         let composed = text.compose_existing(range.clone());
@@ -1253,6 +1275,7 @@ impl Exo {
             self.events.push(event);
         }
         self.composed_region = Some(composed);
+        true
     }
 
     /// The text of the region Exo composed last from existing text, if it
@@ -2087,6 +2110,47 @@ mod tests {
         };
         assert_eq!(events(&mut exo), [(TI, deleted.into()), commit(1, "ab가~")]);
         assert_eq!(*predicted(&exo), predicts("0ab가~1", 7, None));
+    }
+
+    #[test]
+    fn a_request_answered_while_a_key_is_in_flight_waits_for_it_but_its_delete() {
+        let mut exo = active(V11);
+        send(&mut exo, TI, surrounding("0ab", 3));
+        exo.ask(Request::AcceptSuggestion);
+        exo.key(NOW, k('r'), DOWN);
+        exo.take_engine();
+        let delete = TextAction::Delete {
+            before: 2,
+            after: 0,
+        };
+        answer_request(&mut exo, 0, vec![delete, commits("ab~")]);
+        let deleted = zwp_text_input_v1::Event::DeleteSurroundingText {
+            index: 1,
+            length: 2,
+        };
+        assert_eq!(events(&mut exo), [(TI, deleted.into())]);
+        // The commit goes out after the key's peek, with its text.
+        let text = EngineOut::Text {
+            id: 1,
+            actions: vec![shows("ㄱ")],
+        };
+        exo.answer(&text);
+        exo.answer(&EngineOut::Done {
+            id: 1,
+            handled: true,
+        });
+        let mut expected = vec![peek(1, 'r', DOWN), commit(2, "ab~")];
+        expected.extend(preedit(3, "ㄱ"));
+        assert_eq!(events(&mut exo), expected);
+        // While IMA takes the engine to compose, a delete is dropped.
+        exo.ask(Request::AcceptSuggestion);
+        exo.take_engine();
+        let delete = TextAction::Delete {
+            before: 1,
+            after: 0,
+        };
+        answer_request(&mut exo, 2, vec![delete]);
+        assert_eq!(events(&mut exo), []);
     }
 
     #[test]
