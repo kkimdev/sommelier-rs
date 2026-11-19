@@ -111,7 +111,6 @@ impl ImeCore {
         env: &impl Env,
         fx: &mut Effects,
     ) {
-        debug_assert!(!self.inputs.contains_key(&ti), "{ti:?} exists already");
         fx.to_host.push(HostOut::Request(
             zwp_text_input_manager_v1::req::create_text_input(manager, host.v1),
         ));
@@ -123,7 +122,6 @@ impl ImeCore {
                     host.v1,
                 ),
             ));
-            self.by_ext.insert(ext.id, ti);
         }
         // A text input created after the seat's keyboard took its focus
         // still needs that `enter`, or the client would wait for one.
@@ -132,7 +130,7 @@ impl ImeCore {
             fx.to_guest
                 .push(zwp_text_input_v3::evt::enter(ti.0, surface.0));
         }
-        self.inputs.insert(ti, TextInput::new(seat, host, surface));
+        self.insert(ti, seat, host, surface);
     }
 
     /// G3, G4, G7 and G8, which are ignored while unfocused.
@@ -242,10 +240,9 @@ impl ImeCore {
 
     /// The end of G10: forget the text input and destroy its extension.
     fn remove(&mut self, ti: TiId, fx: &mut Effects) {
-        let Some(ext) = self.inputs.remove(&ti).and_then(|t| t.host().ext) else {
+        let Some(ext) = self.forget(ti).and_then(|t| t.host().ext) else {
             return;
         };
-        self.by_ext.remove(&ext.id);
         fx.to_host.extend([
             HostOut::Request(zcr_extended_text_input_v1::req::destroy(ext.id)),
             HostOut::Retire(ext.id),

@@ -29,18 +29,18 @@ use crate::wire::Outgoing;
 
 /// The host state a text input should have (design 2, "Reconcile").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct HostTarget {
+pub(crate) struct HostTarget {
     /// The host surface of an enabled field, if the host knows it: the
     /// text input wants input there.
-    pub(super) surface: Option<u32>,
+    pub(crate) surface: Option<u32>,
     /// The host seat that can carry an `activate` or `deactivate`.
-    pub(super) seat: Option<u32>,
-    pub(super) content_type: HostContentType,
+    pub(crate) seat: Option<u32>,
+    pub(crate) content_type: HostContentType,
 }
 
 /// How the link's activation changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ActivationStep {
+pub(crate) enum ActivationStep {
     Activate {
         seat: u32,
         surface: u32,
@@ -57,13 +57,13 @@ pub(super) enum ActivationStep {
 
 /// The host requests that bring a link to its target, in order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct HostSteps {
-    pub(super) activation: Option<ActivationStep>,
-    pub(super) content_type: Option<HostContentType>,
+pub(crate) struct HostSteps {
+    pub(crate) activation: Option<ActivationStep>,
+    pub(crate) content_type: Option<HostContentType>,
 }
 
 /// The host state text input `t` should have.
-pub(super) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
+pub(crate) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
     let field = t.field();
     let committed = field.map(|(_, committed)| committed);
     HostTarget {
@@ -88,7 +88,7 @@ pub(super) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
 /// host gets each content type once it can apply it, and only then"). A
 /// draining link waits for its barrier. Pure, and idempotent once its
 /// steps are applied.
-pub(super) fn reconcile(target: &HostTarget, link: LinkState) -> HostSteps {
+pub(crate) fn reconcile(target: &HostTarget, link: LinkState) -> HostSteps {
     let activation = match (target.surface, link) {
         (Some(surface), LinkState::Detached) => target
             .seat

@@ -755,6 +755,149 @@ fn row_G9c_an_enable_while_another_is_enabled_applies_the_rest() {
     assert_eq!(out.keys, [Key::Lease(TI2, LeaseOutcome::End)]);
 }
 
+/// INVARIANTS "Every commit that leaves a field enabled gets a `done`":
+/// an enable of an enabled field keeps its composition and the content
+/// type the host applied, while a commit that disables it starts a new
+/// field, whose reconcile ends the composition with the link, so the field
+/// enabled again shows none of it. The old code's test of
+/// `TextInputState::commit`, against the core.
+#[test]
+fn only_an_enable_that_changes_the_field_closes_its_composition() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let out = ime.enable(TI);
+    let kept = [
+        surrounding(TI, "", 0),
+        cursor_rect(TI, (0, 0, 0, 0)),
+        commit_state(TI, 2),
+    ];
+    assert_eq!(out.host, kept);
+    assert_eq!(out.guest, [preedit("가"), done(2)]);
+    assert_eq!(out.keys, []);
+
+    ime.step(Input::Disable(TI));
+    let out = ime.step(Input::Commit(TI));
+    let [barrier] = out.barriers()[..] else {
+        panic!("one drain: {out:?}");
+    };
+    let mut deactivate = vec![
+        req(v1(TI), V1::Deactivate { seat: HOST_SEAT }),
+        Host::Barrier(barrier),
+    ];
+    deactivate.extend([
+        surrounding(TI, "", 0),
+        cursor_rect(TI, (0, 0, 0, 0)),
+        commit_state(TI, 3),
+    ]);
+    assert_eq!(out.host, deactivate);
+    assert_eq!(out.guest, []);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+
+    ime.step(Input::BarrierDone(barrier));
+    let out = ime.enable(TI);
+    assert_eq!(out.host, activation(TI, 4));
+    assert_eq!(out.guest, [done(4)]);
+}
+
+/// INVARIANTS "The host gets each content type once it can apply it, and
+/// only then": from every link, with or without a target surface and a
+/// live seat, one reconcile reaches the target with only the requests it
+/// needs, and the next has nothing left to send. The old code's test of
+/// its `reconcile` over `HostApplied`, against the core's.
+#[test]
+fn reconcile_reaches_every_target_with_only_needed_requests() {
+    use super::state::LinkState;
+    use crate::state::HostContentType;
+    use host::{ActivationStep, HostSteps, HostTarget};
+    let content_types: Vec<_> = [(1, 2), (3, 4)]
+        .into_iter()
+        .flat_map(|content_type| {
+            [None, Some(false), Some(true)].map(|surrounding_text_support| HostContentType {
+                content_type,
+                surrounding_text_support,
+            })
+        })
+        .collect();
+    let draining = LinkState::Draining {
+        barrier: BarrierToken(100),
+    };
+    let links: Vec<_> = [LinkState::Detached, draining]
+        .into_iter()
+        .chain(
+            [None]
+                .into_iter()
+                .chain(content_types.iter().copied().map(Some))
+                .map(|content_type| LinkState::Attached { content_type }),
+        )
+        .collect();
+    // Apply `steps` to `link` as the host does.
+    let apply = |link: LinkState, steps: HostSteps| {
+        let mut next = match (steps.activation, link) {
+            (Some(ActivationStep::Activate { .. }), LinkState::Detached) => {
+                LinkState::Attached { content_type: None }
+            }
+            (Some(ActivationStep::Deactivate { .. }), LinkState::Attached { .. }) => {
+                LinkState::Draining {
+                    barrier: BarrierToken(101),
+                }
+            }
+            (Some(ActivationStep::Abandon), LinkState::Attached { .. }) => LinkState::Detached,
+            (None, link) => link,
+            (step, link) => panic!("{step:?} is no transition from {link:?}"),
+        };
+        if let Some(content_type) = steps.content_type {
+            let LinkState::Attached {
+                content_type: applied,
+            } = next
+            else {
+                panic!("{steps:?} sends a content type no input method applies");
+            };
+            assert_ne!(applied, Some(content_type), "{steps:?} resends {applied:?}");
+            next = LinkState::Attached {
+                content_type: Some(content_type),
+            };
+        }
+        next
+    };
+    for surface in [None, Some(HOST_SURFACE)] {
+        for seat in [None, Some(HOST_SEAT)] {
+            for &content_type in &content_types {
+                let target = HostTarget {
+                    surface,
+                    seat,
+                    content_type,
+                };
+                for &link in &links {
+                    let reached = apply(link, host::reconcile(&target, link));
+                    let attached = LinkState::Attached {
+                        content_type: Some(content_type),
+                    };
+                    let expected = match (link, surface, seat) {
+                        // The barrier's completion reconciles again.
+                        (LinkState::Draining { .. }, ..) => link,
+                        (_, Some(_), Some(_)) => attached,
+                        (LinkState::Attached { .. }, None, Some(_)) => LinkState::Draining {
+                            barrier: BarrierToken(101),
+                        },
+                        (_, None, _) => LinkState::Detached,
+                        // A seat that cannot carry an activate keeps the
+                        // link as it is, with the content type it can still
+                        // take.
+                        (LinkState::Detached, Some(_), None) => link,
+                        (LinkState::Attached { .. }, Some(_), None) => attached,
+                    };
+                    assert_eq!(reached, expected, "{target:?} from {link:?}");
+                    assert_eq!(
+                        host::reconcile(&target, reached),
+                        HostSteps::default(),
+                        "{target:?} is reached from {link:?} in one reconcile"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn row_G9c_surrounding_text_support_follows_the_field() {
     let mut ime = Ime::enabled();

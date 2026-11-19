@@ -297,7 +297,10 @@ every object such state names, against the table; a test's `Client`,
 the fuzzer's included, runs it after every batch that keeps the session.
 A seat reference is the exception: it outlives its seat
 ([Object lifetimes](INVARIANTS.md#object-lifetimes)), so only its copies
-are checked, against their keyboard's.
+are checked, against their keyboard's. It also checks the IME core's
+invariants (`ImeCore::assert_invariants`, design 3.1 of
+[IME_REDESIGN.md](IME_REDESIGN.md)), and that each text input's drain
+and press fence wait for a pending `InternalCallback::TextInput`.
 
 ### Message effects
 
@@ -374,7 +377,7 @@ becomes an unused variable, which CI rejects. There is no generic
   attachment, damage, scale, transform, offsets and viewport.
 - `V3Pending` (`input.rs`) follows it for a text-input-v3 object's
   enable, surrounding text, content type and cursor rectangle, which
-  `TextInputState::commit` applies to `V3Committed`, except the cursor
+  `ime::TextInput::apply_commit` applies to `V3Committed`, except the cursor
   rectangle, which only the host keeps and the commit forwards. A commit
   whose surrounding text does not fit a v1 message resets it unapplied.
 - `OutputRecord` (`outputs.rs`) is a deliberate exception: an output event
@@ -477,12 +480,20 @@ Exo delivers IME input through `zwp_text_input_v1` and the
 `zwp_text_input_v3`. The proxy exposes a synthetic text-input-v3 manager
 and bridges each guest v3 object to a host v1 object plus its extension.
 
+The IME core (`sommelier/src/ime`, `Context::ime`) owns the state of
+every text input: its field, its link to the host text input, its
+composition and its barriers. It is being wired in stages
+([IME_REDESIGN.md](IME_REDESIGN.md) section 5): until its `step` handles
+every message, the handlers in `handler/text_input.rs` keep their shape
+and change that state only through the core's named transitions, made
+`pub(crate)` for this window, and the core's `reconcile`.
+
 The bridge reconciles state rather than translating requests, because Exo
 applies a request against state the proxy cannot see: it drops a content
 type while no input method is attached, and attaching one resets the
-type. `HostApplied` (`input.rs`) models what the host text input has
-applied, by those rules, and the pure `reconcile` returns the requests
-that make it match the target the guest committed (`HostTarget`): the
+type. `ime::LinkState` models what the host text input has applied, by
+those rules, and the pure `ime::reconcile` returns the requests that
+make it match the target the guest committed (`HostTarget`): the
 activation step and, when the attached input method lacks it, the content
 type. `text_input::reconcile_host` sends them wherever the target or the
 host's ability to apply it changes: a guest commit, a focus change, a

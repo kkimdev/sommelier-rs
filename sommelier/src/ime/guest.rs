@@ -26,7 +26,7 @@ use crate::wire::Outgoing;
 /// A preedit as the guest is shown it. Its text is never empty: an empty
 /// preedit is no preedit, which [`Self::new`] makes impossible.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Preedit {
+pub(crate) struct Preedit {
     text: String,
     /// The `cursor_begin` and `cursor_end` sent with it.
     cursor: (i32, i32),
@@ -38,7 +38,7 @@ impl Preedit {
         (!text.is_empty()).then_some(Self { text, cursor })
     }
 
-    pub(super) fn text(&self) -> &str {
+    pub(crate) fn text(&self) -> &str {
         &self.text
     }
 }
@@ -57,7 +57,7 @@ pub(super) struct GuestTxn {
 
 /// A string of a transaction does not fit one message.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct TooLong;
+pub(crate) struct TooLong;
 
 impl GuestTxn {
     /// The only builder of `zwp_text_input_v3` `preedit_string`,
