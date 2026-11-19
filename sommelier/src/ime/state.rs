@@ -442,6 +442,7 @@ impl TextInput {
     }
 
     /// The barriers this text input waits for: its drain and its fence.
+    #[cfg(test)]
     pub(crate) fn barriers(&self) -> impl Iterator<Item = BarrierToken> {
         let drain = match self.link {
             LinkState::Draining { barrier } => Some(barrier),

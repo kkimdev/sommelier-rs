@@ -443,6 +443,7 @@ impl ExoMirror {
         self.exact().expect("an exact prediction")
     }
 
+    #[cfg(test)]
     pub(super) fn expected(&self) -> &VecDeque<Entry> {
         &self.expected
     }
@@ -574,6 +575,7 @@ impl ExoMirror {
         self.health
     }
 
+    #[cfg(test)]
     pub(super) fn dropped(&self) -> bool {
         self.dropped
     }
