@@ -588,11 +588,19 @@ impl Exo {
                     }
                     return Answer::Normal;
                 }
+                // `Keyboard::OnKeyEvent` passes a press only of a key it does
+                // not hold, as one pressed raw since the press went to the
+                // engine.
                 let code = keymap::keycode(k).0;
-                self.pressed.insert(code, handled);
+                let held = self.pressed.contains_key(&code);
+                if !held {
+                    self.pressed.insert(code, handled);
+                }
                 let pressed = wl_keyboard::KEY_STATE_PRESSED;
                 let sent = if handled {
-                    self.key_events(k, time, pressed, true);
+                    if !held {
+                        self.key_events(k, time, pressed, true);
+                    }
                     self.flush()
                 } else {
                     let shown = self
@@ -600,7 +608,9 @@ impl Exo {
                         .client
                         .is_some_and(|client| self.confirm_composition(client));
                     let sent = self.flush() || shown;
-                    self.key_events(k, time, pressed, false);
+                    if !held {
+                        self.key_events(k, time, pressed, false);
+                    }
                     sent
                 };
                 if dropped {
@@ -2049,6 +2059,18 @@ mod tests {
             key(2, 'r', UP),
         ];
         assert_eq!(events(&mut exo), raw);
+        // Nor does the engine's answer to a press of a key pressed raw
+        // since, though IMA still confirms before it.
+        let mut exo = active(V11);
+        exo.key(NOW, k(' '), DOWN);
+        let [EngineIn::Key { id, .. }] = exo.take_engine()[..] else {
+            panic!("the key went to the engine");
+        };
+        send(&mut exo, TI, deactivate());
+        exo.key(NOW, k(' '), DOWN);
+        events(&mut exo);
+        exo.answer(&EngineOut::Done { id, handled: false });
+        assert_eq!(events(&mut exo), []);
         assert!(exo.in_engine.is_empty());
     }
 
