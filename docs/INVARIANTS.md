@@ -776,11 +776,13 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   (`ime_keys::PendingRecovery`), and decides it before it handles the
   host's next event. Before any peek, `wl_keyboard.modifiers` leave it
   waiting, and so does the `peek_key` press of a key the keyboard does not
-  hold. That key's `wl_keyboard.key` press, with the peek's serial, drops
-  it, as a confirmation that finds no held key, and so does the text
-  input's `leave`: Exo confirms as it detaches the input method (E6). Any
-  other host event recovers the key first, so that its pair and `done`
-  precede that event.
+  hold, from any keyboard of the connection: Exo has one seat, which every
+  guest `wl_seat` stands for, and sends each keyboard the press in turn.
+  That key's `wl_keyboard.key` press on the same keyboard, with the peek's
+  serial, drops it, as a confirmation that finds no held key, and so does
+  the text input's `leave`: Exo confirms as it detaches the input method
+  (E6). Any other host event recovers the key first, so that its pair and
+  `done` precede that event.
   With a recovery that waits the proxy sends the host a `wl_display.sync`,
   whose `done` follows the whole task (E11), so one round trip decides it
   at the latest, with no timer. The pair goes only if the text input still
@@ -789,12 +791,19 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   detach (H2), as when the input method's process restarts, also ends the
   recovery of every key the seat holds: the key events in flight die with
   the input method, so a held key's release may never come, and only the
-  key's next press can be recovered. Otherwise a key typed while Backspace
-  or Space is held would also repeat the held key, and so would a restart.
+  key's next press can be recovered. A `peek_key` press of a key still
+  held is that next press, whose release died. The detach ends nothing
+  else: such a key is still guest input, so its keysym reaches the guest,
+  which a flag of its own (`PeekKeyProvenance::stale`) keeps apart from
+  the one that marks an accelerator's key. Otherwise a key typed while
+  Backspace or Space is held would also repeat the held key, and so would
+  a restart.
   Tests: `a_confirmation_before_an_unhandled_press_recovers_no_held_key`,
   `a_confirmation_before_a_handled_press_recovers_the_held_key`,
+  `a_press_on_another_seats_keyboard_keeps_a_recovery_waiting`,
   `a_waiting_recovery_ends_with_its_text_input_or_keyboard`,
   `an_input_method_detach_ends_the_recovery_of_held_keys`,
+  `a_key_held_across_a_detach_is_typed_and_recovered_again`,
   `keys_held_since_enter_are_ordered_by_their_peeks`.
 - **A key waits for at most one late release per channel.** When a key
   is pressed again before the channel that gave the guest its previous
@@ -956,7 +965,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `done`, then the keyboard events that moved the focus, then the text
   input's `leave` and `enter`. The keyboard handler hands those events to
   the IME core (`ime::Input::FocusChanged`'s `keyboard`) rather than
-  forwarding them, since a forward would precede the commit. mutter and
+  forwarding them, since a forward would precede the commit. A host sends
+  each keyboard of a seat its `leave` in turn, so the first keyboard's
+  `leave` of the seat's surface moves the seat's focus off it, though
+  the seat's other keyboards still focus it
+  (`KeyboardFocusRegistry::leave` retires them, each still owed its own
+  `leave`): the commit goes before every keyboard's `leave`. mutter and
   ibus commit a preedit at a focus-out, and Exo's detach confirms the
   composition (E6 of [IME_REDESIGN.md](IME_REDESIGN.md) 2.4), so Exo keeps
   the text too. But the keyboard hears of a focus move before the text
@@ -970,6 +984,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   would go into, which is why the IME core hears of the destroy before
   the focus change it causes (previous rule).
   Tests: `a_focus_loss_commits_the_shown_preedit_before_leave`,
+  `the_first_keyboard_leave_of_a_seat_commits_the_preedit_before_it`,
+  `leave_from_one_keyboard_ends_the_seats_focus_on_the_surface`,
   `keyboard_release_ends_focus_when_no_other_keyboard_owns_the_seat`,
   `release_does_not_end_child_text_input_focus`,
   `wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave`,

@@ -25,10 +25,17 @@ pub struct PeekKeyProvenance {
     pub serial: u32,
     pub time: u32,
     pub sequence: u64,
-    /// The generation may recover an IME-consumed repeat. Host accelerators
-    /// and placement chords permanently clear this bit for the lifetime of
-    /// the generation.
+    /// The generation is guest input, which may recover an IME-consumed
+    /// repeat or reach the guest as a keysym. Host accelerators and
+    /// placement chords permanently clear this bit for the lifetime of the
+    /// generation.
     pub eligible: bool,
+    /// The input method detached on its own while the key was held (H2),
+    /// so the key's release may have died with it: the generation recovers
+    /// no IME-consumed repeat, and the key's next `peek_key` press starts a
+    /// new one. It concerns only that recovery; the key is still guest
+    /// input.
+    pub stale: bool,
 }
 
 /// Causal watermark for the newest physical generation in one seat/focus
@@ -621,6 +628,7 @@ impl KeyGenerationRegistry {
             time,
             sequence,
             eligible,
+            stale: false,
         });
         sequence
     }
@@ -654,12 +662,13 @@ impl KeyGenerationRegistry {
         }
     }
 
-    /// No key `keyboard` holds now may recover an IME-consumed repeat.
-    pub(crate) fn invalidate_peeks(&mut self, keyboard: HostId) {
+    /// No key `keyboard` holds now may recover an IME-consumed repeat
+    /// ([`PeekKeyProvenance::stale`]).
+    pub(crate) fn mark_peeks_stale(&mut self, keyboard: HostId) {
         let generations = self.entries.get_mut(&keyboard).into_iter().flatten();
         for (_, generation) in generations {
             if let Some(peek) = generation.peek.as_mut() {
-                peek.eligible = false;
+                peek.stale = true;
             }
         }
     }
@@ -1216,7 +1225,8 @@ pub struct KeyboardFocusUpdate {
 ///
 /// Every keyboard on one seat must own the same surface. Entering a different
 /// surface retires older keyboard generations for that seat instead of
-/// retaining a fallback focus that a delayed leave could revive.
+/// retaining a fallback focus that a delayed leave could revive, and so does
+/// one keyboard's leave of the seat's surface ([`Self::leave`]).
 #[derive(Default)]
 pub struct KeyboardFocusRegistry {
     keyboards: BTreeMap<HostId, KeyboardFocus>,
@@ -1367,7 +1377,31 @@ impl KeyboardFocusRegistry {
         if focus.host_surface != host_surface {
             return KeyboardFocusUpdate::default();
         }
-        self.remove_keyboard(host_keyboard, focus)
+        // A host sends every keyboard of the seat its leave in turn, so the
+        // first one moves the seat's focus off the surface, and the field's
+        // preedit is committed before any keyboard leaves it (F1). The
+        // seat's other keyboards, all on that surface, are retired, each
+        // still owed its own leave, as at an enter of another surface.
+        let mut update = self.remove_keyboard(host_keyboard, focus);
+        let mut others = self
+            .keyboards
+            .iter()
+            .filter(|(_, other)| other.guest_seat == focus.guest_seat)
+            .map(|(&keyboard, &other)| (keyboard, other))
+            .collect::<Vec<_>>();
+        others.sort_unstable_by_key(|(keyboard, _)| keyboard.0);
+        for (keyboard, other) in others {
+            self.keyboards.remove(&keyboard);
+            self.retired_guest_enters
+                .insert((keyboard, other.host_surface), other);
+            update.retired_keyboards.push(keyboard);
+        }
+        update.seat_changes = vec![SeatFocusChange {
+            guest_seat: focus.guest_seat,
+            previous_surface: Some(focus.guest_surface),
+            current_surface: None,
+        }];
+        update
     }
 
     pub fn release(&mut self, host_keyboard: HostId) -> KeyboardFocusUpdate {
@@ -1596,27 +1630,30 @@ mod tests {
         }
     }
 
+    /// The first keyboard's leave of a shared surface moves the seat's
+    /// focus off it and retires the other keyboard, whose own leave then
+    /// balances its enter and moves nothing.
     #[test]
-    fn keyboard_focus_registry_keeps_shared_surface_until_last_owner() {
+    fn keyboard_focus_registry_ends_a_shared_surface_at_its_first_leave() {
         let mut registry = KeyboardFocusRegistry::default();
         registry.enter(KEYBOARD_A, ON_20);
         registry.enter(KEYBOARD_B, ON_20);
 
         assert_eq!(
             registry.leave(KEYBOARD_A, ON_20.host_surface),
-            accepted(Vec::new(), vec![KEYBOARD_A])
-        );
-        assert_eq!(registry.surface_for_seat(1), Some(20));
-        assert_eq!(
-            registry.leave(KEYBOARD_B, ON_20.host_surface),
             accepted(
                 vec![SeatFocusChange {
                     guest_seat: 1,
                     previous_surface: Some(20),
                     current_surface: None,
                 }],
-                vec![KEYBOARD_B]
+                vec![KEYBOARD_A, KEYBOARD_B]
             )
+        );
+        assert_eq!(registry.surface_for_seat(1), None);
+        assert_eq!(
+            registry.leave(KEYBOARD_B, ON_20.host_surface),
+            accepted(Vec::new(), Vec::new())
         );
         assert_eq!(registry.surface_for_seat(1), None);
     }
@@ -2459,6 +2496,7 @@ mod tests {
                     time,
                     sequence,
                     eligible,
+                    stale: false,
                 });
             }
 

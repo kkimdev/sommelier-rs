@@ -1077,8 +1077,14 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
         let pressed_before = ctx
             .key_generations
             .physically_held(host_keyboard_id, key);
-        let peek_pressed_before =
-            pressed_before && ctx.key_generations.peek(host_keyboard_id, key).is_some();
+        // A peek the input method's own detach made stale (H2) describes a
+        // press whose release may have died with it, so a press peek of
+        // the key is its next press.
+        let peek_pressed_before = pressed_before
+            && ctx
+                .key_generations
+                .peek(host_keyboard_id, key)
+                .is_some_and(|peek| !peek.stale);
         match state {
             KEY_STATE_PRESSED | KEY_STATE_REPEATED
                 if state == KEY_STATE_PRESSED || pressed_before =>
@@ -3523,28 +3529,29 @@ mod tests {
         assert_eq!(kb.s.host_received(), []);
     }
 
+    /// A host sends every keyboard of the seat its leave, so the first
+    /// one ends the seat's focus on the surface, though the other keyboard
+    /// still focuses it; the other's leave then balances its enter.
     #[tokio::test]
-    async fn leave_from_one_keyboard_keeps_same_surface_focused_for_another() {
+    async fn leave_from_one_keyboard_ends_the_seats_focus_on_the_surface() {
         let mut kb = Kb::new().await;
         let ime = kb.text_input().await;
         let surface = kb.surface;
         // Each keyboard gets its own enter.
         let other = kb.another_keyboard().await;
 
-        // The first keyboard leaves, but the other one still focuses the
-        // surface, so the seat's text input keeps it.
         kb.s.host([wl_keyboard::evt::leave(kb.k.host, 2, surface.host)])
-            .await;
-        assert_eq!(kb.s.guest_received(), [left(kb.k, 2, surface.id)]);
-        assert_eq!(kb.s.host_received(), []);
-
-        kb.s.host([wl_keyboard::evt::leave(other.host, 3, surface.host)])
             .await;
         assert_eq!(
             kb.s.guest_received(),
-            [left(other, 3, surface.id), v3_leave(ime, surface.id),]
+            [left(kb.k, 2, surface.id), v3_leave(ime, surface.id)]
         );
         assert!(deactivated(ime, &kb.s.host_received()));
+
+        kb.s.host([wl_keyboard::evt::leave(other.host, 3, surface.host)])
+            .await;
+        assert_eq!(kb.s.guest_received(), [left(other, 3, surface.id)]);
+        assert_eq!(kb.s.host_received(), []);
     }
 
     #[tokio::test]
@@ -3938,6 +3945,49 @@ mod tests {
         assert_eq!(
             kb.s.guest_received(),
             [left(other, 2, surface.id), v3_leave(ime, surface.id),]
+        );
+        assert!(deactivated(ime, &kb.s.host_received()));
+    }
+
+    /// A host sends each keyboard of a seat its focus change in turn, so
+    /// the first keyboard's `leave` comes while the other still focuses
+    /// the field. That leave moves the seat's focus off it: the guest
+    /// commits its preedit before the leave, as with one keyboard (F1),
+    /// since a client listening on that keyboard drops input-method events
+    /// for a window it has left. The other keyboard's leave and enter then
+    /// move nothing.
+    #[tokio::test]
+    async fn the_first_keyboard_leave_of_a_seat_commits_the_preedit_before_it() {
+        let mut kb = Kb::new().await;
+        let ime = kb.text_input().await;
+        let other = kb.another_keyboard().await;
+        let preedit = zwp_text_input_v1::evt::preedit_string(ime.host, 0, "한", "").unwrap();
+        kb.s.host([preedit]).await;
+        assert_eq!(kb.s.guest_received(), [v3_preedit(ime, "한"), done(ime)]);
+
+        let (surface, next) = (kb.surface, kb.s.surface().await);
+        kb.s.host([
+            wl_keyboard::evt::leave(kb.k.host, 2, surface.host),
+            wl_keyboard::evt::enter(kb.k.host, 3, next.host, &[]).unwrap(),
+            wl_keyboard::evt::leave(other.host, 2, surface.host),
+            wl_keyboard::evt::enter(other.host, 3, next.host, &[]).unwrap(),
+        ])
+        .await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [
+                v3_preedit(ime, ""),
+                v3_commit(ime, "한"),
+                done(ime),
+                left(kb.k, 2, surface.id),
+                v3_leave(ime, surface.id),
+                entered(kb.k, 3, next.id, &[]),
+                modifiers(kb.k, 3, 0),
+                v3_enter(ime, next.id),
+                left(other, 2, surface.id),
+                entered(other, 3, next.id, &[]),
+                modifiers(other, 3, 0),
+            ]
         );
         assert!(deactivated(ime, &kb.s.host_received()));
     }
@@ -4421,6 +4471,49 @@ mod tests {
         }
     }
 
+    /// ChromeOS has one physical seat, which every guest `wl_seat` stands
+    /// for, and Exo sends each keyboard of the client its key events in
+    /// turn, so another seat's keyboard may hear of a press first. Its
+    /// peek keeps a recovery waiting as one on the held key's keyboard
+    /// would, and its key press, with the peek's serial, shows the
+    /// confirmation was Exo's before that press (E13): the held Space is
+    /// not recovered.
+    #[tokio::test]
+    async fn a_press_on_another_seats_keyboard_keeps_a_recovery_waiting() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        let mut kb = Kb::new().await;
+        let ime = kb.text_input().await;
+        let (_, other) = kb.s.keyboard().await;
+        let other = Keyboard {
+            id: other.id,
+            host: other.host,
+            ext: 0,
+        };
+        let surface = kb.surface;
+        let other = kb.first_enter(other, surface).await;
+        kb.peek(700, 1234, KEY_SPACE, PRESSED).await;
+
+        let confirm = zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0);
+        kb.s.host([confirm]).await;
+        let [(_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            kb.s.host_received()[..]
+        else {
+            panic!("no recovery waits");
+        };
+        kb.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(other.ext, 701, 1300, KEY_A, PRESSED),
+            wl_keyboard::evt::key(other.host, 701, 1300, KEY_A, PRESSED),
+        ])
+        .await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [key_event(other, 701, 1300, KEY_A, PRESSED)]
+        );
+        assert_eq!(kb.s.host_received(), [acked(other, 701, HANDLED)]);
+        kb.s.host([wl_callback::evt::done(callback, 0)]).await;
+        assert_eq!(kb.s.guest_received(), []);
+    }
+
     #[tokio::test]
     async fn held_space_repeats_after_ime_commit_until_physical_release() {
         let mut kb = Kb::new().await;
@@ -4573,11 +4666,24 @@ mod tests {
     async fn a_keysym_goes_through_the_focused_keyboard() {
         let mut kb = Kb::new().await;
         let other = kb.another_keyboard().await;
-        let ime = kb.text_input().await;
         let surface = kb.surface;
-        kb.s.host([wl_keyboard::evt::leave(kb.k.host, 5, surface.host)])
-            .await;
-        assert_eq!(kb.s.guest_received(), [left(kb.k, 5, surface.id)]);
+        // Both keyboards leave, and only the other enters again.
+        kb.s.host([
+            wl_keyboard::evt::leave(kb.k.host, 5, surface.host),
+            wl_keyboard::evt::leave(other.host, 5, surface.host),
+            wl_keyboard::evt::enter(other.host, 6, surface.host, &[]).unwrap(),
+        ])
+        .await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [
+                left(kb.k, 5, surface.id),
+                left(other, 5, surface.id),
+                entered(other, 6, surface.id, &[]),
+                modifiers(other, 6, 0),
+            ]
+        );
+        let ime = kb.text_input().await;
 
         kb.peek(6, 600, KEY_SPACE, PRESSED).await;
         kb.keysym(ime, 601, 7, keysyms::KEY_space, PRESSED).await;

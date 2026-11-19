@@ -4403,6 +4403,53 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.recovered(again));
     }
 
+    /// Exo's own detach (H2) ends only the recovery of the keys held
+    /// across it, which stay the guest's keys: the keysym of `1` reaches
+    /// the guest. Their releases died with the input method, so a
+    /// `peek_key` press of a key still held is its next press, which an
+    /// empty confirmation recovers.
+    #[tokio::test]
+    async fn a_key_held_across_a_detach_is_typed_and_recovered_again() {
+        const KEY_1: u32 = 2;
+        let mut f = Field::typing().await;
+        let one = Stroke {
+            key: KEY_1,
+            state: PRESSED,
+            serial: 700,
+            time: 1_234,
+        };
+        let space = Stroke {
+            key: SPACE,
+            serial: 701,
+            time: 1_240,
+            ..one
+        };
+        f.s.host([f.peek(one), f.peek(space), f.confirm(), v1::leave(f.host)])
+            .await;
+        let callback = barrier(&f.s.host_received());
+        let answer = wl_callback::evt::done(callback, 0);
+        f.s.host([answer, v1::enter(f.host, f.surface.host)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        let one_again = Stroke {
+            serial: 702,
+            time: 1_400,
+            ..one
+        };
+        f.s.host([f.peek(one_again), f.keysym(u32::from(b'1'), one_again)])
+            .await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(one_again)]);
+
+        let space_again = Stroke {
+            serial: 703,
+            time: 1_500,
+            ..space
+        };
+        f.s.host([f.peek(space_again), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
+        assert_eq!(f.s.guest_received(), f.recovered(space_again));
+    }
+
     /// A recovery that waits goes only to a text input that still passes
     /// the gate: once the guest disabled or destroyed it, or the key's
     /// keyboard, the host's next event recovers nothing.
@@ -4986,7 +5033,7 @@ pub(super) mod tests {
     /// Each keyboard of a seat gets one `enter` and one `leave` for each
     /// focus it is given, whatever order the host's events take, and the
     /// seat's focus, which its text input follows, is the focus of the
-    /// keyboard that entered last.
+    /// keyboard that entered last, until a keyboard leaves it.
     #[tokio::test]
     async fn each_keyboard_focus_is_entered_and_left_once() {
         // Keyboard `a` has entered the surface with serial 1.
@@ -5028,15 +5075,17 @@ pub(super) mod tests {
         // A second keyboard needs its own enter; a duplicate is dropped.
         f.s.host([enter(b, 2, surface), enter(b, 3, surface)]).await;
         assert_eq!(f.s.guest_received(), entered(b, 2, surface));
-        // The seat keeps its focus through `b`.
+        // The first leave moves the seat's focus off the surface, which
+        // the host leaves on every keyboard; `b`'s own leave balances its
+        // enter.
         f.s.host([leave(a, 4, surface), leave(a, 5, surface)]).await;
-        assert_eq!(f.s.guest_received(), [left(a, 4, surface)]);
-        f.s.host([leave(b, 6, surface)]).await;
-        let mut expected = vec![left(b, 6, surface)];
+        let mut expected = vec![left(a, 4, surface)];
         expected.extend(f.events([V3::Leave {
             surface: surface.id,
         }]));
         assert_eq!(f.s.guest_received(), expected);
+        f.s.host([leave(b, 6, surface)]).await;
+        assert_eq!(f.s.guest_received(), [left(b, 6, surface)]);
 
         // `b` takes the seat's focus elsewhere before `a` leaves: that
         // leave still balances `a`'s enter, once, and moves no focus.
