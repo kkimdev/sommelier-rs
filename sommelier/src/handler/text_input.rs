@@ -20,8 +20,8 @@ use crate::handler::ime_keys::{
     held_backspace_keyboard_for_seat, held_repeat_key_for_seat, synthesize_ime_consumed_key_pair,
 };
 use crate::ime::{
-    self, content_type_requests, ActivationStep, Env, HostExt, HostIme, HostOut, HostTi, Input,
-    KeyEffect, LeaseOutcome, LinkState, SeatId, SurfaceId, TextInput, TiId,
+    self, Env, HostExt, HostIme, HostOut, HostTi, Input, KeyEffect, LeaseOutcome, SeatId,
+    SurfaceId, TiId,
 };
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
@@ -33,10 +33,11 @@ use crate::protocols::wayland::wl_seat;
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    Context, CursorRect, InternalCallback, KeyboardFocusRegistry, Link, SeatFocusChange,
-    ShadowTable,
+    Context, InternalCallback, KeyboardFocusRegistry, Link, SeatFocusChange, ShadowTable,
 };
-use crate::wire::{queue_or_drop, Action, IndexedString, Outgoing};
+#[cfg(test)]
+use crate::wire::queue_or_drop;
+use crate::wire::{Action, IndexedString, Outgoing};
 
 /// Queue `zwp_text_input_v3.commit_string`, or drop host text that does not
 /// fit a message (see [`queue_or_drop`]).
@@ -62,6 +63,7 @@ pub(crate) struct CtxEnv<'a> {
 }
 
 impl<'a> CtxEnv<'a> {
+    #[cfg(test)]
     pub(crate) fn of(ctx: &'a Context) -> Self {
         Self::new(&ctx.shadow_table, &ctx.keyboard_focus)
     }
@@ -419,7 +421,6 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
     }
 
     fn on_get_text_input(&mut self, ctx: &mut Context, id: u32, seat: u32) -> Action {
-        log::trace!(">>> v3 on_get_text_input: guest_id={}, seat={}", id, seat);
         let Some(host_manager_id) = ctx.host_text_input_manager_v1_id else {
             log::error!("Cannot create v3 text input without a host v1 manager");
             return Action::Drop;
@@ -439,12 +440,6 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             zwp_text_input_v1::NAME,
             host_manager_version,
         );
-        ctx.client_to_host_queue
-            .push(zwp_text_input_manager_v1::req::create_text_input(
-                host_manager_id,
-                host_v1_id,
-            ));
-
         let host_ext = ctx
             .host_text_input_extension_v1_id
             .map(|host_ext_manager_id| {
@@ -454,37 +449,22 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
                 let host_ext_id = ctx
                     .shadow_table
                     .create_host_only(zcr_extended_text_input_v1::NAME, host_ext_version);
-                ctx.client_to_host_queue.push(
-                    zcr_text_input_extension_v1::req::get_extended_text_input(
-                        host_ext_manager_id,
-                        host_ext_id,
-                        host_v1_id,
-                    ),
-                );
                 HostExt {
                     id: host_ext_id,
                     version: host_ext_version,
                     manager: host_ext_manager_id,
                 }
             });
-
-        let active_surface = ctx.keyboard_focus.surface_for_seat(seat);
-
-        let host = HostTi {
-            v1: host_v1_id,
-            ext: host_ext,
+        let create = Input::Create {
+            ti: TiId(id),
+            seat: SeatId(seat),
+            host: HostTi {
+                v1: host_v1_id,
+                ext: host_ext,
+            },
+            manager: host_manager_id,
         };
-        ctx.ime
-            .insert(TiId(id), SeatId(seat), host, active_surface.map(SurfaceId));
-
-        // A text-input object created after keyboard focus was established
-        // still needs the current enter event; otherwise the client may wait
-        // indefinitely for a focus transition before enabling IME.
-        if let Some(surface) = active_surface {
-            ctx.host_to_client_queue
-                .push(zwp_text_input_v3::evt::enter(id, surface));
-        }
-
+        ime(ctx, create);
         Action::Drop
     }
 }
@@ -506,130 +486,6 @@ fn live_host_seat(table: &ShadowTable, guest_seat: u32) -> Option<u32> {
     }
 }
 
-/// What a guest commit sends the host besides its reconciled state: the
-/// surrounding text, already encoded, and the cursor rectangle it states.
-/// Exo keeps both with or without an input method and edits its copy of
-/// the surrounding text as the input method commits, so each statement is
-/// forwarded rather than reconciled.
-#[derive(Default)]
-pub(crate) struct GuestCommit {
-    surrounding_text: Option<Outgoing>,
-    cursor_rect: Option<CursorRect>,
-}
-
-/// Queue the host requests that bring the text input `guest_id` to the
-/// state its guest committed ([`ime::reconcile`]), and record what the
-/// host applies.
-///
-/// Called wherever that state or the host's ability to apply it changes: a
-/// guest commit, which passes its own requests in `commit`, a focus change,
-/// a drain barrier's completion, a seat's bind and the object's destroy. The
-/// requests go in one order: the activation step, the surrounding text,
-/// the content type, the cursor rectangle and, after a guest commit or a
-/// content type, `commit_state` with the guest's commit count.
-pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<GuestCommit>) {
-    let ti = TiId(guest_id);
-    let Some(t) = ctx.ime.get(ti) else {
-        return;
-    };
-    let target = ime::target(t, &CtxEnv::of(ctx));
-    let link = t.link();
-    let steps = ime::reconcile(&target, link);
-    let host = t.host();
-    let serial = t.serial().get();
-    let guest_seat = t.seat().0;
-
-    match steps.activation {
-        Some(ActivationStep::Activate {
-            seat: host_seat,
-            surface: host_surface,
-        }) => {
-            log::info!(
-                "Activating text input {guest_id} (host {}) on host surface {host_surface}",
-                host.v1
-            );
-            ctx.client_to_host_queue
-                .push(zwp_text_input_v1::req::activate(
-                    host.v1,
-                    host_seat,
-                    host_surface,
-                ));
-            if let Some(t) = ctx.ime.get_mut(ti) {
-                t.activate_sent();
-            }
-        }
-        // Deactivate behind a drain barrier
-        // ([`InternalCallback::TextInput`]). The ordered host stream is the
-        // proof: deactivate first, then sync. Draining rejects stale host
-        // events until the callback's `done`.
-        Some(ActivationStep::Deactivate { seat: host_seat }) => {
-            log::info!("Deactivating text input {guest_id} (host {})", host.v1);
-            ctx.client_to_host_queue
-                .push(zwp_text_input_v1::req::deactivate(host.v1, host_seat));
-            let token = ctx.ime.new_barrier();
-            queue_internal_sync(ctx, InternalCallback::TextInput { token });
-            if let Some(t) = ctx.ime.get_mut(ti) {
-                t.deactivate_sent(token);
-            }
-        }
-        Some(ActivationStep::Abandon) => {
-            log::debug!("Text input {guest_id} lost its host seat while active");
-            if let Some(t) = ctx.ime.get_mut(ti) {
-                t.abandoned();
-            }
-        }
-        // An activation the target needs and the host cannot take yet.
-        None if target.surface.is_some() && !matches!(link, LinkState::Attached { .. }) => {
-            if matches!(link, LinkState::Draining { .. }) {
-                log::debug!(
-                    "Deferring text input {guest_id} activation until the previous generation drains"
-                );
-            } else {
-                // Warn once per text input, however many seats it loses:
-                // every reconcile until the guest binds a seat under the ID
-                // would repeat it.
-                let first = ctx
-                    .ime
-                    .get_mut(ti)
-                    .is_some_and(TextInput::first_seat_warning);
-                let level = if first {
-                    log::Level::Warn
-                } else {
-                    log::Level::Debug
-                };
-                log::log!(
-                    level,
-                    "Cannot activate text input {guest_id}: guest seat {guest_seat} has no live host seat"
-                );
-            }
-        }
-        None => {}
-    }
-
-    let guest_commit = commit.is_some();
-    let GuestCommit {
-        surrounding_text,
-        cursor_rect,
-    } = commit.unwrap_or_default();
-    let mut transaction = Vec::from_iter(surrounding_text);
-    if let Some(content_type) = steps.content_type {
-        let ext = host.ext.map(|ext| (ext.id, ext.version));
-        transaction.extend(content_type_requests(host.v1, ext, content_type));
-        if let Some(t) = ctx.ime.get_mut(ti) {
-            t.content_type_sent(content_type);
-        }
-    }
-    if let Some((x, y, width, height)) = cursor_rect {
-        transaction.push(zwp_text_input_v1::req::set_cursor_rectangle(
-            host.v1, x, y, width, height,
-        ));
-    }
-    if guest_commit || steps.content_type.is_some() {
-        transaction.push(zwp_text_input_v1::req::commit_state(host.v1, serial));
-    }
-    ctx.client_to_host_queue.extend(transaction);
-}
-
 /// Tell the IME core of each seat's keyboard focus change (F1), after the
 /// keyboard concern's own teardown: the seat's peek watermarks and its
 /// Backspace repeats end.
@@ -649,51 +505,13 @@ pub(crate) fn apply_keyboard_focus_changes(ctx: &mut Context, changes: &[SeatFoc
     }
 }
 
-/// Text-input-v3 requests are ignored while the object is not entered on a
-/// surface.  In particular, a leave event must form a hard boundary: queued
-/// editor state from the old surface must not be sent to the host IME until a
-/// subsequent enter establishes a new focus.
-fn v3_is_focused(ctx: &Context, guest_id: u32) -> bool {
-    ctx.ime
-        .get(TiId(guest_id))
-        .is_some_and(|t| t.focused_surface().is_some())
-}
-
-/// The pending state of text input `guest_id`, while it is focused.
-fn pending_mut(ctx: &mut Context, guest_id: u32) -> Option<&mut crate::state::V3Pending> {
-    ctx.ime
-        .get_mut(TiId(guest_id))
-        .and_then(TextInput::pending_mut)
-}
-
 /// Forget guest `zwp_text_input_v3` `guest_id`, which ended (see
-/// `crate::state::lifecycle`), and destroy its host extension. Nothing is
-/// sent to its v1 object once the host has deleted it (`host_deleted`).
+/// `crate::state::lifecycle`): the IME core deactivates it and destroys
+/// its host extension (G10). Nothing goes to its v1 object once the host
+/// has deleted it (`host_deleted`, F6).
 pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: bool) {
     let ti = TiId(guest_id);
-    let Some(t) = ctx.ime.get_mut(ti) else {
-        return;
-    };
-    // Destruction is the final disabled transition. Route it through the
-    // same activation reconciler as commit/focus changes so parent-seat
-    // lifetime validation cannot drift between teardown paths.
-    let guest_seat = t.seat().0;
-    t.refocus(None);
-    end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-    if !host_deleted {
-        reconcile_host(ctx, guest_id, None);
-    } else if let Some(t) = ctx.ime.get_mut(ti) {
-        t.host_deleted();
-    }
-
-    // zwp_text_input_v1 has no destructor, but its ChromeOS extension does.
-    // Stop extension events and remove all local routing state.
-    let host_ext = ctx.ime.forget(ti).and_then(|t| t.host().ext);
-    if let Some(host_ext) = host_ext {
-        ctx.client_to_host_queue
-            .push(zcr_extended_text_input_v1::req::destroy(host_ext.id));
-        ctx.retire_destroyed_host_object(host_ext.id);
-    }
+    ime(ctx, Input::Destroy { ti, host_deleted });
 }
 
 /// A press on guest surface `surface`, a pointer button's or a
@@ -725,22 +543,15 @@ pub(crate) fn end_composition_on_press(
     }
 }
 
-/// Answer the guest's latest commit on text input `guest_id` with a
-/// `done`, if the commit left the field enabled, as mutter and KWin do. The
-/// protocol numbers each `done` by the commits so far, and a client may
-/// hold its surrounding text and cursor rectangle until a `done` names its
-/// latest commit, as Chromium does. A `done` applies the preedit sent since
-/// the previous one, or none, so this one repeats the preedit the guest
-/// shows; should it not fit, the `done` alone clears it, and the proxy
-/// forgets it too. Unlike mutter and KWin, the proxy does not end the
-/// host's composition when the guest resets its own; only a pointer press
-/// or a touch-down does ([`end_composition_on_press`]).
-fn answer_guest_commit(ctx: &mut Context, guest_id: u32) {
-    let ti = TiId(guest_id);
-    if let Some(t) = ctx.ime.get_mut(ti) {
-        let transaction = t.answer(ti);
-        ctx.host_to_client_queue.extend(transaction);
-    }
+/// The guest text input that sent the request being handled.
+fn sender(ctx: &Context) -> TiId {
+    TiId(ctx.last_sender_id)
+}
+
+/// Hand a guest request to the IME core (G3 to G9), which consumes it.
+fn guest_request(ctx: &mut Context, input: Input) -> Action {
+    ime(ctx, input);
+    Action::Drop
 }
 
 pub struct TextInputV3Handler;
@@ -763,27 +574,11 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
     }
 
     fn on_enable(&mut self, ctx: &mut Context) -> Action {
-        let guest_id = ctx.last_sender_id;
-        if !v3_is_focused(ctx, guest_id) {
-            return Action::Drop;
-        }
-        log::info!(">>> v3 on_enable: guest_id={}", guest_id);
-        if let Some(pending) = pending_mut(ctx, guest_id) {
-            *pending = crate::state::V3Pending::reset(true);
-        }
-        Action::Drop
+        guest_request(ctx, Input::Enable(sender(ctx)))
     }
 
     fn on_disable(&mut self, ctx: &mut Context) -> Action {
-        let guest_id = ctx.last_sender_id;
-        if !v3_is_focused(ctx, guest_id) {
-            return Action::Drop;
-        }
-        log::info!(">>> v3 on_disable: guest_id={}", guest_id);
-        if let Some(pending) = pending_mut(ctx, guest_id) {
-            *pending = crate::state::V3Pending::reset(false);
-        }
-        Action::Drop
+        guest_request(ctx, Input::Disable(sender(ctx)))
     }
 
     fn on_set_surrounding_text(
@@ -793,48 +588,8 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         cursor: i32,
         anchor: i32,
     ) -> Action {
-        let guest_id = ctx.last_sender_id;
-        if !v3_is_focused(ctx, guest_id) {
-            return Action::Drop;
-        }
-        // The cursor and anchor are byte offsets into the text, which
-        // replacing an invalid sequence would move. Empty the field's text
-        // instead, so that the host's input method does not go on editing
-        // text the guest no longer has, and keep its support for
-        // surrounding text, which would change the host's content type.
-        let IndexedString::Utf8(text) = text else {
-            log::debug!("Emptying surrounding text that is not UTF-8");
-            if let Some(pending) = pending_mut(ctx, guest_id) {
-                pending.surrounding_text = Some(Some((String::new(), 0, 0)));
-            }
-            return Action::Drop;
-        };
-        log::trace!(
-            ">>> v3 on_set_surrounding_text: guest_id={}, text={:?}, cursor={}, anchor={}",
-            guest_id,
-            text,
-            cursor,
-            anchor
-        );
-        let cursor_valid = cursor >= 0
-            && anchor >= 0
-            && (cursor as usize) <= text.len()
-            && (anchor as usize) <= text.len()
-            && text.is_char_boundary(cursor as usize)
-            && text.is_char_boundary(anchor as usize);
-        if !cursor_valid {
-            log::warn!(
-                "Ignoring invalid surrounding text offsets: len={}, cursor={}, anchor={}",
-                text.len(),
-                cursor,
-                anchor
-            );
-            return Action::Drop;
-        }
-        if let Some(pending) = pending_mut(ctx, guest_id) {
-            pending.surrounding_text = Some(Some((text.clone(), cursor, anchor)));
-        }
-        Action::Drop
+        let input = Input::SurroundingText(sender(ctx), text.clone(), cursor, anchor);
+        guest_request(ctx, input)
     }
 
     /// The host's text-input-v1 has no text-change cause to forward it to.
@@ -843,20 +598,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
     }
 
     fn on_set_content_type(&mut self, ctx: &mut Context, hint: u32, purpose: u32) -> Action {
-        let guest_id = ctx.last_sender_id;
-        if !v3_is_focused(ctx, guest_id) {
-            return Action::Drop;
-        }
-        log::trace!(
-            ">>> v3 on_set_content_type: guest_id={}, hint={}, purpose={}",
-            guest_id,
-            hint,
-            purpose
-        );
-        if let Some(pending) = pending_mut(ctx, guest_id) {
-            pending.content_type = Some((hint, purpose));
-        }
-        Action::Drop
+        guest_request(ctx, Input::ContentType(sender(ctx), (hint, purpose)))
     }
 
     fn on_set_cursor_rectangle(
@@ -867,103 +609,12 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         width: i32,
         height: i32,
     ) -> Action {
-        let guest_id = ctx.last_sender_id;
-        if !v3_is_focused(ctx, guest_id) {
-            return Action::Drop;
-        }
-        log::trace!(
-            ">>> v3 on_set_cursor_rectangle: guest_id={}, rect=({}, {}, {}, {})",
-            guest_id,
-            x,
-            y,
-            width,
-            height
-        );
-        if let Some(pending) = pending_mut(ctx, guest_id) {
-            pending.cursor_rect = Some((x, y, width, height));
-        }
-        Action::Drop
+        let input = Input::CursorRect(sender(ctx), (x, y, width, height));
+        guest_request(ctx, input)
     }
 
     fn on_commit(&mut self, ctx: &mut Context) -> Action {
-        let guest_id = ctx.last_sender_id;
-        let ti = TiId(guest_id);
-        let Some(t) = ctx.ime.get_mut(ti) else {
-            return Action::Drop;
-        };
-        t.count_commit();
-        let serial = t.serial().get();
-        // The pending state of an unfocused text input stays as it is.
-        let Some(pending) = t.take_pending() else {
-            return Action::Drop;
-        };
-        let host_v1_id = t.host().v1;
-        let guest_seat = t.seat().0;
-        // Exo has one seat and gives its input method to the text input
-        // that activated last, without telling the one it replaced, which
-        // then gets no input until it is deactivated and activated again.
-        // So one text input on the connection is enabled at a time, whatever
-        // guest seat it was created for.
-        let enable_conflict = pending.enabled == Some(true)
-            && ctx
-                .ime
-                .iter()
-                .any(|(other, t)| other != ti && t.is_enabled());
-        log::trace!(
-            ">>> v3 on_commit: guest_id={guest_id}, serial={serial}, host_v1_id={host_v1_id}"
-        );
-
-        // Encode the one request that can fail before changing any state,
-        // so a commit that cannot reach the host only counts and consumes
-        // its pending state, which no later commit retries, and Exo and the
-        // bridge keep the same field. v3 enable and disable clear the
-        // surrounding text, and the clear reaches the host too, or Exo
-        // would keep the old field's text.
-        let mut surrounding_text = Vec::new();
-        if let Some(text) = &pending.surrounding_text {
-            let (text, cursor, anchor) =
-                text.as_ref().map_or(("", 0, 0), |(text, cursor, anchor)| {
-                    (text.as_str(), *cursor, *anchor)
-                });
-            if !queue_or_drop(
-                &mut surrounding_text,
-                zwp_text_input_v1::req::set_surrounding_text(
-                    host_v1_id,
-                    text,
-                    cursor as u32,
-                    anchor as u32,
-                ),
-                format_args!("the surrounding text of text input {guest_id}"),
-            ) {
-                answer_guest_commit(ctx, guest_id);
-                return Action::Drop;
-            }
-        }
-
-        if enable_conflict {
-            log::warn!(
-                "Ignoring text-input enable for guest {guest_id}: another text input is enabled"
-            );
-        }
-        let cursor_rect = pending.cursor_rect;
-        let new_field = ctx
-            .ime
-            .get_mut(ti)
-            .expect("the focused text input was found above")
-            .apply_commit(pending, enable_conflict);
-        if new_field {
-            end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-        }
-        reconcile_host(
-            ctx,
-            guest_id,
-            Some(GuestCommit {
-                surrounding_text: surrounding_text.pop(),
-                cursor_rect,
-            }),
-        );
-        answer_guest_commit(ctx, guest_id);
-        Action::Drop
+        guest_request(ctx, Input::Commit(sender(ctx)))
     }
 }
 
@@ -973,7 +624,7 @@ pub(super) mod tests {
     use crate::handler::callback::CallbackHandler;
     use crate::handler::ime_keys::backspace_repeat_active_for_keyboard;
     use crate::handler::keyboard::KeyboardHandler;
-    use crate::ime::{delete_lengths, map_v3_content_type};
+    use crate::ime::{delete_lengths, map_v3_content_type, LinkState};
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
@@ -5663,30 +5314,39 @@ pub(super) mod tests {
     #[test]
     fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
         let mut ime = Ime::new();
-        ime.state().refocus(None);
-        reconcile_host(&mut ime.ctx, TI, None);
-        let LinkState::Draining { barrier } = ime.state().link() else {
-            panic!("a barrier");
+        ime.focus(HOST_KEYBOARD);
+        let ti = TiId(TI);
+        forget_text_input(&mut ime.ctx, TI, false);
+        // The deactivate, its drain barrier, then the extension's destroy.
+        let queue = std::mem::take(&mut ime.ctx.client_to_host_queue);
+        let [(_, wl_display::Request::Sync { callback })] =
+            decoded(&queue[1..2], wl_display::Request::from_wire)[..]
+        else {
+            panic!("the destroy drains behind a barrier");
         };
-        let callback = ime
-            .ctx
-            .internal_callbacks
-            .awaits(InternalCallback::TextInput { token: barrier })
-            .expect("the barrier's callback");
-        ime.ctx.ime.forget(TiId(TI));
         let replacement = HostTi { v1: 11, ext: None };
-        let surface = Some(SurfaceId(SURFACE));
-        ime.ctx
-            .ime
-            .insert(TiId(TI), SeatId(SEAT), replacement, surface);
-        ime.committed().enabled = true;
-        let drain = ime.ctx.ime.new_barrier();
-        queue_internal_sync(&mut ime.ctx, InternalCallback::TextInput { token: drain });
-        let link = LinkState::Draining { barrier: drain };
-        ime.state().set_link_for_test(link);
+        let create = Input::Create {
+            ti,
+            seat: SeatId(SEAT),
+            host: replacement,
+            manager: 2,
+        };
+        // It activates, deactivates, and is enabled again while it drains.
+        for input in [
+            create,
+            Input::Enable(ti),
+            Input::Commit(ti),
+            Input::Disable(ti),
+            Input::Commit(ti),
+            Input::Enable(ti),
+            Input::Commit(ti),
+        ] {
+            super::ime(&mut ime.ctx, input);
+        }
+        assert!(matches!(ime.state().link(), LinkState::Draining { .. }));
         ime.ctx.client_to_host_queue.clear();
 
-        ime.ctx.last_sender_id = callback.0;
+        ime.ctx.last_sender_id = callback;
         CallbackHandler.on_done(&mut ime.ctx, 0);
         assert!(!ime.state().is_attached());
         assert!(ime.ctx.client_to_host_queue.is_empty());

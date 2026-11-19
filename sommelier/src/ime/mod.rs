@@ -37,15 +37,13 @@ mod tests;
 // Shared with the old handlers until the staged switch deletes them.
 #[cfg(test)]
 pub(crate) use guest::delete_lengths;
-pub(crate) use host::content_type_requests;
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
-// The storage switch's window (docs/IME_REDESIGN.md, C3a to C3c): the old
-// handlers keep their shape, and reach the state through these.
-pub(crate) use host::{reconcile, target, ActivationStep};
 #[cfg(test)]
 pub(crate) use state::Assembly;
-pub(crate) use state::{LinkState, TextInput};
+#[cfg(test)]
+pub(crate) use state::LinkState;
+pub(crate) use state::TextInput;
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -307,13 +305,6 @@ impl ImeCore {
     /// Every text input, in `TiId` order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (TiId, &TextInput)> {
         self.inputs.iter().map(|(&ti, t)| (ti, t))
-    }
-
-    /// A barrier no text input has waited for.
-    pub(crate) fn new_barrier(&mut self) -> BarrierToken {
-        let barrier = BarrierToken(self.next_barrier);
-        self.next_barrier += 1;
-        barrier
     }
 }
 
