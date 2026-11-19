@@ -1261,7 +1261,7 @@ sommelier/src/sim/            #[cfg(test)]
   display.rs     The display D4 plays: syncs, delete_id and globals    ~100
   oracle.rs      The exact oracle (SpecText) and the user-intent oracle  ~300
   surfaces.rs    Each field's surfaces, a generation each (F2)         ~170
-  golden.rs      Golden trace hashes for the staged switch (C3-pre to C3c)  ~80
+  golden.rs      Golden trace hashes for the staged switch (C3-pre to C3c; deleted in C3c)  ~80
   shrink.rs      Minimizing a failing case                             ~150
   regressions.rs Replays: minimized cases and from_log                 grows
 ```
@@ -1878,8 +1878,9 @@ count.
 
 ### 4.9 Golden traces for the staged switch
 
-C3-pre commits the goldens (**done**, `sim/golden.rs`; CONTRIBUTING,
-"Golden traces"), and C3c deletes them:
+C3-pre committed the goldens (`sim/golden.rs` and `sim/golden.txt`), and
+C3c deleted them, with the harness's record of the bytes the proxy sent,
+once every stage had matched them unblessed. They worked as follows:
 
 - **Recording.** `SOMMELIER_DST_BLESS=1` writes `sim/golden.txt`, with
   one line per seed for 2,000 seeds: a hash of the full `P→C` and `P→E`
@@ -1966,7 +1967,7 @@ C3-pre commits the goldens (**done**, `sim/golden.rs`; CONTRIBUTING,
     `cargo test` job.
   - INVARIANTS cites them under the press rule, "Focus teardown" and
     "Every commit…", so `check-cited-tests.py` keeps them.
-  - `golden_traces_match` runs from C3-pre to C3c.
+  - `golden_traces_match` ran from C3-pre to C3c, which deleted it.
   - CONTRIBUTING gets a "Simulation test" section next to "Randomized
     tests".
 
