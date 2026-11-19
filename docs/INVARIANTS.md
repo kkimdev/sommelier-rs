@@ -1054,10 +1054,17 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
 
   A region must cover the preedit Exo holds; it deletes only the bytes
   beyond it on each side, which the guest has, and shows them with that
-  preedit. One that does not cover it, an empty region and a region short
-  on either side included, is dropped with a debug log: Exo would leave
-  the rest of that preedit as text, which only a commit after the
-  region's delete could give the guest. A guest report that crosses the
+  preedit. An empty region at Exo's cursor after that preedit ends Exo's
+  composition and leaves the preedit as text, since nothing filters an
+  empty range (`InputMethodAsh::SetCompositionRange` and
+  `SetComposingRange`,
+  `TextInput::SetCompositionFromExistingText`) and the tracker keeps an
+  empty composition (`OnSetCompositionFromExistingText`): the guest
+  commits the preedit, as at a confirmation. Any other region that does
+  not cover it, an empty one with Exo's cursor inside the preedit and a
+  region short on either side included, is dropped with a debug log: Exo
+  would leave the rest of that preedit as text, which only a commit after
+  the region's delete could give the guest. A guest report that crosses the
   transaction clears `unreported_taken` early, the same race as above.
   Tests: `exo_deletes_become_v3_deletes_around_the_cursor`,
   `a_region_over_a_region_deletes_only_what_the_guest_has`,
@@ -1065,6 +1072,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back`,
   `a_region_over_a_host_preedit_is_measured_from_exos_cursor`,
   `a_region_that_does_not_cover_a_host_preedit_is_dropped`,
+  `an_empty_region_over_a_held_preedit_commits_it`,
   `an_empty_preedit_has_no_hidden_cursor`,
   `a_region_equal_to_the_shown_one_sends_only_the_preedit`,
   `a_region_that_does_not_cover_the_shown_one_is_dropped`,

@@ -279,6 +279,9 @@ pub(super) struct Counts {
     /// Preedit regions the guest got over a preedit Exo holds whose bytes
     /// the committed text does not hold, a host preedit's (X1).
     pub regions_over_preedits: u64,
+    /// Empty preedit regions that ended the composition Exo held, which the
+    /// guest committed (X1).
+    pub regions_ended: u64,
     /// Preedit regions dropped for their range or for not covering a
     /// region the guest had not reported (X1').
     pub regions_dropped: u64,
@@ -327,6 +330,7 @@ impl std::ops::AddAssign for Counts {
         self.regions += other.regions;
         self.regions_over_regions += other.regions_over_regions;
         self.regions_over_preedits += other.regions_over_preedits;
+        self.regions_ended += other.regions_ended;
         self.regions_dropped += other.regions_dropped;
         self.crossed_reports += other.crossed_reports;
         self.regions_crossing_reports += other.regions_crossing_reports;
@@ -948,6 +952,20 @@ impl SpecText {
         });
         // A report Exo has yet to get moves what the proxy measures from.
         self.counts.regions_crossing_reports += u64::from(origin.crossed);
+        // An empty region at Exo's cursor after the preedit it holds ends
+        // the composition and leaves that preedit as text: the guest
+        // commits it, as at X2.
+        if region == Some((0, 0)) && !held.is_empty() && at == held.len() {
+            self.counts.regions_ended += 1;
+            self.shown = None;
+            self.end_lease();
+            self.edited();
+            let txn = Txn {
+                commit: held,
+                ..Txn::default()
+            };
+            return Some((txn, (0, 0)));
+        }
         let (Some((before, after)), Some(delete)) = (region, delete) else {
             self.counts.regions_dropped += 1;
             return None;
