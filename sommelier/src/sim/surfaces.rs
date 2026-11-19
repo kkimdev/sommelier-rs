@@ -28,12 +28,14 @@ use std::rc::Rc;
 #[derive(Clone, Debug, Default)]
 pub(super) struct Surfaces(Rc<RefCell<Map>>);
 
-/// The map: each field's surfaces, and the host surfaces the guest has
-/// destroyed, whose IDs the proxy has not reused.
+/// The map: each field's surfaces, and the surfaces the guest has
+/// destroyed: on the guest, whose IDs it never reuses
+/// (`Session::new_id`), and on the host, until the proxy reuses the ID.
 #[derive(Debug, Default)]
 struct Map {
     fields: Vec<FieldSurfaces>,
-    destroyed: BTreeSet<u32>,
+    guests_destroyed: BTreeSet<u32>,
+    hosts_destroyed: BTreeSet<u32>,
 }
 
 /// One field's surfaces, a generation each.
@@ -57,7 +59,7 @@ impl Surfaces {
             .collect();
         Self(Rc::new(RefCell::new(Map {
             fields,
-            destroyed: BTreeSet::new(),
+            ..Map::default()
         })))
     }
 
@@ -78,9 +80,12 @@ impl Surfaces {
             .expect("a guest surface")
     }
 
-    /// Field `field`'s host surface now, once the host has one.
+    /// Field `field`'s host surface now: none until the host has one, nor
+    /// from the destroy of its last one until the proxy creates the next.
     pub fn host(&self, field: usize) -> Option<u32> {
-        self.0.borrow().fields[field].host.last().copied()
+        let map = self.0.borrow();
+        let host = map.fields[field].host.last().copied();
+        host.filter(|host| !map.hosts_destroyed.contains(host))
     }
 
     /// The field guest surface `surface` is or was, if any.
@@ -110,7 +115,7 @@ impl Surfaces {
     /// so an earlier generation that had `surface` no longer names it.
     pub fn add_host(&self, field: Option<usize>, surface: u32) {
         let mut map = self.0.borrow_mut();
-        map.destroyed.remove(&surface);
+        map.hosts_destroyed.remove(&surface);
         for earlier in map.fields.iter_mut() {
             earlier.host.retain(|&host| host != surface);
         }
@@ -120,23 +125,32 @@ impl Surfaces {
             .push(surface);
     }
 
-    /// The number of generations field `field` has had.
-    pub fn generations(&self, field: usize) -> usize {
-        self.0.borrow().fields[field].guest.len()
-    }
-
-    /// The guest destroyed field `field`'s surface: its host surface now
-    /// is gone too, until the proxy reuses its ID.
-    pub fn destroy(&self, field: usize) {
+    /// The proxy got the guest's destroy of guest surface `surface`, a
+    /// field's: its host surface is gone too, until the proxy reuses the
+    /// ID. That is the field's last host surface, since the proxy creates
+    /// the next only at the guest's next request, which follows the
+    /// destroy.
+    ///
+    /// # Panics
+    ///
+    /// If `surface` is no field's.
+    pub fn destroy(&self, surface: u32) {
+        let field = self.field_of_guest(surface).expect("a field's surface");
         let mut map = self.0.borrow_mut();
+        map.guests_destroyed.insert(surface);
         if let Some(&host) = map.fields[field].host.last() {
-            map.destroyed.insert(host);
+            map.hosts_destroyed.insert(host);
         }
     }
 
+    /// Whether guest surface `surface` is one the guest destroyed.
+    pub fn guest_destroyed(&self, surface: u32) -> bool {
+        self.0.borrow().guests_destroyed.contains(&surface)
+    }
+
     /// Whether host surface `surface` is one the guest destroyed.
-    pub fn destroyed(&self, surface: u32) -> bool {
-        self.0.borrow().destroyed.contains(&surface)
+    pub fn host_destroyed(&self, surface: u32) -> bool {
+        self.0.borrow().hosts_destroyed.contains(&surface)
     }
 }
 
@@ -157,16 +171,20 @@ mod tests {
         assert_eq!(surfaces.field_of_guest(31), Some(1), "an earlier one");
         assert_eq!(surfaces.field_of_host(22), Some(1));
         assert_eq!(surfaces.field_of_host(99), None);
-        assert_eq!((surfaces.generations(0), surfaces.generations(1)), (1, 2));
+        // The destroy of a field's surface takes its host surface too, and
+        // the field has none until the next.
+        surfaces.destroy(32);
+        assert!(surfaces.guest_destroyed(32) && !surfaces.guest_destroyed(31));
+        assert!(surfaces.host_destroyed(22));
+        assert_eq!(surfaces.host(1), None);
+        surfaces.add_guest(1, 33);
+        surfaces.add_host(Some(1), 23);
+        assert_eq!(surfaces.host(1), Some(23));
         // A host ID the proxy reuses names its new field only, and is no
         // longer destroyed.
-        surfaces.destroy(1);
-        assert!(surfaces.destroyed(22));
         surfaces.add_host(Some(0), 22);
-        assert!(!surfaces.destroyed(22));
-        assert_eq!(surfaces.host(1), Some(21));
-        surfaces.add_host(Some(0), 21);
-        assert_eq!(surfaces.field_of_host(21), Some(0));
-        assert_eq!(surfaces.host(1), None);
+        assert!(!surfaces.host_destroyed(22));
+        assert_eq!(surfaces.field_of_host(22), Some(0));
+        assert_eq!(surfaces.host(0), Some(22));
     }
 }

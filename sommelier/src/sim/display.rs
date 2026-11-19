@@ -61,6 +61,8 @@ pub(super) struct Display {
     /// The fields whose windows open again, in order, each with whether
     /// it had the seat's focus, which the new surface then takes (F2).
     reopening: VecDeque<(usize, bool)>,
+    /// The new surfaces that take the seat's focus once mapped.
+    mapping: Vec<u32>,
     /// The surface the pointer is on.
     pointer_on: Option<u32>,
     /// The last serial an input event of the pointer or touch took. Exo
@@ -90,6 +92,7 @@ impl Display {
             objects: BTreeMap::from([(WL_DISPLAY_ID, wl_display::NAME.to_owned())]),
             surfaces,
             reopening: VecDeque::new(),
+            mapping: Vec::new(),
             pointer_on: None,
             serial: 1 << 20,
         }
@@ -97,7 +100,11 @@ impl Display {
 
     /// The window of `field` opens again (F2): the next surface the proxy
     /// creates is its; if it had the seat's focus, `refocus`, the new one
-    /// takes it, as a window manager gives it to a new window.
+    /// takes it once mapped, as a window manager gives it to a new window.
+    ///
+    /// Exo maps a window at the commit that gives a surface with a shell
+    /// role its first buffer; the display has neither roles nor buffers, so
+    /// the new surface's first commit stands for that one.
     pub fn reopen(&mut self, field: usize, refocus: bool) {
         self.reopening.push_back((field, refocus));
     }
@@ -123,10 +130,16 @@ impl Display {
                     Some((field, refocus)) => {
                         self.surfaces.add_host(Some(field), id);
                         if refocus {
-                            exo.move_focus(Some(id));
+                            self.mapping.push(id);
                         }
                     }
                     None => self.surfaces.add_host(None, id),
+                }
+            }
+            AnyRequest::WlSurface(wl_surface::Request::Commit {}) => {
+                if let Some(i) = self.mapping.iter().position(|&id| id == sender) {
+                    self.mapping.remove(i);
+                    exo.move_focus(Some(sender));
                 }
             }
             _ => {}
@@ -323,6 +336,7 @@ mod tests {
         };
         let create = |id| wl_compositor::Request::CreateSurface { id }.into();
         let destroy = || wl_surface::Request::Destroy {}.into();
+        let commit = || wl_surface::Request::Commit {}.into();
         request(
             &mut display,
             &mut exo,
@@ -335,10 +349,11 @@ mod tests {
         exo.set_text_input_focus(Some(7));
         display.click(7, Target::Start, 9);
         // F2: the focused window closes and opens again; its new surface
-        // takes the focus.
+        // takes the focus once mapped.
         display.reopen(0, true);
         assert_eq!(request(&mut display, &mut exo, 7, destroy()), None);
-        assert_eq!(request(&mut display, &mut exo, 3, create(9)), Some(9));
+        assert_eq!(request(&mut display, &mut exo, 3, create(9)), None);
+        assert_eq!(request(&mut display, &mut exo, 9, commit()), Some(9));
         assert_eq!(surfaces.host(0), Some(9));
         assert_eq!(surfaces.field_of_host(7), Some(0));
         // The pointer left the destroyed surface, so a click enters anew.
@@ -352,6 +367,7 @@ mod tests {
         display.reopen(1, false);
         assert_eq!(request(&mut display, &mut exo, 8, destroy()), Some(9));
         assert_eq!(request(&mut display, &mut exo, 3, create(10)), Some(9));
+        assert_eq!(request(&mut display, &mut exo, 10, commit()), Some(9));
         assert_eq!(surfaces.host(1), Some(10));
     }
 

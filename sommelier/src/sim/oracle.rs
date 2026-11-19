@@ -637,13 +637,6 @@ impl SpecText {
             &AnyEvent::ZcrExtendedKeyboardV1(peek::Event::PeekKey { key, state, .. }) => {
                 self.peek(key, state);
             }
-            // The proxy drops an enter naming a surface the guest destroyed,
-            // and a press then lands nowhere.
-            AnyEvent::WlPointer(wl_pointer::Event::Enter { surface, .. })
-                if self.surfaces.destroyed(*surface) =>
-            {
-                self.pointer = None;
-            }
             AnyEvent::WlPointer(wl_pointer::Event::Enter {
                 surface, surface_x, ..
             }) => self.pointer = Some((*surface, *surface_x)),
@@ -656,13 +649,19 @@ impl SpecText {
             AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. })
                 if *state == wl_pointer::BUTTON_STATE_PRESSED =>
             {
-                if let Some((surface, x)) = self.pointer {
+                // A press on a surface the guest destroyed lands nowhere:
+                // the proxy drops an enter that names it, and forgets the
+                // pointer's focus on it at the destroy. Exo sent the press
+                // before the host's `delete_id`, so the proxy has not
+                // reused the surface's ID yet.
+                let (surface, x) = self.pointer.expect("a press on a surface");
+                if !self.surfaces.host_destroyed(surface) {
                     self.press(surface, x);
                 }
             }
             // The proxy drops a touch on a surface the guest destroyed.
             AnyEvent::WlTouch(wl_touch::Event::Down { surface, .. })
-                if self.surfaces.destroyed(*surface) => {}
+                if self.surfaces.host_destroyed(*surface) => {}
             AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => self.press(*surface, *x),
             AnyEvent::WlCallback(wl_callback::Event::Done { .. }) => {
                 if self.link == Link::Draining(Some(sender)) {
@@ -712,7 +711,7 @@ impl SpecText {
             // guest destroyed.
             wl_keyboard::Event::Enter { surface, .. }
             | wl_keyboard::Event::Leave { surface, .. }
-                if self.surfaces.destroyed(surface) => {}
+                if self.surfaces.host_destroyed(surface) => {}
             wl_keyboard::Event::Enter { surface, .. } => {
                 // The keys an enter lists are held, but had no peek, so none
                 // is a key to recover; Exo's model lists none.
@@ -1271,8 +1270,8 @@ pub(super) struct Shadow {
     /// Which field each guest surface is.
     surfaces: Surfaces,
     views: Vec<View>,
-    /// The field the text input entered.
-    entered: Option<usize>,
+    /// The field the text input entered, and its surface.
+    entered: Option<(usize, u32)>,
     /// The field the keyboard focuses.
     keyboard: Option<usize>,
     shift: bool,
@@ -1326,6 +1325,16 @@ impl Shadow {
             Seen::SurfaceDestroyed { field } if self.keyboard == Some(field) => {
                 self.keyboard = None;
             }
+            // The proxy leaves a surface the guest destroys in the step
+            // that destroys it, while the surface is still valid (F2).
+            Seen::StepEnd => {
+                if let Some((_, surface)) = self.entered {
+                    assert!(
+                        !self.surfaces.guest_destroyed(surface),
+                        "the text input stays entered on guest surface {surface}, which the guest destroyed"
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -1333,9 +1342,9 @@ impl Shadow {
     fn text_input(&mut self, event: &v3::Event) {
         let (txn, cursor) = &mut self.txn;
         match event {
-            &v3::Event::Enter { surface } => self.entered = Some(self.field(surface)),
+            &v3::Event::Enter { surface } => self.entered = Some((self.field(surface), surface)),
             v3::Event::Leave { .. } => {
-                if let Some(field) = self.entered.take() {
+                if let Some((field, _)) = self.entered.take() {
                     self.views[field].model.preedit.clear();
                     self.views[field].preedit_cursor = (0, 0);
                 }
@@ -1359,7 +1368,8 @@ impl Shadow {
             } => txn.delete = (before_length as usize, after_length as usize),
             v3::Event::Done { .. } => {
                 let (txn, cursor) = std::mem::take(&mut self.txn);
-                let view = &mut self.views[self.entered.expect("a done while entered")];
+                let (field, _) = self.entered.expect("a done while entered");
+                let view = &mut self.views[field];
                 // The view keeps the cursor as sent, an empty preedit's
                 // included, which the specification holds to (0, 0).
                 view.model.apply_txn(&clamped(&view.model, &txn));
@@ -1369,7 +1379,14 @@ impl Shadow {
         }
     }
 
+    /// The field on guest surface `surface`, which the guest has not
+    /// destroyed: the proxy names no surface after the guest's destroy
+    /// reached it.
     fn field(&self, surface: u32) -> usize {
+        assert!(
+            !self.surfaces.guest_destroyed(surface),
+            "the proxy named guest surface {surface}, which the guest destroyed"
+        );
         let field = self.surfaces.field_of_guest(surface);
         field.unwrap_or_else(|| panic!("guest surface {surface} has no field"))
     }
@@ -2087,7 +2104,7 @@ mod tests {
     /// A step: the guest destroys field `field`'s surface, and the proxy
     /// sends `decisions`.
     fn destroy(spec: &mut SpecText, field: usize, decisions: &[AnyRequest]) {
-        spec.surfaces.destroy(field);
+        spec.surfaces.destroy(GUEST[field]);
         spec.see(Seen::SurfaceDestroyed { field });
         decisions
             .iter()
@@ -2100,7 +2117,20 @@ mod tests {
         // F2: the text input leaves the focused surface the guest destroys
         // and the field detaches, dropping the preedit; the seat focuses
         // no surface now.
+        let pointer = || wl_pointer::Event::Enter {
+            serial: 2,
+            surface: HOST[0],
+            surface_x: keymap::position(Target::Start),
+            surface_y: 0,
+        };
+        let press = || wl_pointer::Event::Button {
+            serial: 3,
+            time: 0,
+            button: 0x110,
+            state: wl_pointer::BUTTON_STATE_PRESSED,
+        };
         let mut spec = attached(&["0", "1"]);
+        host(&mut spec, pointer(), &[]);
         preedit(&mut spec, "가");
         destroy(&mut spec, 0, &[deactivate(), sync()]);
         assert_eq!(spec.views[0], view("0", 1, ""));
@@ -2117,24 +2147,16 @@ mod tests {
             wl_callback::Event::Done { callback_data: 0 },
             &[],
         );
+        // A press Exo sent before it learned of the destroy lands nowhere,
+        // as the proxy forgot the pointer's focus on the surface.
+        host(&mut spec, press(), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
         // The proxy drops the input that names the destroyed surface.
         host(&mut spec, enter(0), &[]);
         assert_eq!(spec.focus, None);
         host(&mut spec, tap(0, Target::Start), &[]);
-        let pointer = wl_pointer::Event::Enter {
-            serial: 2,
-            surface: HOST[0],
-            surface_x: keymap::position(Target::Start),
-            surface_y: 0,
-        };
-        host(&mut spec, pointer, &[]);
-        let press = wl_pointer::Event::Button {
-            serial: 3,
-            time: 0,
-            button: 0x110,
-            state: wl_pointer::BUTTON_STATE_PRESSED,
-        };
-        host(&mut spec, press, &[]);
+        host(&mut spec, pointer(), &[]);
+        host(&mut spec, press(), &[]);
         assert_eq!(spec.views[0], view("0", 1, ""));
         // Exo focuses the field's new surface, and the field attaches anew.
         spec.surfaces.add_host(Some(0), 22);

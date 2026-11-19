@@ -274,6 +274,15 @@ pub(super) struct Detach {
 /// A press the guest got: its surface and the target it lands on.
 type Press = (u32, Target);
 
+/// Where the guest's pointer is, as the proxy tells it.
+#[derive(Clone, Copy, Debug)]
+enum Pointer {
+    /// On guest surface `.0`, at x `.1`.
+    On(u32, i32),
+    /// On a surface the guest destroyed, whose enter the proxy dropped.
+    Gone,
+}
+
 /// One case's client, proxy, Exo, engine and display, joined by channels.
 pub(super) struct World<'t> {
     now: Micros,
@@ -298,7 +307,7 @@ pub(super) struct World<'t> {
     /// globals, Shift and where its pointer is, as the proxy tells it.
     globals: BTreeMap<String, (u32, u32)>,
     shift: bool,
-    pointer: Option<(u32, i32)>,
+    pointer: Option<Pointer>,
     /// The resets Exo handed the engine.
     resets: u64,
     /// The key the user holds, which repeats, and when it next does.
@@ -590,7 +599,11 @@ impl<'t> World<'t> {
             UserAction::Reopen(field) => return self.reopen(field),
             UserAction::Settle => return,
         };
-        let surface = self.surfaces.host(field).expect("the field's host surface");
+        // A window that is opening again, after a replay or a shrink drops
+        // the `Settle` behind its reopen, cannot be clicked yet.
+        let Some(surface) = self.surfaces.host(field) else {
+            return;
+        };
         let mut detach = Detach::default();
         if self.exo.focus() != Some(surface) {
             detach = Detach {
@@ -625,6 +638,7 @@ impl<'t> World<'t> {
         let mut requests = client.reopen(now, field, new);
         requests.push(wl_surface::req::destroy(old));
         requests.push(wl_compositor::req::create_surface(self.compositor, new));
+        requests.push(wl_surface::req::commit(new));
         self.guest(requests);
     }
 
@@ -724,17 +738,18 @@ impl<'t> World<'t> {
         // A field's surface the guest destroys (F2).
         let surfaces = self.surfaces.clone();
         let destroyed = decode(&request.0, &mut VecDeque::new(), |msg| {
-            match surfaces.field_of_guest(msg.sender_id) {
-                Some(field) => wl_surface::Request::from_wire(msg).map(|r| (field, r)),
-                None => Err(crate::wire::ProtocolError::InvalidSender(msg.sender_id)),
+            let surface = msg.sender_id;
+            match surfaces.field_of_guest(surface) {
+                Some(field) => wl_surface::Request::from_wire(msg).map(|r| (surface, field, r)),
+                None => Err(crate::wire::ProtocolError::InvalidSender(surface)),
             }
         });
-        if let Ok((_, (field, wl_surface::Request::Destroy {}))) = destroyed {
+        if let Ok((_, (surface, field, wl_surface::Request::Destroy {}))) = destroyed {
             self.log(
                 Place::CToP,
                 format!("the surface of field {field} destroyed"),
             );
-            self.surfaces.destroy(field);
+            self.surfaces.destroy(surface);
             self.see(Seen::SurfaceDestroyed { field });
         }
         let goes_on = self.session.try_guest([request]).await;
@@ -744,6 +759,13 @@ impl<'t> World<'t> {
     /// A host event reaches the proxy.
     async fn deliver_host_event(&mut self, event: Outgoing, origin: Origin) {
         let (sender, decoded) = self.display.decode(&event);
+        // The proxy drops a pointer enter that names a surface the guest
+        // destroyed, so the guest's pointer is on none of its surfaces.
+        if let AnyEvent::WlPointer(wl_pointer::Event::Enter { surface, .. }) = decoded {
+            if self.surfaces.host_destroyed(surface) {
+                self.pointer = Some(Pointer::Gone);
+            }
+        }
         let note = if origin.late { " (late)" } else { "" };
         self.log(Place::EToP, format!("{sender} {}{note}", shown(&decoded)));
         self.see(Seen::Host {
@@ -786,9 +808,9 @@ impl<'t> World<'t> {
         match *event {
             AnyEvent::WlPointer(wl_pointer::Event::Enter {
                 surface, surface_x, ..
-            }) => self.pointer = Some((surface, surface_x)),
+            }) => self.pointer = Some(Pointer::On(surface, surface_x)),
             AnyEvent::WlPointer(wl_pointer::Event::Motion { surface_x, .. }) => {
-                if let Some((_, x)) = &mut self.pointer {
+                if let Some(Pointer::On(_, x)) = &mut self.pointer {
                     *x = surface_x;
                 }
             }
@@ -796,10 +818,13 @@ impl<'t> World<'t> {
             AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. })
                 if state == wl_pointer::BUTTON_STATE_PRESSED =>
             {
-                // A press after the pointer's surface was destroyed, whose
-                // enter the proxy dropped, lands nowhere.
-                let (surface, x) = self.pointer?;
-                return Some((surface, target(x)));
+                // A press on a surface the guest destroyed lands nowhere.
+                match self.pointer.expect("a press on a surface") {
+                    Pointer::On(surface, x) if !self.surfaces.guest_destroyed(surface) => {
+                        return Some((surface, target(x)));
+                    }
+                    Pointer::On(..) | Pointer::Gone => return None,
+                }
             }
             AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => {
                 return Some((surface, target(x)));
@@ -837,6 +862,10 @@ impl<'t> World<'t> {
             (AnyEvent::WlPointer(wl_pointer::Event::Button { .. }), None)
             | (AnyEvent::WlTouch(wl_touch::Event::Up { .. }), None) => client.release(now, false),
             (AnyEvent::ZwpTextInputV3(event), _) => client.event(now, sender, event),
+            (AnyEvent::WlDisplay(wl_display::Event::DeleteId { id }), _) => {
+                client.deleted(id);
+                Vec::new()
+            }
             (AnyEvent::WlKeyboard(wl_keyboard::Event::Enter { surface, .. }), _) => {
                 client.keyboard_focus(now, Some(surface))
             }

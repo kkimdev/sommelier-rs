@@ -42,7 +42,7 @@ limitations under the License.
 use std::mem;
 
 use super::{
-    caret_rect, chars_around, content_type, cursor_rectangle, delete_chars, field_on, utf8, Client,
+    caret_rect, chars_around, content_type, cursor_rectangle, delete_chars, utf8, Client,
     DropReason, Dropped, Field, Part, PressKind, Protocol,
 };
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{self, req, Event};
@@ -328,8 +328,19 @@ impl Client for Gtk {
     /// (`gtk_im_context_wayland_focus_out`, `focus_in`). The entry needs a
     /// reset after either (`gtk_entry_focus_in`, `gtk_entry_focus_out`).
     fn keyboard_focus(&mut self, _now: Micros, surface: Option<u32>) -> Vec<Outgoing> {
+        let focus = match surface {
+            // The keys that follow an enter that crossed the client's
+            // destroy of its surface go nowhere.
+            Some(surface) => match self.protocol.field_on(&self.fields, surface) {
+                None => {
+                    self.protocol.closed = true;
+                    return Vec::new();
+                }
+                field => field,
+            },
+            None => None,
+        };
         self.protocol.closed &= surface.is_none();
-        let focus = surface.map(|surface| field_on(&self.fields, surface));
         if focus == self.current {
             return Vec::new();
         }
@@ -439,11 +450,18 @@ impl Client for Gtk {
         self.layout(out)
     }
 
+    fn deleted(&mut self, id: u32) {
+        self.protocol.deleted(id);
+    }
+
     /// C8: before the cursor moves, GTK4 always resets
     /// (`gtk_text_click_gesture_pressed`), and GTK3 only if the entry needs
     /// it and the cursor moves (`gtk_entry_real_set_position`).
     fn press(&mut self, _now: Micros, surface: u32, at: Target, _kind: PressKind) -> Vec<Outgoing> {
-        let field = field_on(&self.fields, surface);
+        let Some(field) = self.protocol.field_on(&self.fields, surface) else {
+            self.press = None;
+            return Vec::new();
+        };
         let model = &self.fields[field].model;
         let mut clicked = model.clone();
         clicked.click(at);
@@ -490,7 +508,7 @@ impl Client for Gtk {
         if self.press.is_some_and(|(pressed, _)| pressed == field) {
             self.press = None;
         }
-        self.fields[field].reopen(surface);
+        self.protocol.reopen(&mut self.fields[field], surface);
         self.contexts[field] = Context {
             events: Events::default(),
             preedit: None,
@@ -809,18 +827,31 @@ mod tests {
                 "v4: {v4}"
             );
             let field = &gtk.fields()[0];
-            assert_eq!(field.model, model("0", 1, ""), "v4: {v4}");
-            assert!(field.owns(SURFACES[0]) && field.owns(22), "v4: {v4}");
-            // A key the proxy forwarded before it heard of the close goes
-            // nowhere.
+            let expected = (22, &model("0", 1, ""));
+            assert_eq!((field.surface, &field.model), expected, "v4: {v4}");
+            // A key, a focus or a press the proxy sent before it got the
+            // destroy goes nowhere; it leaves the surface while it is
+            // valid.
             assert_eq!(requests(gtk.key(Micros(0), Key::Char('a'))), []);
+            gtk.keyboard_focus(Micros(0), Some(SURFACES[0]));
+            assert_eq!(gtk.focused_field(), None, "v4: {v4}");
+            let press = gtk.press(Micros(0), SURFACES[0], Target::Start, PressKind::Button);
+            assert_eq!(requests(press), []);
+            assert_eq!(requests(gtk.release(Micros(0), false)), []);
             assert_eq!(gtk.fields()[0].model, model("0", 1, ""), "v4: {v4}");
+            send(&mut gtk, Micros(0), [leave(0)]);
+            gtk.deleted(SURFACES[0]);
             // The new window takes the focus.
             gtk.keyboard_focus(Micros(0), Some(22));
             assert_eq!(gtk.focused_field(), Some(0), "v4: {v4}");
             // An unfocused window opens again with no request.
             assert_eq!(requests(gtk.reopen(Micros(0), 1, 23)), []);
             assert_eq!(gtk.focused_field(), Some(0), "v4: {v4}");
+            // The keys after a keyboard enter that crossed the destroy go
+            // nowhere.
+            gtk.keyboard_focus(Micros(0), None);
+            gtk.keyboard_focus(Micros(0), Some(SURFACES[1]));
+            assert_eq!(requests(gtk.key(Micros(0), Key::Char('a'))), []);
         }
     }
 
