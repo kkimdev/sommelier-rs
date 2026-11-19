@@ -47,7 +47,9 @@ pub(crate) mod exo;
 mod hangul;
 mod keymap;
 pub(crate) mod oracle;
+mod regressions;
 mod sched;
+mod shrink;
 mod user;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -356,6 +358,8 @@ struct Summary {
 /// seed, run twice, and their two traces must be identical.
 fn run_all(cases: &[Case]) -> Summary {
     let mut summary = Summary::default();
+    // Only the first failure is shrunk: a broken proxy fails many cases.
+    let mut shrunk = false;
     for case in cases {
         let mut trace = Vec::new();
         let outcome = catch_unwind(AssertUnwindSafe(|| run(case, case.choices(), &mut trace)));
@@ -411,10 +415,17 @@ fn run_all(cases: &[Case]) -> Summary {
             .extend(outcome.known.map(|issue| (case.seed, issue)));
         summary.counts += outcome.counts;
         summary.coverage.count(case, &outcome);
-        if !outcome.failures.is_empty() {
-            summary
-                .failed
-                .push(report(case, &outcome, &outcome.failures, &trace));
+        if let Some(first) = outcome.failures.first() {
+            let mut text = report(case, &outcome, &outcome.failures, &trace);
+            if !std::mem::replace(&mut shrunk, true) {
+                let check = (first.tier, first.check, first.field);
+                let shrinking = catch_unwind(AssertUnwindSafe(|| {
+                    shrink::shrunk_report(case, &outcome.choices, check)
+                }));
+                text +=
+                    &shrinking.unwrap_or_else(|_| "  shrinking: shrinking panicked\n".to_owned());
+            }
+            summary.failed.push(text);
         }
     }
     summary
