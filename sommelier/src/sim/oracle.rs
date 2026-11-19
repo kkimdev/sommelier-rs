@@ -637,6 +637,13 @@ impl SpecText {
             &AnyEvent::ZcrExtendedKeyboardV1(peek::Event::PeekKey { key, state, .. }) => {
                 self.peek(key, state);
             }
+            // The proxy drops an enter naming a surface the guest destroyed,
+            // and a press then lands nowhere.
+            AnyEvent::WlPointer(wl_pointer::Event::Enter { surface, .. })
+                if self.surfaces.destroyed(*surface) =>
+            {
+                self.pointer = None;
+            }
             AnyEvent::WlPointer(wl_pointer::Event::Enter {
                 surface, surface_x, ..
             }) => self.pointer = Some((*surface, *surface_x)),
@@ -649,9 +656,13 @@ impl SpecText {
             AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. })
                 if *state == wl_pointer::BUTTON_STATE_PRESSED =>
             {
-                let (surface, x) = self.pointer.expect("a press on a surface");
-                self.press(surface, x);
+                if let Some((surface, x)) = self.pointer {
+                    self.press(surface, x);
+                }
             }
+            // The proxy drops a touch on a surface the guest destroyed.
+            AnyEvent::WlTouch(wl_touch::Event::Down { surface, .. })
+                if self.surfaces.destroyed(*surface) => {}
             AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => self.press(*surface, *x),
             AnyEvent::WlCallback(wl_callback::Event::Done { .. }) => {
                 if self.link == Link::Draining(Some(sender)) {
@@ -697,6 +708,11 @@ impl SpecText {
     /// before it, and Exo sends no keysym (H10).
     fn keyboard(&mut self, event: &wl_keyboard::Event) {
         match *event {
+            // The proxy drops an enter or a leave that names a surface the
+            // guest destroyed.
+            wl_keyboard::Event::Enter { surface, .. }
+            | wl_keyboard::Event::Leave { surface, .. }
+                if self.surfaces.destroyed(surface) => {}
             wl_keyboard::Event::Enter { surface, .. } => {
                 // The keys an enter lists are held, but had no peek, so none
                 // is a key to recover; Exo's model lists none.

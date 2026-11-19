@@ -734,6 +734,7 @@ impl<'t> World<'t> {
                 Place::CToP,
                 format!("the surface of field {field} destroyed"),
             );
+            self.surfaces.destroy(field);
             self.see(Seen::SurfaceDestroyed { field });
         }
         let goes_on = self.session.try_guest([request]).await;
@@ -795,7 +796,9 @@ impl<'t> World<'t> {
             AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. })
                 if state == wl_pointer::BUTTON_STATE_PRESSED =>
             {
-                let (surface, x) = self.pointer.expect("a press on a surface");
+                // A press after the pointer's surface was destroyed, whose
+                // enter the proxy dropped, lands nowhere.
+                let (surface, x) = self.pointer?;
                 return Some((surface, target(x)));
             }
             AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => {

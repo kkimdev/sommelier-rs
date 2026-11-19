@@ -21,11 +21,20 @@ limitations under the License.
 //! that a surface of an earlier generation still names its field.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 /// The surfaces of each field, oldest first; cloning shares the map.
 #[derive(Clone, Debug, Default)]
-pub(super) struct Surfaces(Rc<RefCell<Vec<FieldSurfaces>>>);
+pub(super) struct Surfaces(Rc<RefCell<Map>>);
+
+/// The map: each field's surfaces, and the host surfaces the guest has
+/// destroyed, whose IDs the proxy has not reused.
+#[derive(Debug, Default)]
+struct Map {
+    fields: Vec<FieldSurfaces>,
+    destroyed: BTreeSet<u32>,
+}
 
 /// One field's surfaces, a generation each.
 #[derive(Clone, Debug, Default)]
@@ -46,7 +55,10 @@ impl Surfaces {
                 host: host.get(i).copied().into_iter().collect(),
             })
             .collect();
-        Self(Rc::new(RefCell::new(fields)))
+        Self(Rc::new(RefCell::new(Map {
+            fields,
+            destroyed: BTreeSet::new(),
+        })))
     }
 
     /// A new field, on guest surface `guest`.
@@ -55,12 +67,12 @@ impl Surfaces {
             guest: vec![guest],
             host: Vec::new(),
         };
-        self.0.borrow_mut().push(field);
+        self.0.borrow_mut().fields.push(field);
     }
 
     /// Field `field`'s guest surface now.
     pub fn guest(&self, field: usize) -> u32 {
-        *self.0.borrow()[field]
+        *self.0.borrow().fields[field]
             .guest
             .last()
             .expect("a guest surface")
@@ -68,28 +80,28 @@ impl Surfaces {
 
     /// Field `field`'s host surface now, once the host has one.
     pub fn host(&self, field: usize) -> Option<u32> {
-        self.0.borrow()[field].host.last().copied()
+        self.0.borrow().fields[field].host.last().copied()
     }
 
     /// The field guest surface `surface` is or was, if any.
     pub fn field_of_guest(&self, surface: u32) -> Option<usize> {
-        let fields = self.0.borrow();
-        fields
+        let map = self.0.borrow();
+        map.fields
             .iter()
             .position(|field| field.guest.contains(&surface))
     }
 
     /// The field host surface `surface` is or was, if any.
     pub fn field_of_host(&self, surface: u32) -> Option<usize> {
-        let fields = self.0.borrow();
-        fields
+        let map = self.0.borrow();
+        map.fields
             .iter()
             .position(|field| field.host.contains(&surface))
     }
 
     /// Field `field` has guest surface `surface` from now on.
     pub fn add_guest(&self, field: usize, surface: u32) {
-        self.0.borrow_mut()[field].guest.push(surface);
+        self.0.borrow_mut().fields[field].guest.push(surface);
     }
 
     /// Field `field` has host surface `surface` from now on; with no
@@ -97,19 +109,34 @@ impl Surfaces {
     /// guest's order. The proxy reuses the host ID of a destroyed object,
     /// so an earlier generation that had `surface` no longer names it.
     pub fn add_host(&self, field: Option<usize>, surface: u32) {
-        let mut fields = self.0.borrow_mut();
-        for earlier in fields.iter_mut() {
+        let mut map = self.0.borrow_mut();
+        map.destroyed.remove(&surface);
+        for earlier in map.fields.iter_mut() {
             earlier.host.retain(|&host| host != surface);
         }
-        let field = field.or_else(|| fields.iter().position(|field| field.host.is_empty()));
-        fields[field.expect("a field for the host surface")]
+        let field = field.or_else(|| map.fields.iter().position(|field| field.host.is_empty()));
+        map.fields[field.expect("a field for the host surface")]
             .host
             .push(surface);
     }
 
     /// The number of generations field `field` has had.
     pub fn generations(&self, field: usize) -> usize {
-        self.0.borrow()[field].guest.len()
+        self.0.borrow().fields[field].guest.len()
+    }
+
+    /// The guest destroyed field `field`'s surface: its host surface now
+    /// is gone too, until the proxy reuses its ID.
+    pub fn destroy(&self, field: usize) {
+        let mut map = self.0.borrow_mut();
+        if let Some(&host) = map.fields[field].host.last() {
+            map.destroyed.insert(host);
+        }
+    }
+
+    /// Whether host surface `surface` is one the guest destroyed.
+    pub fn destroyed(&self, surface: u32) -> bool {
+        self.0.borrow().destroyed.contains(&surface)
     }
 }
 
@@ -131,9 +158,15 @@ mod tests {
         assert_eq!(surfaces.field_of_host(22), Some(1));
         assert_eq!(surfaces.field_of_host(99), None);
         assert_eq!((surfaces.generations(0), surfaces.generations(1)), (1, 2));
-        // A host ID the proxy reuses names its new field only.
+        // A host ID the proxy reuses names its new field only, and is no
+        // longer destroyed.
+        surfaces.destroy(1);
+        assert!(surfaces.destroyed(22));
+        surfaces.add_host(Some(0), 22);
+        assert!(!surfaces.destroyed(22));
+        assert_eq!(surfaces.host(1), Some(21));
         surfaces.add_host(Some(0), 21);
         assert_eq!(surfaces.field_of_host(21), Some(0));
-        assert_eq!(surfaces.host(1), Some(22));
+        assert_eq!(surfaces.host(1), None);
     }
 }
