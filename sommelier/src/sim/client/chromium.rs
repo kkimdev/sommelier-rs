@@ -498,6 +498,7 @@ impl Client for Chromium {
     }
 
     fn keyboard_focus(&mut self, now: Micros, surface: Option<u32>) -> Vec<Outgoing> {
+        self.protocol.closed &= surface.is_none();
         let focus = surface.map(|surface| field_on(&self.fields, surface));
         if focus == self.keyboard {
             return Vec::new();
@@ -544,9 +545,13 @@ impl Client for Chromium {
     /// an accelerator stops resets the input method; no key the simulation
     /// types is one.
     fn key(&mut self, _now: Micros, key: Key) -> Vec<Outgoing> {
-        let field = self
-            .keyboard
-            .expect("protocol violation: a key without the keyboard focus");
+        let Some(field) = self.keyboard else {
+            assert!(
+                self.protocol.closed,
+                "protocol violation: a key without the keyboard focus"
+            );
+            return Vec::new();
+        };
         self.windows[field].guard_until = Micros::default();
         self.fields[field].model.insert_key(key);
         self.report(field)
@@ -571,6 +576,26 @@ impl Client for Chromium {
             Some((field, at)) if !dragged => self.click(now, field, at),
             _ => Vec::new(),
         }
+    }
+
+    /// The window blurs if it was focused, and opens again with a fresh
+    /// input method context that predicts the field's text.
+    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing> {
+        let focused = self.keyboard == Some(field);
+        let out = match focused {
+            true => self.keyboard_focus(now, None),
+            false => Vec::new(),
+        };
+        self.protocol.closed |= focused;
+        if self.touch.is_some_and(|(touched, _)| touched == field) {
+            self.touch = None;
+        }
+        self.fields[field].reopen(surface);
+        self.windows[field] = Window {
+            predicted: self.fields[field].model.clone(),
+            ..Window::default()
+        };
+        out
     }
 }
 

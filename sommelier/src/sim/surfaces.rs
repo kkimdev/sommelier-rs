@@ -1,0 +1,139 @@
+/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Which field a surface is. A field's window can close and open again on a
+//! new surface (F2), so a field has a surface per generation, on the guest
+//! and on the host. The world, the display, the specification and the
+//! shadow share one map ([`Surfaces`]) and look every surface up in it, so
+//! that a surface of an earlier generation still names its field.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// The surfaces of each field, oldest first; cloning shares the map.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Surfaces(Rc<RefCell<Vec<FieldSurfaces>>>);
+
+/// One field's surfaces, a generation each.
+#[derive(Clone, Debug, Default)]
+struct FieldSurfaces {
+    guest: Vec<u32>,
+    host: Vec<u32>,
+}
+
+impl Surfaces {
+    /// Fields on guest surfaces `guest` and host surfaces `host`, a
+    /// generation each; `host` may be shorter until the host has them.
+    pub fn new(guest: &[u32], host: &[u32]) -> Self {
+        let fields = guest
+            .iter()
+            .enumerate()
+            .map(|(i, &guest)| FieldSurfaces {
+                guest: vec![guest],
+                host: host.get(i).copied().into_iter().collect(),
+            })
+            .collect();
+        Self(Rc::new(RefCell::new(fields)))
+    }
+
+    /// A new field, on guest surface `guest`.
+    pub fn add_field(&self, guest: u32) {
+        let field = FieldSurfaces {
+            guest: vec![guest],
+            host: Vec::new(),
+        };
+        self.0.borrow_mut().push(field);
+    }
+
+    /// Field `field`'s guest surface now.
+    pub fn guest(&self, field: usize) -> u32 {
+        *self.0.borrow()[field]
+            .guest
+            .last()
+            .expect("a guest surface")
+    }
+
+    /// Field `field`'s host surface now, once the host has one.
+    pub fn host(&self, field: usize) -> Option<u32> {
+        self.0.borrow()[field].host.last().copied()
+    }
+
+    /// The field guest surface `surface` is or was, if any.
+    pub fn field_of_guest(&self, surface: u32) -> Option<usize> {
+        let fields = self.0.borrow();
+        fields
+            .iter()
+            .position(|field| field.guest.contains(&surface))
+    }
+
+    /// The field host surface `surface` is or was, if any.
+    pub fn field_of_host(&self, surface: u32) -> Option<usize> {
+        let fields = self.0.borrow();
+        fields
+            .iter()
+            .position(|field| field.host.contains(&surface))
+    }
+
+    /// Field `field` has guest surface `surface` from now on.
+    pub fn add_guest(&self, field: usize, surface: u32) {
+        self.0.borrow_mut()[field].guest.push(surface);
+    }
+
+    /// Field `field` has host surface `surface` from now on; with no
+    /// field, the first that has none yet, as the proxy creates them in the
+    /// guest's order. The proxy reuses the host ID of a destroyed object,
+    /// so an earlier generation that had `surface` no longer names it.
+    pub fn add_host(&self, field: Option<usize>, surface: u32) {
+        let mut fields = self.0.borrow_mut();
+        for earlier in fields.iter_mut() {
+            earlier.host.retain(|&host| host != surface);
+        }
+        let field = field.or_else(|| fields.iter().position(|field| field.host.is_empty()));
+        fields[field.expect("a field for the host surface")]
+            .host
+            .push(surface);
+    }
+
+    /// The number of generations field `field` has had.
+    pub fn generations(&self, field: usize) -> usize {
+        self.0.borrow()[field].guest.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_field_keeps_the_surfaces_of_its_generations() {
+        let surfaces = Surfaces::new(&[30, 31], &[]);
+        let shared = surfaces.clone();
+        surfaces.add_host(None, 20);
+        surfaces.add_host(None, 21);
+        assert_eq!((shared.host(0), shared.host(1)), (Some(20), Some(21)));
+        shared.add_guest(1, 32);
+        surfaces.add_host(Some(1), 22);
+        assert_eq!((surfaces.guest(1), surfaces.host(1)), (32, Some(22)));
+        assert_eq!(surfaces.field_of_guest(31), Some(1), "an earlier one");
+        assert_eq!(surfaces.field_of_host(22), Some(1));
+        assert_eq!(surfaces.field_of_host(99), None);
+        assert_eq!((surfaces.generations(0), surfaces.generations(1)), (1, 2));
+        // A host ID the proxy reuses names its new field only.
+        surfaces.add_host(Some(0), 21);
+        assert_eq!(surfaces.field_of_host(21), Some(0));
+        assert_eq!(surfaces.host(1), Some(22));
+    }
+}

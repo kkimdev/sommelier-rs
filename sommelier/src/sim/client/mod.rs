@@ -58,8 +58,33 @@ use crate::wire::{IndexedString, Outgoing};
 pub(super) struct Field {
     /// The guest `wl_surface` the field is on.
     pub surface: u32,
+    /// The surfaces it was on before, oldest first: its window closed and
+    /// opened again on a new surface (F2). Their number is its generation.
+    pub past: Vec<u32>,
     /// What the field shows.
     pub model: TextModel,
+}
+
+impl Field {
+    /// A field holding `model` on `surface`.
+    pub fn new(surface: u32, model: TextModel) -> Self {
+        Self {
+            surface,
+            past: Vec::new(),
+            model,
+        }
+    }
+
+    /// Whether `surface` is the field's, now or in an earlier generation.
+    pub fn owns(&self, surface: u32) -> bool {
+        self.surface == surface || self.past.contains(&surface)
+    }
+
+    /// The field's window opens again, on `surface`.
+    fn reopen(&mut self, surface: u32) {
+        self.past
+            .push(std::mem::replace(&mut self.surface, surface));
+    }
 }
 
 /// A part of an event that a client dropped.
@@ -149,6 +174,11 @@ pub(super) trait Client {
     /// The release or lift that ends the last press; `dragged` if it moved
     /// past the drag threshold in between.
     fn release(&mut self, now: Micros, dragged: bool) -> Vec<Outgoing>;
+
+    /// The window of `field` closes and opens again on `surface`, with the
+    /// same text (F2): it loses the keyboard focus, if it had it, and the
+    /// client forgets what it reported of it.
+    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing>;
 }
 
 /// The content type of every field: plain text.
@@ -164,6 +194,10 @@ struct Protocol {
     text_input: u32,
     /// The field whose surface the text input entered.
     entered: Option<usize>,
+    /// The client closed the window that had the keyboard focus, and no
+    /// window has had it since: a key the proxy sent before it heard of the
+    /// close goes nowhere (F2).
+    closed: bool,
     /// The surrounding texts the client sent since the text input last
     /// entered, as text and cursor. A delete the proxy measured against
     /// one can cross the client's next `enable` in flight.
@@ -175,6 +209,7 @@ impl Protocol {
         Self {
             text_input,
             entered: None,
+            closed: false,
             sent: Vec::new(),
         }
     }
@@ -202,8 +237,8 @@ impl Protocol {
             Event::Leave { surface } => {
                 let field = self.entered.take();
                 assert_eq!(
-                    field.map(|field| fields[field].surface),
-                    Some(surface),
+                    field.map(|field| fields[field].owns(surface)),
+                    Some(true),
                     "protocol violation: leave of a surface not entered"
                 );
             }
@@ -266,7 +301,7 @@ impl Protocol {
 fn field_on(fields: &[Field], surface: u32) -> usize {
     fields
         .iter()
-        .position(|field| field.surface == surface)
+        .position(|field| field.owns(surface))
         .unwrap_or_else(|| panic!("protocol violation: surface {surface} has no field"))
 }
 
@@ -361,10 +396,7 @@ mod script {
         texts
             .iter()
             .zip(SURFACES)
-            .map(|(text, surface)| Field {
-                surface,
-                model: TextModel::new(text),
-            })
+            .map(|(text, surface)| Field::new(surface, TextModel::new(text)))
             .collect()
     }
 

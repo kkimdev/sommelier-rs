@@ -129,6 +129,10 @@ pub(super) enum UserAction {
     /// composition, or before a character that is not
     /// [`reconvertible`], it does nothing.
     Reconvert,
+    /// The client closes the window of a field and opens it again on a
+    /// new surface, with the same text: the guest destroys the field's
+    /// surface and creates another (F2). Only a free case does.
+    Reopen(usize),
     /// Waits for the system to settle before the next action.
     Settle,
 }
@@ -402,6 +406,7 @@ impl Reference {
                 self.region = Some(region);
             }
             UserAction::Focus(_)
+            | UserAction::Reopen(_)
             | UserAction::KeyUp(_)
             | UserAction::AcceptSuggestion
             | UserAction::Reconvert

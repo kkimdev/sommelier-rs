@@ -47,6 +47,7 @@ use super::exo::{self, Exo};
 use super::hangul::Key;
 use super::keymap;
 use super::sched::Detach;
+use super::surfaces::Surfaces;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1 as peek;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1 as v1;
@@ -73,6 +74,8 @@ pub(super) enum Seen<'a> {
     /// The proxy sent the guest a button press or a touch-down, which
     /// lands at `at` on the guest's surface `surface`.
     GuestPress { surface: u32, at: Target },
+    /// The guest destroyed the surface of field `field` (F2).
+    SurfaceDestroyed { field: usize },
     /// The proxy has sent all it sends for the message that reached it.
     StepEnd,
 }
@@ -354,6 +357,10 @@ pub(super) struct Counts {
     pub leases_ended: u64,
     /// Autorepeats of a held key that Exo handed the engine (D7).
     pub repeats: u64,
+    /// Field surfaces the guest destroyed, and those the text input was
+    /// focused on (F2).
+    pub surface_destroys: u64,
+    pub focused_surface_destroys: u64,
     /// Recovered keys whose confirmation is Exo's before the press of
     /// another key (E13), not an autorepeat's: the guest gets a press of
     /// the held key that the user did not repeat.
@@ -386,6 +393,8 @@ impl std::ops::AddAssign for Counts {
         self.leases += other.leases;
         self.leases_ended += other.leases_ended;
         self.repeats += other.repeats;
+        self.surface_destroys += other.surface_destroys;
+        self.focused_surface_destroys += other.focused_surface_destroys;
         self.recoveries_before_a_press += other.recoveries_before_a_press;
     }
 }
@@ -407,8 +416,8 @@ struct Held {
 /// the host, and what an ideal client then shows. The case has one guest
 /// text input on one seat, which follows the keyboard focus.
 pub(super) struct SpecText {
-    /// Each field's host surface.
-    surfaces: Vec<u32>,
+    /// Which field each host surface is.
+    surfaces: Surfaces,
     views: Vec<View>,
     /// The field the keyboard focuses, which the text input follows (F1).
     focus: Option<usize>,
@@ -462,10 +471,10 @@ pub(super) struct SpecText {
 }
 
 impl SpecText {
-    /// Fields holding `texts`, on host surfaces `surfaces`.
-    pub fn new(surfaces: &[u32], texts: &[String]) -> Self {
+    /// Fields holding `texts`, on the host surfaces `surfaces` names.
+    pub fn new(surfaces: Surfaces, texts: &[String]) -> Self {
         Self {
-            surfaces: surfaces.to_vec(),
+            surfaces,
             views: texts.iter().map(|text| View::new(text)).collect(),
             focus: None,
             shift: false,
@@ -512,6 +521,10 @@ impl SpecText {
                 self.host(sender, event, origin);
             }
             Seen::ToHost(request) => self.decision(request),
+            Seen::SurfaceDestroyed { field } => {
+                self.input = format!("the destroy of field {field}'s surface");
+                self.surface_destroyed(field);
+            }
             Seen::ToGuest(_) | Seen::GuestPress { .. } => {}
             Seen::StepEnd => self.step_end(),
         }
@@ -1118,7 +1131,7 @@ impl SpecText {
             }
             Link::Detached if wants => {
                 let field = self.focus.expect("a focused field");
-                self.expected.activate = Some(self.surfaces[field]);
+                self.expected.activate = self.surfaces.host(field);
                 self.link = Link::Attached;
             }
             _ => {}
@@ -1170,8 +1183,22 @@ impl SpecText {
     }
 
     fn field(&self, surface: u32) -> usize {
-        let field = self.surfaces.iter().position(|&s| s == surface);
+        let field = self.surfaces.field_of_host(surface);
         field.unwrap_or_else(|| panic!("host surface {surface} has no field"))
+    }
+
+    /// F2: the guest destroyed field `field`'s surface. If the text input
+    /// is focused on it, it leaves it while the surface is still valid, and
+    /// its focus is projected again from the seat's keyboard focus, which
+    /// the destroyed surface had and which no surface has now. Its field
+    /// is reset as at any focus change.
+    fn surface_destroyed(&mut self, field: usize) {
+        self.counts.surface_destroys += 1;
+        if self.focus == Some(field) {
+            self.counts.focused_surface_destroys += 1;
+            self.held.clear();
+            self.move_focus(None);
+        }
     }
 }
 
@@ -1225,8 +1252,8 @@ fn preedit_cursor(text: &str, index: Option<i32>) -> (i32, i32) {
 /// transaction at `done` to the entered field, drops the preedit at
 /// `leave`, and types keys and takes presses as [`TextModel`] does.
 pub(super) struct Shadow {
-    /// Each field's guest surface.
-    surfaces: Vec<u32>,
+    /// Which field each guest surface is.
+    surfaces: Surfaces,
     views: Vec<View>,
     /// The field the text input entered.
     entered: Option<usize>,
@@ -1240,10 +1267,10 @@ pub(super) struct Shadow {
 }
 
 impl Shadow {
-    /// Fields holding `texts`, on guest surfaces `surfaces`.
-    pub fn new(surfaces: &[u32], texts: &[String]) -> Self {
+    /// Fields holding `texts`, on the guest surfaces `surfaces` names.
+    pub fn new(surfaces: Surfaces, texts: &[String]) -> Self {
         Self {
-            surfaces: surfaces.to_vec(),
+            surfaces,
             views: texts.iter().map(|text| View::new(text)).collect(),
             entered: None,
             keyboard: None,
@@ -1277,6 +1304,11 @@ impl Shadow {
             Seen::GuestPress { surface, at } => {
                 let field = self.field(surface);
                 self.views[field].model.click(at);
+            }
+            // The client's window with the keyboard focus is gone: a key
+            // for it goes nowhere until the focus comes back.
+            Seen::SurfaceDestroyed { field } if self.keyboard == Some(field) => {
+                self.keyboard = None;
             }
             _ => {}
         }
@@ -1322,7 +1354,7 @@ impl Shadow {
     }
 
     fn field(&self, surface: u32) -> usize {
-        let field = self.surfaces.iter().position(|&s| s == surface);
+        let field = self.surfaces.field_of_guest(surface);
         field.unwrap_or_else(|| panic!("guest surface {surface} has no field"))
     }
 }
@@ -1709,6 +1741,11 @@ mod tests {
     /// The callbacks of the proxy's syncs.
     const SYNC: u32 = 40;
 
+    /// The surfaces of the first `fields` fields.
+    fn both(fields: usize) -> Surfaces {
+        Surfaces::new(&GUEST[..fields], &HOST[..fields])
+    }
+
     fn texts(texts: &[&str]) -> Vec<String> {
         texts.iter().map(|text| text.to_string()).collect()
     }
@@ -1776,7 +1813,7 @@ mod tests {
     /// The spec of fields holding `fields`, the keyboard on field 0, its
     /// text input enabled and attached.
     fn attached(fields: &[&str]) -> SpecText {
-        let mut spec = SpecText::new(&HOST, &texts(fields));
+        let mut spec = SpecText::new(both(2), &texts(fields));
         host(&mut spec, enter(0), &[]);
         guest(&mut spec, &enable(), &[activate(0), reported("", 0)]);
         spec
@@ -1841,7 +1878,7 @@ mod tests {
     #[test]
     fn composition_events_reach_the_guest_only_through_the_gate() {
         // Not attached: dropped, but not by a fence.
-        let mut spec = SpecText::new(&HOST[..1], &texts(&["0"]));
+        let mut spec = SpecText::new(both(1), &texts(&["0"]));
         host(&mut spec, enter(0), &[]);
         preedit(&mut spec, "가");
         assert_eq!(spec.views, [view("0", 1, "")]);
@@ -1919,7 +1956,7 @@ mod tests {
 
     #[test]
     fn the_link_follows_the_fields_wish_through_a_barrier() {
-        let mut spec = SpecText::new(&HOST, &texts(&["0", "1"]));
+        let mut spec = SpecText::new(both(2), &texts(&["0", "1"]));
         host(&mut spec, enter(0), &[]);
         // An enabled, focused field must be activated on its surface.
         guest(&mut spec, &enable(), &[activate(1)]);
@@ -1963,7 +2000,7 @@ mod tests {
     #[test]
     fn each_step_must_give_the_guest_the_transactions_the_specification_asks() {
         let mut spec = attached(&["0"]);
-        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["0"]));
+        let mut shadow = Shadow::new(both(1), &texts(&["0"]));
         let to_guest = |shadow: &mut Shadow, events: Vec<AnyEvent>| {
             events
                 .iter()
@@ -2288,7 +2325,7 @@ mod tests {
 
     #[test]
     fn the_shadow_applies_what_the_guest_got() {
-        let mut shadow = Shadow::new(&GUEST, &texts(&["0", "1"]));
+        let mut shadow = Shadow::new(both(2), &texts(&["0", "1"]));
         let events: Vec<AnyEvent> = vec![
             v3::Event::Enter { surface: GUEST[0] }.into(),
             v3::Event::PreeditString {
@@ -2324,7 +2361,7 @@ mod tests {
 
     #[test]
     fn a_delete_that_does_not_fit_is_clamped_to_whole_characters() {
-        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["a가"]));
+        let mut shadow = Shadow::new(both(1), &texts(&["a가"]));
         let delete = |before_length, after_length| -> [AnyEvent; 2] {
             [
                 v3::Event::DeleteSurroundingText {
@@ -2367,7 +2404,7 @@ mod tests {
         let checks = |spec: &SpecText, engine: &str, resets| -> Vec<&'static str> {
             let shadow = Shadow {
                 views: spec.views.clone(),
-                ..Shadow::new(&GUEST[..1], &[])
+                ..Shadow::new(both(1), &[])
             };
             let failures = exact(&[], spec, &shadow, &exo, engine, resets, None);
             let checks = failures.iter().map(|failure| failure.check);
@@ -2434,7 +2471,7 @@ mod tests {
         let checks = |exo: &Exo, engine: &str| -> Vec<&'static str> {
             let shadow = Shadow {
                 views: spec.views.clone(),
-                ..Shadow::new(&GUEST[..1], &[])
+                ..Shadow::new(both(1), &[])
             };
             let failures = exact(&[], &spec, &shadow, exo, engine, 0, None);
             let checks = failures.iter().map(|failure| failure.check);
@@ -2460,10 +2497,7 @@ mod tests {
         let fields = texts
             .iter()
             .zip(GUEST)
-            .map(|(text, surface)| Field {
-                surface,
-                model: TextModel::new(text),
-            })
+            .map(|(text, surface)| Field::new(surface, TextModel::new(text)))
             .collect();
         let mut gtk = Gtk::new(true, 10, fields);
         gtk.keyboard_focus(Micros(0), Some(GUEST[focus]));

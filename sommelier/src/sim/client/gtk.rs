@@ -328,6 +328,7 @@ impl Client for Gtk {
     /// (`gtk_im_context_wayland_focus_out`, `focus_in`). The entry needs a
     /// reset after either (`gtk_entry_focus_in`, `gtk_entry_focus_out`).
     fn keyboard_focus(&mut self, _now: Micros, surface: Option<u32>) -> Vec<Outgoing> {
+        self.protocol.closed &= surface.is_none();
         let focus = surface.map(|surface| field_on(&self.fields, surface));
         if focus == self.current {
             return Vec::new();
@@ -407,9 +408,13 @@ impl Client for Gtk {
     /// [`TextModel::backspace_to_nfd_prefix`]:
     ///     crate::sim::editor::TextModel::backspace_to_nfd_prefix
     fn key(&mut self, _now: Micros, key: Key) -> Vec<Outgoing> {
-        let field = self
-            .current
-            .expect("protocol violation: a key without the keyboard focus");
+        let Some(field) = self.current else {
+            assert!(
+                self.protocol.closed,
+                "protocol violation: a key without the keyboard focus"
+            );
+            return Vec::new();
+        };
         let model = &mut self.fields[field].model;
         let out = match key {
             Key::Char(_) => {
@@ -471,6 +476,30 @@ impl Client for Gtk {
         }
         let out = self.enable();
         self.layout(out)
+    }
+
+    /// The field's context loses the focus if it had it, and the window
+    /// opens again with a fresh context, laid out once.
+    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing> {
+        let focused = self.current == Some(field);
+        let out = match focused {
+            true => self.keyboard_focus(now, None),
+            false => Vec::new(),
+        };
+        self.protocol.closed |= focused;
+        if self.press.is_some_and(|(pressed, _)| pressed == field) {
+            self.press = None;
+        }
+        self.fields[field].reopen(surface);
+        self.contexts[field] = Context {
+            events: Events::default(),
+            preedit: None,
+            enabled: false,
+            surrounding: None,
+            laid_out: caret_rect(&self.fields[field].model),
+            need_im_reset: false,
+        };
+        out
     }
 }
 

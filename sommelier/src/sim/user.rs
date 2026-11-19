@@ -154,6 +154,7 @@ pub(super) fn actions(
             },
             86..93 => UserAction::Focus(rng.below(FIELDS)),
             93..95 => UserAction::RestartInputMethod,
+            95..97 if !settled => UserAction::Reopen(rng.below(FIELDS)),
             _ => UserAction::Settle,
         };
         let moves = !matches!(
@@ -183,7 +184,10 @@ pub(super) fn actions(
             // reconverted ahead of: the key commits the region, which
             // clears it. But the host may show no region, so the flag is
             // kept as if there were none.
-            UserAction::AcceptSuggestion | UserAction::Reconvert | UserAction::Settle => false,
+            UserAction::AcceptSuggestion
+            | UserAction::Reconvert
+            | UserAction::Reopen(_)
+            | UserAction::Settle => false,
         };
         if settled && moves {
             settle(&mut actions);
@@ -196,6 +200,10 @@ pub(super) fn actions(
         match action {
             UserAction::Settle => settle(&mut actions),
             action => actions.push(action),
+        }
+        // The window opens again before the user acts on it.
+        if let UserAction::Reopen(_) = action {
+            settle(&mut actions);
         }
         if settled && (moves || stale) {
             settle(&mut actions);
