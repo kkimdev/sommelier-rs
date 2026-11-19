@@ -2439,8 +2439,10 @@ fn row_G9c_a_forwarded_report_is_glued_to_a_barrier() {
 }
 
 /// A report that does not fit a message sends nothing, a barrier
-/// included (G9b); one that fits but may reach Exo in two reads leaves
-/// the mirror unsure where it applied.
+/// included (G9b). One that fits but may reach Exo in two reads leaves
+/// the mirror exact, unless an event of Exo's comes while it is on its
+/// way, which Exo may have processed before the report or after it: the
+/// mirror is then unsure, and the guest out of step.
 #[test]
 fn row_G9b_a_report_that_does_not_fit_queues_no_barrier() {
     let mut ime = Ime::enabled();
@@ -2450,12 +2452,48 @@ fn row_G9b_a_report_that_does_not_fit_queues_no_barrier() {
     assert_eq!(ime.step_unanswered(Input::Commit(TI)).host, []);
     assert!(ime.in_step());
 
+    let health = |ime: &Ime| {
+        let exo = ime.core.get(TI).expect("a text input").exo();
+        exo.mirror().health()
+    };
     let long = "x".repeat(4_000);
     let barrier = ime.report_unanswered(&long, 0);
     ime.step(Input::BarrierDone(barrier));
-    let exo = ime.core.get(TI).expect("a text input").exo();
-    assert_eq!(exo.mirror().health(), mirror::Health::Uncertain);
+    assert_eq!(health(&ime), mirror::Health::Exact);
+    assert!(ime.in_step());
+
+    let barrier = ime.report_unanswered(&long, 1);
+    ime.host_commit("y");
+    ime.step(Input::BarrierDone(barrier));
+    assert_eq!(health(&ime), mirror::Health::Unknown);
     assert!(!ime.in_step());
+}
+
+/// An event of Exo's that does not agree with the mirror is a misreading
+/// of Chromium's, which warns once per text input. The mirror no longer
+/// knows Exo's text, nor which state Exo's history holds in its place, so
+/// it measures nothing until a press's `reset` empties that history and a
+/// report resets Exo.
+#[test]
+fn row_X1_a_mirror_that_diverges_warns_once() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    let exo = |ime: &Ime| {
+        let exo = ime.core.get(TI).expect("a text input").exo();
+        (exo.warned(), exo.mirror().health())
+    };
+    assert_eq!(exo(&ime), (false, mirror::Health::Exact));
+    // A region before the text's start.
+    ime.region(-3, 1);
+    assert_eq!(exo(&ime), (true, mirror::Health::Unknown));
+    assert!(!ime.in_step());
+    ime.report("abc", 3);
+    assert_eq!(exo(&ime), (true, mirror::Health::Unknown));
+    ime.compose("가");
+    let fence = ime.press(SURFACE).barriers()[0];
+    ime.step(Input::BarrierDone(fence));
+    ime.report("abc가", 6);
+    assert_eq!(exo(&ime), (true, mirror::Health::Exact));
 }
 
 /// A report without the preedit the guest shows names no state of Exo's,

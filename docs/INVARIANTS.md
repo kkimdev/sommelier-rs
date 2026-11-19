@@ -1229,15 +1229,40 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     libwayland dispatches in one read, so no event of Exo's falls between
     them; the mirror applies the request at that sync's `done`, after
     every event that reached the proxy before it. A report too long for
-    one submission with its sync makes the mirror uncertain.
-  - The mirror checks each event against its state, and says whether it
-    is `Exact`. An event Exo could not have sent makes it `Diverged`; an
-    evicted history state, text over 4 KiB, a composition selection
-    (a highlight span at the preedit cursor), a pair it can read two
-    ways, a split report, or a host without the extension, which
-    composes existing text unseen, make it `Uncertain`. Only a press's
-    `reset`, which empties Exo's history, and then a report Exo must
-    reset to make it exact again; never without the extension.
+    one submission with its sync may reach Exo apart from it, so an event
+    of Exo's that arrives while such a report is on its way may have come
+    before it or after it.
+  - The mirror checks each event against its state, and says how much it
+    knows (`ime::mirror::Health`): its prediction of Exo's state is
+    `Exact`; `Vague`, exact but for a selection IMA made from a highlight
+    span at the preedit cursor (a composition selection), whose other end
+    the wire does not carry; or `Unknown`. Its history keeps no text: each
+    state is a fingerprint (the text's length and 64-bit hash, the
+    selection unless vague, the composition, and the keys of the text
+    without the composition and of the composition's text), or an
+    unknown state, up to 4,096 states; evicting the oldest leaves an
+    unknown state in its place, which Exo could match. An event Exo could
+    not have sent (an echo check failed) makes the prediction and the
+    state it pushes unknown, and warns once per text input, as it is a
+    misreading of Chromium; so, without a warning, do an event that
+    arrives while a report that may reach Exo apart from its sync is on
+    its way, one whose effect depends on a vague selection, any event
+    while unknown, text over 256 KiB, a pair below v11 it can read two
+    ways while composing, and a host without the extension, which
+    composes existing text unseen. A vague selection lies inside the
+    composition, and is exact again after the next event that sets the
+    selection or replaces the whole composition: a commit over the
+    composition, a confirm that moves the cursor after it, a delete, a
+    selection range, or a preedit with no highlight at its cursor. A
+    report Exo processes is ambiguous when an unknown state, or a vague
+    one with the report's text, comes before any state equal to it: the
+    history becomes one unknown state, and the prediction unknown too,
+    unless it is the report's with no composition. A report with no
+    ambiguous state before an equal one matches it; one with neither
+    resets Exo to it, which makes the mirror exact again with no press.
+    Once the history holds an unknown state, only a press's `reset`,
+    which empties Exo's history, and then a report before any event of
+    Exo's do; and nothing does without the extension.
   - The guest is in step with Exo while its text is Exo's predicted text
     without the composition Exo holds, which the guest shows, its cursor
     at the composition's start or else at Exo's cursor, with no
@@ -1258,8 +1283,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     `IsModifierKey`), does not. A new field, a refocus, and a commit of
     the shown preedit with no event of Exo's end it.
   - In Mirror mode, while the guest is in step, the mirror is exact, and
-    no report on its way to Exo will name no state of Exo's (which would
-    mean an edit of the guest's that Exo made the event without), a delete
+    no report on its way to Exo will, or may, name no state of Exo's (which
+    would mean an edit of the guest's that Exo made the event without), a delete
     and a region are measured in Exo's state before the event: a delete
     of bytes around Exo's cursor, with no composition, deletes them around
     the guest's; a region from Exo's cursor that covers the composition,
@@ -1268,15 +1293,16 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     nothing. A region that does not cover the composition is dropped, as
     in Legacy mode. Otherwise, and for a negative delete index, Mirror mode
     falls back to Legacy mode's measurement (previous rule), with a debug
-    log, never dropping what Legacy mode applies: a dropped delete or
+    log that names why (`ime::exo_view::Unmeasured`: an unsure mirror,
+    keys or presses the guest has not stated, a crossing report, or a
+    guest out of step), never dropping what Legacy mode applies: a dropped delete or
     region is not harmless, as the input method goes on as if it applied,
     and its next commit doubles the text (a reconverted 한국 committed as
     韓國 shows 한국韓國; an accepted suggestion shows `word word~`). Each
     transaction Mirror mode measures changes what Legacy mode keeps as its
     own would (`Composition::taken`, `ExoText`), so Legacy mode can take
-    over at any event: an unsure mirror (a field that never reports
-    evicts history at v11's empty confirmation per unhandled key), a guest
-    out of step, or a crossing report. Legacy mode logs at trace where the
+    over at any event: an unsure mirror, a guest out of step, or a
+    crossing report. Legacy mode logs at trace where the
     mirror would have sent another transaction.
   - In Mirror mode, a guest report that would only drop Exo's composition
     is withheld (design exo-mirror 5). A v3 guest reports its text without
@@ -1285,7 +1311,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     drops the composition (E4). While the mirror is exact and the guest
     shows a preedit, a report the guest stated (not the empty stand-in for
     a field that states none) that names no state of the history Exo will
-    hold once it has processed the requests in flight, but is one of those
+    hold once it has processed the requests in flight, which must hold no
+    unknown state, but is one of those
     states without its composition, which is the shown preedit, at the
     composition's start, is not sent, nor is its sync; the content type,
     cursor rectangle and `commit_state` of the commit still are. A report
@@ -1300,9 +1327,13 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     no-op, and one that names none resets Exo to the guest's text. Nothing
     is ever inserted into a report, so a wrong mirror can only leave Exo
     stale until the composition ends, never put the preedit in Exo's text.
-  The DST checks at every `done` of a sync that an exact mirror equals the
-  simulated Exo's tracker, and that Exo's tracker holds each report the
-  proxy withheld with the shown preedit as its composition.
+  The DST checks at every `done` of a sync that an exact mirror's
+  prediction equals the simulated Exo's tracker's, and that its history
+  holds the fingerprints of the tracker's (an unknown state fits any
+  state, a leading one any number of them), and that Exo's tracker holds
+  each report the proxy withheld with the shown preedit as its
+  composition. It counts every fallback to Legacy mode by its cause
+  (`mirror_fallbacks_all`).
   Tests: `a_report_reaches_the_host_with_its_barrier`,
   `a_reports_barrier_is_glued_into_its_entry`,
   `a_forwarded_key_holds_back_exos_delete_until_the_guest_commits`,
@@ -1310,10 +1341,16 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_region_over_a_region_falls_back_in_mirror_mode`,
   `a_region_over_a_host_preedit_with_exos_cursor_inside_it`,
   `an_unsure_mirror_falls_back_to_legacy_mode`,
-  `a_composition_selection_makes_it_uncertain`,
+  `a_highlight_is_vague_until_a_commit`,
+  `an_evicted_state_still_matches`,
+  `long_text_makes_it_unknown`,
+  `a_split_report_without_an_event_stays_exact`,
+  `a_split_report_with_an_event_is_unknown`,
+  `each_echo_check_diverges`,
   `a_report_crosses_when_it_will_name_no_state`,
   `a_matched_report_finds_the_guest_without_a_composition`,
-  `healing_needs_a_cancel_then_a_clean_report`,
+  `a_definite_reset_heals_without_a_press`,
+  `an_ambiguous_report_stays_unknown`,
   `a_report_without_the_shown_preedit_is_withheld`.
   The core's row tests of X1 and H9 in Mirror mode, and of report
   suppression, are listed in the design's rows and G9c

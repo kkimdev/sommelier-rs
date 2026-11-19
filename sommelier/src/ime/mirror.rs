@@ -49,22 +49,37 @@ limitations under the License.
 //! name theirs). The proxy's own requests take effect where Exo processed
 //! them, which the `wl_display.sync` sent right after each one reveals
 //! ([`ExoMirror::sent`], [`ExoMirror::barrier_done`]).
+//!
+//! The history keeps no text, only what a report and report suppression
+//! compare: each state's [`Fingerprint`], whose texts are a length and a
+//! 64-bit hash. Two texts of one length with one hash would match falsely;
+//! that needs adversarial text, and the echo checks would likely catch
+//! what follows from it.
+//!
+//! The mirror says how much it knows ([`Health`], design single-exo-model
+//! 3.3): the prediction is exact, exact but for its selection (vague), or
+//! unknown, and so is each history state. An event the mirror cannot
+//! follow makes the prediction unknown and pushes an unknown state; a
+//! report Exo processes heals it whenever its outcome is certain.
 
 use std::collections::VecDeque;
+use std::hash::{DefaultHasher, Hasher};
 use std::ops::Range;
 
 use super::BarrierToken;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 
-/// The most history states the mirror keeps. Evicting one makes it
-/// [`Health::Uncertain`], since Exo still has it and could match it.
-const HISTORY_CAP: usize = 64;
+/// The most history states the mirror keeps. Exo keeps every one (STT has
+/// no cap), so evicting the oldest leaves an unknown state in its place,
+/// which Exo could match. Only a field with this many events of Exo's and
+/// no report reaches it.
+const HISTORY_CAP: usize = 4096;
 
-/// The longest text the mirror keeps, in bytes. A longer one makes it
-/// [`Health::Uncertain`] and blind until a report resets it; no report can
-/// be that long anyway, as it must fit one wire message.
-const TEXT_CAP: usize = 4096;
+/// The longest text the mirror predicts, in bytes. A longer one makes the
+/// prediction unknown until a report resets it; the history holds no text,
+/// so this cap bounds only the prediction.
+const TEXT_CAP: usize = 256 * 1024;
 
 /// A `gfx::Range`: directed, so `start` may lie after `end`, and empty
 /// when they are equal.
@@ -184,6 +199,92 @@ impl ExoState {
     }
 }
 
+/// A text's fingerprint: its length in bytes and its hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Key {
+    len: usize,
+    hash: u64,
+}
+
+impl Key {
+    /// `DefaultHasher::new` uses fixed keys, so a text has one key.
+    pub(super) fn of(text: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(text.as_bytes());
+        Self {
+            len: text.len(),
+            hash: hasher.finish(),
+        }
+    }
+}
+
+/// What a report and report suppression compare of one tracker state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Fingerprint {
+    text: Key,
+    /// `None` while the selection is vague ([`Health::Vague`]).
+    selection: Option<Span>,
+    /// The composition, [`NO_COMPOSITION`] if there is none.
+    composition: Range<usize>,
+    /// With a composition, the keys of the text without it and of its
+    /// text.
+    split: Option<(Key, Key)>,
+}
+
+impl Fingerprint {
+    /// `state`'s fingerprint, vague if this one is.
+    #[cfg(test)]
+    pub(super) fn of_alike(&self, state: &ExoState) -> Self {
+        Self::of(state, self.selection.is_none())
+    }
+
+    fn of(state: &ExoState, vague: bool) -> Self {
+        let composition = state.composition.clone();
+        let split = (!composition.is_empty()).then(|| {
+            let mut rest = state.text[..composition.start].to_owned();
+            rest.push_str(&state.text[composition.end..]);
+            (Key::of(&rest), Key::of(state.composition_text()))
+        });
+        Self {
+            text: Key::of(&state.text),
+            selection: (!vague).then_some(state.selection),
+            composition,
+            split,
+        }
+    }
+}
+
+/// One state of the history: its fingerprint, with whether the transaction
+/// that led to it kept a guest in step with Exo if it was
+/// ([`ExoMirror::mark`]); or a state the mirror could not compute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Entry {
+    Known { print: Fingerprint, in_step: bool },
+    Unknown,
+}
+
+/// Where a report stands in the history, from the oldest state on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lookup {
+    /// The first state equal to it, with nothing before it that Exo could
+    /// match instead.
+    Match(usize),
+    /// An unknown state, or a vague one with its text, comes first: Exo
+    /// may have matched there.
+    Ambiguous,
+    /// No state can equal it.
+    Missing,
+}
+
+/// Why the mirror could not take an event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Miss {
+    /// It does not agree with the mirror's state: an echo check failed.
+    Diverged,
+    /// Its effect depends on what the mirror does not know.
+    Unknowable,
+}
+
 /// `InsertTextCursorBehavior`. Exo always passes
 /// [`Self::MoveCursorAfterText`] (TI 274-280).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +294,8 @@ enum CursorBehavior {
     MoveCursorBeforeText,
 }
 
-/// `SurroundingTextTracker::UpdateResult`.
+/// `SurroundingTextTracker::UpdateResult`, and the outcome the mirror
+/// cannot decide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpdateResult {
     /// A history state matched: the states before it are gone, and the
@@ -201,44 +303,49 @@ enum UpdateResult {
     Updated,
     /// None matched: the report replaced the prediction and the history.
     Reset,
+    /// Exo may have done either ([`Lookup::Ambiguous`]).
+    Ambiguous,
 }
 
 /// A request the proxy sent Exo that changes its tracker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Sent {
-    /// v1 `set_surrounding_text(text, cursor, anchor)`: `Update`.
+    /// v1 `set_surrounding_text(text, cursor, anchor)`: `Update`. `split`
+    /// if it and its barrier may reach Exo in two reads, between which Exo
+    /// may process an event.
     Report {
         text: String,
         cursor: u32,
         anchor: u32,
+        split: bool,
     },
     /// v1 `reset`: `CancelComposition` (TI 152-156).
     Cancel,
 }
 
-/// Whether the mirror is known to equal Exo's tracker.
+/// How much the mirror knows of Exo's prediction (design single-exo-model
+/// 3.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Health {
+    /// It equals Exo's.
     Exact,
-    /// Something the mirror cannot see may have happened: a history state
-    /// was evicted, the text grew over [`TEXT_CAP`], a composition had a
-    /// selection, a report may have been read apart from its barrier, or
-    /// an event could be read two ways; and a host without the extension
-    /// composes existing text with no event (`SetCompositionFromExistingText`,
-    /// TI 483-508), so its mirror starts so. Clears only at a reset point
-    /// (see [`Self::Healing`]).
-    Uncertain,
-    /// An event did not agree with the mirror's state (an echo check
-    /// failed), and the mirror did not apply it. Clears only at a reset
-    /// point.
-    Diverged,
-    /// A `reset` emptied Exo's history (`CancelComposition`, STT 124-129)
-    /// while the mirror was unhealthy. The next report Exo processes then
-    /// matches nothing and resets Exo to it, which makes the mirror
-    /// [`Self::Exact`]. A tracker-changing event before that report could
-    /// be matched instead, so it makes the mirror [`Self::Uncertain`]
-    /// until the next `reset`.
-    Healing,
+    /// It equals Exo's but for the selection, which IMA made from a
+    /// highlight span whose other end the wire does not carry. With a
+    /// composition, the selection lies inside it. An event that sets the
+    /// selection absolutely, or replaces the whole composition, makes the
+    /// mirror exact again; one whose effect depends on where the selection
+    /// is makes it unknown.
+    Vague,
+    /// The mirror cannot tell Exo's text: an event did not agree with it
+    /// (an echo check failed: it diverged), came while a report that may
+    /// reach Exo apart from its barrier was on its way, or came while
+    /// unknown; the text grew over [`TEXT_CAP`]; or a report's outcome is
+    /// ambiguous. A report Exo must reset to makes it exact again, which
+    /// after a press's `reset` (an empty history) is any report before the
+    /// next event. Without the extension nothing does, as Exo composes
+    /// existing text unseen (`SetCompositionFromExistingText`, TI
+    /// 483-508).
+    Unknown,
 }
 
 /// What a request did once Exo processed it ([`ExoMirror::barrier_done`]),
@@ -249,8 +356,9 @@ pub(super) enum Applied {
     /// state with no composition from there, and `in_step` if it has no
     /// selection and every transaction after it kept the guest in step.
     Matched { in_step: bool },
-    /// A report matched none and reset Exo to it; `cursor` if its
-    /// selection is empty.
+    /// A report matched none and reset Exo to it, or the mirror cannot
+    /// tell whether it matched, and Exo's prediction is the report's
+    /// either way or unknown; `cursor` if its selection is empty.
     Reset { cursor: bool },
     /// A `reset` emptied the history.
     Cancel,
@@ -259,12 +367,13 @@ pub(super) enum Applied {
 /// Exo's tracker for one host text input, as the wire shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ExoMirror {
-    /// `predicted_state_` after every message Exo has processed so far.
+    /// `predicted_state_` after every message Exo has processed so far, as
+    /// far as `health` says: the empty text while unknown.
     predicted: ExoState,
-    /// `expected_updates_`, states only, oldest first, at most
-    /// [`HISTORY_CAP`]; each with whether the transaction that led to it
-    /// kept a guest in step with Exo if it was ([`Self::mark`]).
-    expected: VecDeque<(ExoState, bool)>,
+    health: Health,
+    /// `expected_updates_`, as fingerprints, oldest first, at most
+    /// [`HISTORY_CAP`].
+    expected: VecDeque<Entry>,
     /// The newest state has not been marked yet.
     unmarked: bool,
     /// Requests sent and not yet known to be processed, each with the
@@ -281,10 +390,8 @@ pub(super) struct ExoMirror {
     /// The last report reset a non-empty composition (E4), and nothing
     /// has composed since.
     dropped: bool,
-    health: Health,
-    /// The text grew over [`TEXT_CAP`]: the mirror keeps no text and
-    /// applies no event until a report resets it.
-    blind: bool,
+    /// An echo check failed since [`Self::take_diverged`] last looked.
+    diverged: bool,
     /// The host extension's version, `None` without one.
     ext_version: Option<u32>,
 }
@@ -295,6 +402,7 @@ impl ExoMirror {
     pub(super) fn new(ext_version: Option<u32>) -> Self {
         let mut mirror = Self {
             predicted: ExoState::default(),
+            health: Health::Exact,
             expected: VecDeque::new(),
             unmarked: false,
             in_flight: VecDeque::new(),
@@ -302,22 +410,26 @@ impl ExoMirror {
             highlights: Vec::new(),
             cursor_position: None,
             dropped: false,
-            health: match ext_version {
-                Some(_) => Health::Exact,
-                None => Health::Uncertain,
-            },
-            blind: false,
+            diverged: false,
             ext_version,
         };
         mirror.reset_internal("", Span::at(0));
         mirror
     }
 
-    pub(super) fn predicted(&self) -> &ExoState {
-        &self.predicted
+    /// Exo's prediction, if the mirror knows it exactly.
+    pub(super) fn exact(&self) -> Option<&ExoState> {
+        (self.health == Health::Exact).then_some(&self.predicted)
     }
 
-    pub(super) fn expected(&self) -> &VecDeque<(ExoState, bool)> {
+    /// The prediction, which must be exact.
+    #[cfg(test)]
+    #[track_caller]
+    pub(super) fn predicted(&self) -> &ExoState {
+        self.exact().expect("an exact prediction")
+    }
+
+    pub(super) fn expected(&self) -> &VecDeque<Entry> {
         &self.expected
     }
 
@@ -325,20 +437,38 @@ impl ExoMirror {
     /// guest in step, if no state has been marked since it was pushed.
     pub(super) fn mark(&mut self, in_step: bool) {
         if std::mem::take(&mut self.unmarked) {
-            if let Some((_, step)) = self.expected.back_mut() {
+            if let Some(Entry::Known { in_step: step, .. }) = self.expected.back_mut() {
                 *step = in_step;
             }
         }
     }
 
-    /// Something the mirror cannot see may have happened.
-    pub(super) fn uncertain(&mut self) {
-        self.degrade(Health::Uncertain);
+    /// Whether an echo check failed since the last call.
+    pub(super) fn take_diverged(&mut self) -> bool {
+        std::mem::take(&mut self.diverged)
+    }
+
+    /// Where a report of `text` with `selection` stands in the history
+    /// from state `from` on.
+    fn lookup(&self, from: usize, text: &str, selection: Span) -> Lookup {
+        let text = Key::of(text);
+        for (at, entry) in self.expected.iter().enumerate().skip(from) {
+            let Entry::Known { print, .. } = entry else {
+                return Lookup::Ambiguous;
+            };
+            match print.selection {
+                _ if print.text != text => {}
+                None => return Lookup::Ambiguous,
+                Some(equal) if equal == selection => return Lookup::Match(at),
+                Some(_) => {}
+            }
+        }
+        Lookup::Missing
     }
 
     /// Whether a report the proxy sent and Exo has yet to process will
-    /// match no state Exo has now, or follows a `reset` that will empty
-    /// the history: the guest made an edit Exo has yet to see.
+    /// match no state Exo has now, or may not, or follows a `reset` that
+    /// will empty the history: the guest made an edit Exo has yet to see.
     pub(super) fn report_crosses(&self) -> bool {
         let mut from = 0;
         for (at, (_, sent)) in self.in_flight.iter().enumerate() {
@@ -346,6 +476,7 @@ impl ExoMirror {
                 text,
                 cursor,
                 anchor,
+                ..
             } = sent
             else {
                 let mut rest = self.in_flight.iter().skip(at);
@@ -354,11 +485,9 @@ impl ExoMirror {
             let Some(selection) = report_selection(text, *cursor, *anchor) else {
                 continue;
             };
-            let matches =
-                |(state, _): &(ExoState, bool)| state.selection == selection && state.text == *text;
-            match self.expected.iter().skip(from).position(matches) {
-                Some(at) => from += at,
-                None => return true,
+            match self.lookup(from, text, selection) {
+                Lookup::Match(at) => from = at,
+                Lookup::Ambiguous | Lookup::Missing => return true,
             }
         }
         false
@@ -368,11 +497,12 @@ impl ExoMirror {
     /// finds that the guest's report `(text, cursor, anchor)`, from a guest
     /// that shows the preedit `shown`, would only make Exo drop its
     /// composition. It names no state of the history Exo will hold once it
-    /// has processed every request in flight, but one such state is the
-    /// guest's text with the composition `shown` inline, at the cursor.
-    /// Then `Some` of whether every transaction since that state kept a
-    /// guest in step. A report that names a state is a no-op for Exo, and
-    /// any other resets it to the guest's text, so both go out.
+    /// has processed every request in flight, which holds no unknown
+    /// state, but one such state is the guest's text with the composition
+    /// `shown` inline, at the cursor. Then `Some` of whether every
+    /// transaction since that state kept a guest in step. A report that
+    /// names a state is a no-op for Exo, and any other resets it to the
+    /// guest's text, so both go out.
     pub(super) fn withholds(
         &self,
         text: &str,
@@ -385,29 +515,22 @@ impl ExoMirror {
             return None;
         }
         let from = self.projected_from()?;
-        let mut states = self.expected.iter().skip(from);
-        if states
-            .clone()
-            .any(|(state, _)| state.selection == selection && state.text == text)
-        {
+        if self.lookup(from, text, selection) != Lookup::Missing {
             return None;
         }
-        let cursor = selection.start;
-        states.find(|(state, _)| {
-            let composition = &state.composition;
-            !composition.is_empty()
-                && composition.start == cursor
-                && state.composition_text() == shown
-                && text.get(..cursor) == Some(&state.text[..cursor])
-                && text.get(cursor..) == Some(&state.text[composition.end..])
+        let split = Some((Key::of(text), Key::of(shown)));
+        let mut states = self.expected.iter().skip(from);
+        states.find(|entry| {
+            matches!(entry, Entry::Known { print, .. }
+                if print.split == split && print.composition.start == selection.start)
         })?;
-        Some(states.all(|&(_, in_step)| in_step))
+        Some(states.all(|entry| matches!(entry, Entry::Known { in_step: true, .. })))
     }
 
     /// Where the history Exo will hold once it has processed every request
     /// in flight starts in `expected`, of which it is a suffix: every event
-    /// so far came before them. `None` if one of them will reset it or
-    /// empty it.
+    /// so far came before them. `None` if one of them will reset it, may,
+    /// or will empty it.
     fn projected_from(&self) -> Option<usize> {
         let mut from = 0;
         for (_, sent) in &self.in_flight {
@@ -415,6 +538,7 @@ impl ExoMirror {
                 text,
                 cursor,
                 anchor,
+                ..
             } = sent
             else {
                 return None;
@@ -422,9 +546,10 @@ impl ExoMirror {
             let Some(selection) = report_selection(text, *cursor, *anchor) else {
                 continue;
             };
-            let matches =
-                |(state, _): &(ExoState, bool)| state.selection == selection && state.text == *text;
-            from += self.expected.iter().skip(from).position(matches)?;
+            match self.lookup(from, text, selection) {
+                Lookup::Match(at) => from = at,
+                Lookup::Ambiguous | Lookup::Missing => return None,
+            }
         }
         Some(from)
     }
@@ -467,33 +592,40 @@ impl ExoMirror {
     ///
     /// Echo: `commit` is `text`, and the cursor is a char boundary of it.
     /// A highlight with one end at the cursor and the other elsewhere is a
-    /// composition selection the mirror cannot know, which makes it
-    /// [`Health::Uncertain`].
+    /// composition selection the mirror cannot know, so the selection is
+    /// [`Health::Vague`]; without one, the cursor sets it.
     pub(super) fn preedit_string(&mut self, text: &str, commit: &str) {
         let cursor = self.preedit_cursor.take();
         let highlights = std::mem::take(&mut self.highlights);
-        let at = cursor.map_or(Ok(text.len()), usize::try_from);
-        if highlights
-            .iter()
-            .any(|span| at.is_ok_and(|at| span.start == at || span.end == at))
-        {
-            self.uncertain();
-        }
         self.observe(|mirror| {
             let cursor = match cursor {
                 None => text.len(),
                 Some(cursor) => match usize::try_from(cursor) {
                     Ok(cursor) if text.is_char_boundary(cursor) => cursor,
-                    _ => return false,
+                    _ => return Err(Miss::Diverged),
                 },
             };
             if commit != text {
-                return false;
+                return Err(Miss::Diverged);
             }
+            // With no composition, it replaces the selection.
+            if mirror.health == Health::Vague && mirror.predicted.composition.is_empty() {
+                return Err(Miss::Unknowable);
+            }
+            let vague = highlights
+                .iter()
+                .any(|span| span.start == cursor || span.end == cursor);
+            mirror.health = if vague { Health::Vague } else { Health::Exact };
             mirror.dropped = false;
             mirror.on_set_composition_text(text, Span::at(cursor));
-            true
+            Ok(())
         });
+    }
+
+    /// H7 with a text that is not UTF-8: Exo changed its tracker in a way
+    /// the mirror cannot read.
+    pub(super) fn unreadable(&mut self) {
+        self.observe(|_| Err(Miss::Unknowable));
     }
 
     /// H6 `cursor_position(index, anchor)`: `SetCursor` (ZTIM 192-199),
@@ -503,9 +635,11 @@ impl ExoMirror {
     }
 
     /// H8 `commit_string(text)`. Alone, it is `TI::InsertText` →
-    /// `OnInsertText(text, kMoveCursorAfterText)` (TI 274-280). After a
-    /// `cursor_position(range)`, it is one of two pairs, both of which
-    /// commit the composition text (TI 240-263, 386-403):
+    /// `OnInsertText(text, kMoveCursorAfterText)` (TI 274-280), which over
+    /// a composition holding the selection replaces the composition
+    /// wherever the selection is in it. After a `cursor_position(range)`,
+    /// it is one of two pairs, both of which commit the composition text
+    /// (TI 240-263, 386-403):
     ///
     /// - `ConfirmCompositionText(true)`'s fallback, which IMA takes only
     ///   below the extension's `confirm_preedit` (ZTIM 430-447), and which
@@ -513,37 +647,45 @@ impl ExoMirror {
     /// - `SetEditableSelectionRange(range)`, which keeps the composition.
     ///
     /// The pair is read as a confirm only when it can be one; one that can
-    /// be either while composing makes the mirror [`Health::Uncertain`].
+    /// be either while composing, or with a vague selection, makes the
+    /// mirror [`Health::Unknown`].
     ///
     /// Echo, for a pair: the range is in the text, and `text` is the
     /// composition's.
     pub(super) fn commit_string(&mut self, text: &str) {
         let cursor_position = self.cursor_position.take();
         self.observe(|mirror| {
+            let vague = mirror.health == Health::Vague;
+            let composing = !mirror.predicted.composition.is_empty();
             let Some((index, anchor)) = cursor_position else {
+                if vague && !composing {
+                    return Err(Miss::Unknowable);
+                }
+                mirror.health = Health::Exact;
                 mirror.on_insert_text(text, CursorBehavior::MoveCursorAfterText);
-                return true;
+                return Ok(());
             };
             let (Ok(start), Ok(end)) = (usize::try_from(anchor), usize::try_from(index)) else {
-                return false;
+                return Err(Miss::Diverged);
             };
             let range = Span::new(start, end);
             let predicted = &mirror.predicted;
             if !predicted.holds_span(range) || text != predicted.composition_text() {
-                return false;
+                return Err(Miss::Diverged);
             }
             let confirms_by_event = mirror
                 .ext_version
                 .is_some_and(|version| version >= ext::EVT_CONFIRM_PREEDIT_SINCE);
-            if !confirms_by_event && range == predicted.selection {
-                if !predicted.composition.is_empty() {
-                    mirror.uncertain();
+            if !confirms_by_event && (vague || range == predicted.selection) {
+                if vague || composing {
+                    return Err(Miss::Unknowable);
                 }
                 mirror.on_confirm_composition_text(true);
             } else {
+                mirror.health = Health::Exact;
                 mirror.on_set_editable_selection_range(range);
             }
-            true
+            Ok(())
         });
     }
 
@@ -552,15 +694,20 @@ impl ExoMirror {
     /// selection for `unchanged`.
     pub(super) fn confirm_preedit(&mut self, keep_selection: bool) {
         self.observe(|mirror| {
+            if !keep_selection && !mirror.predicted.composition.is_empty() {
+                // The selection goes to the composition's end.
+                mirror.health = Health::Exact;
+            }
             mirror.on_confirm_composition_text(keep_selection);
-            true
+            Ok(())
         });
     }
 
     /// H9 `delete_surrounding_text(index, length)`:
     /// `ExtendSelectionAndDelete` → `OnExtendSelectionAndDelete` (TI
     /// 434-449). ZTIM sends the absolute range TI clamped to the text
-    /// (ZTIM 201-213), which gives back `before` and `after` exactly.
+    /// (ZTIM 201-213), which gives back `before` and `after` exactly; so it
+    /// erases that range wherever a vague selection is in it.
     ///
     /// Echo: the range is in the text and contains the selection, and
     /// there is no composition, as IMA never deletes while composing (IMA
@@ -568,55 +715,82 @@ impl ExoMirror {
     pub(super) fn delete_surrounding_text(&mut self, index: i32, length: u32) {
         self.observe(|mirror| {
             let Ok(start) = usize::try_from(index) else {
-                return false;
+                return Err(Miss::Diverged);
             };
             let end = start + length as usize;
-            let predicted = &mirror.predicted;
+            let vague = mirror.health == Health::Vague;
+            let predicted = &mut mirror.predicted;
             let selection = predicted.selection;
+            let around = start <= selection.min() && selection.max() <= end;
             if !predicted.composition.is_empty()
                 || !predicted.holds_span(Span::new(start, end))
-                || start > selection.min()
-                || end < selection.max()
+                || !(around || vague)
             {
-                return false;
+                return Err(Miss::Diverged);
             }
+            if vague {
+                predicted.selection = Span::at(start);
+                mirror.health = Health::Exact;
+            }
+            let selection = mirror.predicted.selection;
             mirror.on_extend_selection_and_delete(selection.min() - start, end - selection.max());
-            true
+            Ok(())
         });
     }
 
     /// X1 `set_preedit_region(index, length)`:
     /// `SetCompositionFromExistingText` → `OnSetCompositionFromExistingText`
     /// (TI 483-508). ZTIM measures `index` from the selection's directed
-    /// end (ZTIM 248-268). An empty region ends the composition.
+    /// end (ZTIM 248-268), which a vague selection does not tell. An empty
+    /// region ends the composition.
     ///
     /// Echo: the range is in the text (IMA's `text_range.Contains`).
     pub(super) fn set_preedit_region(&mut self, index: i32, length: u32) {
         self.observe(|mirror| {
+            if mirror.health == Health::Vague {
+                return Err(Miss::Unknowable);
+            }
             let start = mirror.predicted.selection.end as i64 + i64::from(index);
             let Ok(start) = usize::try_from(start) else {
-                return false;
+                return Err(Miss::Diverged);
             };
             let end = start + length as usize;
             if !mirror.predicted.holds_span(Span::new(start, end)) {
-                return false;
+                return Err(Miss::Diverged);
             }
             mirror.dropped = false;
             mirror.on_set_composition_from_existing_text(start..end);
-            true
+            Ok(())
         });
     }
 
     /// Applies one tracker-changing event: `apply` checks it against the
-    /// mirror and changes the mirror only if it agrees.
-    fn observe(&mut self, apply: impl FnOnce(&mut Self) -> bool) {
+    /// mirror and changes the mirror only if it agrees and its effect is
+    /// known. Otherwise Exo's state is unknown, and so is the state it
+    /// pushed. A report that may reach Exo apart from its barrier and is
+    /// still on its way may come before the event or after it.
+    fn observe(&mut self, apply: impl FnOnce(&mut Self) -> Result<(), Miss>) {
         self.unmarked = false;
-        if self.health == Health::Healing {
-            self.health = Health::Uncertain;
+        let split = self
+            .in_flight
+            .iter()
+            .any(|(_, sent)| matches!(sent, Sent::Report { split: true, .. }));
+        let applied = match self.health {
+            Health::Unknown => Err(Miss::Unknowable),
+            _ if split => Err(Miss::Unknowable),
+            _ => apply(self),
+        };
+        if let Err(miss) = applied {
+            self.diverged |= miss == Miss::Diverged;
+            self.unknown();
+            self.push();
         }
-        if !self.blind && !apply(self) {
-            self.degrade(Health::Diverged);
-        }
+    }
+
+    /// The prediction is unknown.
+    fn unknown(&mut self) {
+        self.health = Health::Unknown;
+        self.predicted = ExoState::default();
     }
 
     // The proxy's requests.
@@ -645,14 +819,10 @@ impl ExoMirror {
                 text,
                 cursor,
                 anchor,
+                ..
             } => self.report(&text, cursor, anchor),
             Sent::Cancel => {
                 self.cancel_composition();
-                // Without the extension, Exo may compose existing text
-                // unseen at any time, so nothing heals the mirror.
-                if self.health != Health::Exact && self.ext_version.is_some() {
-                    self.health = Health::Healing;
-                }
                 Some(Applied::Cancel)
             }
         }
@@ -664,58 +834,58 @@ impl ExoMirror {
     /// `TI::SetSurroundingText` calls `Update` (TI 158-175).
     fn report(&mut self, text: &str, cursor: u32, anchor: u32) -> Option<Applied> {
         let selection = report_selection(text, cursor, anchor)?;
-        let composing = !self.predicted.composition.is_empty();
+        let composing = self.health != Health::Unknown && !self.predicted.composition.is_empty();
+        let cursor = selection.is_empty();
         match self.update(text, selection) {
             UpdateResult::Updated => {
                 // A v3 guest reports no preedit, so it is at the first
                 // equal state with no composition, not at one whose
                 // composition it holds as text.
-                let mut states = self.expected.iter().skip_while(|(state, _)| {
-                    !state.composition.is_empty()
-                        || state.selection != selection
-                        || state.text != text
-                });
-                let at = states.next();
-                let in_step =
-                    at.is_some() && selection.is_empty() && states.all(|&(_, in_step)| in_step);
-                Some(Applied::Matched { in_step })
+                let text = Key::of(text);
+                let (mut found, mut in_step) = (false, cursor);
+                for entry in &self.expected {
+                    match entry {
+                        Entry::Known { in_step: step, .. } if found => in_step &= *step,
+                        Entry::Known { print, .. } => {
+                            found = print.composition.is_empty()
+                                && print.selection == Some(selection)
+                                && print.text == text;
+                        }
+                        Entry::Unknown => in_step = false,
+                    }
+                }
+                Some(Applied::Matched {
+                    in_step: found && in_step,
+                })
             }
             UpdateResult::Reset => {
                 self.dropped |= composing;
-                if self.health == Health::Healing {
-                    self.health = Health::Exact;
-                }
-                Some(Applied::Reset {
-                    cursor: selection.is_empty(),
-                })
+                Some(Applied::Reset { cursor })
             }
-        }
-    }
-
-    /// Marks the mirror unhealthy; a divergence outranks an uncertainty.
-    fn degrade(&mut self, to: Health) {
-        if self.health != Health::Diverged {
-            self.health = to;
+            UpdateResult::Ambiguous => Some(Applied::Reset { cursor }),
         }
     }
 
     // `SurroundingTextTracker`, line for line, in bytes with offset 0.
 
-    /// `expected_updates_.emplace_back(predicted_state_, …)`, within the
-    /// caps.
+    /// `expected_updates_.emplace_back(predicted_state_, …)`, as a
+    /// fingerprint, within the caps.
     fn push(&mut self) {
         if self.predicted.text.len() > TEXT_CAP {
-            self.degrade(Health::Uncertain);
-            self.blind = true;
-            self.predicted = ExoState::default();
-            self.expected.clear();
-            return;
+            self.unknown();
         }
-        self.expected.push_back((self.predicted.clone(), false));
+        let entry = match self.health {
+            Health::Unknown => Entry::Unknown,
+            health => Entry::Known {
+                print: Fingerprint::of(&self.predicted, health == Health::Vague),
+                in_step: false,
+            },
+        };
+        self.expected.push_back(entry);
         self.unmarked = true;
         if self.expected.len() > HISTORY_CAP {
             self.expected.pop_front();
-            self.degrade(Health::Uncertain);
+            self.expected[0] = Entry::Unknown;
         }
     }
 
@@ -727,18 +897,32 @@ impl ExoMirror {
 
     /// `Update` (STT 131-191). With offset 0, `compare_begin` is 0, so a
     /// state matches when its selection and its whole text are equal, and
-    /// the match is exact.
+    /// the match is exact. When an unknown state, or a vague one with the
+    /// report's text, comes before any equal state, the mirror cannot tell
+    /// whether Exo matched there: the history is unknown, and so is the
+    /// prediction, unless it is the report's with no composition, which
+    /// Exo's is then either way.
     fn update(&mut self, text: &str, selection: Span) -> UpdateResult {
-        let matches =
-            |(state, _): &(ExoState, bool)| state.selection == selection && state.text == text;
-        match self.expected.iter().position(matches) {
-            Some(at) => {
+        match self.lookup(0, text, selection) {
+            Lookup::Match(at) => {
                 self.expected.drain(..at);
                 UpdateResult::Updated
             }
-            None => {
+            Lookup::Missing => {
                 self.reset_internal(text, selection);
                 UpdateResult::Reset
+            }
+            Lookup::Ambiguous => {
+                let reported = self.exact().is_some_and(|predicted| {
+                    predicted.composition.is_empty()
+                        && predicted.selection == selection
+                        && predicted.text == text
+                });
+                if !reported {
+                    self.unknown();
+                }
+                self.expected = VecDeque::from([Entry::Unknown]);
+                UpdateResult::Ambiguous
             }
         }
     }
@@ -887,13 +1071,18 @@ impl ExoMirror {
     }
 
     /// `ResetInternal` (STT 374-381).
+    /// Without the extension, Exo may compose existing text unseen at any
+    /// time, so the mirror never knows its state.
     fn reset_internal(&mut self, text: &str, selection: Span) {
-        self.blind = false;
         self.predicted = ExoState {
             text: text.to_owned(),
             selection,
             composition: NO_COMPOSITION,
         };
+        self.health = Health::Exact;
+        if self.ext_version.is_none() {
+            self.unknown();
+        }
         self.expected.clear();
         self.push();
     }
@@ -951,17 +1140,32 @@ mod tests {
     /// is `predicted`.
     fn at(predicted: ExoState) -> ExoMirror {
         let mut mirror = ExoMirror::new(Some(11));
-        mirror.predicted = predicted.clone();
-        mirror.expected = VecDeque::from([(predicted, false)]);
+        let print = Fingerprint::of(&predicted, false);
+        mirror.predicted = predicted;
+        mirror.expected = VecDeque::from([Entry::Known {
+            print,
+            in_step: false,
+        }]);
         mirror
     }
 
-    fn history(mirror: &ExoMirror) -> Vec<ExoState> {
-        mirror
-            .expected()
-            .iter()
-            .map(|(state, _)| state.clone())
-            .collect()
+    /// A history entry is a state's if it is its exact fingerprint.
+    impl PartialEq<ExoState> for Entry {
+        fn eq(&self, state: &ExoState) -> bool {
+            matches!(self, Entry::Known { print, .. } if *print == Fingerprint::of(state, false))
+        }
+    }
+
+    /// The history, without the marks.
+    fn history(mirror: &ExoMirror) -> Vec<Entry> {
+        let unmarked = |entry: &Entry| match entry {
+            Entry::Known { print, .. } => Entry::Known {
+                print: print.clone(),
+                in_step: false,
+            },
+            Entry::Unknown => Entry::Unknown,
+        };
+        mirror.expected().iter().map(unmarked).collect()
     }
 
     /// The prediction is the last history state, as every STT function
@@ -969,24 +1173,24 @@ mod tests {
     #[track_caller]
     fn assert_pushed(mirror: &ExoMirror, predicted: &ExoState) {
         assert_eq!(mirror.predicted(), predicted);
-        assert_eq!(
-            mirror.expected().back().map(|(state, _)| state),
-            Some(predicted)
-        );
+        let back = mirror.expected().back();
+        assert!(back.is_some_and(|entry| entry == predicted), "{back:?}");
         assert!(predicted.fits(), "{predicted:?}");
+    }
+
+    fn sent_report(text: &str, cursor: u32, anchor: u32) -> Sent {
+        Sent::Report {
+            text: text.to_owned(),
+            cursor,
+            anchor,
+            split: false,
+        }
     }
 
     /// Sends a report and its barrier, and lets Exo process both.
     fn report(mirror: &mut ExoMirror, text: &str, cursor: u32, anchor: u32) {
         let token = BarrierToken(1);
-        mirror.sent(
-            token,
-            Sent::Report {
-                text: text.to_owned(),
-                cursor,
-                anchor,
-            },
-        );
+        mirror.sent(token, sent_report(text, cursor, anchor));
         mirror.barrier_done(token);
     }
 
@@ -1007,7 +1211,7 @@ mod tests {
         assert_eq!(mirror.health(), Health::Exact);
         assert!(!mirror.dropped());
         // Without the extension, Exo composes existing text unseen.
-        assert_eq!(ExoMirror::new(None).health(), Health::Uncertain);
+        assert_eq!(ExoMirror::new(None).health(), Health::Unknown);
     }
 
     /// `Update` (STT 131-191), exact match: the first state from the
@@ -1166,7 +1370,7 @@ mod tests {
             step(&mut mirror);
             let predicted = mirror.predicted().clone();
             assert_pushed(&mirror, &predicted);
-            assert!(mirror.expected().iter().all(|(s, _)| s.fits()), "{name}");
+            assert_eq!(mirror.health(), Health::Exact, "{name}");
         }
         assert_eq!(mirror.predicted(), &state("바", (3, 3), NO_COMPOSITION));
     }
@@ -1419,7 +1623,7 @@ mod tests {
             mirror.predicted(),
             &state("가나다라", (12, 12), NO_COMPOSITION)
         );
-        assert_eq!(history(&mirror), []);
+        assert!(history(&mirror).is_empty());
         assert_eq!(mirror.update("가나다라", Span::at(12)), UpdateResult::Reset);
         // An event after the cancel leaves a history of its own state.
         let mut mirror = at(state(GANADA, (9, 9), NO_COMPOSITION));
@@ -1457,14 +1661,7 @@ mod tests {
     #[test]
     fn a_request_applies_at_its_barrier_not_when_sent() {
         let mut mirror = at(state("가", (3, 3), NO_COMPOSITION));
-        mirror.sent(
-            BarrierToken(7),
-            Sent::Report {
-                text: "가".to_owned(),
-                cursor: 0,
-                anchor: 0,
-            },
-        );
+        mirror.sent(BarrierToken(7), sent_report("가", 0, 0));
         mirror.sent(BarrierToken(8), Sent::Cancel);
         // Exo composed before it processed the report.
         mirror.preedit_string("나", "나");
@@ -1478,7 +1675,7 @@ mod tests {
         assert_eq!(history(&mirror), [state("가", (0, 0), NO_COMPOSITION)]);
         assert!(mirror.dropped());
         mirror.barrier_done(BarrierToken(8));
-        assert_eq!(history(&mirror), []);
+        assert!(history(&mirror).is_empty());
         assert_eq!(mirror.predicted(), &state("가", (0, 0), NO_COMPOSITION));
 
         // Applied when sent, the report would have come before the
@@ -1494,38 +1691,45 @@ mod tests {
     /// `cursor_position(selection)` + `commit_string(composition)` (TI
     /// 240-263); so is `SetEditableSelectionRange` (TI 386-403), which
     /// keeps the composition. The pair is a confirm only below v11 and
-    /// with the predicted selection, where it could be either, which makes
-    /// the mirror `Uncertain`.
+    /// with the predicted selection, where it could be either while
+    /// composing, which makes the mirror unknown.
     #[test]
     fn a_cursor_position_pair_is_a_confirm_only_below_v11_with_the_predicted_selection() {
         let composing = state(GANADA, (6, 6), 3..6);
-        let confirmed = state(GANADA, (6, 6), NO_COMPOSITION);
-        for (version, (index, anchor), expected, health) in [
-            (None, (6, 6), confirmed.clone(), Health::Uncertain),
-            (Some(10), (6, 6), confirmed, Health::Uncertain),
-            (Some(11), (6, 6), composing.clone(), Health::Exact),
-            (Some(10), (9, 0), state(GANADA, (0, 9), 3..6), Health::Exact),
-            (None, (3, 3), state(GANADA, (3, 3), 3..6), Health::Exact),
+        for (version, (index, anchor), expected) in [
+            (Some(10), (6, 6), None),
+            (Some(11), (6, 6), Some(composing.clone())),
+            (Some(10), (9, 0), Some(state(GANADA, (0, 9), 3..6))),
         ] {
             let mut mirror = at(composing.clone());
             mirror.ext_version = version;
             mirror.cursor_position(index, anchor);
             mirror.commit_string("나");
+            let Some(expected) = expected else {
+                assert_eq!(mirror.health(), Health::Unknown);
+                assert_eq!(mirror.expected().back(), Some(&Entry::Unknown));
+                assert!(!mirror.take_diverged());
+                continue;
+            };
             assert_pushed(&mirror, &expected);
-            assert_eq!(mirror.health(), health);
             // The pair is spent: the next commit is an insert.
             mirror.commit_string("라");
             assert!(mirror.predicted().text.contains('라'));
         }
-        // With no composition, both pairs commit "".
+        // With no composition, both pairs commit "", and agree.
         let mut mirror = at(state(GANADA, (3, 3), NO_COMPOSITION));
+        mirror.ext_version = Some(10);
+        mirror.cursor_position(3, 3);
+        mirror.commit_string("");
+        assert_pushed(&mirror, &state(GANADA, (3, 3), NO_COMPOSITION));
         mirror.cursor_position(6, 6);
         mirror.commit_string("");
         assert_pushed(&mirror, &state(GANADA, (6, 6), NO_COMPOSITION));
     }
 
     /// Every echo check: an event that does not agree with the mirror
-    /// changes nothing and makes the mirror `Diverged`.
+    /// diverges, which makes the prediction and the state the event pushed
+    /// unknown.
     #[test]
     fn each_echo_check_diverges() {
         let composing = state(GANADA, (6, 6), 3..6);
@@ -1587,134 +1791,252 @@ mod tests {
         for (name, start, event) in cases {
             let mut mirror = at(start.clone());
             event(&mut mirror);
-            assert_eq!(mirror.health(), Health::Diverged, "{name}");
-            assert_eq!(history(&mirror), std::slice::from_ref(start), "{name}");
-            assert_pushed(&mirror, start);
-            // A diverged mirror still applies the events that agree, and
-            // a divergence outranks an uncertainty.
+            assert_eq!(mirror.health(), Health::Unknown, "{name}");
+            assert!(mirror.take_diverged(), "{name}");
+            let history = history(&mirror);
+            assert!(history[0] == *start, "{name}");
+            assert_eq!(history[1..], [Entry::Unknown], "{name}");
+            // An unknown mirror pushes an unknown state for every event,
+            // which is no divergence.
             mirror.confirm_preedit(true);
-            mirror.degrade(Health::Uncertain);
-            assert_eq!(mirror.health(), Health::Diverged, "{name}");
-            assert_eq!(mirror.expected().len(), 2, "{name}");
+            assert!(!mirror.take_diverged(), "{name}");
+            assert_eq!(mirror.expected().len(), 3, "{name}");
+            assert_eq!(mirror.expected().back(), Some(&Entry::Unknown), "{name}");
         }
     }
 
-    /// The caps: evicting a history state, which Exo still has, makes the
-    /// mirror `Uncertain`; so does text over the cap, which the mirror
-    /// then stops keeping until a report resets it.
+    /// The history keeps fingerprints, so a field that gets many events
+    /// of Exo's with no report, such as v11's empty confirmation for each
+    /// key the input method does not handle, still holds the oldest state
+    /// Exo does, which a report then matches. Past [`HISTORY_CAP`], the
+    /// oldest goes, and an unknown state stands for it, which Exo could
+    /// match: a report then leaves the history unknown.
     #[test]
-    fn eviction_and_long_text_make_it_uncertain() {
+    fn an_evicted_state_still_matches() {
         let mut mirror = at(state("", (0, 0), NO_COMPOSITION));
-        for _ in 1..HISTORY_CAP {
+        for _ in 0..100 {
+            mirror.confirm_preedit(true);
+        }
+        mirror.commit_string("가");
+        assert_eq!(mirror.expected().len(), 102);
+        report(&mut mirror, "", 0, 0);
+        assert_eq!(mirror.health(), Health::Exact);
+        assert_eq!(mirror.expected().len(), 102, "the oldest state matched");
+
+        for _ in 0..HISTORY_CAP {
             mirror.confirm_preedit(true);
         }
         assert_eq!(mirror.expected().len(), HISTORY_CAP);
+        assert_eq!(mirror.expected().front(), Some(&Entry::Unknown));
         assert_eq!(mirror.health(), Health::Exact);
-        mirror.commit_string("가");
-        assert_eq!(mirror.expected().len(), HISTORY_CAP);
-        assert_eq!(
-            history(&mirror).last(),
-            Some(&state("가", (3, 3), NO_COMPOSITION))
-        );
-        assert_eq!(mirror.health(), Health::Uncertain);
-
-        let full = "가".repeat(TEXT_CAP / 3 - 1);
-        let mut mirror = at(state(&full, (full.len(), full.len()), NO_COMPOSITION));
-        mirror.commit_string("가");
-        assert_eq!(mirror.health(), Health::Exact);
-        mirror.commit_string("가");
-        assert_eq!(mirror.health(), Health::Uncertain);
-        assert_eq!(history(&mirror), []);
-        // Blind: events are not checked or applied.
-        mirror.delete_surrounding_text(30, 3);
-        mirror.commit_string("가");
-        assert_eq!(mirror.health(), Health::Uncertain);
-        assert_eq!(history(&mirror), []);
-        // A report gives it text again, still uncertain.
+        // Exo's prediction is a report of it whether Exo matched a lost
+        // state or reset; after another, the mirror cannot tell.
         report(&mut mirror, "가", 3, 3);
-        assert_eq!(history(&mirror), [state("가", (3, 3), NO_COMPOSITION)]);
-        mirror.commit_string("나");
-        assert_eq!(mirror.predicted(), &state("가나", (6, 6), NO_COMPOSITION));
-        assert_eq!(mirror.health(), Health::Uncertain);
+        assert_eq!(mirror.health(), Health::Exact);
+        assert_eq!(history(&mirror), [Entry::Unknown]);
+        report(&mut mirror, "나", 3, 3);
+        assert_eq!(mirror.health(), Health::Unknown);
     }
 
-    /// An unhealthy mirror heals only at a reset point: a cancel, which
-    /// empties Exo's history, and then a report, which must reset Exo,
-    /// with no tracker-changing event between them. A matched report heals
-    /// nothing, and the cancel of a healthy mirror changes nothing.
+    /// Text over [`TEXT_CAP`] makes the prediction unknown, and events are
+    /// then neither checked nor applied, until a press's `reset` and a
+    /// report.
     #[test]
-    fn healing_needs_a_cancel_then_a_clean_report() {
-        let start = state(GANADA, (9, 9), NO_COMPOSITION);
-        let mut mirror = at(start.clone());
-        cancel(&mut mirror);
-        assert_eq!(mirror.health(), Health::Exact);
-
-        let mut mirror = at(start.clone());
-        mirror.delete_surrounding_text(0, 3);
-        assert_eq!(mirror.health(), Health::Diverged);
-        report(&mut mirror, GANADA, 9, 9);
-        assert_eq!(mirror.health(), Health::Diverged, "a matched report");
+    fn long_text_makes_it_unknown() {
+        let full = "가".repeat(TEXT_CAP / 3);
+        let mut mirror = at(state(&full, (full.len(), full.len()), NO_COMPOSITION));
+        mirror.commit_string("a");
+        assert_eq!(mirror.predicted().text.len(), TEXT_CAP);
+        mirror.commit_string("가");
+        assert_eq!(mirror.health(), Health::Unknown);
+        assert_eq!(mirror.expected().back(), Some(&Entry::Unknown));
+        mirror.delete_surrounding_text(30, 3);
+        assert!(!mirror.take_diverged());
         report(&mut mirror, "가", 3, 3);
-        assert_eq!(
-            mirror.health(),
-            Health::Diverged,
-            "a reset without a cancel"
-        );
-
-        // An event between the cancel and the report.
+        assert_eq!(mirror.health(), Health::Unknown);
         cancel(&mut mirror);
-        assert_eq!(mirror.health(), Health::Healing);
-        mirror.commit_string("나");
-        assert_eq!(mirror.health(), Health::Uncertain);
-        report(&mut mirror, "다", 3, 3);
-        assert_eq!(mirror.health(), Health::Uncertain);
+        report(&mut mirror, "가", 3, 3);
+        assert_pushed(&mirror, &state("가", (3, 3), NO_COMPOSITION));
+    }
 
-        // A cancel, then a report Exo must reset to.
+    /// A report heals the mirror whenever Exo must reset to it: no state
+    /// Exo could match (an unknown one, or a vague one with the report's
+    /// text) comes before, and none equals it. That needs no press. After
+    /// a press's `reset` the history is empty, so any report before the
+    /// next event heals. Without the extension nothing does, as Exo
+    /// composes existing text unseen.
+    #[test]
+    fn a_definite_reset_heals_without_a_press() {
+        let mut mirror = at(state(GANADA, (9, 9), NO_COMPOSITION));
+        convert(&mut mirror, "漢字", 3);
+        assert_eq!(mirror.health(), Health::Vague);
+        report(&mut mirror, "가나다漢", 12, 12);
+        assert_pushed(&mirror, &state("가나다漢", (12, 12), NO_COMPOSITION));
+        assert_eq!(history(&mirror).len(), 1);
+
+        let mut mirror = at(state(GANADA, (9, 9), NO_COMPOSITION));
+        mirror.delete_surrounding_text(0, 3);
+        assert_eq!(mirror.health(), Health::Unknown);
         cancel(&mut mirror);
-        assert_eq!(mirror.health(), Health::Healing);
         report(&mut mirror, "라", 3, 3);
-        assert_eq!(mirror.health(), Health::Exact);
-        assert_eq!(history(&mirror), [state("라", (3, 3), NO_COMPOSITION)]);
+        assert_pushed(&mirror, &state("라", (3, 3), NO_COMPOSITION));
 
-        // Without the extension Exo composes existing text unseen, so
-        // nothing heals the mirror.
         let mut mirror = ExoMirror::new(None);
         cancel(&mut mirror);
         report(&mut mirror, "라", 3, 3);
-        assert_eq!(mirror.health(), Health::Uncertain);
+        assert_eq!(mirror.health(), Health::Unknown);
+    }
+
+    /// A report whose outcome the mirror cannot tell, as an unknown state
+    /// or a vague one with its text comes first, leaves the history
+    /// unknown, and the prediction too, unless it is the report's with no
+    /// composition. Only a press's `reset` with no event before the next
+    /// report heals that. A report that matches a state before the unknown
+    /// one keeps the history from there.
+    #[test]
+    fn an_ambiguous_report_stays_unknown() {
+        let start = state(GANADA, (9, 9), NO_COMPOSITION);
+        let mut mirror = at(start.clone());
+        mirror.delete_surrounding_text(0, 3);
+        report(&mut mirror, GANADA, 9, 9);
+        assert_eq!(mirror.health(), Health::Unknown);
+        assert_eq!(mirror.expected().len(), 2);
+        report(&mut mirror, "가", 3, 3);
+        assert_eq!(history(&mirror), [Entry::Unknown]);
+        assert_eq!(mirror.health(), Health::Unknown);
+        // An event between the press's reset and the report.
+        cancel(&mut mirror);
+        mirror.commit_string("나");
+        report(&mut mirror, "다", 3, 3);
+        assert_eq!(mirror.health(), Health::Unknown);
+
+        // A vague state with the report's text.
+        let mut mirror = at(start);
+        convert(&mut mirror, "漢字", 3);
+        report(&mut mirror, "가나다漢字", 15, 15);
+        assert_eq!(history(&mirror), [Entry::Unknown]);
+        assert_eq!(mirror.health(), Health::Unknown);
+    }
+
+    /// A conversion's preedit `text`, its first `selected` bytes
+    /// highlighted, with the cursor at their end.
+    fn convert(mirror: &mut ExoMirror, text: &str, selected: u32) {
+        mirror.preedit_styling(0, selected, zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT);
+        mirror.preedit_cursor(selected as i32);
+        mirror.preedit_string(text, text);
     }
 
     /// IMA makes a composition selection from a highlight span with the
     /// cursor at one end (`ExtractCompositionText`), whose other end the
-    /// wire does not carry: the mirror cannot know the selection.
+    /// wire does not carry: the selection is vague, inside the
+    /// composition, and the rest of the state is known. An event that sets
+    /// the selection absolutely or replaces the whole composition makes
+    /// the mirror exact again; one that depends on where the selection is
+    /// makes it unknown.
     #[test]
-    fn a_composition_selection_makes_it_uncertain() {
+    fn a_highlight_is_vague_until_a_commit() {
         let highlight = zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT;
-        for (case, style, (index, length), health) in [
-            (
-                "a highlight ending at the cursor",
-                highlight,
-                (0, 3),
-                Health::Uncertain,
-            ),
-            ("one starting at it", highlight, (3, 3), Health::Uncertain),
-            ("one apart from it", highlight, (6, 3), Health::Exact),
+        for (case, style, (index, length), vague) in [
+            ("a highlight ending at the cursor", highlight, (0, 3), true),
+            ("one starting at it", highlight, (3, 3), true),
+            ("one apart from it", highlight, (6, 3), false),
             (
                 "an underline",
                 zwp_text_input_v1::PREEDIT_STYLE_UNDERLINE,
                 (0, 3),
-                Health::Exact,
+                false,
             ),
         ] {
             let mut mirror = at(state("", (0, 0), NO_COMPOSITION));
             mirror.preedit_styling(index, length, style);
             mirror.preedit_cursor(3);
             mirror.preedit_string(GANADA, GANADA);
+            let health = [Health::Exact, Health::Vague][usize::from(vague)];
             assert_eq!(mirror.health(), health, "{case}");
+            let print = Fingerprint::of(&state(GANADA, (3, 3), 0..9), vague);
+            let pushed = Entry::Known {
+                print,
+                in_step: false,
+            };
+            assert_eq!(history(&mirror).last(), Some(&pushed), "{case}");
             // The spans are spent.
             mirror.preedit_cursor(3);
             mirror.preedit_string("가", "가");
-            assert_eq!(mirror.health(), health, "{case}");
+            assert_eq!(mirror.health(), Health::Exact, "{case}");
+        }
+
+        let vague = || {
+            let mut mirror = at(state(GANADA, (9, 9), NO_COMPOSITION));
+            convert(&mut mirror, "漢字", 3);
+            mirror
+        };
+        let converted = state("가나다漢字", (15, 15), NO_COMPOSITION);
+        // A commit replaces the composition, which holds the selection.
+        let mut mirror = vague();
+        mirror.commit_string("漢字");
+        assert_pushed(&mirror, &converted);
+        let mut mirror = vague();
+        mirror.confirm_preedit(false);
+        assert_pushed(&mirror, &converted);
+        let mut mirror = vague();
+        mirror.cursor_position(9, 9);
+        mirror.commit_string("漢字");
+        assert_pushed(&mirror, &state("가나다漢字", (9, 9), 9..15));
+        // A confirm that keeps the selection keeps it vague, and a delete
+        // over it sets it.
+        let mut mirror = vague();
+        mirror.confirm_preedit(true);
+        assert_eq!(mirror.health(), Health::Vague);
+        mirror.delete_surrounding_text(9, 6);
+        assert_pushed(&mirror, &state(GANADA, (9, 9), NO_COMPOSITION));
+        // A region is measured from the selection, and a commit with no
+        // composition replaces it.
+        let mut mirror = vague();
+        mirror.set_preedit_region(-3, 3);
+        assert_eq!(mirror.health(), Health::Unknown);
+        let mut mirror = vague();
+        mirror.confirm_preedit(true);
+        mirror.commit_string("라");
+        assert_eq!(mirror.health(), Health::Unknown);
+        assert!(!mirror.take_diverged());
+    }
+
+    /// A report that may reach Exo apart from its barrier leaves the
+    /// mirror exact if no event of Exo's comes while it is on its way.
+    #[test]
+    fn a_split_report_without_an_event_stays_exact() {
+        let mut mirror = at(state("가", (3, 3), NO_COMPOSITION));
+        mirror.sent(BarrierToken(1), split_report("가", 0));
+        mirror.barrier_done(BarrierToken(1));
+        assert_pushed(&mirror, &state("가", (0, 0), NO_COMPOSITION));
+        mirror.commit_string("나");
+        assert_pushed(&mirror, &state("나가", (3, 3), NO_COMPOSITION));
+    }
+
+    /// An event of Exo's that comes while a report that may reach Exo
+    /// apart from its barrier is on its way may have come before the
+    /// report or after it: its state is unknown, and so is the mirror,
+    /// until a press's `reset` and a report.
+    #[test]
+    fn a_split_report_with_an_event_is_unknown() {
+        let mut mirror = at(state("가", (3, 3), NO_COMPOSITION));
+        mirror.sent(BarrierToken(1), split_report("가", 0));
+        mirror.commit_string("나");
+        assert_eq!(mirror.health(), Health::Unknown);
+        assert!(!mirror.take_diverged());
+        mirror.barrier_done(BarrierToken(1));
+        assert_eq!(mirror.health(), Health::Unknown);
+        cancel(&mut mirror);
+        report(&mut mirror, "가나", 6, 6);
+        assert_pushed(&mirror, &state("가나", (6, 6), NO_COMPOSITION));
+    }
+
+    fn split_report(text: &str, cursor: u32) -> Sent {
+        Sent::Report {
+            text: text.to_owned(),
+            cursor,
+            anchor: cursor,
+            split: true,
         }
     }
 
@@ -1724,11 +2046,7 @@ mod tests {
     fn a_report_crosses_when_it_will_name_no_state() {
         let mut mirror = at(state("ab", (2, 2), NO_COMPOSITION));
         mirror.commit_string("c");
-        let sent = |text: &str, cursor| Sent::Report {
-            text: text.to_owned(),
-            cursor,
-            anchor: cursor,
-        };
+        let sent = |text: &str, cursor| sent_report(text, cursor, cursor);
         mirror.sent(BarrierToken(1), sent("ab", 2));
         mirror.sent(BarrierToken(2), sent("abc", 3));
         assert!(!mirror.report_crosses());
@@ -1756,12 +2074,7 @@ mod tests {
             mirror.preedit_string("나", "나");
             mirror.mark(second);
             let token = BarrierToken(1);
-            let report = Sent::Report {
-                text: "가".to_owned(),
-                cursor: 3,
-                anchor: 3,
-            };
-            mirror.sent(token, report);
+            mirror.sent(token, sent_report("가", 3, 3));
             mirror.barrier_done(token)
         };
         // The report names the state with the composition "가" first, whose
