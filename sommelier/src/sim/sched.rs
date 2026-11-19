@@ -814,7 +814,7 @@ impl<'t> World<'t> {
     /// What the proxy sent goes out on P→E and P→C. A surrounding text or a
     /// `reset` and the barrier right after it go together, as one
     /// submission, which Exo's display dispatches in one read
-    /// (`HostOut::GluedBarrier`).
+    /// (`HostOut::Glued`).
     fn send_proxy_output(&mut self, goes_on: bool) {
         let mut batch: Vec<(u32, AnyRequest)> = Vec::new();
         for (sender, request) in self.session.host_received() {

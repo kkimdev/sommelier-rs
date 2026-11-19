@@ -53,16 +53,28 @@ pub(super) struct ExoView {
     edits: Edits,
     /// `edits` once the proxy had handled the guest's latest commit.
     at_commit: Edits,
-    /// Each report's barrier, with the edits the report may not hold: Exo's
-    /// since the guest's commit before it, which the guest may not have got
-    /// when it made the report, and the others since the report, `None`
-    /// for the empty stand-in of a guest that stated no text, which tells
-    /// nothing of the guest's; and whether a later report the core withheld
-    /// has already said where the guest is, so that this one can only take
-    /// it out of step, by resetting Exo.
-    reports: VecDeque<(BarrierToken, Option<Edits>, bool)>,
+    /// The reports on their way to Exo, oldest first, which the mirror
+    /// also holds among its requests in flight, with what only the view
+    /// knows of each.
+    reports: VecDeque<InFlightReport>,
+    /// The barrier of the newest report sent before the latest report the
+    /// core withheld, which already said where the guest is: a report up
+    /// to it can only take the guest out of step, by resetting Exo.
+    withheld_through: Option<BarrierToken>,
     /// The mirror has diverged from Exo once, which warned.
     warned: bool,
+}
+
+/// A report on its way to Exo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InFlightReport {
+    barrier: BarrierToken,
+    /// The edits the report may not hold: Exo's since the guest's commit
+    /// before it, which the guest may not have got when it made the
+    /// report, and the others since the report; `None` for the empty
+    /// stand-in of a guest that stated no text, which tells nothing of the
+    /// guest's.
+    since: Option<Edits>,
 }
 
 /// Why the core cannot measure an event of Exo's in the mirror, and so
@@ -112,6 +124,7 @@ impl ExoView {
             edits: Edits::default(),
             at_commit: Edits::default(),
             reports: VecDeque::new(),
+            withheld_through: None,
             warned: false,
         }
     }
@@ -290,8 +303,10 @@ impl ExoView {
             from_exo: self.at_commit.from_exo,
             unseen: self.edits.unseen,
         };
-        self.reports
-            .push_back((token, stated.then_some(since), false));
+        self.reports.push_back(InFlightReport {
+            barrier: token,
+            since: stated.then_some(since),
+        });
     }
 
     /// Report suppression (G9c): whether the core withholds the guest's report `report`, from a guest that
@@ -313,8 +328,8 @@ impl ExoView {
         };
         self.in_step = in_step;
         self.unseen = false;
-        for (_, _, superseded) in &mut self.reports {
-            *superseded = true;
+        if let Some(newest) = self.reports.back() {
+            self.withheld_through = Some(newest.barrier);
         }
         true
     }
@@ -332,17 +347,13 @@ impl ExoView {
         let mirror = &mut self.mirror;
         let health = mirror.health();
         let applied = mirror.barrier_done(token);
-        let since = match self.reports.front() {
-            Some(&(front, since, superseded)) if front == token => {
-                self.reports.pop_front();
-                Some((since, superseded))
-            }
-            _ => None,
-        };
+        let report = self.reports.front().filter(|r| r.barrier == token).copied();
         let exact = mirror.health() == Health::Exact;
-        let Some((since, superseded)) = since else {
+        let Some(InFlightReport { since, .. }) = report else {
             return Self::health_changed(mirror, ti, health);
         };
+        self.reports.pop_front();
+        let superseded = self.withheld_through >= Some(token);
         let Some(since) = since else {
             // A stand-in: Exo holds empty text, the guest perhaps not.
             self.in_step = false;

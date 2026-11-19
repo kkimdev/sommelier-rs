@@ -94,11 +94,16 @@ pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
             HostOut::Barrier(token) => {
                 queue_internal_sync(ctx, InternalCallback::TextInput { token });
             }
-            HostOut::GluedBarrier(token) => {
+            HostOut::Glued { request, barrier } => {
+                ctx.client_to_host_queue.push(request);
+                let token = barrier;
                 queue_internal_sync(ctx, InternalCallback::TextInput { token });
                 glue_last_two(&mut ctx.client_to_host_queue);
             }
-            HostOut::Retire(id) => ctx.retire_destroyed_host_object(id),
+            HostOut::Destroy { request, id } => {
+                ctx.client_to_host_queue.push(request);
+                ctx.retire_destroyed_host_object(id);
+            }
         }
     }
     for key in fx.keys {
@@ -111,7 +116,7 @@ pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
 /// never splits (`connection::OutgoingMessages`).
 fn glue_last_two(queue: &mut Vec<Outgoing>) {
     let (Some((bytes, fds)), Some((into, into_fds))) = (queue.pop(), queue.last_mut()) else {
-        unreachable!("a glued barrier follows its request");
+        unreachable!("a glued barrier's sync follows its request");
     };
     into.extend_from_slice(&bytes);
     into_fds.extend(fds);

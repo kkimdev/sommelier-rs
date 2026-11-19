@@ -266,10 +266,8 @@ impl Ima {
     /// resets the engine (E13), behind the next key if that is in flight.
     fn key(&mut self, key: Key) -> bool {
         let shown = self.composer.preedit();
-        let out = self.composer.key(key);
-        // The engine takes a Space that ends a composition (E15).
-        let ends_with_space = key == Key::Char(' ') && !out.commit.is_empty();
-        if !out.consumed && !ends_with_space {
+        let out = self.composer.chromeos_key(key);
+        if !out.consumed {
             return std::mem::take(&mut self.composing);
         }
         if !out.commit.is_empty() {

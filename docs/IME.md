@@ -461,10 +461,11 @@ A step returns its `Effects`, each list in order:
   transaction, and so are the keyboard events of a focus change (F1).
 - `to_host`: `HostOut`s. A `Request`; a `Barrier`, a host
   `wl_display.sync` whose `done` comes back as `Input::BarrierDone`; a
-  `GluedBarrier`, a barrier that goes out in one submission with the
-  request before it (INVARIANTS "Exo's deletes and regions are measured
-  in the Exo mirror, or dropped"); and `Retire`, which retires the host
-  object the previous request destroyed and so must follow it.
+  `Glued`, a request and a barrier that go out in one submission
+  (INVARIANTS "Exo's deletes and regions are measured in the Exo mirror,
+  or dropped"); and `Destroy`, a destructor request, after which the
+  adapter retires the host object it destroyed. Each carries its
+  request, so the pairing holds by construction.
 - `keys`: `KeyEffect`s for the keyboard concern, applied after the
   other two: a `Lease` outcome (`End` or `ArmIfBackspaceHeld`), or
   `RecoverHeldKey` (X2').
@@ -531,7 +532,8 @@ ever at `trace`.
    its encoded `set_surrounding_text` and cursor rectangle, so the wire
    order of the "Reconcile" convention (section 2) is kept.
 3. **Removals.** The Destroy arm marks a text input as ending, and phase
-   2 reconciles it to inactive. It is then removed, and its extension's `destroy` and `Retire` are appended.
+   2 reconciles it to inactive. It is then removed, and its extension's
+   `Destroy` is appended.
 
 A host composition event first goes to the mirror, then through the
 gate: without a `Current`, it is stale and dropped. With one, the arm

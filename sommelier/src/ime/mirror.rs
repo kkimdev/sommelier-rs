@@ -292,6 +292,16 @@ enum Lookup {
     Missing,
 }
 
+/// Why [`ExoMirror::project`] cannot place Exo's history once it has
+/// processed every request in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// A report will name no state Exo holds, or may not.
+    Unmatched,
+    /// A `reset` will empty the history, with reports after it, or not.
+    Cancelled { reports_after: bool },
+}
+
 /// Why the mirror could not take an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Miss {
@@ -483,27 +493,11 @@ impl ExoMirror {
     /// match no state Exo has now, or may not, or follows a `reset` that
     /// will empty the history: the guest made an edit Exo has yet to see.
     pub(super) fn report_crosses(&self) -> bool {
-        let mut from = 0;
-        for (at, (_, sent)) in self.in_flight.iter().enumerate() {
-            let Sent::Report {
-                text,
-                cursor,
-                anchor,
-                ..
-            } = sent
-            else {
-                let mut rest = self.in_flight.iter().skip(at);
-                return rest.any(|(_, sent)| matches!(sent, Sent::Report { .. }));
-            };
-            let Some(selection) = report_selection(text, *cursor, *anchor) else {
-                continue;
-            };
-            match self.lookup(from, text, selection) {
-                Lookup::Match(at) => from = at,
-                Lookup::Ambiguous | Lookup::Missing => return true,
-            }
+        match self.project() {
+            Ok(_) => false,
+            Err(Stop::Unmatched) => true,
+            Err(Stop::Cancelled { reports_after }) => reports_after,
         }
-        false
     }
 
     /// Report suppression (G9c): whether an exact mirror
@@ -527,7 +521,7 @@ impl ExoMirror {
         if self.health != Health::Exact || !selection.is_empty() {
             return None;
         }
-        let from = self.projected_from()?;
+        let from = self.project().ok()?;
         if self.lookup(from, text, selection) != Lookup::Missing {
             return None;
         }
@@ -542,11 +536,11 @@ impl ExoMirror {
 
     /// Where the history Exo will hold once it has processed every request
     /// in flight starts in `expected`, of which it is a suffix: every event
-    /// so far came before them. `None` if one of them will reset it, may,
-    /// or will empty it.
-    fn projected_from(&self) -> Option<usize> {
+    /// so far came before them. Walks the requests in flight until one will
+    /// reset the history, may, or will empty it ([`Stop`]).
+    fn project(&self) -> Result<usize, Stop> {
         let mut from = 0;
-        for (_, sent) in &self.in_flight {
+        for (at, (_, sent)) in self.in_flight.iter().enumerate() {
             let Sent::Report {
                 text,
                 cursor,
@@ -554,17 +548,19 @@ impl ExoMirror {
                 ..
             } = sent
             else {
-                return None;
+                let mut rest = self.in_flight.iter().skip(at);
+                let reports_after = rest.any(|(_, sent)| matches!(sent, Sent::Report { .. }));
+                return Err(Stop::Cancelled { reports_after });
             };
             let Some(selection) = report_selection(text, *cursor, *anchor) else {
                 continue;
             };
             match self.lookup(from, text, selection) {
                 Lookup::Match(at) => from = at,
-                Lookup::Ambiguous | Lookup::Missing => return None,
+                Lookup::Ambiguous | Lookup::Missing => return Err(Stop::Unmatched),
             }
         }
-        Some(from)
+        Ok(from)
     }
 
     pub(super) fn health(&self) -> Health {

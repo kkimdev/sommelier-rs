@@ -72,7 +72,7 @@ pub(crate) const MAX_BYTES_PER_SEND: usize = crate::virtwl_channel::MAX_SEND_SIZ
 /// A submission ends only at an entry of `ends`, one per pushed entry. An
 /// entry may hold several messages, which a submission then never splits:
 /// the IME glues a surrounding-text report or a `reset` and the
-/// `wl_display.sync` after it into one (`ime::HostOut::GluedBarrier`).
+/// `wl_display.sync` after it into one (`ime::HostOut::Glued`).
 #[derive(Debug, Default)]
 pub(crate) struct OutgoingMessages {
     bytes: Vec<u8>,

@@ -349,7 +349,7 @@ impl Reference {
             UserAction::Key(key) | UserAction::KeyDown(key) => {
                 let out = match self.typing.latin {
                     true => Output::default(),
-                    false => self.composer.key(key),
+                    false => self.composer.chromeos_key(key),
                 };
                 // A key commits a reconverted region as it is.
                 let region = self.region.take().unwrap_or_default();
@@ -422,9 +422,7 @@ impl Reference {
     /// rather than consume it; a Latin layout has no engine. The ChromeOS
     /// Korean engine takes a Space that ends a composition, with it (E15).
     pub fn engine_passes(&self, key: Key) -> bool {
-        let out = self.composer.clone().key(key);
-        let ends_with_space = key == Key::Char(' ') && !out.commit.is_empty();
-        !self.typing.latin && !out.consumed && !ends_with_space
+        !self.typing.latin && !self.composer.clone().chromeos_key(key).consumed
     }
 
     /// Whether accepting a suggestion would replace a word: one is before

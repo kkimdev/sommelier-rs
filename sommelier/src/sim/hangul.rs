@@ -47,8 +47,11 @@ limitations under the License.
 //!
 //! Assumptions only a real ChromeOS host can confirm: that its Korean
 //! input method, with default settings, composes and deletes jamo by jamo
-//! as above, lone compound consonants included; and that Space, Enter, the arrows and punctuation commit the
-//! syllable and then reach the application, rather than being consumed.
+//! as above, lone compound consonants included; and that Enter, the
+//! arrows and punctuation commit the syllable and then reach the
+//! application, rather than being consumed. A host trace showed that the
+//! engine consumes a Space that ends a syllable, and commits it with the
+//! syllable (E15), which [`Composer::chromeos_key`] adds.
 
 /// A key the user presses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +223,17 @@ impl Composer {
             preedit: self.preedit(),
             consumed: true,
         }
+    }
+
+    /// Feeds one key as the ChromeOS Korean engine takes it: a Space that
+    /// ends a composition is consumed, and committed with it (E15).
+    pub fn chromeos_key(&mut self, key: Key) -> Output {
+        let mut out = self.key(key);
+        if key == Key::Char(' ') && !out.commit.is_empty() {
+            out.commit.push(' ');
+            out.consumed = true;
+        }
+        out
     }
 
     /// The composition, as the user sees it; empty if none.
@@ -583,5 +597,17 @@ mod tests {
         // Neither leaves anything for the next vowel to join.
         assert_eq!(composer.key(Key::Char('k')).preedit, "ㅏ");
         assert_eq!(cancelled.key(Key::Char('k')).preedit, "ㅏ");
+    }
+
+    /// E15: the ChromeOS engine consumes a Space that ends a syllable,
+    /// and commits it with the syllable; one with nothing composed passes.
+    #[test]
+    fn a_space_that_ends_a_syllable_is_committed_with_it() {
+        let mut composer = Composer::default();
+        composer.chromeos_key(Key::Char('r'));
+        composer.chromeos_key(Key::Char('k'));
+        let out = composer.chromeos_key(Key::Char(' '));
+        assert_eq!((out.commit.as_str(), out.consumed), ("가 ", true));
+        assert!(!composer.chromeos_key(Key::Char(' ')).consumed);
     }
 }

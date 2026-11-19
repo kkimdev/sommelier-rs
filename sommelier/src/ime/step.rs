@@ -282,10 +282,10 @@ impl ImeCore {
         let Some(ext) = self.inputs.remove(&ti).map(|t| t.host().ext) else {
             return;
         };
-        fx.to_host.extend([
-            HostOut::Request(zcr_extended_text_input_v1::req::destroy(ext.id)),
-            HostOut::Retire(ext.id),
-        ]);
+        fx.to_host.push(HostOut::Destroy {
+            request: zcr_extended_text_input_v1::req::destroy(ext.id),
+            id: ext.id,
+        });
     }
 
     /// H2 and H2'.
@@ -416,10 +416,10 @@ impl ImeCore {
                     fx.to_guest.extend(events);
                     fx.to_guest.push(resend);
                     // Glued, as the mirror applies the reset at its fence.
-                    fx.to_host.extend([
-                        HostOut::Request(zwp_text_input_v1::req::reset(t.host().v1)),
-                        HostOut::GluedBarrier(fence),
-                    ]);
+                    fx.to_host.push(HostOut::Glued {
+                        request: zwp_text_input_v1::req::reset(t.host().v1),
+                        barrier: fence,
+                    });
                     t.exo_mut().cancel_sent(fence);
                     fx.keys.push(lease);
                 }
@@ -519,8 +519,7 @@ impl ImeCore {
                 let barrier = BarrierToken(self.next_barrier);
                 self.next_barrier += 1;
                 let one_read = request.0.len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
-                fx.to_host
-                    .extend([HostOut::Request(request), HostOut::GluedBarrier(barrier)]);
+                fx.to_host.push(HostOut::Glued { request, barrier });
                 t.exo_mut().report_sent(barrier, report, one_read, stated);
             }
             if let Some(content_type) = steps.content_type {

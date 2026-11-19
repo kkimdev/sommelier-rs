@@ -206,12 +206,19 @@ pub enum HostOut {
     /// Queue a host `wl_display.sync` here. Its `done` comes back as
     /// [`Input::BarrierDone`].
     Barrier(BarrierToken),
-    /// A [`Self::Barrier`] that the previous request and it reach the host
-    /// in one submission, which Exo dispatches in one read, so that no
-    /// event of Exo's falls between them.
-    GluedBarrier(BarrierToken),
-    /// Retire the host object the previous request destroyed.
-    Retire(u32),
+    /// `request`, then a [`Self::Barrier`], which reach the host in one
+    /// submission, which Exo dispatches in one read, so that no event of
+    /// Exo's falls between them.
+    Glued {
+        request: Outgoing,
+        barrier: BarrierToken,
+    },
+    /// `request`, the destructor of host object `id`, which is then
+    /// retired.
+    Destroy {
+        request: Outgoing,
+        id: u32,
+    },
 }
 
 /// What becomes of the Backspace repeat leased to a text input.

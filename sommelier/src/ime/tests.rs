@@ -160,21 +160,22 @@ fn guest_events(queue: &[Outgoing]) -> Vec<(u32, AnyEvent)> {
 }
 
 fn decode(fx: Effects) -> Out {
+    let req = |request| {
+        let [(id, request)] = decoded(&[request], |m| {
+            AnyRequest::from_wire(interface(m.sender_id), m)
+        })
+        .try_into()
+        .unwrap();
+        Host::Req(id, request)
+    };
     let host = fx
         .to_host
         .into_iter()
-        .map(|out| match out {
-            HostOut::Request(request) => {
-                let [(id, request)] = decoded(&[request], |m| {
-                    AnyRequest::from_wire(interface(m.sender_id), m)
-                })
-                .try_into()
-                .unwrap();
-                Host::Req(id, request)
-            }
-            HostOut::Barrier(token) => Host::Barrier(token),
-            HostOut::GluedBarrier(token) => Host::GluedBarrier(token),
-            HostOut::Retire(id) => Host::Retire(id),
+        .flat_map(|out| match out {
+            HostOut::Request(request) => vec![req(request)],
+            HostOut::Barrier(token) => vec![Host::Barrier(token)],
+            HostOut::Glued { request, barrier } => vec![req(request), Host::GluedBarrier(barrier)],
+            HostOut::Destroy { request, id } => vec![req(request), Host::Retire(id)],
         })
         .collect();
     let keys = fx

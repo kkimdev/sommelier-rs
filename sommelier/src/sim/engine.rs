@@ -284,14 +284,10 @@ impl Engine {
         }
         let shown = self.composer.preedit();
         let Output {
-            mut commit,
+            commit,
             preedit,
-            mut consumed,
-        } = self.composer.key(key);
-        if key == Key::Char(' ') && !commit.is_empty() {
-            commit.push(' ');
-            consumed = true;
-        }
+            consumed,
+        } = self.composer.chromeos_key(key);
         let mut actions = Vec::new();
         let shown = if commit.is_empty() {
             shown
