@@ -299,8 +299,8 @@ the fuzzer's included, runs it after every batch that keeps the session.
 A seat reference is the exception: it outlives its seat
 ([Object lifetimes](INVARIANTS.md#object-lifetimes)), so only its copies
 are checked, against their keyboard's. It also checks the IME core's
-invariants (`ImeCore::assert_invariants`, design 3.1 of
-[IME_REDESIGN.md](IME_REDESIGN.md)), and that each text input's drain
+invariants (`ImeCore::assert_invariants`, I1a to I7 of
+[IME.md](IME.md#31-state)), and that each text input's drain
 and press fence wait for a pending `InternalCallback::TextInput`.
 
 ### Message effects
@@ -484,7 +484,8 @@ and bridges each guest v3 object to a host v1 object plus its extension.
 The IME core (`sommelier/src/ime`, `Context::ime`) owns the state of
 every text input: its field, its link to the host text input, its
 composition and its barriers. It is a sans-IO state machine
-([IME_REDESIGN.md](IME_REDESIGN.md) section 3): every message that can
+([IME.md](IME.md#3-the-ime-core) section 3, which implements the
+behaviour table of its section 2): every message that can
 change that state reaches it as one `ime::Input` through `ImeCore::step`,
 which returns the guest events, host requests and barriers, and
 keyboard-concern requests it makes, and reads what it does not own (the
@@ -511,7 +512,7 @@ activation step and, when the attached input method lacks it, the content
 type. `step` sends them for every text input at the end of each input, so
 between messages every link matches its target, but one that drains, one
 whose activation no live seat can carry, and an attached one whose seat
-has ended (design 3.1, I1b).
+has ended (I1b of [IME.md](IME.md#31-state)).
 The surrounding text and cursor rectangle are not reconciled: Exo keeps
 both regardless and edits its copy of the text as the input method
 commits, so each guest commit forwards the ones it states, but for a
@@ -529,8 +530,9 @@ the mirror while the guest is in step, and dropped otherwise, as it is
 always below v11; and a guest report that leaves out the preedit it
 shows, which Exo holds inline, is withheld when the mirror finds that
 preedit the only difference from a state Exo will hold. `ime/state.rs`
-keeps only what the guest is shown. A guest commit that leaves the field enabled is answered
-with a `done`, which Chromium waits for before it sends more. A pointer
+keeps only what the guest is shown. A guest commit that leaves the
+field enabled is answered with a `done`, which Chromium waits for before
+it sends more. A pointer
 press or a touch-down on the surface of a composition ends it before the
 guest gets the press, as mutter and KWin do: `pointer.rs` follows each
 pointer's surface, `touch.rs` reads a down's own, the guest commits the

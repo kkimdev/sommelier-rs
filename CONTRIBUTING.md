@@ -174,13 +174,14 @@ types into models of Chromium's and GTK's text-input-v3 clients through
 a whole proxy client (`proxy::harness::Session`), with a model of Exo
 and its Korean input method behind it. Every message travels a FIFO
 channel with a drawn latency on one virtual clock, so a seed fixes the
-whole case, timing included; `docs/IME_REDESIGN.md` section 4 describes
-it. `ime_reaches_the_specified_text` holds the proxy to the
-specification, whatever the timing: after every message the proxy
-handles, the transactions the guest gets and what it then shows, the
-preedit's cursor included, and the activations and resets the proxy asks
-of the host. `ime_reaches_the_intended_text` also holds the client to
-the user's intent, in cases that settle around every click, tap, focus
+whole case, timing included; [docs/IME.md](docs/IME.md#4-the-dst-harness)
+describes it. `ime_reaches_the_specified_text` holds the proxy to the
+specification (section 2 of that document), whatever the timing:
+after every message the proxy handles, the transactions the guest gets
+and what it then shows, the preedit's cursor included, and the
+activations and resets the proxy asks of the host.
+`ime_reaches_the_intended_text` also holds the client to the user's
+intent, in cases that settle around every click, tap, focus
 move and restart of the input method, and after a key the input method
 passes while it takes the engine to compose, whose confirmation then
 resets the engine. Exo's deletes and preedit regions must reach the

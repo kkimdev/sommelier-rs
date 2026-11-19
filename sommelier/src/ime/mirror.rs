@@ -18,7 +18,7 @@ limitations under the License.
 //! keeps for one host `zwp_text_input_v1`, driven only by the wire. It is
 //! pure: the core feeds it every request it sends and every event Exo
 //! sends, and reads it to measure Exo's deletes and preedit regions
-//! (`docs/IME_REDESIGN.md` 2.2, X1 and H9).
+//! (`docs/IME.md` 2.2, X1 and H9).
 //!
 //! Sources, all at Chromium `main` **`6975bb48a8cd`** (2026-11-19), which
 //! line numbers below refer to: `ui/base/ime/surrounding_text_tracker.cc`
@@ -56,11 +56,11 @@ limitations under the License.
 //! that needs adversarial text, and the echo checks would likely catch
 //! what follows from it.
 //!
-//! The mirror says how much it knows ([`Health`], design single-exo-model
-//! 3.3): the prediction is exact, exact but for its selection (vague), or
-//! unknown, and so is each history state. An event the mirror cannot
-//! follow makes the prediction unknown and pushes an unknown state; a
-//! report Exo processes heals it whenever its outcome is certain.
+//! The mirror says how much it knows ([`Health`]): the prediction is
+//! exact, exact but for its selection (vague), or unknown, and so is each
+//! history state. An event the mirror cannot follow makes the prediction
+//! unknown and pushes an unknown state; a report Exo processes heals it
+//! whenever its outcome is certain.
 
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hasher};
@@ -339,8 +339,7 @@ pub(super) enum Sent {
     Cancel,
 }
 
-/// How much the mirror knows of Exo's prediction (design single-exo-model
-/// 3.3).
+/// How much the mirror knows of Exo's prediction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Health {
     /// It equals Exo's.
@@ -510,7 +509,7 @@ impl ExoMirror {
         false
     }
 
-    /// Report suppression (design exo-mirror 5): whether an exact mirror
+    /// Report suppression (G9c): whether an exact mirror
     /// finds that the guest's report `(text, cursor, anchor)`, from a guest
     /// that shows the preedit `shown`, would only make Exo drop its
     /// composition. It names no state of the history Exo will hold once it

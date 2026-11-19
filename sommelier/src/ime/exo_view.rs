@@ -18,7 +18,7 @@ limitations under the License.
 //! the [`ExoMirror`] of its host text input, fed every request the core
 //! sends and every event Exo sends, and whether the guest is in step with
 //! it, which is when a [`Frame`] measures Exo's deletes (H9) and preedit
-//! regions (X1) in Exo's own text (`docs/IME_REDESIGN.md` 2.2). The core
+//! regions (X1) in Exo's own text (`docs/IME.md` 2.2). The core
 //! drops every delete and region it cannot measure so ([`Unmeasured`]).
 
 use std::collections::VecDeque;
@@ -49,7 +49,7 @@ pub(super) struct ExoView {
     mirror: Option<ExoMirror>,
     /// The guest's text is Exo's predicted text without the composition
     /// Exo holds, which the guest shows as its preedit, with its cursor
-    /// where Exo predicts it (design exo-mirror 3.1), but for `unseen`.
+    /// where Exo predicts it, but for `unseen`.
     /// Only a report sets it: one Exo has processed, or one the core
     /// withheld. Never without the mirror.
     in_step: bool,
@@ -102,7 +102,7 @@ pub(super) struct Edit {
 }
 
 /// Exo's state before a host event, with the guest in step with it, in
-/// which the event is measured (design exo-mirror 3.3).
+/// which the event is measured.
 #[derive(Clone, Debug)]
 pub(super) struct Frame {
     state: ExoState,
@@ -127,7 +127,7 @@ impl ExoView {
         }
     }
 
-    /// Whether a frame measures the next event (design exo-mirror 3.1).
+    /// Whether a frame measures the next event.
     #[cfg(test)]
     pub(super) fn in_step(&self) -> bool {
         self.in_step && !self.unseen
@@ -160,9 +160,8 @@ impl ExoView {
     /// The frame `frame` made before the event just observed, if it
     /// measures the event: the text input has a mirror, which was exact
     /// before the event and after it, the guest has stated every key and
-    /// press, no report on its way to Exo crossed the event (design
-    /// exo-mirror 3.3, "Crossings"), and the guest was in step with the
-    /// frame.
+    /// press, no report on its way to Exo crossed the event, and the guest
+    /// was in step with the frame.
     pub(super) fn measuring(&self, frame: Result<Frame, Unmeasured>) -> Result<Frame, Unmeasured> {
         let mirror = self.mirror.as_ref().ok_or(Unmeasured::NoMirror)?;
         // An event can make a mirror that was unsure exact again.
@@ -225,8 +224,7 @@ impl ExoView {
     /// before it, `edit` what reached the guest, if anything did, and
     /// `shown` the preedit the guest shows now: whether the event's
     /// transaction keeps a guest in step with Exo if it was, which the new
-    /// state records, and so whether the guest still is (design exo-mirror
-    /// 3.2).
+    /// state records, and so whether the guest still is.
     pub(super) fn after(
         &mut self,
         frame: Option<&Frame>,
@@ -315,7 +313,7 @@ impl ExoView {
             .push_back((token, stated.then_some(since), false));
     }
 
-    /// Report suppression (design exo-mirror 5): with the mirror, whether
+    /// Report suppression (G9c): with the mirror, whether
     /// the core withholds the guest's report `report`, from a guest that
     /// shows `shown`, which Exo could not match only for the composition
     /// the guest shows outside its text, so that it would only drop that
@@ -349,10 +347,10 @@ impl ExoView {
     }
 
     /// The barrier `token` is done. A report Exo processed puts the guest in
-    /// step if it matched a state the guest is in step with, or reset Exo
-    /// to the guest's text with no edit of Exo's since the guest's commit
-    /// before it; either with no other edit since the report (design
-    /// exo-mirror 3.2). Without the mirror nothing waits for a barrier.
+    /// step if it matched a state the guest is in step with, or reset Exo to
+    /// the guest's text with no edit of Exo's since the guest's commit
+    /// before it; either with no other edit since the report. Without the
+    /// mirror nothing waits for a barrier.
     pub(super) fn barrier_done(&mut self, ti: TiId, token: BarrierToken) {
         let Some(mirror) = &mut self.mirror else {
             return;

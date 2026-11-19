@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! **Tier 1, exact, every case.** [`SpecText`] reads what reached the
 //! proxy, in order ([`Seen`]), and applies the specification of the
-//! design's section 2 (`docs/IME_REDESIGN.md`) to an ideal client per
+//! design's section 2 (`docs/IME.md`) to an ideal client per
 //! field. From the inputs alone it decides what the proxy must ask of the
 //! host: an `activate` or a `deactivate` and its barrier where the field's
 //! wish and the link differ, and a `reset` and its fence for a press that
@@ -40,7 +40,7 @@ limitations under the License.
 //! Exo's deletes (H9) and preedit regions (X1) reach the guest as
 //! `SpecText` measures them in Exo's real text ([`RegionTruth`]), from v11
 //! of the host's text-input extension, or not at all: the proxy drops what
-//! its Exo mirror cannot measure (design single-exo-model 3.4), and below
+//! its Exo mirror cannot measure, and below
 //! v11 every one ([`SpecText::resolve`]). Exo sends no `preedit_styling`
 //! (H4).
 
@@ -1453,7 +1453,7 @@ impl SpecText {
     /// field's.
     ///
     /// With an Exo mirror the proxy may withhold a report while the guest
-    /// shows a preedit (design exo-mirror 5), if Exo's tracker holds the
+    /// shows a preedit, if Exo's tracker holds the
     /// report with that preedit as its composition, which the caller
     /// checks.
     fn check_reports(&mut self) {
@@ -1874,10 +1874,9 @@ pub(super) fn intended(reference: &Reference, client: &dyn Client) -> Vec<Failur
 /// PR that fixes it deletes both. C5 deleted the last two of tier 2, the
 /// focus loss (P1) and the restart that lost a composition Exo no longer
 /// tracked (H2), by committing the shown preedit at both. Report
-/// suppression (M4 of the Exo mirror plan) deleted the report that left
-/// out the shown preedit (E4), and the single Exo model (design
-/// single-exo-model) the four of the old measurement of regions. None
-/// is known now.
+/// suppression (G9c) deleted the report that left
+/// out the shown preedit (E4), and the single Exo model the four of the
+/// old measurement of regions. None is known now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum KnownIssue {}
 

@@ -8,10 +8,11 @@ the proxy; the rules it keeps are under
 
 A key can reach the guest four ways: a `wl_keyboard.key`, a key the
 `wl_keyboard.enter` lists, a text-input keysym, and a press and release
-the proxy recovers for an empty IME confirmation (X2'). Exo announces each
-key on `zcr_extended_keyboard_v1.peek_key` first, even one its input
-method consumes, so the proxy sees the key's physical life on two
-channels and its delivery on up to three.
+the proxy recovers for an empty IME confirmation (X2' of
+[IME.md](IME.md#22-host-events)). Exo announces each key on
+`zcr_extended_keyboard_v1.peek_key` first, even one its input method
+consumes, so the proxy sees the key's physical life on two channels and
+its delivery on up to three.
 
 ## State
 
@@ -49,10 +50,11 @@ beside the new one (`retired_guest_releases`), at most one per channel.
 
 Phase and guest delivery are independent because the channels race: a
 keysym can come before the key's peek, and a `wl_keyboard` press after
-its peek release. Within each part the old flags' illegal combinations
-cannot be written:
+its peek release. The registry's model test (see [Tests](#tests)) keeps
+each generation as independent flags; within each part, their illegal
+combinations cannot be written:
 
-| Flag before | Now |
+| Model flag | State |
 | --- | --- |
 | `physical_state` | the `KeyPhase` variant |
 | `peek`, `peek_press_serial` | `PeekRecord`, inside `Held` and `Released`; a live peek's serial is its announced serial |

@@ -1096,8 +1096,7 @@ impl Exo {
     /// Whether the tracker of the text input attached on the focused
     /// surface holds a state with the composition `composition` at the
     /// cursor of the report `(text, cursor, anchor)`, which that state is
-    /// without it: a report that would only drop the composition (design
-    /// exo-mirror 5).
+    /// without it: a report that would only drop the composition.
     pub(super) fn holds_with_composition(
         &self,
         (text, cursor, anchor): &(String, u32, u32),

@@ -25,7 +25,7 @@ limitations under the License.
 //! included. The user ([`user`]) types Korean or Latin, clicks, taps and
 //! moves the focus. Two oracles judge the case once it settles
 //! ([`oracle`]): tier 1, every case, holds the proxy to the specification
-//! of `docs/IME_REDESIGN.md`, section 2, whatever the timing; tier 2,
+//! of `docs/IME.md`, section 2, whatever the timing; tier 2,
 //! settled cases only, holds the client to the user's intent. The design's
 //! section 4 describes it whole.
 //!

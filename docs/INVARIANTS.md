@@ -708,6 +708,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
 
 ## Keyboard and IME
 
+IDs such as E6, C11, H2 and X2' name the behaviour rows and the Exo and
+client facts of [IME.md](IME.md), which also describes the IME core and
+the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
+
 - **Keymaps are mapped privately.** `wl_keyboard.keymap` descriptors MUST be
   mapped read-only with `MAP_PRIVATE`, as the protocol requires, on both
   the VirtWL and plain memfd paths. Do not switch to `MAP_SHARED` because
@@ -914,9 +918,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   is such a detach, since the proxy's own `deactivate` starts draining
   first: the generation ends there without a barrier, its composition
   ends, and reconciling activates again if the guest still wants input.
-  Exo's detach confirms first (E6 of [IME_REDESIGN.md](IME_REDESIGN.md)
-  2.4): `confirm_preedit` from extension v11, and below it a
-  `commit_string` of the composition Exo tracks, which reach the proxy
+  Exo's detach confirms first (E6 of
+  [IME.md](IME.md#24-exo-facts-the-models-implement)): `confirm_preedit`
+  from extension v11, and below it a `commit_string` of the composition
+  Exo tracks, which reach the proxy
   while it is attached and commit the preedit the guest shows. A preedit
   the guest still shows at the `leave` is one Exo no longer tracked: a
   report it could not match dropped it (E4), so nothing confirmed it. The
@@ -959,8 +964,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   disabled and is not activated. The flag lives in the committed state of
   the focused field, so a focus change, a surface's end and the object's
   end clear it with the field, and the IME core's invariants check that
-  one text input at most has it (I3 of
-  [IME_REDESIGN.md](IME_REDESIGN.md) 3.1).
+  one text input at most has it (I3 of [IME.md](IME.md#31-state)).
   Test: `second_text_input_enable_on_the_connection_is_ignored`.
 - **Focus teardown sends `leave` itself.** When a focused text-input
   surface is destroyed or loses focus, the proxy MUST send
@@ -991,8 +995,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   (`KeyboardFocusRegistry::leave` retires them, each still owed its own
   `leave`): the commit goes before every keyboard's `leave`. mutter and
   ibus commit a preedit at a focus-out, and Exo's detach confirms the
-  composition (E6 of [IME_REDESIGN.md](IME_REDESIGN.md) 2.4), so Exo keeps
-  the text too. But the keyboard hears of a focus move before the text
+  composition (E6 of
+  [IME.md](IME.md#24-exo-facts-the-models-implement)), so Exo keeps the
+  text too. But the keyboard hears of a focus move before the text
   input (E12), so the proxy has reset the field and started draining when
   that confirmation arrives, and drops it; without its own commit the
   guest would lose the syllable. The commit goes first because a client
@@ -1186,7 +1191,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `commit_string` pair the mirror could misread; it is fixed when the
   text input is created. The mirror is a replica of the
   `ui::SurroundingTextTracker` Exo keeps for the host text input
-  (`docs/IME_REDESIGN.md` 2.2 X1 and H9; Chromium `main` 6975bb48a8cd),
+  ([IME.md](IME.md#22-host-events) X1 and H9; Chromium `main` 6975bb48a8cd),
   and the core feeds it every event of the text input before the gate,
   since stale and fenced events changed Exo's tracker too. Without a
   mirror, every delete and region is dropped
@@ -1286,7 +1291,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     never deletes or loses the guest's text, and the guest's next report,
     which names no state of Exo's, resets Exo to the guest's text.
   - With a mirror, a guest report that would only drop Exo's composition
-    is withheld (design exo-mirror 5; `ime::exo_view::ExoView::withholds`).
+    is withheld (`ime::exo_view::ExoView::withholds`; G9c of
+    [IME.md](IME.md#21-guest-requests)).
     A v3 guest reports its text without
     the preedit it shows, while every state Exo predicted since the
     composition began holds it inline, so such a report names none and Exo
@@ -1308,14 +1314,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     no-op, and one that names none resets Exo to the guest's text. Nothing
     is ever inserted into a report, so a wrong mirror can only leave Exo
     stale until the composition ends, never put the preedit in Exo's text.
-  The DST checks at every `done` of a sync that an exact mirror's
-  prediction equals the simulated Exo's tracker's, and that its history
-  holds the fingerprints of the tracker's (an unknown state fits any
-  state, a leading one any number of them), and that Exo's tracker holds
-  each report the proxy withheld with the shown preedit as its
-  composition. Its specification sends a delete or region as it measures
-  it in the simulated Exo's text, or not at all, and below v11 never; it
-  counts the proxy's drops by cause (`Counts::drops`), and fails a
+  The DST holds the mirror to the simulated Exo's tracker at every
+  sync, and each delete and region to what that Exo held
+  ([IME.md](IME.md#48-known-issues-and-the-mirror-checks)); it fails a
   settled case with a drop the mirror could measure.
   Tests: `a_report_reaches_the_host_with_its_barrier`,
   `a_reports_barrier_is_glued_into_its_entry`,
@@ -1343,8 +1344,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_report_unlike_a_vague_selection_heals_it`,
   `a_report_without_the_shown_preedit_is_withheld`.
   The core's row tests of G1 (the mirror from v11), X1 and H9, and of
-  report suppression, are listed in the design's rows and G9c
-  (`docs/IME_REDESIGN.md` 2.1 and 2.2).
+  report suppression, are listed in their rows of
+  [IME.md](IME.md#2-behavioural-specification).
 - **Every commit that leaves a field enabled gets a `done`.** The proxy
   answers each such v3 `commit` with a `done` that carries its serial, as
   mutter and KWin do. The protocol has a client send its surrounding text,
@@ -1361,11 +1362,13 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   which ends the composition and the Backspace repeat leased to it and
   tells the host its content type again. An enable of an enabled field
   keeps the composition, as mutter and KWin keep the preedit across it,
-  and the host keeps the content type, since before the v8 extension a
-  resend would reset its composition. GTK3 sends one on a click's
-  release in the field, after its press; a press on the field's surface
-  has already ended the composition (next rule), so the composition it keeps is one
-  a click elsewhere, such as on a subsurface, left running. A commit that disables
+  and the host keeps its content type unless the commit changes it,
+  since before the v8 extension a resend would reset its composition; a
+  changed one is sent again, as for any commit. GTK3 sends one on a
+  click's release in the field, after its press; a press on the field's
+  surface has already ended the composition (next rule), so the
+  composition it keeps is one a click elsewhere, such as on a
+  subsurface, left running. A commit that disables
   the field, and a commit while unfocused, get no `done`, as from mutter;
   nor does an enable ignored because another text input on the
   connection is enabled, which leaves the field disabled. A preedit the
