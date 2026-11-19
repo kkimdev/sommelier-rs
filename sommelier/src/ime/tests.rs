@@ -455,10 +455,11 @@ fn guest_txn_encodes_in_canonical_order() {
 }
 
 /// The production sources of the core.
-const SOURCES: [(&str, &str); 6] = [
+const SOURCES: [(&str, &str); 7] = [
     ("mod.rs", include_str!("mod.rs")),
     ("guest.rs", include_str!("guest.rs")),
     ("host.rs", include_str!("host.rs")),
+    ("mirror.rs", include_str!("mirror.rs")),
     ("serial.rs", include_str!("serial.rs")),
     ("state.rs", include_str!("state.rs")),
     ("step.rs", include_str!("step.rs")),
