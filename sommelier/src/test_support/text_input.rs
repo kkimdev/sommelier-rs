@@ -23,8 +23,10 @@ limitations under the License.
 //! what the peers receive uses `proxy::harness::Session` instead.
 
 use crate::handler::text_input::CtxEnv;
-use crate::ime::{Assembly, HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId};
-use crate::state::{Context, HostId, InternalCallback, V3Pending};
+use crate::ime::{
+    Assembly, HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId, V3Pending,
+};
+use crate::state::{Context, HostId, InternalCallback};
 
 /// A text input the guest committed, enabled unless [`Active::enabled`]
 /// says otherwise, and the host activated if enabled, as [`insert`] sets it

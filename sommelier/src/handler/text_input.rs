@@ -2396,7 +2396,7 @@ pub(super) mod tests {
         // read it to pin that the leave bounds what the requests change.
         assert_eq!(
             f.state().pending_for_test(),
-            &crate::state::V3Pending::default(),
+            &crate::ime::V3Pending::default(),
             "inactive v3 requests must not mutate double-buffered state"
         );
     }
@@ -5000,7 +5000,7 @@ pub(super) mod tests {
         }
 
         /// The committed state of the field, which is focused.
-        pub(in crate::handler) fn committed(&mut self) -> &mut crate::state::V3Committed {
+        pub(in crate::handler) fn committed(&mut self) -> &mut crate::ime::V3Committed {
             let state = self.state();
             state.committed_mut_for_test().expect("a focused field")
         }
@@ -5174,7 +5174,7 @@ pub(super) mod tests {
 
         assert!(ime.ctx.client_to_host_queue.is_empty());
         expected.set_commits_for_test(1);
-        *expected.pending_mut().expect("a focused field") = crate::state::V3Pending::default();
+        *expected.pending_mut().expect("a focused field") = crate::ime::V3Pending::default();
         assert_eq!(ime.state(), &expected);
         // The field stays enabled, so the commit gets its `done`.
         assert_eq!(ime.events(), [(TI, V3::Done { serial: 1 }.into())]);

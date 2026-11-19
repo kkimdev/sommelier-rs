@@ -42,7 +42,7 @@ pub(crate) use guest::delete_lengths;
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
 #[cfg(test)]
-pub(crate) use state::{Assembly, LinkState, TextInput};
+pub(crate) use state::{Assembly, LinkState, TextInput, V3Committed, V3Pending};
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

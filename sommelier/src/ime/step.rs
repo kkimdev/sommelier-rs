@@ -20,7 +20,7 @@ limitations under the License.
 
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
-use super::state::{Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput};
+use super::state::{Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput, V3Pending};
 use super::{
     BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, Input, KeyEffect, LeaseOutcome,
     SeatId, SurfaceId, TiId,
@@ -30,7 +30,6 @@ use crate::protocols::text_input_extension_unstable_v1::{
 };
 use crate::protocols::text_input_unstable_v1::{zwp_text_input_manager_v1, zwp_text_input_v1};
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::state::V3Pending;
 use crate::wire::{IndexedString, Outgoing};
 
 /// The log target of the replayable trace (design 3.3): every input, every

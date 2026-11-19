@@ -480,8 +480,8 @@ fn count_bumps_only_in_the_commit_arm() {
 }
 
 /// B5 and the core's isolation: one builder of the v3 transaction
-/// events, and no import from the rest of the proxy but the wire, the
-/// generated protocols and the three state types the old code shares.
+/// events, and no import from the rest of the proxy but the wire and the
+/// generated protocols.
 #[test]
 fn ime_is_isolated() {
     for event in [
@@ -497,21 +497,13 @@ fn ime_is_isolated() {
         );
     }
     assert_eq!(occurrences("crate::handler"), [] as [&str; 0]);
-    let state_types = |names: &str| {
-        names
-            .trim_matches(['{', '}'])
-            .split(',')
-            .all(|name| ["HostContentType", "V3Committed", "V3Pending"].contains(&name))
-    };
     for (file, source) in SOURCES {
         let mut source = source;
         while let Some(start) = source.find("use crate::") {
             let rest = &source[start + "use crate::".len()..];
             let end = rest.find(';').expect("a use ends");
             let path: String = rest[..end].split_whitespace().collect();
-            let allowed = path.starts_with("protocols::")
-                || path.starts_with("wire::")
-                || path.strip_prefix("state::").is_some_and(state_types);
+            let allowed = path.starts_with("protocols::") || path.starts_with("wire::");
             assert!(allowed, "{file} uses crate::{path}");
             source = rest;
         }
@@ -820,8 +812,8 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
 /// its `reconcile` over `HostApplied`, against the core's.
 #[test]
 fn reconcile_reaches_every_target_with_only_needed_requests() {
+    use super::host::HostContentType;
     use super::state::LinkState;
-    use crate::state::HostContentType;
     use host::{ActivationStep, HostSteps, HostTarget};
     let content_types: Vec<_> = [(1, 2), (3, 4)]
         .into_iter()

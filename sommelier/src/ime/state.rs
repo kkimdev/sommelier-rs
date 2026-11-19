@@ -24,10 +24,50 @@ use std::ops::Range;
 use super::guest::{delete_lengths, lengths_around_cursor, resolve_preedit_cursor};
 use super::guest::{GuestTxn, Preedit, TooLong};
 use super::host;
+use super::host::HostContentType;
 use super::serial::{CommitCount, Serial};
 use super::{BarrierToken, Env, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
-use crate::state::{HostContentType, V3Committed, V3Pending};
 use crate::wire::Outgoing;
+
+/// A text-input-v3 content type: `(hint, purpose)`.
+pub(super) type ContentType = (u32, u32);
+/// Text-input-v3 surrounding text: `(text, cursor, anchor)`.
+pub(super) type SurroundingText = (String, i32, i32);
+/// A text-input-v3 cursor rectangle: `(x, y, width, height)`.
+pub(super) type CursorRect = (i32, i32, i32, i32);
+
+/// The text-input-v3 requests a guest made since its most recent commit,
+/// each `None` until made.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct V3Pending {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) surrounding_text: Option<Option<SurroundingText>>,
+    pub(crate) content_type: Option<ContentType>,
+    pub(crate) cursor_rect: Option<CursorRect>,
+}
+
+impl V3Pending {
+    /// The pending state after `enable` or `disable`, which reset every
+    /// other piece of state. The host's v1 has no unset cursor rectangle,
+    /// so an empty one stands for it.
+    pub(crate) fn reset(enabled: bool) -> Self {
+        Self {
+            enabled: Some(enabled),
+            surrounding_text: Some(None),
+            content_type: Some(ContentType::default()),
+            cursor_rect: Some(CursorRect::default()),
+        }
+    }
+}
+
+/// The text-input-v3 state a guest has committed, but the cursor
+/// rectangle, which only the host keeps.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct V3Committed {
+    pub(crate) enabled: bool,
+    pub(crate) surrounding_text: Option<SurroundingText>,
+    pub(crate) content_type: ContentType,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TextInput {

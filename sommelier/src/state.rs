@@ -46,9 +46,9 @@ use xkbcommon::xkb;
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
-    CursorRect, GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostContentType,
-    KeyGenerationRegistry, KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate,
-    PeekKeyProvenance, PointerFocus, SeatFocusChange, V3Committed, V3Pending,
+    GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, KeyGenerationRegistry,
+    KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PeekKeyProvenance, PointerFocus,
+    SeatFocusChange,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::objects::{DeletedHostId, Link, ShadowTable};

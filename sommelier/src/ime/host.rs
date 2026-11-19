@@ -19,13 +19,21 @@ limitations under the License.
 //! [`LinkState`] to it ([`reconcile`]), and their
 //! encoding.
 
-use super::state::{LinkState, TextInput};
+use super::state::{ContentType, LinkState, TextInput};
 use super::Env;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::state::HostContentType;
 use crate::wire::Outgoing;
+
+/// A content type as the host applies it: the v3 content type, and the
+/// surrounding-text support told with it, or `None` if the host's
+/// extension cannot be told one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostContentType {
+    pub(super) content_type: ContentType,
+    pub(super) surrounding_text_support: Option<bool>,
+}
 
 /// The host state a text input should have (design 2, "Reconcile").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
