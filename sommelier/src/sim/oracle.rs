@@ -41,9 +41,10 @@ limitations under the License.
 //! text is ahead of what it last reported, which drops Exo's absolute
 //! deletes (H9), and the bytes the preedit regions took since, which with
 //! the preedit Exo holds give Exo's text, which Exo measures a region in
-//! (X1). In Mirror mode it measures both in Exo's real text, which the
-//! proxy may do only while the guest is in step with it, and accepts a
-//! drop ([`SpecText::measured`]). Exo sends no `preedit_styling` (H4).
+//! (X1). In Mirror mode it also measures both in Exo's real text, and the
+//! proxy must send either that transaction or Legacy mode's, which it falls
+//! back to whenever it cannot tell the guest is in step with Exo
+//! ([`SpecText::alternative`]). Exo sends no `preedit_styling` (H4).
 
 use std::collections::BTreeMap;
 
@@ -365,10 +366,12 @@ pub(super) struct Counts {
     /// Preedit regions dropped for their range or for not covering a
     /// region the guest had not reported (X1').
     pub regions_dropped: u64,
-    /// Mirror mode: deletes and regions the proxy dropped, and those of
-    /// them it dropped while the ideal client was in step with Exo.
+    /// Mirror mode: deletes and regions the proxy measured in Exo's text
+    /// and dropped, and those it measured as Legacy mode does, which it
+    /// falls back to while it cannot tell the guest is in step with Exo,
+    /// where the two differ.
     pub mirror_drops: u64,
-    pub mirror_drops_in_step: u64,
+    pub mirror_fallbacks: u64,
     /// Guest reports that crossed an edit on its way to the guest (P4).
     pub crossed_reports: u64,
     /// Preedit regions Exo made before it got a report the proxy had sent
@@ -434,7 +437,7 @@ impl std::ops::AddAssign for Counts {
         self.regions_ended += other.regions_ended;
         self.regions_dropped += other.regions_dropped;
         self.mirror_drops += other.mirror_drops;
-        self.mirror_drops_in_step += other.mirror_drops_in_step;
+        self.mirror_fallbacks += other.mirror_fallbacks;
         self.crossed_reports += other.crossed_reports;
         self.regions_crossing_reports += other.regions_crossing_reports;
         self.regions_stale += other.regions_stale;
@@ -485,7 +488,7 @@ struct Waiting {
 
 /// Mirror mode's transaction for a delete or a region measured in Exo's
 /// text (H9, X1), which the guest gets only if the proxy sends it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Measured {
     txn: Txn,
     cursor: (i32, i32),
@@ -494,6 +497,25 @@ struct Measured {
     shown: Option<Shown>,
     /// A delete, a region, or an empty region that ends the composition.
     kind: &'static str,
+}
+
+/// Mirror mode: what Legacy mode's delete or region changed of the
+/// specification, and what Exo's text measures instead: `None` if no guest
+/// can be in step with it, a selection's; or else the transaction, `None`
+/// for a drop ([`SpecText::alternative`]).
+#[derive(Debug)]
+struct Alternative {
+    views: Vec<View>,
+    shown: Option<Shown>,
+    taken: Option<(usize, usize)>,
+    ahead: bool,
+    edits: u64,
+    diverged: Option<&'static str>,
+    wrong_regions: Vec<(&'static str, String)>,
+    counts: Counts,
+    held: BTreeMap<u32, Held>,
+    txns: usize,
+    measured: Option<Option<Measured>>,
 }
 
 /// What the specification says the proxy does: the decisions it asks of
@@ -540,11 +562,9 @@ pub(super) struct SpecText {
     assembly: Option<i32>,
     /// The text input is in Mirror mode (`ime::ImeMode`).
     mirror: bool,
-    /// Mirror mode: the step's delete or region, and the transaction the
-    /// guest may get for it, measured in Exo's text ([`SpecText::held`]);
-    /// and whether the ideal client was in step with Exo then.
-    measured: Option<Option<Measured>>,
-    in_step: bool,
+    /// Mirror mode: the step's delete or region, measured in Exo's text,
+    /// and what Legacy mode's measurement changed ([`Alternative`]).
+    alternative: Option<Alternative>,
     /// The keys the host holds, by keycode, and the peeks so far: the
     /// sequence of the latest since the focus last moved, and their count.
     held: BTreeMap<u32, Held>,
@@ -608,8 +628,7 @@ impl SpecText {
             region_model: None,
             assembly: None,
             mirror: false,
-            measured: None,
-            in_step: false,
+            alternative: None,
             held: BTreeMap::new(),
             latest_peek: None,
             peeks: 0,
@@ -831,10 +850,19 @@ impl SpecText {
             &AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion {
                 index,
                 length,
-            }) if self.mirror => self.composition_event(origin, |spec| {
-                spec.measure_region(truth, index, length, origin);
-                None
-            }),
+            }) if self.mirror => {
+                let rollback = self.rollback();
+                self.composition_event(origin, |spec| {
+                    let measured = spec.measure_region(truth, index, length, origin);
+                    spec.alternative = Some(Alternative {
+                        measured,
+                        ..rollback
+                    });
+                    let edit = spec.region(index, length, origin);
+                    spec.judge_region(truth, edit.as_ref(), origin);
+                    edit
+                });
+            }
             &AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion {
                 index,
                 length,
@@ -1212,9 +1240,14 @@ impl SpecText {
             }
             // A negative index keeps the v1 XML's reading in Mirror mode.
             &v1::Event::DeleteSurroundingText { index, length } if self.mirror && index >= 0 => {
+                let rollback = self.rollback();
                 self.composition_event(origin, |spec| {
-                    spec.measure_delete(truth, index, length, origin);
-                    None
+                    let measured = spec.measure_delete(truth, index, length, origin);
+                    spec.alternative = Some(Alternative {
+                        measured,
+                        ..rollback
+                    });
+                    spec.delete(index, length)
                 });
             }
             &v1::Event::DeleteSurroundingText { index, length } => {
@@ -1358,6 +1391,69 @@ impl SpecText {
         Some((txn, preedit_cursor))
     }
 
+    /// Mirror mode: what Legacy mode's measurement of a delete or a region
+    /// may change, so that it can be undone.
+    fn rollback(&self) -> Alternative {
+        Alternative {
+            views: self.views.clone(),
+            shown: self.shown.clone(),
+            taken: self.taken,
+            ahead: self.ahead,
+            edits: self.edits,
+            diverged: self.diverged,
+            wrong_regions: self.wrong_regions.clone(),
+            counts: self.counts,
+            held: self.held.clone(),
+            txns: self.txns.len(),
+            measured: None,
+        }
+    }
+
+    /// Mirror mode: the guest got the transactions `got` for the step's
+    /// delete or region, after the step's earlier ones. They must be Legacy
+    /// mode's, which the specification applied, or the measurement in Exo's
+    /// text, which then replaces Legacy mode's.
+    fn resolve(&mut self, alternative: Alternative, got: &[(Txn, (i32, i32))]) {
+        let legacy = &self.txns[alternative.txns.min(self.txns.len())..];
+        let measured = alternative.measured.clone().map(|measured| {
+            let txn = measured.as_ref().map(|m| (m.txn.clone(), m.cursor));
+            (measured, txn.into_iter().collect::<Vec<_>>())
+        });
+        let Some(after) = got.get(alternative.txns..) else {
+            return;
+        };
+        match measured {
+            Some((measured, txns)) if after == txns && after != legacy => {
+                let Alternative {
+                    views,
+                    shown,
+                    taken,
+                    ahead,
+                    edits,
+                    diverged,
+                    wrong_regions,
+                    counts,
+                    held,
+                    txns,
+                    ..
+                } = alternative;
+                (self.views, self.shown, self.taken, self.ahead) = (views, shown, taken, ahead);
+                (self.edits, self.diverged, self.wrong_regions) = (edits, diverged, wrong_regions);
+                (self.counts, self.held) = (counts, held);
+                self.txns.truncate(txns);
+                match measured {
+                    Some(measured) => self.accept(measured),
+                    None => self.counts.mirror_drops += 1,
+                }
+            }
+            Some((_, txns)) if txns != legacy && after == legacy => {
+                self.counts.mirror_fallbacks += 1
+            }
+            None if !legacy.is_empty() && after == legacy => self.counts.mirror_fallbacks += 1,
+            _ => {}
+        }
+    }
+
     /// Mirror mode: where a guest in step with Exo's text before the
     /// event, `truth`, has its preedit: the composition, which it shows,
     /// with the rest of Exo's text and its cursor at the composition's
@@ -1369,7 +1465,7 @@ impl SpecText {
     /// client's text is no guide: a client model's can differ, as GTK's
     /// Backspace leaves a syllable's first jamo (C14). The specification
     /// holds the proxy only to a measurement in Exo's text, if it makes
-    /// one, and counts the drops where the ideal client was in step.
+    /// one, or else to Legacy mode's.
     fn held(truth: &RegionTruth) -> Option<std::ops::Range<usize>> {
         match &truth.composition {
             Some(composition) => Some(composition.clone()),
@@ -1380,37 +1476,19 @@ impl SpecText {
         }
     }
 
-    /// Whether the ideal client is in step with Exo's text before the
-    /// event, `truth`, with its preedit where `held` says.
-    fn client_in_step(&self, truth: &RegionTruth, held: &std::ops::Range<usize>) -> bool {
-        let Some(field) = self.focus else {
-            return false;
-        };
-        let model = &self.views[field].model;
-        let text = [&truth.text[..held.start], &truth.text[held.end..]].concat();
-        let preedit = &truth.text[held.clone()];
-        model.text == text
-            && model.cursor == held.start
-            && (held.is_empty() || model.preedit == *preedit)
-    }
-
     /// Mirror mode, X1: the bytes from `index` past Exo's cursor, `length`
     /// long, in Exo's text (`truth`), become the preedit, if they cover the
-    /// preedit Exo holds; an empty region leaves that preedit as text, which
-    /// the guest commits. The proxy sends it only while the guest is in
-    /// step with Exo.
+    /// preedit Exo holds, or are dropped; an empty region leaves that
+    /// preedit as text, which the guest commits.
     fn measure_region(
-        &mut self,
+        &self,
         truth: Option<&RegionTruth>,
         index: i32,
         length: u32,
         origin: Origin,
-    ) {
-        let held = truth.and_then(|truth| Some((truth, Self::held(truth)?)));
-        self.in_step = held
-            .as_ref()
-            .is_some_and(|(truth, held)| self.client_in_step(truth, held));
-        let measured = held.and_then(|(truth, held)| {
+    ) -> Option<Option<Measured>> {
+        let (truth, held) = truth.and_then(|truth| Some((truth, Self::held(truth)?)))?;
+        let measured = (|| {
             let start = usize::try_from(truth.cursor as i64 + i64::from(index)).ok()?;
             let end = start + length as usize;
             let text = truth.text.get(start..end)?;
@@ -1440,51 +1518,45 @@ impl SpecText {
                 ..Txn::default()
             };
             Some((txn, cursor, Some(shown), "region"))
-        });
-        self.measured = Some(measured.map(|(txn, cursor, shown, kind)| Measured {
+        })();
+        Some(measured.map(|(txn, cursor, shown, kind)| Measured {
             txn,
             cursor,
             origin,
             shown,
             kind,
-        }));
+        }))
     }
 
     /// Mirror mode, H9: Exo deletes `length` bytes from `index` of its text
     /// (`truth`), which holds no composition, around its cursor, the
-    /// guest's. The proxy sends it only while the guest is in step with
-    /// Exo.
+    /// guest's, or the delete is dropped.
     fn measure_delete(
-        &mut self,
+        &self,
         truth: Option<&RegionTruth>,
         index: i32,
         length: u32,
         origin: Origin,
-    ) {
-        let held = truth.and_then(|truth| Some((truth, Self::held(truth)?)));
-        self.in_step = held
-            .as_ref()
-            .is_some_and(|(truth, held)| self.client_in_step(truth, held));
-        let measured = held.and_then(|(truth, held)| {
-            let start = usize::try_from(index).ok()?;
-            let (before, after) = around(&truth.text, held.start, start as i64, length)?;
-            let around = held.is_empty() && (before, after) != (0, 0);
-            around.then(|| Measured {
-                txn: Txn {
-                    delete: (before, after),
-                    ..Txn::default()
-                },
-                cursor: (0, 0),
-                origin,
-                shown: None,
-                kind: "delete",
-            })
-        });
-        self.measured = Some(measured);
+    ) -> Option<Option<Measured>> {
+        let (truth, held) = truth.and_then(|truth| Some((truth, Self::held(truth)?)))?;
+        let start = usize::try_from(index).ok();
+        let lengths = start.and_then(|start| around(&truth.text, held.start, start as i64, length));
+        let measured = lengths.filter(|&lengths| held.is_empty() && lengths != (0, 0));
+        Some(measured.map(|(before, after)| Measured {
+            txn: Txn {
+                delete: (before, after),
+                ..Txn::default()
+            },
+            cursor: (0, 0),
+            origin,
+            shown: None,
+            kind: "delete",
+        }))
     }
 
     /// Mirror mode: the guest got `measured`, the transaction of the
-    /// step's delete or region.
+    /// step's delete or region, which changes what Legacy mode keeps as
+    /// the core's does.
     fn accept(&mut self, measured: Measured) {
         let Measured {
             txn,
@@ -1496,12 +1568,22 @@ impl SpecText {
         self.end_lease();
         self.shown = shown;
         match kind {
-            "delete" => self.counts.deletes += 1,
-            "ended" => self.counts.regions_ended += 1,
-            _ => self.counts.regions += u64::from(!txn.preedit.is_empty()),
-        }
-        if txn.delete != (0, 0) || !txn.commit.is_empty() || !txn.preedit.is_empty() {
-            self.edited();
+            "delete" => {
+                self.counts.deletes += 1;
+                self.edited();
+            }
+            "ended" => {
+                self.counts.regions_ended += 1;
+                self.edited();
+            }
+            _ if !txn.preedit.is_empty() => {
+                self.counts.regions += 1;
+                self.forward_edit();
+                let (before, after) = self.taken.unwrap_or_default();
+                let taken = (before + txn.delete.0, after + txn.delete.1);
+                self.taken = (taken != (0, 0)).then_some(taken);
+            }
+            _ => {}
         }
         self.counts.late_shown += u64::from(origin.late);
         self.apply(&txn, cursor);
@@ -1929,22 +2011,10 @@ impl Shadow {
 /// and preedit cursor included. Returns the difference, if any, and starts
 /// the next step.
 pub(super) fn step(spec: &mut SpecText, shadow: &mut Shadow) -> Option<String> {
-    // Mirror mode: the guest gets a measured delete or region only if the
-    // proxy found it in step with Exo; otherwise the proxy drops it.
-    if let Some(measured) = spec.measured.take() {
-        let sent = measured.as_ref().filter(|measured| {
-            let txns = (&spec.txns, &shadow.txns);
-            txns.1.len() == txns.0.len() + 1
-                && txns.1.starts_with(txns.0)
-                && txns.1.last() == Some(&(measured.txn.clone(), measured.cursor))
-        });
-        match sent.is_some() {
-            true => spec.accept(measured.expect("a measured transaction")),
-            false => {
-                spec.counts.mirror_drops += 1;
-                spec.counts.mirror_drops_in_step += u64::from(spec.in_step);
-            }
-        }
+    // Mirror mode: the guest gets Legacy mode's delete or region, or the
+    // one measured in Exo's text.
+    if let Some(alternative) = spec.alternative.take() {
+        spec.resolve(alternative, &shadow.txns);
     }
     let (expected, got) = (
         std::mem::take(&mut spec.txns),
@@ -2196,6 +2266,8 @@ impl KnownIssue {
 /// region in other text than the proxy knew
 /// ([`SpecText::judge_region`]).
 pub(super) fn classify(failures: &[Failure], counts: &Counts, mirror: bool) -> Vec<KnownIssue> {
+    // Legacy mode's issues reach Mirror mode only where it fell back.
+    let legacy = !mirror || counts.mirror_fallbacks > 0;
     let mut known = Vec::new();
     for failure in failures {
         let issue = match (failure.tier, failure.check) {
@@ -2203,7 +2275,7 @@ pub(super) fn classify(failures: &[Failure], counts: &Counts, mirror: bool) -> V
                 KnownIssue::ReportDropsComposition
             }
             // The rest are Legacy mode's: Mirror mode measures in Exo's text.
-            _ if mirror => return Vec::new(),
+            _ if !legacy => return Vec::new(),
             (Tier::Exact, "composition") if counts.regions_crossing_reports > 0 => {
                 KnownIssue::RegionCrossesReport
             }

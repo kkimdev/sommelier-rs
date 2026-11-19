@@ -2444,6 +2444,7 @@ fn row_G9c_a_forwarded_report_is_glued_to_a_barrier() {
 #[test]
 fn row_G9b_a_report_that_does_not_fit_queues_no_barrier() {
     let mut ime = Ime::enabled();
+    ime.report("", 0);
     let long = "x".repeat(4_084);
     ime.step(Input::SurroundingText(TI, long.as_str().into(), 0, 0));
     assert_eq!(ime.step_unanswered(Input::Commit(TI)).host, []);
@@ -2516,119 +2517,150 @@ fn row_X1_a_region_made_before_a_report_is_measured_before_it() {
     assert!(ime.in_step());
 }
 
+/// Mirror mode's guest output for the last of `steps`, which must be
+/// Legacy mode's: out of step with Exo, it falls back to Legacy mode,
+/// rather than drop what Legacy mode would measure.
+fn falls_back(steps: impl Fn(&mut Ime) -> Out) -> Vec<(u32, AnyEvent)> {
+    let mut mirror = Ime::enabled();
+    let out = steps(&mut mirror);
+    assert!(!mirror.in_step(), "the guest is in step");
+    let mut legacy = Ime::legacy_enabled();
+    assert_eq!(out.guest, steps(&mut legacy).guest, "not Legacy mode's");
+    out.guest
+}
+
 /// A report on its way to Exo that names no state of Exo's holds an
 /// edit of the guest's that Exo made the region without.
 #[test]
-fn row_X1_a_region_crossing_a_guest_edit_is_dropped() {
-    let mut ime = Ime::enabled();
-    ime.report("ab", 2);
-    let barrier = ime.report_unanswered("abX", 3);
-    assert_eq!(ime.region(-1, 1).guest, []);
-    // Exo then takes the report, which drops the region's composition.
-    ime.step(Input::BarrierDone(barrier));
-    let out = ime.region(-1, 1);
-    assert_eq!(out.guest, [delete(1, 0), preedit_at("X", 1, 1), done(3)]);
+fn row_X1_a_region_crossing_a_guest_edit_falls_back() {
+    let out = falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.report_unanswered("abX", 3);
+        ime.region(-1, 1)
+    });
+    assert_eq!(out, [delete(1, 0), preedit_at("X", 1, 1), done(3)]);
 }
 
-/// An event the mirror finds Exo could not have sent leaves it diverged,
-/// which measures nothing until it heals.
+/// An event the mirror finds Exo could not have sent leaves it diverged
+/// until it heals.
 #[test]
-fn row_X1_a_mirror_that_is_not_exact_drops() {
-    let mut ime = Ime::enabled();
-    ime.report("ab", 2);
-    assert_eq!(ime.region(-5, 1).guest, []);
-    assert_eq!(ime.region(-1, 1).guest, []);
+fn row_X1_a_mirror_that_is_not_exact_falls_back() {
+    let out = falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.region(-5, 1);
+        ime.region(-1, 1)
+    });
+    assert_eq!(out, [delete(1, 0), preedit_at("b", 1, 1), done(2)]);
 }
 
 /// A v11 confirmation keeps Exo's selection, inside the composition, while
 /// the guest's cursor goes after the preedit it commits.
 #[test]
-fn row_X1_after_a_confirm_inside_the_composition_drops() {
-    let mut ime = Ime::enabled();
-    ime.v1(HostIme::PreeditCursor(3));
-    ime.compose("가나");
-    assert!(ime.in_step());
-    let out = ime.ext(HostIme::Confirm {
-        keep_selection: true,
+fn row_X1_after_a_confirm_inside_the_composition_falls_back() {
+    let out = falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.v1(HostIme::PreeditCursor(3));
+        ime.compose("가나");
+        let confirmed = ime.ext(HostIme::Confirm {
+            keep_selection: true,
+        });
+        assert_eq!(confirmed.guest, [no_preedit(), commit("가나"), done(2)]);
+        ime.region(-2, 2)
     });
-    assert_eq!(out.guest, [no_preedit(), commit("가나"), done(1)]);
-    assert!(!ime.in_step());
-    assert_eq!(ime.region(-3, 3).guest, []);
+    assert_eq!(out, [delete(2, 0), preedit_at("ab", 2, 2), done(2)]);
 }
 
 /// v11's `SetEditableSelectionRange` moves Exo's selection and keeps its
 /// composition, while the guest commits it.
 #[test]
-fn row_H9_after_set_editable_selection_range_drops() {
-    let mut ime = Ime::enabled();
-    ime.report("ab", 2);
-    ime.compose("가");
-    ime.v1(HostIme::CursorPosition {
-        index: 0,
-        anchor: 0,
+fn row_H9_after_set_editable_selection_range_falls_back() {
+    falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.compose("가");
+        ime.v1(HostIme::CursorPosition {
+            index: 0,
+            anchor: 0,
+        });
+        let out = ime.host_commit("가");
+        assert_eq!(out.guest, [no_preedit(), commit("가"), done(2)]);
+        ime.delete(-1, 1)
     });
-    let out = ime.host_commit("가");
-    assert_eq!(out.guest, [no_preedit(), commit("가"), done(2)]);
-    assert!(!ime.in_step());
-    assert_eq!(ime.delete(0, 1).guest, []);
 }
 
 /// An empty region ends Exo's composition as text, which the guest
 /// commits, but leaves Exo's cursor inside it.
 #[test]
-fn row_H9_after_an_empty_region_with_exos_cursor_inside_drops() {
-    let mut ime = Ime::enabled();
-    ime.report("ab", 2);
-    ime.v1(HostIme::PreeditCursor(3));
-    ime.compose("가나");
-    let out = ime.region(0, 0);
-    assert_eq!(out.guest, [no_preedit(), commit("가나"), done(2)]);
-    assert!(!ime.in_step());
-    assert_eq!(ime.delete(2, 3).guest, []);
+fn row_H9_after_an_empty_region_with_exos_cursor_inside_falls_back() {
+    falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.v1(HostIme::PreeditCursor(3));
+        ime.compose("가나");
+        // Mirror mode commits "가나"; Legacy mode drops the region.
+        ime.region(0, 0);
+        ime.delete(2, 3)
+    });
 }
 
 /// A region dropped for not covering the preedit Exo holds leaves Exo
 /// composing what the guest does not show.
 #[test]
-fn row_H9_after_a_dropped_region_drops() {
-    let mut ime = Ime::enabled();
-    ime.report("abc", 3);
-    ime.compose("가");
-    assert_eq!(ime.region(-4, 1).guest, []);
-    assert!(!ime.in_step());
-    ime.ext(HostIme::Confirm {
-        keep_selection: true,
+fn row_H9_after_a_dropped_region_falls_back() {
+    falls_back(|ime| {
+        ime.report("abc", 3);
+        ime.compose("가");
+        assert_eq!(ime.region(-4, 1).guest, []);
+        ime.ext(HostIme::Confirm {
+            keep_selection: true,
+        });
+        ime.delete(3, 3)
     });
-    assert_eq!(ime.delete(3, 3).guest, []);
 }
 
 /// Chromium applies a delete before it clears the preedit it shows, and
 /// drops it (C3).
 #[test]
-fn row_H9_after_a_delete_over_a_shown_preedit_drops() {
-    let mut ime = Ime::enabled();
-    ime.report("ab", 2);
-    ime.compose("가");
-    // Exo drops its composition (E4); the guest still shows it.
-    ime.report("ab", 1);
-    let out = ime.delete(0, 1);
-    assert_eq!(out.guest, [no_preedit(), delete(1, 0), done(3)]);
-    assert!(!ime.in_step());
-    assert_eq!(ime.delete(0, 1).guest, []);
+fn row_H9_after_a_delete_over_a_shown_preedit_falls_back() {
+    falls_back(|ime| {
+        ime.report("ab", 2);
+        ime.compose("가");
+        // Exo drops its composition (E4); the guest still shows it.
+        ime.report("ab", 1);
+        let out = ime.delete(0, 1);
+        assert_eq!(out.guest, [no_preedit(), delete(1, 0), done(3)]);
+        ime.delete(0, 1)
+    });
 }
 
-/// A key the guest gets may edit its text where Exo does not see.
+/// A field that states no surrounding text, as a terminal's, gets the
+/// proxy's empty stand-in, which tells nothing of the guest's text: Mirror
+/// mode falls back to Legacy mode, which has no text to measure in.
 #[test]
-fn row_H9_after_a_forwarded_key_drops() {
-    let mut ime = Ime::enabled();
-    ime.report("abc", 3);
-    ime.step(Input::GuestKey(SEAT));
-    assert_eq!(ime.delete(2, 1).guest, []);
-    // And so may a press.
-    let mut ime = Ime::enabled();
-    ime.report("abc", 3);
-    ime.press(SURFACE);
-    assert_eq!(ime.delete(2, 1).guest, []);
+fn row_H9_a_field_that_states_no_text_falls_back() {
+    let out = falls_back(|ime| {
+        ime.host_commit("X");
+        ime.delete(0, 1)
+    });
+    assert_eq!(out, []);
+}
+
+/// A key the guest gets may edit its text where Exo does not see, and so
+/// may a press: Exo's delete of "cX" after a commit the guest has yet to
+/// report, which the mirror would measure, falls back to Legacy mode,
+/// which waits for the report.
+#[test]
+fn row_H9_after_a_forwarded_key_falls_back() {
+    for press in [false, true] {
+        let out = falls_back(|ime| {
+            ime.report("abc", 3);
+            ime.host_commit("X");
+            match press {
+                false => ime.step(Input::GuestKey(SEAT)),
+                true => ime.press(SURFACE),
+            };
+            ime.delete(2, 2)
+        });
+        assert_eq!(out, []);
+    }
 }
 
 /// A report after the key states what it did, and a commit without one

@@ -3907,6 +3907,91 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), []);
     }
 
+    /// #85 in Mirror mode: a region over the shown region deletes while
+    /// the guest shows a preedit, which Chromium drops (C3), so the guest
+    /// is out of step with Exo; the next, growing region falls back to
+    /// Legacy mode, which measures it from the bytes the regions took,
+    /// rather than drop it, which would leave the input method's next
+    /// commit to double the text.
+    #[tokio::test]
+    async fn a_region_over_a_region_falls_back_in_mirror_mode() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = || V3::Done { serial: 2 };
+        let region = |f: &Field, index, length| ext::set_preedit_region(f.host_ext, index, length);
+        f.s.host([region(&f, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([region(&f, -2, 2)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([region(&f, -3, 3)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("bcd", 3, 3), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// Mirror mode measures a region over a host preedit with Exo's cursor
+    /// inside it from that cursor, the preedit at the guest's.
+    #[tokio::test]
+    async fn a_region_over_a_host_preedit_with_exos_cursor_inside_it() {
+        let mut f = Field::with_surrounding_text("a1", 2, 2).await;
+        let done = || V3::Done { serial: 2 };
+        f.s.host([v1::preedit_cursor(f.host, 3), f.preedit("가나", "가나")])
+            .await;
+        let expected = [preedit_at("가나", 3, 3), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        // Exo's "a1가|나": "1가나".
+        f.s.host([ext::set_preedit_region(f.host_ext, -4, 7)]).await;
+        let expected = [
+            no_preedit(),
+            delete(1, 0),
+            preedit_at("1가나", 4, 4),
+            done(),
+        ];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// At v11 Exo confirms before each press its input method does not
+    /// handle, so a field that never reports, or a held key, makes the
+    /// mirror evict a history state Exo may still have: it is unsure, and
+    /// Mirror mode falls back to Legacy mode rather than drop Exo's delete.
+    #[tokio::test]
+    async fn an_unsure_mirror_falls_back_to_legacy_mode() {
+        let mut f = Field::with_surrounding_text("abc", 3, 3).await;
+        for _ in 0..65 {
+            f.s.host([f.confirm()]).await;
+        }
+        f.answer_recovery_syncs().await;
+        f.s.guest_received();
+        f.s.host([f.delete_range(2, 1)]).await;
+        let expected = [delete(1, 0), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A modifier the guest gets edits no text, so it does not hold back
+    /// Exo's next delete: one after a commit the guest has yet to report,
+    /// which only the mirror measures, as Legacy mode waits for the
+    /// report.
+    #[tokio::test]
+    async fn a_modifier_key_does_not_hold_back_exos_delete() {
+        let mut f = Field::typing().await;
+        f.s.host([f.commit("X")]).await;
+        let expected = [commit("X"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let shift = Stroke {
+            key: 42,
+            state: PRESSED,
+            serial: 60,
+            time: 1_000,
+        };
+        f.s.host([f.peek(shift), f.key(shift)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(shift)]);
+        assert_eq!(f.host_received().await, [f.ack(60, true)]);
+        // Exo's "가X|".
+        f.s.host([f.delete_range(0, 4)]).await;
+        let expected = [delete(4, 0), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
     /// After an edit of the input method, Exo measures deletes against
     /// text the guest has not committed yet; a guest commit that states its
     /// surrounding text, and only such a commit, catches the proxy up.

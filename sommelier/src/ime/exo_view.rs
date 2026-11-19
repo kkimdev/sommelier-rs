@@ -54,8 +54,10 @@ pub(super) struct ExoView {
     at_commit: Edits,
     /// Each report's barrier, with the edits the report may not hold: Exo's
     /// since the guest's commit before it, which the guest may not have got
-    /// when it made the report, and the others since the report.
-    reports: VecDeque<(BarrierToken, Edits)>,
+    /// when it made the report, and the others since the report; `None`
+    /// for the empty stand-in of a guest that stated no text, which tells
+    /// nothing of the guest's.
+    reports: VecDeque<(BarrierToken, Option<Edits>)>,
 }
 
 /// What reached the guest of one host event.
@@ -222,6 +224,7 @@ impl ExoView {
         token: BarrierToken,
         (text, cursor, anchor): (String, u32, u32),
         one_read: bool,
+        stated: bool,
     ) {
         if !one_read {
             self.mirror.uncertain();
@@ -238,7 +241,7 @@ impl ExoView {
             from_exo: self.at_commit.from_exo,
             unseen: self.edits.unseen,
         };
-        self.reports.push_back((token, since));
+        self.reports.push_back((token, stated.then_some(since)));
     }
 
     /// The core sent a `reset`, then its fence `token`.
@@ -263,6 +266,12 @@ impl ExoView {
         };
         let exact = self.mirror.health() == Health::Exact;
         let Some(since) = since else {
+            return self.health_changed(ti, health);
+        };
+        let Some(since) = since else {
+            // A stand-in: Exo holds empty text, the guest perhaps not.
+            self.in_step = false;
+            self.mirror.mark(false);
             return self.health_changed(ti, health);
         };
         match applied {

@@ -56,13 +56,18 @@ enum Takes {
     Planned,
 }
 
+/// A report the core forwards: the text, cursor and anchor, and whether
+/// the guest stated them, or the empty stand-in for a field that states
+/// none.
+type Report = ((String, u32, u32), bool);
+
 /// What a guest commit sends the host besides its reconciled state: the
 /// surrounding text, already encoded, with what it reports, and the cursor
 /// rectangle it states. Exo keeps both with or without an input method,
 /// so each statement is forwarded rather than reconciled.
 struct GuestCommit {
     ti: TiId,
-    surrounding_text: Option<(Outgoing, (String, u32, u32))>,
+    surrounding_text: Option<(Outgoing, Report)>,
     cursor_rect: Option<(i32, i32, i32, i32)>,
 }
 
@@ -230,7 +235,10 @@ impl ImeCore {
                 let request =
                     zwp_text_input_v1::req::set_surrounding_text(t.host().v1, text, cursor, anchor);
                 match request {
-                    Ok(request) => Some((request, (text.to_owned(), cursor, anchor))),
+                    Ok(request) => {
+                        let stated = text_stated(&pending.surrounding_text);
+                        Some((request, ((text.to_owned(), cursor, anchor), stated)))
+                    }
                     // G9b: the commit counted and its pending state is
                     // spent, but nothing else changes.
                     Err(error) => {
@@ -498,13 +506,13 @@ impl ImeCore {
                 };
             // A report applies at the barrier glued to it, which places it
             // among Exo's events for the mirror (design exo-mirror 2.3).
-            if let Some((request, report)) = surrounding_text {
+            if let Some((request, (report, stated))) = surrounding_text {
                 let barrier = BarrierToken(self.next_barrier);
                 self.next_barrier += 1;
                 let one_read = request.0.len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
                 fx.to_host
                     .extend([HostOut::Request(request), HostOut::GluedBarrier(barrier)]);
-                t.exo_mut().report_sent(barrier, report, one_read);
+                t.exo_mut().report_sent(barrier, report, one_read, stated);
             }
             if let Some(content_type) = steps.content_type {
                 let ext = host.ext.map(|e| (e.id, e.version));
@@ -576,10 +584,9 @@ fn composition_event(
             (cur.host_commit(text), Takes::IfApplied)
         }
         HostIme::Delete { index, length } => {
-            let planned = match (mode, frame) {
-                // A negative index keeps the v1 XML's reading, from the
-                // guest's cursor.
-                (ImeMode::Mirror, _) if index < 0 => cur.delete(index, length),
+            // A negative index keeps the v1 XML's reading, from the guest's
+            // cursor, which Legacy mode measures.
+            let planned = match (mode, frame.filter(|_| index >= 0)) {
                 (ImeMode::Mirror, Some(frame)) => frame.delete(index, length).map(|lengths| {
                     let txn = GuestTxn {
                         delete: Some(lengths),
@@ -587,8 +594,11 @@ fn composition_event(
                     };
                     cur.measured(txn, None)
                 }),
-                (ImeMode::Mirror, None) => Err(DeleteDrop::OutOfStep),
-                (ImeMode::Legacy, _) => {
+                (ImeMode::Mirror, None) => {
+                    log_fallback(ti, "delete");
+                    cur.delete(index, length)
+                }
+                (ImeMode::Legacy, frame) => {
                     let mirror = frame.and_then(|frame| frame.delete(index, length).ok());
                     let mirror = mirror.map(|lengths| GuestTxn {
                         delete: Some(lengths),
@@ -613,7 +623,10 @@ fn composition_event(
                 (ImeMode::Mirror, Some(frame)) => frame
                     .region(index, length, assembly)
                     .map(|(txn, held)| cur.measured(txn, held)),
-                (ImeMode::Mirror, None) => Err(RegionDrop::OutOfStep),
+                (ImeMode::Mirror, None) => {
+                    log_fallback(ti, "region");
+                    cur.region(index, length, assembly)
+                }
                 (ImeMode::Legacy, _) => {
                     let mirror = frame.and_then(|frame| frame.region(index, length, assembly).ok());
                     let legacy = cur.region(index, length, assembly);
@@ -623,7 +636,7 @@ fn composition_event(
             };
             match planned {
                 Ok(planned) => (planned, Takes::Before),
-                Err(drop @ (RegionDrop::Uncovered | RegionDrop::OutOfStep)) => {
+                Err(drop @ RegionDrop::Uncovered) => {
                     log::debug!(
                         "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
                         ti.0
@@ -676,9 +689,19 @@ fn composition_event(
     }
 }
 
+/// Mirror mode: the core cannot tell the guest is in step with Exo, or the
+/// mirror is unsure, so a host `what` is measured as Legacy mode does.
+fn log_fallback(ti: TiId, what: &str) {
+    log::debug!(
+        "Text input {}: measuring a {what} as Legacy mode does, out of step with the Exo mirror",
+        ti.0
+    );
+}
+
 /// Legacy mode: where the Exo mirror, had the guest been in step, would
 /// have sent `mirror` for a host `what`, and Legacy mode sends another
-/// transaction or drops it (design exo-mirror 6, the decision diff).
+/// transaction or drops it (design exo-mirror 6, the decision diff). It
+/// carries the user's text, so it is at `trace`.
 fn log_decision_diff<E>(
     ti: TiId,
     what: &str,
@@ -687,12 +710,19 @@ fn log_decision_diff<E>(
 ) {
     let legacy = legacy.as_ref().ok().map(Planned::txn);
     if mirror.as_ref() != legacy {
-        log::debug!(
+        log::trace!(
+            target: TRACE,
             "Text input {}: the Exo mirror would send {mirror:?} for a {what}, Legacy mode sends \
              {legacy:?}",
             ti.0
         );
     }
+}
+
+/// Whether a pending surrounding text is one the guest stated, not the
+/// stand-in of an enable or a disable.
+fn text_stated(text: &Option<Option<(String, i32, i32)>>) -> bool {
+    matches!(text, Some(Some(_)))
 }
 
 /// F1 and H2: a field that loses the focus or its input method commits

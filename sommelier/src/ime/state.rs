@@ -642,9 +642,6 @@ pub(super) struct Current<'a> {
 /// Why a host delete (H9) is dropped.
 #[derive(Debug)]
 pub(super) enum DeleteDrop {
-    /// Mirror mode: the guest is not in step with Exo's text, the mirror
-    /// is not exact, or a report on its way to Exo crossed the delete.
-    OutOfStep,
     NoSurroundingText,
     Selection,
     /// A non-negative index is measured against Exo's prediction of the
@@ -657,8 +654,6 @@ pub(super) enum DeleteDrop {
 /// Why a preedit region (X1') is dropped.
 #[derive(Debug)]
 pub(super) enum RegionDrop {
-    /// As [`DeleteDrop::OutOfStep`].
-    OutOfStep,
     NoSurroundingText,
     NotAroundCursor,
     /// The region does not cover the preedit Exo holds, whose rest Exo
@@ -744,12 +739,23 @@ impl<'a> Current<'a> {
     }
 
     /// Mirror mode's H9 and X1: a transaction measured in Exo's text
-    /// (`exo_view::Frame`), with `held` as a region's (X1).
+    /// (`exo_view::Frame`), with `held` as a region's (X1). It changes
+    /// what Legacy mode keeps as Legacy mode's own would, so that Legacy
+    /// mode can measure the next event when Mirror mode cannot: the bytes a
+    /// region deletes are taken, and an edit gives them back.
     pub(super) fn measured(self, txn: GuestTxn, held: Option<u32>) -> Planned<'a> {
-        let ahead = txn.commit.is_some()
-            || txn.preedit.is_some()
-            || txn.delete.is_some_and(|lengths| lengths != (0, 0));
-        let mut planned = self.plan(txn, ahead, None, LeaseOutcome::End);
+        let delete = txn.delete.unwrap_or_default();
+        let ahead = txn.commit.is_some() || txn.preedit.is_some() || delete != (0, 0);
+        let taken = match (&txn.commit, &txn.preedit) {
+            (None, Some(_)) => {
+                let (before, after) = self.composition.taken.unwrap_or_default();
+                Some((before + delete.0, after + delete.1)).filter(|&taken| taken != (0, 0))
+            }
+            // An empty region with no composition edits nothing.
+            (None, None) if delete == (0, 0) => self.composition.taken,
+            _ => None,
+        };
+        let mut planned = self.plan(txn, ahead, taken, LeaseOutcome::End);
         planned.held = held;
         planned
     }
