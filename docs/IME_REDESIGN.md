@@ -227,7 +227,10 @@ The DST should find or measure these automatically.
     and the DST counts them.
   - Cases checked against user intent never click inside the window.
 - **P4. A Chromium report crossing an edit in flight** (HANDOVER,
-  deletes). It needs the engine's deletes, which D6 adds.
+  deletes). It needs the engine's deletes, which D6 adds. The DST
+  counts the reports that cross an edit and the absolute deletes the
+  proxy drops while the guest's text is ahead (H9); a region crossing a
+  report is the known issue `RegionOverShownPreedit` (4.8).
 
 ---
 
@@ -1471,6 +1474,19 @@ sees them.
   `Delete { before: last word }` and then a `Commit(replacement)`, only
   while nothing is composed (E10). It also adds a reconversion region
   (X1). This exercises H9, X1 and P4.
+  - Both are `Request`s, which Exo hands the engine with the text before
+    the cursor as it predicts it. The word runs back to a marker or a
+    space, and its replacement is the word and a `~`. A reconversion
+    takes one character, or one more before the region it has, and the
+    next key commits the region as it is. Exo sends the region with
+    `set_preedit_region` from its cursor, only with an extension, and
+    the engine learns the region's text from the field, since it
+    measured the region in text that can lag.
+  - A free case makes half of these twice at once, for a delete while
+    the guest's text is ahead (P4) and a region over a region (#85). A
+    settled case makes them only right after a key, since GTK3 reports
+    a click's cursor only with its next edit, and never twice, since Exo
+    drops a reported region as a composition (E4).
 - **D7** adds holds: `UserAction::KeyDown(Key)` and `KeyUp(Key)` next to
   #73's atomic `Key`.
   - The engine gets autorepeats (500 ms delay, 33 Hz). Exo forwards
@@ -1554,10 +1570,10 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
 - **Markers.** The generator keeps the markers. It generates a Backspace
   only when the `Reference` has something after the last marker, or
   after the start, to delete.
-- **Mix.** About 63% keys (jamo for syllable patterns, plus Space and
-  Backspace), 15% clicks, 8% taps, 7% focus changes, 2% restarts of the
-  input method and 5% `Settle`. A case has 10 to 60 actions and two
-  fields.
+- **Mix.** About 59% keys (jamo for syllable patterns, plus Space and
+  Backspace), 2% accepted suggestions, 2% reconversions (4.4), 15%
+  clicks, 8% taps, 7% focus changes, 2% restarts of the input method and
+  5% `Settle`. A case has 10 to 60 actions and two fields.
 - **Restarts.** `UserAction::RestartInputMethod` destroys Exo's input
   method (`Exo::destroy_input_method`), which confirms and detaches on
   its own (E2, E6), and starts its engine afresh. It is the only action
@@ -1634,7 +1650,10 @@ Each mode gets half of the cases.
   - late results applied after a fence (P3);
   - text dropped by a fence;
   - raw keys;
-  - dropped deletes, by reason;
+  - deletes and preedit regions, and those dropped, by reason: a delete
+    while the text is ahead, or for its range; a region over a region,
+    over a shown preedit, or dropped;
+  - guest reports that crossed an edit in flight (P4);
   - client drops, by reason;
   - one counter per draw.
 
@@ -1680,7 +1699,8 @@ DST FAILURE seed=81321 mode=free client=Gtk{v4:false} ext=11 e6=confirm e8=text-
 
 ### 4.8 The known-issue list
 
-#72 retired P2. P1 remains, and reaching H2 added a second.
+#72 retired P2. P1 remains; reaching H2 added a second, and D6 a
+third.
 
 ```rust
 // sim/oracle.rs
@@ -1695,6 +1715,13 @@ enum KnownIssue {
     /// (E4); at the leave the proxy clears the preedit the guest shows.
     /// C5 decides whether H2 commits it.
     RestartLosesUntrackedComposition,
+    /// X1: a region while the guest shows a preedit whose bytes the
+    /// committed text does not hold (a host preedit, or a region the
+    /// guest has reported) is measured from the guest's cursor, before
+    /// that preedit, while Exo makes it from its own, after the
+    /// composition it holds as text; and Chromium drops such a region's
+    /// delete while it shows a preedit (C3). The core's X1 decides.
+    RegionOverShownPreedit,
 }
 ```
 
@@ -1708,8 +1735,14 @@ strikes:
   that leaves a field while it composes;
 - the lost restart, at each restart where the world recorded that Exo
   could confirm nothing: the extension is below v11 and Exo tracked no
-  composition. It occurs in about 1 settled case in 100 (54 of seeds
+  composition. It occurs in about 1 settled case in 100 (55 of seeds
   1,000,001 to 1,009,999, odd), so the run does not require it.
+
+The region over a shown preedit is a free case's issue: it shows as tier
+1's composition check, since Exo composes other bytes than the guest
+shows. It explains a case whose only failures are that check, if the
+case had such a region (`Counts::regions_over_preedits`). It occurs in
+about 1 free case in 1,000 (5 of seeds 1,000,000 to 1,009,998, even).
 
 Everything else fails the run. The scenario keeps being generated, so
 any other bug on that path stays visible. The summary prints the known
