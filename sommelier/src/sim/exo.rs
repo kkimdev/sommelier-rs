@@ -374,8 +374,9 @@ impl Tracker {
     }
 
     /// `OnExtendSelectionAndDelete`: the text in `range`, where it lies in
-    /// the prediction, goes, and the cursor, with no selection, goes to its
-    /// start.
+    /// the prediction, goes, with a composition it meets; a composition
+    /// apart from it goes too. The cursor, with no selection, goes to the
+    /// start of what went.
     fn delete(&mut self, range: Range<usize>) {
         let predicted = &mut self.predicted;
         let text = &predicted.text;
@@ -385,9 +386,9 @@ impl Tracker {
         {
             return;
         }
+        let range = predicted.take_composition(range);
         predicted.text.replace_range(range.clone(), "");
         predicted.selection = Selection::caret(range.start);
-        predicted.composition = None;
         self.hidden = None;
         self.expected.push(self.predicted.clone());
     }
@@ -2229,6 +2230,36 @@ mod tests {
         tracker.compose_existing(1..2, false);
         tracker.insert("x");
         assert_eq!(tracker.predicted, predicts("axc", 2, None));
+    }
+
+    /// `OnExtendSelectionAndDelete` widens the deleted range over a
+    /// composition it meets, and otherwise erases the composition and
+    /// moves the range with the text after it, where Exo's own
+    /// `delete_surrounding_text` names only the range.
+    #[test]
+    fn delete_ends_the_composition_with_its_text() {
+        let composed = |range: Range<usize>| {
+            let mut tracker = Tracker::default();
+            tracker.update("abcde".to_owned(), 3, 3);
+            tracker.compose_existing(range, false);
+            tracker
+        };
+        // Apart: the composition "a" goes, and so does "d", after it.
+        let mut tracker = composed(0..1);
+        tracker.delete(3..4);
+        assert_eq!(tracker.predicted, predicts("bce", 2, None));
+        // Apart, after the range, and with nothing deleted.
+        let mut tracker = composed(3..4);
+        tracker.delete(1..2);
+        assert_eq!(tracker.predicted, predicts("ace", 1, None));
+        let mut tracker = composed(1..3);
+        tracker.delete(3..3);
+        assert_eq!(tracker.predicted, predicts("ade", 1, None));
+        // Met: the range takes the whole composition.
+        let mut tracker = composed(1..3);
+        tracker.delete(2..4);
+        assert_eq!(tracker.predicted, predicts("ae", 1, None));
+        assert_eq!(tracker.expected.len(), 3);
     }
 
     #[test]
