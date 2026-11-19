@@ -199,6 +199,9 @@ struct TextInput {
     /// What Exo predicts the field holds (E4). [`Field::surrounding_text`]
     /// is the last report as sent, for the fuzzer to compare.
     text: Tracker,
+    /// When it registered as the seat's observer: at its first `activate`
+    /// after a `Deactivate`, which unregisters it (E12).
+    registered: Option<u64>,
 }
 
 /// What `SurroundingTextTracker` (`ui/base/ime/surrounding_text_tracker.cc`)
@@ -336,6 +339,7 @@ impl TextInput {
             },
             pending_support: true,
             text: Tracker::default(),
+            registered: None,
         }
     }
 
@@ -371,6 +375,9 @@ pub(super) fn draw_extension_version(choices: &mut impl Choose) -> Option<u32> {
 #[derive(Clone, Copy)]
 struct Keyboard {
     id: u32,
+    /// When it registered as the seat's observer, which is when it was
+    /// created (E12).
+    registered: u64,
     /// Its `zcr_extended_keyboard_v1`, which the proxy binds at v2, the
     /// first with `peek_key`.
     extended: Option<u32>,
@@ -475,6 +482,8 @@ pub(crate) struct Exo {
     /// The text of the region composed from existing text since the
     /// engine last learned one.
     composed_region: Option<String>,
+    /// The seat's observers registered so far (E12).
+    observers: u64,
 }
 
 impl Exo {
@@ -485,12 +494,17 @@ impl Exo {
     /// Move the seat's focus, as Alt-Tab or a click on another window does:
     /// the keyboard leaves the old surface and enters the new one, and then
     /// the text inputs follow as in [`Exo::set_text_input_focus`]. The seat
-    /// tells its observers in the order they registered, and a case's
-    /// keyboard registers before its text input's first activate (E12).
+    /// tells its observers in the order they registered (E12): a keyboard
+    /// bound after a text input's `activate` hears second
+    /// ([`Exo::text_inputs_hear_first`]).
     pub(super) fn move_focus(&mut self, focus: Option<u32>) {
         let lost = self.focus;
         if lost == focus {
             return;
+        }
+        let text_inputs_first = self.text_inputs_hear_first();
+        if text_inputs_first {
+            self.set_text_input_focus(focus);
         }
         if let Some(Keyboard { id, .. }) = self.keyboard {
             if let Some(surface) = lost {
@@ -502,7 +516,20 @@ impl Exo {
                 self.keyboard_enter(id, surface);
             }
         }
-        self.set_text_input_focus(focus);
+        if !text_inputs_first {
+            self.set_text_input_focus(focus);
+        }
+    }
+
+    /// Whether a text input registered as the seat's observer before the
+    /// keyboard, so that it hears of a focus move first: a keyboard bound
+    /// after the text input's `activate` (E12).
+    pub(super) fn text_inputs_hear_first(&self) -> bool {
+        let Some(keyboard) = self.keyboard else {
+            return false;
+        };
+        let registered = |ti: &TextInput| ti.registered.is_some_and(|r| r < keyboard.registered);
+        self.text_inputs.values().any(registered)
     }
 
     /// The user presses or releases `key` at `now`, as `state` says. While
@@ -818,7 +845,13 @@ impl Exo {
             AnyRequest::ZwpTextInputV1(request) => self.text_input_request(sender, request),
             AnyRequest::WlSeat(wl_seat::Request::GetKeyboard { id }) => {
                 let id = *id;
-                self.keyboard = Some(Keyboard { id, extended: None });
+                self.observers += 1;
+                let registered = self.observers;
+                self.keyboard = Some(Keyboard {
+                    id,
+                    extended: None,
+                    registered,
+                });
                 // A new keyboard learns the seat's focus at once.
                 if let Some(surface) = self.focus {
                     self.keyboard_enter(id, surface);
@@ -1014,6 +1047,10 @@ impl Exo {
         if self.text_input(id).surface == Some(surface) {
             return;
         }
+        if self.text_input(id).registered.is_none() {
+            self.observers += 1;
+            self.text_input(id).registered = Some(self.observers);
+        }
         self.detach(id);
         self.text_input(id).surface = Some(surface);
         if self.focus == Some(surface) {
@@ -1024,7 +1061,9 @@ impl Exo {
     /// `TextInput::Deactivate`.
     fn deactivate(&mut self, id: u32) {
         self.detach(id);
-        self.text_input(id).surface = None;
+        let text_input = self.text_input(id);
+        text_input.surface = None;
+        text_input.registered = None;
     }
 
     /// `AttachInputMethod` resets the type and mode to text, and keeps the
@@ -1328,6 +1367,7 @@ impl Exo {
         let Some(Keyboard {
             id: keyboard,
             extended,
+            ..
         }) = self.keyboard
         else {
             return;
@@ -2553,6 +2593,36 @@ mod tests {
             leave(),
         ];
         assert_eq!(events(&mut exo), expected);
+        assert!(!exo.text_inputs_hear_first());
+    }
+
+    #[test]
+    fn e12_a_keyboard_bound_after_the_activate_hears_of_a_focus_move_second() {
+        let mut exo = active(V10);
+        send(
+            &mut exo,
+            SEAT,
+            wl_seat::Request::GetKeyboard { id: KEYBOARD2 },
+        );
+        events(&mut exo);
+        assert!(exo.text_inputs_hear_first());
+        exo.move_focus(Some(B));
+        let got = events(&mut exo);
+        let leave_at = |sender| {
+            got.iter().position(|(s, e)| {
+                *s == sender
+                    && matches!(
+                        e,
+                        AnyEvent::WlKeyboard(wl_keyboard::Event::Leave { .. })
+                            | AnyEvent::ZwpTextInputV1(zwp_text_input_v1::Event::Leave {})
+                    )
+            })
+        };
+        assert!(leave_at(TI) < leave_at(KEYBOARD2), "{got:?}");
+        // The deactivate unregistered the text input; its next activate
+        // registers it after the keyboard.
+        send(&mut exo, TI, activate(B));
+        assert!(!exo.text_inputs_hear_first());
     }
 
     #[test]
