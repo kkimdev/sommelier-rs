@@ -1236,6 +1236,8 @@ pub(super) fn step(spec: &mut SpecText, shadow: &mut Shadow) -> Option<String> {
 /// resets the engine on its own, as at a content type change. Of such a
 /// preedit, which `resets`, the engine resets so far, tells, Exo may
 /// compose nothing at all.
+/// And a host without the text-input extension may compose a reconverted
+/// region that the guest never shows.
 pub(super) fn exact(
     steps: &[String],
     spec: &SpecText,
@@ -1276,7 +1278,10 @@ pub(super) fn exact(
         let dropped = spec.shown.as_ref().is_some_and(|shown| {
             (shown.origin.late || shown.origin.resets < resets) && engine.is_empty()
         });
-        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) {
+        // Without the extension, Exo composes a reconverted region it
+        // cannot show.
+        let hidden = extension.is_none() && preedit.is_empty() && tracked == engine;
+        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) && !hidden {
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
             );

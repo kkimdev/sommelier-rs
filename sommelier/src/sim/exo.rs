@@ -703,16 +703,13 @@ impl Exo {
 
     /// The user makes `request` of the engine (D6). IMA hands it over with
     /// the text before the cursor of the text input it serves, as Exo
-    /// predicts it, but only while it serves one and has an engine; and a
-    /// reconversion only for a text input whose extension can show a
-    /// region (`set_preedit_region`).
+    /// predicts it, but only while it serves one and has an engine. A
+    /// text input without an extension gets a reconversion too, which Exo
+    /// composes but cannot show it.
     pub(super) fn ask(&mut self, request: Request) {
         let Some(client) = self.ima.client.filter(|_| !self.latin) else {
             return;
         };
-        if request == Request::Reconvert && self.extension_of(client).is_none() {
-            return;
-        }
         let predicted = &self.text_inputs[&client].text.predicted;
         let before = predicted.text[..predicted.cursor].to_owned();
         let id = self.next_key;
@@ -2206,17 +2203,26 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_gets_no_request_without_a_text_input_or_for_a_region_without_an_extension() {
+    fn the_engine_gets_no_request_without_a_text_input_and_a_hidden_region_without_an_extension() {
         let mut exo = exo();
         exo.ask(Request::AcceptSuggestion);
         assert_eq!(exo.take_engine(), [], "no text input attached");
         exo.extensions.clear();
         send(&mut exo, TI, activate(A));
+        send(&mut exo, TI, surrounding("0a", 2));
+        events(&mut exo);
         exo.take_engine();
+        // Without an extension, Exo composes the region, and sends nothing.
         exo.ask(Request::Reconvert);
-        assert_eq!(exo.take_engine(), [], "no extension to show a region");
-        exo.ask(Request::AcceptSuggestion);
         assert_eq!(exo.take_engine().len(), 1);
+        let region = TextAction::Region {
+            before: 1,
+            after: 0,
+        };
+        answer_request(&mut exo, 0, vec![region]);
+        assert_eq!(events(&mut exo), []);
+        assert_eq!(*predicted(&exo), predicts("0a", 2, Some(1..2)));
+        assert_eq!(exo.take_composed_region().as_deref(), Some("a"));
     }
 
     #[test]
