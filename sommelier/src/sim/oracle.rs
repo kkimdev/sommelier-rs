@@ -2446,6 +2446,34 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "the proxy named guest surface 30, which the guest destroyed")]
+    fn the_shadow_fails_on_an_event_naming_a_destroyed_surface() {
+        let surfaces = both(2);
+        let mut shadow = Shadow::new(surfaces.clone(), &texts(&["0", "1"]));
+        surfaces.destroy(GUEST[0]);
+        shadow.see(Seen::SurfaceDestroyed { field: 0 });
+        shadow.see(Seen::StepEnd);
+        let enter = wl_keyboard::Event::Enter {
+            serial: 1,
+            surface: GUEST[0],
+            keys: Vec::new(),
+        };
+        shadow.see(Seen::ToGuest(&enter.into()));
+    }
+
+    #[test]
+    #[should_panic(expected = "the text input stays entered on guest surface 30")]
+    fn the_shadow_fails_on_a_text_input_entered_on_a_destroyed_surface() {
+        let surfaces = both(2);
+        let mut shadow = Shadow::new(surfaces.clone(), &texts(&["0", "1"]));
+        let enter = v3::Event::Enter { surface: GUEST[0] }.into();
+        shadow.see(Seen::ToGuest(&enter));
+        surfaces.destroy(GUEST[0]);
+        shadow.see(Seen::SurfaceDestroyed { field: 0 });
+        shadow.see(Seen::StepEnd);
+    }
+
+    #[test]
     fn the_shadow_applies_what_the_guest_got() {
         let mut shadow = Shadow::new(both(2), &texts(&["0", "1"]));
         let events: Vec<AnyEvent> = vec![
