@@ -1812,6 +1812,28 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_region_stands_until_the_tracker_changes_its_composition() {
+        type Change = fn(&mut Tracker);
+        let changes: [(&str, Change); 5] = [
+            ("cancel", Tracker::cancel),
+            ("insert", |t| t.insert("x")),
+            ("confirm", Tracker::confirm),
+            ("delete", |t| t.delete(0..1)),
+            ("a report it cannot match", |t| {
+                t.update("other".to_owned(), 0, 0)
+            }),
+        ];
+        for (change, apply) in changes {
+            let mut tracker = Tracker::default();
+            tracker.update("0a".to_owned(), 2, 2);
+            tracker.compose_existing(1..2, true);
+            assert!(tracker.hidden);
+            apply(&mut tracker);
+            assert!(!tracker.hidden, "{change}");
+        }
+    }
+
+    #[test]
     fn e1_activate_moves_the_input_method_only_to_another_surface() {
         let mut exo = exo();
         send(&mut exo, TI, activate(A));

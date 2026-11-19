@@ -47,6 +47,7 @@ use super::exo::{self, Exo};
 use super::hangul::Key;
 use super::keymap;
 use super::sched::Detach;
+use super::surfaces::Surfaces;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1 as peek;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1 as v1;
@@ -73,6 +74,8 @@ pub(super) enum Seen<'a> {
     /// The proxy sent the guest a button press or a touch-down, which
     /// lands at `at` on the guest's surface `surface`.
     GuestPress { surface: u32, at: Target },
+    /// The guest destroyed the surface of field `field` (F2).
+    SurfaceDestroyed { field: usize },
     /// The proxy has sent all it sends for the message that reached it.
     StepEnd,
 }
@@ -153,24 +156,25 @@ impl V3Field {
             content_type,
             surrounding_text_supported: self.surrounding_text.is_some()
                 || extension_version < extended::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
-            surrounding_text: host_surrounding_text(self.surrounding_text.as_ref(), None),
+            surrounding_text: host_surrounding_text(self.surrounding_text.as_ref()),
             cursor_rectangle: self.cursor_rectangle.unwrap_or_default(),
         }
     }
 }
 
 /// The surrounding text the proxy reports to the host for a commit that
-/// states `stated`, while the guest shows the preedit `shown`: the text,
-/// cursor and anchor as the guest stated them, or `("", 0, 0)` for a
-/// cleared one (an enable or a disable). The one place the oracle says what
-/// a report to the host holds, per step ([`SpecText`]) and at quiescence
-/// ([`V3Field::on_host`]).
-pub(crate) fn host_surrounding_text(
-    stated: Option<&(String, u32, u32)>,
-    shown: Option<&str>,
-) -> (String, u32, u32) {
-    let _ = shown;
+/// states `stated`: the text, cursor and anchor as the guest stated them,
+/// or `("", 0, 0)` for a cleared one (an enable or a disable). The one
+/// place the oracle says what a report to the host holds, per step
+/// ([`SpecText`]) and at quiescence ([`V3Field::on_host`]).
+pub(crate) fn host_surrounding_text(stated: Option<&(String, u32, u32)>) -> (String, u32, u32) {
     stated.cloned().unwrap_or_default()
+}
+
+/// Whether `request` to the host reports a content type or the support for
+/// surrounding text.
+fn is_content_type(request: &AnyRequest) -> bool {
+    content_type_matches(request, (0, 0), false).is_some()
 }
 
 /// What a content-type request to the host must hold for a field whose
@@ -353,6 +357,10 @@ pub(super) struct Counts {
     pub leases_ended: u64,
     /// Autorepeats of a held key that Exo handed the engine (D7).
     pub repeats: u64,
+    /// Field surfaces the guest destroyed, and those the text input was
+    /// focused on (F2).
+    pub surface_destroys: u64,
+    pub focused_surface_destroys: u64,
     /// Recovered keys whose confirmation is Exo's before the press of
     /// another key (E13), not an autorepeat's: the guest gets a press of
     /// the held key that the user did not repeat.
@@ -385,6 +393,8 @@ impl std::ops::AddAssign for Counts {
         self.leases += other.leases;
         self.leases_ended += other.leases_ended;
         self.repeats += other.repeats;
+        self.surface_destroys += other.surface_destroys;
+        self.focused_surface_destroys += other.focused_surface_destroys;
         self.recoveries_before_a_press += other.recoveries_before_a_press;
     }
 }
@@ -406,8 +416,8 @@ struct Held {
 /// the host, and what an ideal client then shows. The case has one guest
 /// text input on one seat, which follows the keyboard focus.
 pub(super) struct SpecText {
-    /// Each field's host surface.
-    surfaces: Vec<u32>,
+    /// Which field each host surface is.
+    surfaces: Surfaces,
     views: Vec<View>,
     /// The field the keyboard focuses, which the text input follows (F1).
     focus: Option<usize>,
@@ -448,7 +458,8 @@ pub(super) struct SpecText {
     /// The steps whose decisions were not the specification's.
     pub wrong_decisions: Vec<String>,
     /// The surrounding text the proxy must report to the host in the step,
-    /// if a commit stated one, and the reports it sent.
+    /// if a commit stated one, and the reports it sent. An `Option`: a step
+    /// handles one request, so at most one commit.
     report: Option<(String, u32, u32)>,
     reported: Vec<(String, u32, u32)>,
     /// The content-type requests the proxy sent in the step that are not
@@ -460,10 +471,10 @@ pub(super) struct SpecText {
 }
 
 impl SpecText {
-    /// Fields holding `texts`, on host surfaces `surfaces`.
-    pub fn new(surfaces: &[u32], texts: &[String]) -> Self {
+    /// Fields holding `texts`, on the host surfaces `surfaces` names.
+    pub fn new(surfaces: Surfaces, texts: &[String]) -> Self {
         Self {
-            surfaces: surfaces.to_vec(),
+            surfaces,
             views: texts.iter().map(|text| View::new(text)).collect(),
             focus: None,
             shift: false,
@@ -510,6 +521,10 @@ impl SpecText {
                 self.host(sender, event, origin);
             }
             Seen::ToHost(request) => self.decision(request),
+            Seen::SurfaceDestroyed { field } => {
+                self.input = format!("the destroy of field {field}'s surface");
+                self.surface_destroyed(field);
+            }
             Seen::ToGuest(_) | Seen::GuestPress { .. } => {}
             Seen::StepEnd => self.step_end(),
         }
@@ -581,8 +596,7 @@ impl SpecText {
         // The commit reports a stated surrounding text to the host, enabled
         // or not.
         if let Some(text) = &surrounding_text {
-            let shown = self.shown.as_ref().map(|shown| shown.text.as_str());
-            self.report = Some(host_surrounding_text(text.as_ref(), shown));
+            self.report = Some(host_surrounding_text(text.as_ref()));
         }
         let was_enabled = self.committed.is_some();
         let enabled = enabled.unwrap_or(was_enabled);
@@ -635,9 +649,19 @@ impl SpecText {
             AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. })
                 if *state == wl_pointer::BUTTON_STATE_PRESSED =>
             {
+                // A press on a surface the guest destroyed lands nowhere:
+                // the proxy drops an enter that names it, and forgets the
+                // pointer's focus on it at the destroy. Exo sent the press
+                // before the host's `delete_id`, so the proxy has not
+                // reused the surface's ID yet.
                 let (surface, x) = self.pointer.expect("a press on a surface");
-                self.press(surface, x);
+                if !self.surfaces.host_destroyed(surface) {
+                    self.press(surface, x);
+                }
             }
+            // The proxy drops a touch on a surface the guest destroyed.
+            AnyEvent::WlTouch(wl_touch::Event::Down { surface, .. })
+                if self.surfaces.host_destroyed(*surface) => {}
             AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => self.press(*surface, *x),
             AnyEvent::WlCallback(wl_callback::Event::Done { .. }) => {
                 if self.link == Link::Draining(Some(sender)) {
@@ -683,6 +707,11 @@ impl SpecText {
     /// before it, and Exo sends no keysym (H10).
     fn keyboard(&mut self, event: &wl_keyboard::Event) {
         match *event {
+            // The proxy drops an enter or a leave that names a surface the
+            // guest destroyed.
+            wl_keyboard::Event::Enter { surface, .. }
+            | wl_keyboard::Event::Leave { surface, .. }
+                if self.surfaces.host_destroyed(surface) => {}
             wl_keyboard::Event::Enter { surface, .. } => {
                 // The keys an enter lists are held, but had no peek, so none
                 // is a key to recover; Exo's model lists none.
@@ -1067,7 +1096,7 @@ impl SpecText {
             let surrounding = field.surrounding_text.is_some();
             content_type_matches(request, field.content_type, surrounding)
         });
-        let typed = content_type_matches(request, (0, 0), false).is_some();
+        let typed = is_content_type(request);
         if typed && matches != Some(true) {
             self.typed
                 .push(format!("{request:?} for the committed {committed:?}"));
@@ -1117,7 +1146,7 @@ impl SpecText {
             }
             Link::Detached if wants => {
                 let field = self.focus.expect("a focused field");
-                self.expected.activate = Some(self.surfaces[field]);
+                self.expected.activate = self.surfaces.host(field);
                 self.link = Link::Attached;
             }
             _ => {}
@@ -1169,8 +1198,22 @@ impl SpecText {
     }
 
     fn field(&self, surface: u32) -> usize {
-        let field = self.surfaces.iter().position(|&s| s == surface);
+        let field = self.surfaces.field_of_host(surface);
         field.unwrap_or_else(|| panic!("host surface {surface} has no field"))
+    }
+
+    /// F2: the guest destroyed field `field`'s surface. If the text input
+    /// is focused on it, it leaves it while the surface is still valid, and
+    /// its focus is projected again from the seat's keyboard focus, which
+    /// the destroyed surface had and which no surface has now. Its field
+    /// is reset as at any focus change.
+    fn surface_destroyed(&mut self, field: usize) {
+        self.counts.surface_destroys += 1;
+        if self.focus == Some(field) {
+            self.counts.focused_surface_destroys += 1;
+            self.held.clear();
+            self.move_focus(None);
+        }
     }
 }
 
@@ -1224,11 +1267,11 @@ fn preedit_cursor(text: &str, index: Option<i32>) -> (i32, i32) {
 /// transaction at `done` to the entered field, drops the preedit at
 /// `leave`, and types keys and takes presses as [`TextModel`] does.
 pub(super) struct Shadow {
-    /// Each field's guest surface.
-    surfaces: Vec<u32>,
+    /// Which field each guest surface is.
+    surfaces: Surfaces,
     views: Vec<View>,
-    /// The field the text input entered.
-    entered: Option<usize>,
+    /// The field the text input entered, and its surface.
+    entered: Option<(usize, u32)>,
     /// The field the keyboard focuses.
     keyboard: Option<usize>,
     shift: bool,
@@ -1239,10 +1282,10 @@ pub(super) struct Shadow {
 }
 
 impl Shadow {
-    /// Fields holding `texts`, on guest surfaces `surfaces`.
-    pub fn new(surfaces: &[u32], texts: &[String]) -> Self {
+    /// Fields holding `texts`, on the guest surfaces `surfaces` names.
+    pub fn new(surfaces: Surfaces, texts: &[String]) -> Self {
         Self {
-            surfaces: surfaces.to_vec(),
+            surfaces,
             views: texts.iter().map(|text| View::new(text)).collect(),
             entered: None,
             keyboard: None,
@@ -1277,6 +1320,21 @@ impl Shadow {
                 let field = self.field(surface);
                 self.views[field].model.click(at);
             }
+            // The client's window with the keyboard focus is gone: a key
+            // for it goes nowhere until the focus comes back.
+            Seen::SurfaceDestroyed { field } if self.keyboard == Some(field) => {
+                self.keyboard = None;
+            }
+            // The proxy leaves a surface the guest destroys in the step
+            // that destroys it, while the surface is still valid (F2).
+            Seen::StepEnd => {
+                if let Some((_, surface)) = self.entered {
+                    assert!(
+                        !self.surfaces.guest_destroyed(surface),
+                        "the text input stays entered on guest surface {surface}, which the guest destroyed"
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -1284,9 +1342,9 @@ impl Shadow {
     fn text_input(&mut self, event: &v3::Event) {
         let (txn, cursor) = &mut self.txn;
         match event {
-            &v3::Event::Enter { surface } => self.entered = Some(self.field(surface)),
+            &v3::Event::Enter { surface } => self.entered = Some((self.field(surface), surface)),
             v3::Event::Leave { .. } => {
-                if let Some(field) = self.entered.take() {
+                if let Some((field, _)) = self.entered.take() {
                     self.views[field].model.preedit.clear();
                     self.views[field].preedit_cursor = (0, 0);
                 }
@@ -1310,7 +1368,8 @@ impl Shadow {
             } => txn.delete = (before_length as usize, after_length as usize),
             v3::Event::Done { .. } => {
                 let (txn, cursor) = std::mem::take(&mut self.txn);
-                let view = &mut self.views[self.entered.expect("a done while entered")];
+                let (field, _) = self.entered.expect("a done while entered");
+                let view = &mut self.views[field];
                 // The view keeps the cursor as sent, an empty preedit's
                 // included, which the specification holds to (0, 0).
                 view.model.apply_txn(&clamped(&view.model, &txn));
@@ -1320,8 +1379,15 @@ impl Shadow {
         }
     }
 
+    /// The field on guest surface `surface`, which the guest has not
+    /// destroyed: the proxy names no surface after the guest's destroy
+    /// reached it.
     fn field(&self, surface: u32) -> usize {
-        let field = self.surfaces.iter().position(|&s| s == surface);
+        assert!(
+            !self.surfaces.guest_destroyed(surface),
+            "the proxy named guest surface {surface}, which the guest destroyed"
+        );
+        let field = self.surfaces.field_of_guest(surface);
         field.unwrap_or_else(|| panic!("guest surface {surface} has no field"))
     }
 }
@@ -1708,6 +1774,11 @@ mod tests {
     /// The callbacks of the proxy's syncs.
     const SYNC: u32 = 40;
 
+    /// The surfaces of the first `fields` fields.
+    fn both(fields: usize) -> Surfaces {
+        Surfaces::new(&GUEST[..fields], &HOST[..fields])
+    }
+
     fn texts(texts: &[&str]) -> Vec<String> {
         texts.iter().map(|text| text.to_string()).collect()
     }
@@ -1775,7 +1846,7 @@ mod tests {
     /// The spec of fields holding `fields`, the keyboard on field 0, its
     /// text input enabled and attached.
     fn attached(fields: &[&str]) -> SpecText {
-        let mut spec = SpecText::new(&HOST, &texts(fields));
+        let mut spec = SpecText::new(both(2), &texts(fields));
         host(&mut spec, enter(0), &[]);
         guest(&mut spec, &enable(), &[activate(0), reported("", 0)]);
         spec
@@ -1840,7 +1911,7 @@ mod tests {
     #[test]
     fn composition_events_reach_the_guest_only_through_the_gate() {
         // Not attached: dropped, but not by a fence.
-        let mut spec = SpecText::new(&HOST[..1], &texts(&["0"]));
+        let mut spec = SpecText::new(both(1), &texts(&["0"]));
         host(&mut spec, enter(0), &[]);
         preedit(&mut spec, "가");
         assert_eq!(spec.views, [view("0", 1, "")]);
@@ -1918,7 +1989,7 @@ mod tests {
 
     #[test]
     fn the_link_follows_the_fields_wish_through_a_barrier() {
-        let mut spec = SpecText::new(&HOST, &texts(&["0", "1"]));
+        let mut spec = SpecText::new(both(2), &texts(&["0", "1"]));
         host(&mut spec, enter(0), &[]);
         // An enabled, focused field must be activated on its surface.
         guest(&mut spec, &enable(), &[activate(1)]);
@@ -1962,7 +2033,7 @@ mod tests {
     #[test]
     fn each_step_must_give_the_guest_the_transactions_the_specification_asks() {
         let mut spec = attached(&["0"]);
-        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["0"]));
+        let mut shadow = Shadow::new(both(1), &texts(&["0"]));
         let to_guest = |shadow: &mut Shadow, events: Vec<AnyEvent>| {
             events
                 .iter()
@@ -2028,6 +2099,95 @@ mod tests {
         host(&mut spec, v1::Event::Leave {}, &[]);
         assert_eq!(spec.counts.host_detaches, 0);
         assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+    }
+
+    /// A step: the guest destroys field `field`'s surface, and the proxy
+    /// sends `decisions`.
+    fn destroy(spec: &mut SpecText, field: usize, decisions: &[AnyRequest]) {
+        spec.surfaces.destroy(GUEST[field]);
+        spec.see(Seen::SurfaceDestroyed { field });
+        decisions
+            .iter()
+            .for_each(|request| spec.see(Seen::ToHost(request)));
+        spec.see(Seen::StepEnd);
+    }
+
+    #[test]
+    fn a_destroyed_surface_loses_the_focus_and_its_input_goes_nowhere() {
+        // F2: the text input leaves the focused surface the guest destroys
+        // and the field detaches, dropping the preedit; the seat focuses
+        // no surface now.
+        let pointer = || wl_pointer::Event::Enter {
+            serial: 2,
+            surface: HOST[0],
+            surface_x: keymap::position(Target::Start),
+            surface_y: 0,
+        };
+        let press = || wl_pointer::Event::Button {
+            serial: 3,
+            time: 0,
+            button: 0x110,
+            state: wl_pointer::BUTTON_STATE_PRESSED,
+        };
+        let mut spec = attached(&["0", "1"]);
+        host(&mut spec, pointer(), &[]);
+        preedit(&mut spec, "가");
+        destroy(&mut spec, 0, &[deactivate(), sync()]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        assert_eq!(spec.focus, None);
+        assert_eq!(
+            (
+                spec.counts.surface_destroys,
+                spec.counts.focused_surface_destroys
+            ),
+            (1, 1)
+        );
+        host(
+            &mut spec,
+            wl_callback::Event::Done { callback_data: 0 },
+            &[],
+        );
+        // A press Exo sent before it learned of the destroy lands nowhere,
+        // as the proxy forgot the pointer's focus on the surface.
+        host(&mut spec, press(), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        // The proxy drops the input that names the destroyed surface.
+        host(&mut spec, enter(0), &[]);
+        assert_eq!(spec.focus, None);
+        host(&mut spec, tap(0, Target::Start), &[]);
+        host(&mut spec, pointer(), &[]);
+        host(&mut spec, press(), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        // Exo focuses the field's new surface, and the field attaches anew.
+        spec.surfaces.add_host(Some(0), 22);
+        let enter = wl_keyboard::Event::Enter {
+            serial: 3,
+            surface: 22,
+            keys: Vec::new(),
+        };
+        host(&mut spec, enter, &[]);
+        assert_eq!(spec.focus, Some(0));
+        let activate = v1::Request::Activate {
+            seat: 1,
+            surface: 22,
+        };
+        guest(&mut spec, &enable(), &[activate.into(), reported("0", 1)]);
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+        // Destroying an unfocused surface changes no focus.
+        destroy(&mut spec, 1, &[]);
+        assert_eq!(spec.focus, Some(0));
+        assert_eq!(
+            (
+                spec.counts.surface_destroys,
+                spec.counts.focused_surface_destroys
+            ),
+            (2, 1)
+        );
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+        // A destroy the proxy does not leave is a wrong step.
+        let mut spec = attached(&["0", "1"]);
+        destroy(&mut spec, 0, &[]);
+        assert_ne!(spec.wrong_decisions, Vec::<String>::new());
     }
 
     /// The guest reports `text` with the cursor at `cursor`, and commits.
@@ -2286,8 +2446,36 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "the proxy named guest surface 30, which the guest destroyed")]
+    fn the_shadow_fails_on_an_event_naming_a_destroyed_surface() {
+        let surfaces = both(2);
+        let mut shadow = Shadow::new(surfaces.clone(), &texts(&["0", "1"]));
+        surfaces.destroy(GUEST[0]);
+        shadow.see(Seen::SurfaceDestroyed { field: 0 });
+        shadow.see(Seen::StepEnd);
+        let enter = wl_keyboard::Event::Enter {
+            serial: 1,
+            surface: GUEST[0],
+            keys: Vec::new(),
+        };
+        shadow.see(Seen::ToGuest(&enter.into()));
+    }
+
+    #[test]
+    #[should_panic(expected = "the text input stays entered on guest surface 30")]
+    fn the_shadow_fails_on_a_text_input_entered_on_a_destroyed_surface() {
+        let surfaces = both(2);
+        let mut shadow = Shadow::new(surfaces.clone(), &texts(&["0", "1"]));
+        let enter = v3::Event::Enter { surface: GUEST[0] }.into();
+        shadow.see(Seen::ToGuest(&enter));
+        surfaces.destroy(GUEST[0]);
+        shadow.see(Seen::SurfaceDestroyed { field: 0 });
+        shadow.see(Seen::StepEnd);
+    }
+
+    #[test]
     fn the_shadow_applies_what_the_guest_got() {
-        let mut shadow = Shadow::new(&GUEST, &texts(&["0", "1"]));
+        let mut shadow = Shadow::new(both(2), &texts(&["0", "1"]));
         let events: Vec<AnyEvent> = vec![
             v3::Event::Enter { surface: GUEST[0] }.into(),
             v3::Event::PreeditString {
@@ -2323,7 +2511,7 @@ mod tests {
 
     #[test]
     fn a_delete_that_does_not_fit_is_clamped_to_whole_characters() {
-        let mut shadow = Shadow::new(&GUEST[..1], &texts(&["a가"]));
+        let mut shadow = Shadow::new(both(1), &texts(&["a가"]));
         let delete = |before_length, after_length| -> [AnyEvent; 2] {
             [
                 v3::Event::DeleteSurroundingText {
@@ -2366,7 +2554,7 @@ mod tests {
         let checks = |spec: &SpecText, engine: &str, resets| -> Vec<&'static str> {
             let shadow = Shadow {
                 views: spec.views.clone(),
-                ..Shadow::new(&GUEST[..1], &[])
+                ..Shadow::new(both(1), &[])
             };
             let failures = exact(&[], spec, &shadow, &exo, engine, resets, None);
             let checks = failures.iter().map(|failure| failure.check);
@@ -2433,7 +2621,7 @@ mod tests {
         let checks = |exo: &Exo, engine: &str| -> Vec<&'static str> {
             let shadow = Shadow {
                 views: spec.views.clone(),
-                ..Shadow::new(&GUEST[..1], &[])
+                ..Shadow::new(both(1), &[])
             };
             let failures = exact(&[], &spec, &shadow, exo, engine, 0, None);
             let checks = failures.iter().map(|failure| failure.check);
@@ -2459,10 +2647,7 @@ mod tests {
         let fields = texts
             .iter()
             .zip(GUEST)
-            .map(|(text, surface)| Field {
-                surface,
-                model: TextModel::new(text),
-            })
+            .map(|(text, surface)| Field::new(surface, TextModel::new(text)))
             .collect();
         let mut gtk = Gtk::new(true, 10, fields);
         gtk.keyboard_focus(Micros(0), Some(GUEST[focus]));

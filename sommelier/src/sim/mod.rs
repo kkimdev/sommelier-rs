@@ -50,6 +50,7 @@ pub(crate) mod oracle;
 mod regressions;
 mod sched;
 mod shrink;
+mod surfaces;
 mod user;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -526,6 +527,8 @@ fn check(test: &str, settled: bool) {
                 counts.confirms_unheld,
                 counts.leases,
                 counts.leases_ended,
+                counts.surface_destroys,
+                counts.focused_surface_destroys,
             ]),
             // The known issue's count drops to 0 once C5 fixes P1, which
             // then deletes it here.

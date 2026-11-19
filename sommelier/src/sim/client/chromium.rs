@@ -47,8 +47,8 @@ limitations under the License.
 use std::mem;
 
 use super::{
-    caret_rect, chars_around, confirm, content_type, cursor_rectangle, delete_chars, field_on,
-    utf8, Client, DropReason, Dropped, Field, Part, PressKind, Protocol,
+    caret_rect, chars_around, confirm, content_type, cursor_rectangle, delete_chars, utf8, Client,
+    DropReason, Dropped, Field, Part, PressKind, Protocol,
 };
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{req, Event};
 use crate::sim::clock::Micros;
@@ -238,7 +238,8 @@ impl Chromium {
         let mut out = Vec::new();
         for field in 0..self.windows.len() {
             let window = &mut self.windows[field];
-            let activated = window.focused && self.protocol.entered == Some(field);
+            let activated =
+                window.focused && self.protocol.entered == Some(self.fields[field].surface);
             if window.activated == activated {
                 continue;
             }
@@ -498,7 +499,19 @@ impl Client for Chromium {
     }
 
     fn keyboard_focus(&mut self, now: Micros, surface: Option<u32>) -> Vec<Outgoing> {
-        let focus = surface.map(|surface| field_on(&self.fields, surface));
+        let focus = match surface {
+            // The keys that follow an enter that crossed the client's
+            // destroy of its surface go nowhere.
+            Some(surface) => match self.protocol.field_on(&self.fields, surface) {
+                None => {
+                    self.protocol.closed = true;
+                    return Vec::new();
+                }
+                field => field,
+            },
+            None => None,
+        };
+        self.protocol.closed &= surface.is_none();
         if focus == self.keyboard {
             return Vec::new();
         }
@@ -544,18 +557,29 @@ impl Client for Chromium {
     /// an accelerator stops resets the input method; no key the simulation
     /// types is one.
     fn key(&mut self, _now: Micros, key: Key) -> Vec<Outgoing> {
-        let field = self
-            .keyboard
-            .expect("protocol violation: a key without the keyboard focus");
+        let Some(field) = self.keyboard else {
+            assert!(
+                self.protocol.closed,
+                "protocol violation: a key without the keyboard focus"
+            );
+            return Vec::new();
+        };
         self.windows[field].guard_until = Micros::default();
         self.fields[field].model.insert_key(key);
         self.report(field)
     }
 
+    fn deleted(&mut self, id: u32) {
+        self.protocol.deleted(id);
+    }
+
     /// A mouse press clicks at once; a touch clicks when it lifts as a tap
     /// (`kGestureTap`), as the press path skips touch (`EF_FROM_TOUCH`).
     fn press(&mut self, now: Micros, surface: u32, at: Target, kind: PressKind) -> Vec<Outgoing> {
-        let field = field_on(&self.fields, surface);
+        let Some(field) = self.protocol.field_on(&self.fields, surface) else {
+            self.touch = None;
+            return Vec::new();
+        };
         match kind {
             PressKind::Button => self.click(now, field, at),
             PressKind::Touch => {
@@ -571,6 +595,26 @@ impl Client for Chromium {
             Some((field, at)) if !dragged => self.click(now, field, at),
             _ => Vec::new(),
         }
+    }
+
+    /// The window blurs if it was focused, and opens again with a fresh
+    /// input method context that predicts the field's text.
+    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing> {
+        let focused = self.keyboard == Some(field);
+        let out = match focused {
+            true => self.keyboard_focus(now, None),
+            false => Vec::new(),
+        };
+        self.protocol.closed |= focused;
+        if self.touch.is_some_and(|(touched, _)| touched == field) {
+            self.touch = None;
+        }
+        self.protocol.reopen(&mut self.fields[field], surface);
+        self.windows[field] = Window {
+            predicted: self.fields[field].model.clone(),
+            ..Window::default()
+        };
+        out
     }
 }
 
@@ -808,6 +852,40 @@ mod tests {
     }
 
     #[test]
+    fn a_window_that_opens_again_blurs_and_moves_to_its_new_surface() {
+        let mut chromium = entered(&["0", "1"]);
+        compose(&mut chromium, "가");
+        let t0 = Micros(0);
+        // F2: the focused window closes, blurring as at any blur, and
+        // opens again on surface 22.
+        let reopen = chromium.reopen(t0, 0, 22);
+        assert_eq!(requests(reopen), [Request::Disable {}, Request::Commit {}]);
+        let field = &chromium.fields()[0];
+        assert_eq!((field.surface, &field.model), (22, &model("0가", 4, "")));
+        // A key, a focus or a press the proxy sent before it got the
+        // destroy goes nowhere; it leaves the surface while it is valid.
+        assert_eq!(requests(chromium.key(t0, Key::Char('a'))), []);
+        chromium.keyboard_focus(t0, Some(SURFACES[0]));
+        assert_eq!(chromium.focused_field(), None);
+        chromium.press(t0, SURFACES[0], Target::Start, PressKind::Touch);
+        chromium.release(t0, false);
+        assert_eq!(chromium.fields()[0].model, model("0가", 4, ""));
+        send(&mut chromium, t0, [leave(0)]);
+        chromium.deleted(SURFACES[0]);
+        // The new window takes the focus.
+        chromium.keyboard_focus(t0, Some(22));
+        assert_eq!(chromium.focused_field(), Some(0));
+        // An unfocused window opens again with no request.
+        assert_eq!(requests(chromium.reopen(t0, 1, 23)), []);
+        assert_eq!(chromium.focused_field(), Some(0));
+        // The keys after a keyboard enter that crossed the destroy go
+        // nowhere.
+        chromium.keyboard_focus(t0, None);
+        chromium.keyboard_focus(t0, Some(SURFACES[1]));
+        assert_eq!(requests(chromium.key(t0, Key::Char('a'))), []);
+    }
+
+    #[test]
     fn after_a_done_it_reports_the_text_it_predicts() {
         let mut chromium = entered(&["0"]);
         compose(&mut chromium, "가");
@@ -816,6 +894,26 @@ mod tests {
         let out = answered(&mut chromium, Micros(1), [commit("나")]);
         assert_eq!(out, [surrounding("0가나", 7), Request::Commit {}]);
         assert_eq!(chromium.fields()[0].model, model("0가", 4, ""));
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol violation: surface 20 has no field")]
+    fn an_enter_on_a_destroyed_surface_is_a_protocol_violation() {
+        let mut chromium = entered(&["0"]);
+        chromium.reopen(Micros(0), 0, 22);
+        send(&mut chromium, Micros(0), [leave(0)]);
+        chromium.deleted(SURFACES[0]);
+        send(&mut chromium, Micros(0), [enter(0)]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "protocol violation: the text input is still entered on destroyed surface 20"
+    )]
+    fn a_text_input_entered_on_a_destroyed_surface_is_a_protocol_violation() {
+        let mut chromium = entered(&["0"]);
+        chromium.reopen(Micros(0), 0, 22);
+        chromium.deleted(SURFACES[0]);
     }
 
     #[test]

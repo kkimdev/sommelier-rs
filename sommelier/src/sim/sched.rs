@@ -57,10 +57,11 @@ use super::exo::{Answer, Exo};
 use super::hangul::Key;
 use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
+use super::surfaces::Surfaces;
 use super::ClientKind;
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{
-    wl_compositor, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_touch,
+    wl_compositor, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_surface, wl_touch,
 };
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::Session;
@@ -273,6 +274,15 @@ pub(super) struct Detach {
 /// A press the guest got: its surface and the target it lands on.
 type Press = (u32, Target);
 
+/// Where the guest's pointer is, as the proxy tells it.
+#[derive(Clone, Copy, Debug)]
+enum Pointer {
+    /// On guest surface `.0`, at x `.1`.
+    On(u32, i32),
+    /// On a surface the guest destroyed, whose enter the proxy dropped.
+    Gone,
+}
+
 /// One case's client, proxy, Exo, engine and display, joined by channels.
 pub(super) struct World<'t> {
     now: Micros,
@@ -297,7 +307,7 @@ pub(super) struct World<'t> {
     /// globals, Shift and where its pointer is, as the proxy tells it.
     globals: BTreeMap<String, (u32, u32)>,
     shift: bool,
-    pointer: Option<(u32, i32)>,
+    pointer: Option<Pointer>,
     /// The resets Exo handed the engine.
     resets: u64,
     /// The key the user holds, which repeats, and when it next does.
@@ -308,10 +318,12 @@ pub(super) struct World<'t> {
     /// proxy sent the guest, and those the guest got; and whether the
     /// transaction each is in so far edits.
     edits: Edits,
-    /// The guest's text input.
+    /// The guest's text input and compositor.
     text_input: u32,
-    /// The fields' guest surfaces.
-    surfaces: Vec<u32>,
+    compositor: u32,
+    /// Which field each surface is, shared with the display, the
+    /// specification and the shadow.
+    surfaces: Surfaces,
     /// The oracle's two readers, from the end of the setup.
     pub spec: Option<SpecText>,
     pub shadow: Option<Shadow>,
@@ -337,6 +349,7 @@ impl<'t> World<'t> {
     pub async fn new(setup: &Setup<'_>, choices: Choices, trace: &'t mut Vec<Line>) -> World<'t> {
         let mut exo = Exo::default();
         exo.latin = setup.latin;
+        let surfaces = Surfaces::default();
         let mut world = World {
             now: Micros(0),
             choices,
@@ -344,7 +357,7 @@ impl<'t> World<'t> {
             client: None,
             exo,
             engine: Engine::new(setup.lag),
-            display: Display::new(setup.extension),
+            display: Display::new(setup.extension, surfaces.clone()),
             c_to_p: Channel::new(GUEST_LATENCY),
             p_to_c: Channel::new(GUEST_LATENCY),
             p_to_e: Channel::new(HOST_LATENCY),
@@ -358,7 +371,8 @@ impl<'t> World<'t> {
             reports_to_exo: 0,
             edits: Edits::default(),
             text_input: 0,
-            surfaces: Vec::new(),
+            compositor: 0,
+            surfaces,
             spec: None,
             shadow: None,
             steps: Vec::new(),
@@ -385,8 +399,10 @@ impl<'t> World<'t> {
             world.guest([bind.expect("a bind fits a message")]);
             id
         });
-        world.surfaces = setup.texts.iter().map(|_| world.session.new_id()).collect();
-        for surface in world.surfaces.clone() {
+        world.compositor = compositor;
+        for _ in setup.texts {
+            let surface = world.session.new_id();
+            world.surfaces.add_field(surface);
             world.guest([wl_compositor::req::create_surface(compositor, surface)]);
         }
         let [keyboard, pointer, touch, text_input] = [(); 4].map(|_| world.session.new_id());
@@ -401,22 +417,18 @@ impl<'t> World<'t> {
         if world.ended {
             return world;
         }
-        let fields = world
-            .surfaces
-            .iter()
+        let fields = (0..setup.texts.len())
+            .map(|field| world.surfaces.guest(field))
             .zip(setup.texts)
-            .map(|(&surface, text)| Field {
-                surface,
-                model: TextModel::new(text),
-            })
+            .map(|(surface, text)| Field::new(surface, TextModel::new(text)))
             .collect();
         world.client = Some(match setup.client {
             ClientKind::Chromium => Box::new(Chromium::new(text_input, fields)),
             ClientKind::Gtk3 => Box::new(Gtk::new(false, text_input, fields)),
             ClientKind::Gtk4 => Box::new(Gtk::new(true, text_input, fields)),
         });
-        world.spec = Some(SpecText::new(world.display.surfaces(), setup.texts));
-        world.shadow = Some(Shadow::new(&world.surfaces, setup.texts));
+        world.spec = Some(SpecText::new(world.surfaces.clone(), setup.texts));
+        world.shadow = Some(Shadow::new(world.surfaces.clone(), setup.texts));
         world.act(UserAction::Focus(0));
         world.run(&[]).await;
         if setup.late_keyboard && !world.ended {
@@ -584,9 +596,14 @@ impl<'t> World<'t> {
                 });
                 return self.host_sends(Vec::new(), false);
             }
+            UserAction::Reopen(field) => return self.reopen(field),
             UserAction::Settle => return,
         };
-        let surface = self.display.surfaces()[field];
+        // A window that is opening again, after a replay or a shrink drops
+        // the `Settle` behind its reopen, cannot be clicked yet.
+        let Some(surface) = self.surfaces.host(field) else {
+            return;
+        };
         let mut detach = Detach::default();
         if self.exo.focus() != Some(surface) {
             detach = Detach {
@@ -605,6 +622,24 @@ impl<'t> World<'t> {
             _ => Vec::new(),
         };
         self.host_sends(presses, false);
+    }
+
+    /// The client closes `field`'s window and opens it again (F2): it
+    /// destroys the field's surface and creates another, and the display
+    /// gives the new one the seat's focus if the old one had it.
+    fn reopen(&mut self, field: usize) {
+        let old = self.surfaces.guest(field);
+        let new = self.session.new_id();
+        let refocus = self.exo.focus().is_some() && self.exo.focus() == self.surfaces.host(field);
+        self.display.reopen(field, refocus);
+        self.surfaces.add_guest(field, new);
+        let now = self.now;
+        let client = self.client.as_mut().expect("a client model");
+        let mut requests = client.reopen(now, field, new);
+        requests.push(wl_surface::req::destroy(old));
+        requests.push(wl_compositor::req::create_surface(self.compositor, new));
+        requests.push(wl_surface::req::commit(new));
+        self.guest(requests);
     }
 
     /// Whether Exo's detach would confirm no composition now: below v11 of
@@ -700,6 +735,23 @@ impl<'t> World<'t> {
             }
             Err(_) => self.log(Place::CToP, "a setup request".to_owned()),
         }
+        // A field's surface the guest destroys (F2).
+        let surfaces = self.surfaces.clone();
+        let destroyed = decode(&request.0, &mut VecDeque::new(), |msg| {
+            let surface = msg.sender_id;
+            match surfaces.field_of_guest(surface) {
+                Some(field) => wl_surface::Request::from_wire(msg).map(|r| (surface, field, r)),
+                None => Err(crate::wire::ProtocolError::InvalidSender(surface)),
+            }
+        });
+        if let Ok((_, (surface, field, wl_surface::Request::Destroy {}))) = destroyed {
+            self.log(
+                Place::CToP,
+                format!("the surface of field {field} destroyed"),
+            );
+            self.surfaces.destroy(surface);
+            self.see(Seen::SurfaceDestroyed { field });
+        }
         let goes_on = self.session.try_guest([request]).await;
         self.send_proxy_output(goes_on);
     }
@@ -707,6 +759,13 @@ impl<'t> World<'t> {
     /// A host event reaches the proxy.
     async fn deliver_host_event(&mut self, event: Outgoing, origin: Origin) {
         let (sender, decoded) = self.display.decode(&event);
+        // The proxy drops a pointer enter that names a surface the guest
+        // destroyed, so the guest's pointer is on none of its surfaces.
+        if let AnyEvent::WlPointer(wl_pointer::Event::Enter { surface, .. }) = decoded {
+            if self.surfaces.host_destroyed(surface) {
+                self.pointer = Some(Pointer::Gone);
+            }
+        }
         let note = if origin.late { " (late)" } else { "" };
         self.log(Place::EToP, format!("{sender} {}{note}", shown(&decoded)));
         self.see(Seen::Host {
@@ -749,9 +808,9 @@ impl<'t> World<'t> {
         match *event {
             AnyEvent::WlPointer(wl_pointer::Event::Enter {
                 surface, surface_x, ..
-            }) => self.pointer = Some((surface, surface_x)),
+            }) => self.pointer = Some(Pointer::On(surface, surface_x)),
             AnyEvent::WlPointer(wl_pointer::Event::Motion { surface_x, .. }) => {
-                if let Some((_, x)) = &mut self.pointer {
+                if let Some(Pointer::On(_, x)) = &mut self.pointer {
                     *x = surface_x;
                 }
             }
@@ -759,8 +818,13 @@ impl<'t> World<'t> {
             AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. })
                 if state == wl_pointer::BUTTON_STATE_PRESSED =>
             {
-                let (surface, x) = self.pointer.expect("a press on a surface");
-                return Some((surface, target(x)));
+                // A press on a surface the guest destroyed lands nowhere.
+                match self.pointer.expect("a press on a surface") {
+                    Pointer::On(surface, x) if !self.surfaces.guest_destroyed(surface) => {
+                        return Some((surface, target(x)));
+                    }
+                    Pointer::On(..) | Pointer::Gone => return None,
+                }
             }
             AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => {
                 return Some((surface, target(x)));
@@ -798,6 +862,10 @@ impl<'t> World<'t> {
             (AnyEvent::WlPointer(wl_pointer::Event::Button { .. }), None)
             | (AnyEvent::WlTouch(wl_touch::Event::Up { .. }), None) => client.release(now, false),
             (AnyEvent::ZwpTextInputV3(event), _) => client.event(now, sender, event),
+            (AnyEvent::WlDisplay(wl_display::Event::DeleteId { id }), _) => {
+                client.deleted(id);
+                Vec::new()
+            }
             (AnyEvent::WlKeyboard(wl_keyboard::Event::Enter { surface, .. }), _) => {
                 client.keyboard_focus(now, Some(surface))
             }
