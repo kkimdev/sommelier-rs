@@ -225,6 +225,30 @@ pub(super) fn settled(actions: &[UserAction]) -> bool {
     })
 }
 
+/// Whether the key holds of `actions` are possible: one key is held at a
+/// time, only other keys are pressed while it is held, and the case ends
+/// with it released.
+pub(super) fn holds_valid(actions: &[UserAction]) -> bool {
+    let mut held = None;
+    for &action in actions {
+        match (action, held) {
+            (UserAction::KeyDown(key), None) => held = Some(key),
+            (UserAction::KeyUp(key), Some(h)) if key == h => held = None,
+            (UserAction::Key(key), h) if h != Some(key) => {}
+            (UserAction::KeyDown(_) | UserAction::KeyUp(_), _) => return false,
+            (_, None) => {}
+            (_, Some(_)) => return false,
+        }
+    }
+    held.is_none()
+}
+
+/// Whether `actions` are a case the generator could have made: its holds are
+/// possible and, in a settled case, it is [`settled`].
+pub(super) fn valid(actions: &[UserAction], settled_case: bool) -> bool {
+    holds_valid(actions) && (!settled_case || settled(actions))
+}
+
 /// Whether `InputMethodAsh` takes the Korean engine to be composing
 /// (`composing_text_`), as the user's keys leave it. Any composition the
 /// engine shows sets it, an empty one included, and only a commit or a
