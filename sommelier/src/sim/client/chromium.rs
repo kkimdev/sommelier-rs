@@ -833,6 +833,30 @@ mod tests {
     }
 
     #[test]
+    fn a_window_that_opens_again_blurs_and_moves_to_its_new_surface() {
+        let mut chromium = entered(&["0", "1"]);
+        compose(&mut chromium, "가");
+        let t0 = Micros(0);
+        // F2: the focused window closes, blurring as at any blur, and
+        // opens again on surface 22.
+        let reopen = chromium.reopen(t0, 0, 22);
+        assert_eq!(requests(reopen), [Request::Disable {}, Request::Commit {}]);
+        let field = &chromium.fields()[0];
+        assert_eq!(field.model, model("0가", 4, ""));
+        assert!(field.owns(SURFACES[0]) && field.owns(22));
+        // A key the proxy forwarded before it heard of the close goes
+        // nowhere.
+        assert_eq!(requests(chromium.key(t0, Key::Char('a'))), []);
+        assert_eq!(chromium.fields()[0].model, model("0가", 4, ""));
+        // The new window takes the focus.
+        chromium.keyboard_focus(t0, Some(22));
+        assert_eq!(chromium.focused_field(), Some(0));
+        // An unfocused window opens again with no request.
+        assert_eq!(requests(chromium.reopen(t0, 1, 23)), []);
+        assert_eq!(chromium.focused_field(), Some(0));
+    }
+
+    #[test]
     fn after_a_done_it_reports_the_text_it_predicts() {
         let mut chromium = entered(&["0"]);
         compose(&mut chromium, "가");

@@ -796,6 +796,35 @@ mod tests {
     }
 
     #[test]
+    fn a_window_that_opens_again_blurs_and_moves_to_its_new_surface() {
+        for v4 in [false, true] {
+            let mut gtk = entered(v4, &["0", "1"]);
+            answered(&mut gtk, Micros(0), [preedit("가")]);
+            // F2: the focused window closes, blurring as at any blur, and
+            // opens again on surface 22.
+            let reopen = gtk.reopen(Micros(0), 0, 22);
+            assert_eq!(
+                requests(reopen),
+                [Request::Disable {}, Request::Commit {}],
+                "v4: {v4}"
+            );
+            let field = &gtk.fields()[0];
+            assert_eq!(field.model, model("0", 1, ""), "v4: {v4}");
+            assert!(field.owns(SURFACES[0]) && field.owns(22), "v4: {v4}");
+            // A key the proxy forwarded before it heard of the close goes
+            // nowhere.
+            assert_eq!(requests(gtk.key(Micros(0), Key::Char('a'))), []);
+            assert_eq!(gtk.fields()[0].model, model("0", 1, ""), "v4: {v4}");
+            // The new window takes the focus.
+            gtk.keyboard_focus(Micros(0), Some(22));
+            assert_eq!(gtk.focused_field(), Some(0), "v4: {v4}");
+            // An unfocused window opens again with no request.
+            assert_eq!(requests(gtk.reopen(Micros(0), 1, 23)), []);
+            assert_eq!(gtk.focused_field(), Some(0), "v4: {v4}");
+        }
+    }
+
+    #[test]
     fn backspace_leaves_the_start_of_a_hangul_syllable() {
         for v4 in [false, true] {
             let mut gtk = entered(v4, &["a가각"]);
