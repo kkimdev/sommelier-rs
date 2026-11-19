@@ -529,7 +529,7 @@ sommelier/src/ime/
 handler/text_input.rs   Adapters: decode, build an Input, call step,
                         apply the Effects.                             ~300
 handler/ime_keys.rs     Keysym routing, held-key recovery and Backspace
-                        leases, moved out of text_input.rs (PR K1).    ~400 (moved)
+                        leases, moved out of text_input.rs (PR K1).    ~400 (moved, production only)
 ```
 
 `ime` imports nothing from `handler`. From the rest of the crate it uses
@@ -1740,7 +1740,7 @@ D4 records goldens; C3-pre commits them and C3c deletes them:
   pending events (`Exo::take_events`), so the `done` follows every event
   of earlier requests (E11).
 - **The keymap (D4 decision).** `keysym_to_evdev_keycode` in
-  `handler/text_input.rs` compiles the system's default XKB keymap from
+  `handler/ime_keys.rs` compiles the system's default XKB keymap from
   names, so it reads the `XKB_DEFAULT_*` environment variables. The DST
   pins those variables for the test process, or injects the keymap, so
   that a replay on another machine sends the same keycodes.
