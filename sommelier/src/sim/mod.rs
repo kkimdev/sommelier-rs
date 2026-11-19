@@ -418,8 +418,12 @@ fn run_all(cases: &[Case]) -> Summary {
         if let Some(first) = outcome.failures.first() {
             let mut text = report(case, &outcome, &outcome.failures, &trace);
             if !std::mem::replace(&mut shrunk, true) {
-                let check = (first.tier, first.check);
-                text += &shrink::shrunk_report(case, &outcome.choices, check);
+                let check = (first.tier, first.check, first.field);
+                let shrinking = catch_unwind(AssertUnwindSafe(|| {
+                    shrink::shrunk_report(case, &outcome.choices, check)
+                }));
+                text +=
+                    &shrinking.unwrap_or_else(|_| "  shrinking: shrinking panicked\n".to_owned());
             }
             summary.failed.push(text);
         }

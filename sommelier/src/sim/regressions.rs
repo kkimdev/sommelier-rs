@@ -55,7 +55,7 @@ impl Regression {
 
     /// The Rust text of a regression of `case` that replays `choices`, to
     /// paste into [`CASES`].
-    pub fn snippet(name: &str, case: &Case, choices: &[u32]) -> String {
+    pub(super) fn snippet(name: &str, case: &Case, choices: &[u32]) -> String {
         let texts: Vec<String> = case.texts.iter().map(|text| format!("{text:?}")).collect();
         let actions: Vec<String> = case.actions.iter().map(|&a| action(a)).collect();
         format!(
@@ -89,9 +89,11 @@ fn action(action: UserAction) -> String {
     }
 }
 
-/// The regressions, each replayed against the oracle.
+/// The regressions, each replayed against the oracle. The first is a
+/// placeholder that shows the form and smoke-tests the replay: no bug
+/// produced it. Real ones come from a shrunk failure.
 const CASES: &[Regression] = &[Regression {
-    name: "a syllable, a Backspace and a focus move, on the sequential schedule",
+    name: "placeholder: a syllable, a Backspace and a focus move, on the sequential schedule",
     client: ClientKind::Gtk4,
     settled: false,
     latin: false,
@@ -125,7 +127,7 @@ fn every_regression_passes_the_oracle() {
 fn a_snippet_names_the_case_and_its_choices() {
     let regression = &CASES[0];
     let snippet = Regression::snippet(regression.name, &regression.case(), &[3, 0, 1]);
-    assert!(snippet.starts_with("Regression {\n    name: \"a syllable"));
+    assert!(snippet.starts_with("Regression {\n    name: \"placeholder: a syllable"));
     assert!(snippet.contains("client: ClientKind::Gtk4,"));
     assert!(snippet.contains("texts: &[\"가\", \"1\"],"));
     assert!(snippet.contains("UserAction::Key(Key::Char('r')),"));

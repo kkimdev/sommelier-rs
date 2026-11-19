@@ -30,13 +30,16 @@ limitations under the License.
 
 use std::time::{Duration, Instant};
 
-use super::oracle::Tier;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+use super::oracle::{Failure, Tier};
 use super::regressions::Regression;
 use super::sched::Choices;
-use super::{report, run, Case};
+use super::sched::Line;
+use super::{report, run, Case, Outcome};
 
-/// A check that failed: its tier and name.
-pub(super) type Check = (Tier, &'static str);
+/// A check that failed: its tier, name and field.
+pub(super) type Check = (Tier, &'static str, Option<usize>);
 
 /// What bounds a shrink.
 #[derive(Clone, Copy, Debug)]
@@ -137,7 +140,12 @@ impl Shrinker<'_, '_> {
         let mut size = self.choices.len().next_power_of_two();
         while size >= 1 {
             let mut end = self.choices.len();
+            // A run that draws fewer choices shortens the stream.
             while end > 0 {
+                end = end.min(self.choices.len());
+                if end == 0 {
+                    break;
+                }
                 let start = end.saturating_sub(size);
                 if self.choices[start..end].iter().any(|&c| c != 0) {
                     let mut choices = self.choices.clone();
@@ -183,37 +191,37 @@ pub(super) fn shrink(
     }
 }
 
-/// The check `case` fails when run with `choices`, if it fails one.
-fn first_check(
-    case: &Case,
-    choices: Vec<u32>,
-    trace: &mut Vec<super::sched::Line>,
-) -> Option<Check> {
-    let outcome = run(case, Choices::replay(choices), trace);
-    outcome.failures.first().map(|f| (f.tier, f.check))
+/// Runs `case` with `choices`, its trace in `trace`; `None` if the run
+/// panics, which a candidate takes as not failing the check.
+fn try_run(case: &Case, choices: &[u32], trace: &mut Vec<Line>) -> Option<Outcome> {
+    let run = || run(case, Choices::replay(choices.to_vec()), trace);
+    catch_unwind(AssertUnwindSafe(run)).ok()
+}
+
+/// Whether `outcome` fails `check`: the one predicate that accepts a
+/// candidate and confirms the result.
+fn fails(outcome: &Outcome, check: Check) -> bool {
+    let same = |f: &Failure| (f.tier, f.check, f.field) == check;
+    outcome.failures.iter().any(same)
 }
 
 /// What a failed case shrinks to, as a report: the shrunk case's own
-/// report, and the snippet that replays it. Empty if the failure does not
-/// replay from its choices.
+/// report, and the snippet that replays it. A note instead if the failure
+/// does not replay from its choices.
 pub(super) fn shrunk_report(case: &Case, choices: &[u32], check: Check) -> String {
     let mut failing = |case: &Case, choices: &[u32]| {
-        let outcome = run(case, Choices::replay(choices.to_vec()), &mut Vec::new());
-        let same = outcome.failures.iter().any(|f| (f.tier, f.check) == check);
-        same.then_some(outcome.choices)
+        let outcome = try_run(case, choices, &mut Vec::new())?;
+        fails(&outcome, check).then_some(outcome.choices)
     };
     if failing(case, choices).is_none() {
         return "  shrinking: the failure does not replay from its choices\n".to_owned();
     }
     let shrunk = shrink(case, choices, Limits::default(), &mut failing);
     let mut trace = Vec::new();
-    let found = first_check(&shrunk.case, shrunk.choices.clone(), &mut trace);
-    assert_eq!(found, Some(check), "a shrunk case fails the same check");
-    let outcome = run(
-        &shrunk.case,
-        Choices::replay(shrunk.choices.clone()),
-        &mut Vec::new(),
-    );
+    let outcome = try_run(&shrunk.case, &shrunk.choices, &mut trace);
+    let Some(outcome) = outcome.filter(|outcome| fails(outcome, check)) else {
+        return "  shrinking: the shrunk case does not fail the same check\n".to_owned();
+    };
     let mut text = format!(
         "SHRUNK from {} actions and {} choices to {} and {}, in {} runs\n",
         case.actions.len(),
@@ -325,5 +333,27 @@ mod tests {
                 assert_eq!(snippet.matches("UserAction::").count(), case.actions.len());
             },
         );
+    }
+
+    #[test]
+    fn a_stream_that_shrinks_under_the_shrinker_is_zeroed_within_bounds() {
+        // Zeroing the middle fails, and a run then draws far fewer choices.
+        let case = Case::new(0, &ClientKind::ALL);
+        let mut failing = |_: &Case, choices: &[u32]| {
+            (choices.first() == Some(&1)).then(|| choices[..choices.len().min(2)].to_vec())
+        };
+        let shrunk = shrink(&case, &[1; 40], Limits::default(), &mut failing);
+        assert_eq!(shrunk.choices, [1]);
+    }
+
+    #[test]
+    fn a_panicking_candidate_does_not_fail_the_check() {
+        let case = Case::new(0, &ClientKind::ALL);
+        let mut trace = Vec::new();
+        let outcome = try_run(&case, &[], &mut trace).expect("a run");
+        assert!(!fails(&outcome, (Tier::Exact, "no such check", None)));
+        let mut broken = case.clone();
+        broken.actions = vec![UserAction::Focus(99)];
+        assert!(try_run(&broken, &[], &mut trace).is_none());
     }
 }
