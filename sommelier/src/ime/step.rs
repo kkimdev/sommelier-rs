@@ -21,12 +21,10 @@ limitations under the License.
 use super::exo_view::{Edit, Frame, Unmeasured};
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
-use super::state::{
-    Confirm, Deferral, DeleteDrop, LinkState, Planned, RegionDrop, TextInput, V3Pending,
-};
+use super::state::{Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput, V3Pending};
 use super::{
-    BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, ImeMode, Input, KeyEffect,
-    LeaseOutcome, SeatId, SurfaceId, TiId,
+    BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, Input, KeyEffect, LeaseOutcome,
+    SeatId, SurfaceId, TiId,
 };
 use crate::connection::MAX_BYTES_PER_SEND;
 use crate::protocols::text_input_extension_unstable_v1::{
@@ -361,7 +359,7 @@ impl ImeCore {
         let measuring = t.exo().measuring(frame.clone());
         let measuring = measuring.as_ref().map_err(|&why| why);
         let edit = composition_event(ti, t, event, measuring, fx);
-        t.exo_after(frame.as_ref(), edit);
+        t.exo_after(frame.as_ref().ok(), edit);
     }
 
     /// F1, per text input of the seat, in `TiId` order. The field the
@@ -552,11 +550,9 @@ impl ImeCore {
 }
 
 /// H7 to H9, X1 and X2 through the gate: plan the event's transaction and
-/// send it. In Mirror mode a delete and a region are measured in the frame
-/// `measuring` holds, Exo's text before the event, and measured as Legacy
-/// mode does without one; Legacy mode measures them in the committed text,
-/// and logs where the mirror would differ. Returns what reached the guest,
-/// if the event did.
+/// send it. A delete and a region are measured in the frame `measuring`
+/// holds, Exo's text before the event, or dropped (design single-exo-model
+/// 3.4). Returns what reached the guest, if the event did.
 fn composition_event(
     ti: TiId,
     t: &mut TextInput,
@@ -565,7 +561,6 @@ fn composition_event(
     fx: &mut Effects,
 ) -> Option<Edit> {
     let count = t.serial().get();
-    let mode = t.exo().mode();
     let Some(mut cur) = t.current(ti) else {
         // B3: a preedit and a region take the assembly they apply
         // whatever becomes of them, a stale one included.
@@ -578,6 +573,8 @@ fn composition_event(
         log::debug!("Ignoring a stale composition event of text input {}", ti.0);
         return None;
     };
+    // A region dropped, whose empty range commits the shown preedit.
+    let mut dropped = None;
     let (planned, takes) = match event {
         HostIme::Preedit {
             serial,
@@ -599,79 +596,49 @@ fn composition_event(
             (cur.host_commit(text), Takes::IfApplied)
         }
         HostIme::Delete { index, length } => {
-            // A negative index keeps the v1 XML's reading, from the guest's
-            // cursor, which Legacy mode measures.
-            // The mirror diverges at one.
-            let measuring = measuring.and_then(|frame| match index >= 0 {
-                true => Ok(frame),
-                false => Err(Unmeasured::Unsure),
-            });
-            let planned = match (mode, measuring) {
-                (ImeMode::Mirror, Ok(frame)) => frame.delete(index, length).map(|lengths| {
+            let lengths = measuring
+                .map_err(DeleteDrop::Unmeasured)
+                .and_then(|frame| frame.delete(index, length));
+            match lengths {
+                Ok(lengths) => {
                     let txn = GuestTxn {
                         delete: Some(lengths),
                         ..GuestTxn::default()
                     };
-                    cur.measured(txn, None)
-                }),
-                (ImeMode::Mirror, Err(why)) => {
-                    log_fallback(ti, "delete", why);
-                    cur.delete(index, length)
+                    (cur.plan(txn, LeaseOutcome::End), Takes::IfApplied)
                 }
-                (ImeMode::Legacy, frame) => {
-                    let mirror = frame
-                        .ok()
-                        .and_then(|frame| frame.delete(index, length).ok());
-                    let mirror = mirror.map(|lengths| GuestTxn {
-                        delete: Some(lengths),
-                        ..GuestTxn::default()
-                    });
-                    let legacy = cur.delete(index, length);
-                    log_decision_diff(ti, "delete", mirror, &legacy);
-                    legacy
-                }
-            };
-            match planned {
-                Ok(planned) => (planned, Takes::IfApplied),
+                // An empty delete edits nothing, so the guest stays as
+                // Exo is.
+                Err(DeleteDrop::Empty) => return Some(Edit::default()),
                 Err(drop) => {
                     log_delete_drop(ti, t, index, length, drop);
+                    // Exo edited its text, unless the range was empty.
+                    if length > 0 {
+                        fx.keys.push(lease(ti, t, LeaseOutcome::End));
+                    }
                     return None;
                 }
             }
         }
         HostIme::PreeditRegion { index, length } => {
             let assembly = cur.take_assembly();
-            let planned = match (mode, measuring) {
-                (ImeMode::Mirror, Ok(frame)) => frame
-                    .region(index, length, assembly)
-                    .map(|(txn, held)| cur.measured(txn, held)),
-                (ImeMode::Mirror, Err(why)) => {
-                    log_fallback(ti, "region", why);
-                    cur.region(index, length, assembly)
-                }
-                (ImeMode::Legacy, frame) => {
-                    let mirror = frame
-                        .ok()
-                        .and_then(|frame| frame.region(index, length, assembly).ok());
-                    let legacy = cur.region(index, length, assembly);
-                    log_decision_diff(ti, "region", mirror.map(|(txn, _)| txn), &legacy);
-                    legacy
-                }
-            };
-            match planned {
-                Ok(planned) => (planned, Takes::Before),
-                Err(drop @ RegionDrop::Uncovered) => {
-                    log::debug!(
-                        "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
-                        ti.0
-                    );
-                    return None;
+            let txn = measuring
+                .map_err(RegionDrop::Unmeasured)
+                .and_then(|frame| frame.region(index, length, assembly));
+            match txn {
+                Ok(txn) => (cur.plan(txn, LeaseOutcome::End), Takes::Before),
+                // Exo ends its composition at an empty region, measured or
+                // not, and leaves it as text: the guest commits what it
+                // shows, which at worst doubles text the next preedit
+                // would otherwise replace (design single-exo-model 3.4).
+                Err(drop) if length == 0 && cur.shown().is_some() => {
+                    dropped = Some((index, length, drop));
+                    (cur.commit_shown(), Takes::Before)
                 }
                 Err(drop) => {
-                    log::warn!(
-                        "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
-                        ti.0
-                    );
+                    log_region_drop(ti, t, index, length, drop);
+                    // Exo edited its composition all the same.
+                    fx.keys.push(lease(ti, t, LeaseOutcome::End));
                     return None;
                 }
             }
@@ -689,6 +656,9 @@ fn composition_event(
     };
     let edit = planned.edit();
     let applied = planned.apply();
+    if let Some((index, length, drop)) = dropped {
+        log_region_drop(ti, t, index, length, drop);
+    }
     let take = match takes {
         Takes::Before => false,
         Takes::IfApplied => applied.is_ok(),
@@ -713,27 +683,41 @@ fn composition_event(
     }
 }
 
-/// Mirror mode: the core cannot measure a host `what` in the Exo mirror,
-/// for `why`, so it is measured as Legacy mode does.
-fn log_fallback(ti: TiId, what: &str, why: Unmeasured) {
+/// The core drops a host `what`, a delete or a region, as the Exo mirror
+/// cannot measure it, for `why`. The event did not reach the guest, which
+/// is then out of step with Exo until its next report (design
+/// single-exo-model 3.4). The first drop for want of a mirror warns, as it
+/// is the host's limit.
+fn log_unmeasured(ti: TiId, t: &mut TextInput, what: &str, why: Unmeasured) {
     #[cfg(test)]
-    FALLBACKS.with(|fallbacks| {
-        let mut counted = fallbacks.get();
+    DROPS.with(|drops| {
+        let mut counted = drops.get();
         counted.count(why);
-        fallbacks.set(counted);
+        drops.set(counted);
     });
-    log::debug!(
-        "Text input {}: measuring a {what} as Legacy mode does, as the Exo mirror cannot: \
-         {why:?}",
-        ti.0
-    );
+    if why == Unmeasured::NoMirror && t.first_no_mirror_warning() {
+        match t.host().ext {
+            Some(ext) => log::warn!(
+                "Host text-input extension v{} < 11: Exo's deletes and regions of text input {} \
+                 are dropped",
+                ext.version,
+                ti.0
+            ),
+            None => log::warn!(
+                "Host has no text-input extension: Exo's deletes of text input {} are dropped",
+                ti.0
+            ),
+        }
+    }
+    log::debug!("Dropping Exo's {what} of text input {}: {why:?}", ti.0);
 }
 
-/// Mirror mode's fallbacks to Legacy mode, by cause, which the DST counts
-/// (`mirror_fallbacks_all`).
+/// The deletes and regions the core dropped as the Exo mirror could not
+/// measure them, by cause, which the DST counts.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Fallbacks {
+pub(crate) struct Drops {
+    pub(crate) no_mirror: u64,
     pub(crate) unsure: u64,
     pub(crate) unseen: u64,
     pub(crate) crossing: u64,
@@ -741,20 +725,27 @@ pub(crate) struct Fallbacks {
 }
 
 #[cfg(test)]
-impl Fallbacks {
+impl Drops {
     fn count(&mut self, why: Unmeasured) {
         *match why {
+            Unmeasured::NoMirror => &mut self.no_mirror,
             Unmeasured::Unsure => &mut self.unsure,
             Unmeasured::Unseen => &mut self.unseen,
             Unmeasured::Crossing => &mut self.crossing,
             Unmeasured::OutOfStep => &mut self.out_of_step,
         } += 1;
     }
+
+    /// The drops of a text input with a mirror: every cause but its want.
+    pub(crate) fn mirrored(&self) -> u64 {
+        self.unsure + self.unseen + self.crossing + self.out_of_step
+    }
 }
 
 #[cfg(test)]
-impl std::ops::AddAssign for Fallbacks {
+impl std::ops::AddAssign for Drops {
     fn add_assign(&mut self, other: Self) {
+        self.no_mirror += other.no_mirror;
         self.unsure += other.unsure;
         self.unseen += other.unseen;
         self.crossing += other.crossing;
@@ -764,36 +755,15 @@ impl std::ops::AddAssign for Fallbacks {
 
 #[cfg(test)]
 thread_local! {
-    /// This thread's fallbacks: a DST case runs its proxy on its own
-    /// thread, one case at a time.
-    static FALLBACKS: std::cell::Cell<Fallbacks> = std::cell::Cell::default();
+    /// This thread's drops: a DST case runs its proxy on its own thread,
+    /// one case at a time.
+    static DROPS: std::cell::Cell<Drops> = std::cell::Cell::default();
 }
 
-/// This thread's fallbacks since the last call.
+/// This thread's drops since the last call.
 #[cfg(test)]
-pub(crate) fn take_fallbacks_for_test() -> Fallbacks {
-    FALLBACKS.take()
-}
-
-/// Legacy mode: where the Exo mirror, had the guest been in step, would
-/// have sent `mirror` for a host `what`, and Legacy mode sends another
-/// transaction or drops it (design exo-mirror 6, the decision diff). It
-/// carries the user's text, so it is at `trace`.
-fn log_decision_diff<E>(
-    ti: TiId,
-    what: &str,
-    mirror: Option<GuestTxn>,
-    legacy: &Result<Planned, E>,
-) {
-    let legacy = legacy.as_ref().ok().map(Planned::txn);
-    if mirror.as_ref() != legacy {
-        log::trace!(
-            target: TRACE,
-            "Text input {}: the Exo mirror would send {mirror:?} for a {what}, Legacy mode sends \
-             {legacy:?}",
-            ti.0
-        );
-    }
+pub(crate) fn take_drops_for_test() -> Drops {
+    DROPS.take()
 }
 
 /// Whether a pending surrounding text is one the guest stated, not the
@@ -851,15 +821,29 @@ fn log_host_serial(serial: u32, count: u32) {
     }
 }
 
-/// H9's drops. The first of a range around no cursor warns, since only
-/// the log shows the lost delete.
+/// X1's drops. One around no cursor is one Exo could not have sent, which
+/// warns.
+fn log_region_drop(ti: TiId, t: &mut TextInput, index: i32, length: u32, drop: RegionDrop) {
+    match drop {
+        RegionDrop::Unmeasured(why) => log_unmeasured(ti, t, "region", why),
+        RegionDrop::Uncovered => log::debug!(
+            "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
+            ti.0
+        ),
+        RegionDrop::NotAroundCursor => log::warn!(
+            "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
+            ti.0
+        ),
+    }
+}
+
+/// H9's drops. A range around no cursor is one Exo could not have sent,
+/// which the mirror's divergence already warned of.
 fn log_delete_drop(ti: TiId, t: &mut TextInput, index: i32, length: u32, drop: DeleteDrop) {
-    let level = match drop {
-        DeleteDrop::NotAroundCursor if t.first_delete_range_warning() => log::Level::Warn,
-        _ => log::Level::Debug,
-    };
-    log::log!(
-        level,
+    if let DeleteDrop::Unmeasured(why) = drop {
+        return log_unmeasured(ti, t, "delete", why);
+    }
+    log::debug!(
         "Ignoring v1 delete range {index}+{length} of text input {}: {drop:?}",
         ti.0
     );

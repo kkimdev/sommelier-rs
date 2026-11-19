@@ -55,7 +55,6 @@ mod user;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use crate::ime::ImeMode;
 use crate::test_support::Rng;
 use editor::{Reference, TextModel, Typing, UserAction};
 use engine::Lag;
@@ -121,12 +120,13 @@ impl Case {
 
     /// How keys reach the client's fields, through a host whose text-input
     /// extension is `extension`: GTK's Backspace leaves a syllable's NFD
-    /// prefix (C14), and only the extension shows a reconverted region.
+    /// prefix (C14), and only the proxy's Exo mirror, from v11, measures
+    /// Exo's deletes and regions.
     fn typing(&self, extension: Option<u32>) -> Typing {
         Typing {
             latin: self.latin,
             nfd_backspace: self.client != ClientKind::Chromium,
-            regionless: extension.is_none(),
+            unmeasured: !extension.is_some_and(|version| version >= 11),
             late_cursor: self.client == ClientKind::Gtk3,
         }
     }
@@ -189,11 +189,11 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         .build()
         .expect("a runtime");
     runtime.block_on(async {
-        // The proxy counts its fallbacks on this thread.
-        crate::ime::take_fallbacks_for_test();
+        // The proxy counts its drops on this thread.
+        crate::ime::take_drops_for_test();
         let mut world = World::new(&setup, choices, trace).await;
         world.run(&case.actions).await;
-        let fallbacks = crate::ime::take_fallbacks_for_test();
+        let drops = crate::ime::take_drops_for_test();
         let mut outcome = Outcome {
             failures: Vec::new(),
             known: Vec::new(),
@@ -212,7 +212,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
             return outcome;
         };
         outcome.counts = spec.counts;
-        outcome.counts.mirror_fallbacks_all = fallbacks;
+        outcome.counts.drops = drops;
         let (engine, resets) = (world.engine_composition(), world.engine_resets());
         let (exo, steps) = (&world.exo, &world.steps);
         let mut failures = oracle::exact(steps, spec, shadow, exo, &engine, resets, extension);
@@ -230,8 +230,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
                 detail: world.mirrors.join("\n"),
             });
         }
-        let mirror = ImeMode::of(extension, crate::handler::text_input::mirror_shadowed());
-        outcome.known = oracle::classify(&failures, &spec.counts, mirror == ImeMode::Mirror);
+        outcome.known = oracle::classify(&failures, &spec.counts);
         if outcome.known.is_empty() {
             outcome.failures = failures;
         }
@@ -546,17 +545,15 @@ fn check(test: &str, settled: bool) {
                 counts.focused_surface_destroys,
             ]);
         }
-        // Rarer paths, which a long run must reach: a region over a region
-        // the guest has not reported, or over a preedit the committed text
-        // does not hold, a dropped region, and a delete dropped while the
-        // guest's text is ahead (P4) or for its range.
+        // Rarer paths, which a long run must reach: a region over a shown
+        // preedit, a delete Exo's text measures to nothing, and the drops
+        // of a host with no mirror and of one that cannot measure.
         if !settled && *cases >= 5_000 {
             reached.extend([
-                counts.regions_over_regions,
                 counts.regions_over_preedits,
-                counts.regions_dropped,
-                counts.deletes_ahead,
                 counts.deletes_misplaced,
+                counts.drops.no_mirror,
+                counts.drops.mirrored(),
             ]);
         }
         if *cases >= 300 {
@@ -569,6 +566,11 @@ fn check(test: &str, settled: bool) {
         assert!(
             !settled || counts.fence_drops == 0,
             "a settled case met the fence: {counts:?}"
+        );
+        // The mirror measures every delete and region of a settled case.
+        assert!(
+            !settled || counts.drops.mirrored() == 0,
+            "a settled case dropped a delete or region it could measure: {counts:?}"
         );
         if let Some(first) = failed.first() {
             panic!(

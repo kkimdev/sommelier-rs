@@ -34,18 +34,15 @@
   optional guest-initiated host `reset`) and C7 (test slimming) remain.
   Whether a composition should survive a blur, as native Chrome keeps
   it, is open (U5, U13, U14 of the design's 6.2); C5 commits it, as
-  mutter and ibus do. The Exo mirror's M2 and M3 are done: the core keeps
-  a replica of Exo's text tracker per text input, and from v11 of the
-  text-input extension measures Exo's deletes and preedit regions in it
-  (Mirror mode; INVARIANTS "From v11 of the extension, Exo's deletes and
-  regions are measured in the Exo mirror"). `SOMMELIER_IME_MIRROR=shadow`
-  keeps every text input in Legacy mode for one release (CONTRIBUTING).
-  M4 is done too: in Mirror mode a report that would only drop Exo's
-  composition is withheld (same rule, "In Mirror mode, a guest report
-  that would only drop Exo's composition is withheld"). M5 needed no
-  change: C5 already commits at Exo's detach a preedit Exo did not hold
-  (H2, every mode), which retired `RestartLosesUntrackedComposition`.
-  M6, removing the kill switch, waits a release.
+  mutter and ibus do. The Exo mirror is done: from v11 of the text-input
+  extension the core keeps a replica of Exo's text tracker per text
+  input, the one model of Exo's text, and measures Exo's deletes and
+  preedit regions in it, or drops them; below v11 it drops them all
+  (INVARIANTS "Exo's deletes and regions are measured in the Exo mirror,
+  or dropped"; `specs/single-exo-model.md`). A report that would only
+  drop Exo's composition is withheld (same rule). C5 commits at Exo's
+  detach a preedit Exo did not hold (H2), which retired
+  `RestartLosesUntrackedComposition`.
 
 ## Known issues and debt
 
@@ -104,20 +101,6 @@
   bytes still ends the session as too large
   ([Wire messages](docs/INVARIANTS.md#wire-messages)). No client is known
   to send one.
-- In Legacy mode (below v11 of the extension, or under the kill switch):
-  Exo measures a `delete_surrounding_text` against its predicted text,
-  which includes input-method edits the guest has not yet reported. The
-  proxy drops deletes until the guest commits its surrounding text after
-  such an edit, but a guest commit that crosses an edit in flight still
-  counts as caught up, so the next delete can land wrong
-  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A Chromium
-  or Electron v3 guest crosses one after a delete then a commit, as when
-  a suggestion is accepted: it answers the delete's `done` with its text,
-  which clears the gate, before it applies the commit. The `done` that
-  answers that report lets it report the text after the commit at once
-  (`a_client_that_waits_for_done_reports_the_text_an_edit_leaves`), so
-  only a delete within that round trip can land wrong. Mirror mode closes
-  it from v11; no host has shown it.
 - An empty IME confirmation while a key the input method took is held
   recovers that key only once the host's next event shows it repeated,
   one round trip later at most
@@ -130,98 +113,48 @@
   Exo's own detach of the input method ends the recovery of the keys held
   then, whose releases may have died with it, so a key held across an
   input-method restart stops repeating until its next press.
-- In Legacy mode, a preedit region is measured in Exo's text as the
-  proxy knows it: the guest's text with the preedit Exo holds at the
-  guest's cursor ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)).
-  These cases stay approximate; the DST names the first three as known
-  issues. At v11 Mirror mode measures in Exo's text instead while it can,
-  and falls back to this otherwise (see below).
-  - A region that does not cover the preedit Exo holds is dropped, but
-    an empty one at Exo's cursor after it, which the guest commits: the
-    guest keeps showing the old preedit while Exo composes the new range
-    and keeps the rest of the old one as text. The exact answer commits
-    that rest after the region's delete, and the proxy would then have
-    to track text the guest gained, not only bytes it lost, until the
-    guest reports.
-  - The proxy assumes Exo matched every guest report but one without a
-    region's bytes. A report Exo cannot match otherwise drops Exo's
-    composition (E4), and nothing tells the proxy: it still measures
-    with the preedit the guest shows (`RegionOverUnheldPreedit`; seed
-    18654, a GTK3 report of a tap's cursor that lags behind a late
-    answer). A report Exo has yet to get, on its way to Exo or sent
-    while the region is on its way back, is the converse
-    (`RegionCrossesReport`; seeds 2452 and 8116 cross the region on the
-    wire). A region the proxy drops can start such a divergence too: in
-    seed 12364 (free, GTK3, extension v10), an engine answer made before
-    a focus move shows a preedit in the newly focused field that Exo
-    drops at the guest's next report; the proxy drops Exo's next region,
-    measured with that preedit, and Exo composes from it, so the region
-    after it is measured over a preedit Exo no longer holds. The judge
-    names it `RegionOverUnheldPreedit` (regression in `sim/regressions.rs`).
-  - Ahead: the proxy measures in the text the guest last reported, less
-    the bytes regions took, so a region made while host commits, a
-    press's commit, or a reset commit the guest has not reported yet
-    are in Exo's text lands wrong (`RegionWhileAhead`; seeds 10114 and
-    10174). It probably also feeds `StaleRegionAfterCommit`. Mirror mode
-    closes it.
-  - Selection: Exo's tracker replaces a selection with the composition
-    (`OnSetCompositionText`), while `ime::Current::predicted` inserts
-    the preedit at the guest's cursor and ignores the anchor, so a region
-    while the guest has a selection is measured in other text than
-    Exo's. No DST case makes a selection.
-  - A v3 guest states its text without the preedit, while Exo predicts
-    it with the composition inline and Chromium's own v1 client sends it
-    so (`ZwpTextInputV1Impl::SetSurroundingText`). So a report without a
-    region's bytes names no state Exo predicted, and Exo drops its
-    composition (E4): the guest keeps a preedit nothing composes. Sending
-    Exo each report with the preedit the guest shows *now* inserted at
-    its cursor is not the fix: every transaction since the guest's last
-    commit carries the same `done` serial, so the proxy cannot tell which
-    one a report reflects, and a report that lags (Chromium's, or GTK3's
-    after each of two transactions) gets a preedit it never showed, which
-    names no state either and leaves the preedit in Exo as text. Tried on
-    the DST, it regressed seed 537 (settled, Chromium), did not retire
-    `StaleRegionAfterCommit` (seed 1008752) or `RegionCrossesReport`
-    (seed 474), and doubled `RestartLosesUntrackedComposition` (63 to
-    145 of 5,000 settled cases from seed 1,000,001; C5 has since
-    retired that issue). The fix needs the
-    preedit each transaction left, matched to the report as Exo's
-    `SurroundingTextTracker::Update` matches its history, which Mirror
-    mode does: it withholds such a report (M4).
-  - Chromium applies a transaction's delete before its preedit clear and
-    drops a delete while it shows a composition (C3 of
-    [IME_REDESIGN](docs/IME_REDESIGN.md)), so a region over a shown
-    preedit that deletes bytes beyond it leaves them in Chromium's text
-    as well as in the new preedit. Ending the old preedit with a `done`
-    of its own first would serve Chromium, but the report Chromium
-    answers it with lacks the preedit, so Exo would drop its
-    composition (E4).
-- Mirror mode (from v11) measures in the Exo mirror only while the guest
-  is in step with Exo, the mirror is exact and no report crosses the
-  event, and falls back to Legacy mode's measurement otherwise. It must
-  not drop instead: the input method's next commit would double the text.
-  In 20,000 DST cases from seed 0, 6 events of the free cases fell back
-  where the two measurements differ (14 before M4), none in settled cases; the Legacy
-  issues then appear at v11 in a few cases (4.8 of the design). Counting
-  every fallback (`mirror_fallbacks_all`), 19 events of the free cases
-  fell back, none for an unsure mirror, and none of the settled cases:
-  the floor for dropping Legacy mode (`specs/single-exo-model.md` PR B).
-  The mirror is unsure only after a divergence, an event that arrives
-  while a split report is on its way, the 4,096-state or 256 KiB caps, or
-  an ambiguous report; a press's `reset` then a report heal those, and a
-  vague selection heals at the next event that sets it. Its
+- Exo's deletes and preedit regions are measured in the Exo mirror only
+  while the text input has one (extension v11 or later), the guest is in
+  step with Exo, the mirror is exact, and no report crosses the event;
+  otherwise they are dropped
+  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A drop
+  never deletes or loses text, but the input method goes on as if it
+  applied, so its next commit doubles text once (`word word~`, 한국韓國)
+  until the guest's next report resets Exo to the guest's text. Before
+  the drops replaced the old fallback, 20,000 DST cases from seed 0 fell
+  back on 19 events of the free cases and none of the settled ones; the
+  DST now fails a settled case with a drop the mirror could measure. The
+  mirror is unsure only after a divergence, an event that arrives while
+  a split report is on its way, the 4,096-state or 256 KiB caps, or an
+  ambiguous report; a press's `reset` then a report heal those, and a
+  vague selection heals at the next event that sets it. Below v11 every
+  delete and region is dropped, which warns once per text input. Its
   gaps:
   - A silent edit the proxy does not see breaks the guest model: GTK3
     reports a click's new cursor only with its next edit, so a region
-    right after the click is measured at Exo's old cursor, as Legacy mode
-    measures it. The DST's tier 1 holds the proxy to Exo's real text, not
-    to the guest's, so it does not see it; tier 2 sees it only in free
-    cases, which it does not judge.
+    right after the click is measured at Exo's old cursor. The DST's
+    tier 1 holds the proxy to Exo's real text, not to the guest's, so it
+    does not see it; tier 2 sees it only in free cases, which it does not
+    judge.
   - A forwarded key or press suspends measuring until the guest states
     its text: a report it made after it, or a commit with no surrounding
     text, which the proxy reads as "unchanged" (Chromium reports its text
     only when it changed, C1). A client that commits without stating its
     changed text would break that.
+  - A region that does not cover the composition Exo holds is dropped:
+    the guest keeps showing the old preedit while Exo composes the new
+    range and keeps the rest of the old one as text. The exact answer
+    commits that rest after the region's delete.
+  - Chromium applies a transaction's delete before its preedit clear and
+    drops a delete while it shows a composition (C3 of
+    [IME_REDESIGN](docs/IME_REDESIGN.md)), so a region over a shown
+    preedit that deletes bytes beyond it leaves them in Chromium's text
+    as well as in the new preedit, and the guest is out of step: the next
+    region is dropped until the guest reports (#85,
+    `a_region_over_a_region_drops`). Ending the old preedit with a `done`
+    of its own first would serve Chromium, but the report Chromium
+    answers it with lacks the preedit, so Exo would drop its composition
+    (E4).
   - A withheld report hides a guest edit that happens to equal Exo's
     state without the composition the guest shows, as from a client that
     drops its preedit without a word (C4 of the design): Exo keeps
@@ -230,12 +163,13 @@
   - The mirror is only as right as its reading of Chromium
     (`6975bb48a8cd`). A host check, with `RUST_LOG=sommelier::ime=debug`,
     in gedit, a GTK4 app, and Chrome or VS Code with
-    `--enable-wayland-ime --wayland-text-input-version=3`: type Korean;
-    reconvert with the hanja key inside a word, then press Esc and
-    Backspace; click while composing; paste a long paragraph and keep
-    typing. No "Exo mirror ... diverged" warning should show; with
-    `SOMMELIER_IME_MIRROR=shadow`, the debug log shows where the mirror
-    would have measured otherwise.
+    `--enable-wayland-ime --wayland-text-input-version=3`: type Korean
+    with Shift; hold Backspace; reconvert with the hanja key inside a
+    word and after it, then press Esc and Backspace; click while
+    composing; move the focus while composing; accept a suggestion if
+    one is offered. No "Exo mirror ... diverged" warning should show,
+    and every "Dropping Exo's" debug line should have a cause the case
+    explains.
 - The pointer press or touch-down that ends a composition
   ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)) has not been
   checked on a host. In VS Code or Chrome started with

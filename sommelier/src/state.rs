@@ -1022,16 +1022,13 @@ impl Context {
                 None
             }
         };
-        let mut ctx = Self::from_parts(
+        Self::from_parts(
             gpu_accel,
             xdg_decoration,
             vm_identifier,
             allocator,
             placement,
-        );
-        // The IME's kill switch, `SOMMELIER_IME_MIRROR`, read once.
-        ctx.ime = crate::ime::ImeCore::new(crate::handler::text_input::mirror_shadowed());
-        ctx
+        )
     }
 
     /// Build the state from resolved inputs; reads no environment.
@@ -1301,7 +1298,6 @@ mod tests {
             // is a virtio-gpu render node, as in a Crostini container;
             // elsewhere a probe fails unseen.
             ("SOMMELIER_DRM_DEVICE", "/dev/dri/renderD128"),
-            ("SOMMELIER_IME_MIRROR", "shadow"),
             ("SOMMELIER_VM_IDENTIFIER", "penguin-vm"),
             ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
             ("SOMMELIER_WINDOW_PLACEMENT_BACKEND", "arc"),

@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 //! The state of one text input (design 3.1). Its fields are private to
-//! this file and its child `legacy`: every change is a named method, and a host composition event
+//! this file: every change is a named method, and a host composition event
 //! or a press can change what the guest is shown only through
 //! [`Current`], which only [`TextInput::current`] makes.
 
-use super::exo_view::{Edit, ExoView, Frame};
+use super::exo_view::{Edit, ExoView, Frame, Unmeasured};
 use super::guest::{resolve_preedit_cursor, GuestTxn, Preedit, TooLong};
 #[cfg(test)]
 use super::host;
@@ -27,14 +27,8 @@ use super::host::HostContentType;
 use super::serial::{CommitCount, Serial};
 #[cfg(test)]
 use super::Env;
-use super::{BarrierToken, HostTi, ImeMode, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
+use super::{BarrierToken, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
 use crate::wire::Outgoing;
-use legacy::ExoText;
-
-// Legacy mode's H9 and X1, which measure in the committed text: a child
-// module, as it plans through the private fields of `Current`.
-#[path = "legacy.rs"]
-mod legacy;
 
 /// A text-input-v3 content type: `(hint, purpose)`.
 pub(super) type ContentType = (u32, u32);
@@ -107,7 +101,6 @@ struct FocusedField {
     /// The committed state. Its `enabled` lives here, so ending or
     /// refocusing the field clears it by construction (B7).
     committed: V3Committed,
-    text: ExoText,
 }
 
 /// What the host text input has applied, by Exo's rules (INVARIANTS "The
@@ -128,24 +121,11 @@ pub(crate) enum LinkState {
     Draining { barrier: BarrierToken },
 }
 
-/// What the guest shows, and the v1 pieces of the next host event.
+/// What the guest shows, and the v1 pieces of the next host event. What
+/// Exo holds is the Exo mirror's ([`ExoView`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Composition {
     shown: Option<Preedit>,
-    /// The bytes before and after the committed cursor that preedit
-    /// regions took since the guest last reported its surrounding text
-    /// (X1). The committed text still holds them, but the guest no longer
-    /// does. `Some` only while the text is `Ahead`: a report clears it
-    /// ([`TextInput::apply_commit`]), and so does every end of the
-    /// composition, which gives the bytes back as text, a reset commit
-    /// (H7) included. Any other host preedit keeps it.
-    taken: Option<(u32, u32)>,
-    /// Where Exo's cursor is in `shown`, while Exo holds it as its
-    /// composition, inline in its text at the guest's cursor (X1). `None`
-    /// with nothing shown, and for a region's preedit once the guest
-    /// reported text without the region's bytes, which Exo cannot match,
-    /// so it drops its composition (E4).
-    held: Option<u32>,
     assembly: Assembly,
 }
 
@@ -162,7 +142,8 @@ pub(crate) struct Assembly {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Warned {
     seat_missing: bool,
-    delete_range: bool,
+    /// Exo's deletes and regions are dropped for want of a mirror.
+    no_mirror: bool,
     /// The deferral last logged.
     deferral: Option<Deferral>,
 }
@@ -177,12 +158,7 @@ pub(super) enum Deferral {
 }
 
 impl TextInput {
-    pub(super) fn new(
-        seat: SeatId,
-        host: HostTi,
-        surface: Option<SurfaceId>,
-        mode: ImeMode,
-    ) -> Self {
+    pub(super) fn new(seat: SeatId, host: HostTi, surface: Option<SurfaceId>) -> Self {
         Self {
             seat,
             host,
@@ -191,7 +167,7 @@ impl TextInput {
             field: Field::focused_on(surface),
             link: LinkState::Detached,
             fence: None,
-            exo: ExoView::new(mode, host.ext.map(|ext| ext.version)),
+            exo: ExoView::new(host.ext.map(|ext| ext.version)),
             composition: Composition::default(),
             warned: Warned::default(),
         }
@@ -259,20 +235,11 @@ impl TextInput {
 
     /// Whether the core withholds the guest's report `report`
     /// (`ExoView::withholds`).
-    /// The commit has already taken the report to make Exo drop the
-    /// composition of a region (`apply_commit`), but Exo keeps it, so
-    /// Legacy mode, which measures wherever Mirror mode cannot, holds the
-    /// shown preedit again, with Exo's cursor in it.
     pub(super) fn withholds_report(&mut self, report: &(String, u32, u32)) -> bool {
-        let shown = self.composition.shown.as_ref();
-        if !self.exo.withholds(report, shown) {
-            return false;
-        }
-        self.composition.held = shown.and_then(|shown| self.exo.cursor_in(shown));
-        true
+        self.exo.withholds(report, self.composition.shown.as_ref())
     }
 
-    /// After a tracker-changing host event, with `frame` the one taken
+    /// After a tracker-changing host event, with `frame` the one made
     /// before it and `edit` what reached the guest (`ExoView::after`).
     pub(super) fn exo_after(&mut self, frame: Option<&Frame>, edit: Option<Edit>) {
         self.exo.after(frame, edit, self.composition.shown.as_ref());
@@ -314,12 +281,6 @@ impl TextInput {
         }
         if let Some(surrounding_text) = surrounding_text {
             f.committed.surrounding_text = surrounding_text;
-            f.text = ExoText::Synced;
-            // A text without the bytes regions took names no state Exo
-            // predicted, so Exo drops its composition (E4).
-            if self.composition.taken.take().is_some() {
-                self.composition.held = None;
-            }
         }
         if let Some(content_type) = content_type {
             f.committed.content_type = content_type;
@@ -345,8 +306,6 @@ impl TextInput {
                 ti.0
             );
             self.composition.shown = None;
-            self.composition.taken = None;
-            self.composition.held = None;
             vec![bare_done(ti, serial)]
         })
     }
@@ -390,15 +349,13 @@ impl TextInput {
         if !self.is_attached() || self.fence.is_some() {
             return None;
         }
-        let Field::Focused(f) = &mut self.field else {
+        if matches!(self.field, Field::Unfocused) {
             return None;
-        };
+        }
         Some(Current {
             ti,
             seat: self.seat,
             serial: self.commits.serial(),
-            committed: &f.committed,
-            text: &mut f.text,
             composition: &mut self.composition,
             fence: &mut self.fence,
         })
@@ -478,10 +435,10 @@ impl TextInput {
         !std::mem::replace(&mut self.warned.seat_missing, true)
     }
 
-    /// Whether H9's delete around no cursor is warned of now: once per
-    /// text input.
-    pub(super) fn first_delete_range_warning(&mut self) -> bool {
-        !std::mem::replace(&mut self.warned.delete_range, true)
+    /// Whether a delete or region dropped for want of a mirror is warned
+    /// of now: once per text input.
+    pub(super) fn first_no_mirror_warning(&mut self) -> bool {
+        !std::mem::replace(&mut self.warned.no_mirror, true)
     }
 
     /// The barriers this text input waits for: its drain and its fence.
@@ -517,28 +474,9 @@ impl TextInput {
                 panic!("I1b: {ti:?} is attached with no target: {self:?}")
             }
         }
-        let Composition {
-            shown,
-            taken,
-            held,
-            assembly,
-        } = &self.composition;
-        if shown.is_some() || taken.is_some() || *assembly != Assembly::default() {
+        let Composition { shown, assembly } = &self.composition;
+        if shown.is_some() || *assembly != Assembly::default() {
             assert!(attached, "I2: {ti:?} composes while not attached");
-        }
-        if taken.is_some() {
-            let ahead = matches!(&self.field, Field::Focused(f) if f.text == ExoText::Ahead);
-            assert!(
-                ahead,
-                "I2: {ti:?} keeps taken bytes past a report: {self:?}"
-            );
-        }
-        if let Some(at) = held {
-            let at = *at as usize;
-            let holds = shown
-                .as_ref()
-                .is_some_and(|p| p.text().is_char_boundary(at));
-            assert!(holds, "I2: {ti:?} holds no preedit at {at}: {self:?}");
         }
         if shown.is_some() {
             assert!(
@@ -582,12 +520,11 @@ impl TextInput {
         self.link = LinkState::Attached { content_type };
     }
 
-    /// Show `text` with the cursor at its end, which Exo holds there, or
-    /// show nothing for empty `text`.
+    /// Show `text` with the cursor at its end, or show nothing for empty
+    /// `text`.
     pub(crate) fn show_for_test(&mut self, text: &str) {
         let end = text.len() as i32;
         self.composition.shown = Preedit::new(text.to_string(), (end, end));
-        self.composition.held = self.composition.shown.as_ref().map(|_| end as u32);
     }
 
     /// The text of the preedit the guest shows.
@@ -613,8 +550,10 @@ impl TextInput {
         self.exo = other.exo.clone();
     }
 
+    /// Whether it warned of a missing seat, and of a delete or region
+    /// dropped for want of a mirror.
     pub(crate) fn warned_for_test(&self) -> (bool, bool) {
-        (self.warned.seat_missing, self.warned.delete_range)
+        (self.warned.seat_missing, self.warned.no_mirror)
     }
 }
 
@@ -624,7 +563,6 @@ impl Field {
             Some(surface) => Self::Focused(FocusedField {
                 surface,
                 committed: V3Committed::default(),
-                text: ExoText::Synced,
             }),
             None => Self::Unfocused,
         }
@@ -648,8 +586,6 @@ pub(super) struct Current<'a> {
     ti: TiId,
     seat: SeatId,
     serial: Serial,
-    committed: &'a V3Committed,
-    text: &'a mut ExoText,
     composition: &'a mut Composition,
     fence: &'a mut Option<BarrierToken>,
 }
@@ -657,11 +593,8 @@ pub(super) struct Current<'a> {
 /// Why a host delete (H9) is dropped.
 #[derive(Debug)]
 pub(super) enum DeleteDrop {
-    NoSurroundingText,
-    Selection,
-    /// A non-negative index is measured against Exo's prediction of the
-    /// text, which holds an edit the guest has not reported.
-    TextAhead,
+    /// The Exo mirror cannot measure it.
+    Unmeasured(Unmeasured),
     NotAroundCursor,
     Empty,
 }
@@ -669,7 +602,8 @@ pub(super) enum DeleteDrop {
 /// Why a preedit region (X1') is dropped.
 #[derive(Debug)]
 pub(super) enum RegionDrop {
-    NoSurroundingText,
+    /// The Exo mirror cannot measure it.
+    Unmeasured(Unmeasured),
     NotAroundCursor,
     /// The region does not cover the preedit Exo holds, whose rest Exo
     /// would leave as text.
@@ -687,28 +621,19 @@ impl<'a> Current<'a> {
         self.composition.shown.as_ref()
     }
 
-    /// Plan `txn`, after which regions have taken `taken`.
-    fn plan(
-        self,
-        txn: GuestTxn,
-        ahead: bool,
-        taken: Option<(u32, u32)>,
-        lease: LeaseOutcome,
-    ) -> Planned<'a> {
+    /// Plan `txn`, with what becomes of the Backspace lease, `lease`. H9
+    /// and X1 plan the transaction a `exo_view::Frame` measured in Exo's
+    /// text.
+    pub(super) fn plan(self, txn: GuestTxn, lease: LeaseOutcome) -> Planned<'a> {
         Planned {
             cur: self,
             txn,
-            ahead,
-            taken,
-            held: None,
             lease,
             fence: None,
         }
     }
 
-    /// H7. A cleared preedit with a commit text is Exo's reset commit,
-    /// which gives the bytes regions took back as text, as every edit
-    /// that ends the composition does. A preedit keeps them.
+    /// H7. A cleared preedit with a commit text is Exo's reset commit.
     pub(super) fn preedit(self, text: String, commit: String, assembly: Assembly) -> Planned<'a> {
         let shown = self.shown().is_some();
         if text.is_empty() && shown && !commit.is_empty() {
@@ -716,63 +641,27 @@ impl<'a> Current<'a> {
                 commit: Some(commit),
                 ..GuestTxn::default()
             };
-            return self.plan(txn, true, None, LeaseOutcome::End);
+            return self.plan(txn, LeaseOutcome::End);
         }
-        let taken = self.composition.taken;
         let lease = match text.is_empty() && shown {
             true => LeaseOutcome::ArmIfBackspaceHeld,
             false => LeaseOutcome::End,
         };
-        // Exo's cursor is where it sent the preedit's, or else, as no
-        // cursor of its own converted, at the end.
-        let held = assembly
-            .cursor
-            .and_then(|at| u32::try_from(at).ok())
-            .filter(|&at| text.is_char_boundary(at as usize))
-            .unwrap_or(text.len() as u32);
         let cursor = resolve_preedit_cursor(&text, assembly.selection, assembly.cursor);
-        let preedit = Preedit::new(text, cursor);
-        let held = preedit.as_ref().map(|_| held);
         let txn = GuestTxn {
-            preedit,
+            preedit: Preedit::new(text, cursor),
             ..GuestTxn::default()
         };
-        let mut planned = self.plan(txn, false, taken, lease);
-        planned.held = held;
-        planned
+        self.plan(txn, lease)
     }
 
-    /// H8. An empty commit is no edit, whether or not a preedit shows, so
-    /// it leaves Exo's prediction of the text where it was.
+    /// H8.
     pub(super) fn host_commit(self, text: String) -> Planned<'a> {
-        let ahead = !text.is_empty();
         let txn = GuestTxn {
             commit: Some(text),
             ..GuestTxn::default()
         };
-        self.plan(txn, ahead, None, LeaseOutcome::End)
-    }
-
-    /// Mirror mode's H9 and X1: a transaction measured in Exo's text
-    /// (`exo_view::Frame`), with `held` as a region's (X1). It changes
-    /// what Legacy mode keeps as Legacy mode's own would, so that Legacy
-    /// mode can measure the next event when Mirror mode cannot: the bytes a
-    /// region deletes are taken, and an edit gives them back.
-    pub(super) fn measured(self, txn: GuestTxn, held: Option<u32>) -> Planned<'a> {
-        let delete = txn.delete.unwrap_or_default();
-        let ahead = txn.commit.is_some() || txn.preedit.is_some() || delete != (0, 0);
-        let taken = match (&txn.commit, &txn.preedit) {
-            (None, Some(_)) => {
-                let (before, after) = self.composition.taken.unwrap_or_default();
-                Some((before + delete.0, after + delete.1)).filter(|&taken| taken != (0, 0))
-            }
-            // An empty region with no composition edits nothing.
-            (None, None) if delete == (0, 0) => self.composition.taken,
-            _ => None,
-        };
-        let mut planned = self.plan(txn, ahead, taken, LeaseOutcome::End);
-        planned.held = held;
-        planned
+        self.plan(txn, LeaseOutcome::End)
     }
 
     /// X2 commits the shown preedit; X2', with none shown, recovers the
@@ -808,7 +697,7 @@ impl<'a> Current<'a> {
             commit: text,
             ..GuestTxn::default()
         };
-        self.plan(txn, true, None, LeaseOutcome::End)
+        self.plan(txn, LeaseOutcome::End)
     }
 }
 
@@ -818,22 +707,12 @@ impl<'a> Current<'a> {
 pub(super) struct Planned<'a> {
     cur: Current<'a>,
     txn: GuestTxn,
-    /// The guest's text gains an edit it has yet to report.
-    ahead: bool,
-    /// The bytes regions have taken after the transaction.
-    taken: Option<(u32, u32)>,
-    /// Exo's cursor in the transaction's preedit, if Exo holds it.
-    held: Option<u32>,
     lease: LeaseOutcome,
     /// The press's reset fence (F4).
     fence: Option<BarrierToken>,
 }
 
 impl Planned<'_> {
-    pub(super) fn txn(&self) -> &GuestTxn {
-        &self.txn
-    }
-
     /// What reaches the guest of the transaction, if it applies.
     pub(super) fn edit(&self) -> Edit {
         let txn = &self.txn;
@@ -853,19 +732,11 @@ impl Planned<'_> {
         let Planned {
             cur,
             txn,
-            ahead,
-            taken,
-            held,
             lease,
             fence,
         } = self;
         let events = txn.encode(cur.ti, cur.composition.shown.is_some(), cur.serial)?;
         cur.composition.shown = txn.preedit;
-        cur.composition.taken = taken;
-        cur.composition.held = held;
-        if ahead {
-            *cur.text = ExoText::Ahead;
-        }
         if fence.is_some() {
             // The gate admitted the press, so no fence was pending.
             *cur.fence = fence;

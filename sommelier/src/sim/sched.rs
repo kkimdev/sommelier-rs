@@ -59,7 +59,6 @@ use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
 use super::surfaces::Surfaces;
 use super::ClientKind;
-use crate::ime::{ImeCore, ImeMode};
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{
     wl_callback, wl_compositor, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat,
@@ -298,7 +297,7 @@ pub(super) struct World<'t> {
     p_to_e: Channel<Vec<(u32, AnyRequest)>>,
     /// Each host event, what engine text it carries, and how many of the
     /// proxy's surrounding texts Exo had got when it sent the event.
-    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>, u64)>,
+    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>)>,
     to_engine: Channel<EngineIn>,
     /// The guest's view of what the client models do not take: the
     /// globals, Shift and where its pointer is, as the proxy tells it.
@@ -316,10 +315,6 @@ pub(super) struct World<'t> {
     resets: u64,
     /// The key the user holds, which repeats, and when it next does.
     repeat: Option<(Key, Micros)>,
-    /// How many surrounding texts the proxy sent Exo, and how many of them
-    /// Exo got.
-    reports_sent: u64,
-    reports_got: u64,
     /// The transactions that edit the text (a delete or a commit) the
     /// proxy sent the guest, and those the guest got; and whether the
     /// transaction each is in so far edits.
@@ -376,8 +371,6 @@ impl<'t> World<'t> {
             keyboard_gone: false,
             resets: 0,
             repeat: None,
-            reports_sent: 0,
-            reports_got: 0,
             edits: Edits::default(),
             text_input: 0,
             compositor: 0,
@@ -390,10 +383,6 @@ impl<'t> World<'t> {
             settles: Vec::new(),
             trace,
         };
-        // The IME's kill switch, which `Context::new` reads and a test
-        // context does not: no peer sets it.
-        let shadow = crate::handler::text_input::mirror_shadowed();
-        world.session.ctx().ime = ImeCore::new(shadow);
         let registry = world.session.new_id();
         world.guest([wl_display::req::get_registry(WL_DISPLAY_ID, registry)]);
         world.run(&[]).await;
@@ -440,8 +429,8 @@ impl<'t> World<'t> {
             ClientKind::Gtk3 => Box::new(Gtk::new(false, text_input, fields)),
             ClientKind::Gtk4 => Box::new(Gtk::new(true, text_input, fields)),
         });
-        let mode = ImeMode::of(setup.extension, shadow);
-        world.spec = Some(SpecText::new(world.surfaces.clone(), setup.texts).in_mode(mode));
+        let spec = SpecText::new(world.surfaces.clone(), setup.texts);
+        world.spec = Some(spec.at_extension(setup.extension));
         world.shadow = Some(Shadow::new(world.surfaces.clone(), setup.texts));
         world.act(UserAction::Focus(0));
         world.run(&[]).await;
@@ -518,17 +507,12 @@ impl<'t> World<'t> {
                 }
                 2 => {
                     for (sender, request) in self.p_to_e.take() {
-                        self.reports_got += u64::from(is_report(&request));
                         let events = self.display.request(sender, &request, &mut self.exo);
                         self.host_sends(events, false);
                     }
                 }
                 3 => {
-                    let (event, mut origin, truth, reports) = self.e_to_p.take();
-                    // A report the proxy sent before the event reached it,
-                    // which Exo had yet to get when it sent the event,
-                    // crossed it: on its way to Exo then, or sent since.
-                    origin.crossed = self.reports_sent > reports;
+                    let (event, origin, truth) = self.e_to_p.take();
                     self.deliver_host_event(event, origin, truth).await;
                 }
                 4 => {
@@ -667,17 +651,15 @@ impl<'t> World<'t> {
             late,
             resets: self.resets,
             press,
-            crossed: false,
         };
-        let reports = self.reports_got;
         for (event, truth) in self.exo.take_events_with_truths() {
             self.e_to_p
-                .send(self.now, (event, origin, truth, reports), &mut self.choices);
+                .send(self.now, (event, origin, truth), &mut self.choices);
         }
         for event in events {
             let origin = Origin::default();
             self.e_to_p
-                .send(self.now, (event, origin, None, reports), &mut self.choices);
+                .send(self.now, (event, origin, None), &mut self.choices);
         }
         for input in self.exo.take_engine() {
             self.resets += u64::from(input == EngineIn::Reset);
@@ -696,9 +678,6 @@ impl<'t> World<'t> {
             Some(RegionOutcome::Composed(text)) => self.engine.learn_region(text),
             Some(RegionOutcome::Refused) => self.engine.refused_region(),
             None => {}
-        }
-        if let Some(spec) = &mut self.spec {
-            spec.counts.regions_stale = self.exo.regions_stale;
         }
         if let Some(spec) = &mut self.spec {
             spec.counts.late += u64::from(verdict == Answer::Late);
@@ -737,7 +716,6 @@ impl<'t> World<'t> {
                 if let Some(spec) = self.spec.as_mut().filter(|_| report) {
                     let crossed = edits < self.edits.sent.0;
                     spec.counts.crossed_reports += u64::from(crossed);
-                    spec.report_crossed(crossed);
                 }
                 self.see(Seen::Guest(request));
             }
@@ -842,7 +820,6 @@ impl<'t> World<'t> {
     fn send_proxy_output(&mut self, goes_on: bool) {
         let mut batch: Vec<(u32, AnyRequest)> = Vec::new();
         for (sender, request) in self.session.host_received() {
-            self.reports_sent += u64::from(is_report(&request));
             self.log(Place::PToE, format!("{sender} {request:?}"));
             self.see(Seen::ToHost(&request));
             let glued = matches!(

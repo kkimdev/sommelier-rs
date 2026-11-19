@@ -1128,37 +1128,23 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   (`ui/base/ime/ash/input_method_ash.cc` 1090-1102). So the proxy sends
   each delete at once, as a v3 transaction of its own with a `done` that
   ends any preedit, never holding it for a later commit, which might
-  never come or might follow a cursor move. In Legacy mode, below v11 of
-  the text-input extension or under the kill switch (the next rule has
-  Mirror mode), it measures the range against
-  the surrounding text the guest last committed and turns it into bytes
-  before and after the cursor. A negative index can only mean the v1
-  XML's reading, which a host that follows it sends, so it counts from the
-  cursor instead; a non-negative one is Exo's. An empty range is not
-  forwarded. The proxy drops a delete rather than delete the wrong text,
-  with a debug log, except that the first drop of a range not around the
-  cursor on each text input is a warning:
+  never come or might follow a cursor move. It measures the range in
+  Exo's own text (next rule) and turns it into bytes before and after
+  the guest's cursor. An empty range is not forwarded, and edits
+  nothing. The proxy drops a delete rather than delete the wrong text,
+  with a debug log:
   - while the guest has a selection: GTK and Qt count v3 lengths from the
     cursor, while Chromium's v3 client counts them from the selection's
     ends (`ui/ozone/platform/wayland/host/wayland_input_method_context.cc`
-    802-825), so no lengths delete Exo's range in both;
-  - for a non-negative index, while an edit of the input method that the
-    proxy forwarded (a non-empty commit, the reset commit of a cleared
-    preedit, a confirmation, a non-empty preedit region or a delete) is
-    not yet in a surrounding text the guest committed
-    (the field's text is `ExoText::Ahead`), since Exo measures against
-    its prediction of the text, which includes the edit;
-  - if the range does not contain the cursor, does not fit that text on
-    character boundaries, or the guest stated no surrounding text, which
-    means the two texts differ.
-
-  The texts can still differ the other way: a guest commit that crosses
-  an edit in flight states text without it, which the proxy takes as
-  caught up while Exo replays the edit onto it, so the next delete may
-  land wrong (see HANDOVER). Preedit regions are deliberately not gated
-  by `ExoText::Ahead`: dropping one would leave Exo composing text
-  the guest does not show, so a region right after an unreported edit may
-  take its text from the guest's last report.
+    802-825), so no lengths delete Exo's range in both; no guest with a
+    selection is in step with Exo, so a region is dropped then too (the
+    selection cases of `exo_deletes_become_v3_deletes_around_the_cursor`,
+    and `an_empty_preedit_region_sends_no_delete`);
+  - for a negative index, which only the v1 XML's cursor-relative
+    reading could mean, and a range that does not contain Exo's cursor or
+    does not fit its text on character boundaries: Exo sends none of
+    them, so the mirror diverges at one (next rule);
+  - whenever the mirror cannot measure it (next rule).
 
   Exo makes a region of the bytes around its own cursor in the text it
   predicts (`TextInput::SetCompositionFromExistingText`,
@@ -1167,38 +1153,22 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   inline, with its cursor where the composition's is
   (`SurroundingTextTracker::OnSetCompositionText`,
   `ui/base/ime/surrounding_text_tracker.cc`), while the guest shows its
-  preedit outside its text. So the proxy measures a region in Exo's text
-  as far as it knows it (`ime::Current::predicted`): the guest's text,
-  with the preedit Exo holds at the guest's cursor and Exo's cursor in it
-  (`Composition::held`, where Exo sent that preedit's cursor, or
-  its end). The guest's text is the committed surrounding text without
-  the bytes around its cursor that preedit regions took since the guest
-  last reported (`Composition::taken`; only the guest's
-  committed surrounding text, or an edit that ends the composition and
-  gives the bytes back as text, a preedit cleared with a reset commit
-  included, clears it, and any other host `preedit_string` does not). Exo
-  holds every preedit the proxy showed but a region's whose bytes the
-  guest has since reported without: no state Exo predicted names that
-  report, so Exo drops its composition (E4 of `docs/IME_REDESIGN.md`).
-
-  A region must cover the preedit Exo holds; it deletes only the bytes
-  beyond it on each side, which the guest has, and shows them with that
-  preedit. An empty region at Exo's cursor after that preedit ends Exo's
-  composition and leaves the preedit as text, since nothing filters an
-  empty range (`InputMethodAsh::SetCompositionRange` and
-  `SetComposingRange`,
+  preedit outside its text. So the proxy measures a region in Exo's
+  text as the mirror predicts it (next rule). A region must cover the
+  composition Exo holds, which the guest shows, or Exo's cursor with
+  none; it deletes only the bytes beyond it on each side, which the guest
+  has, and shows them with that composition. An empty region ends Exo's
+  composition and leaves it as text, since nothing filters an empty range
+  (`InputMethodAsh::SetCompositionRange` and `SetComposingRange`,
   `TextInput::SetCompositionFromExistingText`) and the tracker keeps an
   empty composition (`OnSetCompositionFromExistingText`): the guest
-  commits the preedit, as at a confirmation. Any other region that does
-  not cover it, an empty one with Exo's cursor inside the preedit and a
-  region short on either side included, is dropped with a debug log: Exo
-  would leave the rest of that preedit as text, which only a commit after
-  the region's delete could give the guest. A guest report that crosses the
-  transaction clears `taken` early, the same race as above.
+  commits the preedit, as at a confirmation; with no composition it
+  edits nothing. Any other region that does not cover the composition,
+  one short on either side included, is dropped with a debug log: Exo
+  would leave the rest of that composition as text, which only a commit
+  after the region's delete could give the guest.
   Tests: `exo_deletes_become_v3_deletes_around_the_cursor`,
-  `a_region_over_a_region_deletes_only_what_the_guest_has`,
   `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`,
-  `a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back`,
   `a_region_over_a_host_preedit_is_measured_from_exos_cursor`,
   `a_region_that_does_not_cover_a_host_preedit_is_dropped`,
   `an_empty_region_over_a_held_preedit_commits_it`,
@@ -1206,22 +1176,25 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_region_equal_to_the_shown_one_sends_only_the_preedit`,
   `a_region_that_does_not_cover_the_shown_one_is_dropped`,
   `a_region_over_a_region_deletes_the_rest_on_both_sides`,
-  `a_delete_waits_for_the_guest_to_report_the_input_methods_edits`,
-  `a_reset_commit_waits_for_the_guest_to_report_it`,
-  `delete_lengths_read_both_conventions`,
-  `an_unconvertible_delete_is_warned_of_once`.
-- **From v11 of the extension, Exo's deletes and regions are measured in
-  the Exo mirror.** Each text input's mode is fixed when it is created
-  (`ime::ImeMode`): Mirror from v11 of the host's
-  `zcr_extended_text_input_v1`, the first that confirms with
-  `confirm_preedit` rather than a `cursor_position` and `commit_string`
-  pair the mirror could misread, unless the kill switch
-  `SOMMELIER_IME_MIRROR=shadow`, which the proxy reads once, keeps it in
-  Legacy mode. In both modes the core keeps `ime::mirror::ExoMirror`, a
-  replica of the `ui::SurroundingTextTracker` Exo keeps for the host text
-  input (`docs/IME_REDESIGN.md` 2.2 X1 and H9; Chromium `main`
-  6975bb48a8cd), and feeds it every event of the text input before the
-  gate, since stale and fenced events changed Exo's tracker too.
+  `an_empty_preedit_region_sends_no_delete`,
+  `a_reset_commit_waits_for_the_guest_to_report_it`.
+- **Exo's deletes and regions are measured in the Exo mirror, or
+  dropped.** A text input has a mirror (`ime::exo_view::ExoView`'s
+  `mirror`, an `Option<ime::mirror::ExoMirror>`) exactly when the host's
+  `zcr_extended_text_input_v1` is v11 or later, the first that confirms
+  with `confirm_preedit` rather than a `cursor_position` and
+  `commit_string` pair the mirror could misread; it is fixed when the
+  text input is created. The mirror is a replica of the
+  `ui::SurroundingTextTracker` Exo keeps for the host text input
+  (`docs/IME_REDESIGN.md` 2.2 X1 and H9; Chromium `main` 6975bb48a8cd),
+  and the core feeds it every event of the text input before the gate,
+  since stale and fenced events changed Exo's tracker too. Without a
+  mirror, every delete and region is dropped
+  (`ime::exo_view::Unmeasured::NoMirror`), and the first drop on each
+  text input warns that the host's extension is older than v11; typing,
+  preedits, commits, confirmations, presses, focus changes and Exo's
+  detach do not need the mirror, every report goes out unchanged, and the
+  extension still carries the content type.
   - A request applies where Exo processed it. The proxy sends a
     `wl_display.sync` right after each surrounding text it forwards, and
     after the `reset` of a press, glued into one queue entry, which one
@@ -1236,9 +1209,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     knows (`ime::mirror::Health`): its prediction of Exo's state is
     `Exact`; `Vague`, exact but for a selection IMA made from a highlight
     span at the preedit cursor (a composition selection), whose other end
-    the wire does not carry; or `Unknown`. Its history keeps no text: each
-    state is a fingerprint (the text's length and 64-bit hash, the
-    selection unless vague, the composition, and the keys of the text
+    the wire does not carry; or `Unknown`. A vague selection is empty at
+    the preedit cursor or runs from it to such a highlight's other end, so
+    a report, whose selection is forward, can equal it only at one of
+    those. Its history keeps no text: each state is a fingerprint (the
+    text's length and 64-bit hash, the selection, or the ones a vague one
+    may be, the composition, and the keys of the text
     without the composition and of the composition's text), or an
     unknown state, up to 4,096 states; evicting the oldest leaves an
     unknown state in its place, which Exo could match. An event Exo could
@@ -1247,22 +1223,23 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     misreading of Chromium; so, without a warning, do an event that
     arrives while a report that may reach Exo apart from its sync is on
     its way, one whose effect depends on a vague selection, any event
-    while unknown, text over 256 KiB, a pair below v11 it can read two
-    ways while composing, and a host without the extension, which
-    composes existing text unseen. A vague selection lies inside the
+    while unknown, and text over 256 KiB. A `cursor_position` and
+    `commit_string` pair is `SetEditableSelectionRange`, which keeps the
+    composition. A vague selection lies inside the
     composition, and is exact again after the next event that sets the
     selection or replaces the whole composition: a commit over the
     composition, a confirm that moves the cursor after it, a delete, a
     selection range, or a preedit with no highlight at its cursor. A
     report Exo processes is ambiguous when an unknown state, or a vague
-    one with the report's text, comes before any state equal to it: the
+    one with the report's text and a selection it may be, comes before
+    any state equal to it: the
     history becomes one unknown state, and the prediction unknown too,
     unless it is the report's with no composition. A report with no
     ambiguous state before an equal one matches it; one with neither
     resets Exo to it, which makes the mirror exact again with no press.
     Once the history holds an unknown state, only a press's `reset`,
     which empties Exo's history, and then a report before any event of
-    Exo's do; and nothing does without the extension.
+    Exo's do.
   - The guest is in step with Exo while its text is Exo's predicted text
     without the composition Exo holds, which the guest shows, its cursor
     at the composition's start or else at Exo's cursor, with no
@@ -1282,30 +1259,35 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     key, which edits no text by the keyboard's keymap (X11's
     `IsModifierKey`), does not. A new field, a refocus, and a commit of
     the shown preedit with no event of Exo's end it.
-  - In Mirror mode, while the guest is in step, the mirror is exact, and
-    no report on its way to Exo will, or may, name no state of Exo's (which
-    would mean an edit of the guest's that Exo made the event without), a delete
-    and a region are measured in Exo's state before the event: a delete
-    of bytes around Exo's cursor, with no composition, deletes them around
-    the guest's; a region from Exo's cursor that covers the composition,
-    or Exo's cursor, deletes the rest around the guest's cursor and shows
-    the region; an empty one commits the composition, or with none edits
-    nothing. A region that does not cover the composition is dropped, as
-    in Legacy mode. Otherwise, and for a negative delete index, Mirror mode
-    falls back to Legacy mode's measurement (previous rule), with a debug
-    log that names why (`ime::exo_view::Unmeasured`: an unsure mirror,
-    keys or presses the guest has not stated, a crossing report, or a
-    guest out of step), never dropping what Legacy mode applies: a dropped delete or
-    region is not harmless, as the input method goes on as if it applied,
-    and its next commit doubles the text (a reconverted 한국 committed as
-    韓國 shows 한국韓國; an accepted suggestion shows `word word~`). Each
-    transaction Mirror mode measures changes what Legacy mode keeps as its
-    own would (`Composition::taken`, `ExoText`), so Legacy mode can take
-    over at any event: an unsure mirror, a guest out of step, or a
-    crossing report. Legacy mode logs at trace where the
-    mirror would have sent another transaction.
-  - In Mirror mode, a guest report that would only drop Exo's composition
-    is withheld (design exo-mirror 5). A v3 guest reports its text without
+  - While the guest is in step, the mirror was exact before the event
+    and is after it, and no report on its way to Exo will, or may, name
+    no state of Exo's (which would mean an edit of the guest's that Exo
+    made the event without), a delete and a region are measured in Exo's
+    state before the event (`ime::exo_view::Frame`): a delete of bytes
+    around Exo's cursor, with no composition, deletes them around the
+    guest's; a region from Exo's cursor that covers the composition, or
+    Exo's cursor, deletes the rest around the guest's cursor and shows the
+    region; an empty one commits the composition, or with none edits
+    nothing (previous rule). Otherwise the delete or region is dropped,
+    with a debug log that names why (`ime::exo_view::Unmeasured`: a
+    mirror unsure before the event or after it, keys or presses the guest
+    has not stated, a crossing report, or a guest out of step). A drop
+    sends nothing, but an empty region over a preedit the guest shows,
+    which Exo ends as text whether or not the proxy can measure it: the
+    guest commits that preedit, as it would were the region measured, so
+    that Exo's next preedit, which replaces Exo's composition, cannot lose
+    it from the guest. A drop takes a region's assembly, ends the
+    Backspace repeat leased to the text input, as Exo edited, but for an
+    empty delete, which edits nothing, and leaves the guest out of step,
+    until its next report puts it in step again, matched or reset. A drop
+    is not harmless, as the input method goes on as if it applied, and its
+    next commit doubles the text (a reconverted 한국 committed as 韓國
+    shows 한국韓國; an accepted suggestion shows `word word~`), but it
+    never deletes or loses the guest's text, and the guest's next report,
+    which names no state of Exo's, resets Exo to the guest's text.
+  - With a mirror, a guest report that would only drop Exo's composition
+    is withheld (design exo-mirror 5; `ime::exo_view::ExoView::withholds`).
+    A v3 guest reports its text without
     the preedit it shows, while every state Exo predicted since the
     composition began holds it inline, so such a report names none and Exo
     drops the composition (E4). While the mirror is exact and the guest
@@ -1318,11 +1300,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     cursor rectangle and `commit_state` of the commit still are. A report
     Exo matches changes only its history, so Exo is where the report with
     the preedit would have left it, and the guest is in step as after a
-    matched report, at that state. Legacy mode, which measures wherever
-    Mirror mode cannot, takes Exo to hold the shown preedit still, with
-    Exo's cursor in it, although the commit stated text without it; and a
-    report on its way to Exo before the withheld one can take the guest
-    out of step only by resetting Exo, not by matching an older state.
+    matched report, at that state. Withholding changes only the core's
+    view of the guest (`ExoView`), and a report on its way to Exo before
+    the withheld one can take the guest out of step only by resetting Exo,
+    not by matching an older state.
     Every other report goes out unchanged: one that names a state is a
     no-op, and one that names none resets Exo to the guest's text. Nothing
     is ever inserted into a report, so a wrong mirror can only leave Exo
@@ -1332,15 +1313,23 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   holds the fingerprints of the tracker's (an unknown state fits any
   state, a leading one any number of them), and that Exo's tracker holds
   each report the proxy withheld with the shown preedit as its
-  composition. It counts every fallback to Legacy mode by its cause
-  (`mirror_fallbacks_all`).
+  composition. Its specification sends a delete or region as it measures
+  it in the simulated Exo's text, or not at all, and below v11 never; it
+  counts the proxy's drops by cause (`Counts::drops`), and fails a
+  settled case with a drop the mirror could measure.
   Tests: `a_report_reaches_the_host_with_its_barrier`,
   `a_reports_barrier_is_glued_into_its_entry`,
   `a_forwarded_key_holds_back_exos_delete_until_the_guest_commits`,
   `a_modifier_key_does_not_hold_back_exos_delete`,
-  `a_region_over_a_region_falls_back_in_mirror_mode`,
+  `a_region_over_a_region_drops`,
   `a_region_over_a_host_preedit_with_exos_cursor_inside_it`,
-  `an_unsure_mirror_falls_back_to_legacy_mode`,
+  `many_empty_confirmations_keep_the_mirror_exact`,
+  `a_delete_in_flight_at_a_press_is_dropped`,
+  `an_unmeasured_empty_region_commits_the_shown_preedit`,
+  `an_unmeasured_empty_region_must_commit_the_shown_preedit`,
+  `ime_edits_end_a_stale_backspace_repeat`,
+  `a_cursor_position_pair_sets_the_selection_and_keeps_the_composition`,
+  `exos_delete_or_region_reaches_the_guest_as_exos_text_measures_it_or_not_at_all`,
   `a_highlight_is_vague_until_a_commit`,
   `an_evicted_state_still_matches`,
   `long_text_makes_it_unknown`,
@@ -1351,9 +1340,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_matched_report_finds_the_guest_without_a_composition`,
   `a_definite_reset_heals_without_a_press`,
   `an_ambiguous_report_stays_unknown`,
+  `a_report_unlike_a_vague_selection_heals_it`,
   `a_report_without_the_shown_preedit_is_withheld`.
-  The core's row tests of X1 and H9 in Mirror mode, and of report
-  suppression, are listed in the design's rows and G9c
+  The core's row tests of G1 (the mirror from v11), X1 and H9, and of
+  report suppression, are listed in the design's rows and G9c
   (`docs/IME_REDESIGN.md` 2.1 and 2.2).
 - **Every commit that leaves a field enabled gets a `done`.** The proxy
   answers each such v3 `commit` with a `done` that carries its serial, as
@@ -1379,10 +1369,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   the field, and a commit while unfocused, get no `done`, as from mutter;
   nor does an enable ignored because another text input on the
   connection is enabled, which leaves the field disabled. A preedit the
-  answer cannot repeat is forgotten, since its bare `done` clears it. Host IME events reach the
-  guest as whole transactions, so this `done` never splits one, and it
-  leaves `ExoText::Ahead` alone: only the surrounding text a commit
-  states clears that. Unlike mutter and KWin, the proxy does not end the
+  answer cannot repeat is forgotten, since its bare `done` clears it.
+  Host IME events reach the guest as whole transactions, so this `done`
+  never splits one. Unlike mutter and KWin, the proxy does not end the
   host's composition when the guest resets its own; only a pointer press
   or a touch-down does (next rule).
   Tests: `every_commit_of_an_enabled_field_gets_a_done`,
@@ -1445,9 +1434,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   faf801e427d0. So the `reset` itself commits nothing, and the guest's
   commit is the only commit of that text that the reset causes.
 
-  The commit is an input-method edit the guest has yet to report
-  (`ExoText::Ahead`), and it ends the Backspace repeat leased to
-  the field, as a confirmation does. The press is re-sent after the
+  The commit is an edit the guest has yet to report, so the guest's
+  next report states it, and it ends the Backspace repeat leased to the
+  field, as a confirmation does. The press is re-sent after the
   transaction rather than forwarded, since a forward precedes its
   message's other events; the rest of its host batch follows it in order
   and unchanged. So the transaction may land inside a `wl_touch.frame`
