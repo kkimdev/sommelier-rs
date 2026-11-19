@@ -60,8 +60,13 @@ limitations under the License.
 //! - IMA's character composer and password fields, the engine's focus and
 //!   blur on a type change, and a single-character commit sent as a key
 //!   (`NeedInsertChar`), which the Korean engine never makes;
-//! - `preedit_styling`, the keymap and key repeats, which Exo never sends,
-//!   and the release of a keyboard or its extension.
+//! - `preedit_styling` and key repeats, which Exo never sends a client;
+//!   the keys held at a `wl_keyboard.enter`, which the model never lists;
+//!   and the release of a keyboard or its extension. The keymap is the
+//!   display's ([`super::display`]).
+//!
+//! The engine gets the autorepeats of a held key ([`Exo::autorepeat`]),
+//! and IMA confirms before each one it did not handle (E13).
 //!
 //! IMA drops a handled release: it reaches the extension as a `peek_key`
 //! only, as its press did, and no `wl_keyboard.key` follows.
@@ -418,6 +423,8 @@ struct PendingKey {
     /// text goes out at once, as no key is in flight, and which has no key
     /// events.
     key: Option<(Key, bool)>,
+    /// The press is an autorepeat, which no key event follows (E7).
+    repeat: bool,
     /// The key's time, in milliseconds.
     time: u32,
     /// Whether the engine sent the key's text.
@@ -529,6 +536,7 @@ impl Exo {
         self.in_engine.push_back(PendingKey {
             id,
             key: Some((key, pressed)),
+            repeat: false,
             time,
             answered: false,
             late: false,
@@ -574,6 +582,7 @@ impl Exo {
                 assert_eq!(pending.id, id, "the engine answers in order");
                 let PendingKey {
                     key,
+                    repeat,
                     time,
                     late,
                     dropped,
@@ -582,6 +591,21 @@ impl Exo {
                 let Some((k, pressed)) = key else {
                     return Answer::Normal;
                 };
+                if repeat {
+                    // An unhandled autorepeat is confirmed before it is
+                    // passed on (E13), and the keyboard then drops it (E7).
+                    let shown = !handled
+                        && self
+                            .ima
+                            .client
+                            .is_some_and(|client| self.confirm_composition(client));
+                    let sent = self.flush() || shown;
+                    return match (dropped, late && sent) {
+                        (true, _) => Answer::Dropped,
+                        (false, true) => Answer::Late,
+                        (false, false) => Answer::Normal,
+                    };
+                }
                 if !pressed {
                     if let Some(consumed) = self.release(k) {
                         self.key_events(k, time, wl_keyboard::KEY_STATE_RELEASED, consumed);
@@ -624,6 +648,45 @@ impl Exo {
         }
     }
 
+    /// The key whose press, not an autorepeat, `out` answers, if it does.
+    pub(super) fn press_of(&self, out: &EngineOut) -> Option<Key> {
+        let pending = self.in_engine.front()?;
+        let id = match *out {
+            EngineOut::Text { id, .. } | EngineOut::Done { id, .. } => id,
+        };
+        match pending.key {
+            Some((key, true)) if pending.id == id && !pending.repeat => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The engine repeats held `key` at `now` (D7). IMA hands it the
+    /// autorepeat as a press while it serves a text input and has an
+    /// engine; the keyboard drops every autorepeat (E7), so otherwise it
+    /// goes nowhere. Returns whether the engine got it.
+    pub(super) fn autorepeat(&mut self, now: Micros, key: Key) -> bool {
+        if self.ima.client.is_none() || self.latin {
+            return false;
+        }
+        let id = self.next_key;
+        self.next_key += 1;
+        self.in_engine.push_back(PendingKey {
+            id,
+            key: Some((key, true)),
+            repeat: true,
+            time: millis(now),
+            answered: false,
+            late: false,
+            dropped: false,
+        });
+        self.to_engine.push(EngineIn::Key {
+            key,
+            pressed: true,
+            id,
+        });
+        true
+    }
+
     /// The user makes `request` of the engine (D6). IMA hands it over with
     /// the text before the cursor of the text input it serves, as Exo
     /// predicts it, but only while it serves one and has an engine; and a
@@ -643,6 +706,7 @@ impl Exo {
         self.in_engine.push_back(PendingKey {
             id,
             key: None,
+            repeat: false,
             time: 0,
             answered: false,
             late: false,
@@ -2032,6 +2096,35 @@ mod tests {
     }
 
     #[test]
+    fn e13_an_autorepeat_goes_to_the_engine_and_no_further() {
+        let mut exo = active(V11);
+        let repeat = |exo: &mut Exo, actions: &[TextAction], handled| {
+            assert!(exo.autorepeat(NOW, k(' ')));
+            let [EngineIn::Key {
+                id, pressed: true, ..
+            }] = exo.take_engine()[..]
+            else {
+                panic!("the repeat went to the engine as a press");
+            };
+            if !actions.is_empty() {
+                let actions = actions.to_vec();
+                exo.answer(&EngineOut::Text { id, actions });
+            }
+            exo.answer(&EngineOut::Done { id, handled });
+            events(exo)
+        };
+        // Unhandled, it is confirmed (E13), and the keyboard drops it (E7).
+        assert_eq!(repeat(&mut exo, &[], false), [confirm()]);
+        // Handled, only its text goes out.
+        assert_eq!(repeat(&mut exo, &[shows("ㄱ")], true), preedit(1, "ㄱ"));
+        // With no text input attached, the engine gets none.
+        send(&mut exo, TI, deactivate());
+        events(&mut exo);
+        assert!(!exo.autorepeat(NOW, k(' ')));
+        assert_eq!(exo.take_engine(), []);
+    }
+
+    #[test]
     fn a_text_input_that_ends_leaves_the_engine_alone_too() {
         let mut exo = active(V10);
         press(&mut exo, 'r', &[shows("가")], true);
@@ -2059,18 +2152,6 @@ mod tests {
             key(2, 'r', UP),
         ];
         assert_eq!(events(&mut exo), raw);
-        // Nor does the engine's answer to a press of a key pressed raw
-        // since, though IMA still confirms before it.
-        let mut exo = active(V11);
-        exo.key(NOW, k(' '), DOWN);
-        let [EngineIn::Key { id, .. }] = exo.take_engine()[..] else {
-            panic!("the key went to the engine");
-        };
-        send(&mut exo, TI, deactivate());
-        exo.key(NOW, k(' '), DOWN);
-        events(&mut exo);
-        exo.answer(&EngineOut::Done { id, handled: false });
-        assert_eq!(events(&mut exo), []);
         assert!(exo.in_engine.is_empty());
     }
 
@@ -2195,6 +2276,18 @@ mod tests {
             key(2, 'r', UP),
         ];
         assert_eq!(events(&mut exo), raw);
+        // Nor does the engine's answer to a press of a key pressed raw
+        // since, though IMA still confirms before it.
+        let mut exo = active(V11);
+        exo.key(NOW, k(' '), DOWN);
+        let [EngineIn::Key { id, .. }] = exo.take_engine()[..] else {
+            panic!("the key went to the engine");
+        };
+        send(&mut exo, TI, deactivate());
+        exo.key(NOW, k(' '), DOWN);
+        events(&mut exo);
+        exo.answer(&EngineOut::Done { id, handled: false });
+        assert_eq!(events(&mut exo), []);
     }
 
     #[test]

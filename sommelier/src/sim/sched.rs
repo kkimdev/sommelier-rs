@@ -54,6 +54,7 @@ use super::display::Display;
 use super::editor::{Target, TextModel, UserAction};
 use super::engine::{Engine, EngineIn, EngineOut, Lag, Request, TextAction};
 use super::exo::{Answer, Exo};
+use super::hangul::Key;
 use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
 use super::ClientKind;
@@ -190,6 +191,12 @@ const HOST_LATENCY: Micros = Micros(3_000);
 const ENGINE_LATENCY: Micros = Micros(1_000);
 /// How long the user waits once everything has settled.
 const SETTLE: Micros = Micros::from_millis(50);
+/// How long a held key waits before it repeats, and then between its
+/// repeats: 500 ms, then 33 Hz (the design's section 4.4).
+const REPEAT_DELAY: Micros = Micros::from_millis(500);
+const REPEAT_INTERVAL: Micros = Micros(30_303);
+/// The longest a user holds a key before the next action.
+const HOLD: u64 = 1_500;
 
 /// Where a line of a case's trace happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +286,8 @@ pub(super) struct World<'t> {
     pointer: Option<(u32, i32)>,
     /// The resets Exo handed the engine.
     resets: u64,
+    /// The key the user holds, which repeats, and when it next does.
+    repeat: Option<(Key, Micros)>,
     /// The transactions that edit the text (a delete or a commit) the
     /// proxy sent the guest, and those the guest got; and whether the
     /// transaction each is in so far edits.
@@ -329,6 +338,7 @@ impl<'t> World<'t> {
             shift: false,
             pointer: None,
             resets: 0,
+            repeat: None,
             edits: Edits::default(),
             text_input: 0,
             surfaces: Vec::new(),
@@ -433,7 +443,9 @@ impl<'t> World<'t> {
                 Some(_) => Some(next.max(self.now)),
                 None => None,
             };
+            // A held key repeats until it is up, which no settle waits for.
             let mut sources = idle.to_vec();
+            sources.push(self.repeat.map(|(_, at)| at));
             sources.push(user);
             let Some(source) = earliest(&sources, &mut self.choices) else {
                 return;
@@ -462,12 +474,25 @@ impl<'t> World<'t> {
                     self.engine.send(self.now, input, &mut self.choices);
                 }
                 5 => self.engine_answers(),
+                6 => {
+                    let (key, at) = self.repeat.expect("a held key");
+                    self.repeat = Some((key, at + REPEAT_INTERVAL));
+                    self.log(Place::User, format!("repeat {key:?}"));
+                    let handed = self.exo.autorepeat(self.now, key);
+                    if let Some(spec) = &mut self.spec {
+                        spec.counts.repeats += u64::from(handed);
+                    }
+                    self.host_sends(Vec::new(), false);
+                }
                 _ => {
                     let action = actions.next().expect("an action");
                     self.act(action);
                     next = self.now
                         + match action {
                             UserAction::Settle => SETTLE,
+                            UserAction::KeyDown(_) => {
+                                Micros::from_millis(self.choices.between(0, HOLD))
+                            }
                             _ if self.choices.pick(2) == 0 => {
                                 Micros::from_millis(self.choices.between(30, 300))
                             }
@@ -496,6 +521,18 @@ impl<'t> World<'t> {
                 ] {
                     self.exo.key(self.now, key, state);
                 }
+                // The key the user typed last repeats, and it is up.
+                self.repeat = None;
+                return self.host_sends(Vec::new(), false);
+            }
+            UserAction::KeyDown(key) => {
+                self.exo.key(self.now, key, wl_keyboard::KEY_STATE_PRESSED);
+                self.repeat = Some((key, self.now + REPEAT_DELAY));
+                return self.host_sends(Vec::new(), false);
+            }
+            UserAction::KeyUp(key) => {
+                self.exo.key(self.now, key, wl_keyboard::KEY_STATE_RELEASED);
+                self.repeat = self.repeat.filter(|&(repeating, _)| repeating != key);
                 return self.host_sends(Vec::new(), false);
             }
             UserAction::RestartInputMethod => {
@@ -532,9 +569,15 @@ impl<'t> World<'t> {
     /// a late answer if `late`, made before the resets this input hands the
     /// engine.
     fn host_sends(&mut self, events: Vec<Outgoing>, late: bool) {
+        self.host_sends_of(events, late, None);
+    }
+
+    /// [`World::host_sends`], of Exo's answer to a press of `press`.
+    fn host_sends_of(&mut self, events: Vec<Outgoing>, late: bool, press: Option<Key>) {
         let origin = Origin {
             late,
             resets: self.resets,
+            press,
         };
         for event in self.exo.take_events() {
             self.e_to_p
@@ -556,6 +599,7 @@ impl<'t> World<'t> {
     fn engine_answers(&mut self) {
         let answer = self.engine.take(&mut self.choices);
         self.log(Place::Engine, format!("{answer:?}"));
+        let press = self.exo.press_of(&answer);
         let verdict = self.exo.answer(&answer);
         if let EngineOut::Text { actions, .. } = &answer {
             if actions
@@ -569,7 +613,7 @@ impl<'t> World<'t> {
             spec.counts.late += u64::from(verdict == Answer::Late);
             spec.counts.dropped += u64::from(verdict == Answer::Dropped);
         }
-        self.host_sends(Vec::new(), verdict == Answer::Late);
+        self.host_sends_of(Vec::new(), verdict == Answer::Late, press);
     }
 
     /// The guest sends `requests` at once, on C→P.
@@ -614,7 +658,7 @@ impl<'t> World<'t> {
     async fn deliver_host_event(&mut self, event: Outgoing, origin: Origin) {
         let (sender, decoded) = self.display.decode(&event);
         let note = if origin.late { " (late)" } else { "" };
-        self.log(Place::EToP, format!("{sender} {decoded:?}{note}"));
+        self.log(Place::EToP, format!("{sender} {}{note}", shown(&decoded)));
         self.see(Seen::Host {
             sender,
             event: &decoded,
@@ -633,7 +677,7 @@ impl<'t> World<'t> {
                 .send(self.now, (sender, request), &mut self.choices);
         }
         for (sender, event) in self.session.guest_received() {
-            self.log(Place::PToC, format!("{sender} {event:?}"));
+            self.log(Place::PToC, format!("{sender} {}", shown(&event)));
             self.edits.sent.follow(&event);
             self.see(Seen::ToGuest(&event));
             let press = self.press(&event);
@@ -750,6 +794,17 @@ impl<'t> World<'t> {
             place,
             text,
         });
+    }
+}
+
+/// `event` as a trace shows it: a keymap without its descriptor, whose
+/// number a replay need not repeat.
+fn shown(event: &AnyEvent) -> String {
+    match event {
+        AnyEvent::WlKeyboard(wl_keyboard::Event::Keymap { format, size, .. }) => {
+            format!("WlKeyboard(Keymap {{ format: {format}, size: {size} }})")
+        }
+        event => format!("{event:?}"),
     }
 }
 

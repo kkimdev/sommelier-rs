@@ -19,13 +19,15 @@ limitations under the License.
 //! Each field starts with marker digits ([`Target::BeforeMarker`]) between
 //! a few letters and syllables, and the user never types a digit, so a
 //! marker names the same place to the user and to a client that lags. The
-//! actions are about 59% keys (two-set jamo, in the order syllables take,
+//! actions are about 56% keys (two-set jamo, in the order syllables take,
 //! plus Space and Backspace), 2% accepted suggestions and 2%
 //! reconversions (in a free case, half of each followed at once by
 //! another, for a delete while the guest has not reported the first and a
 //! region over a region), 15%
 //! clicks, 8% taps, 7% focus moves, 2% restarts of the input method and 5%
-//! settles. A Backspace comes only where it deletes no marker, and a
+//! settles. A free case also holds a key one action in 33: it presses
+//! it, may type up to two other keys, and releases it, while the engine
+//! repeats it. A Backspace comes only where it deletes no marker, and a
 //! suggestion or a reconversion only where it changes something; in a
 //! settled case, also only right after a key. GTK3 reports a cursor that a
 //! click moved only with its next edit, so after a click the engine would
@@ -85,8 +87,9 @@ pub(super) fn actions(
     let mut reference = Reference::new(fields).typing(typing);
     let mut ima = Ima::default();
     let mut actions = Vec::new();
-    // A request a free case makes again at once.
+    // A request a free case makes again at once, or the rest of a hold.
     let mut again = None;
+    let mut holding = Vec::new();
     // Whether the last action but a settle was a key, which the client
     // reported, so that the engine knows where the cursor is.
     let mut typed = false;
@@ -98,6 +101,29 @@ pub(super) fn actions(
         let more = settled && typed && (takes || reconverts) && rng.one_in(8);
         let action = match rng.below(100) {
             _ if again.is_some() => again.take().expect("a request to repeat"),
+            _ if !holding.is_empty() => holding.remove(0),
+            56..59 if !settled => {
+                // Mostly a key the input method passes once nothing is
+                // composed, whose repeats it then confirms (E13).
+                let field = &reference.fields()[reference.focus()];
+                let held = match rng.below(5) {
+                    0 | 1 => Key::Char(' '),
+                    2 | 3 if deletes_no_marker(field) => Key::Backspace,
+                    _ => key(rng, &reference),
+                };
+                // Up to two other keys while it is held, then its release.
+                let others = (0..rng.below(3)).map(|_| match rng.below(3) {
+                    0 => letter(rng, CONSONANTS),
+                    1 => letter(rng, VOWELS),
+                    _ => Key::Char(' '),
+                });
+                holding = others
+                    .filter(|&other| other != held)
+                    .map(UserAction::Key)
+                    .chain([UserAction::KeyUp(held)])
+                    .collect();
+                UserAction::KeyDown(held)
+            }
             _ if more && takes && (!reconverts || rng.one_in(2)) => UserAction::AcceptSuggestion,
             _ if more => UserAction::Reconvert,
             59..61 if asks && takes => {
@@ -121,9 +147,14 @@ pub(super) fn actions(
             93..95 => UserAction::RestartInputMethod,
             _ => UserAction::Settle,
         };
-        let moves = !matches!(action, UserAction::Key(_) | UserAction::Settle);
+        let moves = !matches!(
+            action,
+            UserAction::Key(_) | UserAction::KeyDown(_) | UserAction::KeyUp(_) | UserAction::Settle
+        );
         let stale = match action {
             UserAction::Key(key) => !typing.latin && ima.key(key),
+            // Only a free case holds a key.
+            UserAction::KeyDown(_) | UserAction::KeyUp(_) => false,
             UserAction::Click { field, .. } | UserAction::Tap { field, .. } => {
                 ima.moved(field != reference.focus());
                 false
@@ -160,6 +191,8 @@ pub(super) fn actions(
             settle(&mut actions);
         }
     }
+    // A hold the case ends in is released.
+    actions.extend(holding);
     actions
 }
 
@@ -227,7 +260,6 @@ fn settle(actions: &mut Vec<UserAction>) {
 /// A key: a consonant, a vowel, a shifted jamo, Space, or a Backspace
 /// where it deletes no marker in the focused field of `reference`.
 fn key(rng: &mut Rng, reference: &Reference) -> Key {
-    let letter = |rng: &mut Rng, keys: &[u8]| Key::Char(char::from(*rng.pick(keys)));
     match rng.below(100) {
         0..40 => letter(rng, CONSONANTS),
         40..75 => letter(rng, VOWELS),
@@ -236,6 +268,11 @@ fn key(rng: &mut Rng, reference: &Reference) -> Key {
         _ if deletes_no_marker(&reference.fields()[reference.focus()]) => Key::Backspace,
         _ => letter(rng, CONSONANTS),
     }
+}
+
+/// A key of `keys`.
+fn letter(rng: &mut Rng, keys: &[u8]) -> Key {
+    Key::Char(char::from(*rng.pick(keys)))
 }
 
 /// Whether a Backspace in `field` takes back a jamo or deletes a character
@@ -417,6 +454,30 @@ mod tests {
     }
 
     #[test]
+    fn a_free_case_holds_a_key_and_releases_it_after_other_keys() {
+        let mut holds = 0;
+        for (_, actions) in cases(Typing::default(), false) {
+            let mut held = None;
+            for action in actions {
+                match action {
+                    UserAction::KeyDown(key) => {
+                        assert_eq!(held.replace(key), None, "one key held at a time");
+                        holds += 1;
+                    }
+                    UserAction::KeyUp(key) => assert_eq!(held.take(), Some(key)),
+                    UserAction::Key(key) => assert_ne!(held, Some(key)),
+                    other => assert_eq!(held, None, "{other:?} while a key is held"),
+                }
+            }
+            assert_eq!(held, None);
+        }
+        assert!(holds > 0);
+        for (_, actions) in cases(Typing::default(), true) {
+            assert!(!actions.iter().any(|a| matches!(a, UserAction::KeyDown(_))));
+        }
+    }
+
+    #[test]
     fn the_mix_holds_every_kind_of_action() {
         let actions: Vec<UserAction> = cases(Typing::default(), false)
             .into_iter()
@@ -425,7 +486,7 @@ mod tests {
         let share = |is: fn(&UserAction) -> bool| {
             actions.iter().filter(|action| is(action)).count() * 100 / actions.len()
         };
-        assert!((55..75).contains(&share(|a| matches!(a, UserAction::Key(_)))));
+        assert!((50..75).contains(&share(|a| matches!(a, UserAction::Key(_)))));
         assert!((10..20).contains(&share(|a| matches!(a, UserAction::Click { .. }))));
         assert!((4..12).contains(&share(|a| matches!(a, UserAction::Tap { .. }))));
         assert!((4..10).contains(&share(|a| matches!(a, UserAction::Focus(_)))));

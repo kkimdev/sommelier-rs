@@ -39,10 +39,14 @@ limitations under the License.
 //! reported, which drops Exo's absolute deletes (H9), and the bytes the
 //! preedit regions took since (X1). Exo sends no `preedit_styling` (H4).
 
+use std::collections::BTreeMap;
+
 use super::client::Client;
 use super::editor::{Reference, Target, TextModel, Txn, Typing, UserAction};
 use super::exo::{self, Exo};
+use super::hangul::Key;
 use super::keymap;
+use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1 as peek;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1 as v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3 as v3;
@@ -80,6 +84,8 @@ pub(super) struct Origin {
     pub late: bool,
     /// How many resets Exo had handed the engine when it sent the event.
     pub resets: u64,
+    /// The key whose press, not an autorepeat, the event answers.
+    pub press: Option<Key>,
 }
 
 /// Which oracle a check belongs to.
@@ -268,6 +274,21 @@ pub(super) struct Counts {
     pub regions_dropped: u64,
     /// Guest reports that crossed an edit on its way to the guest (P4).
     pub crossed_reports: u64,
+    /// Empty confirmations that recovered a held key (X2'): its press and
+    /// release reached the guest, or not, as `wl_keyboard.key` had already
+    /// delivered it; and those that found no eligible held key.
+    pub recovered_keys: u64,
+    pub recoveries_skipped: u64,
+    pub confirms_unheld: u64,
+    /// Backspace leases armed, and ended while armed.
+    pub leases: u64,
+    pub leases_ended: u64,
+    /// Autorepeats of a held key that Exo handed the engine (D7).
+    pub repeats: u64,
+    /// Recovered keys whose confirmation is Exo's before the press of
+    /// another key (E13), not an autorepeat's: the guest gets a press of
+    /// the held key that the user did not repeat.
+    pub recoveries_before_a_press: u64,
 }
 
 impl std::ops::AddAssign for Counts {
@@ -287,7 +308,27 @@ impl std::ops::AddAssign for Counts {
         self.regions_over_preedits += other.regions_over_preedits;
         self.regions_dropped += other.regions_dropped;
         self.crossed_reports += other.crossed_reports;
+        self.recovered_keys += other.recovered_keys;
+        self.recoveries_skipped += other.recoveries_skipped;
+        self.confirms_unheld += other.confirms_unheld;
+        self.leases += other.leases;
+        self.leases_ended += other.leases_ended;
+        self.repeats += other.repeats;
+        self.recoveries_before_a_press += other.recoveries_before_a_press;
     }
+}
+
+/// A key the host holds, as the keyboard concern learns of it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Held {
+    /// The order of its `peek_key` press among all.
+    sequence: u64,
+    /// `wl_keyboard.key` delivered its press to the guest.
+    forwarded: bool,
+    /// Backspace only: the text input holds its IME repeat lease, or the
+    /// lease was cancelled for the rest of the press.
+    leased: bool,
+    cancelled: bool,
 }
 
 /// What the specification says the proxy does: the decisions it asks of
@@ -315,6 +356,12 @@ pub(super) struct SpecText {
     taken: Option<(usize, usize)>,
     /// The last `preedit_cursor` since a terminal event (H5).
     assembly: Option<i32>,
+    /// The keys the host holds, by keycode, and the peeks so far: the
+    /// sequence of the latest since the focus last moved, and their count.
+    held: BTreeMap<u32, Held>,
+    latest_peek: Option<u64>,
+    peeks: u64,
+
     /// The step's decisions: what the specification asks, and what the
     /// proxy sent, with the callback of each sync after its request.
     expected: Decisions,
@@ -349,6 +396,9 @@ impl SpecText {
             ahead: false,
             taken: None,
             assembly: None,
+            held: BTreeMap::new(),
+            latest_peek: None,
+            peeks: 0,
             expected: Decisions::default(),
             sent: Decisions::default(),
             synced: (None, None),
@@ -447,6 +497,7 @@ impl SpecText {
         let was_enabled = self.committed.is_some();
         let enabled = enabled.unwrap_or(was_enabled);
         if enabled != was_enabled {
+            self.end_lease();
             self.shown = None;
             self.committed = enabled.then(V3Field::default);
         }
@@ -479,6 +530,9 @@ impl SpecText {
     fn host(&mut self, sender: u32, event: &AnyEvent, origin: Origin) {
         match event {
             AnyEvent::WlKeyboard(event) => self.keyboard(event),
+            &AnyEvent::ZcrExtendedKeyboardV1(peek::Event::PeekKey { key, state, .. }) => {
+                self.peek(key, state);
+            }
             AnyEvent::WlPointer(wl_pointer::Event::Enter {
                 surface, surface_x, ..
             }) => self.pointer = Some((*surface, *surface_x)),
@@ -505,10 +559,13 @@ impl SpecText {
             }
             AnyEvent::ZwpTextInputV1(event) => self.text_input(event, origin),
             AnyEvent::ZcrExtendedTextInputV1(extended::Event::ConfirmPreedit { .. }) => {
-                // X2 confirms the shown preedit; X2' recovers a held key, of
-                // which a case has none.
+                // X2 confirms the shown preedit; X2' recovers a held key.
                 self.composition_event(origin, |spec| {
-                    let commit = spec.shown.take()?.text;
+                    let Some(shown) = spec.shown.take() else {
+                        return spec.recover_held_key(origin);
+                    };
+                    let commit = shown.text;
+                    spec.end_lease();
                     spec.edited();
                     Some((
                         Txn {
@@ -530,11 +587,18 @@ impl SpecText {
     /// The keyboard: its focus, which resets the text input (F1), Shift,
     /// and its keys. The ideal client types every press the host sends.
     /// The keyboard concern may keep a press from the guest only by a rule
-    /// of its own, and no case reaches one before D7: a case holds no key,
-    /// so no press repeats a held one, and Exo sends no keysym (H10).
+    /// of its own, and no case reaches one: Exo sends a key's press on
+    /// `wl_keyboard` only once, and only if the input method did not
+    /// consume it, so no press repeats a key held, leased or recovered
+    /// before it, and Exo sends no keysym (H10).
     fn keyboard(&mut self, event: &wl_keyboard::Event) {
         match *event {
-            wl_keyboard::Event::Enter { surface, .. } => self.move_focus(Some(self.field(surface))),
+            wl_keyboard::Event::Enter { surface, .. } => {
+                // The keys an enter lists are held, but had no peek, so none
+                // is a key to recover; Exo's model lists none.
+                self.held.clear();
+                self.move_focus(Some(self.field(surface)));
+            }
             wl_keyboard::Event::Leave { .. } => self.move_focus(None),
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
                 self.shift = mods_depressed & keymap::SHIFT != 0;
@@ -542,6 +606,12 @@ impl SpecText {
             wl_keyboard::Event::Key { key, state, .. } => {
                 let typed = keymap::key(key, self.shift);
                 let pressed = state == wl_keyboard::KEY_STATE_PRESSED;
+                if pressed {
+                    self.press_key(key);
+                    if let Some(held) = self.held.get_mut(&key) {
+                        held.forwarded = true;
+                    }
+                }
                 if let (true, Some(field), Some(key)) = (pressed, self.focus, typed) {
                     self.counts.raw_keys += u64::from(self.link != Link::Attached);
                     self.views[field].model.insert_key(key);
@@ -551,12 +621,115 @@ impl SpecText {
         }
     }
 
+    /// F5: a `peek_key` of the host's `key` in `state`. A press is the
+    /// latest peek, and a release ends the key's press.
+    fn peek(&mut self, key: u32, state: u32) {
+        if state != wl_keyboard::KEY_STATE_PRESSED {
+            self.held.remove(&key);
+            return;
+        }
+        self.press_key(key);
+        self.peeks += 1;
+        let sequence = self.peeks;
+        self.held.insert(
+            key,
+            Held {
+                sequence,
+                ..Held::default()
+            },
+        );
+        self.latest_peek = Some(sequence);
+    }
+
+    /// A press of any key but Backspace cancels a held Backspace's repeat
+    /// for the rest of its press, lease or not.
+    fn press_key(&mut self, key: u32) {
+        let backspace = keymap::keycode(Key::Backspace).0;
+        if key == backspace {
+            return;
+        }
+        if let Some(held) = self.held.get_mut(&backspace) {
+            self.counts.leases_ended += u64::from(held.leased);
+            held.cancelled = true;
+            held.leased = false;
+        }
+    }
+
+    /// The text input's Backspace lease ends: an armed lease is cancelled
+    /// for the rest of the press.
+    fn end_lease(&mut self) {
+        let backspace = keymap::keycode(Key::Backspace).0;
+        if let Some(held) = self.held.get_mut(&backspace).filter(|held| held.leased) {
+            self.counts.leases_ended += 1;
+            held.cancelled = true;
+            held.leased = false;
+        }
+    }
+
+    /// The text input takes the lease of a held Backspace, unless its
+    /// repeat was cancelled.
+    fn arm_lease(&mut self) {
+        let backspace = keymap::keycode(Key::Backspace).0;
+        if let Some(held) = self.held.get_mut(&backspace).filter(|held| !held.cancelled) {
+            self.counts.leases += u64::from(!held.leased);
+            held.leased = true;
+        }
+    }
+
+    /// X2': an empty confirmation stands for the eligible held key, the
+    /// one with the latest peek, if it is the latest peek since the focus
+    /// moved and not a cancelled Backspace. The guest gets its press and
+    /// release, unless `wl_keyboard.key` delivered it already, and then a
+    /// bare `done`. Recovering Backspace arms its lease; skipping it, or
+    /// recovering another key, ends it, and skipping another key leaves it.
+    /// With no eligible key, nothing goes out, and the lease ends.
+    /// `origin` says which key's press, if any, the confirmation is Exo's
+    /// confirmation before (E13).
+    fn recover_held_key(&mut self, origin: Origin) -> Option<(Txn, (i32, i32))> {
+        let backspace = keymap::keycode(Key::Backspace).0;
+        let latest = self.held.iter().max_by_key(|(_, held)| held.sequence);
+        let eligible = latest.filter(|&(&key, held)| {
+            self.latest_peek
+                .is_none_or(|sequence| sequence == held.sequence)
+                && !(key == backspace && held.cancelled)
+        });
+        let Some((&key, &held)) = eligible else {
+            self.counts.confirms_unheld += 1;
+            self.end_lease();
+            return None;
+        };
+        if held.forwarded {
+            self.counts.recoveries_skipped += 1;
+            if key == backspace {
+                self.end_lease();
+            }
+        } else {
+            self.counts.recovered_keys += 1;
+            let before = origin
+                .press
+                .is_some_and(|press| keymap::keycode(press).0 != key);
+            self.counts.recoveries_before_a_press += u64::from(before);
+            let field = self.focus.expect("a recovery in the focused field");
+            if let Some(typed) = keymap::key(key, self.shift) {
+                self.views[field].model.insert_key(typed);
+            }
+            match key == backspace {
+                true => self.arm_lease(),
+                false => self.end_lease(),
+            }
+        }
+        Some((Txn::default(), (0, 0)))
+    }
+
     /// F1: a focus change resets the text input. The field it leaves ends
     /// its composition, which the guest drops at the text input's `leave`.
+    /// The keyboard ends the seat's lease and forgets its latest peek.
     fn move_focus(&mut self, focus: Option<usize>) {
         if focus == self.focus {
             return;
         }
+        self.end_lease();
+        self.latest_peek = None;
         if let Some(left) = self.focus {
             self.views[left].model.preedit.clear();
             self.views[left].preedit_cursor = (0, 0);
@@ -578,6 +751,7 @@ impl SpecText {
         if self.gate() && self.focus == Some(field) {
             if let Some(shown) = self.shown.take() {
                 self.counts.press_commits += 1;
+                self.end_lease();
                 self.edited();
                 self.assembly = None;
                 self.expected.reset = true;
@@ -612,6 +786,10 @@ impl SpecText {
                 };
                 self.composition_event(origin, |spec| {
                     let shown = spec.shown.take();
+                    match text.is_empty() && shown.is_some() && commit.is_empty() {
+                        true => spec.arm_lease(),
+                        false => spec.end_lease(),
+                    }
                     if text.is_empty() {
                         let commit = shown.map_or_else(String::new, |_| commit.clone());
                         // The reset commit is an edit, which leaves the
@@ -642,6 +820,7 @@ impl SpecText {
                     spec.shown = None;
                     spec.taken = None;
                     spec.ahead |= !text.is_empty();
+                    spec.end_lease();
                     let txn = Txn {
                         commit: text.clone(),
                         ..Txn::default()
@@ -693,6 +872,7 @@ impl SpecText {
         }
         self.counts.deletes += 1;
         self.shown = None;
+        self.end_lease();
         self.edited();
         let txn = Txn {
             delete: (before, after),
@@ -729,6 +909,7 @@ impl SpecText {
         let at = self.assembly.unwrap_or(before as i32);
         let preedit_cursor = preedit_cursor(&preedit, Some(at));
         self.shown = None;
+        self.end_lease();
         if !preedit.is_empty() {
             self.counts.regions += 1;
             self.counts.regions_over_regions += u64::from(self.taken.is_some());
@@ -1083,6 +1264,13 @@ pub(super) fn exact(
     if !spec.wrong_decisions.is_empty() {
         failures.push(failure("decision", None, spec.wrong_decisions.join("\n")));
     }
+    let recoveries = spec.counts.recoveries_before_a_press;
+    if recoveries > 0 {
+        let detail = format!(
+            "{recoveries} held keys recovered for Exo's confirmation before another key's press"
+        );
+        failures.push(failure("recovery", spec.focus, detail));
+    }
     if let (Some(field), Some(tracked)) = (spec.focus, exo.composition()) {
         let preedit = &spec.views[field].model.preedit;
         let dropped = spec.shown.as_ref().is_some_and(|shown| {
@@ -1153,6 +1341,10 @@ pub(super) enum KnownIssue {
     /// A preedit region while the guest shows a preedit whose bytes the
     /// committed text does not hold takes other bytes than Exo composes.
     RegionOverShownPreedit,
+    /// An empty confirmation before the press of a key the input method
+    /// did not handle (E13) recovers the key held before it, as if it had
+    /// repeated (X2').
+    RecoveryBeforeAPress,
 }
 
 impl KnownIssue {
@@ -1174,6 +1366,13 @@ impl KnownIssue {
                  field (F1) and sends the guest only `leave`, at which GTK drops its preedit; \
                  Exo's detach then confirms the composition, but the link is draining and the \
                  proxy drops the confirmation"
+            }
+            Self::RecoveryBeforeAPress => {
+                "at v11 Exo confirms before every key the input method did not handle (E13), \
+                 and that key's peek comes only after its confirmation (E8), so the proxy takes \
+                 the confirmation for one of the key held before, which is still the latest \
+                 peek, and sends the guest a press and release of it (X2'): a held Backspace \
+                 deletes once more, a held Space types once more"
             }
             Self::RegionOverShownPreedit => {
                 "Exo makes a region from its own cursor, which follows the composition it holds \
@@ -1203,6 +1402,9 @@ impl KnownIssue {
                 "docs/IME_REDESIGN.md 2.2 X1; the core's X1 must decide how a region over a \
                  reported region is measured"
             }
+            Self::RecoveryBeforeAPress => {
+                "docs/IME_REDESIGN.md 2.2 X2', with REVIEW2's held-key peek sequence"
+            }
         }
     }
 }
@@ -1210,18 +1412,38 @@ impl KnownIssue {
 /// The known issues that explain a case's `failures`, if any do: tier 1
 /// passed, and the client shows exactly what a set of issues predicts
 /// together (`predicts`, asked of each set, the smallest first, and only
-/// then); or only tier 1's composition check failed, in a case with a
-/// region over a shown preedit (`counts`), whose region Exo composes
-/// elsewhere.
+/// then); or every failure is of tier 1 and a known issue's trigger
+/// explains it: a composition check, in a case with a region over a shown
+/// preedit (`counts`), whose region Exo composes elsewhere, and a recovery
+/// check, of a key recovered for a confirmation before another's press.
 pub(super) fn classify(
     failures: &[Failure],
     counts: &Counts,
     mut predicts: impl FnMut(&[KnownIssue]) -> bool,
 ) -> Vec<KnownIssue> {
-    let composition = |f: &Failure| f.tier == Tier::Exact && f.check == "composition";
-    if !failures.is_empty() && failures.iter().all(composition) && counts.regions_over_preedits > 0
-    {
-        return vec![KnownIssue::RegionOverShownPreedit];
+    // Tier 1 failures that a known issue's trigger explains.
+    let mut known = Vec::new();
+    let mut unexplained = Vec::new();
+    for failure in failures {
+        let issue = match (failure.tier, failure.check) {
+            (Tier::Exact, "composition") if counts.regions_over_preedits > 0 => {
+                KnownIssue::RegionOverShownPreedit
+            }
+            (Tier::Exact, "recovery") => KnownIssue::RecoveryBeforeAPress,
+            _ => {
+                unexplained.push(failure);
+                continue;
+            }
+        };
+        if !known.contains(&issue) {
+            known.push(issue);
+        }
+    }
+    if !known.is_empty() {
+        return match unexplained.is_empty() {
+            true => known,
+            false => Vec::new(),
+        };
     }
     let intent_only = !failures.is_empty() && failures.iter().all(|f| f.tier == Tier::Intent);
     let mut sets = KnownIssue::SETS.into_iter();
@@ -1686,6 +1908,114 @@ mod tests {
         assert_eq!(spec.views[0], view("0", 1, ""));
     }
 
+    /// The host's `peek_key` of `key`, pressed or released.
+    fn peek_key(key: Key, state: u32) -> peek::Event {
+        peek::Event::PeekKey {
+            serial: 1,
+            time: 0,
+            key: keymap::keycode(key).0,
+            state,
+        }
+    }
+
+    fn confirm() -> extended::Event {
+        extended::Event::ConfirmPreedit {
+            selection_behavior: 1,
+        }
+    }
+
+    const DOWN: u32 = wl_keyboard::KEY_STATE_PRESSED;
+    const UP: u32 = wl_keyboard::KEY_STATE_RELEASED;
+
+    #[test]
+    fn an_empty_confirmation_recovers_the_latest_held_key_unless_delivered() {
+        let mut spec = attached(&["0"]);
+        spec.txns.clear();
+        let bare = || vec![(Txn::default(), (0, 0))];
+        // Nothing held: nothing goes out.
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.txns, []);
+        // A held Space the input method consumed: its press, then a done.
+        host(&mut spec, peek_key(Key::Char(' '), DOWN), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(
+            (&spec.views[0], std::mem::take(&mut spec.txns)),
+            (&view("0 ", 2, ""), bare())
+        );
+        // One that wl_keyboard delivered: only the done.
+        host(&mut spec, peek_key(Key::Char(' '), UP), &[]);
+        host(&mut spec, peek_key(Key::Char('a'), DOWN), &[]);
+        let key = wl_keyboard::Event::Key {
+            serial: 1,
+            time: 0,
+            key: keymap::keycode(Key::Char('a')).0,
+            state: DOWN,
+        };
+        host(&mut spec, key, &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(
+            (&spec.views[0], std::mem::take(&mut spec.txns)),
+            (&view("0 a", 3, ""), bare())
+        );
+        // A key held but not the latest peek: nothing.
+        host(&mut spec, peek_key(Key::Char('s'), DOWN), &[]);
+        host(&mut spec, peek_key(Key::Char('s'), UP), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.txns, []);
+        let c = spec.counts;
+        let counts = (c.recovered_keys, c.recoveries_skipped, c.confirms_unheld);
+        assert_eq!(counts, (1, 1, 2));
+        // A held Space recovered for Exo's confirmation before Enter's press
+        // stands for no repeat.
+        host(&mut spec, peek_key(Key::Char(' '), DOWN), &[]);
+        let before_enter = Origin {
+            press: Some(Key::Enter),
+            ..Origin::default()
+        };
+        let event = confirm().into();
+        spec.see(Seen::Host {
+            sender: SYNC,
+            event: &event,
+            origin: before_enter,
+        });
+        spec.see(Seen::StepEnd);
+        assert_eq!(spec.views[0], view("0 a ", 4, ""));
+        assert_eq!(spec.counts.recoveries_before_a_press, 1);
+    }
+
+    #[test]
+    fn a_held_backspace_leases_its_repeat_until_an_edit_or_another_key() {
+        let backspace = |state| peek_key(Key::Backspace, state);
+        let cleared = || v1::Event::PreeditString {
+            serial: 0,
+            text: IndexedString::Utf8(String::new()),
+            commit: String::new(),
+        };
+        let mut spec = attached(&["0ab"]);
+        preedit(&mut spec, "가");
+        // Backspace takes back the composition, which arms the lease, and
+        // its repeats are recovered.
+        host(&mut spec, backspace(DOWN), &[]);
+        host(&mut spec, cleared(), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.views[0], view("0a", 2, ""));
+        assert_eq!((spec.counts.leases, spec.counts.leases_ended), (1, 0));
+        // An edit ends it for the rest of the press.
+        host(&mut spec, commit("x"), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.views[0], view("0ax", 3, ""));
+        assert_eq!(spec.counts.leases_ended, 1);
+        // So does another key's press, lease or not.
+        host(&mut spec, backspace(UP), &[]);
+        host(&mut spec, backspace(DOWN), &[]);
+        host(&mut spec, peek_key(Key::Char('a'), DOWN), &[]);
+        host(&mut spec, peek_key(Key::Char('a'), UP), &[]);
+        host(&mut spec, confirm(), &[]);
+        assert_eq!(spec.views[0], view("0ax", 3, ""));
+        assert_eq!(spec.counts.recovered_keys, 1);
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+    }
+
     #[test]
     fn a_guest_commit_is_answered_with_the_shown_preedit_and_records_the_field() {
         let mut spec = attached(&["0"]);
@@ -1837,7 +2167,7 @@ mod tests {
         };
         let origin = Origin {
             late: true,
-            resets: 0,
+            ..Origin::default()
         };
         spec.see(Seen::Host {
             sender: 10,
@@ -1953,7 +2283,7 @@ mod tests {
             regions_over_preedits: 1,
             ..Counts::default()
         };
-        let both = [composition.clone(), lost];
+        let both = [composition.clone(), lost.clone()];
         let known = [KnownIssue::RegionOverShownPreedit];
         assert_eq!(
             classify(std::slice::from_ref(&composition), &region, |_| false),
@@ -1964,6 +2294,21 @@ mod tests {
             []
         );
         assert_eq!(classify(&both, &region, |_| true), []);
+        // A key recovered for a confirmation before another's press.
+        let recovery = Failure {
+            tier: Tier::Exact,
+            check: "recovery",
+            ..lost.clone()
+        };
+        let before = KnownIssue::RecoveryBeforeAPress;
+        assert_eq!(
+            classify(std::slice::from_ref(&recovery), &none, |_| false),
+            [before]
+        );
+        let explained = [recovery.clone(), composition];
+        let both = [before, KnownIssue::RegionOverShownPreedit];
+        assert_eq!(classify(&explained, &region, |_| false), both);
+        assert_eq!(classify(&[recovery, lost], &none, |_| true), []);
         assert!(!P1.reason().is_empty() && P1.tracking().contains("C5"));
         assert!(!Lost.reason().is_empty() && Lost.tracking().contains("H2"));
     }

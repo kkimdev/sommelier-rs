@@ -455,8 +455,10 @@ fn pinned(test: &str, body: impl FnOnce()) {
 /// must also have met each variant a case draws and each path the mode is
 /// there to reach: presses that end a composition, Exo's own detaches
 /// (H2), its deletes (H9) and its preedit regions (X1); in free cases,
-/// fence drops, late answers the guest got, raw keys and reports that
-/// crossed an edit (P4), and in a run of 5,000 or more the rarer region
+/// fence drops, late answers the guest got, raw keys, reports that
+/// crossed an edit (P4), autorepeats of a held key, empty confirmations
+/// that recovered it, skipped its pair or found none (X2'), and Backspace
+/// leases armed and ended; and in a run of 5,000 or more the rarer region
 /// and delete paths; in settled ones, the known issues, and no fence drop,
 /// which a settled case must not cause.
 fn check(test: &str, settled: bool) {
@@ -501,6 +503,12 @@ fn check(test: &str, settled: bool) {
                 counts.late_shown,
                 counts.raw_keys,
                 counts.crossed_reports,
+                counts.repeats,
+                counts.recovered_keys,
+                counts.recoveries_skipped,
+                counts.confirms_unheld,
+                counts.leases,
+                counts.leases_ended,
             ]),
             // The known issue's count drops to 0 once C5 fixes P1, which
             // then deletes it here.

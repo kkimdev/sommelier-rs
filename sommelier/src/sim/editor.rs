@@ -88,6 +88,12 @@ pub(super) struct Typing {
 pub(super) enum UserAction {
     /// Presses and releases a key, which goes to the focused field.
     Key(Key),
+    /// Presses a key and holds it until its `KeyUp`; the input method's
+    /// engine repeats it meanwhile (D7). Only a free case holds a key, so
+    /// the reference editor takes the press alone, as a `Key`.
+    KeyDown(Key),
+    /// Releases a key that a `KeyDown` held.
+    KeyUp(Key),
     /// Presses and releases the pointer at a point of a field's surface.
     Click {
         /// The field.
@@ -336,7 +342,7 @@ impl Reference {
     /// Applies one user action.
     pub fn apply(&mut self, action: UserAction) {
         match action {
-            UserAction::Key(key) => {
+            UserAction::Key(key) | UserAction::KeyDown(key) => {
                 let out = match self.typing.latin {
                     true => Output::default(),
                     false => self.composer.key(key),
@@ -391,6 +397,7 @@ impl Reference {
                 self.region = Some(region);
             }
             UserAction::Focus(_)
+            | UserAction::KeyUp(_)
             | UserAction::AcceptSuggestion
             | UserAction::Reconvert
             | UserAction::Settle => {}
@@ -843,6 +850,16 @@ mod tests {
         let mut editor = Reference::new(vec![TextModel::new("0a가")]).typing(regionless);
         editor.apply(reconvert);
         assert_eq!(editor.fields(), [model("0a가", 5, "")]);
+    }
+
+    #[test]
+    fn a_held_key_types_as_its_press_and_its_release_types_nothing() {
+        let held = [
+            UserAction::KeyDown(Key::Char('r')),
+            UserAction::Key(Key::Char('k')),
+            UserAction::KeyUp(Key::Char('r')),
+        ];
+        assert_eq!(intended(&["0"], &held), intended(&["0"], &typing("rk")));
     }
 
     #[test]
