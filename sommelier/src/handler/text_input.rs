@@ -630,94 +630,22 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
     ctx.client_to_host_queue.extend(transaction);
 }
 
-/// Reconcile the text inputs of the guest seat `guest_seat`, which a bind
-/// just gave a host seat.
-pub(crate) fn reconcile_seat(ctx: &mut Context, guest_seat: u32) {
-    let text_inputs = ctx
-        .ime
-        .iter()
-        .filter_map(|(ti, t)| (t.seat() == SeatId(guest_seat)).then_some(ti.0))
-        .collect::<Vec<_>>();
-    for guest_id in text_inputs {
-        reconcile_host(ctx, guest_id, None);
-    }
-}
-
-/// Project authoritative seat focus changes onto every text-input object.
-///
-/// Keeping seat-wide repeat teardown here and delegating per-object mutation
-/// to the shared update path prevents handlers from implementing subtly
-/// different focus boundaries.
+/// Tell the IME core of each seat's keyboard focus change (F1), after the
+/// keyboard concern's own teardown: the seat's peek watermarks and its
+/// Backspace repeats end.
 pub(crate) fn apply_keyboard_focus_changes(ctx: &mut Context, changes: &[SeatFocusChange]) {
     for change in changes {
         if change.previous_surface == change.current_surface {
             continue;
         }
-
         ctx.key_generations
             .clear_peek_watermarks_for_seat(change.guest_seat);
         end_backspace_repeat_for_seat(ctx, change.guest_seat);
-        let updates = ctx
-            .ime
-            .iter()
-            .filter_map(|(ti, t)| {
-                (t.seat() == SeatId(change.guest_seat)).then_some((ti.0, change.current_surface))
-            })
-            .collect::<Vec<_>>();
-        apply_text_input_focus_updates(ctx, &updates);
-    }
-}
-
-/// Repair text inputs that still reference a surface after its keyboard
-/// generation was retired.
-///
-/// This is intentionally object-scoped. Treating one stale projection as a
-/// new seat transition would invalidate healthy text inputs that already
-/// track the registry's current surface.
-pub(crate) fn repair_destroyed_surface_focus(ctx: &mut Context, destroyed_surface: u32) {
-    let updates = ctx
-        .ime
-        .iter()
-        .filter(|(_, t)| t.focused_surface() == Some(SurfaceId(destroyed_surface)))
-        .map(|(ti, t)| (ti.0, ctx.keyboard_focus.surface_for_seat(t.seat().0)))
-        .collect::<Vec<_>>();
-    apply_text_input_focus_updates(ctx, &updates);
-}
-
-/// Apply focused-surface targets to selected text-input objects atomically.
-///
-/// Both authoritative seat transitions and lifecycle recovery use this path,
-/// so editor invalidation, guest events, and host-v1 activation cannot drift.
-fn apply_text_input_focus_updates(ctx: &mut Context, updates: &[(u32, Option<u32>)]) {
-    let mut events = Vec::new();
-    let mut text_inputs_to_update = Vec::new();
-    for &(guest_text_input_id, current_surface) in updates {
-        let Some(t) = ctx.ime.get_mut(TiId(guest_text_input_id)) else {
-            continue;
+        let focus = Input::FocusChanged {
+            seat: SeatId(change.guest_seat),
+            surface: change.current_surface.map(SurfaceId),
         };
-
-        // The field ends and a new one starts, disabled: reconciling ends
-        // the link, and the composition with it.
-        let previous_surface = t.refocus(current_surface.map(SurfaceId)).map(|s| s.0);
-
-        // A stale local projection can already equal the authoritative target
-        // even though the seat crossed a real focus boundary. Always
-        // invalidate and reconcile host activation, but do not fabricate
-        // duplicate guest leave/enter events in that case.
-        if previous_surface != current_surface {
-            if let Some(surface) = previous_surface {
-                events.push(zwp_text_input_v3::evt::leave(guest_text_input_id, surface));
-            }
-            if let Some(surface) = current_surface {
-                events.push(zwp_text_input_v3::evt::enter(guest_text_input_id, surface));
-            }
-        }
-        text_inputs_to_update.push(guest_text_input_id);
-    }
-
-    ctx.host_to_client_queue.extend(events);
-    for guest_text_input_id in text_inputs_to_update {
-        reconcile_host(ctx, guest_text_input_id, None);
+        ime(ctx, focus);
     }
 }
 

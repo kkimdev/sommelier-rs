@@ -1402,7 +1402,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         }
         if interface == wl_seat::NAME {
             // A text input whose seat had no host object can activate now.
-            crate::handler::text_input::reconcile_seat(ctx, *guest_new_id);
+            let seat = crate::ime::SeatId(*guest_new_id);
+            crate::handler::text_input::ime(ctx, crate::ime::Input::SeatBound(seat));
         }
 
         Action::Drop

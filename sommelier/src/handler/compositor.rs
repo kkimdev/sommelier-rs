@@ -444,7 +444,8 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
     // matches no live generation and is idempotent.
     let focus_update = ctx.keyboard_focus.destroy_surface(wl_surface_guest_id);
     crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
-    crate::handler::text_input::repair_destroyed_surface_focus(ctx, wl_surface_guest_id);
+    let surface = crate::ime::SurfaceId(wl_surface_guest_id);
+    crate::handler::text_input::ime(ctx, crate::ime::Input::SurfaceDestroyed(surface));
     for keyboard_id in focus_update.retired_keyboards {
         ctx.key_generations.clear_keyboard(keyboard_id);
     }
