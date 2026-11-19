@@ -48,6 +48,7 @@ use super::editor::{Reference, Target, TextModel, Txn, Typing, UserAction};
 use super::exo::{self, Exo};
 use super::hangul::Key;
 use super::keymap;
+use super::sched::Detach;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1 as peek;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1 as v1;
@@ -88,6 +89,9 @@ pub(super) struct Origin {
     pub resets: u64,
     /// The key whose press, not an autorepeat, the event answers.
     pub press: Option<Key>,
+    /// A surrounding text the proxy sent Exo was on its way when Exo sent
+    /// the event, so the proxy's committed text is newer than Exo's.
+    pub crossed: bool,
 }
 
 /// Which oracle a check belongs to.
@@ -280,6 +284,17 @@ pub(super) struct Counts {
     pub regions_dropped: u64,
     /// Guest reports that crossed an edit on its way to the guest (P4).
     pub crossed_reports: u64,
+    /// Preedit regions Exo made while a report the proxy sent it was on
+    /// its way (KnownIssue::RegionCrossesReport).
+    pub regions_crossing_reports: u64,
+    /// Regions Exo composed for a text input without an extension, which
+    /// the guest never sees, and ranges IMA sent after the commit of the
+    /// key it held them for (KnownIssue::StaleRegionAfterCommit).
+    pub regions_hidden: u64,
+    pub regions_stale: u64,
+    /// Focus moves that the text input heard of before the keyboard, bound
+    /// after its activate, so that Exo detached while attached (H2).
+    pub detaches_before_keyboard: u64,
     /// Empty confirmations that recovered a held key (X2'): its press and
     /// release reached the guest, or not, as `wl_keyboard.key` had already
     /// delivered it; and those that found no eligible held key.
@@ -314,6 +329,10 @@ impl std::ops::AddAssign for Counts {
         self.regions_over_preedits += other.regions_over_preedits;
         self.regions_dropped += other.regions_dropped;
         self.crossed_reports += other.crossed_reports;
+        self.regions_crossing_reports += other.regions_crossing_reports;
+        self.regions_hidden += other.regions_hidden;
+        self.regions_stale += other.regions_stale;
+        self.detaches_before_keyboard += other.detaches_before_keyboard;
         self.recovered_keys += other.recovered_keys;
         self.recoveries_skipped += other.recoveries_skipped;
         self.confirms_unheld += other.confirms_unheld;
@@ -927,6 +946,8 @@ impl SpecText {
                 (exo_cursor + after).checked_sub(start + held.len())?,
             ))
         });
+        // A report Exo has yet to get moves what the proxy measures from.
+        self.counts.regions_crossing_reports += u64::from(origin.crossed);
         let (Some((before, after)), Some(delete)) = (region, delete) else {
             self.counts.regions_dropped += 1;
             return None;
@@ -1267,6 +1288,8 @@ pub(super) fn step(spec: &mut SpecText, shadow: &mut Shadow) -> Option<String> {
 /// resets the engine on its own, as at a content type change. Of such a
 /// preedit, which `resets`, the engine resets so far, tells, Exo may
 /// compose nothing at all.
+/// And a host without the text-input extension may compose a reconverted
+/// region that the guest never shows.
 pub(super) fn exact(
     steps: &[String],
     spec: &SpecText,
@@ -1307,7 +1330,10 @@ pub(super) fn exact(
         let dropped = spec.shown.as_ref().is_some_and(|shown| {
             (shown.origin.late || shown.origin.resets < resets) && engine.is_empty()
         });
-        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) {
+        // Without the extension, Exo composes a reconverted region the
+        // guest never sees, over what it shows or not.
+        let hidden = extension.is_none() && spec.counts.regions_hidden > 0;
+        if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) && !hidden {
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
             );
@@ -1373,6 +1399,13 @@ pub(super) enum KnownIssue {
     /// did not handle (E13) recovers the key held before it, as if it had
     /// repeated (X2').
     RecoveryBeforeAPress,
+    /// A preedit region Exo made from text older than the guest's report
+    /// the proxy already committed is measured from the newer cursor (X1).
+    RegionCrossesReport,
+    /// A range IMA held for a key and sent after that key's commit
+    /// composes the committed text, which the guest shows as a preedit
+    /// that Exo drops at its next report (E4).
+    StaleRegionAfterCommit,
 }
 
 impl KnownIssue {
@@ -1394,6 +1427,19 @@ impl KnownIssue {
                  field (F1) and sends the guest only `leave`, at which GTK drops its preedit; \
                  Exo's detach then confirms the composition, but the link is draining and the \
                  proxy drops the confirmation"
+            }
+            Self::StaleRegionAfterCommit => {
+                "IMA holds a reconversion's range while a key is in flight and sends it after \
+                 that key's commit, which ended the region; Exo composes the committed text \
+                 again, the proxy shows it (X1), and the guest's next report, which leaves the \
+                 preedit out, makes Exo drop it (E4), so the guest shows a preedit nothing \
+                 composes"
+            }
+            Self::RegionCrossesReport => {
+                "Exo makes a region from its cursor in the text it had, while a report of the \
+                 guest's, which moved the cursor, was on its way to it; the proxy has already \
+                 committed that report and measures the region from the new cursor (X1), so \
+                 the guest shows other bytes than Exo composes"
             }
             Self::RecoveryBeforeAPress => {
                 "at v11 Exo confirms before every key the input method did not handle (E13), \
@@ -1421,6 +1467,14 @@ impl KnownIssue {
             Self::RecoveryBeforeAPress => {
                 "docs/IME_REDESIGN.md 2.2 X2', with REVIEW2's held-key peek sequence"
             }
+            Self::RegionCrossesReport => {
+                "docs/IME_REDESIGN.md 2.2 X1; the core must measure a region against the text \
+                 Exo had"
+            }
+            Self::StaleRegionAfterCommit => {
+                "docs/IME_REDESIGN.md 2.2 X1; IMA's ordering, made lasting by the proxy's \
+                 reports without the preedit"
+            }
         }
     }
 }
@@ -1430,9 +1484,11 @@ impl KnownIssue {
 /// together (`predicts`, asked of each set, the smallest first, and only
 /// then); or every failure is of tier 1 and a known issue's trigger
 /// explains it: a recovery check, of a key recovered for a confirmation
-/// before another's press.
+/// before another's press, and a composition check, in a case with a
+/// region that crossed a report or was stale (`counts`).
 pub(super) fn classify(
     failures: &[Failure],
+    counts: &Counts,
     mut predicts: impl FnMut(&[KnownIssue]) -> bool,
 ) -> Vec<KnownIssue> {
     // Tier 1 failures that a known issue's trigger explains.
@@ -1440,6 +1496,12 @@ pub(super) fn classify(
     let mut unexplained = Vec::new();
     for failure in failures {
         let issue = match (failure.tier, failure.check) {
+            (Tier::Exact, "composition") if counts.regions_crossing_reports > 0 => {
+                KnownIssue::RegionCrossesReport
+            }
+            (Tier::Exact, "composition") if counts.regions_stale > 0 => {
+                KnownIssue::StaleRegionAfterCommit
+            }
             (Tier::Exact, "recovery") => KnownIssue::RecoveryBeforeAPress,
             _ => {
                 unexplained.push(failure);
@@ -1471,16 +1533,17 @@ pub(super) struct Played<'a> {
     pub texts: &'a [String],
     pub typing: Typing,
     pub actions: &'a [UserAction],
-    /// For each restart of the input method, whether Exo's detach confirmed
-    /// no composition there.
-    pub untracked_restarts: &'a [bool],
+    /// For each restart, click, tap and focus move, in order, what Exo's
+    /// own detach did there.
+    pub detaches: &'a [Detach],
 }
 
 /// Whether `client` shows exactly what `issues` predict of `played`: the
 /// user's intent, except that each issue loses the composition where it
 /// strikes instead of committing it. P1 strikes at each focus move away
-/// from a composing field; the lost restart at each restart whose detach
-/// confirmed nothing.
+/// from a composing field that the keyboard heard of first; the lost
+/// detach at each restart, and each focus move the text input heard of
+/// first, whose detach confirmed nothing.
 pub(super) fn issues_predict(issues: &[KnownIssue], played: &Played, client: &dyn Client) -> bool {
     let fields = played
         .texts
@@ -1488,19 +1551,22 @@ pub(super) fn issues_predict(issues: &[KnownIssue], played: &Played, client: &dy
         .map(|text| TextModel::new(text))
         .collect();
     let mut reference = Reference::new(fields).typing(played.typing);
-    let mut restarts = played.untracked_restarts.iter();
+    let mut detaches = played.detaches.iter();
     for &action in played.actions {
-        let lose = match action {
-            UserAction::RestartInputMethod => {
-                let untracked = restarts.next().copied().unwrap_or(false);
-                untracked && issues.contains(&KnownIssue::RestartLosesUntrackedComposition)
-            }
-            action => {
-                issues.contains(&KnownIssue::FocusWhileComposing)
-                    && reference.leaves_composition(action)
-            }
+        let detach = match action {
+            UserAction::RestartInputMethod
+            | UserAction::Click { .. }
+            | UserAction::Tap { .. }
+            | UserAction::Focus(_) => detaches.next().copied().unwrap_or_default(),
+            _ => Detach::default(),
         };
-        reference.apply_losing(action, lose);
+        let lost = detach.before_keyboard
+            && detach.untracked
+            && issues.contains(&KnownIssue::RestartLosesUntrackedComposition);
+        let p1 = !detach.before_keyboard
+            && issues.contains(&KnownIssue::FocusWhileComposing)
+            && reference.leaves_composition(action);
+        reference.apply_losing(action, lost || p1);
     }
     intended(&reference, client).is_empty()
 }
@@ -2234,6 +2300,55 @@ mod tests {
     }
 
     #[test]
+    fn a_region_made_while_a_report_was_on_its_way_explains_a_composition() {
+        let composition = Failure {
+            tier: Tier::Exact,
+            check: "composition",
+            field: Some(0),
+            detail: String::new(),
+        };
+        let crossing = Counts {
+            regions_crossing_reports: 1,
+            ..Counts::default()
+        };
+        let one = std::slice::from_ref(&composition);
+        assert_eq!(
+            classify(one, &crossing, |_| false),
+            [KnownIssue::RegionCrossesReport]
+        );
+        assert_eq!(classify(one, &Counts::default(), |_| true), []);
+        // The scheduler marks such a region, which SpecText counts.
+        let mut spec = attached(&["0ab"]);
+        report(&mut spec, "0ab", 3);
+        let region = extended::Event::SetPreeditRegion {
+            index: -1,
+            length: 1,
+        };
+        let origin = Origin {
+            crossed: true,
+            ..Origin::default()
+        };
+        spec.see(Seen::Host {
+            sender: SYNC,
+            event: &region.into(),
+            origin,
+        });
+        spec.see(Seen::StepEnd);
+        assert_eq!(spec.counts.regions_crossing_reports, 1);
+        let issue = KnownIssue::RegionCrossesReport;
+        assert!(!issue.reason().is_empty() && issue.tracking().contains("X1"));
+        // So does a range IMA sent after the commit of the key it held it
+        // for.
+        let stale = Counts {
+            regions_stale: 1,
+            ..Counts::default()
+        };
+        let issue = KnownIssue::StaleRegionAfterCommit;
+        assert_eq!(classify(one, &stale, |_| false), [issue]);
+        assert!(!issue.reason().is_empty() && issue.tracking().contains("X1"));
+    }
+
+    #[test]
     fn a_known_issue_must_predict_exactly_what_the_client_shows() {
         use KnownIssue::{FocusWhileComposing as P1, RestartLosesUntrackedComposition as Lost};
         // The user typed 가 in field 0 and moved to field 1: P1 loses it.
@@ -2247,7 +2362,7 @@ mod tests {
             texts: &texts,
             typing: Typing::default(),
             actions: &actions,
-            untracked_restarts: &[],
+            detaches: &[],
         };
         let predicts =
             |issues: &[KnownIssue], client: &Gtk| issues_predict(issues, &played, client);
@@ -2268,15 +2383,42 @@ mod tests {
             UserAction::RestartInputMethod,
             UserAction::Focus(1),
         ];
-        let lost = |untracked_restarts| Played {
-            untracked_restarts,
+        let detach = |untracked| Detach {
+            before_keyboard: true,
+            untracked,
+        };
+        let restarted = [detach(true), Detach::default()];
+        let confirmed = [detach(false), Detach::default()];
+        let first = [detach(true)];
+        let first_confirmed = [detach(false)];
+        let lost = |detaches| Played {
+            detaches,
             actions: &actions,
             ..played
         };
         let client = gtk(["0", "1"], 1);
-        assert!(issues_predict(&[Lost], &lost(&[true]), &client));
-        assert!(!issues_predict(&[Lost], &lost(&[false]), &client));
-        assert!(!issues_predict(&[P1], &lost(&[true]), &client), "not P1's");
+        assert!(issues_predict(&[Lost], &lost(&restarted), &client));
+        assert!(!issues_predict(&[Lost], &lost(&confirmed), &client));
+        assert!(
+            !issues_predict(&[P1], &lost(&restarted), &client),
+            "not P1's"
+        );
+        // So does a focus move the text input hears of first, where P1
+        // cannot strike; one it confirms keeps the syllable.
+        let actions = [
+            UserAction::Key(Key::Char('r')),
+            UserAction::Key(Key::Char('k')),
+            UserAction::Focus(1),
+        ];
+        let moved = |detaches| Played {
+            detaches,
+            actions: &actions,
+            ..played
+        };
+        assert!(issues_predict(&[Lost], &moved(&first), &client));
+        assert!(!issues_predict(&[P1], &moved(&first), &client));
+        let kept = gtk(["0가", "1"], 1);
+        assert!(issues_predict(&[], &moved(&first_confirmed), &kept));
         let lost = Failure {
             tier: Tier::Intent,
             check: "text",
@@ -2284,24 +2426,26 @@ mod tests {
             detail: String::new(),
         };
         let one = std::slice::from_ref(&lost);
-        assert_eq!(classify(one, |_| true), [P1]);
-        assert_eq!(classify(one, |issues| issues == [Lost]), [Lost]);
-        assert_eq!(classify(one, |issues| issues.len() == 2), [P1, Lost]);
-        assert_eq!(classify(one, |_| false), []);
-        assert_eq!(classify(&[], |_| true), []);
+        let none = Counts::default();
+        assert_eq!(classify(one, &none, |_| true), [P1]);
+        assert_eq!(classify(one, &none, |issues| issues == [Lost]), [Lost]);
+        assert_eq!(classify(one, &none, |issues| issues.len() == 2), [P1, Lost]);
+        assert_eq!(classify(one, &none, |_| false), []);
+        assert_eq!(classify(&[], &none, |_| true), []);
         let exact = Failure {
             tier: Tier::Exact,
             ..lost.clone()
         };
-        assert_eq!(classify(&[lost.clone(), exact], |_| true), []);
-        // No issue explains a composition that Exo composes elsewhere.
+        assert_eq!(classify(&[lost.clone(), exact], &none, |_| true), []);
+        // No issue explains a composition that Exo composes elsewhere
+        // without a region that crossed a report or was stale.
         let composition = Failure {
             tier: Tier::Exact,
             check: "composition",
             ..lost.clone()
         };
         let one = std::slice::from_ref(&composition);
-        assert_eq!(classify(one, |_| true), []);
+        assert_eq!(classify(one, &none, |_| true), []);
         // A key recovered for a confirmation before another's press.
         let recovery = Failure {
             tier: Tier::Exact,
@@ -2310,11 +2454,14 @@ mod tests {
         };
         let before = KnownIssue::RecoveryBeforeAPress;
         assert_eq!(
-            classify(std::slice::from_ref(&recovery), |_| false),
+            classify(std::slice::from_ref(&recovery), &none, |_| false),
             [before]
         );
-        assert_eq!(classify(&[recovery.clone(), composition], |_| false), []);
-        assert_eq!(classify(&[recovery, lost], |_| true), []);
+        assert_eq!(
+            classify(&[recovery.clone(), composition], &none, |_| false),
+            []
+        );
+        assert_eq!(classify(&[recovery, lost], &none, |_| true), []);
         assert!(!P1.reason().is_empty() && P1.tracking().contains("C5"));
         assert!(!Lost.reason().is_empty() && Lost.tracking().contains("H2"));
     }

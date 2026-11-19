@@ -79,8 +79,13 @@ pub(super) struct Typing {
     /// character.
     pub nfd_backspace: bool,
     /// The host shows no reconverted region, as it has no text-input
-    /// extension, so the input method reconverts nothing.
+    /// extension. The engine and Exo still compose the region, which the
+    /// field never shows, and the next key commits it, so its text shows
+    /// twice.
     pub regionless: bool,
+    /// The client reports a cursor that a click moved only with its next
+    /// edit, as GTK3 does.
+    pub late_cursor: bool,
 }
 
 /// What the user does.
@@ -385,15 +390,15 @@ impl Reference {
                 });
             }
             UserAction::Reconvert if self.reconverts() => {
-                let field = &mut self.fields[self.focus];
-                let c = field.text[..field.cursor].chars().next_back();
-                let c = c.expect("a character to reconvert");
+                let c = self.reconverted().expect("a character to reconvert");
                 let region = format!("{c}{}", self.region.take().unwrap_or_default());
-                field.apply_txn(&Txn {
-                    delete: (c.len_utf8(), 0),
-                    preedit: region.clone(),
-                    ..Txn::default()
-                });
+                if !self.typing.regionless {
+                    self.fields[self.focus].apply_txn(&Txn {
+                        delete: (c.len_utf8(), 0),
+                        preedit: region.clone(),
+                        ..Txn::default()
+                    });
+                }
                 self.region = Some(region);
             }
             UserAction::Focus(_)
@@ -445,13 +450,24 @@ impl Reference {
     }
 
     /// Whether a reconversion would take a character: one it can take is
-    /// before the cursor, no jamo are composed, the layout has an engine,
-    /// and the host can show a region.
+    /// before the cursor, or before the region, and no jamo are composed,
+    /// and the layout has an engine.
     pub fn reconverts(&self) -> bool {
+        let engine = !self.typing.latin;
+        engine && self.composer.preedit().is_empty() && self.reconverted().is_some()
+    }
+
+    /// The character a reconversion would take: the one before the region,
+    /// which a host without a region still holds as text, or before the
+    /// cursor; if it can take it.
+    fn reconverted(&self) -> Option<char> {
         let field = &self.fields[self.focus];
-        let before = field.text[..field.cursor].chars().next_back();
-        let engine = !self.typing.latin && !self.typing.regionless;
-        engine && self.composer.preedit().is_empty() && before.is_some_and(reconvertible)
+        let hidden = match self.typing.regionless {
+            true => self.region.as_ref().map_or(0, String::len),
+            false => 0,
+        };
+        let before = field.text[..field.cursor - hidden].chars().next_back();
+        before.filter(|&c| reconvertible(c))
     }
 
     /// The composition: the reconverted region, or the composer's.
@@ -842,14 +858,18 @@ mod tests {
         assert!(editor.leaves_composition(UserAction::Focus(1)));
         editor.apply_losing(UserAction::Focus(1), true);
         assert_eq!(editor.fields()[0], model("0a", 2, ""));
-        // A host that cannot show a region gets none.
+        // A host that cannot show a region shows none, and the next key
+        // commits it again.
         let regionless = Typing {
             regionless: true,
             ..Typing::default()
         };
         let mut editor = Reference::new(vec![TextModel::new("0a가")]).typing(regionless);
         editor.apply(reconvert);
+        editor.apply(reconvert);
         assert_eq!(editor.fields(), [model("0a가", 5, "")]);
+        editor.apply(UserAction::Key(Key::Char(' ')));
+        assert_eq!(editor.fields(), [model("0a가a가 ", 10, "")]);
     }
 
     #[test]

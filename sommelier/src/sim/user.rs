@@ -29,9 +29,11 @@ limitations under the License.
 //! it, may type up to two other keys, and releases it, while the engine
 //! repeats it. A Backspace comes only where it deletes no marker, and a
 //! suggestion or a reconversion only where it changes something; in a
-//! settled case, also only right after a key. GTK3 reports a cursor that a
-//! click moved only with its next edit, so after a click the engine would
-//! measure the word or the region from where the cursor was; and once the
+//! settled case of GTK3, also only right after a key. GTK3 reports a
+//! cursor that a click moved only with its next edit, so after a click the
+//! engine would measure the word or the region from where the cursor was;
+//! and in any settled case, a suggestion only while IMA takes the engine to
+//! compose nothing, and a key right after a reconversion. Once the
 //! guest reports a region, Exo drops it as a composition (E4), so the
 //! engine cannot grow it.
 //!
@@ -90,17 +92,24 @@ pub(super) fn actions(
     // A request a free case makes again at once, or the rest of a hold.
     let mut again = None;
     let mut holding = Vec::new();
+    // A settled case types a key after a reconversion, which commits the
+    // region; a host without one shows nothing until then.
+    let mut must_type = false;
     // Whether the last action but a settle was a key, which the client
     // reported, so that the engine knows where the cursor is.
     let mut typed = false;
     for _ in 0..10 + rng.below(51) {
-        let asks = typed || !settled;
+        let asks = typed || !settled || !typing.late_cursor;
         // A settled case asks so rarely right after a key that it asks then
         // one time in eight, where it can.
-        let (takes, reconverts) = (reference.takes_suggestion(), reference.reconverts());
+        // IMA drops a suggestion's delete while it takes the engine to
+        // compose, so a settled case asks only while it does not.
+        let takes = reference.takes_suggestion() && !(settled && ima.composing);
+        let reconverts = reference.reconverts();
         let more = settled && typed && (takes || reconverts) && rng.one_in(8);
         let action = match rng.below(100) {
             _ if again.is_some() => again.take().expect("a request to repeat"),
+            _ if std::mem::take(&mut must_type) => UserAction::Key(key(rng, &reference)),
             _ if !holding.is_empty() => holding.remove(0),
             56..59 if !settled => {
                 // Mostly a key the input method passes once nothing is
@@ -182,6 +191,7 @@ pub(super) fn actions(
         if action != UserAction::Settle {
             typed = matches!(action, UserAction::Key(_));
         }
+        must_type = settled && action == UserAction::Reconvert;
         reference.apply(action);
         match action {
             UserAction::Settle => settle(&mut actions),
@@ -367,8 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn a_settled_case_asks_the_engine_only_right_after_a_key() {
-        for (_, actions) in cases(Typing::default(), true) {
+    fn a_settled_case_of_gtk3_asks_the_engine_only_right_after_a_key() {
+        let gtk3 = Typing {
+            late_cursor: true,
+            ..Typing::default()
+        };
+        for (_, actions) in cases(gtk3, true) {
             let acts: Vec<UserAction> = actions
                 .into_iter()
                 .filter(|&action| action != UserAction::Settle)
@@ -380,6 +394,9 @@ mod tests {
                 );
                 let after = matches!(pair[0], UserAction::Key(_));
                 assert!(!asks || after, "{pair:?}");
+                // And types a key after a reconversion.
+                let typed = matches!(pair[1], UserAction::Key(_));
+                assert!(pair[0] != UserAction::Reconvert || typed, "{pair:?}");
             }
         }
     }
@@ -432,6 +449,7 @@ mod tests {
                 latin: true,
                 nfd_backspace: true,
                 regionless: false,
+                late_cursor: false,
             },
         ];
         for typing in typings {

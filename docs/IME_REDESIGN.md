@@ -1479,7 +1479,9 @@ sees them.
     space, and its replacement is the word and a `~`. A reconversion
     takes one character, or one more before the region it has, and the
     next key commits the region as it is. Exo sends the region with
-    `set_preedit_region` from its cursor, only with an extension, and
+    `set_preedit_region` from its cursor, only with an extension; without
+    one it composes the region all the same, which the guest never sees,
+    so the next key commits its text a second time; and
     the engine learns the region's text from the field, since it
     measured the region in text that can lag.
   - A free case makes half of these twice at once, for a delete while
@@ -1489,7 +1491,7 @@ sees them.
     drops a reported region as a composition (E4).
 - **D7** adds holds: `UserAction::KeyDown(Key)` and `KeyUp(Key)` next to
   #73's atomic `Key`.
-  - The engine gets autorepeats (500 ms delay, 33 Hz). Exo forwards
+  - The engine gets autorepeats (500 ms delay, 20 Hz). Exo forwards
     none of them (E7).
   - IMA precedes every unhandled key, autorepeats included, with an
     empty `confirm_preedit` at v11 (E13, formerly U11). This exercises
@@ -1592,7 +1594,17 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
   5% `Settle`. A case has 10 to 60 actions and two fields.
 - **Restarts.** `UserAction::RestartInputMethod` destroys Exo's input
   method (`Exo::destroy_input_method`), which confirms and detaches on
-  its own (E2, E6), and starts its engine afresh. It is the only action
+  its own (E2, E6); its confirmation resets the engine only if a text
+  input was attached, and a key in flight never gets its callback. Ash
+  destroys `InputMethodAsh` only at shutdown, so this is a model's
+  trigger, not production's. Production reaches H2 when a keyboard is
+  bound after the text input's `activate`: it registers as the seat's
+  observer after the text input, so the text input's detach comes
+  before the keyboard's `leave` at the next focus move (E12). Half the
+  cases bind their keyboard again once the text input is active (the
+  new one first, the old one's release once it entered, so the seat
+  keeps its focus), which the counter `detaches_before_keyboard` counts.
+  Before that, the restart was the only action
   that reaches H2: since E12, a focus move always reaches the keyboard
   first, so the proxy has already deactivated when Exo's `leave` comes
   (H2'). A surface the guest destroys (F2) cannot reach H2 either: the
@@ -1733,13 +1745,24 @@ enum KnownIssue {
     /// H2: below v11 of the extension, Exo's detach confirms only a
     /// composition it tracks, and a report it cannot match drops that
     /// (E4); at the leave the proxy clears the preedit the guest shows.
-    /// C5 decides whether H2 commits it.
+    /// C5 decides whether H2 commits it. A restart, or a focus move that
+    /// the text input hears of before a keyboard bound after its activate,
+    /// detaches it so.
     RestartLosesUntrackedComposition,
     /// X2': Exo's confirmation before a key the input method did not
     /// handle (E13) comes before that key's peek (E8), so the proxy takes
     /// it for a repeat of the key held before, which is still the latest
     /// peek, and the guest gets one more press of it.
     RecoveryBeforeAPress,
+    /// X1: a region Exo makes from text older than a guest report the
+    /// proxy has committed, still on its way to Exo, is measured from
+    /// the newer cursor.
+    RegionCrossesReport,
+    /// IMA holds a reconversion's range while a key is in flight and
+    /// sends it after that key's commit, so it composes the committed
+    /// text; the guest's next report, without the preedit, makes Exo drop
+    /// it (E4), and the guest shows a preedit nothing composes.
+    StaleRegionAfterCommit,
 }
 ```
 
@@ -1751,9 +1774,11 @@ strikes:
 
 - P1, in GTK only, at each `Focus` (or click or tap on the other field)
   that leaves a field while it composes;
-- the lost restart, at each restart where the world recorded that Exo
-  could confirm nothing: the extension is below v11 and Exo tracked no
-  composition. It occurs in about 1 settled case in 100 (55 of seeds
+- the lost detach, at each restart, and each focus move the text input
+  hears of first, where the world recorded that Exo could confirm
+  nothing: the extension is below v11 and Exo tracked no composition. P1
+  does not strike at such a focus move, since Exo's confirmation reaches
+  the proxy while it is attached. It occurs in about 1 settled case in 100 (55 of seeds
   1,000,001 to 1,009,999, odd), so the run does not require it.
 
 The recovery before a press is a free case's issue, as only free cases
