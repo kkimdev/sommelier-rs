@@ -983,14 +983,15 @@ mod tests {
         assert!(generations.physically_held(other, BACKSPACE));
     }
 
-    /// An IME edit ends the held-Backspace fallback a confirmation leased.
+    /// An IME edit that reaches the guest ends the held-Backspace fallback
+    /// a confirmation leased.
     #[test]
     fn ime_edits_end_a_stale_backspace_repeat() {
         type Event = fn(&mut Ime);
         let cases: [(&str, Event); 3] = [
             ("an empty commit", |ime| ime.commit("")),
             ("a reset preedit", |ime| ime.preedit("", "확정")),
-            ("a preedit region", |ime| ime.preedit_region(-3, 3)),
+            ("a new preedit", |ime| ime.preedit("나", "나")),
         ];
         for (case, event) in cases {
             let mut ime = Ime::with_keyboard();

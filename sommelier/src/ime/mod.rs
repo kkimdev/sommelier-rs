@@ -36,17 +36,15 @@ mod step;
 #[cfg(test)]
 mod tests;
 
-// What handler tests outside the core use: two pure helpers they test, and
+// What handler tests outside the core use: a pure helper they test, and
 // the state they set up and read directly, as no peer can
-// (`test_support::text_input`).
-#[cfg(test)]
-pub(crate) use guest::delete_lengths;
+// (`test_support::text_input`); and the drops the DST counts.
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
 #[cfg(test)]
 pub(crate) use state::{Assembly, LinkState, TextInput, V3Committed, V3Pending};
 #[cfg(test)]
-pub(crate) use step::{take_fallbacks_for_test, Fallbacks};
+pub(crate) use step::{take_drops_for_test, Drops};
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,32 +82,6 @@ pub struct HostExt {
     pub version: u32,
     /// The host `zcr_text_input_extension_v1` it is created from.
     pub manager: u32,
-}
-
-/// How a text input measures Exo's deletes (H9) and preedit regions (X1),
-/// fixed at its creation (G1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImeMode {
-    /// In the surrounding text the guest last committed (`ime/legacy.rs`).
-    /// The Exo mirror runs beside it, in shadow, and only logs.
-    Legacy,
-    /// In the Exo mirror, while the guest is in step with it.
-    Mirror,
-}
-
-impl ImeMode {
-    /// [`Self::Mirror`] from v11 of the host's text-input extension, the
-    /// first whose confirmations are `confirm_preedit` and not a
-    /// `cursor_position` and `commit_string` pair the mirror could misread,
-    /// unless `shadow`, the kill switch, keeps every text input in Legacy
-    /// mode.
-    pub fn of(ext_version: Option<u32>, shadow: bool) -> Self {
-        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
-        match ext_version {
-            Some(version) if !shadow && version >= ext::EVT_CONFIRM_PREEDIT_SINCE => Self::Mirror,
-            _ => Self::Legacy,
-        }
-    }
 }
 
 /// One message the core handles. Every trigger of an IME change is one of
@@ -303,20 +275,9 @@ pub struct ImeCore {
     /// change it.
     by_ext: BTreeMap<u32, TiId>,
     next_barrier: u64,
-    /// The kill switch: every text input is in [`ImeMode::Legacy`].
-    shadow: bool,
 }
 
 impl ImeCore {
-    /// The text inputs of a new connection, every one of them in
-    /// [`ImeMode::Legacy`] if `shadow`.
-    pub fn new(shadow: bool) -> Self {
-        Self {
-            shadow,
-            ..Self::default()
-        }
-    }
-
     /// G1: text input `ti` of `seat`, with the host objects `host`, focused
     /// on `surface`, if any.
     fn insert(&mut self, ti: TiId, seat: SeatId, host: HostTi, surface: Option<SurfaceId>) {
@@ -328,9 +289,8 @@ impl ImeCore {
         if let Some(ext) = host.ext {
             self.by_ext.insert(ext.id, ti);
         }
-        let mode = ImeMode::of(host.ext.map(|ext| ext.version), self.shadow);
         self.inputs
-            .insert(ti, state::TextInput::new(seat, host, surface, mode));
+            .insert(ti, state::TextInput::new(seat, host, surface));
     }
 
     /// Forget text input `ti`, and its extension.
@@ -349,8 +309,9 @@ impl ImeCore {
 #[cfg(test)]
 impl ImeCore {
     /// Text input `ti` as [`Input::Create`] makes it, without its host
-    /// requests, in Legacy mode: the state its tests set up directly is
-    /// none the Exo mirror could have followed.
+    /// requests. Its mirror holds Exo's empty text, and the guest is not in
+    /// step with it, so Exo's deletes and regions are dropped until a
+    /// report.
     pub(crate) fn insert_for_test(
         &mut self,
         ti: TiId,
@@ -358,9 +319,7 @@ impl ImeCore {
         host: HostTi,
         surface: Option<SurfaceId>,
     ) {
-        let shadow = std::mem::replace(&mut self.shadow, true);
         self.insert(ti, seat, host, surface);
-        self.shadow = shadow;
     }
 
     pub(crate) fn get(&self, ti: TiId) -> Option<&TextInput> {
@@ -390,7 +349,7 @@ impl ImeCore {
         history: &[StateForTest],
     ) -> Option<String> {
         let t = self.inputs.values().find(|t| t.host().v1 == v1)?;
-        let mirror = t.exo().mirror();
+        let mirror = t.exo().mirror()?;
         let exact = mirror.exact()?;
         let state = |(text, (start, end), composition): &StateForTest| mirror::ExoState {
             text: text.clone(),

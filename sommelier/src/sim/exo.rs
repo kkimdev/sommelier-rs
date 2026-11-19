@@ -201,24 +201,17 @@ struct TextInput {
     registered: Option<u64>,
 }
 
-/// What Exo did of a `set_preedit_region` it sent, for the oracle to judge
-/// the proxy's translation of it by; and of a `delete_surrounding_text`,
-/// which composes nothing.
+/// Exo's text before a `set_preedit_region` or a
+/// `delete_surrounding_text` it sent, in which the oracle measures the
+/// proxy's translation of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct RegionTruth {
-    /// Its tracker's predicted text and cursor when it made the region,
-    /// with the composition it held there, empty for none, and where they
-    /// are.
+    /// Its tracker's predicted text and cursor when it sent the event, with
+    /// its selection and the composition it held there, if any.
     pub text: String,
     pub cursor: usize,
-    pub held: String,
     pub selection: Selection,
     pub composition: Option<Range<usize>>,
-    /// A report it could not match had dropped the composition it held
-    /// before, and nothing composed since (E4).
-    pub dropped: bool,
-    /// The text it composed, which the guest must then show.
-    pub composed: String,
 }
 
 impl RegionTruth {
@@ -228,11 +221,8 @@ impl RegionTruth {
         Self {
             text: predicted.text.clone(),
             cursor: predicted.cursor(),
-            held: predicted.composition().to_owned(),
             selection: predicted.selection,
             composition: predicted.composition.clone(),
-            dropped: tracker.dropped,
-            composed: String::new(),
         }
     }
 }
@@ -1556,10 +1546,6 @@ impl Exo {
             let index = -i32::try_from(cursor - range.start).expect("a short region");
             let length = u32::try_from(range.len()).expect("a short region");
             let event = extended::evt::set_preedit_region(extension, index, length);
-            let truth = RegionTruth {
-                composed: composed.clone(),
-                ..truth
-            };
             self.region_truths.push((self.events.len(), truth));
             self.events.push(event);
         }

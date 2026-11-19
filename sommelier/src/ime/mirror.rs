@@ -67,7 +67,6 @@ use std::hash::{DefaultHasher, Hasher};
 use std::ops::Range;
 
 use super::BarrierToken;
-use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 
 /// The most history states the mirror keeps. Exo keeps every one (STT has
@@ -342,9 +341,7 @@ pub(super) enum Health {
     /// unknown; the text grew over [`TEXT_CAP`]; or a report's outcome is
     /// ambiguous. A report Exo must reset to makes it exact again, which
     /// after a press's `reset` (an empty history) is any report before the
-    /// next event. Without the extension nothing does, as Exo composes
-    /// existing text unseen (`SetCompositionFromExistingText`, TI
-    /// 483-508).
+    /// next event.
     Unknown,
 }
 
@@ -392,14 +389,12 @@ pub(super) struct ExoMirror {
     dropped: bool,
     /// An echo check failed since [`Self::take_diverged`] last looked.
     diverged: bool,
-    /// The host extension's version, `None` without one.
-    ext_version: Option<u32>,
 }
 
 impl ExoMirror {
     /// The tracker of a new host text input (`SurroundingTextTracker()`,
     /// STT 114-116).
-    pub(super) fn new(ext_version: Option<u32>) -> Self {
+    pub(super) fn new() -> Self {
         let mut mirror = Self {
             predicted: ExoState::default(),
             health: Health::Exact,
@@ -411,7 +406,6 @@ impl ExoMirror {
             cursor_position: None,
             dropped: false,
             diverged: false,
-            ext_version,
         };
         mirror.reset_internal("", Span::at(0));
         mirror
@@ -638,17 +632,11 @@ impl ExoMirror {
     /// `OnInsertText(text, kMoveCursorAfterText)` (TI 274-280), which over
     /// a composition holding the selection replaces the composition
     /// wherever the selection is in it. After a `cursor_position(range)`,
-    /// it is one of two pairs, both of which commit the composition text
-    /// (TI 240-263, 386-403):
-    ///
-    /// - `ConfirmCompositionText(true)`'s fallback, which IMA takes only
-    ///   below the extension's `confirm_preedit` (ZTIM 430-447), and which
-    ///   sends the predicted selection;
-    /// - `SetEditableSelectionRange(range)`, which keeps the composition.
-    ///
-    /// The pair is read as a confirm only when it can be one; one that can
-    /// be either while composing, or with a vague selection, makes the
-    /// mirror [`Health::Unknown`].
+    /// it is `SetEditableSelectionRange(range)` (TI 386-403), which keeps
+    /// the composition and sends its text. The mirror exists only from v11
+    /// of the extension, whose confirmations are `confirm_preedit` (ZTIM
+    /// 430-447), so the pair is never `ConfirmCompositionText(true)`'s
+    /// fallback (TI 240-263), which IMA takes only below it.
     ///
     /// Echo, for a pair: the range is in the text, and `text` is the
     /// composition's.
@@ -673,18 +661,8 @@ impl ExoMirror {
             if !predicted.holds_span(range) || text != predicted.composition_text() {
                 return Err(Miss::Diverged);
             }
-            let confirms_by_event = mirror
-                .ext_version
-                .is_some_and(|version| version >= ext::EVT_CONFIRM_PREEDIT_SINCE);
-            if !confirms_by_event && (vague || range == predicted.selection) {
-                if vague || composing {
-                    return Err(Miss::Unknowable);
-                }
-                mirror.on_confirm_composition_text(true);
-            } else {
-                mirror.health = Health::Exact;
-                mirror.on_set_editable_selection_range(range);
-            }
+            mirror.health = Health::Exact;
+            mirror.on_set_editable_selection_range(range);
             Ok(())
         });
     }
@@ -1071,8 +1049,6 @@ impl ExoMirror {
     }
 
     /// `ResetInternal` (STT 374-381).
-    /// Without the extension, Exo may compose existing text unseen at any
-    /// time, so the mirror never knows its state.
     fn reset_internal(&mut self, text: &str, selection: Span) {
         self.predicted = ExoState {
             text: text.to_owned(),
@@ -1080,9 +1056,6 @@ impl ExoMirror {
             composition: NO_COMPOSITION,
         };
         self.health = Health::Exact;
-        if self.ext_version.is_none() {
-            self.unknown();
-        }
         self.expected.clear();
         self.push();
     }
@@ -1139,7 +1112,7 @@ mod tests {
     /// A mirror at extension v11 whose prediction and only history state
     /// is `predicted`.
     fn at(predicted: ExoState) -> ExoMirror {
-        let mut mirror = ExoMirror::new(Some(11));
+        let mut mirror = ExoMirror::new();
         let print = Fingerprint::of(&predicted, false);
         mirror.predicted = predicted;
         mirror.expected = VecDeque::from([Entry::Known {
@@ -1204,14 +1177,12 @@ mod tests {
     /// (STT 114-116).
     #[test]
     fn a_new_mirror_holds_the_empty_text() {
-        let mirror = ExoMirror::new(Some(11));
+        let mirror = ExoMirror::new();
         let empty = state("", (0, 0), NO_COMPOSITION);
         assert_eq!(history(&mirror), std::slice::from_ref(&empty));
         assert_pushed(&mirror, &empty);
         assert_eq!(mirror.health(), Health::Exact);
         assert!(!mirror.dropped());
-        // Without the extension, Exo composes existing text unseen.
-        assert_eq!(ExoMirror::new(None).health(), Health::Unknown);
     }
 
     /// `Update` (STT 131-191), exact match: the first state from the
@@ -1687,41 +1658,27 @@ mod tests {
         assert!(!early.dropped());
     }
 
-    /// Below the extension's `confirm_preedit` (v11), a confirm is
-    /// `cursor_position(selection)` + `commit_string(composition)` (TI
-    /// 240-263); so is `SetEditableSelectionRange` (TI 386-403), which
-    /// keeps the composition. The pair is a confirm only below v11 and
-    /// with the predicted selection, where it could be either while
-    /// composing, which makes the mirror unknown.
+    /// `cursor_position(range)` + `commit_string(composition)` is
+    /// `SetEditableSelectionRange` (TI 386-403), which keeps the
+    /// composition, whatever the range: from v11, a confirm is
+    /// `confirm_preedit`.
     #[test]
-    fn a_cursor_position_pair_is_a_confirm_only_below_v11_with_the_predicted_selection() {
+    fn a_cursor_position_pair_sets_the_selection_and_keeps_the_composition() {
         let composing = state(GANADA, (6, 6), 3..6);
-        for (version, (index, anchor), expected) in [
-            (Some(10), (6, 6), None),
-            (Some(11), (6, 6), Some(composing.clone())),
-            (Some(10), (9, 0), Some(state(GANADA, (0, 9), 3..6))),
+        for ((index, anchor), expected) in [
+            ((6, 6), composing.clone()),
+            ((9, 0), state(GANADA, (0, 9), 3..6)),
         ] {
             let mut mirror = at(composing.clone());
-            mirror.ext_version = version;
             mirror.cursor_position(index, anchor);
             mirror.commit_string("나");
-            let Some(expected) = expected else {
-                assert_eq!(mirror.health(), Health::Unknown);
-                assert_eq!(mirror.expected().back(), Some(&Entry::Unknown));
-                assert!(!mirror.take_diverged());
-                continue;
-            };
             assert_pushed(&mirror, &expected);
             // The pair is spent: the next commit is an insert.
             mirror.commit_string("라");
             assert!(mirror.predicted().text.contains('라'));
         }
-        // With no composition, both pairs commit "", and agree.
+        // With no composition, the pair commits "".
         let mut mirror = at(state(GANADA, (3, 3), NO_COMPOSITION));
-        mirror.ext_version = Some(10);
-        mirror.cursor_position(3, 3);
-        mirror.commit_string("");
-        assert_pushed(&mirror, &state(GANADA, (3, 3), NO_COMPOSITION));
         mirror.cursor_position(6, 6);
         mirror.commit_string("");
         assert_pushed(&mirror, &state(GANADA, (6, 6), NO_COMPOSITION));
@@ -1863,8 +1820,7 @@ mod tests {
     /// Exo could match (an unknown one, or a vague one with the report's
     /// text) comes before, and none equals it. That needs no press. After
     /// a press's `reset` the history is empty, so any report before the
-    /// next event heals. Without the extension nothing does, as Exo
-    /// composes existing text unseen.
+    /// next event heals.
     #[test]
     fn a_definite_reset_heals_without_a_press() {
         let mut mirror = at(state(GANADA, (9, 9), NO_COMPOSITION));
@@ -1880,11 +1836,6 @@ mod tests {
         cancel(&mut mirror);
         report(&mut mirror, "라", 3, 3);
         assert_pushed(&mirror, &state("라", (3, 3), NO_COMPOSITION));
-
-        let mut mirror = ExoMirror::new(None);
-        cancel(&mut mirror);
-        report(&mut mirror, "라", 3, 3);
-        assert_eq!(mirror.health(), Health::Unknown);
     }
 
     /// A report whose outcome the mirror cannot tell, as an unknown state
@@ -2089,7 +2040,7 @@ mod tests {
     /// after it names the latest state.
     #[test]
     fn korean_typing_through_the_wire() {
-        let mut mirror = ExoMirror::new(Some(11));
+        let mut mirror = ExoMirror::new();
         for syllable in ["ㅎ", "하", "한"] {
             mirror.preedit_cursor(3);
             mirror.preedit_string(syllable, syllable);

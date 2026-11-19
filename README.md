@@ -290,6 +290,12 @@ release a draft until every upload has finished.
   falls back to its validated VirtWL shared-memory path. This is not
   end-to-end zero-copy.
 - A compatible guest kernel and host compositor are required.
+- The IME measures the host input method's deletes and preedit regions
+  only with the host's `zcr_extended_text_input_v1` at v11 or later
+  (ChromeOS M116 or so, August 2023 on). Below that, typing, preedits,
+  commits and confirmations work, but those deletes (an accepted
+  suggestion) and regions (a reconversion) are dropped, so their text can
+  show twice, as `word word~` or `한국韓國`.
 - This is an independent fork, not an officially supported Google product or
   ChromiumOS component.
 

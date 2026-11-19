@@ -115,16 +115,6 @@ fn glue_last_two(queue: &mut Vec<Outgoing>) {
     into_fds.extend(fds);
 }
 
-/// Whether the kill switch `SOMMELIER_IME_MIRROR=shadow` keeps every text
-/// input in Legacy mode, with the Exo mirror only logging
-/// ([`ime::ImeMode`]). Read once, so the IME core stays free of I/O.
-pub(crate) fn mirror_shadowed() -> bool {
-    static SHADOW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("SOMMELIER_IME_MIRROR").is_some_and(|value| value == "shadow")
-    });
-    *SHADOW
-}
-
 /// The keyboard concern forwarded a key press or repeat to the guest on
 /// guest seat `seat`, which may edit its text where Exo does not see.
 pub(crate) fn guest_key(ctx: &mut Context, seat: u32) {
@@ -635,7 +625,7 @@ pub(super) mod tests {
     use crate::handler::callback::CallbackHandler;
     use crate::handler::ime_keys::backspace_repeat_active_for_keyboard;
     use crate::handler::keyboard::KeyboardHandler;
-    use crate::ime::{delete_lengths, map_v3_content_type, LinkState};
+    use crate::ime::{map_v3_content_type, LinkState};
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
@@ -696,10 +686,6 @@ pub(super) mod tests {
         /// and takes the proxy's `ack_key`, and sends the keyboard the
         /// default keymap, whose keys repeat.
         keyboard_extension_with_keymap: bool,
-        /// Whether the proxy runs under the kill switch
-        /// `SOMMELIER_IME_MIRROR=shadow`, which keeps its text inputs in
-        /// Legacy mode ([`ime::ImeMode`]).
-        shadow: bool,
     }
 
     /// A guest text input and the host objects behind it, which a
@@ -728,7 +714,6 @@ pub(super) mod tests {
             Self::offered(Host {
                 text_input_extension: extension,
                 keyboard_extension_with_keymap: false,
-                shadow: false,
             })
             .await
         }
@@ -794,10 +779,6 @@ pub(super) mod tests {
                 assert_eq!((sender, keyboard), (extension, f.keyboard.host));
                 f.extended_keyboard = id;
             }
-            if host.shadow {
-                // The kill switch, which only the proxy's environment sets.
-                f.s.ctx().ime = ime::ImeCore::new(true);
-            }
             let ti = f.s.new_id();
             f.create_text_input(ti).await;
             // The offset still keeps every guest ID above every host ID.
@@ -822,24 +803,9 @@ pub(super) mod tests {
             Self::new(EXTENSION).await
         }
 
-        /// [`Self::disabled`] in Legacy mode, as under the kill switch.
-        async fn legacy() -> Self {
-            Self::offered(Host {
-                text_input_extension: EXTENSION,
-                keyboard_extension_with_keymap: false,
-                shadow: true,
-            })
-            .await
-        }
-
         /// A text input the guest enabled, which the host activated.
         async fn enabled() -> Self {
             Self::enable(Self::disabled().await).await
-        }
-
-        /// [`Self::enabled`] in Legacy mode.
-        async fn legacy_enabled() -> Self {
-            Self::enable(Self::legacy().await).await
         }
 
         /// `f` once the guest enabled it and the host activated it.
@@ -855,11 +821,6 @@ pub(super) mod tests {
         /// `done` is numbered 2.
         async fn with_surrounding_text(text: &str, cursor: i32, anchor: i32) -> Self {
             Self::report(Self::enabled().await, text, cursor, anchor).await
-        }
-
-        /// [`Self::with_surrounding_text`] in Legacy mode.
-        async fn legacy_with_surrounding_text(text: &str, cursor: i32, anchor: i32) -> Self {
-            Self::report(Self::legacy_enabled().await, text, cursor, anchor).await
         }
 
         /// `f`, enabled, once its guest committed the surrounding text
@@ -886,7 +847,6 @@ pub(super) mod tests {
             let mut f = Self::offered(Host {
                 text_input_extension: EXTENSION,
                 keyboard_extension_with_keymap: true,
-                shadow: false,
             })
             .await;
             f.start_typing().await;
@@ -2854,17 +2814,25 @@ pub(super) mod tests {
 
     /// A delete Exo sent before it handled the press's `reset` was made
     /// against the composition the press committed: the guest never gets
-    /// it, even one counted from the cursor, which the proxy would
-    /// otherwise forward at once.
+    /// it. Once the fence is done and the guest has reported what the press
+    /// did, Exo's deletes reach it again.
     #[tokio::test]
     async fn a_delete_in_flight_at_a_press_is_dropped() {
         let mut f = Field::with_surrounding_text("나", 3, 3).await;
         let (_, fence) = press_after_na_ga(&mut f).await;
-        f.s.host([f.delete_range(-3, 3)]).await;
+        f.s.host([f.delete_range(0, 3)]).await;
         assert_eq!(f.s.guest_received(), []);
         f.drain(fence).await;
-        f.s.host([f.delete_range(-3, 3)]).await;
-        let expected = [delete(3, 0), V3::Done { serial: 2 }];
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "나가", 6, 6).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let expected = [f.surrounding_text("나가", 6, 6), f.commit_state(3)];
+        assert_eq!(f.host_received().await, expected);
+        f.answered(3);
+        f.s.host([f.delete_range(3, 3)]).await;
+        let expected = [delete(3, 0), V3::Done { serial: 3 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
@@ -3228,11 +3196,11 @@ pub(super) mod tests {
     /// second; the `done` that answers that report lets it report the text
     /// after the second at once, rather than at the input method's next
     /// event, so the next delete is measured against the text the guest
-    /// shows. A delete ends a preedit, and the `done` of the next commit
-    /// repeats none.
+    /// shows. The `done` of the next commit repeats no preedit once its
+    /// clear reached the guest.
     #[tokio::test]
     async fn a_client_that_waits_for_done_reports_the_text_an_edit_leaves() {
-        let mut f = Field::legacy().await;
+        let mut f = Field::disabled().await;
         let mut client = DoneCountingClient::new();
         f.s.guest([
             v3::enable(f.ti),
@@ -3286,11 +3254,11 @@ pub(super) mod tests {
         assert_eq!(events, f.events([preedit("x"), done(4)]));
         client.receive(events);
 
-        // The input method takes the suggestion back, which is measured
-        // against the text reported last.
-        f.s.host([f.delete_range(8, 8)]).await;
+        // The input method clears its composition and takes the suggestion
+        // back, which is measured in Exo's text.
+        f.s.host([f.preedit("", ""), f.delete_range(8, 8)]).await;
         let events = f.s.guest_received();
-        let expected = [no_preedit(), delete(8, 0), done(4)];
+        let expected = [no_preedit(), done(4), delete(8, 0), done(4)];
         assert_eq!(events, f.events(expected));
         client.receive(events);
         assert!(client.may_send());
@@ -3527,11 +3495,11 @@ pub(super) mod tests {
     /// Exo's `delete_surrounding_text(index, length)` deletes the bytes
     /// `index..index + length` of the surrounding text, counted from its
     /// start, and no `commit_string` closes it. The guest gets it at once,
-    /// in bytes before and after its cursor. A delete is dropped where v3
-    /// cannot carry it to every client (a range the cursor is not in, a
-    /// selection) and where the text Exo measured may not be the text the
-    /// guest committed (a range that text does not have, an edit of the
-    /// input method the guest has not reported since).
+    /// in bytes before and after its cursor, measured in Exo's text, edits
+    /// of the input method the guest has yet to report included. A delete
+    /// is dropped where v3 cannot carry it to every client (a range the
+    /// cursor is not in, a selection) and where Exo could not have sent it
+    /// (a range its text does not have, a negative index).
     #[tokio::test]
     async fn exo_deletes_become_v3_deletes_around_the_cursor() {
         type Events = fn(&Field) -> Vec<Outgoing>;
@@ -3607,39 +3575,12 @@ pub(super) mod tests {
                 vec![commit("x"), DONE],
             ),
             (
-                // Exo deletes only without a composition; were one shown,
-                // the delete would end it, as a commit does.
-                "a delete ends the preedit",
-                Some(("가", 3, 3)),
-                |f| vec![f.preedit("나", ""), f.delete_range(0, 3), f.confirm()],
-                vec![preedit("나"), DONE_2, no_preedit(), delete(3, 0), DONE_2],
-            ),
-            (
-                // The v1 XML's reading, relative to the cursor, which only
-                // a negative index can mean.
-                "a negative index counts from the cursor",
+                // Only the v1 XML's reading, relative to the cursor, could
+                // give one a meaning; Exo's index is absolute.
+                "a negative index is dropped",
                 Some(("abc", 3, 3)),
-                |f| vec![f.delete_range(-1, 1)],
-                vec![delete(1, 0), DONE_2],
-            ),
-            (
-                "a negative index with a length past the cursor",
-                Some(("abc", 1, 1)),
-                |f| vec![f.delete_range(-1, 3)],
-                vec![delete(1, 2), DONE_2],
-            ),
-            (
-                "a negative index whose range ends before the cursor is dropped",
-                Some(("abc", 3, 3)),
-                |f| vec![f.delete_range(-2, 1), f.commit("x")],
+                |f| vec![f.delete_range(-1, 1), f.commit("x")],
                 vec![commit("x"), DONE_2],
-            ),
-            (
-                // Its range is the guest's own, around its cursor.
-                "a negative index needs no report of the last edit",
-                Some(("abc", 3, 3)),
-                |f| vec![f.commit("X"), f.delete_range(-1, 1)],
-                vec![commit("X"), DONE_2, delete(1, 0), DONE_2],
             ),
             (
                 // Exo sends one when the input method deletes nothing.
@@ -3660,7 +3601,7 @@ pub(super) mod tests {
                 // preedit, so it has no edit to report.
                 "an empty commit over a preedit edits nothing",
                 Some(("abc", 3, 3)),
-                |f| vec![f.preedit("x", ""), f.commit(""), f.delete_range(2, 1)],
+                |f| vec![f.preedit("x", "x"), f.commit(""), f.delete_range(2, 1)],
                 vec![
                     preedit("x"),
                     DONE_2,
@@ -3672,12 +3613,13 @@ pub(super) mod tests {
             ),
             (
                 // It commits the preedit, an edit, as a confirmation does
-                // ([`an_empty_region_over_a_held_preedit_commits_it`]).
+                // ([`an_empty_region_over_a_held_preedit_commits_it`]), so
+                // "c" of Exo's "abcx|" is apart from the cursor.
                 "an empty preedit region over a preedit commits it",
                 Some(("abc", 3, 3)),
                 |f| {
                     vec![
-                        f.preedit("x", ""),
+                        f.preedit("x", "x"),
                         ext::set_preedit_region(f.host_ext, 0, 0),
                         f.delete_range(2, 1),
                     ]
@@ -3697,34 +3639,38 @@ pub(super) mod tests {
                 vec![DONE_2, delete(1, 0), DONE_2],
             ),
             (
-                // Exo deletes "cX" of its "abcX|def"; in the guest's
-                // "abc|def", the same bytes are "c" and "d".
-                "a delete after a commit the guest has not reported is dropped",
+                // Exo deletes "cX" of its "abcX|def", which the guest has.
+                "a delete after a commit the guest has not reported",
                 Some(("abcdef", 3, 3)),
                 |f| vec![f.commit("X"), f.delete_range(2, 2)],
-                vec![commit("X"), DONE_2],
+                vec![commit("X"), DONE_2, delete(2, 0), DONE_2],
             ),
             (
-                // Exo deletes "bd" of its "ab|def"; in "abc|def", the same
-                // bytes are "ab".
-                "a delete after a delete the guest has not reported is dropped",
+                // Exo deletes "bd" of its "ab|def".
+                "a delete after a delete the guest has not reported",
                 Some(("abcdef", 3, 3)),
                 |f| vec![f.delete_range(2, 1), f.delete_range(1, 2)],
-                vec![delete(1, 0), DONE_2],
+                vec![delete(1, 0), DONE_2, delete(1, 1), DONE_2],
             ),
             (
-                // Exo deletes "b" of its "ab|cd"; in "a|cd", the same byte
-                // is "c".
-                "a delete after a confirmation the guest has not reported is dropped",
+                // Exo deletes "b" of its "ab|cd".
+                "a delete after a confirmation the guest has not reported",
                 Some(("acd", 1, 1)),
-                |f| vec![f.preedit("b", ""), f.confirm(), f.delete_range(1, 1)],
-                vec![preedit("b"), DONE_2, no_preedit(), commit("b"), DONE_2],
+                |f| vec![f.preedit("b", "b"), f.confirm(), f.delete_range(1, 1)],
+                vec![
+                    preedit("b"),
+                    DONE_2,
+                    no_preedit(),
+                    commit("b"),
+                    DONE_2,
+                    delete(1, 0),
+                    DONE_2,
+                ],
             ),
             (
                 // The region "나" becomes a preedit and is cleared, so Exo
-                // deletes "다" of its "가|다"; in "가나다|", the same bytes
-                // are "나".
-                "a delete after a preedit region the guest has not reported is dropped",
+                // deletes "다" of its "가|다".
+                "a delete after a preedit region the guest has not reported",
                 Some(("가나다", 6, 6)),
                 |f| {
                     vec![
@@ -3739,108 +3685,22 @@ pub(super) mod tests {
                     DONE_2,
                     no_preedit(),
                     DONE_2,
+                    delete(0, 3),
+                    DONE_2,
                 ],
             ),
         ];
         for (case, surrounding_text, events, expected) in cases {
             let mut f = match surrounding_text {
                 Some((text, cursor, anchor)) => {
-                    Field::legacy_with_surrounding_text(text, cursor, anchor).await
+                    Field::with_surrounding_text(text, cursor, anchor).await
                 }
-                None => Field::legacy_enabled().await,
+                None => Field::enabled().await,
             };
             let events = events(&f);
             f.s.host(events).await;
             assert_eq!(f.s.guest_received(), f.events(expected), "{case}");
         }
-    }
-
-    /// A v1 delete's index is Exo's, counted from the start of the text,
-    /// unless it is negative, which only the v1 XML's cursor-relative
-    /// reading can mean; either way the range must contain the cursor and
-    /// lie on character boundaries.
-    #[test]
-    fn delete_lengths_read_both_conventions() {
-        /// A delete's surrounding text, cursor, index and length.
-        type Delete = (&'static str, i32, i32, u32);
-        /// The lengths before and after the cursor, if any.
-        type Lengths = Option<(u32, u32)>;
-        let cases: [(&str, Delete, Lengths); 12] = [
-            (
-                "absolute, before the cursor",
-                ("abcdef", 3, 1, 2),
-                Some((2, 0)),
-            ),
-            (
-                "absolute, from the cursor",
-                ("abcdef", 3, 3, 2),
-                Some((0, 2)),
-            ),
-            (
-                "absolute, around the cursor",
-                ("abcdef", 3, 1, 4),
-                Some((2, 2)),
-            ),
-            ("absolute, apart from the cursor", ("abcdef", 3, 0, 2), None),
-            ("absolute, past the text", ("abc", 3, 1, 3), None),
-            ("absolute, inside a character", ("가나", 6, 1, 5), None),
-            (
-                "relative, before the cursor",
-                ("abc", 3, -1, 1),
-                Some((1, 0)),
-            ),
-            (
-                "relative, ending before the cursor",
-                ("abc", 3, -2, 1),
-                None,
-            ),
-            ("relative, before the text", ("abc", 1, -2, 2), None),
-            ("empty, at the cursor", ("abc", 3, 3, 0), Some((0, 0))),
-            (
-                "overflowing a relative index",
-                ("abc", 3, i32::MIN, u32::MAX),
-                None,
-            ),
-            (
-                "overflowing a length",
-                ("abc", i32::MAX, i32::MAX, u32::MAX),
-                None,
-            ),
-        ];
-        for (case, (text, cursor, index, length), expected) in cases {
-            assert_eq!(
-                delete_lengths(text, cursor, index, length),
-                expected,
-                "{case}"
-            );
-        }
-    }
-
-    /// A delete whose range is not around the cursor is lost, which only
-    /// the log shows, so the first per text input is a warning; one that
-    /// waits for the guest's report is expected, and is not.
-    #[tokio::test]
-    async fn an_unconvertible_delete_is_warned_of_once() {
-        let mut f = Field::legacy_with_surrounding_text("abc", 3, 3).await;
-        // Only the log shows the warning, so read the flag that makes it
-        // once.
-        let warned = |f: &mut Field| f.state().warned_for_test().1;
-        f.s.host([f.commit("X"), f.delete_range(2, 2)]).await;
-        let done = |serial| V3::Done { serial };
-        assert_eq!(f.s.guest_received(), f.events([commit("X"), done(2)]));
-        assert!(!warned(&mut f));
-
-        f.s.guest([
-            v3::set_surrounding_text(f.ti, "abcX", 4, 4).unwrap(),
-            v3::commit(f.ti),
-        ])
-        .await;
-        let expected = [f.surrounding_text("abcX", 4, 4), f.commit_state(3)];
-        assert_eq!(f.host_received().await, expected);
-        f.answered(3);
-        f.s.host([f.delete_range(0, 1)]).await;
-        assert_eq!(f.s.guest_received(), []);
-        assert!(warned(&mut f));
     }
 
     /// Each surrounding text reaches the host with a `wl_display.sync`
@@ -3932,14 +3792,13 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), []);
     }
 
-    /// #85 in Mirror mode: a region over the shown region deletes while
-    /// the guest shows a preedit, which Chromium drops (C3), so the guest
-    /// is out of step with Exo; the next, growing region falls back to
-    /// Legacy mode, which measures it from the bytes the regions took,
-    /// rather than drop it, which would leave the input method's next
-    /// commit to double the text.
+    /// #85: a region over the shown region deletes while the guest shows a
+    /// preedit, which Chromium drops (C3), so the guest is out of step with
+    /// Exo; the next, growing region is dropped, and the input method's
+    /// next commit doubles the text until the guest's report puts it in
+    /// step again (design single-exo-model 3.4).
     #[tokio::test]
-    async fn a_region_over_a_region_falls_back_in_mirror_mode() {
+    async fn a_region_over_a_region_drops() {
         let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
         let done = || V3::Done { serial: 2 };
         let region = |f: &Field, index, length| ext::set_preedit_region(f.host_ext, index, length);
@@ -3950,8 +3809,7 @@ pub(super) mod tests {
         let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([region(&f, -3, 3)]).await;
-        let expected = [no_preedit(), delete(1, 0), preedit_at("bcd", 3, 3), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
+        assert_eq!(f.s.guest_received(), []);
     }
 
     /// Mirror mode measures a region over a host preedit with Exo's cursor
@@ -3976,11 +3834,11 @@ pub(super) mod tests {
     }
 
     /// At v11 Exo confirms before each press its input method does not
-    /// handle, so a field that never reports, or a held key, makes the
-    /// mirror evict a history state Exo may still have: it is unsure, and
-    /// Mirror mode falls back to Legacy mode rather than drop Exo's delete.
+    /// handle, so a field that never reports, or a held key, makes many
+    /// history states, which the mirror keeps as fingerprints: it stays
+    /// exact, and measures Exo's delete.
     #[tokio::test]
-    async fn an_unsure_mirror_falls_back_to_legacy_mode() {
+    async fn many_empty_confirmations_keep_the_mirror_exact() {
         let mut f = Field::with_surrounding_text("abc", 3, 3).await;
         for _ in 0..65 {
             f.s.host([f.confirm()]).await;
@@ -3994,8 +3852,7 @@ pub(super) mod tests {
 
     /// A modifier the guest gets edits no text, so it does not hold back
     /// Exo's next delete: one after a commit the guest has yet to report,
-    /// which only the mirror measures, as Legacy mode waits for the
-    /// report.
+    /// which the mirror measures in Exo's text.
     #[tokio::test]
     async fn a_modifier_key_does_not_hold_back_exos_delete() {
         let mut f = Field::typing().await;
@@ -4017,45 +3874,9 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
-    /// After an edit of the input method, Exo measures deletes against
-    /// text the guest has not committed yet; a guest commit that states its
-    /// surrounding text, and only such a commit, catches the proxy up.
-    #[tokio::test]
-    async fn a_delete_waits_for_the_guest_to_report_the_input_methods_edits() {
-        let mut f = Field::legacy_with_surrounding_text("abcdef", 3, 3).await;
-        f.s.host([f.commit("X"), f.delete_range(2, 2)]).await;
-        let done = |serial| V3::Done { serial };
-        assert_eq!(f.s.guest_received(), f.events([commit("X"), done(2)]));
-
-        // A commit without surrounding text reports nothing.
-        f.s.guest([v3::set_cursor_rectangle(f.ti, 1, 2, 3, 4), v3::commit(f.ti)])
-            .await;
-        let rectangle = f.v1(V1::SetCursorRectangle {
-            x: 1,
-            y: 2,
-            width: 3,
-            height: 4,
-        });
-        assert_eq!(f.host_received().await, [rectangle, f.commit_state(3)]);
-        f.answered(3);
-        f.s.host([f.delete_range(2, 2)]).await;
-        assert_eq!(f.s.guest_received(), []);
-
-        f.s.guest([
-            v3::set_surrounding_text(f.ti, "abcXdef", 4, 4).unwrap(),
-            v3::commit(f.ti),
-        ])
-        .await;
-        let expected = [f.surrounding_text("abcXdef", 4, 4), f.commit_state(4)];
-        assert_eq!(f.host_received().await, expected);
-        f.answered(4);
-        f.s.host([f.delete_range(2, 2)]).await;
-        assert_eq!(f.s.guest_received(), f.events([delete(2, 0), done(4)]));
-    }
-
     /// A preedit the host clears with a reset commit reaches the guest as
-    /// that commit, an edit like any other: deletes wait until the guest
-    /// reports it.
+    /// that commit. Exo never sends one, as its commit text is always the
+    /// preedit's, so the mirror cannot follow it, and drops Exo's deletes.
     #[tokio::test]
     async fn a_reset_commit_waits_for_the_guest_to_report_it() {
         let mut f = Field::with_surrounding_text("abc", 3, 3).await;
@@ -4114,45 +3935,21 @@ pub(super) mod tests {
     /// `ui/base/ime/linux/input_method_auralinux.cc` 325-328).
     #[tokio::test]
     async fn an_empty_preedit_has_no_hidden_cursor() {
-        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 2).await;
+        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
         let done = || V3::Done { serial: 2 };
         let expected = f.events([preedit("가"), done(), no_preedit(), done()]);
         f.s.host([
-            f.preedit("가", ""),
+            f.preedit("가", "가"),
             v1::preedit_cursor(f.host, -1),
             f.preedit("", ""),
         ])
         .await;
         assert_eq!(f.s.guest_received(), expected);
-
-        // An empty region clears a preedit Exo no longer holds the same
-        // way: a region's, with its cursor hidden, whose bytes the guest
-        // has reported without.
-        f.s.host([
-            v1::preedit_cursor(f.host, -1),
-            ext::set_preedit_region(f.host_ext, -1, 1),
-        ])
-        .await;
-        let expected = [delete(1, 0), preedit_at("d", -1, -1), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-        f.s.guest([
-            v3::set_surrounding_text(f.ti, "abcef", 3, 3).unwrap(),
-            v3::commit(f.ti),
-        ])
-        .await;
-        let expected = [f.surrounding_text("abcef", 3, 3), f.commit_state(3)];
-        assert_eq!(f.host_received().await, expected);
-        let done = || V3::Done { serial: 3 };
-        let expected = [preedit_at("d", -1, -1), done()];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-        f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
-        assert_eq!(f.s.guest_received(), f.events([no_preedit(), done()]));
     }
 
     /// An empty preedit region deletes nothing, so it sends no
     /// `delete_surrounding_text`, only the empty preedit that clears a
-    /// shown one Exo no longer holds
-    /// ([`an_empty_preedit_reaches_only_a_guest_that_shows_one`],
+    /// shown one ([`an_empty_preedit_reaches_only_a_guest_that_shows_one`],
     /// [`an_empty_preedit_has_no_hidden_cursor`]); one over a preedit Exo
     /// holds commits it
     /// ([`an_empty_region_over_a_held_preedit_commits_it`]). Chromium
@@ -4161,94 +3958,37 @@ pub(super) mod tests {
     /// ffb4f13519), and while nothing is composed it deletes the selection
     /// (`InputMethodAuraLinux::OnDeleteSurroundingText`,
     /// `ui/base/ime/linux/input_method_auralinux.cc` 518): the user's
-    /// selected text would go.
+    /// selected text would go. With a selection, which no guest in step
+    /// with Exo has, the region is dropped altogether.
     #[tokio::test]
     async fn an_empty_preedit_region_sends_no_delete() {
-        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 2).await;
-        let done = || V3::Done { serial: 2 };
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
         f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
+        let done = || V3::Done { serial: 2 };
         assert_eq!(f.s.guest_received(), f.events([done()]));
-    }
-
-    /// A region over the preedit an earlier region made deletes only the
-    /// text the guest still has. Until the guest reports its text, the
-    /// surrounding text it committed still holds the bytes the earlier
-    /// region took for the preedit, which the guest no longer has, so they
-    /// are not deleted again. A region that does not cover them is dropped.
-    /// Once the guest reports, its text is measured as it is.
-    #[tokio::test]
-    async fn a_region_over_a_region_deletes_only_what_the_guest_has() {
-        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 4).await;
-        let done = |serial| V3::Done { serial };
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
-        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        // The guest's text is "abc|ef": of "cd", only "c" is left.
-        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
-        let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        // "ef" does not cover the shown "cd".
-        f.s.host([ext::set_preedit_region(f.host_ext, 0, 2)]).await;
+        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
+        f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
         assert_eq!(f.s.guest_received(), []);
-
-        // The guest reports its text "ab|ef", which no longer holds "cd".
-        f.s.guest([
-            v3::set_surrounding_text(f.ti, "abef", 2, 2).unwrap(),
-            v3::commit(f.ti),
-        ])
-        .await;
-        let expected = [f.surrounding_text("abef", 2, 2), f.commit_state(3)];
-        assert_eq!(f.host_received().await, expected);
-        let expected = [preedit_at("cd", 2, 2), done(3)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
-        let expected = [no_preedit(), delete(1, 0), preedit_at("b", 1, 1), done(3)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
     }
-
     /// A host `preedit_string` after a region replaces the preedit but not
-    /// what the guest lost: the bytes the region took stay out of its text
-    /// until it reports, so a later region still deletes only the rest.
-    /// Exo holds the new preedit in place of those bytes, so the region
-    /// takes it.
+    /// what the guest lost: the bytes the region took stay out of its text,
+    /// so a later region deletes only the rest. Exo holds the new preedit
+    /// in place of those bytes, so the region takes it.
     #[tokio::test]
     async fn a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
-        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 4).await;
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
         let done = |serial| V3::Done { serial };
         f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
         let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
-        f.s.host([f.preedit("x", "")]).await;
+        f.s.host([f.preedit("x", "x")]).await;
         let _ = f.s.guest_received();
 
         // The guest's text is "abc|ef", and Exo's "abcx|ef": of "cx", only
         // "c" is in the guest's.
         f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
         let expected = [no_preedit(), delete(1, 0), preedit_at("cx", 2, 2), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-    }
-
-    /// A preedit cleared with a reset commit gives the guest the region's
-    /// bytes back as text, as a commit does, so a later region deletes
-    /// them again.
-    #[tokio::test]
-    async fn a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back() {
-        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 4).await;
-        let done = |serial| V3::Done { serial };
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
-        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        // The guest's text is "abcd|ef" again.
-        f.s.host([f.preedit("", "d")]).await;
-        let expected = [no_preedit(), commit("d"), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
-        let expected = [delete(2, 0), preedit_at("cd", 2, 2), done(2)];
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
@@ -4280,68 +4020,52 @@ pub(super) mod tests {
     /// each.
     #[tokio::test]
     async fn a_region_that_does_not_cover_a_host_preedit_is_dropped() {
-        let mut f = Field::legacy_with_surrounding_text("abc", 1, 1).await;
         let done = |serial| V3::Done { serial };
         // Exo holds "ax|bc".
-        f.s.host([v1::preedit_cursor(f.host, 1), f.preedit("x", "x")])
-            .await;
-        let expected = [preedit_at("x", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        for (index, length) in [(-2, 1), (0, 1)] {
+        for (index, length, covers) in [(-2, 1, false), (0, 1, false), (-2, 3, true)] {
+            let mut f = Field::with_surrounding_text("abc", 1, 1).await;
+            f.s.host([v1::preedit_cursor(f.host, 1), f.preedit("x", "x")])
+                .await;
+            let expected = [preedit_at("x", 1, 1), done(2)];
+            assert_eq!(f.s.guest_received(), f.events(expected));
             f.s.host([ext::set_preedit_region(f.host_ext, index, length)])
                 .await;
-            assert_eq!(f.s.guest_received(), [], "region {index}+{length}");
+            let expected = match covers {
+                true => f.events([no_preedit(), delete(1, 1), preedit_at("axb", 2, 2), done(2)]),
+                false => Vec::new(),
+            };
+            assert_eq!(f.s.guest_received(), expected, "region {index}+{length}");
         }
-        f.s.host([ext::set_preedit_region(f.host_ext, -2, 3)]).await;
-        let expected = [no_preedit(), delete(1, 1), preedit_at("axb", 2, 2), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
     }
-
     /// An empty region at Exo's cursor ends Exo's composition and leaves
     /// the preedit it held as text: Exo sends `set_preedit_region(0, 0)`
     /// for an empty range (`zwp_text_input_manager.cc`
     /// `SetCompositionFromExistingText`, which nothing before it filters),
     /// and its tracker keeps the text with an empty composition
     /// (`SurroundingTextTracker::OnSetCompositionFromExistingText`). So the
-    /// guest commits the preedit, a host preedit or a region's, which gives
-    /// the region's bytes back. With Exo's cursor inside the preedit, where
-    /// no commit leaves the guest's, the region is dropped.
+    /// guest commits the preedit, a host preedit or a region's.
     #[tokio::test]
     async fn an_empty_region_over_a_held_preedit_commits_it() {
-        let mut f = Field::legacy_with_surrounding_text("abcdef", 4, 4).await;
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
         let done = |serial| V3::Done { serial };
         let empty = || ext::set_preedit_region(f.host_ext, 0, 0);
         f.s.host([f.preedit("x", "x"), empty()]).await;
         let expected = [preedit("x"), done(2), no_preedit(), commit("x"), done(2)];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
-        // A region's preedit, "d" of "abcd|ef".
+        // A region's preedit, "x" of Exo's "abcdx|ef".
         f.s.host([ext::set_preedit_region(f.host_ext, -1, 1), empty()])
             .await;
         let expected = [
             delete(1, 0),
-            preedit_at("d", 1, 1),
+            preedit_at("x", 1, 1),
             done(2),
             no_preedit(),
-            commit("d"),
+            commit("x"),
             done(2),
         ];
         assert_eq!(f.s.guest_received(), f.events(expected));
-        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
-        let expected = [delete(2, 0), preedit_at("cd", 2, 2), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        f.s.host([
-            v1::preedit_cursor(f.host, 1),
-            f.preedit("xy", "xy"),
-            empty(),
-        ])
-        .await;
-        let expected = [preedit_at("xy", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
     }
-
     /// A region equal to the shown one deletes nothing more: only the
     /// preedit is sent again.
     #[tokio::test]
@@ -4357,25 +4081,22 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
-    /// While the guest shows the preedit a region made and has not
-    /// reported, an empty region and a region that does not cover the shown
-    /// one on both sides are dropped.
+    /// While the guest shows the preedit a region made, a region that does
+    /// not cover the shown one on both sides is dropped.
     #[tokio::test]
     async fn a_region_that_does_not_cover_the_shown_one_is_dropped() {
-        let mut f = Field::legacy_with_surrounding_text("abcdef", 3, 3).await;
         let done = |serial| V3::Done { serial };
-        // "c" before the cursor and "d" after it.
-        f.s.host([ext::set_preedit_region(f.host_ext, -1, 2)]).await;
-        let expected = [delete(1, 1), preedit_at("cd", 1, 1), done(2)];
-        assert_eq!(f.s.guest_received(), f.events(expected));
-
-        for (index, length) in [(0, 0), (-2, 2), (0, 2), (-1, 1)] {
+        for (index, length) in [(-2, 2), (0, 2), (-1, 1)] {
+            let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
+            // "c" before the cursor and "d" after it.
+            f.s.host([ext::set_preedit_region(f.host_ext, -1, 2)]).await;
+            let expected = [delete(1, 1), preedit_at("cd", 1, 1), done(2)];
+            assert_eq!(f.s.guest_received(), f.events(expected));
             f.s.host([ext::set_preedit_region(f.host_ext, index, length)])
                 .await;
             assert_eq!(f.s.guest_received(), [], "region {index}+{length}");
         }
     }
-
     /// A region over a region whose bytes lie on both sides of the cursor
     /// deletes the bytes beyond the shown ones on both sides.
     #[tokio::test]
@@ -4396,24 +4117,12 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
-    /// A preedit region makes committed surrounding text around the cursor
-    /// the preedit; text the guest has not committed, or a region apart
-    /// from the cursor, cannot be.
+    /// A preedit region makes text around the cursor the preedit; a region
+    /// apart from the cursor cannot be.
     #[tokio::test]
     async fn on_set_preedit_region_translates_correctly() {
-        let mut f = Field::legacy_enabled().await;
-        f.s.guest([v3::set_surrounding_text(f.ti, "가나다", 6, 6).unwrap()])
-            .await;
-        f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
-        assert_eq!(f.s.guest_received(), []);
-
-        f.s.guest([v3::commit(f.ti)]).await;
-        let mut expected = vec![f.surrounding_text("가나다", 6, 6)];
-        expected.extend(f.content_type((0, 0), true));
-        expected.push(f.commit_state(2));
-        assert_eq!(f.host_received().await, expected);
-        f.answered(2);
         // A region apart from the cursor takes the pending cursor with it.
+        let mut f = Field::with_surrounding_text("가나다", 6, 6).await;
         f.s.host([
             v1::preedit_cursor(f.host, 0),
             ext::set_preedit_region(f.host_ext, -6, 3),
@@ -4421,6 +4130,7 @@ pub(super) mod tests {
         .await;
         assert_eq!(f.s.guest_received(), []);
 
+        let mut f = Field::with_surrounding_text("가나다", 6, 6).await;
         f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
         let done = || V3::Done { serial: 2 };
         let expected = [delete(3, 0), preedit_at("나", 3, 3), done()];
@@ -4444,8 +4154,7 @@ pub(super) mod tests {
         // `src/video/wayland/SDL_waylandevents.c` 2683-2710, main
         // 1fc62260fc81), which its `testime` ignores while a preedit shows
         // (`test/testime.c` 1084-1086). The guest's text is "가|다" now,
-        // so of the region "가나" it deletes only "가"
-        // ([`a_region_over_a_region_deletes_only_what_the_guest_has`]).
+        // so of the region "가나" it deletes only "가".
         f.s.host([
             v1::preedit_styling(f.host, 0, 3, 6),
             ext::set_preedit_region(f.host_ext, -6, 6),
@@ -5025,7 +4734,6 @@ pub(super) mod tests {
         let mut f = Field::offered(Host {
             text_input_extension: EXTENSION,
             keyboard_extension_with_keymap: true,
-            shadow: false,
         })
         .await;
         f.keyboard_leave().await;

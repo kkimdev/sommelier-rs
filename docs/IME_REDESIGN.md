@@ -229,9 +229,8 @@ The DST should find or measure these automatically.
   - Cases checked against user intent never click inside the window.
 - **P4. A Chromium report crossing an edit in flight** (HANDOVER,
   deletes). It needs the engine's deletes, which D6 adds. The DST
-  counts the reports that cross an edit and the absolute deletes the
-  proxy drops while the guest's text is ahead (H9); a region is measured
-  in Exo's text, with the preedit Exo holds (X1).
+  counts the reports that cross an edit; a delete (H9) and a region (X1)
+  are measured in Exo's text, which holds the edit, or dropped.
 
 ---
 
@@ -349,7 +348,7 @@ This is the contract.
 
 | ID | Request | Precondition | Host requests | Guest events | Next state / notes | On encode failure | Sources |
 |---|---|---|---|---|---|---|---|
-| G1 | `zwp_text_input_manager_v3.get_text_input(id, seat)` | A host v1 manager exists (otherwise the request is dropped, with an error log, in the adapter) | `create_text_input`; `get_extended_text_input` if the extension is bound | `enter(surface)` if the seat's keyboard focuses a surface | `Focused` (not enabled), or `Unfocused`; link `Detached`; count 0 | n/a (no strings) | `TextInputManagerV3Handler::on_get_text_input`; INVARIANTS Object lifetimes "Synthetic objects complete their own lifecycle" |
+| G1 | `zwp_text_input_manager_v3.get_text_input(id, seat)` | A host v1 manager exists (otherwise the request is dropped, with an error log, in the adapter) | `create_text_input`; `get_extended_text_input` if the extension is bound | `enter(surface)` if the seat's keyboard focuses a surface | `Focused` (not enabled), or `Unfocused`; link `Detached`; count 0. An Exo mirror (`ExoView`) only from v11 of the extension (row test `row_G1_a_text_input_has_a_mirror_from_v11`). | n/a (no strings) | `TextInputManagerV3Handler::on_get_text_input`; INVARIANTS Object lifetimes "Synthetic objects complete their own lifecycle" |
 | G2 | `zwp_text_input_manager_v3.destroy` | none | none | `delete_id`, sent by the generated local destructor path, not by the core | none | n/a | same |
 | G3 | `enable` | `Focused` | none | none | `pending = V3Pending::reset(true)`. Ignored while `Unfocused`. | n/a | `TextInputV3Handler::on_enable`; `V3Pending::reset` |
 | G4 | `disable` | `Focused` | none | none | `pending = V3Pending::reset(false)`. Ignored while `Unfocused`. | n/a | `on_disable` |
@@ -381,10 +380,13 @@ This is the contract.
    (I1a), so there is no composition and no content type to unset.
    Revision 2 cleared these here explicitly; #82 gets the same result
    from the reconcile (3.1).
-4. **A stated surrounding text** sets the text to `Synced`. Then the
-   content type is applied.
+4. **A stated surrounding text** becomes the committed one, which the
+   reconcile forwards to Exo, glued to a barrier at whose `done` the
+   Exo mirror applies it (or withholds it, below). Then the content type
+   is applied.
 
-**Report suppression** (Mirror mode; design exo-mirror 5). The reconcile
+**Report suppression** (with the Exo mirror, from v11; design
+exo-mirror 5). The reconcile
 withholds the commit's `set_surrounding_text`, and its barrier, when the
 guest stated it (not the empty stand-in), the mirror is `Exact`, the
 report names no state of the history Exo will hold once it has processed
@@ -395,17 +397,16 @@ A report Exo matches changes nothing but its history, so withholding
 one that matches only with the preedit leaves Exo where it would be had
 the guest reported the preedit. The content type, the cursor rectangle
 and `commit_state` still go out, and the guest is in step as after a
-matched report, at that state; Legacy mode, which measures wherever
-Mirror mode cannot, holds the shown preedit again (`held`, Exo's cursor
-in it), and an older report still in flight can take the guest out of
-step only by resetting Exo. Any other report goes out unchanged: one
+matched report, at that state; withholding changes nothing but the
+core's view of the guest (`ExoView`), and an older report still in
+flight can take the guest out of step only by resetting Exo. Below v11
+every report goes out. Any other report goes out unchanged: one
 that names a state is a no-op, and one that names none resets Exo to the
 guest's text. A wrong mirror can only leave Exo stale, never inject
 text, until the composition ends and the next report goes out. Row tests
 `row_G9c_a_report_without_the_shown_preedit_is_withheld`,
 `row_G9c_an_exact_report_goes_out_unchanged`,
 `row_G9c_an_unmatched_report_goes_out_unchanged`,
-`row_G9c_after_a_withheld_report_legacy_mode_holds_the_composition`,
 `row_G9c_an_older_report_matched_after_a_withheld_one_keeps_it_in_step`.
 
 If the field's support for surrounding text flips, the content type is
@@ -421,20 +422,20 @@ reconcile that ends every step.
 | ID | Event | Precondition | Guest events | Next state / notes | On encode failure | Sources |
 |---|---|---|---|---|---|---|
 | H1 | v1 `enter(surface)` | any | none | No change. While attached, it answers the proxy's own `activate`. | n/a | INVARIANTS "The host gets each content type…"; `TextInputV1Handler::on_enter` |
-| H2 | v1 `leave` | `Attached` | If `shown = Some(p)`: `Txn{commit: p, preedit: none}` (**C5, done**; it was `Txn{preedit: none}`). Exo's detach confirms first (E6), which commits the shown preedit at v11 or later, and below v11 if Exo tracks the composition, so a preedit still shown is one Exo no longer tracked (E4): nothing confirmed it, and the guest commits it, so a restart of the input method keeps the user's text. Nothing is committed twice. | Link → `Detached` (Exo's own detach). The commit, as at X2, ends the lease and makes the text `Ahead`; the composition and the assembly are cleared. The fence stays. The reconcile then activates again if the field still wants input. | A commit that does not fit clears the preedit as before C5. | INVARIANTS same rule; Exo `TextInput::OnSurfaceFocused`, `OnSurfaceDestroying` and `OnInputMethodDestroyed` [F]; `host_leave`; tests `row_H2_an_exo_detach_commits_the_preedit_and_activates_again`, `row_H2_a_confirmed_composition_is_committed_once`, `an_exo_detach_commits_the_guest_preedit` |
+| H2 | v1 `leave` | `Attached` | If `shown = Some(p)`: `Txn{commit: p, preedit: none}` (**C5, done**; it was `Txn{preedit: none}`). Exo's detach confirms first (E6), which commits the shown preedit at v11 or later, and below v11 if Exo tracks the composition, so a preedit still shown is one Exo no longer tracked (E4): nothing confirmed it, and the guest commits it, so a restart of the input method keeps the user's text. Nothing is committed twice. | Link → `Detached` (Exo's own detach). The commit, as at X2, ends the lease; the composition and the assembly are cleared. The fence stays. The reconcile then activates again if the field still wants input. | A commit that does not fit clears the preedit as before C5. | INVARIANTS same rule; Exo `TextInput::OnSurfaceFocused`, `OnSurfaceDestroying` and `OnInputMethodDestroyed` [F]; `host_leave`; tests `row_H2_an_exo_detach_commits_the_preedit_and_activates_again`, `row_H2_a_confirmed_composition_is_committed_once`, `an_exo_detach_commits_the_guest_preedit` |
 | H2' | v1 `leave` | `Draining` or `Detached` | none | Ignored: it answers the proxy's own `deactivate`. | n/a | same |
 | H3 | `modifiers_map`, `input_panel_state`, `language`, `text_direction` | any | none | Ignored. | n/a | the handlers of the same names |
 | H4 | `preedit_styling(i, l, style)` | `Attached` (dropped otherwise, as today) | none | Recorded in the assembly when `style == SELECTION`. | n/a | `on_preedit_styling` (records only while `host_is_active`) |
 | H5 | `preedit_cursor(i)` | `Attached` | none | Recorded in the assembly. | n/a | `on_preedit_cursor` |
 | H6 | `cursor_position(i, a)` | `Attached` | none | Logged at debug as having no v3 equivalent, and not recorded (today it is recorded and only logged later). Exo sends it only before a `commit_string` [F]. | n/a | `on_cursor_position` |
-| H7 | `preedit_string(serial, t, commit)` | Gate; `t` is UTF-8 | If `t` is empty, `shown` was set and `commit` is non-empty: `Txn{commit, preedit: none}` (the reset commit; the text becomes `Ahead`). Otherwise: `Txn{preedit: t, with the cursor from the assembly}`. An empty `t` with nothing shown is a bare `done(count)`, whatever `commit` holds (#80). | `shown := t`, or none if `t` is empty. Exo holds `t` (`held`, X1), with its cursor where the assembly's cursor is if that is a character boundary of `t`, and at its end otherwise. The reset commit gives the bytes regions took back as text, so it clears `taken` (#97); any other `t` keeps it. The assembly is taken. **Lease:** `LeaseOutcome::ArmIfBackspaceHeld` if `t` is empty, `shown` was set and `commit` is empty; `End` otherwise. The host serial is only logged. | The event is dropped. The assembly is taken. Nothing else changes. | `on_preedit_string`; Exo sends the preedit text as its commit text [F]; tests `row_H7_a_reset_commit_gives_back_the_bytes_a_region_took`, `a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back` |
+| H7 | `preedit_string(serial, t, commit)` | Gate; `t` is UTF-8 | If `t` is empty, `shown` was set and `commit` is non-empty: `Txn{commit, preedit: none}` (the reset commit; Exo never sends one, as its commit text is always the preedit's, so the Exo mirror diverges at it). Otherwise: `Txn{preedit: t, with the cursor from the assembly}`. An empty `t` with nothing shown is a bare `done(count)`, whatever `commit` holds (#80). | `shown := t`, or none if `t` is empty. The assembly is taken. **Lease:** `LeaseOutcome::ArmIfBackspaceHeld` if `t` is empty, `shown` was set and `commit` is empty; `End` otherwise. The host serial is only logged. | The event is dropped. The assembly is taken. Nothing else changes. | `on_preedit_string`; Exo sends the preedit text as its commit text [F]; tests `row_H7_a_cleared_preedit_with_commit_text_commits_it`, `a_reset_commit_waits_for_the_guest_to_report_it` |
 | H7' | `preedit_string` | Gate fails, or `t` is not UTF-8 | none | Dropped. The assembly is taken. | n/a | INVARIANTS press rule (the fence); Wire messages (byte-indexed strings) |
-| H8 | `commit_string(serial, t)` | Gate | `Txn{commit: t, preedit: none}` | `shown := none`. The text becomes `Ahead` if `t` is non-empty; an empty commit is not sent, so the guest has no edit to report, shown preedit or not (#80; tests `row_H8_an_empty_commit_is_no_edit` and `row_H8_an_empty_commit_over_a_preedit_is_no_edit` in #82). The lease ends. The assembly is taken. | Dropped; the assembly stays (B3, below H9). | `on_commit_string` |
-| H9 | `delete_surrounding_text(index, length)` | Gate | `Txn{delete: (before, after), preedit: none}` | **Mirror mode** (from v11 of the extension, unless the kill switch): measured in the Exo mirror's state before the event while the guest is in step with it, the mirror is exact and no report on its way to Exo crosses it (INVARIANTS "From v11 of the extension, Exo's deletes and regions are measured in the Exo mirror"): a range around Exo's cursor, with no composition, becomes `(cursor − start, end − cursor)`; otherwise, and for a negative index, Legacy mode's measurement below, as a drop would let the input method's next commit double the text. Row tests `row_H9_a_delete_after_an_unreported_edit_lands_in_exos_text`, `row_H9_after_set_editable_selection_range_falls_back`, `row_H9_after_an_empty_region_with_exos_cursor_inside_falls_back`, `row_H9_after_a_dropped_region_falls_back`, `row_H9_after_a_delete_over_a_shown_preedit_falls_back`, `row_H9_a_field_that_states_no_text_falls_back`, `row_H9_after_a_forwarded_key_falls_back`, `row_H9_in_step_again_after_a_matched_report`. **Legacy mode** (`ime/legacy.rs`): `shown := none`; the text becomes `Ahead`; the lease ends. The assembly is taken. **Dropped without other change** when: there is no committed surrounding text; there is a selection; `index ≥ 0` while the text is `Ahead`; the range does not hold the cursor or does not lie on char boundaries (the first such drop warns, later ones log at debug); or the range is empty. A negative index counts from the cursor. *B3, as the old code does it: a preedit and a region (H7, X1) take the assembly first, whatever becomes of them; a commit and a delete (H8, H9) take it only once they reach the guest, so a stale or dropped one leaves it; a confirmation (X2) takes it once the gate admits it with a preedit shown, so a stale or empty one (X2') leaves it; a press (F4) takes it once its commit reaches the guest, so one whose commit does not fit leaves it. #82 took it at every terminal event and at every press; C3b and C3c made the core match the old code, which it was to replace without a wire change (row tests `row_H8_H9_X2_only_an_edit_that_reaches_the_guest_takes_the_assembly` and `row_F4_a_press_whose_commit_does_not_fit_keeps_the_assembly`). Exo sends styling and a cursor only right before their preedit [F], so no client sees the difference.* | Dropped; the assembly stays. | INVARIANTS "Exo's deletes are absolute and stand alone"; `on_delete_surrounding_text`. [F] Chromium drops a delete while a composition is shown (`InputMethodAuraLinux::OnDeleteSurroundingText`). |
+| H8 | `commit_string(serial, t)` | Gate | `Txn{commit: t, preedit: none}` | `shown := none`. An empty commit is not sent, so the guest has no edit to report, shown preedit or not (#80; tests `row_H8_an_empty_commit_is_no_edit` and `row_H8_an_empty_commit_over_a_preedit_is_no_edit` in #82). The lease ends. The assembly is taken. | Dropped; the assembly stays (B3, below H9). | `on_commit_string` |
+| H9 | `delete_surrounding_text(index, length)` | Gate | `Txn{delete: (before, after), preedit: none}` | Measured in the Exo mirror's state before the event (`exo_view::Frame`) while the text input has a mirror (from v11 of the extension), the mirror was exact before the event and is after it, the guest has stated every key and press, no report on its way to Exo crosses the event, and the guest is in step with Exo (INVARIANTS "Exo's deletes and regions are measured in the Exo mirror, or dropped"): a range around Exo's cursor, with no composition, becomes `(cursor − start, end − cursor)`; `shown := none`; the lease ends; the assembly is taken. An empty range sends nothing and keeps the guest in step. **Dropped without other change** otherwise, with a debug log that names why (`exo_view::Unmeasured`), and the guest is then out of step until its next report; below v11 the first drop warns. A negative index, a range not around Exo's cursor and one off its text's char boundaries are none Exo sends, so the mirror diverges at them. Row tests `row_H9_an_absolute_delete_becomes_lengths_around_the_cursor`, `row_H9_a_delete_after_an_unreported_edit_lands_in_exos_text`, `row_H9_after_set_editable_selection_range_drops`, `row_H9_after_an_empty_region_with_exos_cursor_inside_drops`, `row_H9_after_a_dropped_region_drops`, `row_H9_after_a_delete_over_a_shown_preedit_drops`, `row_H9_a_field_that_states_no_text_drops`, `row_H9_after_a_forwarded_key_drops`, `row_H9_in_step_again_after_a_matched_report`, `row_H9_X1_below_v11_deletes_and_regions_are_dropped`. *B3, as the old code does it: a preedit and a region (H7, X1) take the assembly first, whatever becomes of them; a commit and a delete (H8, H9) take it only once they reach the guest, so a stale or dropped one leaves it; a confirmation (X2) takes it once the gate admits it with a preedit shown, so a stale or empty one (X2') leaves it; a press (F4) takes it once its commit reaches the guest, so one whose commit does not fit leaves it. #82 took it at every terminal event and at every press; C3b and C3c made the core match the old code, which it was to replace without a wire change (row tests `row_H8_H9_X2_only_an_edit_that_reaches_the_guest_takes_the_assembly` and `row_F4_a_press_whose_commit_does_not_fit_keeps_the_assembly`). Exo sends styling and a cursor only right before their preedit [F], so no client sees the difference.* | Dropped; the assembly stays. | INVARIANTS "Exo's deletes are absolute and stand alone"; `on_delete_surrounding_text`. [F] Chromium drops a delete while a composition is shown (`InputMethodAuraLinux::OnDeleteSurroundingText`). |
 | H10 | `keysym(...)` | `Attached` (the fence is **not** checked) | `wl_keyboard.key`, through the keyboard concern | Not a core input. `ime_keys` asks `ImeCore::keysym_target(ti)`. Unchanged. Exo sends none today [F, U1]. | n/a | `on_keysym`; INVARIANTS "A key waits for at most one late release per channel" |
-| X1 | ext `set_preedit_region(index, length)` | Gate; a committed surrounding text; the range lies around Exo's cursor in Exo's text on char boundaries | `Txn{delete: (before, after), preedit: (region, cursor)}` | **Mirror mode**: measured in the mirror's state before the event, as H9: `G` = the region from Exo's selection end; an empty `G` commits the composition Exo holds (the guest shows it) or else edits nothing; a `G` that covers the composition, or Exo's cursor with none, gives `Txn{delete: (H.start − G.start, G.end − H.end), preedit: G}`, with the preedit cursor from the assembly or Exo's cursor; anything else is dropped; and out of step, Legacy mode's measurement below. Row tests `row_X1_a_region_after_an_unreported_commit_is_measured_in_exos_text`, `row_X1_a_region_after_an_e4_drop_holds_no_preedit`, `row_X1_a_region_made_before_a_report_is_measured_before_it`, `row_X1_a_region_crossing_a_guest_edit_falls_back`, `row_X1_a_mirror_that_is_not_exact_falls_back`, `row_X1_a_mirror_that_diverges_warns_once`, `row_X1_after_a_confirm_inside_the_composition_falls_back`. **Legacy mode** (`ime/legacy.rs`; the row tests named below run it): `shown := region`, which Exo holds with its cursor where it was (`held`); the text becomes `Ahead` only for a non-empty region (#80: an empty one deletes nothing and leaves no preedit); the lease ends. The assembly is taken. Not gated by `Ahead`, on purpose. **Exo's text** (#97): Exo measures a region from its own cursor, in the text it predicts, which holds its composition inline (E4). The core measures it in that text as far as it knows it (`Current::predicted`): the committed surrounding text without the bytes regions took since the guest last reported (`taken` of the composition; the old code's `unreported_taken`), which is the guest's text, with the preedit Exo holds at the guest's cursor and Exo's cursor in it (`held`; the old code's `ShownPreedit::host_cursor`). Exo holds every preedit the core shows but a region's whose bytes the guest has since reported without, which Exo cannot match, so it drops its composition (E4). **The region must cover the preedit Exo holds**: it deletes only the bytes beyond it on each side, which `taken` gains, and shows them with it. #85's region over a region is the case where the held preedit is the bytes taken. An empty region at Exo's cursor right after the held preedit ends Exo's composition and leaves that preedit as text, so the guest commits it as at X2 (`Txn{commit: p, preedit: none}`; `shown`, `taken` and `held` cleared; the text becomes `Ahead`). Any other region that does not cover it, an empty one with Exo's cursor inside the preedit and one short on either side included, is dropped with a debug log. A host `preedit_string` (H7) keeps `taken`; a report (G9c), every other edit (H8, H9, X2, F4), a reset commit included, a forgetting answer (G9c), and every end of the composition clear it. | Dropped; the assembly is taken. | `on_set_preedit_region`; Exo's region is cursor-relative [F]; `SurroundingTextTracker::OnSetCompositionFromExistingText` keeps an empty composition [F]; tests `on_set_preedit_region_translates_correctly`, `a_region_over_a_region_deletes_only_what_the_guest_has`, `row_X1_a_region_over_a_region_deletes_only_what_the_guest_has`, `row_X1_an_edit_that_ends_the_composition_gives_the_bytes_back`, `a_region_over_a_host_preedit_is_measured_from_exos_cursor`, `row_X1_a_region_over_a_host_preedit_is_measured_from_exos_cursor`, `row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped`, `row_X1_a_report_without_a_regions_bytes_ends_exos_composition`, `an_empty_region_over_a_held_preedit_commits_it`, `row_X1_an_empty_region_over_a_held_preedit_commits_it`, `row_F4_a_press_gives_back_the_bytes_a_region_took`, `row_G9c_an_answer_that_cannot_repeat_the_preedit_forgets_it` |
-| X1' | ext `set_preedit_region` | any other case | none | Dropped; the assembly is taken. A missing surrounding text warns. | n/a | same |
-| X2 | ext `confirm_preedit` | Gate; `shown = Some(p)` | `Txn{commit: p, preedit: none}` | `shown := none`; the text becomes `Ahead`; the lease ends; the assembly is taken. | Dropped; the assembly is taken. (`p` was encoded once, so this cannot happen in practice.) | `on_confirm_preedit`; Exo at v11 or later confirms instead of committing [F] |
+| X1 | ext `set_preedit_region(index, length)` | Gate; measured as H9 is | `Txn{delete: (before, after), preedit: (region, cursor)}` | Measured in the mirror's state before the event, under H9's conditions: `G` = the region from Exo's selection end, in Exo's text, which holds its composition inline (E4); an empty `G` commits the composition Exo holds, which the guest shows (`Txn{commit: p, preedit: none}`), or else edits nothing; a `G` that covers the composition, or Exo's cursor with none, gives `Txn{delete: (H.start − G.start, G.end − H.end), preedit: G}`, with the preedit cursor from the assembly or Exo's cursor: it deletes only the bytes beyond the composition on each side, which the guest has, and shows them with it (#85's region over a region is the case where the composition is the last region). `shown := G`, or none; the lease ends. The assembly is taken. A `G` that does not cover the composition, one short on either side included, is dropped with a debug log: Exo would leave the rest of the composition as text. Row tests `row_X1_a_preedit_region_turns_text_into_the_preedit`, `row_X1_a_region_after_an_unreported_commit_is_measured_in_exos_text`, `row_X1_a_region_after_an_e4_drop_holds_no_preedit`, `row_X1_a_region_made_before_a_report_is_measured_before_it`, `row_X1_a_region_crossing_a_guest_edit_drops`, `row_X1_a_mirror_that_is_not_exact_drops`, `row_X1_a_mirror_that_diverges_warns_once`, `row_X1_after_a_confirm_inside_the_composition_drops`. | Dropped; the assembly is taken. | `on_set_preedit_region`; Exo's region is cursor-relative [F]; `SurroundingTextTracker::OnSetCompositionFromExistingText` keeps an empty composition [F]; tests `on_set_preedit_region_translates_correctly`, `a_region_over_a_region_drops`, `a_region_over_a_host_preedit_is_measured_from_exos_cursor`, `row_X1_a_region_over_a_host_preedit_is_measured_from_exos_cursor`, `row_X1_a_region_after_a_host_preedit_deletes_only_what_the_guest_has`, `row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped`, `row_X1_a_region_that_does_not_cover_the_shown_one_is_dropped`, `an_empty_region_over_a_held_preedit_commits_it`, `row_X1_an_empty_region_over_a_held_preedit_commits_it`, `row_G9c_an_answer_that_cannot_repeat_the_preedit_forgets_it` |
+| X1' | ext `set_preedit_region` | any other case | none | Dropped, as H9 drops; the assembly is taken. | n/a | same |
+| X2 | ext `confirm_preedit` | Gate; `shown = Some(p)` | `Txn{commit: p, preedit: none}` | `shown := none`; the lease ends; the assembly is taken. | Dropped; the assembly is taken. (`p` was encoded once, so this cannot happen in practice.) | `on_confirm_preedit`; Exo at v11 or later confirms instead of committing [F] |
 | X2' | ext `confirm_preedit` | Gate; `shown = None` | Through the keyboard concern: if the seat has an eligible held key, the recovery waits for the host's next event, which decides whether the confirmation was the key's autorepeat or Exo's before a new press (E13, E8). An autorepeat's: the key's press and release unless another channel already delivered it, then the G9c answer under the serial of then (`ImeCore::recovery_done`), if the text input still passes the gate and the key is held; otherwise nothing. **The `done` goes whenever the key is recovered, even when its pair is skipped.** A new press's, or with no held key: nothing is sent. | `KeyEffect::RecoverHeldKey`. **Decision**, before the host's next event is handled: before any peek, `wl_keyboard.modifiers` and the `peek_key` press of a key not held, or held only across a detach (H2), from any keyboard of the connection, keep it waiting; that key's `wl_keyboard.key` press on that keyboard with the peek's serial makes it a new press's, and the text input's `leave` the detach's (E6); any other event, the `done` of the sync the proxy sends with it included, an autorepeat's (`ime_keys::PendingRecovery`; INVARIANTS "An empty confirmation recovers a held key only once the host shows it repeated"; row test `row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery`). Exo's own detach (H2) ends the recovery of every key the seat holds, whose releases may have died with the input method, until the key's next `peek_key` press; it ends nothing else, so the key's keysyms still reach the guest (test `a_key_held_across_a_detach_is_typed_and_recovered_again`). **Lease:** armed if a held Backspace's pair is sent; ended if a held Backspace's pair is skipped, if another held key's pair is sent, or if no key is held; left alone if another held key's pair is skipped (revision 3 corrects this from the old code). The eligible key is the held key with the highest sequence, if it is also the latest peek. A peek numbers its key when it arrives, a key held since `wl_keyboard.enter` included, which the enter had numbered in the order the host listed the keys (#75), so the order of the peeks decides (REVIEW2 "held-key peek sequence"; test `keys_held_since_enter_are_ordered_by_their_peeks`). | n/a | INVARIANTS "A recovered key carries the host's serial"; `on_confirm_preedit` with `held_repeat_key_for_seat` and `synthesize_ime_consumed_key_pair`. The old code recovered at once, so a key typed while Backspace or Space was held repeated the held key (`KnownIssue::RecoveryBeforeAPress`, retired). |
 | X3 | ext grammar, autocorrect and occluded-bounds events | any | none | Ignored. | n/a | the handlers of the same names |
 | W1 | `wl_callback.done` of a drain barrier | `Draining{b}` | none | Link → `Detached`. The final reconcile then activates if the field wants input. | n/a | `CallbackHandler::on_done`; `complete_host_activation_barrier` |
@@ -447,7 +448,7 @@ reconcile that ends every step.
 | F1 | Seat focus change: `wl_keyboard.enter` of another surface, `wl_keyboard.leave`, or a keyboard's end (`KeyboardFocusRegistry`, via `KeyboardHandler::on_enter`, `on_leave` and `forget_keyboard`) | Per text input on that seat, in `TiId` order | Through the reconcile: `deactivate` and a barrier, or `activate` | **C5, done:** first `Txn{commit: p, preedit: none}` if `shown = Some(p)` and the composition is current, then the keyboard events that moved the focus (`Input::FocusChanged::keyboard`: the guest's `wl_keyboard.leave`, or `enter` and its `modifiers`, which the keyboard handler hands the core rather than forwarding), then `leave(old)` and `enter(new)`, each if it changed. The commit goes before the keyboard events because both client models drop input-method events for a window that has lost the keyboard focus (C11, C12). | The field is reset: a new `FocusedField{surface, enabled: false, text: Synced}`, or `Unfocused`, with an empty pending state. The composition and the assembly are cleared. The keyboard ends the seat's leases and peek watermarks, as today. Exo's own confirmation of its detach comes after the keyboard's `leave` (E12), while the link drains, and is dropped. | INVARIANTS "Focus teardown sends `leave` itself", "A field the focus leaves commits its preedit first"; mutter and ibus commit a preedit at a focus-out; `apply_keyboard_focus_changes`; tests `row_F1_a_focus_change_commits_the_shown_preedit_before_leave`, `a_focus_loss_commits_the_shown_preedit_before_leave`; C5 fixes P1 |
 | F2 | Surface destroyed (`forget_surface` in `compositor.rs`) | A text input focused on that surface | as F1 | `leave(s)`, while `s` is still valid. **No commit** (C5): the guest destroyed the window the text would go into. | The focus is projected again from `Env::keyboard_focus`, which the destroy has already moved off `s`. Since C5, `compositor::forget_surface` sends F2 before the F1 of each seat whose keyboard focused `s`, so that F1, which would commit, finds the field reset; F2 always sends `leave`. Old INVARIANTS described a repair that stays on the same surface, which `forget_surface` cannot produce (REVIEW2). | INVARIANTS "Focus teardown…"; `repair_destroyed_surface_focus` until C3c; tests `row_F2_a_destroyed_surface_is_left_while_it_is_valid`, `wl_surface_destroy_repairs_only_text_inputs_on_the_stale_surface` |
 | F3 | `wl_seat` bound under a guest ID (`registry.rs`, `wl_seat` bind) | The text inputs of that seat | Through the reconcile: the deferred `activate`, with its content type | none | | INVARIANTS Object lifetimes "Releasing a parent does not end its children"; test `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type` |
-| F4 | Press: a `wl_pointer.button` press from a pointer whose `enter` named `s`, or a `wl_touch.down` on `s` (#72: `PointerHandler::on_button` and `TouchHandler::on_down`, both through `end_composition_on_press(ctx, surface, resend)`) | The enabled text input is focused on `s`; gate; `shown = Some(p)` | `zwp_text_input_v1.reset`, then a barrier (the fence) | `Txn{commit: p, preedit: none}`, then the press or down itself, re-sent by the core | `shown := none`; the assembly is taken; `fence := Some(f)`; the text becomes `Ahead`; the lease ends. A press whose commit does not fit changes nothing and is forwarded, and leaves the assembly (B3, below H9). A release, another surface (subsurfaces included), no composition, or an open fence changes nothing, and the press is forwarded. | INVARIANTS "A press ends the composition on its surface"; mutter (`meta_wayland_text_input_handle_event`), KWin (`InputMethodEventFilter::pointerButton` and `touchDown`, `InputMethod::commitPendingText`) [F]; Exo `TextInput::Reset` sends nothing back [F] |
+| F4 | Press: a `wl_pointer.button` press from a pointer whose `enter` named `s`, or a `wl_touch.down` on `s` (#72: `PointerHandler::on_button` and `TouchHandler::on_down`, both through `end_composition_on_press(ctx, surface, resend)`) | The enabled text input is focused on `s`; gate; `shown = Some(p)` | `zwp_text_input_v1.reset`, then a barrier (the fence) | `Txn{commit: p, preedit: none}`, then the press or down itself, re-sent by the core | `shown := none`; the assembly is taken; `fence := Some(f)`; the lease ends. A press whose commit does not fit changes nothing and is forwarded, and leaves the assembly (B3, below H9). A release, another surface (subsurfaces included), no composition, or an open fence changes nothing, and the press is forwarded. | INVARIANTS "A press ends the composition on its surface"; mutter (`meta_wayland_text_input_handle_event`), KWin (`InputMethodEventFilter::pointerButton` and `touchDown`, `InputMethod::commitPendingText`) [F]; Exo `TextInput::Reset` sends nothing back [F] |
 | F5 | Key activity (`wl_keyboard.key`, `peek_key`) | n/a | n/a | n/a | **Not a core input.** Leases are keyboard state (`KeyGenerationRegistry::ime_repeat_owner`). The keyboard ends them on a non-Backspace press and on a Backspace release, as today. The core only emits `KeyEffect`s. | INVARIANTS "IME state is scoped to its keyboard or seat" |
 | F6 | Host `delete_id` of the v1 object while the guest object is live (`forget_object`, with `host_deleted`) | any | Nothing to v1; the extension is destroyed | `delete_id`, as in G10 | Link → `Detached` with no requests. | test `a_host_destroyed_text_input_sends_nothing_to_its_host_object` |
 | R1 | **Abandon** (reconcile outcome): the target is inactive, the link is `Attached`, and `Env::host_seat` is `None` | none | none | none | Link → `Detached` locally; the composition is cleared; **the fence stays**. Exo keeps its input method attached until its own focus moves; HANDOVER covers the cost. | `ActivationStep::Abandon`; HANDOVER "A text input whose guest `wl_seat` goes away…" |
@@ -536,7 +537,7 @@ sommelier/src/ime/
               HostExt. Re-exports the helpers the old handlers share
               until the switch.                                  299 [~170]
   state.rs    TextInput, Field, FocusedField, LinkState, Composition,
-              Assembly, ExoText, Warned, Current<'_>, Planned<'_>.
+              Assembly, Warned, Current<'_>, Planned<'_>.
               The fields are private to this file, and transitions
               are named methods of TextInput.                    659 [~300]
   serial.rs   CommitCount and Serial: no public constructor, and one
@@ -550,16 +551,14 @@ sommelier/src/ime/
               handler/text_input.rs.                             278 [~320]
   guest.rs    Preedit, GuestTxn, encode(): the only builder of the v3
               preedit_string, delete_surrounding_text, commit_string
-              and done. Also the range helpers (lengths_around_cursor
-              and delete_lengths, moved; resolve_preedit_cursor,
-              copied until #80 merges).                          202 [~200]
+              and done. Also resolve_preedit_cursor, copied until
+              #80 merges.                                        202 [~200]
   mirror.rs   ExoMirror: Exo's SurroundingTextTracker, driven by the
               wire (M1, specs/exo-mirror.md).
-  exo_view.rs ExoView: a text input's mode, its mirror, and whether
-              the guest is in step with Exo; Frame, which measures
-              X1 and H9 in Mirror mode (M2, M3).
-  legacy.rs   Legacy mode's X1 and H9 (Current::delete, ::region,
-              ::predicted), moved unchanged from state.rs (M3).
+  exo_view.rs ExoView: a text input's mirror, from v11 of the
+              extension, and whether the guest is in step with Exo;
+              Frame, which measures X1 and H9, and Unmeasured, why
+              the core drops one (M2, M3; design single-exo-model).
   tests.rs    One or more row tests per row of section 2, the encoder
               table, and the two source tests: pure, no Session.
                                                           1,542 test [~900]
@@ -632,7 +631,7 @@ pub(super) struct TextInput {
     /// TextInputState::reset_fence does.
     fence: Option<BarrierToken>,
     composition: Composition,
-    warned: Warned,                // { seat_missing, delete_range, deferral }: log-only, ignored by the invariants
+    warned: Warned,                // { seat_missing, no_mirror, deferral }: log-only, ignored by the invariants
 }
 
 enum Field { Unfocused, Focused(FocusedField) }
@@ -644,12 +643,7 @@ struct FocusedField {
     /// The enabled flag lives here, so ending or refocusing the field
     /// clears it by construction (B7).
     committed: V3Committed,
-    /// Whether Exo's predicted text may hold input-method edits the
-    /// guest has not yet reported (today: unreported_host_edit).
-    text: ExoText,
 }
-
-enum ExoText { Synced, Ahead }
 
 /// What the host text input has applied (today: HostApplied). Only the
 /// transitions of TextInput change it, and only TextInput::leave_attached
@@ -666,15 +660,10 @@ pub(super) enum LinkState {
 }
 
 /// What the guest shows, and the v1 pieces of the next host event.
+/// What Exo holds is the Exo mirror's (`ExoView`, beside the link).
 #[derive(Default)]
 struct Composition {
     shown: Option<Preedit>,
-    /// The bytes before and after the committed cursor that regions took
-    /// since the guest last reported (X1; today: unreported_taken).
-    taken: Option<(u32, u32)>,
-    /// Exo's cursor in `shown`, while Exo holds it (X1; today:
-    /// ShownPreedit::host_cursor).
-    held: Option<u32>,
     assembly: Assembly,            // { cursor, selection }: preedit_cursor and preedit_styling
 }
 ```
@@ -721,16 +710,6 @@ field disabled.
     (G9c) or a focus reset (F1, F2);
   - through the answer forgetting a preedit that no longer fits (G9b,
     G9c).
-- `taken` changes where `shown` does, and at a report. Each plan states
-  it (a region what was taken and the bytes it deletes, an H7 preedit
-  what was taken, every other row, a reset commit included, nothing);
-  the exits from `Attached` and the forgetting answer clear it; and so
-  does a report, beside `ExoText::Synced`, so it is set only while the
-  text is `Ahead` (I2).
-- `held` changes where `shown` does: an H7 preedit and a region set it
-  with their preedit, every other plan clears it. A report that clears
-  `taken` clears it too (E4), so it is set only while `shown` is, inside
-  its text (I2).
 - The assembly records only while `Attached` (H4 and H5). A preedit and
   a region take it first (H7, X1), a commit and a delete once they reach
   the guest (H8, H9), a confirmation once it commits a preedit (X2), a
@@ -762,8 +741,6 @@ impl TextInput {
 /// state.rs, so no other module can forge one.
 pub(super) struct Current<'a> {
     ti: TiId, seat: SeatId, serial: Serial,
-    committed: &'a V3Committed,
-    text: &'a mut ExoText,
     composition: &'a mut Composition,
     fence: &'a mut Option<BarrierToken>,
 }
@@ -772,15 +749,14 @@ impl<'a> Current<'a> {
     /// Each method plans the transaction of one row.
     pub(super) fn preedit(self, text: String, commit: String, assembly: Assembly) -> Planned<'a>; // H7
     pub(super) fn host_commit(self, text: String) -> Planned<'a>;                                 // H8
-    pub(super) fn delete(self, index: i32, length: u32) -> Result<Planned<'a>, DeleteDrop>;       // H9
-    pub(super) fn region(self, index: i32, length: u32, assembly: Assembly)
-        -> Result<Planned<'a>, RegionDrop>;                                                       // X1
+    /// H9 and X1: a transaction `exo_view::Frame` measured in Exo's text.
+    pub(super) fn plan(self, txn: GuestTxn, lease: LeaseOutcome) -> Planned<'a>;               // H9, X1
     pub(super) fn confirm(self) -> Confirm<'a>;  // X2: Commit(Planned); X2': RecoverHeldKey(KeyEffect)
     pub(super) fn press_commit(self, fence: BarrierToken) -> Planned<'a>;                         // F4
 }
 /// A planned transaction and the change it makes. Dropping it changes
 /// nothing.
-pub(super) struct Planned<'a> { /* private: txn, next shown, ahead, lease, fence */ }
+pub(super) struct Planned<'a> { /* private: txn, lease, fence */ }
 impl Planned<'_> {
     /// Encode the transaction and, only if it fits, make its change.
     pub(super) fn apply(self) -> Result<(Vec<Outgoing>, KeyEffect), TooLong>;
@@ -812,10 +788,8 @@ from C3a.
     `release_does_not_end_child_text_input_focus`). `Attached` with no
     target cannot occur after a step, since the reconcile deactivates
     or abandons it (R1).
-- **I2.** `shown.is_some()`, `taken.is_some()` or a non-empty assembly
-  implies `Attached`. `taken.is_some()` implies the text is `Ahead`.
-  `held = Some(at)` implies `shown = Some(p)` with `at` a character
-  boundary of `p`. `shown.is_some()` implies `fence.is_none()`.
+- **I2.** `shown.is_some()` or a non-empty assembly implies `Attached`.
+  `shown.is_some()` implies `fence.is_none()`.
 - **I3.** At most one text input has `committed.enabled`.
 - **I4.** `by_ext` is exactly the extensions of `inputs`.
 - **I5.** Every token in `Draining{b}` or in `fence` is pending in
@@ -1550,8 +1524,9 @@ sees them.
     moved the cursor, the engine keeps the region it had, as the field
     does (IMA's `SetComposingRange` returns false before it changes
     anything).
-  - A free case makes half of these twice at once, for a delete while
-    the guest's text is ahead (P4) and a region over a region (#85). A
+  - A free case makes half of these twice at once, for a delete after
+    an edit the guest has yet to report (P4) and a region over a region
+    (#85). A
     settled case makes them only right after a key, since GTK3 reports
     a click's cursor only with its next edit, and never twice, since Exo
     drops a reported region as a composition (E4).
@@ -1741,8 +1716,6 @@ Each mode gets half of the cases.
   - the gate: attached by the last activation step, with no later Exo
     `leave` or `deactivate`, and no open fence;
   - the shown preedit;
-  - whether the text is `Ahead`, by the guest's surrounding-text
-    commits;
   - the focus.
 
   It then applies the events in the logged order:
@@ -1780,9 +1753,9 @@ Each mode gets half of the cases.
   - late results applied after a fence (P3);
   - text dropped by a fence;
   - raw keys;
-  - deletes and preedit regions, and those dropped, by reason: a delete
-    while the text is ahead, or for its range; a region over a region,
-    over a shown preedit, or dropped;
+  - deletes and preedit regions, those over a shown preedit, and those
+    Exo's text measures to nothing; the proxy's drops by cause, and those
+    of a guest that held Exo's text (4.8);
   - guest reports that crossed an edit in flight (P4);
   - autorepeats the engine got; empty confirmations that recovered a held
     key, skipped its pair as `wl_keyboard.key` had delivered it, found
@@ -1845,96 +1818,73 @@ preedit at a focus loss (F1) and at Exo's own detach (H2). They were the
 only issues of tier 2, so the classifier lost its prediction path, and
 every failure of the user's intent fails the run.
 
+Measuring a delete or region in the Exo mirror, or dropping it (design
+single-exo-model), retired the last four, all of X1: a region made in
+text older than a report the proxy had committed
+(`RegionCrossesReport`), a range IMA sent after the commit of the key it
+held it for (`StaleRegionAfterCommit`), a region over a composition Exo
+had dropped (`RegionOverUnheldPreedit`), and a region in text holding
+edits the guest had yet to report (`RegionWhileAhead`). Each came from
+approximating Exo's text by the guest's last report. The list is empty;
+the enum stays, so that a PR that finds an issue adds its variant and
+its trigger to `classify`, and the PR that fixes it deletes both.
+
 ```rust
 // sim/oracle.rs
 /// A tier-1 failure the proxy is known to cause. It is counted, not
 /// failed. The PR that fixes it deletes its variant.
-enum KnownIssue {
-    /// X1: a region Exo makes from text older than a guest report the
-    /// proxy has committed, which was on its way to Exo or was sent while
-    /// the region was on its way back, is measured in that report.
-    RegionCrossesReport,
-    /// IMA holds a reconversion's range while a key is in flight and
-    /// sends it after that key's commit, so it composes the committed
-    /// text; the guest's next report, without the preedit, makes Exo drop
-    /// it (E4), and the guest shows a preedit nothing composes.
-    StaleRegionAfterCommit,
-    /// X1: a region over a composition Exo dropped on a report it could
-    /// not match (E4), which nothing tells the proxy, is measured as if
-    /// Exo still held it.
-    RegionOverUnheldPreedit,
-    /// X1, P4: a region Exo makes in text that holds the input method's
-    /// edits the guest has yet to report is measured in the text the
-    /// guest last reported.
-    RegionWhileAhead,
-}
+enum KnownIssue {}
 ```
 
-**The Exo mirror** (M2 and M3, `specs/exo-mirror.md`). From v11 of the
-extension each text input is in Mirror mode, which measures X1 and H9 in
-the mirror (2.2) while the guest is in step with Exo, and falls back to
-Legacy mode's measurement otherwise. In Mirror mode `SpecText` measures a
-delete or a region both ways, in what the simulated Exo really held before
-it (`RegionTruth`, which Exo's model now attaches to each delete too) and
-as Legacy mode does; the proxy must send one of the two
-(`SpecText::alternative`), and the first replaces the second's effect on
-the specification. The counter `mirror_fallbacks` counts the events where
-the proxy sent Legacy mode's and the two differ, so the four X1 issues,
-Legacy mode's, apply to a Mirror-mode case only if it has one. An ideal
-client's text is no guide to whether the guest is in step, since a client
-model's can differ (GTK's Backspace leaves a jamo, C14; GTK3 reports a
-click's cursor late), so the guest model is judged by tier 2 and by the
-mirror check: at every `done` of a sync, a mirror that says it is exact
-must hold the simulated tracker's prediction at that sync (`Exo::synced`, a
-`mirror` check), and a history that fits the tracker's: each known state
-the fingerprint of the tracker's, an unknown one any state, and a leading
-unknown one any number of them. The display dispatches a surrounding text or a `reset` and
-the sync glued to it in one read, as Exo's libwayland does. M3 left Mirror
-mode one known issue of its own, `ReportDropsComposition`: a v3 guest's
-report leaves out its preedit, which names no state, so Exo dropped its
-composition (E4). Report suppression (M4, G9c) retired it. `SpecText`
+**The Exo mirror** (M2 to M4, `specs/exo-mirror.md`; PR A and PR B of
+`specs/single-exo-model.md`). From v11 of the extension each text input
+has a mirror, which measures X1 and H9 (2.2) while the guest is in step
+with Exo; the proxy drops every other delete and region, and below v11
+all of them. `SpecText` measures each delete and region in what the
+simulated Exo really held before it (`RegionTruth`, which Exo's model
+attaches to each delete and region), and the guest must get exactly that
+transaction or none (`SpecText::resolve`); below v11, none. After a
+region the guest did not get, the composition check waits for Exo's next
+preedit, commit or confirmation (`SpecText::region_dropped`). The proxy
+counts its drops by cause (`Counts::drops`: no mirror, an unsure mirror,
+keys or presses the guest had not stated, a crossing report, a guest out
+of step), and `SpecText` counts those where the guest held Exo's text,
+without its composition, which it showed, cursor included
+(`drops_truth_in_step`): the drops a sharper mirror could avoid. A
+settled case may make no drop with a mirror; below v11 the reference
+editor expects none of Exo's deletes and regions to reach the field
+(`Typing::unmeasured`), so a reconverted region and an accepted
+suggestion double their text there. An ideal client's text is no guide
+to whether the guest is in step, since a client model's can differ
+(GTK's Backspace leaves a jamo, C14; GTK3 reports a click's cursor
+late), so the guest model is judged by tier 2 and by the mirror check: at
+every `done` of a sync, a mirror that says it is exact must hold the
+simulated tracker's prediction at that sync (`Exo::synced`, a `mirror`
+check), and a history that fits the tracker's: each known state the
+fingerprint of the tracker's, an unknown one any state, and a leading
+unknown one any number of them. The display dispatches a surrounding
+text or a `reset` and the sync glued to it in one read, as Exo's
+libwayland does. Report suppression (M4, G9c) retired
+`ReportDropsComposition`: a v3 guest's report leaves out its preedit,
+which names no state, so Exo dropped its composition (E4). `SpecText`
 accepts a withheld report only while the guest shows a preedit, and the
 world holds it to the simulated tracker: its history must hold the
 report with that preedit as its composition at the report's cursor
-(`Exo::holds_with_composition`); the field check then expects Exo to
-keep the report before it.
+(`Exo::holds_with_composition`), which the field check asks of Exo's
+surrounding text too.
 
-In 20,000 cases from seed 0 (release mode, on dd3032e), by extension none,
-7, 10 and 11, with no failure:
-
-| Issue | Before M2 | Mirror mode, M3 | Mirror mode, M4 | Kill switch |
-|---|---|---|---|---|
-| `RegionCrossesReport` | 0, 2, 4, 6 | 0, 2, 2, 6 | 0, 2, 2, 2 | 0, 2, 2, 6 |
-| `StaleRegionAfterCommit` | 0, 2, 2, 0 | 0, 0, 1, 0 | 0, 0, 1, 0 | 0, 0, 1, 2 |
-| `RegionOverUnheldPreedit` | 0, 1, 1, 2 | 0, 0, 0, 1 | 0, 0, 0, 1 | 0, 0, 0, 1 |
-| `RegionWhileAhead` | 0, 3, 3, 1 | 0, 5, 2, 3 | 0, 5, 2, 0 | 0, 5, 2, 6 |
-| `ReportDropsComposition` | — | 0, 0, 0, 3 | — | — |
-
-The syncs change each seed's schedule, so the counts before M2 differ case
-by case, not by rule; the kill-switch run, every text input in Legacy
-mode, has the Mirror run's counts below v11. At v11 the Mirror run fell
-back on 14 events whose two measurements differ, all in free cases: a
-crossing report, or a guest that shows another preedit than Exo composes
-(a late answer, a fence), where no measurement is right. With M4, which
-keeps Exo's composition where the guest's report would have dropped it,
-on 6, and the free cases make 798 regions instead of the kill switch's
-756.
-
-**Mirror health** (PR A of `specs/single-exo-model.md`). The mirror keeps
-its history as fingerprints, up to 4,096, so a long field no longer makes
-it unsure; a split report makes it unsure only when an event of Exo's
-arrives while the report is on its way; a highlight makes only the
-selection vague, until the next event that sets it; and any report Exo
-must reset to heals it (INVARIANTS, "From v11 of the extension"). The
-counter `mirror_fallbacks_all` counts every event Mirror mode measured as
-Legacy mode does, whether or not the two differ, by why the mirror could
-not (`Unmeasured`): these are the drops a single model of Exo's text would
-make. In the same 20,000 cases (release mode), the known issues and
-`mirror_fallbacks` (6) are M4's, the `mirror` check holds, and
-`mirror_fallbacks_all` is 0 in the settled cases and 19 in the free ones:
-11 for keys or presses the guest had not stated (`Unseen`), 4 for a
-crossing report (`Crossing`), 4 for a guest out of step (`OutOfStep`), and
-none for an unsure mirror (`Unsure`).
+**Mirror health** (PR A). The mirror keeps its history as fingerprints,
+up to 4,096, so a long field no longer makes it unsure; a split report
+makes it unsure only when an event of Exo's arrives while the report is
+on its way; a highlight makes only the selection vague, until the next
+event that sets it; and any report Exo must reset to heals it
+(INVARIANTS, "Exo's deletes and regions are measured in the Exo mirror,
+or dropped"). Before PR B, in 20,000 cases from seed 0 (release mode),
+the events the mirror could not measure were 0 in the settled cases and
+19 in the free ones: 11 for keys or presses the guest had not stated
+(`Unseen`), 4 for a crossing report (`Crossing`), 4 for a guest out of
+step (`OutOfStep`), and none for an unsure mirror (`Unsure`). PR B drops
+them.
 
 ### 4.9 Golden traces for the staged switch
 
@@ -2063,7 +2013,7 @@ in review.
 | **P0 = #75** | Determinism. **Merged.** The crate holds no `HashMap` or `HashSet`, and clippy's `disallowed-types` forbids them (INVARIANTS "Nothing the proxy sends depends on hash order"). One change of behaviour: the keys a `wl_keyboard.enter` reports held are numbered in the host's order, not by hash or keycode (test `keys_held_at_an_enter_are_numbered_in_the_hosts_order`). | — | merged |
 | **T1 = #76 + #80** | Canonical v3 transactions on the **old** code, with the tests that pin the old form updated (section 2, Conventions). **#76 (merged)** sends a reset commit after its preedit clear, and a region's delete before its new preedit, in mutter's and KWin's order. **#80 (in review)** sends no empty preedit to a guest that shows none, no `delete(0, 0)` and no `commit_string("")`. It gives an empty preedit the cursor `(0, 0)` and clears a shown preedit before a region's delete. An empty region or commit no longer counts as an edit. This leaves the switch free of wire changes. | #72 | #80: ≈ +275 / −40 lines in all, code, tests and INVARIANTS |
 | **C1 + C2 = #82** | **In review.** Both steps in one PR, not wired in: the only change to existing production code is `mod ime;` and the helpers' move. C1's move is partly done: `lengths_around_cursor`, `delete_lengths`, `map_v3_content_type` and the content-type requests now live in `ime/` and the old handlers call them. `resolve_preedit_cursor` is copied until #80 merges. `HostApplied` and the old `reconcile` stay in `state` until C3a (M-1). The rest is C2: `state.rs`, `step.rs`, `host::reconcile` over `LinkState`, and `tests.rs` with a row test per row. Its departures from revision 2 are in 3.7. | #76 | ≈ +2,075 / +1,542; −227 in `text_input.rs` (moved) |
-| **#82 follow-up** | After #80 merges: delete the old `resolve_preedit_cursor` and point the old code at `ime/guest.rs`, so the copy goes. After region-over-region merges: make X1 subtract what an earlier region took, as the old code does (**done**, `Composition::taken`). Either can ride in #82 if it is still open. | #80, region-over-region, #82 | small |
+| **#82 follow-up** | After #80 merges: delete the old `resolve_preedit_cursor` and point the old code at `ime/guest.rs`, so the copy goes. After region-over-region merges: make X1 subtract what an earlier region took, as the old code does (**done**; the single Exo model since measures X1 in the mirror). Either can ride in #82 if it is still open. | #80, region-over-region, #82 | small |
 | **K1** | A pure move of the keyboard concern into `handler/ime_keys.rs`: keysym routing, held-key recovery, Backspace leases (`keysym_to_evdev_keycode`, `keyboard_for_seat`, `keyboard_for_keysym`, `held_repeat_key_for_seat`, `synthesize_ime_consumed_key_pair`, `end_backspace_repeat_*`, and `on_keysym`'s body). | #82, the old-code fixes below | 0 (moved ~400) |
 | **D2 = #83** | **In review.** `sim/exo.rs` (moved from `proxy/fuzz/exo.rs` and extended; the fuzzer imports it), `sim/engine.rs`, `sim/keymap.rs`, `sim/sched.rs` (`Choose`), `sim/clock.rs`. Unit tests check each E fact. Revision 3 asks it to follow IMA's rules instead of drawing them (2.4, 4.3), and to leave clicks and taps to D4 and the engine's deletes to D6. | #73 | 0 / ≈ +2,150 (moved 409) |
 | **D3 = #79** | **In review.** `sim/client/{mod,chromium,gtk}.rs` and `sim/clock.rs`. One test per client fact, mutation-checked. It corrected C2, C3, C4 and C6 and added C10 to C14 (2.5). | #73 | 0 / ≈ +2,200 |
@@ -2275,9 +2225,9 @@ as a check of the reading.
     of a key's text and its `peek_key` is known.
   - Recommendation: measure with U6 and the P3 counter, then decide.
 - **Q2. Mirror Exo's `SurroundingTextTracker` for deletes (P4)?**
-  `ExoText` could hold the predicted text instead of a flag. Do it only
-  if D6 shows deletes lost in normal flows. The enum makes it a local
-  change.
+  Resolved: the Exo mirror (`ime/mirror.rs`) is the one model of Exo's
+  text, and measures every delete and region, or drops it (design
+  single-exo-model).
 - **Q3. Guest-initiated reset (G6, C6).** GTK's reset is a commit with
   `cause=other`, and GTK4 sends one on every press, which F4 already
   covers. Decide on DST evidence.
@@ -2303,7 +2253,7 @@ C3c applied this table to INVARIANTS and DESIGN.
 | One text input on a connection is enabled at a time | `FocusedField.committed.enabled`, the Commit arm, I3 | Text updated; staleness now impossible |
 | Focus teardown sends `leave` itself | F1, F2 | C5: F2 goes before F1 in `forget_surface`; a new rule, "A field the focus leaves commits its preedit first" (F1, H2's commit in "The host gets each content type…") |
 | Every v3 commit counts | `CommitCount`, G9 | Names: `TextInputState::count_guest_commit` becomes `CommitCount::bump`, called in the Commit arm |
-| Exo's deletes are absolute and stand alone | H9, `ExoText` | `unreported_host_edit` becomes `ExoText::Ahead` |
+| Exo's deletes are absolute and stand alone | H9, X1, the Exo mirror | `unreported_host_edit` went with the single model: deletes and regions are measured in the mirror, or dropped |
 | Every commit that leaves a field enabled gets a `done` | G9b, G9c | Wording: GTK3 sends its enable on the click's release, not right after the press [F]. The reasoning is unchanged, because the release follows the press, so the press has already ended the composition |
 | A press ends the composition on its surface (#72) | F4, W2, the fence beside the link | `host_composition_is_current` becomes `TextInput::current`; `TextInputState::reset_fence` becomes `TextInput::fence`; the callback names merge. The fence's lifetime is **unchanged** |
 | Wire messages: byte-indexed strings that are not UTF-8 | G5, H7' | none |

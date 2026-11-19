@@ -18,7 +18,8 @@ limitations under the License.
 //! the [`ExoMirror`] of its host text input, fed every request the core
 //! sends and every event Exo sends, and whether the guest is in step with
 //! it, which is when a [`Frame`] measures Exo's deletes (H9) and preedit
-//! regions (X1) in Exo's own text (`docs/IME_REDESIGN.md` 2.2).
+//! regions (X1) in Exo's own text (`docs/IME_REDESIGN.md` 2.2). The core
+//! drops every delete and region it cannot measure so ([`Unmeasured`]).
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -26,7 +27,8 @@ use std::ops::Range;
 use super::guest::{resolve_preedit_cursor, GuestTxn, Preedit};
 use super::mirror::{Applied, ExoMirror, ExoState, Health, Sent};
 use super::state::{Assembly, DeleteDrop, RegionDrop};
-use super::{BarrierToken, HostIme, ImeMode, TiId};
+use super::{BarrierToken, HostIme, TiId};
+use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
 use crate::wire::IndexedString;
 
 /// The guest's edits so far: the tracker-changing transactions it got,
@@ -39,13 +41,17 @@ struct Edits {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ExoView {
-    mode: ImeMode,
-    mirror: ExoMirror,
+    /// The mirror, from v11 of the host's text-input extension, the first
+    /// whose confirmations are `confirm_preedit` and not a
+    /// `cursor_position` and `commit_string` pair the mirror could misread,
+    /// and whose regions it can see; `None` below, where Exo's deletes and
+    /// regions are dropped.
+    mirror: Option<ExoMirror>,
     /// The guest's text is Exo's predicted text without the composition
     /// Exo holds, which the guest shows as its preedit, with its cursor
     /// where Exo predicts it (design exo-mirror 3.1), but for `unseen`.
     /// Only a report sets it: one Exo has processed, or one the core
-    /// withheld.
+    /// withheld. Never without the mirror.
     in_step: bool,
     /// The proxy forwarded the guest a key or a press since the guest last
     /// stated its text, which may have edited it where Exo does not see.
@@ -65,9 +71,13 @@ pub(super) struct ExoView {
     warned: bool,
 }
 
-/// Why Mirror mode cannot measure an event of Exo's in the mirror.
+/// Why the core cannot measure an event of Exo's in the mirror, and so
+/// drops it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unmeasured {
+    /// The host's text-input extension is older than v11, or missing, so
+    /// the text input has no mirror.
+    NoMirror,
     /// The mirror does not know Exo's state exactly.
     Unsure,
     /// The proxy forwarded the guest a key or a press it has not yet
@@ -102,10 +112,12 @@ pub(super) struct Frame {
 }
 
 impl ExoView {
-    pub(super) fn new(mode: ImeMode, ext_version: Option<u32>) -> Self {
+    /// The view of a text input whose host extension is `ext_version`, if
+    /// any.
+    pub(super) fn new(ext_version: Option<u32>) -> Self {
+        let mirrored = ext_version.is_some_and(|v| v >= ext::EVT_CONFIRM_PREEDIT_SINCE);
         Self {
-            mode,
-            mirror: ExoMirror::new(ext_version),
+            mirror: mirrored.then(ExoMirror::new),
             in_step: false,
             unseen: false,
             edits: Edits::default(),
@@ -115,10 +127,6 @@ impl ExoView {
         }
     }
 
-    pub(super) fn mode(&self) -> ImeMode {
-        self.mode
-    }
-
     /// Whether a frame measures the next event (design exo-mirror 3.1).
     #[cfg(test)]
     pub(super) fn in_step(&self) -> bool {
@@ -126,8 +134,8 @@ impl ExoView {
     }
 
     #[cfg(test)]
-    pub(super) fn mirror(&self) -> &ExoMirror {
-        &self.mirror
+    pub(super) fn mirror(&self) -> Option<&ExoMirror> {
+        self.mirror.as_ref()
     }
 
     /// The mirror diverged, which only the log shows.
@@ -139,7 +147,7 @@ impl ExoView {
     /// The frame of the next host event, before the mirror takes it: Exo's
     /// state, if a guest that shows `shown` can be in step with it.
     pub(super) fn frame(&self, shown: Option<&Preedit>) -> Option<Frame> {
-        let state = self.mirror.exact()?;
+        let state = self.mirror.as_ref()?.exact()?;
         let held = held(state, shown)?;
         Some(Frame {
             state: state.clone(),
@@ -148,18 +156,19 @@ impl ExoView {
     }
 
     /// The frame `frame` taken before the event just observed, if it
-    /// measures the event: the mirror stayed exact, the guest has stated
-    /// every key and press, no report on its way to Exo crossed the event
-    /// (design exo-mirror 3.3, "Crossings"), and the guest was in step
-    /// with the frame.
+    /// measures the event: the text input has a mirror, which stayed
+    /// exact, the guest has stated every key and press, no report on its
+    /// way to Exo crossed the event (design exo-mirror 3.3, "Crossings"),
+    /// and the guest was in step with the frame.
     pub(super) fn measuring(&self, frame: Option<Frame>) -> Result<Frame, Unmeasured> {
-        if self.mirror.health() != Health::Exact {
+        let mirror = self.mirror.as_ref().ok_or(Unmeasured::NoMirror)?;
+        if mirror.health() != Health::Exact {
             return Err(Unmeasured::Unsure);
         }
         if self.unseen {
             return Err(Unmeasured::Unseen);
         }
-        if self.mirror.report_crosses() {
+        if mirror.report_crosses() {
             return Err(Unmeasured::Crossing);
         }
         frame.filter(|_| self.in_step).ok_or(Unmeasured::OutOfStep)
@@ -168,8 +177,10 @@ impl ExoView {
     /// The mirror takes host event `event`, before the gate: stale events
     /// and those behind a fence changed Exo's tracker too.
     pub(super) fn observe(&mut self, ti: TiId, event: &HostIme) {
-        let health = self.mirror.health();
-        let mirror = &mut self.mirror;
+        let Some(mirror) = &mut self.mirror else {
+            return;
+        };
+        let health = mirror.health();
         match event {
             &HostIme::PreeditStyling {
                 index,
@@ -187,7 +198,7 @@ impl ExoView {
             &HostIme::PreeditRegion { index, length } => mirror.set_preedit_region(index, length),
             &HostIme::Confirm { keep_selection } => mirror.confirm_preedit(keep_selection),
         }
-        if self.mirror.take_diverged() {
+        if mirror.take_diverged() {
             // A misreading of Chromium's: a bug to report, and the same one
             // each time.
             let level = match std::mem::replace(&mut self.warned, true) {
@@ -200,7 +211,7 @@ impl ExoView {
                 ti.0
             );
         }
-        self.health_changed(ti, health);
+        Self::health_changed(mirror, ti, health);
     }
 
     /// After a tracker-changing host event, with `frame` the frame taken
@@ -224,13 +235,16 @@ impl ExoView {
             let cursor = frame.held.start.checked_sub(edit.deleted_before as usize)?;
             Some(cursor + edit.committed)
         });
-        let held = self.mirror.exact().and_then(|state| held(state, shown));
+        let Some(mirror) = &mut self.mirror else {
+            return;
+        };
+        let held = mirror.exact().and_then(|state| held(state, shown));
         let keeps = cursor.is_some_and(|cursor| held.map(|held| held.start) == Some(cursor));
         self.in_step &= keeps;
         if let Some(edit) = edit {
             self.edits.from_exo += u64::from(edit.deleted || edit.committed > 0);
         }
-        self.mirror.mark(keeps);
+        mirror.mark(keeps);
     }
 
     /// The guest may have made an edit Exo does not see: the proxy
@@ -271,7 +285,10 @@ impl ExoView {
         one_read: bool,
         stated: bool,
     ) {
-        self.mirror.sent(
+        let Some(mirror) = &mut self.mirror else {
+            return;
+        };
+        mirror.sent(
             token,
             Sent::Report {
                 text,
@@ -288,7 +305,7 @@ impl ExoView {
             .push_back((token, stated.then_some(since), false));
     }
 
-    /// Report suppression (design exo-mirror 5): in Mirror mode, whether
+    /// Report suppression (design exo-mirror 5): with the mirror, whether
     /// the core withholds the guest's report `report`, from a guest that
     /// shows `shown`, which Exo could not match only for the composition
     /// the guest shows outside its text, so that it would only drop that
@@ -300,11 +317,10 @@ impl ExoView {
         (text, cursor, anchor): &(String, u32, u32),
         shown: Option<&Preedit>,
     ) -> bool {
-        let withheld = (self.mode == ImeMode::Mirror)
-            .then_some(shown)
-            .flatten()
-            .and_then(|shown| self.mirror.withholds(text, *cursor, *anchor, shown.text()));
-        let Some(in_step) = withheld else {
+        let (Some(mirror), Some(shown)) = (&self.mirror, shown) else {
+            return false;
+        };
+        let Some(in_step) = mirror.withholds(text, *cursor, *anchor, shown.text()) else {
             return false;
         };
         self.in_step = in_step;
@@ -315,28 +331,24 @@ impl ExoView {
         true
     }
 
-    /// Where Exo's cursor is in its composition, if that is `shown`.
-    pub(super) fn cursor_in(&self, shown: &Preedit) -> Option<u32> {
-        let state = self.mirror.exact()?;
-        let composition = &state.composition;
-        let cursor = state.selection.end.checked_sub(composition.start)?;
-        let holds = state.composition_text() == shown.text() && cursor <= composition.len();
-        holds.then_some(cursor as u32)
-    }
-
     /// The core sent a `reset`, then its fence `token`.
     pub(super) fn cancel_sent(&mut self, token: BarrierToken) {
-        self.mirror.sent(token, Sent::Cancel);
+        if let Some(mirror) = &mut self.mirror {
+            mirror.sent(token, Sent::Cancel);
+        }
     }
 
     /// The barrier `token` is done. A report Exo processed puts the guest in
     /// step if it matched a state the guest is in step with, or reset Exo
     /// to the guest's text with no edit of Exo's since the guest's commit
     /// before it; either with no other edit since the report (design
-    /// exo-mirror 3.2).
+    /// exo-mirror 3.2). Without the mirror nothing waits for a barrier.
     pub(super) fn barrier_done(&mut self, ti: TiId, token: BarrierToken) {
-        let health = self.mirror.health();
-        let applied = self.mirror.barrier_done(token);
+        let Some(mirror) = &mut self.mirror else {
+            return;
+        };
+        let health = mirror.health();
+        let applied = mirror.barrier_done(token);
         let since = match self.reports.front() {
             Some(&(front, since, superseded)) if front == token => {
                 self.reports.pop_front();
@@ -344,15 +356,15 @@ impl ExoView {
             }
             _ => None,
         };
-        let exact = self.mirror.health() == Health::Exact;
+        let exact = mirror.health() == Health::Exact;
         let Some((since, superseded)) = since else {
-            return self.health_changed(ti, health);
+            return Self::health_changed(mirror, ti, health);
         };
         let Some(since) = since else {
             // A stand-in: Exo holds empty text, the guest perhaps not.
             self.in_step = false;
-            self.mirror.mark(false);
-            return self.health_changed(ti, health);
+            mirror.mark(false);
+            return Self::health_changed(mirror, ti, health);
         };
         match applied {
             // A later report the core withheld placed the guest, and a
@@ -364,17 +376,17 @@ impl ExoView {
                 // it to hold.
                 self.in_step =
                     !superseded && exact && cursor && self.edits.from_exo == since.from_exo;
-                self.mirror.mark(self.in_step);
+                mirror.mark(self.in_step);
             }
             Some(Applied::Cancel) | None => {}
         }
         // The report states every key and press before it.
         self.unseen &= self.edits.unseen != since.unseen;
-        self.health_changed(ti, health);
+        Self::health_changed(mirror, ti, health);
     }
 
-    fn health_changed(&self, ti: TiId, before: Health) {
-        let health = self.mirror.health();
+    fn health_changed(mirror: &ExoMirror, ti: TiId, before: Health) {
+        let health = mirror.health();
         if health != before {
             log::debug!(
                 "The Exo mirror of text input {} is {health:?}, was {before:?}",
@@ -401,13 +413,12 @@ impl Frame {
     /// region must cover the preedit Exo holds, or Exo's cursor: it deletes
     /// the rest, which the guest has, around the guest's cursor. An empty
     /// region leaves Exo's composition as text, which the guest commits.
-    /// Returns the transaction and where Exo's cursor is in its preedit.
     pub(super) fn region(
         &self,
         index: i32,
         length: u32,
         assembly: Assembly,
-    ) -> Result<(GuestTxn, Option<u32>), RegionDrop> {
+    ) -> Result<GuestTxn, RegionDrop> {
         let state = &self.state;
         let exo_cursor = state.selection.end;
         let start = usize::try_from(exo_cursor as i64 + i64::from(index))
@@ -429,7 +440,7 @@ impl Frame {
                     ..GuestTxn::default()
                 },
             };
-            return Ok((txn, None));
+            return Ok(txn);
         }
         if held.start < start || end < held.end {
             return Err(RegionDrop::Uncovered);
@@ -445,7 +456,7 @@ impl Frame {
             preedit,
             ..GuestTxn::default()
         };
-        Ok((txn, Some(before as u32)))
+        Ok(txn)
     }
 
     /// H9: Exo deletes `length` bytes from `index` of its text, which holds

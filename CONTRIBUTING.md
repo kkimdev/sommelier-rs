@@ -191,10 +191,15 @@ of the host. `ime_reaches_the_intended_text` also holds the client to
 the user's intent, in cases that settle around every click, tap, focus
 move and restart of the input method, and after a key the input method
 passes while it takes the engine to compose, whose confirmation then
-resets the engine. A specification failure that a known issue's
-trigger explains, such as a region Exo made in text the proxy had not
-yet seen, is counted, not failed, and the summary lists its seeds; no
-known issue excuses a failure of the user's intent. Each test runs in a
+resets the engine. Exo's deletes and preedit regions must reach the
+guest as the specification measures them in the simulated Exo's text,
+or not at all; the summary counts the proxy's drops by cause
+(`Counts::drops`) and those of a guest that held Exo's text
+(`drops_truth_in_step`), and a settled case with a drop the Exo mirror
+could have measured fails. A specification failure that a known issue's
+trigger explains is counted, not failed, and the summary lists its
+seeds; none is known now, and no known issue may excuse a failure of the
+user's intent. Each test runs in a
 process of its own, with the XKB defaults pinned.
 
 The suite runs 600 seeds from seed 0, an even seed free and an odd one
@@ -215,17 +220,6 @@ SOMMELIER_DST_CASES=1`, which replays it exactly;
 `SOMMELIER_DST_CLIENT=chromium|gtk3|gtk4` and
 `SOMMELIER_DST_MODE=free|settled` narrow a run. The summary counts each
 known issue by the host's text-input extension.
-
-The IME's kill switch, `SOMMELIER_IME_MIRROR=shadow`, keeps every text
-input in Legacy mode, as below v11 of the extension (`ime::ImeMode`):
-the Exo mirror only logs at debug what it would have sent. The proxy
-reads it once, and the DST honours it too, so a run under it checks
-Legacy mode at every extension:
-
-```bash
-SOMMELIER_IME_MIRROR=shadow SOMMELIER_DST_CASES=20000 \
-  cargo test --release -p sommelier --bins sim::ime_reaches
-```
 
 The first failed case of a run is shrunk (`sim/shrink.rs`) after its
 report: ddmin over its actions, zeroing runs of its choices (0 is the

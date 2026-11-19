@@ -516,22 +516,20 @@ The surrounding text and cursor rectangle are not reconciled: Exo keeps
 both regardless and edits its copy of the text as the input method
 commits, so each guest commit forwards the ones it states, but for a
 surrounding text that would only make Exo drop its composition, which
-Mirror mode withholds (below). In the other
+the core withholds (below). In the other
 direction, the edits of Exo's input method reach the guest as v3
 transactions, each closed by a `done`. Exo measures its deletes and
 preedit regions in its own prediction of the text, so the core keeps a
 replica of it per text input, `ime/mirror.rs`, which takes every request
 the core sends at the `done` of a `wl_display.sync` glued to it, and every
-event Exo sends. `ime/exo_view.rs` owns the mirror, the text input's mode
-(`ime::ImeMode`), and whether the guest is in step with Exo; from v11 of
-the extension (Mirror mode) a delete or a region is measured in the
-mirror while it is, and as Legacy mode does otherwise; and a guest
-report that leaves out the preedit it shows, which Exo holds inline, is
-withheld when the mirror finds that preedit the only difference from a
-state Exo will hold. Below v11, or under the kill
-switch `SOMMELIER_IME_MIRROR=shadow`, Legacy mode measures them in the
-text the guest last committed, as `ime/legacy.rs` does, and the mirror
-only logs. A guest commit that leaves the field enabled is answered
+event Exo sends. `ime/exo_view.rs` owns the mirror, which a text input
+has from v11 of the extension, and whether the guest is in step with Exo:
+it is the one model of Exo's text. A delete or a region is measured in
+the mirror while the guest is in step, and dropped otherwise, as it is
+always below v11; and a guest report that leaves out the preedit it
+shows, which Exo holds inline, is withheld when the mirror finds that
+preedit the only difference from a state Exo will hold. `ime/state.rs`
+keeps only what the guest is shown. A guest commit that leaves the field enabled is answered
 with a `done`, which Chromium waits for before it sends more. A pointer
 press or a touch-down on the surface of a composition ends it before the
 guest gets the press, as mutter and KWin do: `pointer.rs` follows each
