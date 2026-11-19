@@ -1443,10 +1443,11 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         );
 
         // Encode the one request that can fail before changing any state,
-        // so a commit that cannot reach the host changes nothing but the
-        // commit count, and Exo and the bridge keep the same field. v3
-        // enable and disable clear the surrounding text, and the clear
-        // reaches the host too, or Exo would keep the old field's text.
+        // so a commit that cannot reach the host only counts and consumes
+        // its pending state, which no later commit retries, and Exo and the
+        // bridge keep the same field. v3 enable and disable clear the
+        // surrounding text, and the clear reaches the host too, or Exo
+        // would keep the old field's text.
         let mut surrounding_text = Vec::new();
         if let Some(text) = &state.pending.surrounding_text {
             let (text, cursor, anchor) =
@@ -1463,6 +1464,10 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 ),
                 format_args!("the surrounding text of text input {guest_id}"),
             ) {
+                ctx.text_inputs
+                    .get_mut(&guest_id)
+                    .expect("the focused text input was found above")
+                    .pending = crate::state::V3Pending::default();
                 answer_guest_commit(ctx, guest_id);
                 return Action::Drop;
             }
@@ -5876,7 +5881,8 @@ pub(super) mod tests {
     }
 
     /// A commit whose surrounding text does not fit a message reaches the
-    /// host with nothing: it changes nothing but the commit count.
+    /// host with nothing: it consumes its pending state and changes
+    /// nothing else but the commit count.
     #[test]
     fn oversized_surrounding_commit_does_not_partially_advance_state() {
         let mut ime = Ime::new();
@@ -5891,9 +5897,56 @@ pub(super) mod tests {
 
         assert!(ime.ctx.client_to_host_queue.is_empty());
         expected.set_guest_commits(1);
+        expected.pending = crate::state::V3Pending::default();
         assert_eq!(ime.state(), &expected);
         // The field stays enabled, so the commit gets its `done`.
         assert_eq!(ime.events(), [(TI, V3::Done { serial: 1 }.into())]);
+    }
+
+    /// The commit after one whose surrounding text did not fit does not
+    /// retry that commit's pending state: it reaches the host with only
+    /// what the guest set since.
+    #[test]
+    fn the_commit_after_an_oversized_one_does_not_retry_it() {
+        let mut ime = Ime::new();
+        ime.ctx.last_sender_id = TI;
+        // The fixture's host has no content type yet, and the host's
+        // content type says whether the field reports its text: this
+        // commit settles both.
+        let text = IndexedString::from("a");
+        TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &text, 1, 1);
+        TextInputV3Handler.on_commit(&mut ime.ctx);
+        ime.requests();
+        ime.events();
+
+        let oversized = IndexedString::from("x".repeat(4_084).as_str());
+        TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &oversized, 4_084, 4_084);
+        let password = zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD;
+        TextInputV3Handler.on_set_content_type(&mut ime.ctx, 0, password);
+        TextInputV3Handler.on_commit(&mut ime.ctx);
+        assert_eq!(ime.requests(), []);
+        assert_eq!(ime.events(), [(TI, V3::Done { serial: 2 }.into())]);
+
+        // Neither the text nor the content type is sent again.
+        TextInputV3Handler.on_commit(&mut ime.ctx);
+        let commit_state =
+            |serial| -> (u32, AnyRequest) { (HOST, V1::CommitState { serial }.into()) };
+        assert_eq!(ime.requests(), [commit_state(3)]);
+        assert_eq!(ime.events(), [(TI, V3::Done { serial: 3 }.into())]);
+
+        let text = IndexedString::from("ab");
+        TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &text, 2, 2);
+        TextInputV3Handler.on_commit(&mut ime.ctx);
+        let surrounding = V1::SetSurroundingText {
+            text: "ab".into(),
+            cursor: 2,
+            anchor: 2,
+        };
+        assert_eq!(
+            ime.requests(),
+            [(HOST, surrounding.into()), commit_state(4)]
+        );
+        assert_eq!(ime.events(), [(TI, V3::Done { serial: 4 }.into())]);
     }
 
     /// A shown preedit the answer to a commit cannot repeat leaves the
