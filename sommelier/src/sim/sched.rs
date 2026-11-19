@@ -53,7 +53,7 @@ use super::clock::Micros;
 use super::display::Display;
 use super::editor::{Target, TextModel, UserAction};
 use super::engine::{Engine, EngineIn, Lag, Request};
-use super::exo::{Answer, Exo};
+use super::exo::{Answer, Exo, RegionTruth};
 use super::hangul::Key;
 use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
@@ -291,7 +291,7 @@ pub(super) struct World<'t> {
     p_to_c: Channel<(u32, AnyEvent, Option<Press>)>,
     p_to_e: Channel<(u32, AnyRequest)>,
     /// Each host event, and what engine text it carries.
-    e_to_p: Channel<(Outgoing, Origin)>,
+    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>)>,
     to_engine: Channel<EngineIn>,
     /// The guest's view of what the client models do not take: the
     /// globals, Shift and where its pointer is, as the proxy tells it.
@@ -499,8 +499,8 @@ impl<'t> World<'t> {
                     self.host_sends(events, false);
                 }
                 3 => {
-                    let (event, origin) = self.e_to_p.take();
-                    self.deliver_host_event(event, origin).await;
+                    let (event, origin, truth) = self.e_to_p.take();
+                    self.deliver_host_event(event, origin, truth).await;
                 }
                 4 => {
                     let input = self.to_engine.take();
@@ -631,14 +631,14 @@ impl<'t> World<'t> {
             press,
             crossed: self.reports_to_exo > 0,
         };
-        for event in self.exo.take_events() {
+        for (event, truth) in self.exo.take_events_with_truths() {
             self.e_to_p
-                .send(self.now, (event, origin), &mut self.choices);
+                .send(self.now, (event, origin, truth), &mut self.choices);
         }
         for event in events {
             let origin = Origin::default();
             self.e_to_p
-                .send(self.now, (event, origin), &mut self.choices);
+                .send(self.now, (event, origin, None), &mut self.choices);
         }
         for input in self.exo.take_engine() {
             self.resets += u64::from(input == EngineIn::Reset);
@@ -695,7 +695,9 @@ impl<'t> World<'t> {
                     zwp_text_input_v3::Request::SetSurroundingText { .. }
                 );
                 if let Some(spec) = self.spec.as_mut().filter(|_| report) {
-                    spec.counts.crossed_reports += u64::from(edits < self.edits.sent.0);
+                    let crossed = edits < self.edits.sent.0;
+                    spec.counts.crossed_reports += u64::from(crossed);
+                    spec.report_crossed(crossed);
                 }
                 self.see(Seen::Guest(request));
             }
@@ -706,7 +708,12 @@ impl<'t> World<'t> {
     }
 
     /// A host event reaches the proxy.
-    async fn deliver_host_event(&mut self, event: Outgoing, origin: Origin) {
+    async fn deliver_host_event(
+        &mut self,
+        event: Outgoing,
+        origin: Origin,
+        truth: Option<RegionTruth>,
+    ) {
         let (sender, decoded) = self.display.decode(&event);
         let note = if origin.late { " (late)" } else { "" };
         self.log(Place::EToP, format!("{sender} {}{note}", shown(&decoded)));
@@ -714,6 +721,7 @@ impl<'t> World<'t> {
             sender,
             event: &decoded,
             origin,
+            region: truth.as_ref(),
         });
         let goes_on = self.session.try_host([event]).await;
         self.send_proxy_output(goes_on);

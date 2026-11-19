@@ -204,6 +204,22 @@ struct TextInput {
     registered: Option<u64>,
 }
 
+/// What Exo did of a `set_preedit_region` it sent, for the oracle to judge
+/// the proxy's translation of it by.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct RegionTruth {
+    /// Its tracker's predicted text and cursor when it made the region,
+    /// with the composition it held there, empty for none.
+    pub text: String,
+    pub cursor: usize,
+    pub held: String,
+    /// A report it could not match had dropped the composition it held
+    /// before, and nothing composed since (E4).
+    pub dropped: bool,
+    /// The text it composed, which the guest must then show.
+    pub composed: String,
+}
+
 /// What `SurroundingTextTracker` (`ui/base/ime/surrounding_text_tracker.cc`)
 /// predicts a field holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -238,6 +254,9 @@ impl Predicted {
 struct Tracker {
     predicted: Predicted,
     expected: Vec<Predicted>,
+    /// A report it could not match dropped the composition, and nothing
+    /// composed since (E4).
+    dropped: bool,
 }
 
 impl Tracker {
@@ -252,6 +271,7 @@ impl Tracker {
         match self.expected.iter().position(named) {
             Some(state) => drop(self.expected.drain(..state)),
             None => {
+                self.dropped |= self.predicted.composition.is_some();
                 self.predicted = Predicted {
                     text,
                     cursor,
@@ -264,6 +284,7 @@ impl Tracker {
 
     /// `OnSetCompositionText`.
     fn set_composition(&mut self, text: &str) {
+        self.dropped = false;
         let range = self.predicted.replace(text);
         self.predicted.composition = (!range.is_empty()).then_some(range);
         self.expected.push(self.predicted.clone());
@@ -289,6 +310,7 @@ impl Tracker {
     /// `OnSetCompositionFromExistingText`: the text in `range` becomes the
     /// composition; returns it.
     fn compose_existing(&mut self, range: Range<usize>) -> String {
+        self.dropped = false;
         let predicted = &mut self.predicted;
         let composed = predicted.text[range.clone()].to_owned();
         predicted.composition = (!range.is_empty()).then_some(range);
@@ -456,6 +478,8 @@ pub(crate) struct Exo {
     extensions: BTreeMap<u32, u32>,
     /// The events Exo sent and no one has taken yet, in order.
     events: Vec<Outgoing>,
+    /// What Exo did of each `set_preedit_region` in `events`, by index.
+    region_truths: Vec<(usize, RegionTruth)>,
     keyboard: Option<Keyboard>,
     /// The modifiers the keyboard last sent.
     modifiers: u32,
@@ -908,7 +932,24 @@ impl Exo {
     /// answers any later `wl_display.sync`, so that the sync's `done`
     /// follows every event of earlier requests (E11).
     pub(crate) fn take_events(&mut self) -> Vec<Outgoing> {
+        self.region_truths.clear();
         std::mem::take(&mut self.events)
+    }
+
+    /// [`Exo::take_events`], each `set_preedit_region` with what Exo did
+    /// of it.
+    pub(super) fn take_events_with_truths(&mut self) -> Vec<(Outgoing, Option<RegionTruth>)> {
+        let mut truths = std::mem::take(&mut self.region_truths)
+            .into_iter()
+            .peekable();
+        let events = std::mem::take(&mut self.events);
+        (0..)
+            .zip(events)
+            .map(|(i, event)| {
+                let truth = truths.next_if(|(at, _)| *at == i).map(|(_, truth)| truth);
+                (event, truth)
+            })
+            .collect()
     }
 
     /// The composition Exo tracks for the text input attached on the
@@ -1324,12 +1365,24 @@ impl Exo {
             return false;
         }
         let cursor = text.predicted.cursor;
+        let truth = RegionTruth {
+            text: text.predicted.text.clone(),
+            cursor,
+            held: text.predicted.composition().to_owned(),
+            dropped: text.dropped,
+            composed: String::new(),
+        };
         let composed = text.compose_existing(range.clone());
         self.regions_hidden += u64::from(self.extension_of(id).is_none());
         if let Some(extension) = self.extension_of(id) {
             let index = -i32::try_from(cursor - range.start).expect("a short region");
             let length = u32::try_from(range.len()).expect("a short region");
             let event = extended::evt::set_preedit_region(extension, index, length);
+            let truth = RegionTruth {
+                composed: composed.clone(),
+                ..truth
+            };
+            self.region_truths.push((self.events.len(), truth));
             self.events.push(event);
         }
         self.composed_region = Some(composed);

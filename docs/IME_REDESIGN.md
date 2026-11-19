@@ -1772,8 +1772,30 @@ enum KnownIssue {
     /// text; the guest's next report, without the preedit, makes Exo drop
     /// it (E4), and the guest shows a preedit nothing composes.
     StaleRegionAfterCommit,
+    /// X1: a region over a composition Exo dropped on a report it could
+    /// not match (E4), which nothing tells the proxy, is measured as if
+    /// Exo still held it.
+    RegionOverUnheldPreedit,
+    /// X1, P4: a region Exo makes in text that holds the input method's
+    /// edits the guest has yet to report is measured in the text the
+    /// guest last reported.
+    RegionWhileAhead,
 }
 ```
+
+Each region has an independent judge: Exo's model attaches to each
+`set_preedit_region` what it did (`RegionTruth`: its text, cursor and
+held composition, whether a report it could not match dropped that
+composition, and the text it composed), and after the region's step the
+guest's preedit must be that text (`SpecText::judge_region`, a `region`
+check). Where Exo made the region in other text than `SpecText` takes it
+to hold, the check names why, from what the world knows and the proxy
+cannot: a composition E4 dropped (`RegionOverUnheldPreedit`), a report
+on its way to Exo (`RegionCrossesReport`), or edits the guest has yet to
+report, a report that crossed one included
+(`RegionWhileAhead`); later regions until the guest's next report keep
+that reason. Only that issue explains such a check. In 20,000 cases from
+seed 0 they occur 2, 12 and 10 times.
 
 A failure is classified as known only when tier 1 passed, every failure
 is of tier 2, and the client shows exactly what a set of known issues
