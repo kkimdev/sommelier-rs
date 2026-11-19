@@ -992,6 +992,8 @@ impl<'t> World<'t> {
         if !matches!(seen, Seen::StepEnd) {
             return;
         }
+        let exo = &self.exo;
+        spec.take_withheld(|report, shown| exo.holds_with_composition(report, shown));
         if let Some(failed) = oracle::step(spec, shadow) {
             if self.steps.len() < 3 {
                 let at = self.now.0 as f64 / 1_000.0;

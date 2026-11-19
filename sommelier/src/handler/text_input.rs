@@ -3873,6 +3873,31 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
+    /// From v11 of the extension, a report that leaves out the preedit
+    /// the guest shows, which Exo holds inline, does not reach Exo, which
+    /// would only drop its composition (E4); the rest of the commit does,
+    /// and Exo's next region over that composition reaches the guest.
+    #[tokio::test]
+    async fn a_report_without_the_shown_preedit_is_withheld() {
+        let mut f = Field::with_surrounding_text("ab", 2, 2).await;
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let done = || V3::Done { serial: 2 };
+        let expected = [delete(1, 0), preedit_at("b", 1, 1), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "a", 1, 1).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(f.s.host_received(), [f.commit_state(3)]);
+        let done = || V3::Done { serial: 3 };
+        let expected = [preedit_at("b", 1, 1), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("ab", 2, 2), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
     /// A key the guest gets may edit its text where Exo does not see, so
     /// Exo's deletes are dropped until the guest states its text: a commit
     /// with no surrounding text states it is unchanged.

@@ -1103,12 +1103,29 @@ impl Exo {
         self.text_inputs[&id].text.hidden.clone()
     }
 
-    /// Whether a report Exo could not match dropped the composition of the
-    /// text input attached on the focused surface (E4), and nothing
-    /// composed since.
-    pub(super) fn composition_dropped(&self) -> bool {
-        let id = self.composing_text_inputs().first().copied();
-        id.is_some_and(|id| self.text_inputs[&id].text.dropped)
+    /// Whether the tracker of the text input attached on the focused
+    /// surface holds a state with the composition `composition` at the
+    /// cursor of the report `(text, cursor, anchor)`, which that state is
+    /// without it: a report that would only drop the composition (design
+    /// exo-mirror 5).
+    pub(super) fn holds_with_composition(
+        &self,
+        (text, cursor, anchor): &(String, u32, u32),
+        composition: &str,
+    ) -> bool {
+        let Some(id) = self.composing_text_inputs().first().copied() else {
+            return false;
+        };
+        let at = *cursor as usize;
+        let holds = |state: &Predicted| {
+            state.composition.as_ref().is_some_and(|range| {
+                range.start == at
+                    && state.text[range.clone()] == *composition
+                    && text.get(..at) == Some(&state.text[..at])
+                    && text.get(at..) == Some(&state.text[range.end..])
+            })
+        };
+        cursor == anchor && self.text_inputs[&id].text.expected.iter().any(holds)
     }
 
     /// The host text inputs an input method is attached to on the focused

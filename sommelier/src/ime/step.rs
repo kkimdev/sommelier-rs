@@ -505,7 +505,20 @@ impl ImeCore {
                     None => (false, None, None),
                 };
             // A report applies at the barrier glued to it, which places it
-            // among Exo's events for the mirror (design exo-mirror 2.3).
+            // among Exo's events for the mirror (design exo-mirror 2.3). One
+            // the guest stated that Exo could only drop its composition for is
+            // withheld (5); the rest of the commit still goes out.
+            let surrounding_text = surrounding_text.filter(|(_, (report, stated))| {
+                let withheld = *stated && t.withholds_report(report);
+                if withheld {
+                    log::debug!(
+                        "Withholding the surrounding text of text input {}: Exo holds it \
+                         with the composition the guest shows",
+                        ti.0
+                    );
+                }
+                !withheld
+            });
             if let Some((request, (report, stated))) = surrounding_text {
                 let barrier = BarrierToken(self.next_barrier);
                 self.next_barrier += 1;

@@ -2458,6 +2458,96 @@ fn row_G9b_a_report_that_does_not_fit_queues_no_barrier() {
     assert!(!ime.in_step());
 }
 
+/// A report without the preedit the guest shows names no state of Exo's,
+/// which holds it inline, so Exo would only drop its composition (E4):
+/// with the composition at the guest's cursor it names one, and the core
+/// withholds it, with no barrier (design exo-mirror 5). The rest of the
+/// commit goes out, and the guest is in step with Exo's composition.
+#[test]
+fn row_G9c_a_report_without_the_shown_preedit_is_withheld() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.region(-1, 1);
+    ime.step(Input::SurroundingText(TI, "a".into(), 1, 1));
+    let out = ime.step_unanswered(Input::Commit(TI));
+    assert_eq!(out.host, [commit_state(TI, 3)]);
+    assert_eq!(out.guest, [preedit_at("b", 1, 1), done(3)]);
+    let exo = ime.core.get(TI).expect("a text input").exo();
+    assert_eq!(exo.mirror().predicted().composition, 1..2);
+    assert!(ime.in_step());
+    // So Exo's region over its composition is measured.
+    let out = ime.region(-2, 2);
+    let expected = [no_preedit(), delete(1, 0), preedit_at("ab", 2, 2), done(3)];
+    assert_eq!(out.guest, expected);
+}
+
+/// A withheld report leaves Exo's composition where it was, so Legacy
+/// mode, which measures once a forwarded key suspends the mirror's
+/// measuring, still takes Exo to hold the preedit: Exo's region over it
+/// only shows it again, and deletes none of the guest's text.
+#[test]
+fn row_G9c_after_a_withheld_report_legacy_mode_holds_the_composition() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.region(-1, 1);
+    let out = ime.report("a", 1);
+    assert_eq!(out.host, [commit_state(TI, 3)]);
+    ime.step(Input::GuestKey(SEAT));
+    assert!(!ime.in_step());
+    let out = ime.region(-1, 1);
+    assert_eq!(out.guest, [preedit_at("b", 1, 1), done(3)]);
+}
+
+/// A report on its way to Exo when the guest's next is withheld can only
+/// take the guest out of step by resetting Exo: matching an older state,
+/// here one with the composition inline, changes nothing of Exo's.
+#[test]
+fn row_G9c_an_older_report_matched_after_a_withheld_one_keeps_it_in_step() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.compose("가");
+    let barrier = ime.report_unanswered("ab가", 5);
+    let out = ime.report("ab", 2);
+    assert_eq!(out.host, [commit_state(TI, 4)]);
+    assert!(ime.in_step());
+    ime.step(Input::BarrierDone(barrier));
+    assert!(ime.in_step());
+}
+
+/// A report that names a state of Exo's goes out: Exo matches it and
+/// keeps its composition. That one would also be the composition's state
+/// without it does not matter.
+#[test]
+fn row_G9c_an_exact_report_goes_out_unchanged() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.compose("가");
+    let out = ime.report("ab", 2);
+    assert_eq!(out.host, [surrounding(TI, "ab", 2), commit_state(TI, 3)]);
+    let exo = ime.core.get(TI).expect("a text input").exo();
+    assert_eq!(exo.mirror().predicted().composition, 2..5);
+}
+
+/// A report that names no state, even with the composition the guest
+/// shows inline, goes out, and Exo resets to the guest's text; so does
+/// every report in Legacy mode.
+#[test]
+fn row_G9c_an_unmatched_report_goes_out_unchanged() {
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.region(-1, 1);
+    let out = ime.report("a", 0);
+    assert_eq!(out.host, [surrounding(TI, "a", 0), commit_state(TI, 3)]);
+    let exo = ime.core.get(TI).expect("a text input").exo();
+    assert!(exo.mirror().predicted().composition.is_empty());
+
+    let mut ime = Ime::legacy_enabled();
+    ime.report("ab", 2);
+    ime.region(-1, 1);
+    let out = ime.report("a", 1);
+    assert_eq!(out.host, [surrounding(TI, "a", 1), commit_state(TI, 3)]);
+}
+
 #[test]
 fn row_X1_a_region_after_an_unreported_commit_is_measured_in_exos_text() {
     let mut ime = Ime::enabled();

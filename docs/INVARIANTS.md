@@ -1278,8 +1278,31 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     evicts history at v11's empty confirmation per unhandled key), a guest
     out of step, or a crossing report. Legacy mode logs at trace where the
     mirror would have sent another transaction.
+  - In Mirror mode, a guest report that would only drop Exo's composition
+    is withheld (design exo-mirror 5). A v3 guest reports its text without
+    the preedit it shows, while every state Exo predicted since the
+    composition began holds it inline, so such a report names none and Exo
+    drops the composition (E4). While the mirror is exact and the guest
+    shows a preedit, a report the guest stated (not the empty stand-in for
+    a field that states none) that names no state of the history Exo will
+    hold once it has processed the requests in flight, but is one of those
+    states without its composition, which is the shown preedit, at the
+    composition's start, is not sent, nor is its sync; the content type,
+    cursor rectangle and `commit_state` of the commit still are. A report
+    Exo matches changes only its history, so Exo is where the report with
+    the preedit would have left it, and the guest is in step as after a
+    matched report, at that state. Legacy mode, which measures wherever
+    Mirror mode cannot, takes Exo to hold the shown preedit still, with
+    Exo's cursor in it, although the commit stated text without it; and a
+    report on its way to Exo before the withheld one can take the guest
+    out of step only by resetting Exo, not by matching an older state.
+    Every other report goes out unchanged: one that names a state is a
+    no-op, and one that names none resets Exo to the guest's text. Nothing
+    is ever inserted into a report, so a wrong mirror can only leave Exo
+    stale until the composition ends, never put the preedit in Exo's text.
   The DST checks at every `done` of a sync that an exact mirror equals the
-  simulated Exo's tracker.
+  simulated Exo's tracker, and that Exo's tracker holds each report the
+  proxy withheld with the shown preedit as its composition.
   Tests: `a_report_reaches_the_host_with_its_barrier`,
   `a_reports_barrier_is_glued_into_its_entry`,
   `a_forwarded_key_holds_back_exos_delete_until_the_guest_commits`,
@@ -1290,9 +1313,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_composition_selection_makes_it_uncertain`,
   `a_report_crosses_when_it_will_name_no_state`,
   `a_matched_report_finds_the_guest_without_a_composition`,
-  `healing_needs_a_cancel_then_a_clean_report`.
-  The core's row tests of X1 and H9 in Mirror mode are listed in the
-  design's rows (`docs/IME_REDESIGN.md` 2.2).
+  `healing_needs_a_cancel_then_a_clean_report`,
+  `a_report_without_the_shown_preedit_is_withheld`.
+  The core's row tests of X1 and H9 in Mirror mode, and of report
+  suppression, are listed in the design's rows and G9c
+  (`docs/IME_REDESIGN.md` 2.1 and 2.2).
 - **Every commit that leaves a field enabled gets a `done`.** The proxy
   answers each such v3 `commit` with a `done` that carries its serial, as
   mutter and KWin do. The protocol has a client send its surrounding text,

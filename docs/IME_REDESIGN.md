@@ -384,6 +384,30 @@ This is the contract.
 4. **A stated surrounding text** sets the text to `Synced`. Then the
    content type is applied.
 
+**Report suppression** (Mirror mode; design exo-mirror 5). The reconcile
+withholds the commit's `set_surrounding_text`, and its barrier, when the
+guest stated it (not the empty stand-in), the mirror is `Exact`, the
+report names no state of the history Exo will hold once it has processed
+the requests in flight, and one such state is the report with the
+composition the guest shows inline at the report's cursor: Exo, which
+holds every state with the composition inline, would only drop it (E4).
+A report Exo matches changes nothing but its history, so withholding
+one that matches only with the preedit leaves Exo where it would be had
+the guest reported the preedit. The content type, the cursor rectangle
+and `commit_state` still go out, and the guest is in step as after a
+matched report, at that state; Legacy mode, which measures wherever
+Mirror mode cannot, holds the shown preedit again (`held`, Exo's cursor
+in it), and an older report still in flight can take the guest out of
+step only by resetting Exo. Any other report goes out unchanged: one
+that names a state is a no-op, and one that names none resets Exo to the
+guest's text. A wrong mirror can only leave Exo stale, never inject
+text, until the composition ends and the next report goes out. Row tests
+`row_G9c_a_report_without_the_shown_preedit_is_withheld`,
+`row_G9c_an_exact_report_goes_out_unchanged`,
+`row_G9c_an_unmatched_report_goes_out_unchanged`,
+`row_G9c_after_a_withheld_report_legacy_mode_holds_the_composition`,
+`row_G9c_an_older_report_matched_after_a_withheld_one_keeps_it_in_step`.
+
 If the field's support for surrounding text flips, the content type is
 re-sent with the new support (test
 `surrounding_text_support_follows_the_field_and_resends_only_on_change`).
@@ -1843,10 +1867,6 @@ enum KnownIssue {
     /// edits the guest has yet to report is measured in the text the
     /// guest last reported.
     RegionWhileAhead,
-    /// Mirror mode: a v3 guest reports its text without the preedit it
-    /// shows, which names no state Exo predicted, so Exo drops its
-    /// composition (E4). Report suppression (PR M4) retires it.
-    ReportDropsComposition,
 }
 ```
 
@@ -1867,27 +1887,36 @@ click's cursor late), so the guest model is judged by tier 2 and by the
 mirror check: at every `done` of a sync, a mirror that says it is exact
 must equal the simulated tracker's snapshot at that sync (`Exo::synced`, a
 `mirror` check). The display dispatches a surrounding text or a `reset` and
-the sync glued to it in one read, as Exo's libwayland does. A
-`composition` check where a report Exo could not match dropped its
-composition is `ReportDropsComposition`'s.
+the sync glued to it in one read, as Exo's libwayland does. M3 left Mirror
+mode one known issue of its own, `ReportDropsComposition`: a v3 guest's
+report leaves out its preedit, which names no state, so Exo dropped its
+composition (E4). Report suppression (M4, G9c) retired it. `SpecText`
+accepts a withheld report only while the guest shows a preedit, and the
+world holds it to the simulated tracker: its history must hold the
+report with that preedit as its composition at the report's cursor
+(`Exo::holds_with_composition`); the field check then expects Exo to
+keep the report before it.
 
 In 20,000 cases from seed 0 (release mode, on dd3032e), by extension none,
 7, 10 and 11, with no failure:
 
-| Issue | Before M2 | Mirror mode | Kill switch |
-|---|---|---|---|
-| `RegionCrossesReport` | 0, 2, 4, 6 | 0, 2, 2, 6 | 0, 2, 2, 6 |
-| `StaleRegionAfterCommit` | 0, 2, 2, 0 | 0, 0, 1, 0 | 0, 0, 1, 2 |
-| `RegionOverUnheldPreedit` | 0, 1, 1, 2 | 0, 0, 0, 1 | 0, 0, 0, 1 |
-| `RegionWhileAhead` | 0, 3, 3, 1 | 0, 5, 2, 3 | 0, 5, 2, 6 |
-| `ReportDropsComposition` | — | 0, 0, 0, 3 | — |
+| Issue | Before M2 | Mirror mode, M3 | Mirror mode, M4 | Kill switch |
+|---|---|---|---|---|
+| `RegionCrossesReport` | 0, 2, 4, 6 | 0, 2, 2, 6 | 0, 2, 2, 2 | 0, 2, 2, 6 |
+| `StaleRegionAfterCommit` | 0, 2, 2, 0 | 0, 0, 1, 0 | 0, 0, 1, 0 | 0, 0, 1, 2 |
+| `RegionOverUnheldPreedit` | 0, 1, 1, 2 | 0, 0, 0, 1 | 0, 0, 0, 1 | 0, 0, 0, 1 |
+| `RegionWhileAhead` | 0, 3, 3, 1 | 0, 5, 2, 3 | 0, 5, 2, 0 | 0, 5, 2, 6 |
+| `ReportDropsComposition` | — | 0, 0, 0, 3 | — | — |
 
 The syncs change each seed's schedule, so the counts before M2 differ case
 by case, not by rule; the kill-switch run, every text input in Legacy
 mode, has the Mirror run's counts below v11. At v11 the Mirror run fell
 back on 14 events whose two measurements differ, all in free cases: a
 crossing report, or a guest that shows another preedit than Exo composes
-(a late answer, a fence), where no measurement is right.
+(a late answer, a fence), where no measurement is right. With M4, which
+keeps Exo's composition where the guest's report would have dropped it,
+on 6, and the free cases make 798 regions instead of the kill switch's
+756.
 
 ### 4.9 Golden traces for the staged switch
 
