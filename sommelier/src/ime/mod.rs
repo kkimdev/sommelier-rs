@@ -42,7 +42,6 @@ pub(crate) use host::content_type_requests;
 pub(crate) use host::map_v3_content_type;
 // The storage switch's window (docs/IME_REDESIGN.md, C3a to C3c): the old
 // handlers keep their shape, and reach the state through these.
-pub(crate) use guest::TooLong;
 pub(crate) use host::{reconcile, target, ActivationStep};
 #[cfg(test)]
 pub(crate) use state::Assembly;
@@ -308,11 +307,6 @@ impl ImeCore {
     /// Every text input, in `TiId` order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (TiId, &TextInput)> {
         self.inputs.iter().map(|(&ti, t)| (ti, t))
-    }
-
-    /// Every text input, in `TiId` order.
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (TiId, &mut TextInput)> {
-        self.inputs.iter_mut().map(|(&ti, t)| (ti, t))
     }
 
     /// A barrier no text input has waited for.

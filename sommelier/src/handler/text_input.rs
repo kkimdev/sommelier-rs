@@ -21,7 +21,7 @@ use crate::handler::ime_keys::{
 };
 use crate::ime::{
     self, content_type_requests, ActivationStep, Env, HostExt, HostIme, HostOut, HostTi, Input,
-    KeyEffect, LeaseOutcome, LinkState, SeatId, SurfaceId, TextInput, TiId, TooLong,
+    KeyEffect, LeaseOutcome, LinkState, SeatId, SurfaceId, TextInput, TiId,
 };
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
@@ -179,37 +179,6 @@ fn apply_lease(ctx: &mut Context, effect: KeyEffect) {
             debug_assert!(armed, "held Backspace disappeared within one event");
         }
         None => end_backspace_repeat_for_text_input(ctx, seat.0, ti.0),
-    }
-}
-
-/// Queue the transaction a host event or a press planned and applied, and
-/// apply its lease.
-///
-/// # Returns
-///
-/// Whether it fitted a message; if not, it changed nothing.
-fn queue_transaction(
-    ctx: &mut Context,
-    ti: TiId,
-    applied: Result<(Vec<Outgoing>, KeyEffect), TooLong>,
-) -> bool {
-    let Ok((transaction, lease)) = applied else {
-        log::warn!(
-            "Dropping a host event of text input {}: its text does not fit a message",
-            ti.0
-        );
-        return false;
-    };
-    apply_lease(ctx, lease);
-    ctx.host_to_client_queue.extend(transaction);
-    true
-}
-
-/// Take the preedit cursor and styling of text input `ti`, which the
-/// composition event that just ended its composition used up.
-fn take_assembly(ctx: &mut Context, ti: TiId) {
-    if let Some(t) = ctx.ime.get_mut(ti) {
-        t.take_assembly();
     }
 }
 
@@ -801,7 +770,8 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
 /// text input focused on it whose composition is current and shows a
 /// preedit. Only one can be: one text input on a connection is enabled at
 /// a time. The guest commits the preedit it shows, and the host `reset`s,
-/// which drops Exo's composition without an event back.
+/// which drops Exo's composition without an event back (F4 of the IME
+/// core).
 ///
 /// # Returns
 ///
@@ -814,35 +784,14 @@ pub(crate) fn end_composition_on_press(
     surface: u32,
     resend: impl FnOnce() -> Outgoing,
 ) -> Action {
-    let Some(ti) = ctx.ime.iter_mut().find_map(|(ti, t)| {
-        let ends = t.focused_surface() == Some(SurfaceId(surface))
-            && t.current(ti)
-                .is_some_and(|current| current.shown().is_some());
-        ends.then_some(ti)
-    }) else {
-        return Action::Forward;
+    let press = Input::Press {
+        surface: SurfaceId(surface),
+        resend: resend(),
     };
-    let fence = ctx.ime.new_barrier();
-    let t = ctx
-        .ime
-        .get_mut(ti)
-        .expect("the press's text input was found above");
-    let host_v1_id = t.host().v1;
-    let current = t.current(ti).expect("its composition was current above");
-    // The preedit reached the guest, so its commit fits a message.
-    let applied = current.press_commit(fence).apply();
-    if applied.is_ok() {
-        take_assembly(ctx, ti);
+    match ime(ctx, press) {
+        true => Action::Forward,
+        false => Action::Drop,
     }
-    if !queue_transaction(ctx, ti, applied) {
-        return Action::Forward;
-    }
-    log::debug!("A press ended the composition of text input {}", ti.0);
-    ctx.client_to_host_queue
-        .push(zwp_text_input_v1::req::reset(host_v1_id));
-    queue_internal_sync(ctx, InternalCallback::TextInput { token: fence });
-    ctx.host_to_client_queue.push(resend());
-    Action::Drop
 }
 
 /// Answer the guest's latest commit on text input `guest_id` with a
