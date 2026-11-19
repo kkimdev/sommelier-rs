@@ -1920,6 +1920,22 @@ keeps Exo's composition where the guest's report would have dropped it,
 on 6, and the free cases make 798 regions instead of the kill switch's
 756.
 
+**Mirror health** (PR A of `specs/single-exo-model.md`). The mirror keeps
+its history as fingerprints, up to 4,096, so a long field no longer makes
+it unsure; a split report makes it unsure only when an event of Exo's
+arrives while the report is on its way; a highlight makes only the
+selection vague, until the next event that sets it; and any report Exo
+must reset to heals it (INVARIANTS, "From v11 of the extension"). The
+counter `mirror_fallbacks_all` counts every event Mirror mode measured as
+Legacy mode does, whether or not the two differ, by why the mirror could
+not (`Unmeasured`): these are the drops a single model of Exo's text would
+make. In the same 20,000 cases (release mode), the known issues and
+`mirror_fallbacks` (6) are M4's, the `mirror` check holds, and
+`mirror_fallbacks_all` is 0 in the settled cases and 19 in the free ones:
+11 for keys or presses the guest had not stated (`Unseen`), 4 for a
+crossing report (`Crossing`), 4 for a guest out of step (`OutOfStep`), and
+none for an unsure mirror (`Unsure`).
+
 ### 4.9 Golden traces for the staged switch
 
 C3-pre committed the goldens (`sim/golden.rs` and `sim/golden.txt`), and

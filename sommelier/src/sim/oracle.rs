@@ -372,6 +372,11 @@ pub(super) struct Counts {
     /// where the two differ.
     pub mirror_drops: u64,
     pub mirror_fallbacks: u64,
+    /// Mirror mode: every delete and region the proxy measured as Legacy
+    /// mode does, whether or not the two measurements differ, by why the
+    /// mirror could not measure it. The proxy counts them; the world reads
+    /// them at the end of the case.
+    pub mirror_fallbacks_all: crate::ime::Fallbacks,
     /// Guest reports that crossed an edit on its way to the guest (P4).
     pub crossed_reports: u64,
     /// Preedit regions Exo made before it got a report the proxy had sent
@@ -438,6 +443,7 @@ impl std::ops::AddAssign for Counts {
         self.regions_dropped += other.regions_dropped;
         self.mirror_drops += other.mirror_drops;
         self.mirror_fallbacks += other.mirror_fallbacks;
+        self.mirror_fallbacks_all += other.mirror_fallbacks_all;
         self.crossed_reports += other.crossed_reports;
         self.regions_crossing_reports += other.regions_crossing_reports;
         self.regions_stale += other.regions_stale;

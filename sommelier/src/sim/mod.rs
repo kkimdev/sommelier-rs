@@ -189,8 +189,11 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         .build()
         .expect("a runtime");
     runtime.block_on(async {
+        // The proxy counts its fallbacks on this thread.
+        crate::ime::take_fallbacks_for_test();
         let mut world = World::new(&setup, choices, trace).await;
         world.run(&case.actions).await;
+        let fallbacks = crate::ime::take_fallbacks_for_test();
         let mut outcome = Outcome {
             failures: Vec::new(),
             known: Vec::new(),
@@ -209,6 +212,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
             return outcome;
         };
         outcome.counts = spec.counts;
+        outcome.counts.mirror_fallbacks_all = fallbacks;
         let (engine, resets) = (world.engine_composition(), world.engine_resets());
         let (exo, steps) = (&world.exo, &world.steps);
         let mut failures = oracle::exact(steps, spec, shadow, exo, &engine, resets, extension);

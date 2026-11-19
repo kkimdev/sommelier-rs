@@ -202,7 +202,14 @@
   not drop instead: the input method's next commit would double the text.
   In 20,000 DST cases from seed 0, 6 events of the free cases fell back
   where the two measurements differ (14 before M4), none in settled cases; the Legacy
-  issues then appear at v11 in a few cases (4.8 of the design). Its
+  issues then appear at v11 in a few cases (4.8 of the design). Counting
+  every fallback (`mirror_fallbacks_all`), 19 events of the free cases
+  fell back, none for an unsure mirror, and none of the settled cases:
+  the floor for dropping Legacy mode (`specs/single-exo-model.md` PR B).
+  The mirror is unsure only after a divergence, an event that arrives
+  while a split report is on its way, the 4,096-state or 256 KiB caps, or
+  an ambiguous report; a press's `reset` then a report heal those, and a
+  vague selection heals at the next event that sets it. Its
   gaps:
   - A silent edit the proxy does not see breaks the guest model: GTK3
     reports a click's new cursor only with its next edit, so a region

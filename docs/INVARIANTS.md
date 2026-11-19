@@ -1332,7 +1332,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   holds the fingerprints of the tracker's (an unknown state fits any
   state, a leading one any number of them), and that Exo's tracker holds
   each report the proxy withheld with the shown preedit as its
-  composition.
+  composition. It counts every fallback to Legacy mode by its cause
+  (`mirror_fallbacks_all`).
   Tests: `a_report_reaches_the_host_with_its_barrier`,
   `a_reports_barrier_is_glued_into_its_entry`,
   `a_forwarded_key_holds_back_exos_delete_until_the_guest_commits`,

@@ -716,11 +716,63 @@ fn composition_event(
 /// Mirror mode: the core cannot measure a host `what` in the Exo mirror,
 /// for `why`, so it is measured as Legacy mode does.
 fn log_fallback(ti: TiId, what: &str, why: Unmeasured) {
+    #[cfg(test)]
+    FALLBACKS.with(|fallbacks| {
+        let mut counted = fallbacks.get();
+        counted.count(why);
+        fallbacks.set(counted);
+    });
     log::debug!(
         "Text input {}: measuring a {what} as Legacy mode does, as the Exo mirror cannot: \
          {why:?}",
         ti.0
     );
+}
+
+/// Mirror mode's fallbacks to Legacy mode, by cause, which the DST counts
+/// (`mirror_fallbacks_all`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Fallbacks {
+    pub(crate) unsure: u64,
+    pub(crate) unseen: u64,
+    pub(crate) crossing: u64,
+    pub(crate) out_of_step: u64,
+}
+
+#[cfg(test)]
+impl Fallbacks {
+    fn count(&mut self, why: Unmeasured) {
+        *match why {
+            Unmeasured::Unsure => &mut self.unsure,
+            Unmeasured::Unseen => &mut self.unseen,
+            Unmeasured::Crossing => &mut self.crossing,
+            Unmeasured::OutOfStep => &mut self.out_of_step,
+        } += 1;
+    }
+}
+
+#[cfg(test)]
+impl std::ops::AddAssign for Fallbacks {
+    fn add_assign(&mut self, other: Self) {
+        self.unsure += other.unsure;
+        self.unseen += other.unseen;
+        self.crossing += other.crossing;
+        self.out_of_step += other.out_of_step;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's fallbacks: a DST case runs its proxy on its own
+    /// thread, one case at a time.
+    static FALLBACKS: std::cell::Cell<Fallbacks> = std::cell::Cell::default();
+}
+
+/// This thread's fallbacks since the last call.
+#[cfg(test)]
+pub(crate) fn take_fallbacks_for_test() -> Fallbacks {
+    FALLBACKS.take()
 }
 
 /// Legacy mode: where the Exo mirror, had the guest been in step, would
