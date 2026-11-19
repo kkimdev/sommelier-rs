@@ -120,12 +120,17 @@ pub enum Input {
     // Cross-concern messages (F1 to F4).
     /// F1: the seat's keyboard focus moved to `surface`, or to none. The
     /// keyboard concern sends one per seat whose focused surface changed.
+    /// `keyboard` is the guest's copy of the keyboard events that moved it,
+    /// which the core queues after the commit of a preedit the move ends
+    /// and before the text inputs' `leave` and `enter`, so that the guest
+    /// gets the commit while the field still has its focus.
     FocusChanged {
         seat: SeatId,
         surface: Option<SurfaceId>,
+        keyboard: Vec<Outgoing>,
     },
-    /// F2: the guest destroyed `surface`, after the `FocusChanged`s its
-    /// destruction caused.
+    /// F2: the guest destroyed `surface`, before the `FocusChanged`s its
+    /// destruction caused, which then find its fields reset.
     SurfaceDestroyed(SurfaceId),
     /// F3: the guest bound a `wl_seat` under this ID.
     SeatBound(SeatId),
@@ -177,7 +182,7 @@ pub enum HostIme {
 pub struct Effects {
     /// Guest events. Every IME transaction ends with its `done`. A press
     /// that ended a composition (F4) is re-sent here, after its
-    /// transaction.
+    /// transaction, and so are the keyboard events of a focus change (F1).
     pub to_guest: Vec<Outgoing>,
     /// Host requests and barriers.
     pub to_host: Vec<HostOut>,

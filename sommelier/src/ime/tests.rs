@@ -704,6 +704,7 @@ fn row_G9a_an_unfocused_commit_only_counts() {
     let out = ime.step(Input::FocusChanged {
         seat: SEAT,
         surface: Some(SURFACE),
+        keyboard: Vec::new(),
     });
     assert_eq!(out.guest, [v3(TI, V3::Enter { surface: SURFACE.0 })]);
     let out = ime.enable(TI);
@@ -1091,6 +1092,7 @@ fn row_G9c_a_refocus_drops_the_pending_enable() {
     ime.step(Input::FocusChanged {
         seat: SEAT,
         surface: Some(OTHER),
+        keyboard: Vec::new(),
     });
     let out = ime.step(Input::Commit(TI));
     assert_eq!(out.host, [commit_state(TI, 1)]);
@@ -1844,10 +1846,10 @@ fn row_W1_only_its_own_barrier_ends_a_drain() {
 #[test]
 fn row_F1_a_focus_change_resets_the_field() {
     let mut ime = Ime::enabled();
-    ime.compose("가");
     let out = ime.step(Input::FocusChanged {
         seat: SEAT,
         surface: Some(OTHER),
+        keyboard: Vec::new(),
     });
     assert_eq!(
         out.guest,
@@ -1873,13 +1875,57 @@ fn row_F1_a_focus_change_resets_the_field() {
     let out = ime.step(Input::FocusChanged {
         seat: SEAT,
         surface: None,
+        keyboard: Vec::new(),
     });
     assert_eq!(out.guest, [v3(TI, V3::Leave { surface: OTHER.0 })]);
     let out = ime.step(Input::FocusChanged {
         seat: SeatId(6),
         surface: Some(SURFACE),
+        keyboard: Vec::new(),
     });
     assert_eq!(out.guest, []);
+}
+
+/// C5: the field the focus leaves commits the preedit the guest shows
+/// before its `leave`, as mutter and ibus do at a focus-out. Exo's detach
+/// confirms the composition too (E6), but after the keyboard's `leave`
+/// (E12), while the link drains, so the proxy drops it.
+#[test]
+fn row_F1_a_focus_change_commits_the_shown_preedit_before_leave() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let out = ime.step(Input::FocusChanged {
+        seat: SEAT,
+        surface: Some(OTHER),
+        keyboard: Vec::new(),
+    });
+    assert_eq!(
+        out.guest,
+        [
+            no_preedit(),
+            commit("가"),
+            done(1),
+            v3(TI, V3::Leave { surface: SURFACE.0 }),
+            v3(TI, V3::Enter { surface: OTHER.0 }),
+        ]
+    );
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    let confirm = ime.ext(HostIme::Confirm);
+    assert!(confirm.guest.is_empty() && confirm.keys.is_empty());
+    // The commit ended the composition: a focus that comes back shows
+    // nothing.
+    let out = ime.step(Input::FocusChanged {
+        seat: SEAT,
+        surface: Some(SURFACE),
+        keyboard: Vec::new(),
+    });
+    assert_eq!(
+        out.guest,
+        [
+            v3(TI, V3::Leave { surface: OTHER.0 }),
+            v3(TI, V3::Enter { surface: SURFACE.0 }),
+        ]
+    );
 }
 
 #[test]
@@ -1896,6 +1942,23 @@ fn row_F2_a_destroyed_surface_is_left_while_it_is_valid() {
         ]
     );
     assert_eq!(out.host[0], req(v1(TI), V1::Deactivate { seat: HOST_SEAT }));
+
+    // A preedit the guest shows is not committed into the destroyed
+    // surface, unlike at F1.
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    ime.world.surfaces.remove(&SURFACE);
+    ime.world.focus.remove(&SEAT);
+    let out = ime.step(Input::SurfaceDestroyed(SURFACE));
+    assert_eq!(out.guest, [v3(TI, V3::Leave { surface: SURFACE.0 })]);
+    assert_eq!(out.keys, []);
+    // The seat's focus change that follows finds the field reset.
+    let out = ime.step(Input::FocusChanged {
+        seat: SEAT,
+        surface: None,
+        keyboard: Vec::new(),
+    });
+    assert!(out.guest.is_empty() && out.host.is_empty() && out.keys.is_empty());
 
     // A repair that stays on the surface tells the guest nothing, and the
     // field counts as disabled until enabled again.
@@ -2107,6 +2170,7 @@ fn row_R1_a_dead_seat_abandons_the_link_and_keeps_the_fence() {
     let out = ime.step(Input::FocusChanged {
         seat: SEAT,
         surface: Some(OTHER),
+        keyboard: Vec::new(),
     });
     assert_eq!(out.host, []);
     // The link is detached, so the field activates again once the seat is

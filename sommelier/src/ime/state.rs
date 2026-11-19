@@ -848,8 +848,8 @@ impl<'a> Current<'a> {
         planned
     }
 
-    /// The commit of the shown preedit (X1, X2, F4).
-    fn commit_shown(self) -> Planned<'a> {
+    /// The commit of the shown preedit (X1, X2, F1, F4).
+    pub(super) fn commit_shown(self) -> Planned<'a> {
         let text = self.shown().map(|shown| shown.text().to_string());
         let txn = GuestTxn {
             commit: text,

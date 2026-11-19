@@ -97,7 +97,11 @@ impl ImeCore {
             Input::BarrierDone(token) => {
                 self.inputs.values_mut().for_each(|t| t.barrier_done(token))
             }
-            Input::FocusChanged { seat, surface } => self.focus_changed(seat, surface, &mut fx),
+            Input::FocusChanged {
+                seat,
+                surface,
+                keyboard,
+            } => self.focus_changed(seat, surface, keyboard, &mut fx),
             Input::SurfaceDestroyed(surface) => self.surface_destroyed(surface, env, &mut fx),
             // F3: the reconcile below activates what the seat can now
             // carry.
@@ -402,18 +406,30 @@ impl ImeCore {
         }
     }
 
-    /// F1, per text input of the seat, in `TiId` order.
-    fn focus_changed(&mut self, seat: SeatId, surface: Option<SurfaceId>, fx: &mut Effects) {
-        for (&ti, t) in &mut self.inputs {
-            if t.seat() == seat {
-                let old = t.refocus(surface);
-                push_focus_events(ti, old, surface, fx);
-            }
+    /// F1, per text input of the seat, in `TiId` order. The field the
+    /// focus leaves commits the preedit the guest shows, before the
+    /// keyboard events that moved the focus and its own `leave`.
+    fn focus_changed(
+        &mut self,
+        seat: SeatId,
+        surface: Option<SurfaceId>,
+        keyboard: Vec<Outgoing>,
+        fx: &mut Effects,
+    ) {
+        for (&ti, t) in self.inputs.iter_mut().filter(|(_, t)| t.seat() == seat) {
+            commit_shown(ti, t, fx);
+        }
+        fx.to_guest.extend(keyboard);
+        for (&ti, t) in self.inputs.iter_mut().filter(|(_, t)| t.seat() == seat) {
+            let old = t.refocus(surface);
+            push_focus_events(ti, old, surface, fx);
         }
     }
 
     /// F2: a text input focused on the destroyed surface takes the seat's
     /// focus again, and tells the guest while the surface is still valid.
+    /// It commits nothing, unlike F1: the guest destroyed the window the
+    /// text would go into.
     fn surface_destroyed(&mut self, surface: SurfaceId, env: &impl Env, fx: &mut Effects) {
         for (&ti, t) in &mut self.inputs {
             if t.focused_surface() == Some(surface) {
@@ -548,6 +564,25 @@ impl ImeCore {
                     )));
             }
         }
+    }
+}
+
+/// F1: a field that loses the focus commits the preedit the guest shows,
+/// if its composition is current, as mutter and ibus do at a focus-out and
+/// as Exo's detach confirms it (E6).
+fn commit_shown(ti: TiId, t: &mut TextInput, fx: &mut Effects) {
+    let Some(cur) = t.current(ti).filter(|cur| cur.shown().is_some()) else {
+        return;
+    };
+    match cur.commit_shown().apply() {
+        Ok((events, lease)) => {
+            fx.to_guest.extend(events);
+            fx.keys.push(lease);
+        }
+        Err(TooLong) => log::warn!(
+            "Dropping the commit of text input {}'s preedit: too long",
+            ti.0
+        ),
     }
 }
 

@@ -174,9 +174,33 @@ mod tests {
         assert_eq!(f.s.guest_received(), [], "the text input keeps its focus");
 
         // Its composition goes on, and the keyboard's leave, which the
-        // keyboard still routes to its seat, ends its focus.
+        // keyboard still routes to its seat, ends its focus, so the field
+        // commits its preedit before the keyboard's `leave` and its own.
         f.preedit("한글").await;
-        f.keyboard_leave().await;
+        let leave = wl_keyboard::evt::leave(f.keyboard.host, 2, f.surface.host);
+        f.s.host([leave]).await;
+        let (id, surface) = (f.text_input.id, f.surface.id);
+        let clear = zwp_text_input_v3::Event::PreeditString {
+            text: Some("".into()),
+            cursor_begin: 0,
+            cursor_end: 0,
+        };
+        let commit = zwp_text_input_v3::Event::CommitString {
+            text: Some("한글".into()),
+        };
+        assert_eq!(
+            f.s.guest_received(),
+            [
+                (id, clear.into()),
+                (id, commit.into()),
+                (id, zwp_text_input_v3::Event::Done { serial: 1 }.into()),
+                (
+                    f.keyboard.id,
+                    wl_keyboard::Event::Leave { serial: 2, surface }.into()
+                ),
+                (id, zwp_text_input_v3::Event::Leave { surface }.into()),
+            ]
+        );
         assert_eq!(f.s.host_received(), []);
     }
 

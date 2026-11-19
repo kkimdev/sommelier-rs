@@ -790,7 +790,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   protocol resets a client's modifiers at `leave` and requires a
   `modifiers` event after every `enter`, which Exo omits, so the proxy
   fills that in: it sends the guest the keyboard's modifiers after each
-  `enter` it forwards.
+  `enter` it sends.
   Tests: `modifiers_sent_before_enter_survive_it`,
   `modifiers_survive_a_focus_change`,
   `modifiers_carry_over_to_a_new_keymap`,
@@ -894,12 +894,39 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   delayed host keyboard leave cannot be relied on, since it may be rejected
   as stale once the surface mapping is gone. Teardown is explicit and
   idempotent: the later delayed leave does not duplicate the event. A
-  surface's end first moves the keyboard focus of each seat off it, which
-  resets that seat's fields (`ime::Input::FocusChanged`), then resets any
-  other field still focused on it to its seat's focus
-  (`ime::Input::SurfaceDestroyed`); each sends the `leave`.
+  surface's end first resets each field focused on it to its seat's focus,
+  which the destroy has already moved off it
+  (`ime::Input::SurfaceDestroyed`), and only then tells the IME core of
+  the seats whose keyboard focus the destroy moved
+  (`ime::Input::FocusChanged`), which find those fields reset; the reset
+  sends the `leave`.
   Tests: `wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave`,
   `ime_reaches_the_specified_text`.
+- **A field the focus leaves commits its preedit first.** When the
+  keyboard focus leaves a field, or its keyboard ends, while the guest
+  shows a preedit, the guest commits it before it hears of the move: the
+  proxy sends the transaction `preedit_string("")`, `commit_string`,
+  `done`, then the keyboard events that moved the focus, then the text
+  input's `leave` and `enter`. The keyboard handler hands those events to
+  the IME core (`ime::Input::FocusChanged`'s `keyboard`) rather than
+  forwarding them, since a forward would precede the commit. mutter and
+  ibus commit a preedit at a focus-out, and Exo's detach confirms the
+  composition (E6 of [IME_REDESIGN.md](IME_REDESIGN.md) 2.4), so Exo keeps
+  the text too. But the keyboard hears of a focus move before the text
+  input (E12), so the proxy has reset the field and started draining when
+  that confirmation arrives, and drops it; without its own commit the
+  guest would lose the syllable. The commit goes first because a client
+  drops input-method events for a window that has lost the keyboard
+  focus: GTK's current context is the focused field's (C12), and
+  Chromium's blur takes its input method's client away (C11). A surface's
+  destroy commits nothing, since the guest destroyed the window the text
+  would go into, which is why the IME core hears of the destroy before
+  the focus change it causes (previous rule).
+  Tests: `a_focus_loss_commits_the_shown_preedit_before_leave`,
+  `keyboard_release_ends_focus_when_no_other_keyboard_owns_the_seat`,
+  `release_does_not_end_child_text_input_focus`,
+  `wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave`,
+  `ime_reaches_the_intended_text`.
 - **Every v3 commit counts.** A text-input-v3 `done` serial is the number
   of `commit` requests the guest made on the object, including commits made
   while unfocused or whose state could not be encoded; those are still not

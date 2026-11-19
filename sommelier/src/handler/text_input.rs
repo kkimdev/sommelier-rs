@@ -474,8 +474,16 @@ fn live_host_seat(table: &ShadowTable, guest_seat: u32) -> Option<u32> {
 
 /// Tell the IME core of each seat's keyboard focus change (F1), after the
 /// keyboard concern's own teardown: the seat's peek watermarks and its
-/// Backspace repeats end.
-pub(crate) fn apply_keyboard_focus_changes(ctx: &mut Context, changes: &[SeatFocusChange]) {
+/// Backspace repeats end. `keyboard` is the guest's copy of the keyboard
+/// events that moved the focus, which the guest gets after the commit of a
+/// preedit the move ends, and before the text inputs' `leave` and `enter`,
+/// so their sender handler drops the originals. A keyboard belongs to one
+/// seat, so they go with the first change.
+pub(crate) fn apply_keyboard_focus_changes(
+    ctx: &mut Context,
+    changes: &[SeatFocusChange],
+    mut keyboard: Vec<Outgoing>,
+) {
     for change in changes {
         if change.previous_surface == change.current_surface {
             continue;
@@ -486,9 +494,11 @@ pub(crate) fn apply_keyboard_focus_changes(ctx: &mut Context, changes: &[SeatFoc
         let focus = Input::FocusChanged {
             seat: SeatId(change.guest_seat),
             surface: change.current_surface.map(SurfaceId),
+            keyboard: std::mem::take(&mut keyboard),
         };
         ime(ctx, focus);
     }
+    ctx.host_to_client_queue.extend(keyboard);
 }
 
 /// Forget guest `zwp_text_input_v3` `guest_id`, which ended (see
@@ -1617,6 +1627,38 @@ pub(super) mod tests {
             f.s.guest_received(),
             f.events([commit("나"), V3::Done { serial: 1 }])
         );
+    }
+
+    /// The focus leaves a field while the guest shows a preedit: the guest
+    /// commits it before the keyboard's `leave` and the text input's (F1),
+    /// while the field still has the focus. Exo's detach confirms the
+    /// composition too (E6), but the keyboard hears of the focus change
+    /// first (E12), so its confirmation arrives while the link drains, and
+    /// is dropped.
+    #[tokio::test]
+    async fn a_focus_loss_commits_the_shown_preedit_before_leave() {
+        let mut f = Field::enabled().await;
+        f.s.host([f.preedit("가", "가")]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            f.events([preedit("가"), V3::Done { serial: 1 }])
+        );
+        let leave = wl_keyboard::evt::leave(f.keyboard.host, 2, f.surface.host);
+        f.s.host([leave]).await;
+        let surface = f.surface.id;
+        let leave = wl_keyboard::Event::Leave { serial: 2, surface };
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.push((f.keyboard.id, leave.into()));
+        expected.extend(f.events([V3::Leave { surface }]));
+        assert_eq!(f.s.guest_received(), expected);
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(callback)]);
+
+        f.s.host([f.confirm(), v1::leave(f.host)]).await;
+        assert_eq!(f.s.guest_received(), []);
+        f.drain(callback).await;
+        assert_eq!(f.s.host_received(), []);
     }
 
     /// Exo's text input hears of a focus change before the keyboard: its

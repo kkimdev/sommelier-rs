@@ -692,20 +692,27 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         Self::initialize_host_keyboard_enter_state(ctx, host_keyboard_id, keys);
         // The protocol requires a modifiers event after every enter, but Exo
         // sends one before it, and only when the modifiers changed. Send
-        // the guest the keyboard's modifiers after the forwarded enter.
+        // the guest the keyboard's modifiers after the enter.
         let modifiers = ctx
             .keyboard_modifiers
             .get(&host_keyboard_id)
             .copied()
             .unwrap_or_default();
-        ctx.host_to_client_queue.push(wl_keyboard::evt::modifiers(
+        let enter = match wl_keyboard::evt::enter(guest_keyboard_id, serial, guest_surface_id, keys)
+        {
+            Ok(enter) => enter,
+            Err(error) => {
+                return ctx.fail(format_args!("Unable to resend wl_keyboard.enter: {error}"));
+            }
+        };
+        let modifiers = wl_keyboard::evt::modifiers(
             guest_keyboard_id,
             serial,
             modifiers.depressed,
             modifiers.latched,
             modifiers.locked,
             modifiers.group,
-        ));
+        );
 
         if focus_update.seat_changes.is_empty() {
             // Another wl_keyboard resource can enter the seat's already
@@ -717,14 +724,18 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 guest_seat_id,
                 guest_surface_id
             );
-            return Action::Forward;
         }
-        crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
-
-        Action::Forward
+        // The IME core sends them after the commit of a preedit the focus
+        // change ends (F1).
+        crate::handler::text_input::apply_keyboard_focus_changes(
+            ctx,
+            &focus_update.seat_changes,
+            vec![enter, modifiers],
+        );
+        Action::Drop
     }
 
-    fn on_leave(&mut self, ctx: &mut Context, _serial: u32, surface: u32) -> Action {
+    fn on_leave(&mut self, ctx: &mut Context, serial: u32, surface: u32) -> Action {
         // on_leave is a host→client event: last_sender_id is the host keyboard ID.
         let host_keyboard_id = HostId::from_event_sender(ctx);
         let guest_keyboard_id = ctx
@@ -755,13 +766,16 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         for retired_keyboard in &focus_update.retired_keyboards {
             Self::clear_host_keyboard_state(ctx, *retired_keyboard);
         }
-        crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
-
-        if surface_can_be_forwarded {
-            Action::Forward
-        } else {
-            Action::Drop
-        }
+        // The IME core sends the leave after the commit of a preedit the
+        // focus change ends (F1).
+        let leave = surface_can_be_forwarded
+            .then(|| wl_keyboard::evt::leave(guest_keyboard_id, serial, guest_surface_id));
+        crate::handler::text_input::apply_keyboard_focus_changes(
+            ctx,
+            &focus_update.seat_changes,
+            leave.into_iter().collect(),
+        );
+        Action::Drop
     }
 
     /// Handle key events: resolve keysym, check against SOMMELIER_ACCELERATORS,
@@ -1016,7 +1030,11 @@ pub(crate) fn forget_keyboard(ctx: &mut Context, guest_keyboard_id: u32, host_ke
             host_keyboard_id.0
         );
     }
-    crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
+    crate::handler::text_input::apply_keyboard_focus_changes(
+        ctx,
+        &focus_update.seat_changes,
+        Vec::new(),
+    );
 }
 
 /// `zcr_keyboard_extension_v1` handler — sommelier only sends requests to this
@@ -2587,11 +2605,11 @@ mod tests {
         // Focus leaves before the chord's release, which the old surface
         // will never receive. The consumed generation must not survive and
         // swallow the first press after focus returns.
-        assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Forward);
+        assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Drop);
         assert_eq!(p.owner(PLACING, KEY_Q), None);
         // Exo sends the released Alt before the enter.
         p.modifiers(PLACING, 0);
-        assert_eq!(p.enter(PLACING, PLACED_HOST_SURFACE, &[]), Action::Forward);
+        assert_eq!(p.enter(PLACING, PLACED_HOST_SURFACE, &[]), Action::Drop);
 
         assert_eq!(
             p.key(PLACING, 6, 300, KEY_Q, PRESSED),
@@ -2609,13 +2627,13 @@ mod tests {
         let mut p = placeable_shortcut();
         assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
 
-        // The host re-enters with the chord key still held. The forwarded
+        // The host re-enters with the chord key still held. The re-sent
         // enter's keys array reports it pressed to the guest, so its later
         // release belongs to the guest rather than to the consumed shortcut.
-        assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Forward);
+        assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Drop);
         assert_eq!(
             p.enter(PLACING, PLACED_HOST_SURFACE, &[KEY_Q]),
-            Action::Forward
+            Action::Drop
         );
         assert_eq!(p.owner(PLACING, KEY_Q), Some(Physical));
         assert_eq!(p.key(PLACING, 5, 101, KEY_Q, RELEASED), Action::Forward);
@@ -2647,14 +2665,14 @@ mod tests {
         // A real host focus cycle lands while the placement barrier holds
         // configures. It drains the host IME generation through its own
         // text-input barrier and the guest re-enables on the new enter.
-        assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Forward);
+        assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Drop);
         let state = text_input::view(&p.ctx, t.guest);
         let Host::Draining(ime_barrier) = state.host else {
             panic!("focus leave must drain the host IME generation: {state:?}");
         };
         assert_ne!(ime_barrier.0, placement_barrier);
         assert_eq!(state.preedit, None);
-        assert_eq!(p.enter(PLACING, PLACED_HOST_SURFACE, &[]), Action::Forward);
+        assert_eq!(p.enter(PLACING, PLACED_HOST_SURFACE, &[]), Action::Drop);
         p.ctx.last_sender_id = t.guest;
         let mut v3 = crate::handler::text_input::TextInputV3Handler;
         assert_eq!(v3.on_enable(&mut p.ctx), Action::Drop);
@@ -3658,13 +3676,11 @@ mod tests {
         };
         p.ctx.keyboard_modifiers.insert(keyboard, held);
 
-        assert_eq!(
-            p.enter(OTHER_KEYBOARD, OTHER_SURFACE.1, &[]),
-            Action::Forward
-        );
+        assert_eq!(p.enter(OTHER_KEYBOARD, OTHER_SURFACE.1, &[]), Action::Drop);
         let queued_after_enter = p.ctx.host_to_client_queue.len();
-        assert_eq!(p.leave(KEYBOARD, SURFACE.1), Action::Forward);
-        assert_eq!(p.ctx.host_to_client_queue.len(), queued_after_enter);
+        assert_eq!(p.leave(KEYBOARD, SURFACE.1), Action::Drop);
+        // Only the keyboard's own leave, which the IME core re-sends.
+        assert_eq!(p.ctx.host_to_client_queue.len(), queued_after_enter + 1);
 
         assert!(p.ctx.keyboard_focus.focus_for_keyboard(keyboard).is_none());
         assert_eq!(
@@ -3716,7 +3732,7 @@ mod tests {
             .cancel_backspace_repeat(keyboard, BACKSPACE);
         assert!(p.ctx.claim_guest_key(keyboard, BACKSPACE, ImeRecovery));
 
-        assert_eq!(p.enter(OTHER_KEYBOARD, SURFACE.1, &[]), Action::Forward);
+        assert_eq!(p.enter(OTHER_KEYBOARD, SURFACE.1, &[]), Action::Drop);
         assert_eq!(p.leave(KEYBOARD, 999), Action::Drop);
 
         assert!(!p.held(KEYBOARD, BACKSPACE));
@@ -3769,7 +3785,7 @@ mod tests {
         );
 
         // A matching leave still ends the fallback and clears focus.
-        assert_eq!(p.leave(KEYBOARD, SURFACE.1), Action::Forward);
+        assert_eq!(p.leave(KEYBOARD, SURFACE.1), Action::Drop);
         assert_eq!(p.ctx.keyboard_focus.surface_for_seat(KEYBOARD.seat), None);
         assert!(!repeating(&p));
     }
@@ -3797,7 +3813,7 @@ mod tests {
         };
         text_input::insert(&mut p.ctx, TEXT_INPUT.guest, stale);
 
-        assert_eq!(p.enter(KEYBOARD, SURFACE.1, &[]), Action::Forward);
+        assert_eq!(p.enter(KEYBOARD, SURFACE.1, &[]), Action::Drop);
 
         let state = text_input::view(&p.ctx, TEXT_INPUT.guest);
         assert_eq!(state.focus, Some(SURFACE.0));
@@ -3854,8 +3870,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Releasing the keyboard that gave a seat its focus ends the seat's
-    /// text-input focus: the guest gets its leave, and the host input
-    /// method is deactivated and drained.
+    /// text-input focus: the guest commits its preedit and gets its leave,
+    /// and the host input method is deactivated and drained.
     #[tokio::test]
     async fn keyboard_release_ends_focus_when_no_other_keyboard_owns_the_seat() {
         let mut kb = Kb::new().await;
@@ -3866,7 +3882,23 @@ mod tests {
 
         kb.s.guest([wl_keyboard::req::release(kb.k.id)]).await;
         let surface = kb.surface.id;
-        assert_eq!(kb.s.guest_received(), [v3_leave(ime, surface)]);
+        let clear = zwp_text_input_v3::Event::PreeditString {
+            text: Some("".into()),
+            cursor_begin: 0,
+            cursor_end: 0,
+        };
+        let commit = zwp_text_input_v3::Event::CommitString {
+            text: Some("한".into()),
+        };
+        assert_eq!(
+            kb.s.guest_received(),
+            [
+                (ime.id, clear.into()),
+                (ime.id, commit.into()),
+                done(ime),
+                v3_leave(ime, surface)
+            ]
+        );
         let host = kb.s.host_received();
         assert_eq!(host[..2], released(kb.k));
         assert!(deactivated(ime, &host[2..]), "{host:?}");

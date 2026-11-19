@@ -751,20 +751,9 @@ impl SpecText {
             AnyEvent::ZwpTextInputV1(event) => self.text_input(event, origin),
             AnyEvent::ZcrExtendedTextInputV1(extended::Event::ConfirmPreedit { .. }) => {
                 // X2 confirms the shown preedit; X2' recovers a held key.
-                self.composition_event(origin, |spec| {
-                    let Some(shown) = spec.shown.take() else {
-                        return spec.recover_held_key(origin);
-                    };
-                    let commit = shown.text;
-                    spec.end_lease();
-                    spec.edited();
-                    Some((
-                        Txn {
-                            commit,
-                            ..Txn::default()
-                        },
-                        (0, 0),
-                    ))
+                self.composition_event(origin, |spec| match spec.commit_shown() {
+                    Some(txn) => Some((txn, (0, 0))),
+                    None => spec.recover_held_key(origin),
                 });
             }
             &AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion {
@@ -921,13 +910,37 @@ impl SpecText {
         Some((Txn::default(), (0, 0)))
     }
 
-    /// F1: a focus change resets the text input. The field it leaves ends
-    /// its composition, which the guest drops at the text input's `leave`.
-    /// The keyboard ends the seat's lease and forgets its latest peek.
+    /// The commit of the shown preedit, if the guest shows one, which ends
+    /// the composition (X2, F1, H2).
+    fn commit_shown(&mut self) -> Option<Txn> {
+        let shown = self.shown.take()?;
+        self.end_lease();
+        self.edited();
+        Some(Txn {
+            commit: shown.text,
+            ..Txn::default()
+        })
+    }
+
+    /// F1: a focus change resets the text input. The field it leaves
+    /// commits the preedit the guest shows, before the text input's
+    /// `leave`, as mutter and ibus do at a focus-out, and as Exo's detach
+    /// would (E6) if its confirmation reached the proxy before the
+    /// keyboard's `leave` (E12).
     fn move_focus(&mut self, focus: Option<usize>) {
         if focus == self.focus {
             return;
         }
+        if let Some(txn) = self.commit_shown() {
+            self.apply(&txn, (0, 0));
+        }
+        self.reset_focus(focus);
+    }
+
+    /// The focus moves to `focus`, and the field it leaves ends its
+    /// composition, which the guest drops at the text input's `leave`. The
+    /// keyboard ends the seat's lease and forgets its latest peek.
+    fn reset_focus(&mut self, focus: Option<usize>) {
         self.end_lease();
         self.latest_peek = None;
         if let Some(left) = self.focus {
@@ -1400,13 +1413,14 @@ impl SpecText {
     /// is focused on it, it leaves it while the surface is still valid, and
     /// its focus is projected again from the seat's keyboard focus, which
     /// the destroyed surface had and which no surface has now. Its field
-    /// is reset as at any focus change.
+    /// is reset as at any focus change, but commits nothing: the guest
+    /// destroyed the window it would go into.
     fn surface_destroyed(&mut self, field: usize) {
         self.counts.surface_destroys += 1;
         if self.focus == Some(field) {
             self.counts.focused_surface_destroys += 1;
             self.held.clear();
-            self.move_focus(None);
+            self.reset_focus(None);
         }
     }
 }
@@ -2300,8 +2314,8 @@ mod tests {
         host(&mut spec, v1::Event::Leave {}, &[activate(0)]);
         assert_eq!(spec.views[0], view("0", 1, ""));
         assert_eq!(spec.counts.host_detaches, 1);
-        // F1: the keyboard leaves; the guest drops the preedit at the text
-        // input's leave.
+        // F1: the keyboard leaves; the guest commits the preedit before the
+        // text input's leave.
         let mut spec = attached(&["0", "1"]);
         preedit(&mut spec, "가");
         let leave = wl_keyboard::Event::Leave {
@@ -2309,11 +2323,11 @@ mod tests {
             surface: HOST[0],
         };
         host(&mut spec, leave, &[deactivate(), sync()]);
-        assert_eq!(spec.views[0], view("0", 1, ""));
+        assert_eq!(spec.views[0], view("0가", 4, ""));
         // Draining, the gate is shut.
         preedit(&mut spec, "각");
         host(&mut spec, enter(0), &[]);
-        assert_eq!(spec.views[0], view("0", 1, ""));
+        assert_eq!(spec.views[0], view("0가", 4, ""));
         // A leave that answers the proxy's deactivate is not Exo's own
         // (H2').
         host(&mut spec, v1::Event::Leave {}, &[]);
