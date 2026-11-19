@@ -1033,8 +1033,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   for: the bytes around the cursor that preedit regions took since the
   guest last reported (`TextInputState::unreported_taken`; only the
   guest's committed surrounding text, or an edit that ends the composition
-  and gives the bytes back as text, clears it, and a host `preedit_string`
-  does not). While it is set, a new region deletes only the bytes around it
+  and gives the bytes back as text, a preedit cleared with a reset commit
+  included, clears it, and any other host `preedit_string` does not).
+  While it is set, a new region deletes only the bytes around it
   that the guest still has, including after a `preedit_string` replaced
   the region's preedit. A region that does not cover those bytes, an empty
   region and a region short on either side included, is dropped with a
@@ -1044,6 +1045,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `exo_deletes_become_v3_deletes_around_the_cursor`,
   `a_region_over_a_region_deletes_only_what_the_guest_has`,
   `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`,
+  `a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back`,
   `a_region_equal_to_the_shown_one_sends_only_the_preedit`,
   `a_region_that_does_not_cover_the_shown_one_is_dropped`,
   `a_region_over_a_region_deletes_the_rest_on_both_sides`,

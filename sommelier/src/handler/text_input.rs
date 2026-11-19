@@ -5275,6 +5275,27 @@ mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
+    /// A preedit cleared with a reset commit gives the guest the region's
+    /// bytes back as text, as a commit does, so a later region deletes
+    /// them again.
+    #[tokio::test]
+    async fn a_region_after_a_reset_commit_deletes_the_bytes_it_gave_back() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // The guest's text is "abcd|ef" again.
+        f.s.host([f.preedit("", "d")]).await;
+        let expected = [no_preedit(), commit("d"), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
+        let expected = [delete(2, 0), preedit_at("cd", 2, 2), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
     /// A region equal to the shown one deletes nothing more: only the
     /// preedit is sent again.
     #[tokio::test]

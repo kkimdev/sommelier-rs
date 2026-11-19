@@ -326,8 +326,9 @@ pub struct TextInputState {
     /// guest no longer has though that text still holds them. `Some` only
     /// while [`Self::unreported_host_edit`] is set, and [`Self::commit`]
     /// owns both. A host `preedit_string` leaves it alone; an edit that
-    /// ends the composition (a commit, a delete, a confirmation) gives
-    /// the bytes back as text, and so clears it. A stale guest report that
+    /// ends the composition (a commit, a preedit cleared with a reset
+    /// commit, a delete, a confirmation) gives the bytes back as text, and
+    /// so clears it. A stale guest report that
     /// crosses a transaction clears it early, the same race INVARIANTS
     /// already admits for the flag.
     pub(crate) unreported_taken: Option<(u32, u32)>,
@@ -603,8 +604,12 @@ impl TextInputState {
         let cleared = text.is_empty() && plan.had_preedit;
         let arm_backspace_repeat = cleared && !has_reset_commit && backspace_held;
         // A cleared preedit with a reset commit reaches the guest as that
-        // commit, an edit the guest has yet to report.
-        self.unreported_host_edit |= cleared && has_reset_commit;
+        // commit, an edit the guest has yet to report, which gives the
+        // bytes regions took back as text, as a commit does.
+        if cleared && has_reset_commit {
+            self.unreported_host_edit = true;
+            self.unreported_taken = None;
+        }
         self.current_preedit = ShownPreedit { text, cursor };
         arm_backspace_repeat
     }

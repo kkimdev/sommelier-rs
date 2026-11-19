@@ -792,10 +792,12 @@ impl SpecText {
                     }
                     if text.is_empty() {
                         let commit = shown.map_or_else(String::new, |_| commit.clone());
-                        // The reset commit is an edit, which leaves the
-                        // bytes regions took alone, as any preedit_string
-                        // does.
-                        spec.ahead |= !commit.is_empty();
+                        // The reset commit is an edit that ends the
+                        // composition, which gives the bytes regions took
+                        // back as text.
+                        if !commit.is_empty() {
+                            spec.edited();
+                        }
                         let txn = Txn {
                             commit,
                             ..Txn::default()
