@@ -918,9 +918,10 @@ impl KnownIssue {
     pub fn reason(self) -> &'static str {
         match self {
             Self::FocusWhileComposing => {
-                "the keyboard's leave reaches the proxy before Exo's confirmation (E12), so the \
-                 field reset clears the composition without telling the guest, and the drain \
-                 drops the confirmation"
+                "the keyboard hears of the focus move first (E12), so the proxy resets the \
+                 field (F1) and sends the guest only `leave`, at which GTK drops its preedit; \
+                 Exo's detach then confirms the composition, but the link is draining and the \
+                 proxy drops the confirmation"
             }
         }
     }
@@ -946,40 +947,20 @@ pub(super) fn classify(
 
 /// Whether `client` shows exactly what P1 predicts of `actions` on fields
 /// holding `texts`, typed as `typing` says: the user's intent, except that
-/// some of the focus moves away from a composing field lose the
-/// composition instead of committing it. Which ones depends on Exo's order
-/// at each move (E12), so each choice of them is tried, up to 12 moves.
+/// each focus move away from a composing field loses the composition
+/// instead of committing it.
 pub(super) fn focus_moves_lose_composition(
     texts: &[String],
     typing: Typing,
     actions: &[UserAction],
     client: &dyn Client,
 ) -> bool {
-    let fresh = || {
-        let fields = texts.iter().map(|text| TextModel::new(text)).collect();
-        Reference::new(fields).typing(typing)
-    };
-    let mut reference = fresh();
-    let mut moves = Vec::new();
-    for (i, &action) in actions.iter().enumerate() {
-        if reference.leaves_composition(action) {
-            moves.push(i);
-        }
-        reference.apply(action);
+    let fields = texts.iter().map(|text| TextModel::new(text)).collect();
+    let mut reference = Reference::new(fields).typing(typing);
+    for &action in actions {
+        reference.apply_losing_composition(action);
     }
-    if moves.is_empty() || moves.len() > 12 {
-        return false;
-    }
-    (1..1_u32 << moves.len()).any(|lost| {
-        let mut reference = fresh();
-        for (i, &action) in actions.iter().enumerate() {
-            match moves.iter().position(|&m| m == i) {
-                Some(bit) if lost >> bit & 1 == 1 => reference.apply_losing_composition(action),
-                _ => reference.apply(action),
-            }
-        }
-        intended(&reference, client).is_empty()
-    })
+    intended(&reference, client).is_empty()
 }
 
 /// A field as `"text with | at the cursor" preedit "…" at (begin, end)`.
