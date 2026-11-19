@@ -573,6 +573,8 @@ fn composition_event(
         log::debug!("Ignoring a stale composition event of text input {}", ti.0);
         return None;
     };
+    // A region dropped, whose empty range commits the shown preedit.
+    let mut dropped = None;
     let (planned, takes) = match event {
         HostIme::Preedit {
             serial,
@@ -610,6 +612,10 @@ fn composition_event(
                 Err(DeleteDrop::Empty) => return Some(Edit::default()),
                 Err(drop) => {
                     log_delete_drop(ti, t, index, length, drop);
+                    // Exo edited its text, unless the range was empty.
+                    if length > 0 {
+                        fx.keys.push(lease(ti, t, LeaseOutcome::End));
+                    }
                     return None;
                 }
             }
@@ -621,22 +627,18 @@ fn composition_event(
                 .and_then(|frame| frame.region(index, length, assembly));
             match txn {
                 Ok(txn) => (cur.plan(txn, LeaseOutcome::End), Takes::Before),
-                Err(RegionDrop::Unmeasured(why)) => {
-                    log_unmeasured(ti, t, "region", why);
-                    return None;
+                // Exo ends its composition at an empty region, measured or
+                // not, and leaves it as text: the guest commits what it
+                // shows, which at worst doubles text the next preedit
+                // would otherwise replace (design single-exo-model 3.4).
+                Err(drop) if length == 0 && cur.shown().is_some() => {
+                    dropped = Some((index, length, drop));
+                    (cur.commit_shown(), Takes::Before)
                 }
-                Err(drop @ RegionDrop::Uncovered) => {
-                    log::debug!(
-                        "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
-                        ti.0
-                    );
-                    return None;
-                }
-                Err(drop @ RegionDrop::NotAroundCursor) => {
-                    log::warn!(
-                        "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
-                        ti.0
-                    );
+                Err(drop) => {
+                    log_region_drop(ti, t, index, length, drop);
+                    // Exo edited its composition all the same.
+                    fx.keys.push(lease(ti, t, LeaseOutcome::End));
                     return None;
                 }
             }
@@ -654,6 +656,9 @@ fn composition_event(
     };
     let edit = planned.edit();
     let applied = planned.apply();
+    if let Some((index, length, drop)) = dropped {
+        log_region_drop(ti, t, index, length, drop);
+    }
     let take = match takes {
         Takes::Before => false,
         Takes::IfApplied => applied.is_ok(),
@@ -813,6 +818,22 @@ fn push_focus_events(ti: TiId, old: Option<SurfaceId>, new: Option<SurfaceId>, f
 fn log_host_serial(serial: u32, count: u32) {
     if serial != count {
         log::debug!("Host event references guest serial {serial}, current serial is {count}");
+    }
+}
+
+/// X1's drops. One around no cursor is one Exo could not have sent, which
+/// warns.
+fn log_region_drop(ti: TiId, t: &mut TextInput, index: i32, length: u32, drop: RegionDrop) {
+    match drop {
+        RegionDrop::Unmeasured(why) => log_unmeasured(ti, t, "region", why),
+        RegionDrop::Uncovered => log::debug!(
+            "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
+            ti.0
+        ),
+        RegionDrop::NotAroundCursor => log::warn!(
+            "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
+            ti.0
+        ),
     }
 }
 

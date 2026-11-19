@@ -1435,7 +1435,10 @@ fn row_H9_a_delete_that_cannot_be_measured_is_dropped() {
             ime.step(Input::Commit(TI));
         }
         let out = ime.v1(HostIme::Delete { index, length });
-        assert!(out.guest.is_empty() && out.keys.is_empty(), "{case}");
+        assert_eq!(out.guest, [], "{case}");
+        // Exo edited its text, unless the range was empty.
+        let ended = (length > 0).then_some(lease(LeaseOutcome::End));
+        assert_eq!(out.keys, Vec::from_iter(ended), "{case}");
     }
 }
 
@@ -1555,7 +1558,7 @@ fn row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped() {
     };
     for (index, length) in [(-2, 1), (0, 1)] {
         let out = composing().ext(region(index, length));
-        let dropped = out.guest.is_empty() && out.keys.is_empty();
+        let dropped = out.guest.is_empty() && out.keys == [lease(LeaseOutcome::End)];
         assert!(dropped, "region {index}+{length}");
     }
     let out = composing().ext(region(-2, 3));
@@ -1602,7 +1605,7 @@ fn row_X1_a_region_that_does_not_cover_the_shown_one_is_dropped() {
         let out = ime.ext(region(-1, 2));
         assert_eq!(out.guest, [delete(1, 1), preedit_at("cd", 1, 1), done(2)]);
         let out = ime.ext(region(index, length));
-        let dropped = out.guest.is_empty() && out.keys.is_empty();
+        let dropped = out.guest.is_empty() && out.keys == [lease(LeaseOutcome::End)];
         assert!(dropped, "region {index}+{length}");
     }
 }
@@ -1632,7 +1635,7 @@ fn row_X1prime_a_region_the_text_cannot_hold_is_dropped() {
     let region = |index, length| HostIme::PreeditRegion { index, length };
     ime.v1(HostIme::PreeditCursor(0));
     let out = ime.ext(region(-1, 1));
-    assert!(out.guest.is_empty() && out.keys.is_empty());
+    assert_eq!(out.guest, []);
     assert_eq!(ime.compose("나").guest, [preedit("나"), done(1)]);
     ime.report("ab", 1);
     assert_eq!(ime.ext(region(1, 1)).guest, []);
@@ -2465,7 +2468,8 @@ fn drops(steps: impl Fn(&mut Ime) -> Out) {
     let out = steps(&mut ime);
     assert!(!ime.in_step(), "the guest is in step");
     assert_eq!(out.guest, [], "a guest transaction");
-    assert_eq!(out.keys, []);
+    // Exo edited all the same.
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
 }
 
 /// A report on its way to Exo that names no state of Exo's holds an
@@ -2593,6 +2597,48 @@ fn row_H9_after_a_forwarded_key_drops() {
             ime.delete(2, 2)
         });
     }
+}
+
+/// Exo ends its composition at an empty region, and leaves it as text,
+/// whether or not the mirror can measure the region. So an empty region
+/// the core drops, below v11 or after a key the guest has not stated,
+/// commits the preedit the guest shows: if Exo had kept it as well, the
+/// text doubles, where sending nothing would lose it to the next preedit,
+/// which replaces it (design single-exo-model 3.4).
+#[test]
+fn row_X1_an_unmeasured_empty_region_commits_the_shown_preedit() {
+    for version in [Some(10), Some(11)] {
+        let mut ime = Ime::enabled_at(version);
+        ime.report("ab", 2);
+        ime.compose("가");
+        ime.step(Input::GuestKey(SEAT));
+        let out = ime.region(0, 0);
+        assert_eq!(
+            out.guest,
+            [no_preedit(), commit("가"), done(2)],
+            "{version:?}"
+        );
+        assert_eq!(out.keys, [lease(LeaseOutcome::End)], "{version:?}");
+        assert_eq!(ime.compose("나").guest, [preedit("나"), done(2)]);
+    }
+}
+
+/// Exo edited its text at a delete or a region the core drops, so either
+/// ends the Backspace repeat leased to the text input, as one that reaches
+/// the guest does; an empty delete edits nothing, and leaves it.
+#[test]
+fn row_H9_X1_a_dropped_delete_or_region_ends_the_lease() {
+    let mut ime = Ime::enabled();
+    ime.report("abc", 3);
+    ime.step(Input::GuestKey(SEAT));
+    let out = ime.region(-1, 1);
+    assert_eq!(out.guest, []);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    let out = ime.delete(0, 1);
+    assert_eq!(out.guest, []);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    let out = ime.delete(1, 0);
+    assert_eq!((out.guest, out.keys), (vec![], vec![]));
 }
 
 /// An event that heals a mirror that was not exact, as a delete over a

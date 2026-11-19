@@ -3792,6 +3792,34 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), []);
     }
 
+    /// An empty region the core cannot measure, here after a key the guest
+    /// has not stated, still ends Exo's composition as text, so the guest
+    /// commits the preedit it shows rather than lose it to Exo's next
+    /// preedit.
+    #[tokio::test]
+    async fn an_unmeasured_empty_region_commits_the_shown_preedit() {
+        let mut f = Field::with_surrounding_text("abc", 3, 3).await;
+        let done = || V3::Done { serial: 2 };
+        f.s.host([f.preedit("가", "가")]).await;
+        assert_eq!(f.s.guest_received(), f.events([preedit("가"), done()]));
+        let space = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 50,
+            time: 1_000,
+        };
+        f.s.host([f.key(space)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(space)]);
+        f.host_received().await;
+        f.s.host([
+            ext::set_preedit_region(f.host_ext, 0, 0),
+            f.preedit("나", "나"),
+        ])
+        .await;
+        let expected = [no_preedit(), commit("가"), done(), preedit("나"), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
     /// #85: a region over the shown region deletes while the guest shows a
     /// preedit, which Chromium drops (C3), so the guest is out of step with
     /// Exo; the next, growing region is dropped, and the input method's
@@ -5487,9 +5515,10 @@ pub(super) mod tests {
     /// Host text too long for a message is dropped whole: the guest gets
     /// nothing, and the text input and its repeat lease stay as they were,
     /// except that the event takes what the host recorded for it: a
-    /// preedit, preedit region or confirmation the preedit cursor and
-    /// styling, a commit the cursor position. Otherwise the next one would
-    /// apply them. Only host
+    /// preedit or a confirmation the preedit cursor and styling, a commit
+    /// the cursor position. Otherwise the next one would apply them. (A
+    /// region is measured only in step with the Exo mirror, which state set
+    /// up directly is not.) Only host
     /// text the proxy lengthened by replacing invalid UTF-8 fits the host's
     /// message but not the guest's (`host_ime_events_become_v3_transactions`
     /// sends such a commit); this test reaches every such drop directly.
@@ -5497,10 +5526,9 @@ pub(super) mod tests {
     fn oversized_host_text_does_not_partially_advance_state() {
         let oversized = "x".repeat(4_084);
         type Event = fn(&mut Ime, &str);
-        let cases: [(&str, Event); 4] = [
+        let cases: [(&str, Event); 3] = [
             ("preedit", |ime, text| ime.preedit(text, "")),
             ("commit", |ime, text| ime.commit(text)),
-            ("preedit region", |ime, _| ime.preedit_region(-4_084, 4_084)),
             ("confirm", |ime, _| ime.confirm()),
         ];
         for (case, event) in cases {

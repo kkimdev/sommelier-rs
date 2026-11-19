@@ -1136,7 +1136,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   - while the guest has a selection: GTK and Qt count v3 lengths from the
     cursor, while Chromium's v3 client counts them from the selection's
     ends (`ui/ozone/platform/wayland/host/wayland_input_method_context.cc`
-    802-825), so no lengths delete Exo's range in both;
+    802-825), so no lengths delete Exo's range in both; no guest with a
+    selection is in step with Exo, so a region is dropped then too (the
+    selection cases of `exo_deletes_become_v3_deletes_around_the_cursor`,
+    and `an_empty_preedit_region_sends_no_delete`);
   - for a negative index, which only the v1 XML's cursor-relative
     reading could mean, and a range that does not contain Exo's cursor or
     does not fit its text on character boundaries: Exo sends none of
@@ -1173,6 +1176,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_region_equal_to_the_shown_one_sends_only_the_preedit`,
   `a_region_that_does_not_cover_the_shown_one_is_dropped`,
   `a_region_over_a_region_deletes_the_rest_on_both_sides`,
+  `an_empty_preedit_region_sends_no_delete`,
   `a_reset_commit_waits_for_the_guest_to_report_it`.
 - **Exo's deletes and regions are measured in the Exo mirror, or
   dropped.** A text input has a mirror (`ime::exo_view::ExoView`'s
@@ -1267,14 +1271,20 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     nothing (previous rule). Otherwise the delete or region is dropped,
     with a debug log that names why (`ime::exo_view::Unmeasured`: a
     mirror unsure before the event or after it, keys or presses the guest
-    has not stated, a crossing report, or a guest out of step). A drop sends nothing, takes a
-    region's assembly, and leaves the guest out of step, until its next
-    report puts it in step again, matched or reset. A drop is not
-    harmless, as the input method goes on as if it applied, and its next
-    commit doubles the text (a reconverted 한국 committed as 韓國 shows
-    한국韓國; an accepted suggestion shows `word word~`), but it never
-    deletes or loses the guest's text, and the guest's next report, which
-    names no state of Exo's, resets Exo to the guest's text.
+    has not stated, a crossing report, or a guest out of step). A drop
+    sends nothing, but an empty region over a preedit the guest shows,
+    which Exo ends as text whether or not the proxy can measure it: the
+    guest commits that preedit, as it would were the region measured, so
+    that Exo's next preedit, which replaces Exo's composition, cannot lose
+    it from the guest. A drop takes a region's assembly, ends the
+    Backspace repeat leased to the text input, as Exo edited, but for an
+    empty delete, which edits nothing, and leaves the guest out of step,
+    until its next report puts it in step again, matched or reset. A drop
+    is not harmless, as the input method goes on as if it applied, and its
+    next commit doubles the text (a reconverted 한국 committed as 韓國
+    shows 한국韓國; an accepted suggestion shows `word word~`), but it
+    never deletes or loses the guest's text, and the guest's next report,
+    which names no state of Exo's, resets Exo to the guest's text.
   - With a mirror, a guest report that would only drop Exo's composition
     is withheld (design exo-mirror 5; `ime::exo_view::ExoView::withholds`).
     A v3 guest reports its text without
@@ -1315,6 +1325,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_region_over_a_host_preedit_with_exos_cursor_inside_it`,
   `many_empty_confirmations_keep_the_mirror_exact`,
   `a_delete_in_flight_at_a_press_is_dropped`,
+  `an_unmeasured_empty_region_commits_the_shown_preedit`,
+  `an_unmeasured_empty_region_must_commit_the_shown_preedit`,
+  `ime_edits_end_a_stale_backspace_repeat`,
   `a_cursor_position_pair_sets_the_selection_and_keeps_the_composition`,
   `exos_delete_or_region_reaches_the_guest_as_exos_text_measures_it_or_not_at_all`,
   `a_highlight_is_vague_until_a_commit`,

@@ -460,6 +460,10 @@ struct Measuring {
     /// the guest can be in step with Exo; `None` for none.
     measured: Option<Measured>,
     region: bool,
+    /// What the guest gets if the proxy cannot measure it: an empty
+    /// region over a preedit the guest shows commits it, as Exo ends its
+    /// composition as text all the same.
+    fallback: Option<Txn>,
     /// The guest held Exo's text, without its composition, which it
     /// showed, cursor included.
     truth_in_step: bool,
@@ -766,7 +770,7 @@ impl SpecText {
                 length,
             }) => self.composition_event(origin, |spec| {
                 let measured = spec.measure_region(truth, index, length, origin);
-                spec.measure(truth, measured, true);
+                spec.measure(truth, measured, true, length);
                 None
             }),
             _ => {}
@@ -1120,7 +1124,7 @@ impl SpecText {
             &v1::Event::DeleteSurroundingText { index, length } => {
                 self.composition_event(origin, |spec| {
                     let measured = spec.measure_delete(truth, index, length, origin);
-                    spec.measure(truth, measured, false);
+                    spec.measure(truth, measured, false, length);
                     None
                 });
             }
@@ -1131,11 +1135,28 @@ impl SpecText {
     /// H9 and X1: the step's delete or region, which Exo's text before it
     /// (`truth`) measures to `measured`, the transaction the guest gets if
     /// the proxy sends it. Only an Exo mirror measures, and only from v11.
-    fn measure(&mut self, truth: Option<&RegionTruth>, measured: Option<Measured>, region: bool) {
+    /// Exo edited its text, unless the event is an empty delete, so the
+    /// Backspace lease ends whatever reaches the guest.
+    fn measure(
+        &mut self,
+        truth: Option<&RegionTruth>,
+        measured: Option<Measured>,
+        region: bool,
+        length: u32,
+    ) {
+        if region || length > 0 {
+            self.end_lease();
+        }
+        let fallback = self.shown.as_ref().filter(|_| region && length == 0);
+        let fallback = fallback.map(|shown| Txn {
+            commit: shown.text.clone(),
+            ..Txn::default()
+        });
         self.measuring = Some(Measuring {
             txns: self.txns.len(),
             measured: measured.filter(|_| self.mirrored),
             region,
+            fallback,
             truth_in_step: truth.is_some_and(|truth| self.truth_in_step(truth)),
         });
     }
@@ -1155,18 +1176,26 @@ impl SpecText {
 
     /// The guest got the transactions `got` in the step of a delete or a
     /// region (`measuring`), after the step's earlier ones: either the one
-    /// Exo's text measures, which the specification then applies, or none,
-    /// a drop. Anything else fails the step, as the specification has none.
+    /// Exo's text measures, which the specification then applies, or a
+    /// drop: none, or the commit of the shown preedit for an empty region,
+    /// which the specification then applies. Anything else fails the step.
     fn resolve(&mut self, measuring: Measuring, got: &[(Txn, (i32, i32))]) {
         let Some(after) = got.get(measuring.txns..) else {
             return;
         };
-        match measuring.measured {
-            Some(measured) if after == [(measured.txn.clone(), measured.cursor)] => {
+        match (measuring.measured, measuring.fallback) {
+            (Some(measured), _) if after == [(measured.txn.clone(), measured.cursor)] => {
                 self.region_dropped &= !measuring.region;
                 self.accept(measured);
             }
-            measured if after.is_empty() => {
+            // Required: a guest that gets anything else fails the step.
+            (measured, Some(fallback)) => {
+                let dropped = measured.is_some() && measuring.truth_in_step;
+                self.counts.drops_truth_in_step += u64::from(dropped);
+                self.shown = None;
+                self.apply(&fallback, (0, 0));
+            }
+            (measured, None) if after.is_empty() => {
                 let dropped = measured.is_some() && measuring.truth_in_step;
                 self.counts.drops_truth_in_step += u64::from(dropped);
                 self.region_dropped |= measuring.region;
@@ -2499,6 +2528,43 @@ mod tests {
                 let in_step = u64::from(got.is_empty() && extension == Some(11));
                 assert_eq!(spec.counts.drops_truth_in_step, in_step, "{case}");
             }
+        }
+    }
+
+    /// An empty region over a preedit the guest shows that the proxy does
+    /// not measure, as with no mirror below v11, must commit that preedit:
+    /// Exo ends its composition as text all the same.
+    #[test]
+    fn an_unmeasured_empty_region_must_commit_the_shown_preedit() {
+        let region = || -> AnyEvent {
+            extended::Event::SetPreeditRegion {
+                index: 0,
+                length: 0,
+            }
+            .into()
+        };
+        let commit = Txn {
+            commit: "가".to_owned(),
+            ..Txn::default()
+        };
+        for (got, fails) in [(vec![(commit, (0, 0))], false), (vec![], true)] {
+            let mut spec = attached(&["0ab"]).at_extension(Some(10));
+            report(&mut spec, "0ab", 3);
+            preedit(&mut spec, "가");
+            // The steps so far, which no shadow checked.
+            spec.txns.clear();
+            spec.see(Seen::Host {
+                sender: SYNC,
+                event: &region(),
+                origin: Origin::default(),
+                region: None,
+            });
+            spec.see(Seen::StepEnd);
+            let mut shadow = Shadow::new(both(1), &texts(&["0ab"]));
+            shadow.txns = got;
+            let failed = step(&mut spec, &mut shadow).is_some_and(|f| f.contains("transactions"));
+            assert_eq!(failed, fails);
+            assert_eq!(spec.views[0], view("0ab가", 6, ""));
         }
     }
 
