@@ -114,30 +114,36 @@ const CASES: &[Regression] = &[
         choices: &[],
     },
     Regression {
-        // Seed 1008182, shrunk. The guest shows a host preedit, which Exo
+        // Seed 1000050, shrunk. The guest shows a host preedit, which Exo
         // holds before its cursor, when the input method reconverts it.
         name: "a region over a host preedit is measured from Exo's cursor",
-        client: ClientKind::Gtk3,
+        client: ClientKind::Chromium,
         settled: false,
         latin: false,
-        texts: &["01닭가2가", "0닭a1aa2"],
+        texts: &["01닭2", "0닭1bb2b"],
         actions: &[
-            UserAction::Key(Key::Char('w')),
-            UserAction::Key(Key::Char('T')),
-            UserAction::Key(Key::Char('j')),
-            UserAction::Key(Key::Char('v')),
-            UserAction::Key(Key::Char('d')),
-            UserAction::RestartInputMethod,
+            UserAction::Key(Key::Char('e')),
+            UserAction::Click {
+                field: 0,
+                at: Target::BeforeMarker(1),
+            },
+            UserAction::Key(Key::Char('z')),
+            UserAction::Tap {
+                field: 0,
+                at: Target::BeforeMarker(2),
+            },
             UserAction::Reconvert,
+            UserAction::Key(Key::Char('o')),
         ],
         choices: &[
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1291, 0, 0, 0, 0, 0, 0, 589, 0, 126, 0, 0, 0, 0, 0, 0, 0,
+            1298, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 568, 0, 0, 0, 0, 0, 0, 0, 0, 914, 0, 0, 0, 0,
-            0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0,
-            0, 1, 0, 1, 0, 0, 0, 1,
+            0, 0, 0, 0, 0, 2, 0, 0, 602, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 290,
+            0, 0, 0, 0, 1,
         ],
     },
 ];
