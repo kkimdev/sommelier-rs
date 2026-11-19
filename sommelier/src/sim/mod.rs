@@ -437,12 +437,13 @@ fn pinned(test: &str, body: impl FnOnce()) {
     );
 }
 
-/// Runs the cases of one mode ([`pinned`]), and fails with the report of
-/// the first case that failed. A run of the default size or more must also
-/// have met each variant a case draws and each path the mode is there to
-/// reach: in free cases, presses that end a composition, fence drops, late
-/// answers the guest got and raw keys; in settled ones, presses and the
-/// known issue, and no fence drop, which a settled case must not cause.
+/// Runs the cases of one mode ([`pinned`]), prints the failed ones, and
+/// fails with the report of the first. A run of the default size or more
+/// must also have met each variant a case draws and each path the mode is
+/// there to reach: in free cases, presses that end a composition, fence
+/// drops, late answers the guest got and raw keys; in settled ones,
+/// presses and the known issue, and no fence drop, which a settled case
+/// must not cause.
 fn check(test: &str, settled: bool) {
     pinned(test, || {
         let summary = run_all(&cases(settled));
@@ -465,6 +466,12 @@ fn check(test: &str, settled: bool) {
                 issue.reason(),
                 issue.tracking()
             );
+        }
+        for report in failed {
+            let heading = report.lines().filter(|line| !line.starts_with("    "));
+            heading
+                .take_while(|line| !line.starts_with("  trace"))
+                .for_each(|line| println!("{line}"));
         }
         let mut reached = coverage.counters(!settled);
         match settled {
@@ -489,12 +496,6 @@ fn check(test: &str, settled: bool) {
             !settled || counts.fence_drops == 0,
             "a settled case met the fence: {counts:?}"
         );
-        for report in failed {
-            let heading = report.lines().filter(|line| !line.starts_with("    "));
-            heading
-                .take_while(|line| !line.starts_with("  trace"))
-                .for_each(|line| println!("{line}"));
-        }
         if let Some(first) = failed.first() {
             panic!(
                 "{} of {cases} DST cases failed; the first:\n{first}",
