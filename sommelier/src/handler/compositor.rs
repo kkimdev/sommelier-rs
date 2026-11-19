@@ -1089,6 +1089,7 @@ mod tests {
     use crate::protocols::AnyRequest;
     use crate::proxy::harness::Session;
     use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
+    use crate::test_support::text_input::{self, Host};
     use crate::test_support::{
         decode, decoded, mapped_test_buffer, msg_opcode, msg_sender, protocol_error_code,
         queued_headers, register_test_buffer, shm_pool_file, BufferKind, BUFFER_KINDS,
@@ -1200,29 +1201,16 @@ mod tests {
         assert_eq!(ctx.outputs.entered_for_test(100), None);
     }
 
-    fn active_text_input_state(
-        host_v1_id: u32,
-        guest_seat: u32,
-        active_surface: u32,
-    ) -> crate::state::TextInputState {
-        let mut state =
-            crate::state::TextInputState::new(host_v1_id, None, guest_seat, Some(active_surface));
-        state.pending = crate::state::V3Pending {
-            enabled: Some(true),
-            surrounding_text: Some(Some(("한".to_string(), 3, 3))),
-            content_type: Some((1, 1)),
-            cursor_rect: Some((1, 2, 3, 4)),
-        };
-        state.committed.enabled = true;
-        state.committed.surrounding_text = Some(("한".to_string(), 3, 3));
-        state.committed.content_type = (1, 1);
-        state.current_preedit = crate::state::ShownPreedit::at_end("한");
-        state.set_guest_commits(1);
-        state.pending_preedit_cursor = Some(1);
-        state.pending_preedit_selection = Some((0, 1));
-        state.pending_cursor_position = Some((1, 1));
-        state.host = crate::state::HostApplied::Active { content_type: None };
-        state
+    /// An enabled text input of `seat` focused on `surface`, whose host is
+    /// active, composing over committed surrounding text with state
+    /// pending.
+    fn composing(host: u32, seat: u32, surface: u32) -> text_input::Active<'static> {
+        text_input::Active {
+            surrounding_text: Some(("한", 3, 3)),
+            preedit: Some("한"),
+            pending: true,
+            ..text_input::Active::new(host, seat, Some(surface))
+        }
     }
 
     /// The pool file of local-copy buffer `guest_id`, which a test writes
@@ -3997,58 +3985,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave() {
-        let mut ctx = toplevel_ctx();
-        let surface = 100;
-        let text_input = 700;
-        let guest_keyboard = 800;
-        let host_keyboard = 900;
+    #[tokio::test]
+    async fn wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave() {
+        use crate::protocols::wayland::{wl_display, wl_keyboard, wl_seat};
+        use crate::wire::WL_DISPLAY_ID;
+        let mut s = Session::new();
+        let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+        let keyboard = s.keyboard_of(seat.id).await;
+        let surface = s.surface().await;
+        s.host([wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap()])
+            .await;
+        assert_eq!(s.guest_received().len(), 2, "the enter and its modifiers");
+        let text_input = s.text_input(seat.id).await;
+        let ti = text_input.id;
+        let enter = zwp_text_input_v3::Event::Enter {
+            surface: surface.id,
+        };
+        assert_eq!(s.guest_received(), [(ti, enter.into())]);
+        s.enable(text_input, 1).await;
+        let done = || (ti, zwp_text_input_v3::Event::Done { serial: 1 }.into());
+        let preedit = zwp_text_input_v1::evt::preedit_string(text_input.host, 0, "한", "");
+        s.host([preedit.unwrap()]).await;
+        let shown = zwp_text_input_v3::Event::PreeditString {
+            text: Some("한".into()),
+            cursor_begin: 3,
+            cursor_end: 3,
+        };
+        assert_eq!(s.guest_received(), [(ti, shown.into()), done()]);
 
-        ctx.shadow_table.insert_paired_for_test(1, 2, "wl_seat");
-        ctx.shadow_table
-            .insert_paired_for_test(text_input, 701, "zwp_text_input_v3");
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard, 1);
-        ctx.keyboard_focus.set_for_test(
-            crate::state::HostId(host_keyboard),
-            1,
-            surface,
-            SURFACE.host,
-        );
-        ctx.text_inputs.insert(text_input, {
-            let mut state = crate::state::TextInputState::new(702, None, 1, Some(surface));
-            state.current_preedit = crate::state::ShownPreedit::at_end("한");
-            state.host = crate::state::HostApplied::Active { content_type: None };
-            state
-        });
-
-        let mut compositor = CompositorHandler;
-        ctx.last_sender_id = surface;
+        s.guest([wl_surface::req::destroy(surface.id)]).await;
+        let leave = zwp_text_input_v3::Event::Leave {
+            surface: surface.id,
+        };
+        assert_eq!(s.guest_received(), [(ti, leave.into())]);
+        let host = s.host_received();
+        let [.., (_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] = host[..]
+        else {
+            panic!("the host got no drain barrier: {host:?}");
+        };
+        let deactivate = zwp_text_input_v1::Request::Deactivate { seat: seat.host };
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut compositor, &mut ctx),
-            Action::Drop
+            host,
+            [
+                (surface.host, wl_surface::Request::Destroy {}.into()),
+                (text_input.host, deactivate.into()),
+                (WL_DISPLAY_ID, wl_display::Request::Sync { callback }.into()),
+            ]
         );
-        assert_eq!(
-            decoded(
-                &ctx.host_to_client_queue,
-                zwp_text_input_v3::Event::from_wire
-            ),
-            [(text_input, zwp_text_input_v3::Event::Leave { surface })]
-        );
-        assert!(ctx.text_inputs[&text_input].active_surface.is_none());
 
         // The host may report the old keyboard leave after surface teardown.
-        // It must clear only stale keyboard state and not emit a second v3
-        // leave for the already-destroyed surface.
-        let mut keyboard = crate::handler::keyboard::KeyboardHandler::new();
-        ctx.last_sender_id = host_keyboard;
-        assert_eq!(
-            WlKeyboardHandler::on_leave(&mut keyboard, &mut ctx, 1, 200),
-            Action::Drop
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        // It must not emit a second v3 leave for the destroyed surface.
+        s.host([wl_keyboard::evt::leave(keyboard.host, 2, surface.host)])
+            .await;
+        assert_eq!(s.guest_received(), []);
+        assert_eq!(s.host_received(), []);
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, surface.host)])
+            .await;
+        let delete_id = wl_display::Event::DeleteId { id: surface.id };
+        assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
     }
 
     #[test]
@@ -4084,10 +4078,8 @@ mod tests {
                 host_object,
                 "zwp_text_input_v3",
             );
-            ctx.text_inputs.insert(
-                guest_text_input,
-                active_text_input_state(host_v1, guest_seat, active_surface),
-            );
+            let active = composing(host_v1, guest_seat, active_surface);
+            text_input::insert(&mut ctx, guest_text_input, active);
         }
 
         ctx.keyboard_focus.set_for_test(
@@ -4117,6 +4109,12 @@ mod tests {
                 .record_latest_peek(guest_seat, Some(surface), keyboard, sequence);
         }
 
+        let state = text_input::view(&ctx, 720);
+        assert_eq!(state.focus, Some(live_surface));
+        assert!(state.enabled);
+        assert_eq!(state.host, Host::Active);
+        assert_eq!(state.preedit.as_deref(), Some("한"));
+        let unaffected = text_input::snapshot(&ctx, 720);
         ctx.last_sender_id = destroyed_surface;
         assert_eq!(
             WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
@@ -4124,16 +4122,12 @@ mod tests {
         );
 
         for guest_text_input in [700, 710] {
-            let state = &ctx.text_inputs[&guest_text_input];
-            assert_eq!(state.active_surface, None);
-            assert!(!state.committed.enabled);
-            assert!(!state.host_is_active());
+            let state = text_input::view(&ctx, guest_text_input);
+            assert_eq!(state.focus, None);
+            assert!(!state.enabled);
+            assert_ne!(state.host, Host::Active);
         }
-        let unaffected = &ctx.text_inputs[&720];
-        assert_eq!(unaffected.active_surface, Some(live_surface));
-        assert!(unaffected.committed.enabled);
-        assert!(unaffected.host_is_active());
-        assert_eq!(unaffected.current_preedit.text, "한");
+        assert_eq!(text_input::snapshot(&ctx, 720), unaffected);
 
         assert_eq!(ctx.host_to_client_queue.len(), 2);
         for guest_text_input in [700, 710] {
@@ -4216,17 +4210,17 @@ mod tests {
             (
                 stale_with_replacement,
                 701,
-                active_text_input_state(702, seat_with_replacement, destroyed_surface),
+                composing(702, seat_with_replacement, destroyed_surface),
             ),
             (
                 healthy_on_replacement,
                 711,
-                active_text_input_state(712, seat_with_replacement, replacement_surface),
+                composing(712, seat_with_replacement, replacement_surface),
             ),
             (
                 stale_without_owner,
                 721,
-                active_text_input_state(722, seat_without_owner, destroyed_surface),
+                composing(722, seat_without_owner, destroyed_surface),
             ),
         ] {
             ctx.shadow_table.insert_paired_for_test(
@@ -4234,7 +4228,7 @@ mod tests {
                 host_object,
                 "zwp_text_input_v3",
             );
-            ctx.text_inputs.insert(guest_text_input, state);
+            text_input::insert(&mut ctx, guest_text_input, state);
         }
         ctx.key_generations.record_latest_peek(
             seat_with_replacement,
@@ -4261,28 +4255,30 @@ mod tests {
             "one stale projection must have no remaining keyboard owner"
         );
 
+        let state = text_input::view(&ctx, healthy_on_replacement);
+        assert_eq!(state.focus, Some(replacement_surface));
+        assert!(state.enabled);
+        assert_eq!(state.host, Host::Active);
+        assert_eq!(state.preedit.as_deref(), Some("한"));
+        let healthy = text_input::snapshot(&ctx, healthy_on_replacement);
         ctx.last_sender_id = destroyed_surface;
         assert_eq!(
             WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
             Action::Drop
         );
 
-        let repaired = &ctx.text_inputs[&stale_with_replacement];
-        assert_eq!(repaired.active_surface, Some(replacement_surface));
-        assert!(!repaired.committed.enabled);
-        assert!(!repaired.host_is_active());
-        assert!(!repaired.current_preedit.has_text());
+        let repaired = text_input::view(&ctx, stale_with_replacement);
+        assert_eq!(repaired.focus, Some(replacement_surface));
+        assert!(!repaired.enabled);
+        assert_ne!(repaired.host, Host::Active);
+        assert_eq!(repaired.preedit, None);
 
-        let repaired_without_owner = &ctx.text_inputs[&stale_without_owner];
-        assert_eq!(repaired_without_owner.active_surface, None);
-        assert!(!repaired_without_owner.committed.enabled);
-        assert!(!repaired_without_owner.host_is_active());
+        let repaired_without_owner = text_input::view(&ctx, stale_without_owner);
+        assert_eq!(repaired_without_owner.focus, None);
+        assert!(!repaired_without_owner.enabled);
+        assert_ne!(repaired_without_owner.host, Host::Active);
 
-        let healthy = &ctx.text_inputs[&healthy_on_replacement];
-        assert_eq!(healthy.active_surface, Some(replacement_surface));
-        assert!(healthy.committed.enabled);
-        assert!(healthy.host_is_active());
-        assert_eq!(healthy.current_preedit.text, "한");
+        assert_eq!(text_input::snapshot(&ctx, healthy_on_replacement), healthy);
 
         assert_eq!(ctx.host_to_client_queue.len(), 3);
         assert!(ctx

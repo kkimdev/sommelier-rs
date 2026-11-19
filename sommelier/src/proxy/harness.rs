@@ -55,6 +55,7 @@ pub(crate) struct Session {
     next_global_name: u32,
     registry: Option<Object>,
     compositor: Option<u32>,
+    text_input_manager: Option<u32>,
 }
 
 impl Session {
@@ -73,6 +74,7 @@ impl Session {
             next_global_name: 1,
             registry: None,
             compositor: None,
+            text_input_manager: None,
         }
     }
 
@@ -453,6 +455,87 @@ impl Session {
         let fd = OwnedFd::from(file);
         let keymap = wl_keyboard::Event::Keymap { format, fd, size };
         assert_eq!(self.guest_received(), [(keyboard.id, keymap.into())]);
+    }
+}
+
+/// A guest text input and the host objects the proxy bridges it to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextInput {
+    pub(crate) id: u32,
+    /// The host `zwp_text_input_v1`.
+    pub(crate) host: u32,
+    /// The host `zcr_extended_text_input_v1`, if the host has the
+    /// extension.
+    pub(crate) ext: Option<u32>,
+}
+
+/// Text inputs, which the proxy bridges to the host's
+/// `zwp_text_input_v1`.
+impl Session {
+    /// A new `zwp_text_input_v3` of `seat`, from a manager the guest binds
+    /// on first use. What the guest gets for it is kept: an `enter` if the
+    /// seat's keyboard focus is on a surface.
+    pub(crate) async fn text_input(&mut self, seat: u32) -> TextInput {
+        use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1::Request as Extension;
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1::{
+            self, Request as Manager,
+        };
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
+        let manager = match self.text_input_manager {
+            Some(manager) => manager,
+            None => {
+                let version = zwp_text_input_manager_v1::VERSION;
+                let manager = self.bind("zwp_text_input_manager_v1", version).await;
+                *self.text_input_manager.insert(manager)
+            }
+        };
+        let id = self.new_id();
+        let earlier = self.host.received.len();
+        self.guest([zwp_text_input_manager_v3::req::get_text_input(
+            manager, id, seat,
+        )])
+        .await;
+        let forwarded = self.host.received.split_off(earlier);
+        let (host, ext) = match forwarded[..] {
+            [(_, AnyRequest::ZwpTextInputManagerV1(Manager::CreateTextInput { id: host }))] => {
+                (host, None)
+            }
+            [(_, AnyRequest::ZwpTextInputManagerV1(Manager::CreateTextInput { id: host })), (
+                _,
+                AnyRequest::ZcrTextInputExtensionV1(Extension::GetExtendedTextInput {
+                    id: ext,
+                    text_input,
+                }),
+            )] if text_input == host => (host, Some(ext)),
+            _ => panic!("the host got no text input: {forwarded:?}"),
+        };
+        TextInput { id, host, ext }
+    }
+
+    /// The guest enables `text_input`, focused, with its commit `serial`,
+    /// and the host activates it; the guest gets the commit's `done`. What
+    /// the proxy sends the host besides the activation is not kept.
+    pub(crate) async fn enable(&mut self, text_input: TextInput, serial: u32) {
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::Request as V1;
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+        let id = text_input.id;
+        let earlier = self.host.received.len();
+        self.guest([
+            zwp_text_input_v3::req::enable(id),
+            zwp_text_input_v3::req::commit(id),
+        ])
+        .await;
+        let forwarded = self.host.received.split_off(earlier);
+        assert!(
+            forwarded.iter().any(|request| matches!(
+                request,
+                (sender, AnyRequest::ZwpTextInputV1(V1::Activate { .. }))
+                    if *sender == text_input.host
+            )),
+            "the host did not activate the text input: {forwarded:?}"
+        );
+        let done = zwp_text_input_v3::Event::Done { serial };
+        assert_eq!(self.guest_received(), [(id, done.into())]);
     }
 }
 

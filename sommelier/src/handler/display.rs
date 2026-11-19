@@ -340,41 +340,49 @@ mod tests {
     /// The host object of an active text input is gone with its
     /// `delete_id`, so forgetting the text input deactivates nothing on it;
     /// its extension is a host object of its own, which it still destroys.
-    #[test]
-    fn a_host_destroyed_text_input_sends_nothing_to_its_host_object() {
-        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
-        const SEAT: u32 = 10;
-        const TEXT_INPUT: u32 = 20;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_for_test(SEAT, 11, "wl_seat");
-        let host = ctx.shadow_table.create_bridged(
-            TEXT_INPUT,
-            "zwp_text_input_v3",
-            1,
-            "zwp_text_input_v1",
-            1,
-        );
-        let extension = ctx
-            .shadow_table
-            .create_host_only("zcr_extended_text_input_v1", 1);
-        let mut state = crate::state::TextInputState::new(host, Some(extension), SEAT, None);
-        state.committed.enabled = true;
-        assert!(state.host.activate());
-        ctx.text_inputs.insert(TEXT_INPUT, state);
+    #[tokio::test]
+    async fn a_host_destroyed_text_input_sends_nothing_to_its_host_object() {
+        use crate::protocols::text_input_extension_unstable_v1::{
+            zcr_extended_text_input_v1, zcr_text_input_extension_v1,
+        };
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+        use crate::protocols::wayland::wl_keyboard;
+        use crate::proxy::harness::Session;
 
-        DisplayHandler.on_delete_id(&mut ctx, host);
+        let mut s = Session::new();
+        let (seat, keyboard) = s.keyboard().await;
+        let surface = s.surface().await;
+        s.host([wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap()])
+            .await;
+        assert_eq!(s.guest_received().len(), 2, "the enter and its modifiers");
+        s.advertise(
+            "zcr_text_input_extension_v1",
+            zcr_text_input_extension_v1::VERSION,
+        )
+        .await;
+        // The proxy binds the extension for itself.
+        s.host_received();
+        let text_input = s.text_input(seat).await;
+        let extension = text_input.ext.expect("an extended text input");
+        let enter = zwp_text_input_v3::Event::Enter {
+            surface: surface.id,
+        };
+        assert_eq!(s.guest_received(), [(text_input.id, enter.into())]);
+        s.enable(text_input, 1).await;
 
+        // The session's check that no state outlives its object pins that
+        // the proxy forgets the text input.
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, text_input.host)])
+            .await;
         assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(extension, zcr_extended_text_input_v1::REQ_DESTROY)]
+            s.host_received(),
+            [(
+                extension,
+                zcr_extended_text_input_v1::Request::Destroy {}.into()
+            )]
         );
-        assert!(ctx.text_inputs.is_empty());
-        assert_eq!(
-            queued_headers(&ctx.host_to_client_queue),
-            [(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)]
-        );
-        assert!(!ctx.is_fatal());
-        ctx.assert_no_orphans();
+        let delete_id = wl_display::Event::DeleteId { id: text_input.id };
+        assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
     }
 
     #[test]
