@@ -231,9 +231,9 @@ pub(super) enum RegionOutcome {
 /// A `gfx::Range` selection in bytes, which keeps its direction: `end` is
 /// where the cursor is, and it may lie before `start`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Selection {
-    start: usize,
-    end: usize,
+pub(super) struct Selection {
+    pub start: usize,
+    pub end: usize,
 }
 
 impl Selection {
@@ -252,12 +252,12 @@ impl Selection {
 /// predicts a field holds: a `State`, whose `utf16_offset` is 0, as the
 /// proxy never sends an offset.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Predicted {
+pub(super) struct Predicted {
     /// The text, with the composition in it.
-    text: String,
-    selection: Selection,
+    pub text: String,
+    pub selection: Selection,
     /// Where the composition is in `text`, if there is one.
-    composition: Option<Range<usize>>,
+    pub composition: Option<Range<usize>>,
 }
 
 impl Predicted {
@@ -307,19 +307,19 @@ fn intersects(a: &Range<usize>, b: &Range<usize>) -> bool {
 
 /// `SurroundingTextTracker`: the prediction, and the states that the input
 /// method's edits since the last report led to, oldest first.
-#[derive(Default)]
-struct Tracker {
-    predicted: Predicted,
-    expected: Vec<Predicted>,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Tracker {
+    pub predicted: Predicted,
+    pub expected: Vec<Predicted>,
     /// A report it could not match dropped the composition, and nothing
     /// composed since (E4).
-    dropped: bool,
+    pub dropped: bool,
     /// While the composition is a region composed from existing text for a
     /// text input without an extension, which its client never sees, and
     /// nothing has changed it since: the composition the client still
     /// shows, the one that stood before the first such region, since
     /// nothing tells the client to drop it.
-    hidden: Option<String>,
+    pub hidden: Option<String>,
 }
 
 impl Tracker {
@@ -610,6 +610,10 @@ pub(crate) struct Exo {
     /// The ranges IMA held for a key and sent after that key's commit, so
     /// that they compose the committed text.
     pub(super) regions_stale: u64,
+    /// Each text input's tracker when the display answered a
+    /// `wl_display.sync`, with the sync's callback, in order
+    /// ([`Exo::snapshot_trackers`]).
+    pub(super) synced: Vec<(u32, BTreeMap<u32, Tracker>)>,
 }
 
 impl Exo {
@@ -1022,6 +1026,19 @@ impl Exo {
             }
         }
         detached
+    }
+
+    /// The display answers the `wl_display.sync` of `callback`: every
+    /// request before it has changed the trackers, and nothing after it
+    /// has, so a model of them that the requests and events up to its
+    /// `done` drive must hold the same ([`Exo::synced`]).
+    pub(super) fn snapshot_trackers(&mut self, callback: u32) {
+        let trackers = self
+            .text_inputs
+            .iter()
+            .map(|(&id, text_input)| (id, text_input.text.clone()))
+            .collect();
+        self.synced.push((callback, trackers));
     }
 
     /// The events Exo sent since the last call, in order. Whoever plays the
