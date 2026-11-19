@@ -411,15 +411,15 @@ impl ImeCore {
             if t.focused_surface() != Some(surface) {
                 continue;
             }
-            let Some(mut cur) = t.current(ti).filter(|cur| cur.shown().is_some()) else {
+            let Some(cur) = t.current(ti).filter(|cur| cur.shown().is_some()) else {
                 continue;
             };
-            // F4 takes the assembly, whatever becomes of the commit.
-            cur.take_assembly();
             let fence = BarrierToken(self.next_barrier);
-            let planned = cur.press_commit(fence);
-            match planned.apply() {
+            match cur.press_commit(fence).apply() {
                 Ok((events, lease)) => {
+                    // It takes the assembly once its commit reaches the
+                    // guest, as a host commit does (B3).
+                    t.take_assembly();
                     self.next_barrier += 1;
                     log::debug!("A press ended the composition of text input {}", ti.0);
                     fx.to_guest.extend(events);

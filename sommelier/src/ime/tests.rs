@@ -1934,6 +1934,28 @@ fn row_F4_a_press_gives_back_the_bytes_a_region_took() {
     assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
 }
 
+/// A press whose commit does not fit is forwarded, and leaves the preedit
+/// cursor and styling to the next preedit, as the old code's
+/// `end_composition_on_press` did: it took them only once the commit
+/// reached the guest.
+#[test]
+fn row_F4_a_press_whose_commit_does_not_fit_keeps_the_assembly() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let long = Preedit::new("x".repeat(4_090), (0, 0)).unwrap();
+    ime.core.inputs.get_mut(&TI).unwrap().replace_shown(long);
+    ime.v1(HostIme::PreeditStyling {
+        index: 0,
+        length: 3,
+        style: zwp_text_input_v1::PREEDIT_STYLE_SELECTION,
+    });
+    ime.v1(HostIme::PreeditCursor(0));
+    let out = ime.press(SURFACE);
+    assert!(out.forward && out.guest.is_empty() && out.host.is_empty());
+    assert_eq!(out.keys, []);
+    assert_eq!(ime.compose("나").guest, [preedit_at("나", 0, 3), done(1)]);
+}
+
 #[test]
 fn row_F4_a_press_elsewhere_or_without_a_composition_is_forwarded() {
     let mut ime = Ime::enabled();

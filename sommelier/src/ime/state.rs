@@ -291,8 +291,8 @@ impl TextInput {
         self.is_attached().then_some(&mut self.composition.assembly)
     }
 
-    /// B3: every host composition event takes the assembly first, whatever
-    /// becomes of the event.
+    /// B3: take the assembly, which a host composition event or a press
+    /// used up (design H9).
     pub(crate) fn take_assembly(&mut self) -> Assembly {
         std::mem::take(&mut self.composition.assembly)
     }
@@ -785,12 +785,6 @@ impl<'a> Current<'a> {
             });
         }
         Confirm::Commit(self.commit_shown())
-    }
-
-    /// F4's assembly, which the press takes whatever becomes of its
-    /// commit.
-    pub(crate) fn take_assembly(&mut self) {
-        self.composition.assembly = Assembly::default();
     }
 
     /// F4: a press commits the shown preedit, and fences the host's
