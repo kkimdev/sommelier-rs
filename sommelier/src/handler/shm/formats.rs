@@ -182,10 +182,10 @@ pub(super) fn wl_shm_format_to_drm_format(format: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, guest_shm_format_available,
-        is_supported_drm_format, record_host_shm_drm_format, record_host_shm_wl_format,
-        register_guest_shm, shm_format_from_drm, wl_shm_format_to_drm_format,
-        SUPPORTED_SHM_FORMATS,
+        clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, format_bytes_per_pixel,
+        guest_shm_format_available, is_supported_drm_format, record_host_shm_drm_format,
+        record_host_shm_wl_format, register_guest_shm, shm_format_from_drm,
+        wl_shm_format_to_drm_format, SUPPORTED_SHM_FORMATS,
     };
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::{wl_registry, wl_shm};
@@ -194,6 +194,15 @@ mod tests {
     use crate::state::Context;
     use crate::test_support::decoded;
     use crate::wire::Action;
+
+    /// Every advertised format has a size, so a buffer in it is never refused
+    /// for want of a bytes-per-pixel.
+    #[test]
+    fn every_supported_format_has_bytes_per_pixel() {
+        for format in SUPPORTED_SHM_FORMATS {
+            assert!(format_bytes_per_pixel(format).is_some(), "{format:#x}");
+        }
+    }
 
     /// The linux-dmabuf shim and the wl_shm shim advertise one set of
     /// formats, numbered two ways: `SUPPORTED_SHM_FORMATS` by wl_shm value,
