@@ -46,7 +46,7 @@ pub(crate) use guest::TooLong;
 pub(crate) use host::{reconcile, target, ActivationStep};
 #[cfg(test)]
 pub(crate) use state::Assembly;
-pub(crate) use state::{Confirm, LinkState, RegionDrop, TextInput};
+pub(crate) use state::{LinkState, TextInput};
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -313,11 +313,6 @@ impl ImeCore {
     /// Every text input, in `TiId` order.
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (TiId, &mut TextInput)> {
         self.inputs.iter_mut().map(|(&ti, t)| (ti, t))
-    }
-
-    /// The text input of host extension `ext`.
-    pub(crate) fn by_ext(&self, ext: u32) -> Option<TiId> {
-        self.by_ext.get(&ext).copied()
     }
 
     /// A barrier no text input has waited for.

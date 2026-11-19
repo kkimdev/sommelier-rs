@@ -20,9 +20,8 @@ use crate::handler::ime_keys::{
     held_backspace_keyboard_for_seat, held_repeat_key_for_seat, synthesize_ime_consumed_key_pair,
 };
 use crate::ime::{
-    self, content_type_requests, ActivationStep, Confirm, Env, HostExt, HostIme, HostOut, HostTi,
-    Input, KeyEffect, LeaseOutcome, LinkState, RegionDrop, SeatId, SurfaceId, TextInput, TiId,
-    TooLong,
+    self, content_type_requests, ActivationStep, Env, HostExt, HostIme, HostOut, HostTi, Input,
+    KeyEffect, LeaseOutcome, LinkState, SeatId, SurfaceId, TextInput, TiId, TooLong,
 };
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
@@ -372,64 +371,9 @@ impl zcr_text_input_extension_v1::ZcrTextInputExtensionV1Handler for TextInputEx
 
 pub struct ExtendedTextInputV1Handler;
 impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextInputV1Handler {
-    // Translates zcr_extended_text_input_v1::set_preedit_region (cursor-relative index/length)
-    // into zwp_text_input_v3::delete_surrounding_text + preedit_string + done.
+    /// X1: Exo's cursor-relative region of its text becomes the preedit.
     fn on_set_preedit_region(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
-        let host_ext_id = ctx.last_sender_id;
-        log::trace!(
-            ">>> on_set_preedit_region: host_ext_id={}, index={}, length={}",
-            host_ext_id,
-            index,
-            length
-        );
-
-        let Some(ti) = ctx.ime.by_ext(host_ext_id) else {
-            return Action::Drop;
-        };
-        let guest_id = ti.0;
-        let t = ctx
-            .ime
-            .get_mut(ti)
-            .expect("an extension names a text input");
-        // A region takes the preedit_cursor and preedit_styling before it,
-        // whatever becomes of it.
-        let assembly = t.take_assembly();
-        let Some(current) = t.current(ti) else {
-            log::debug!("Ignoring a stale preedit region of text input {guest_id}");
-            return Action::Drop;
-        };
-        // Exo measures the region from its cursor in its own text, which
-        // holds the preedit it composes as text. An empty region ends Exo's
-        // composition and leaves the preedit it held as text
-        // (`SurroundingTextTracker::OnSetCompositionFromExistingText` with
-        // an empty range), as a confirmation does, so the guest commits it.
-        let planned = match current.region(index, length, assembly) {
-            Ok(planned) => planned,
-            Err(RegionDrop::NoSurroundingText) => {
-                log::warn!("Ignoring a preedit region of text input {guest_id}, which stated no surrounding text");
-                return Action::Drop;
-            }
-            Err(RegionDrop::NotAroundCursor) => {
-                log::warn!(
-                    "on_set_preedit_region: region {index}+{length} is invalid, non-adjacent to \
-                     the host's cursor, or out of bounds for its text"
-                );
-                return Action::Drop;
-            }
-            // The guest no longer has the preedit Exo holds, whose bytes are
-            // not in its text: they are not deleted. A region that does not
-            // cover them would leave them lost or shown twice.
-            Err(RegionDrop::Uncovered) => {
-                log::debug!(
-                    "Ignoring a preedit region of text input {guest_id} that does not \
-                     cover the preedit it shows"
-                );
-                return Action::Drop;
-            }
-        };
-        let applied = planned.apply();
-        queue_transaction(ctx, ti, applied);
-        Action::Drop
+        host_ext_event(ctx, HostIme::PreeditRegion { index, length })
     }
     fn on_clear_grammar_fragments(&mut self, _ctx: &mut Context, _start: u32, _end: u32) -> Action {
         log::trace!(
@@ -479,42 +423,18 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         );
         Action::Drop
     }
+    /// X2, and X2' with no preedit shown.
     fn on_confirm_preedit(&mut self, ctx: &mut Context, _selection_behavior: u32) -> Action {
-        let host_ext_id = ctx.last_sender_id;
-        log::trace!(
-            ">>> on_confirm_preedit: host_ext_id={}, selection_behavior={}",
-            host_ext_id,
-            _selection_behavior
-        );
-        let Some(ti) = ctx.ime.by_ext(host_ext_id) else {
-            return Action::Drop;
-        };
-        let guest_id = ti.0;
-        let t = ctx
-            .ime
-            .get_mut(ti)
-            .expect("an extension names a text input");
-        let (guest_seat, done_serial) = (t.seat().0, t.serial().get());
-        let Some(current) = t.current(ti) else {
-            log::debug!("Ignoring a stale confirm_preedit of text input {guest_id}");
-            return Action::Drop;
-        };
-        let Some(shown) = current.shown().map(|shown| shown.text().to_string()) else {
-            let done = zwp_text_input_v3::evt::done(guest_id, done_serial);
-            recover_held_key(ctx, ti, SeatId(guest_seat), done);
-            return Action::Drop;
-        };
-        log::debug!("  -> committing cached preedit={shown:?}, guest_id={guest_id}");
-        let Confirm::Commit(planned) = current.confirm() else {
-            unreachable!("a confirmation commits the preedit the guest shows");
-        };
-        // The confirmation takes the preedit_cursor and preedit_styling,
-        // whether or not its commit fits.
-        let applied = planned.apply();
-        take_assembly(ctx, ti);
-        queue_transaction(ctx, ti, applied);
-        Action::Drop
+        host_ext_event(ctx, HostIme::Confirm)
     }
+}
+
+/// X1 and X2: hand a host `zcr_extended_text_input_v1` event to the IME
+/// core, which knows each extension's text input.
+fn host_ext_event(ctx: &mut Context, event: HostIme) -> Action {
+    let ext = ctx.last_sender_id;
+    ime(ctx, Input::Ext { ext, event });
+    Action::Drop
 }
 
 pub struct TextInputManagerV3Handler;
