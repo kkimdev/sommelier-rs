@@ -443,7 +443,11 @@ impl<'t> World<'t> {
                 Some(_) => Some(next.max(self.now)),
                 None => None,
             };
-            // A held key repeats until it is up, which no settle waits for.
+            // A held key repeats until it is up, which no settle waits for,
+            // or until the case ends, as a shrunk one may before its release.
+            if actions.peek().is_none() {
+                self.repeat = None;
+            }
             let mut sources = idle.to_vec();
             sources.push(self.repeat.map(|(_, at)| at));
             sources.push(user);

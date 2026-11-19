@@ -589,6 +589,21 @@ fn a_case_replays_from_its_recorded_choices() {
 }
 
 #[test]
+fn a_key_held_to_the_end_of_a_case_stops_repeating() {
+    use hangul::Key;
+    let mut case = Case::new(0, &[ClientKind::Gtk4]);
+    // Twelve settles hold it past the repeat delay, and the case ends
+    // with no release.
+    case.actions = [UserAction::KeyDown(Key::Char(' '))]
+        .into_iter()
+        .chain([UserAction::Settle; 12])
+        .collect();
+    let mut trace = Vec::new();
+    run(&case, Choices::replay(Vec::new()), &mut trace);
+    assert!(trace.iter().any(|line| line.text.starts_with("repeat")));
+}
+
+#[test]
 fn a_settle_waits_for_everything_to_settle_then_50_ms() {
     use hangul::Key;
     let mut case = Case::new(0, &[ClientKind::Gtk4]);
