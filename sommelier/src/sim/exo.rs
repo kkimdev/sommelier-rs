@@ -484,6 +484,11 @@ pub(crate) struct Exo {
     composed_region: Option<String>,
     /// The seat's observers registered so far (E12).
     observers: u64,
+    /// The regions composed for a text input without an extension, which
+    /// its client never sees, and the ranges IMA held for a key and sent
+    /// after that key's commit, so that they compose the committed text.
+    pub(super) regions_hidden: u64,
+    pub(super) regions_stale: u64,
 }
 
 impl Exo {
@@ -1167,6 +1172,7 @@ impl Exo {
         }
         let region = self.ima.region.take();
         if let Some((before, after)) = region {
+            self.regions_stale += u64::from(commit.is_some());
             self.ima.composing |= self.set_composition_from_existing_text(id, before, after);
         }
         commit.is_some() || composition.is_some() || region.is_some()
@@ -1319,6 +1325,7 @@ impl Exo {
         }
         let cursor = text.predicted.cursor;
         let composed = text.compose_existing(range.clone());
+        self.regions_hidden += u64::from(self.extension_of(id).is_none());
         if let Some(extension) = self.extension_of(id) {
             let index = -i32::try_from(cursor - range.start).expect("a short region");
             let length = u32::try_from(range.len()).expect("a short region");
@@ -2198,6 +2205,28 @@ mod tests {
         let mut expected = vec![peek(1, 'r', DOWN), commit(2, "ab~")];
         expected.extend(preedit(3, "ㄱ"));
         assert_eq!(events(&mut exo), expected);
+        // A range held for a key goes out after the key's commit, which
+        // makes it stale, and counts.
+        exo.ask(Request::Reconvert);
+        exo.key(NOW, k(' '), DOWN);
+        exo.take_engine();
+        let region = TextAction::Region {
+            before: 1,
+            after: 0,
+        };
+        answer_request(&mut exo, 2, vec![region]);
+        assert_eq!(events(&mut exo), []);
+        let text = EngineOut::Text {
+            id: 3,
+            actions: vec![commits("ㄱ")],
+        };
+        exo.answer(&text);
+        exo.answer(&EngineOut::Done {
+            id: 3,
+            handled: true,
+        });
+        events(&mut exo);
+        assert_eq!(exo.regions_stale, 1);
         // While IMA takes the engine to compose, a delete is dropped.
         exo.ask(Request::AcceptSuggestion);
         exo.take_engine();
@@ -2205,7 +2234,7 @@ mod tests {
             before: 1,
             after: 0,
         };
-        answer_request(&mut exo, 2, vec![delete]);
+        answer_request(&mut exo, 4, vec![delete]);
         assert_eq!(events(&mut exo), []);
     }
 

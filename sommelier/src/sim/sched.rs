@@ -657,6 +657,10 @@ impl<'t> World<'t> {
             self.engine.learn_region(text);
         }
         if let Some(spec) = &mut self.spec {
+            spec.counts.regions_hidden = self.exo.regions_hidden;
+            spec.counts.regions_stale = self.exo.regions_stale;
+        }
+        if let Some(spec) = &mut self.spec {
             spec.counts.late += u64::from(verdict == Answer::Late);
             spec.counts.dropped += u64::from(verdict == Answer::Dropped);
         }

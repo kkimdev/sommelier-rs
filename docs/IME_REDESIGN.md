@@ -1764,6 +1764,11 @@ enum KnownIssue {
     /// proxy has committed, still on its way to Exo, is measured from
     /// the newer cursor.
     RegionCrossesReport,
+    /// IMA holds a reconversion's range while a key is in flight and
+    /// sends it after that key's commit, so it composes the committed
+    /// text; the guest's next report, without the preedit, makes Exo drop
+    /// it (E4), and the guest shows a preedit nothing composes.
+    StaleRegionAfterCommit,
 }
 ```
 

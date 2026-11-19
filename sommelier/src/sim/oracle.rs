@@ -281,6 +281,11 @@ pub(super) struct Counts {
     /// Preedit regions Exo made while a report the proxy sent it was on
     /// its way (KnownIssue::RegionCrossesReport).
     pub regions_crossing_reports: u64,
+    /// Regions Exo composed for a text input without an extension, which
+    /// the guest never sees, and ranges IMA sent after the commit of the
+    /// key it held them for (KnownIssue::StaleRegionAfterCommit).
+    pub regions_hidden: u64,
+    pub regions_stale: u64,
     /// Focus moves that the text input heard of before the keyboard, bound
     /// after its activate, so that Exo detached while attached (H2).
     pub detaches_before_keyboard: u64,
@@ -319,6 +324,8 @@ impl std::ops::AddAssign for Counts {
         self.regions_dropped += other.regions_dropped;
         self.crossed_reports += other.crossed_reports;
         self.regions_crossing_reports += other.regions_crossing_reports;
+        self.regions_hidden += other.regions_hidden;
+        self.regions_stale += other.regions_stale;
         self.detaches_before_keyboard += other.detaches_before_keyboard;
         self.recovered_keys += other.recovered_keys;
         self.recoveries_skipped += other.recoveries_skipped;
@@ -1293,9 +1300,9 @@ pub(super) fn exact(
         let dropped = spec.shown.as_ref().is_some_and(|shown| {
             (shown.origin.late || shown.origin.resets < resets) && engine.is_empty()
         });
-        // Without the extension, Exo composes a reconverted region it
-        // cannot show.
-        let hidden = extension.is_none() && preedit.is_empty() && tracked == engine;
+        // Without the extension, Exo composes a reconverted region the
+        // guest never sees, over what it shows or not.
+        let hidden = extension.is_none() && spec.counts.regions_hidden > 0;
         if *preedit != tracked && preedit != engine && !(dropped && tracked.is_empty()) && !hidden {
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
@@ -1368,6 +1375,10 @@ pub(super) enum KnownIssue {
     /// A preedit region Exo made from text older than the guest's report
     /// the proxy already committed is measured from the newer cursor (X1).
     RegionCrossesReport,
+    /// A range IMA held for a key and sent after that key's commit
+    /// composes the committed text, which the guest shows as a preedit
+    /// that Exo drops at its next report (E4).
+    StaleRegionAfterCommit,
 }
 
 impl KnownIssue {
@@ -1389,6 +1400,13 @@ impl KnownIssue {
                  field (F1) and sends the guest only `leave`, at which GTK drops its preedit; \
                  Exo's detach then confirms the composition, but the link is draining and the \
                  proxy drops the confirmation"
+            }
+            Self::StaleRegionAfterCommit => {
+                "IMA holds a reconversion's range while a key is in flight and sends it after \
+                 that key's commit, which ended the region; Exo composes the committed text \
+                 again, the proxy shows it (X1), and the guest's next report, which leaves the \
+                 preedit out, makes Exo drop it (E4), so the guest shows a preedit nothing \
+                 composes"
             }
             Self::RegionCrossesReport => {
                 "Exo makes a region from its cursor in the text it had, while a report of the \
@@ -1438,6 +1456,10 @@ impl KnownIssue {
                 "docs/IME_REDESIGN.md 2.2 X1; the core must measure a region against the text \
                  Exo had"
             }
+            Self::StaleRegionAfterCommit => {
+                "docs/IME_REDESIGN.md 2.2 X1; IMA's ordering, made lasting by the proxy's \
+                 reports without the preedit"
+            }
         }
     }
 }
@@ -1464,6 +1486,9 @@ pub(super) fn classify(
             }
             (Tier::Exact, "composition") if counts.regions_crossing_reports > 0 => {
                 KnownIssue::RegionCrossesReport
+            }
+            (Tier::Exact, "composition") if counts.regions_stale > 0 => {
+                KnownIssue::StaleRegionAfterCommit
             }
             (Tier::Exact, "recovery") => KnownIssue::RecoveryBeforeAPress,
             _ => {
@@ -2287,6 +2312,15 @@ mod tests {
         spec.see(Seen::StepEnd);
         assert_eq!(spec.counts.regions_crossing_reports, 1);
         let issue = KnownIssue::RegionCrossesReport;
+        assert!(!issue.reason().is_empty() && issue.tracking().contains("X1"));
+        // So does a range IMA sent after the commit of the key it held it
+        // for.
+        let stale = Counts {
+            regions_stale: 1,
+            ..Counts::default()
+        };
+        let issue = KnownIssue::StaleRegionAfterCommit;
+        assert_eq!(classify(one, &stale, |_| false), [issue]);
         assert!(!issue.reason().is_empty() && issue.tracking().contains("X1"));
     }
 
