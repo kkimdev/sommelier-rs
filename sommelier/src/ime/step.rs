@@ -269,11 +269,17 @@ impl ImeCore {
         let Some(t) = self.inputs.get_mut(&ti) else {
             return;
         };
+        // Exo's detach confirmed the composition it tracked before its
+        // `leave` (E6), which committed the preedit the guest shows. One
+        // it still shows Exo no longer tracked (E4), below v11 of the
+        // extension, so the guest commits it here.
+        commit_shown(ti, t, fx);
         let Some(shown) = t.exo_detached() else {
             log::debug!("Text input {}: a leave answers our deactivate", ti.0);
             return;
         };
         log::info!("Exo detached the input method of text input {}", ti.0);
+        // Only a preedit whose commit does not fit a message is left.
         if shown {
             let clear = GuestTxn::default().encode(ti, true, t.serial());
             fx.to_guest
@@ -567,9 +573,9 @@ impl ImeCore {
     }
 }
 
-/// F1: a field that loses the focus commits the preedit the guest shows,
-/// if its composition is current, as mutter and ibus do at a focus-out and
-/// as Exo's detach confirms it (E6).
+/// F1 and H2: a field that loses the focus or its input method commits
+/// the preedit the guest shows, if its composition is current, as mutter
+/// and ibus do at a focus-out and as Exo's detach confirms it (E6).
 fn commit_shown(ti: TiId, t: &mut TextInput, fx: &mut Effects) {
     let Some(cur) = t.current(ti).filter(|cur| cur.shown().is_some()) else {
         return;

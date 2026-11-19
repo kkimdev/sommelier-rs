@@ -1598,8 +1598,11 @@ pub(super) mod tests {
         );
     }
 
+    /// Exo detaches while the guest shows a preedit that its detach did
+    /// not confirm, as below v11 of the extension once a report it could
+    /// not match dropped its composition (E4, E6): the guest commits it.
     #[tokio::test]
-    async fn an_exo_detach_clears_the_guest_preedit() {
+    async fn an_exo_detach_commits_the_guest_preedit() {
         let mut f = attached_password_field().await;
 
         // Without a preedit the guest is told nothing.
@@ -1617,7 +1620,7 @@ pub(super) mod tests {
         f.s.host([v1::leave(f.host)]).await;
         assert_eq!(
             f.s.guest_received(),
-            f.events([no_preedit(), V3::Done { serial: 1 }])
+            f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }])
         );
         assert_eq!(f.s.host_received(), f.password_after_activate(1));
 

@@ -395,8 +395,8 @@ impl TextInput {
     }
 
     /// H2: Exo detached its input method itself. Returns `None` if the
-    /// link was not attached (H2'), and otherwise whether the guest showed
-    /// a preedit, which it must now be told to clear.
+    /// link was not attached (H2'), and otherwise whether the guest still
+    /// showed a preedit, which it must now be told to clear.
     pub(super) fn exo_detached(&mut self) -> Option<bool> {
         let left = self.leave_attached(LinkState::Detached)?;
         Some(left.shown.is_some())
@@ -848,7 +848,7 @@ impl<'a> Current<'a> {
         planned
     }
 
-    /// The commit of the shown preedit (X1, X2, F1, F4).
+    /// The commit of the shown preedit (X1, X2, F1, F4, H2).
     pub(super) fn commit_shown(self) -> Planned<'a> {
         let text = self.shown().map(|shown| shown.text().to_string());
         let txn = GuestTxn {

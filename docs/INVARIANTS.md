@@ -844,10 +844,17 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   destroyed, each time through `Deactivate`, so it attaches again only on
   a new `activate`. A `leave` while the proxy's host generation is active
   is such a detach, since the proxy's own `deactivate` starts draining
-  first: the generation ends there without a barrier, its composition is
-  dropped, a preedit the guest shows is cleared with an empty
-  `preedit_string` and `done`, and reconciling activates again if the
-  guest still wants input. If that `leave` beats the `wl_keyboard.leave`
+  first: the generation ends there without a barrier, its composition
+  ends, and reconciling activates again if the guest still wants input.
+  Exo's detach confirms first (E6 of [IME_REDESIGN.md](IME_REDESIGN.md)
+  2.4): `confirm_preedit` from extension v11, and below it a
+  `commit_string` of the composition Exo tracks, which reach the proxy
+  while it is attached and commit the preedit the guest shows. A preedit
+  the guest still shows at the `leave` is one Exo no longer tracked: a
+  report it could not match dropped it (E4), so nothing confirmed it. The
+  guest commits it then, with `preedit_string("")`, `commit_string` and
+  `done`, which keeps the user's text where an input method that restarts
+  would lose it, and commits nothing twice. If that `leave` beats the `wl_keyboard.leave`
   of the same focus change, the activation finds Exo unfocused and the
   keyboard leave drains it. Exo attaches on its own only when focus
   reaches a surface an `activate` found unfocused, after a
@@ -868,7 +875,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `an_exo_detach_activates_again_with_the_content_type`,
   `a_content_type_waits_for_exo_to_attach_again`,
   `the_leave_answering_a_deactivate_is_ignored`,
-  `an_exo_detach_clears_the_guest_preedit`,
+  `an_exo_detach_commits_the_guest_preedit`,
   `an_exo_detach_before_the_keyboard_leave_activates_then_drains`, and
   the fuzzer's end state against its model of Exo, whose input method
   sometimes restarts (`guest_streams_cannot_crash_hang_or_leak`; see

@@ -983,10 +983,14 @@ impl SpecText {
     fn text_input(&mut self, event: &v1::Event, origin: Origin) {
         match event {
             v1::Event::Leave {} if self.link == Link::Attached => {
-                // H2: Exo detached on its own.
+                // H2: Exo detached on its own. Its detach confirmed the
+                // composition it tracked before its `leave` (E6), so a
+                // preedit the guest still shows is one Exo no longer
+                // tracked (E4), below v11 of the extension, which the guest
+                // commits.
                 self.counts.host_detaches += 1;
-                if self.shown.is_some() {
-                    self.apply(&Txn::default(), (0, 0));
+                if let Some(txn) = self.commit_shown() {
+                    self.apply(&txn, (0, 0));
                 }
                 self.leave_attached(Link::Detached);
             }
@@ -2306,13 +2310,13 @@ mod tests {
     }
 
     #[test]
-    fn exo_or_the_proxy_detaching_or_a_focus_change_drops_the_preedit() {
-        // H2: Exo's own detach clears the preedit, committing nothing, and
-        // counts.
+    fn exos_detach_or_a_focus_change_commits_the_preedit() {
+        // H2: Exo's own detach commits the preedit it left unconfirmed,
+        // and counts.
         let mut spec = attached(&["0", "1"]);
         preedit(&mut spec, "가");
         host(&mut spec, v1::Event::Leave {}, &[activate(0)]);
-        assert_eq!(spec.views[0], view("0", 1, ""));
+        assert_eq!(spec.views[0], view("0가", 4, ""));
         assert_eq!(spec.counts.host_detaches, 1);
         // F1: the keyboard leaves; the guest commits the preedit before the
         // text input's leave.

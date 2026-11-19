@@ -1101,12 +1101,16 @@ fn row_G9c_a_refocus_drops_the_pending_enable() {
 
 // 2.2 Host events.
 
+/// Exo's detach confirms only a composition it tracks below v11 of the
+/// extension (E6), and a report it could not match drops that (E4): the
+/// guest commits the preedit nothing confirmed.
 #[test]
-fn row_H2_an_exo_detach_clears_the_preedit_and_activates_again() {
+fn row_H2_an_exo_detach_commits_the_preedit_and_activates_again() {
     let mut ime = Ime::enabled();
     ime.compose("가");
     let out = ime.step(Input::HostLeave(TI));
-    assert_eq!(out.guest, [no_preedit(), done(1)]);
+    assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
     let mut host = vec![req(
         v1(TI),
         V1::Activate {
@@ -1118,6 +1122,27 @@ fn row_H2_an_exo_detach_clears_the_preedit_and_activates_again() {
     host.push(commit_state(TI, 1));
     assert_eq!(out.host, host);
     assert_eq!(ime.compose("나").guest, [preedit("나"), done(1)]);
+}
+
+/// The confirmation Exo's detach sends before its `leave` (E6) commits
+/// the preedit, so the `leave` commits it no more.
+#[test]
+fn row_H2_a_confirmed_composition_is_committed_once() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let out = ime.ext(HostIme::Confirm);
+    assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
+    let out = ime.step(Input::HostLeave(TI));
+    assert!(out.guest.is_empty() && out.keys.is_empty());
+    // Below v11, the confirmation is a commit of the composition.
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    ime.v1(HostIme::Commit {
+        serial: 0,
+        text: "가".into(),
+    });
+    let out = ime.step(Input::HostLeave(TI));
+    assert!(out.guest.is_empty() && out.keys.is_empty());
 }
 
 #[test]
