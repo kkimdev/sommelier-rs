@@ -1650,6 +1650,58 @@ fn row_X2prime_an_empty_confirmation_recovers_the_held_key() {
     assert_eq!(out.keys, [Key::Recover(TI, vec![done(1)])]);
 }
 
+/// B3, as the old handlers did it: a commit or a delete that reaches no
+/// guest, and an empty confirmation, leave the preedit cursor and styling
+/// to the next preedit; a confirmation of a preedit takes them.
+#[test]
+fn row_H8_H9_X2_only_an_edit_that_reaches_the_guest_takes_the_assembly() {
+    type Case = (&'static str, bool, fn() -> HostIme, bool);
+    let cases: [Case; 4] = [
+        (
+            "a commit that does not fit",
+            false,
+            || HostIme::Commit {
+                serial: 0,
+                text: "x".repeat(4_090),
+            },
+            false,
+        ),
+        (
+            "a delete with no surrounding text",
+            false,
+            || HostIme::Delete {
+                index: -1,
+                length: 1,
+            },
+            false,
+        ),
+        ("an empty confirmation", false, || HostIme::Confirm, false),
+        ("a confirmation", true, || HostIme::Confirm, true),
+    ];
+    for (case, composing, event, takes) in cases {
+        let mut ime = Ime::enabled();
+        if composing {
+            ime.compose("가");
+        }
+        ime.v1(HostIme::PreeditStyling {
+            index: 0,
+            length: 3,
+            style: zwp_text_input_v1::PREEDIT_STYLE_SELECTION,
+        });
+        ime.v1(HostIme::PreeditCursor(0));
+        let out = match event() {
+            HostIme::Confirm => ime.ext(HostIme::Confirm),
+            event => ime.v1(event),
+        };
+        assert_eq!(out.guest.is_empty(), !takes, "{case}");
+        let next = match takes {
+            true => preedit("나"),
+            false => preedit_at("나", 0, 3),
+        };
+        assert_eq!(ime.compose("나").guest, [next, done(1)], "{case}");
+    }
+}
+
 #[test]
 fn row_W1_a_drained_link_activates_again() {
     let mut ime = Ime::enabled();
@@ -1878,8 +1930,11 @@ fn row_F4_a_press_elsewhere_or_without_a_composition_is_forwarded() {
     assert!(out.forward && out.guest.is_empty() && out.host.is_empty());
 }
 
+/// Events in flight at a press are dropped. A preedit and a region take
+/// the preedit cursor and styling before them; a commit, a delete and a
+/// confirmation leave them, as the old handlers did (B3).
 #[test]
-fn row_F4_events_in_flight_at_a_press_are_dropped_and_take_the_assembly() {
+fn row_F4_events_in_flight_at_a_press_are_dropped() {
     type Event = (&'static str, fn() -> Input);
     let events: [Event; 5] = [
         ("preedit", || {
@@ -1937,7 +1992,11 @@ fn row_F4_events_in_flight_at_a_press_are_dropped_and_take_the_assembly() {
         let out = ime.step(input());
         assert!(out.guest.is_empty() && out.keys.is_empty(), "{event}");
         ime.step(Input::BarrierDone(fence));
-        assert_eq!(ime.compose("나").guest, [preedit("나"), done(2)], "{event}");
+        let next = match event {
+            "preedit" | "region" => preedit("나"),
+            _ => preedit_at("나", 0, 3),
+        };
+        assert_eq!(ime.compose("나").guest, [next, done(2)], "{event}");
     }
 }
 
