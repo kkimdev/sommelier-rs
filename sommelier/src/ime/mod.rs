@@ -46,7 +46,7 @@ pub(crate) use guest::TooLong;
 pub(crate) use host::{reconcile, target, ActivationStep};
 #[cfg(test)]
 pub(crate) use state::Assembly;
-pub(crate) use state::{Confirm, DeleteDrop, LinkState, RegionDrop, TextInput};
+pub(crate) use state::{LinkState, TextInput};
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -277,7 +277,11 @@ impl ImeCore {
         host: HostTi,
         surface: Option<SurfaceId>,
     ) {
-        debug_assert!(!self.inputs.contains_key(&ti), "{ti:?} exists already");
+        // The guest cannot reuse a live text input's ID. Should one be
+        // replaced anyway, its extension goes with it, so that `by_ext`
+        // names only live text inputs (I4).
+        let replaced = self.forget(ti);
+        debug_assert!(replaced.is_none(), "{ti:?} exists already");
         if let Some(ext) = host.ext {
             self.by_ext.insert(ext.id, ti);
         }
@@ -309,11 +313,6 @@ impl ImeCore {
     /// Every text input, in `TiId` order.
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (TiId, &mut TextInput)> {
         self.inputs.iter_mut().map(|(&ti, t)| (ti, t))
-    }
-
-    /// The text input of host extension `ext`.
-    pub(crate) fn by_ext(&self, ext: u32) -> Option<TiId> {
-        self.by_ext.get(&ext).copied()
     }
 
     /// A barrier no text input has waited for.

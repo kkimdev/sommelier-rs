@@ -483,10 +483,14 @@ and bridges each guest v3 object to a host v1 object plus its extension.
 The IME core (`sommelier/src/ime`, `Context::ime`) owns the state of
 every text input: its field, its link to the host text input, its
 composition and its barriers. It is being wired in stages
-([IME_REDESIGN.md](IME_REDESIGN.md) section 5): until its `step` handles
-every message, the handlers in `handler/text_input.rs` keep their shape
-and change that state only through the core's named transitions, made
-`pub(crate)` for this window, and the core's `reconcile`.
+([IME_REDESIGN.md](IME_REDESIGN.md) section 5). The host's events, those
+of `zwp_text_input_v1` and its extension and the `done` of the core's
+drain barriers and reset fences, go through `ImeCore::step`:
+`text_input::ime` hands it one `ime::Input` and applies the effects it
+returns. Until it handles the rest, the guest's requests, focus changes
+and presses keep their old handlers, which change that state only
+through the core's named transitions, made `pub(crate)` for this window,
+and the core's `reconcile`.
 
 The bridge reconciles state rather than translating requests, because Exo
 applies a request against state the proxy cannot see: it drops a content
@@ -495,10 +499,12 @@ type. `ime::LinkState` models what the host text input has applied, by
 those rules, and the pure `ime::reconcile` returns the requests that
 make it match the target the guest committed (`HostTarget`): the
 activation step and, when the attached input method lacks it, the content
-type. `text_input::reconcile_host` sends them wherever the target or the
-host's ability to apply it changes: a guest commit, a focus change, a
-drain barrier's completion, Exo detaching the input method on its own (a
-host `leave` while active), a `wl_seat` bind and the object's destroy.
+type. `step` sends them for every text input at the end of each input,
+and `text_input::reconcile_host` wherever the target or the host's
+ability to apply it changes: a guest commit, a focus change, a
+`wl_seat` bind and the object's destroy. A drain barrier's completion
+and Exo detaching the input method on its own (a host `leave` while
+active) are host events, which `step` handles.
 The surrounding text and cursor rectangle are not reconciled: Exo keeps
 both regardless and edits its copy of the text as the input method
 commits, so each guest commit forwards the ones it states. In the other

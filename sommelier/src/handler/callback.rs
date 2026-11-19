@@ -60,8 +60,9 @@ impl WlCallbackHandler for CallbackHandler {
                 InternalCallback::GtkShellCapabilities { gtk_shell } => {
                     crate::handler::gtk_shell::announce_capabilities(ctx, gtk_shell);
                 }
+                // W1 and W2: a text input's drain or reset fence.
                 InternalCallback::TextInput { token } => {
-                    crate::handler::text_input::complete_barrier(ctx, token)
+                    crate::handler::text_input::ime(ctx, crate::ime::Input::BarrierDone(token));
                 }
                 InternalCallback::WindowBoundsBarrier { zaura_toplevel } => {
                     crate::handler::window_placement::complete_barrier(

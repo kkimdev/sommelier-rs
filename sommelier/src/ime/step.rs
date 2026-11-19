@@ -20,7 +20,7 @@ limitations under the License.
 
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
-use super::state::{Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput};
+use super::state::{Assembly, Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput};
 use super::{
     BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, Input, KeyEffect, LeaseOutcome,
     SeatId, SurfaceId, TiId,
@@ -299,18 +299,19 @@ impl ImeCore {
                 log::debug!("Cannot represent v1 cursor_position({index}, {anchor}) in v3");
                 return;
             }
-            // B3: a composition event takes the assembly first, whatever
-            // becomes of it. The old handlers differ only where no client
-            // can tell, since Exo sends styling and a cursor only right
-            // before their preedit: a dropped commit took only its
-            // cursor_position, and a dropped delete or confirmation took
-            // nothing.
-            HostIme::Preedit { .. }
-            | HostIme::Commit { .. }
-            | HostIme::Delete { .. }
-            | HostIme::PreeditRegion { .. }
-            | HostIme::Confirm => t.take_assembly(),
+            // B3: a preedit and a region, which apply the assembly, take it
+            // first, whatever becomes of them.
+            HostIme::Preedit { .. } | HostIme::PreeditRegion { .. } => t.take_assembly(),
+            // A commit and a delete take it only once they reach the guest,
+            // and a confirmation once it has a preedit to commit (below), as
+            // the old handlers did (design H9).
+            HostIme::Commit { .. } | HostIme::Delete { .. } | HostIme::Confirm => {
+                Assembly::default()
+            }
         };
+        // Whether the event keeps the assembly if it is dropped, as a
+        // commit and a delete do.
+        let keeps_if_dropped = matches!(event, HostIme::Commit { .. } | HostIme::Delete { .. });
         let count = t.serial().get();
         let Some(cur) = t.current(ti) else {
             log::debug!("Ignoring a stale composition event of text input {}", ti.0);
@@ -365,7 +366,11 @@ impl ImeCore {
             | HostIme::PreeditCursor(_)
             | HostIme::CursorPosition { .. } => unreachable!("handled above"),
         };
-        match planned.apply() {
+        let applied = planned.apply();
+        if applied.is_ok() || !keeps_if_dropped {
+            t.take_assembly();
+        }
+        match applied {
             Ok((events, lease)) => {
                 fx.to_guest.extend(events);
                 fx.keys.push(lease);
