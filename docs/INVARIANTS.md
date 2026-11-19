@@ -1205,9 +1205,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     knows (`ime::mirror::Health`): its prediction of Exo's state is
     `Exact`; `Vague`, exact but for a selection IMA made from a highlight
     span at the preedit cursor (a composition selection), whose other end
-    the wire does not carry; or `Unknown`. Its history keeps no text: each
-    state is a fingerprint (the text's length and 64-bit hash, the
-    selection unless vague, the composition, and the keys of the text
+    the wire does not carry; or `Unknown`. A vague selection is empty at
+    the preedit cursor or runs from it to such a highlight's other end, so
+    a report, whose selection is forward, can equal it only at one of
+    those. Its history keeps no text: each state is a fingerprint (the
+    text's length and 64-bit hash, the selection, or the ones a vague one
+    may be, the composition, and the keys of the text
     without the composition and of the composition's text), or an
     unknown state, up to 4,096 states; evicting the oldest leaves an
     unknown state in its place, which Exo could match. An event Exo could
@@ -1224,7 +1227,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     composition, a confirm that moves the cursor after it, a delete, a
     selection range, or a preedit with no highlight at its cursor. A
     report Exo processes is ambiguous when an unknown state, or a vague
-    one with the report's text, comes before any state equal to it: the
+    one with the report's text and a selection it may be, comes before
+    any state equal to it: the
     history becomes one unknown state, and the prediction unknown too,
     unless it is the report's with no composition. A report with no
     ambiguous state before an equal one matches it; one with neither
@@ -1261,9 +1265,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     Exo's cursor, deletes the rest around the guest's cursor and shows the
     region; an empty one commits the composition, or with none edits
     nothing (previous rule). Otherwise the delete or region is dropped,
-    with a debug log that names why (`ime::exo_view::Unmeasured`: an
-    unsure mirror, keys or presses the guest has not stated, a crossing
-    report, or a guest out of step). A drop sends nothing, takes a
+    with a debug log that names why (`ime::exo_view::Unmeasured`: a
+    mirror unsure before the event or after it, keys or presses the guest
+    has not stated, a crossing report, or a guest out of step). A drop sends nothing, takes a
     region's assembly, and leaves the guest out of step, until its next
     report puts it in step again, matched or reset. A drop is not
     harmless, as the input method goes on as if it applied, and its next
@@ -1323,6 +1327,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_matched_report_finds_the_guest_without_a_composition`,
   `a_definite_reset_heals_without_a_press`,
   `an_ambiguous_report_stays_unknown`,
+  `a_report_unlike_a_vague_selection_heals_it`,
   `a_report_without_the_shown_preedit_is_withheld`.
   The core's row tests of G1 (the mirror from v11), X1 and H9, and of
   report suppression, are listed in the design's rows and G9c

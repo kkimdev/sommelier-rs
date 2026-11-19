@@ -217,12 +217,21 @@ impl Key {
     }
 }
 
+/// What a report compares of a state's selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Selection {
+    /// The selection, directed.
+    Exact(Span),
+    /// The selection is vague ([`Health::Vague`]): these are the forward
+    /// selections it may be, which are all a report's, forward, can equal.
+    Vague(Vec<Span>),
+}
+
 /// What a report and report suppression compare of one tracker state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Fingerprint {
     text: Key,
-    /// `None` while the selection is vague ([`Health::Vague`]).
-    selection: Option<Span>,
+    selection: Selection,
     /// The composition, [`NO_COMPOSITION`] if there is none.
     composition: Range<usize>,
     /// With a composition, the keys of the text without it and of its
@@ -231,13 +240,18 @@ pub(crate) struct Fingerprint {
 }
 
 impl Fingerprint {
-    /// `state`'s fingerprint, vague if this one is.
+    /// `state`'s fingerprint, vague as this one is.
     #[cfg(test)]
     pub(super) fn of_alike(&self, state: &ExoState) -> Self {
-        Self::of(state, self.selection.is_none())
+        let vague = match &self.selection {
+            Selection::Vague(selections) => Some(&selections[..]),
+            Selection::Exact(_) => None,
+        };
+        Self::of(state, vague)
     }
 
-    fn of(state: &ExoState, vague: bool) -> Self {
+    /// `state`'s fingerprint, whose selection is one of `vague`, if given.
+    fn of(state: &ExoState, vague: Option<&[Span]>) -> Self {
         let composition = state.composition.clone();
         let split = (!composition.is_empty()).then(|| {
             let mut rest = state.text[..composition.start].to_owned();
@@ -246,7 +260,10 @@ impl Fingerprint {
         });
         Self {
             text: Key::of(&state.text),
-            selection: (!vague).then_some(state.selection),
+            selection: match vague {
+                Some(selections) => Selection::Vague(selections.to_vec()),
+                None => Selection::Exact(state.selection),
+            },
             composition,
             split,
         }
@@ -268,8 +285,8 @@ enum Lookup {
     /// The first state equal to it, with nothing before it that Exo could
     /// match instead.
     Match(usize),
-    /// An unknown state, or a vague one with its text, comes first: Exo
-    /// may have matched there.
+    /// An unknown state, or a vague one with its text and a selection it
+    /// may have, comes first: Exo may have matched there.
     Ambiguous,
     /// No state can equal it.
     Missing,
@@ -384,6 +401,9 @@ pub(super) struct ExoMirror {
     /// The `cursor_position(index, anchor)` since the last
     /// `commit_string`.
     cursor_position: Option<(i32, i32)>,
+    /// While the prediction is vague, the selections it may have
+    /// ([`Selection::Vague`]).
+    vague: Vec<Span>,
     /// The last report reset a non-empty composition (E4), and nothing
     /// has composed since.
     dropped: bool,
@@ -404,6 +424,7 @@ impl ExoMirror {
             preedit_cursor: None,
             highlights: Vec::new(),
             cursor_position: None,
+            vague: Vec::new(),
             dropped: false,
             diverged: false,
         };
@@ -450,11 +471,13 @@ impl ExoMirror {
             let Entry::Known { print, .. } = entry else {
                 return Lookup::Ambiguous;
             };
-            match print.selection {
+            match &print.selection {
                 _ if print.text != text => {}
-                None => return Lookup::Ambiguous,
-                Some(equal) if equal == selection => return Lookup::Match(at),
-                Some(_) => {}
+                Selection::Vague(selections) if selections.contains(&selection) => {
+                    return Lookup::Ambiguous
+                }
+                Selection::Exact(equal) if *equal == selection => return Lookup::Match(at),
+                Selection::Vague(_) | Selection::Exact(_) => {}
             }
         }
         Lookup::Missing
@@ -587,7 +610,8 @@ impl ExoMirror {
     /// Echo: `commit` is `text`, and the cursor is a char boundary of it.
     /// A highlight with one end at the cursor and the other elsewhere is a
     /// composition selection the mirror cannot know, so the selection is
-    /// [`Health::Vague`]; without one, the cursor sets it.
+    /// [`Health::Vague`]: empty at the cursor, or between it and such a
+    /// highlight's other end. Without one, the cursor sets it.
     pub(super) fn preedit_string(&mut self, text: &str, commit: &str) {
         let cursor = self.preedit_cursor.take();
         let highlights = std::mem::take(&mut self.highlights);
@@ -606,9 +630,26 @@ impl ExoMirror {
             if mirror.health == Health::Vague && mirror.predicted.composition.is_empty() {
                 return Err(Miss::Unknowable);
             }
-            let vague = highlights
-                .iter()
-                .any(|span| span.start == cursor || span.end == cursor);
+            // Where the composition will begin (`OnSetCompositionText`).
+            let predicted = &mirror.predicted;
+            let begin = match predicted.composition.is_empty() {
+                true => predicted.selection.min(),
+                false => predicted.composition.start,
+            };
+            let at = begin + cursor;
+            let others = highlights.iter().filter_map(|span| match () {
+                _ if span.start == cursor => Some(span.end),
+                _ if span.end == cursor => Some(span.start),
+                _ => None,
+            });
+            let others: Vec<Span> = others
+                .map(|other| begin + other.min(text.len()))
+                .map(|other| Span::new(at.min(other), at.max(other)))
+                .collect();
+            let vague = !others.is_empty();
+            if vague {
+                mirror.vague = [Span::at(at)].into_iter().chain(others).collect();
+            }
             mirror.health = if vague { Health::Vague } else { Health::Exact };
             mirror.dropped = false;
             mirror.on_set_composition_text(text, Span::at(cursor));
@@ -826,7 +867,7 @@ impl ExoMirror {
                         Entry::Known { in_step: step, .. } if found => in_step &= *step,
                         Entry::Known { print, .. } => {
                             found = print.composition.is_empty()
-                                && print.selection == Some(selection)
+                                && print.selection == Selection::Exact(selection)
                                 && print.text == text;
                         }
                         Entry::Unknown => in_step = false,
@@ -855,7 +896,10 @@ impl ExoMirror {
         let entry = match self.health {
             Health::Unknown => Entry::Unknown,
             health => Entry::Known {
-                print: Fingerprint::of(&self.predicted, health == Health::Vague),
+                print: Fingerprint::of(
+                    &self.predicted,
+                    (health == Health::Vague).then_some(&self.vague[..]),
+                ),
                 in_step: false,
             },
         };
@@ -876,7 +920,8 @@ impl ExoMirror {
     /// `Update` (STT 131-191). With offset 0, `compare_begin` is 0, so a
     /// state matches when its selection and its whole text are equal, and
     /// the match is exact. When an unknown state, or a vague one with the
-    /// report's text, comes before any equal state, the mirror cannot tell
+    /// report's text and a selection it may have, comes before any equal
+    /// state, the mirror cannot tell
     /// whether Exo matched there: the history is unknown, and so is the
     /// prediction, unless it is the report's with no composition, which
     /// Exo's is then either way.
@@ -1113,7 +1158,7 @@ mod tests {
     /// is `predicted`.
     fn at(predicted: ExoState) -> ExoMirror {
         let mut mirror = ExoMirror::new();
-        let print = Fingerprint::of(&predicted, false);
+        let print = Fingerprint::of(&predicted, None);
         mirror.predicted = predicted;
         mirror.expected = VecDeque::from([Entry::Known {
             print,
@@ -1125,7 +1170,7 @@ mod tests {
     /// A history entry is a state's if it is its exact fingerprint.
     impl PartialEq<ExoState> for Entry {
         fn eq(&self, state: &ExoState) -> bool {
-            matches!(self, Entry::Known { print, .. } if *print == Fingerprint::of(state, false))
+            matches!(self, Entry::Known { print, .. } if *print == Fingerprint::of(state, None))
         }
     }
 
@@ -1861,12 +1906,40 @@ mod tests {
         report(&mut mirror, "다", 3, 3);
         assert_eq!(mirror.health(), Health::Unknown);
 
-        // A vague state with the report's text.
+        // A vague state with the report's text and a selection it may
+        // have.
         let mut mirror = at(start);
         convert(&mut mirror, "漢字", 3);
-        report(&mut mirror, "가나다漢字", 15, 15);
+        report(&mut mirror, "가나다漢字", 12, 12);
         assert_eq!(history(&mirror), [Entry::Unknown]);
         assert_eq!(mirror.health(), Health::Unknown);
+    }
+
+    /// A report's selection is forward. A vague one starts at the preedit
+    /// cursor, and is empty there or runs to the highlight's other end, so
+    /// only a report with one of those selections may match a vague state.
+    /// After a conversion that a confirmation keeping the selection ends,
+    /// as Japanese input methods send, the guest's report of the committed
+    /// text with its cursor after it resets Exo, which heals the mirror.
+    #[test]
+    fn a_report_unlike_a_vague_selection_heals_it() {
+        let confirmed = || {
+            let mut mirror = at(state(GANADA, (9, 9), NO_COMPOSITION));
+            convert(&mut mirror, "漢字", 3);
+            mirror.confirm_preedit(true);
+            mirror
+        };
+        let mut mirror = confirmed();
+        report(&mut mirror, "가나다漢字", 15, 15);
+        assert_pushed(&mirror, &state("가나다漢字", (15, 15), NO_COMPOSITION));
+        assert_eq!(history(&mirror).len(), 1);
+        // The cursor at the highlight's end, and the highlight selected.
+        for (cursor, anchor) in [(12, 12), (12, 9)] {
+            let mut mirror = confirmed();
+            report(&mut mirror, "가나다漢字", cursor, anchor);
+            assert_eq!(mirror.health(), Health::Unknown, "{cursor}, {anchor}");
+            assert_eq!(history(&mirror), [Entry::Unknown]);
+        }
     }
 
     /// A conversion's preedit `text`, its first `selected` bytes
@@ -1887,24 +1960,33 @@ mod tests {
     #[test]
     fn a_highlight_is_vague_until_a_commit() {
         let highlight = zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT;
-        for (case, style, (index, length), vague) in [
-            ("a highlight ending at the cursor", highlight, (0, 3), true),
-            ("one starting at it", highlight, (3, 3), true),
-            ("one apart from it", highlight, (6, 3), false),
+        // The selection is empty at the cursor, or runs to the other end.
+        for (case, style, (index, length), other) in [
+            (
+                "a highlight ending at the cursor",
+                highlight,
+                (0, 3),
+                Some(0),
+            ),
+            ("one starting at it", highlight, (3, 3), Some(6)),
+            ("one apart from it", highlight, (6, 3), None),
             (
                 "an underline",
                 zwp_text_input_v1::PREEDIT_STYLE_UNDERLINE,
                 (0, 3),
-                false,
+                None,
             ),
         ] {
             let mut mirror = at(state("", (0, 0), NO_COMPOSITION));
             mirror.preedit_styling(index, length, style);
             mirror.preedit_cursor(3);
             mirror.preedit_string(GANADA, GANADA);
-            let health = [Health::Exact, Health::Vague][usize::from(vague)];
+            let health = [Health::Exact, Health::Vague][usize::from(other.is_some())];
             assert_eq!(mirror.health(), health, "{case}");
-            let print = Fingerprint::of(&state(GANADA, (3, 3), 0..9), vague);
+            let vague =
+                other.map(|other: usize| [Span::at(3), Span::new(other.min(3), other.max(3))]);
+            let print =
+                Fingerprint::of(&state(GANADA, (3, 3), 0..9), vague.as_ref().map(|v| &v[..]));
             let pushed = Entry::Known {
                 print,
                 in_step: false,

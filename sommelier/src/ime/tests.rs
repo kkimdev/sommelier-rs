@@ -2595,6 +2595,34 @@ fn row_H9_after_a_forwarded_key_drops() {
     }
 }
 
+/// An event that heals a mirror that was not exact, as a delete over a
+/// vague selection does, is dropped as the mirror was unsure, not as the
+/// guest out of step.
+#[test]
+fn row_H9_a_delete_that_heals_an_unsure_mirror_drops_as_unsure() {
+    let mut ime = Ime::enabled();
+    ime.report("가나다", 9);
+    ime.v1(HostIme::PreeditStyling {
+        index: 0,
+        length: 3,
+        style: zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT,
+    });
+    ime.v1(HostIme::PreeditCursor(3));
+    ime.compose("漢字");
+    ime.ext(HostIme::Confirm {
+        keep_selection: true,
+    });
+    assert_eq!(ime.mirror().health(), mirror::Health::Vague);
+    take_drops_for_test();
+    assert_eq!(ime.delete(9, 6).guest, []);
+    assert_eq!(ime.mirror().health(), mirror::Health::Exact);
+    let unsure = Drops {
+        unsure: 1,
+        ..Drops::default()
+    };
+    assert_eq!(take_drops_for_test(), unsure);
+}
+
 /// A report after the key states what it did, and a commit without one
 /// that it changed nothing.
 #[test]

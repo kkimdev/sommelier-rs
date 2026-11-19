@@ -359,7 +359,7 @@ impl ImeCore {
         let measuring = t.exo().measuring(frame.clone());
         let measuring = measuring.as_ref().map_err(|&why| why);
         let edit = composition_event(ti, t, event, measuring, fx);
-        t.exo_after(frame.as_ref(), edit);
+        t.exo_after(frame.as_ref().ok(), edit);
     }
 
     /// F1, per text input of the seat, in `TiId` order. The field the

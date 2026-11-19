@@ -145,24 +145,28 @@ impl ExoView {
     }
 
     /// The frame of the next host event, before the mirror takes it: Exo's
-    /// state, if a guest that shows `shown` can be in step with it.
-    pub(super) fn frame(&self, shown: Option<&Preedit>) -> Option<Frame> {
-        let state = self.mirror.as_ref()?.exact()?;
-        let held = held(state, shown)?;
-        Some(Frame {
+    /// state, if the mirror knows it exactly and a guest that shows `shown`
+    /// can be in step with it.
+    pub(super) fn frame(&self, shown: Option<&Preedit>) -> Result<Frame, Unmeasured> {
+        let mirror = self.mirror.as_ref().ok_or(Unmeasured::NoMirror)?;
+        let state = mirror.exact().ok_or(Unmeasured::Unsure)?;
+        let held = held(state, shown).ok_or(Unmeasured::OutOfStep)?;
+        Ok(Frame {
             state: state.clone(),
             held,
         })
     }
 
     /// The frame `frame` taken before the event just observed, if it
-    /// measures the event: the text input has a mirror, which stayed
-    /// exact, the guest has stated every key and press, no report on its
-    /// way to Exo crossed the event (design exo-mirror 3.3, "Crossings"),
-    /// and the guest was in step with the frame.
-    pub(super) fn measuring(&self, frame: Option<Frame>) -> Result<Frame, Unmeasured> {
+    /// measures the event: the text input has a mirror, which was exact
+    /// before the event and after it, the guest has stated every key and
+    /// press, no report on its way to Exo crossed the event (design
+    /// exo-mirror 3.3, "Crossings"), and the guest was in step with the
+    /// frame.
+    pub(super) fn measuring(&self, frame: Result<Frame, Unmeasured>) -> Result<Frame, Unmeasured> {
         let mirror = self.mirror.as_ref().ok_or(Unmeasured::NoMirror)?;
-        if mirror.health() != Health::Exact {
+        // An event can make a mirror that was unsure exact again.
+        if mirror.health() != Health::Exact || frame.as_ref().err() == Some(&Unmeasured::Unsure) {
             return Err(Unmeasured::Unsure);
         }
         if self.unseen {
@@ -171,7 +175,10 @@ impl ExoView {
         if mirror.report_crosses() {
             return Err(Unmeasured::Crossing);
         }
-        frame.filter(|_| self.in_step).ok_or(Unmeasured::OutOfStep)
+        frame
+            .ok()
+            .filter(|_| self.in_step)
+            .ok_or(Unmeasured::OutOfStep)
     }
 
     /// The mirror takes host event `event`, before the gate: stale events
