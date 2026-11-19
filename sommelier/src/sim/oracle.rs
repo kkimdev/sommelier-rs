@@ -94,8 +94,10 @@ pub(super) struct Origin {
     pub resets: u64,
     /// The key whose press, not an autorepeat, the event answers.
     pub press: Option<Key>,
-    /// A surrounding text the proxy sent Exo was on its way when Exo sent
-    /// the event, so the proxy's committed text is newer than Exo's.
+    /// The proxy had sent Exo a surrounding text, by the time the event
+    /// reached it, that Exo had yet to get when it sent the event: on its
+    /// way to Exo then, or sent while the event was on its way to the
+    /// proxy. Either way the proxy's committed text is newer than Exo's.
     pub crossed: bool,
 }
 
@@ -360,8 +362,8 @@ pub(super) struct Counts {
     pub regions_dropped: u64,
     /// Guest reports that crossed an edit on its way to the guest (P4).
     pub crossed_reports: u64,
-    /// Preedit regions Exo made while a report the proxy sent it was on
-    /// its way (KnownIssue::RegionCrossesReport).
+    /// Preedit regions Exo made before it got a report the proxy had sent
+    /// by the time the region reached it (KnownIssue::RegionCrossesReport).
     pub regions_crossing_reports: u64,
     /// Ranges IMA sent after the commit of the key it held them for
     /// (KnownIssue::StaleRegionAfterCommit).
@@ -1187,8 +1189,8 @@ impl SpecText {
     /// proxy cannot know, the failure says which, so that only its known
     /// issue explains it: a report Exo could not match dropped the
     /// composition the specification takes Exo to hold (E4,
-    /// `RegionOverUnheldPreedit`); a report was on its way to Exo
-    /// (`RegionCrossesReport`); or, Exo holding the composition
+    /// `RegionOverUnheldPreedit`); a report the proxy committed had yet
+    /// to reach Exo (`RegionCrossesReport`); or, Exo holding the composition
     /// the specification takes it to, Exo's text holds edits of the input
     /// method the guest has yet to report (P4, `RegionWhileAhead`). Until the guest
     /// reports, later regions differ for the same reason. Any other
@@ -1747,7 +1749,9 @@ pub(super) enum KnownIssue {
     /// repeated (X2').
     RecoveryBeforeAPress,
     /// A preedit region Exo made from text older than the guest's report
-    /// the proxy already committed is measured from the newer cursor (X1).
+    /// the proxy already committed is measured in that newer report (X1).
+    /// The report was on its way to Exo, or the proxy sent it while the
+    /// region was on its way to the proxy.
     RegionCrossesReport,
     /// A range IMA held for a key and sent after that key's commit
     /// composes the committed text, which the guest shows as a preedit
@@ -1805,10 +1809,11 @@ impl KnownIssue {
                  shows other bytes than Exo composes (X1, P4)"
             }
             Self::RegionCrossesReport => {
-                "Exo makes a region from its cursor in the text it had, while a report of the \
-                 guest's, which moved the cursor, was on its way to it; the proxy has already \
-                 committed that report and measures the region from the new cursor (X1), so \
-                 the guest shows other bytes than Exo composes"
+                "Exo makes a region in the text it had before a report of the guest's, which \
+                 moved the cursor or left out the preedit Exo holds, reached it: the report was \
+                 on its way to Exo, or the proxy sent it while the region was on its way back; \
+                 the proxy has already committed that report and measures the region in it \
+                 (X1), so the guest shows other bytes than Exo composes"
             }
             Self::RecoveryBeforeAPress => {
                 "at v11 Exo confirms before every key the input method did not handle (E13), \

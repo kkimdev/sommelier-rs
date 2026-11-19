@@ -1808,8 +1808,8 @@ enum KnownIssue {
     /// peek, and the guest gets one more press of it.
     RecoveryBeforeAPress,
     /// X1: a region Exo makes from text older than a guest report the
-    /// proxy has committed, still on its way to Exo, is measured from
-    /// the newer cursor.
+    /// proxy has committed, which was on its way to Exo or was sent while
+    /// the region was on its way back, is measured in that report.
     RegionCrossesReport,
     /// IMA holds a reconversion's range while a key is in flight and
     /// sends it after that key's commit, so it composes the committed
@@ -1835,11 +1835,12 @@ guest's preedit must be that text (`SpecText::judge_region`, a `region`
 check). Where Exo made the region in other text than `SpecText` takes it
 to hold, the check names why, from what the world knows and the proxy
 cannot: a composition E4 dropped (`RegionOverUnheldPreedit`), a report
-on its way to Exo (`RegionCrossesReport`), or edits the guest has yet to
+that the proxy committed before the region reached it but Exo had yet
+to get (`RegionCrossesReport`), or edits the guest has yet to
 report, a report that crossed one included
 (`RegionWhileAhead`); later regions until the guest's next report keep
 that reason. Only that issue explains such a check. In 20,000 cases from
-seed 0 they occur 2, 12 and 10 times.
+seed 0 they explain 1, 13 and 11 cases.
 
 A failure is classified as known only when tier 1 passed, every failure
 is of tier 2, and the client shows exactly what a set of known issues

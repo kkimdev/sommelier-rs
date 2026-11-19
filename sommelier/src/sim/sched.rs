@@ -300,8 +300,9 @@ pub(super) struct World<'t> {
     /// the guest's pointer or finger is on which of its surfaces.
     p_to_c: Channel<(u32, AnyEvent, Option<Press>)>,
     p_to_e: Channel<(u32, AnyRequest)>,
-    /// Each host event, and what engine text it carries.
-    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>)>,
+    /// Each host event, what engine text it carries, and how many of the
+    /// proxy's surrounding texts Exo had got when it sent the event.
+    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>, u64)>,
     to_engine: Channel<EngineIn>,
     /// The guest's view of what the client models do not take: the
     /// globals, Shift and where its pointer is, as the proxy tells it.
@@ -312,8 +313,10 @@ pub(super) struct World<'t> {
     resets: u64,
     /// The key the user holds, which repeats, and when it next does.
     repeat: Option<(Key, Micros)>,
-    /// The surrounding texts the proxy sent Exo that Exo has yet to get.
-    reports_to_exo: u64,
+    /// How many surrounding texts the proxy sent Exo, and how many of them
+    /// Exo got.
+    reports_sent: u64,
+    reports_got: u64,
     /// The transactions that edit the text (a delete or a commit) the
     /// proxy sent the guest, and those the guest got; and whether the
     /// transaction each is in so far edits.
@@ -368,7 +371,8 @@ impl<'t> World<'t> {
             pointer: None,
             resets: 0,
             repeat: None,
-            reports_to_exo: 0,
+            reports_sent: 0,
+            reports_got: 0,
             edits: Edits::default(),
             text_input: 0,
             compositor: 0,
@@ -506,12 +510,16 @@ impl<'t> World<'t> {
                 }
                 2 => {
                     let (sender, request) = self.p_to_e.take();
-                    self.reports_to_exo -= u64::from(is_report(&request));
+                    self.reports_got += u64::from(is_report(&request));
                     let events = self.display.request(sender, &request, &mut self.exo);
                     self.host_sends(events, false);
                 }
                 3 => {
-                    let (event, origin, truth) = self.e_to_p.take();
+                    let (event, mut origin, truth, reports) = self.e_to_p.take();
+                    // A report the proxy sent before the event reached it,
+                    // which Exo had yet to get when it sent the event,
+                    // crossed it: on its way to Exo then, or sent since.
+                    origin.crossed = self.reports_sent > reports;
                     self.deliver_host_event(event, origin, truth).await;
                 }
                 4 => {
@@ -664,16 +672,17 @@ impl<'t> World<'t> {
             late,
             resets: self.resets,
             press,
-            crossed: self.reports_to_exo > 0,
+            crossed: false,
         };
+        let reports = self.reports_got;
         for (event, truth) in self.exo.take_events_with_truths() {
             self.e_to_p
-                .send(self.now, (event, origin, truth), &mut self.choices);
+                .send(self.now, (event, origin, truth, reports), &mut self.choices);
         }
         for event in events {
             let origin = Origin::default();
             self.e_to_p
-                .send(self.now, (event, origin, None), &mut self.choices);
+                .send(self.now, (event, origin, None, reports), &mut self.choices);
         }
         for input in self.exo.take_engine() {
             self.resets += u64::from(input == EngineIn::Reset);
@@ -788,7 +797,7 @@ impl<'t> World<'t> {
     /// What the proxy sent goes out on P→E and P→C.
     fn send_proxy_output(&mut self, goes_on: bool) {
         for (sender, request) in self.session.host_received() {
-            self.reports_to_exo += u64::from(is_report(&request));
+            self.reports_sent += u64::from(is_report(&request));
             self.log(Place::PToE, format!("{sender} {request:?}"));
             self.see(Seen::ToHost(&request));
             self.p_to_e
