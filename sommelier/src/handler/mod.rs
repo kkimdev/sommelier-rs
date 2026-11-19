@@ -21,6 +21,7 @@ pub mod compositor;
 pub mod data_device;
 pub mod display;
 pub mod gtk_shell;
+pub mod ime_keys;
 pub mod keyboard;
 pub mod linux_dmabuf;
 pub mod output;
