@@ -324,21 +324,25 @@ impl Context {
             host("pointer focus", pointer.0, "wl_pointer");
             guest("pointer focus", surface, "wl_surface");
         }
-        for (&text_input, state) in &self.text_inputs {
-            guest("text input state", text_input, "zwp_text_input_v3");
-            // A fence that outlived its callback would drop the field's
-            // composition events for good.
-            if let Some(fence) = state.reset_fence {
-                assert_eq!(
-                    self.internal_callbacks.get(fence),
-                    Some(super::InternalCallback::TextInputResetFence { text_input }),
-                    "text input {text_input} keeps a reset fence whose callback is not pending"
+        for (text_input, t) in self.ime.iter() {
+            guest("text input state", text_input.0, "zwp_text_input_v3");
+            // I5: a drain or a fence that outlived its callback would drop
+            // the field's composition events for good.
+            for token in t.barriers() {
+                assert!(
+                    self.internal_callbacks
+                        .awaits(super::InternalCallback::TextInput { token })
+                        .is_some(),
+                    "text input {} keeps barrier {token:?}, whose callback is not pending",
+                    text_input.0
                 );
             }
-            if let Some(surface) = state.active_surface {
-                guest("text input focus", surface, "wl_surface");
+            if let Some(surface) = t.focused_surface() {
+                guest("text input focus", surface.0, "wl_surface");
             }
         }
+        self.ime
+            .assert_invariants(&crate::handler::text_input::CtxEnv(self));
 
         // SHM and dma-buf.
         for &pool in self.pools.keys().chain(&self.stale_shm_pools) {

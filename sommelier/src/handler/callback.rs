@@ -60,21 +60,8 @@ impl WlCallbackHandler for CallbackHandler {
                 InternalCallback::GtkShellCapabilities { gtk_shell } => {
                     crate::handler::gtk_shell::announce_capabilities(ctx, gtk_shell);
                 }
-                InternalCallback::TextInputDrained {
-                    text_input,
-                    host_text_input,
-                } => crate::handler::text_input::complete_host_activation_barrier(
-                    ctx,
-                    HostId(host_id),
-                    text_input,
-                    host_text_input,
-                ),
-                InternalCallback::TextInputResetFence { text_input } => {
-                    crate::handler::text_input::complete_reset_fence(
-                        ctx,
-                        HostId(host_id),
-                        text_input,
-                    )
+                InternalCallback::TextInput { token } => {
+                    crate::handler::text_input::complete_barrier(ctx, token)
                 }
                 InternalCallback::WindowBoundsBarrier { zaura_toplevel } => {
                     crate::handler::window_placement::complete_barrier(

@@ -21,7 +21,7 @@ limitations under the License.
 /// counted whether or not the commit reached the host (INVARIANTS "Every
 /// v3 commit counts"). Its field is private: a count starts at zero, and
 /// only [`Self::bump`] changes it.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CommitCount(u32);
 
 impl CommitCount {
@@ -29,6 +29,13 @@ impl CommitCount {
     /// through `TextInput::count_commit`.
     pub(super) fn bump(&mut self) {
         self.0 = self.0.wrapping_add(1);
+    }
+
+    /// A count of `commits` already made, for the handler tests of the
+    /// storage switch's window (`test_support::text_input`).
+    #[cfg(test)]
+    pub(super) fn starting_at(commits: u32) -> Self {
+        Self(commits)
     }
 
     /// The serial of the next `done`: the commits counted so far.
@@ -40,10 +47,10 @@ impl CommitCount {
 /// The serial of a text-input-v3 `done`. Only [`CommitCount::serial`]
 /// makes one, so a `done` cannot carry another number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Serial(u32);
+pub(crate) struct Serial(u32);
 
 impl Serial {
-    pub(super) fn get(self) -> u32 {
+    pub(crate) fn get(self) -> u32 {
         self.0
     }
 }

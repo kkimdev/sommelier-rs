@@ -18,12 +18,13 @@ limitations under the License.
 //! `handler/text_input.rs` that set up or read state no peer can observe.
 //!
 //! This is the only handler test code outside that file which touches the
-//! text-input storage, so of the handler tests, the IME core's storage
-//! switch (docs/IME_REDESIGN.md, C3a) rewrites only this module; it also
-//! rewrites the storage's own tests in `state/input.rs`. A test that can
-//! pin what the peers receive uses `proxy::harness::Session` instead.
+//! text-input storage, the IME core's ([`crate::ime::ImeCore`]), so the
+//! core's switch from the old handlers to `step` rewrites only this
+//! module. A test that can pin what the peers receive uses
+//! `proxy::harness::Session` instead.
 
-use crate::state::{Context, HostApplied, HostId, ShownPreedit, TextInputState, V3Pending};
+use crate::ime::{Assembly, HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId};
+use crate::state::{Context, HostId, InternalCallback, V3Pending};
 
 /// A text input the guest enabled and committed, and the host activated,
 /// as [`insert`] sets it up.
@@ -35,7 +36,8 @@ pub(crate) struct Active<'a> {
     pub(crate) ext: Option<u32>,
     /// The guest `wl_seat` it was created for.
     pub(crate) seat: u32,
-    /// The guest surface its focus is on, if any.
+    /// The guest surface its focus is on, if any; with none, the field is
+    /// not enabled, but the host still active.
     pub(crate) focus: Option<u32>,
     /// The committed surrounding text: its text, cursor and anchor.
     pub(crate) surrounding_text: Option<(&'a str, i32, i32)>,
@@ -45,7 +47,7 @@ pub(crate) struct Active<'a> {
     pub(crate) commits: u32,
     /// Whether state waits for its commit or for its host event: the
     /// guest's next enable, surrounding text and cursor rectangle, and the
-    /// host's preedit cursor, preedit styling and cursor position.
+    /// host's preedit cursor and preedit styling.
     pub(crate) pending: bool,
 }
 
@@ -69,28 +71,47 @@ impl Active<'_> {
 /// Give guest text input `guest`, whose objects the test has paired, the
 /// state `active` describes.
 pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
-    let mut state = TextInputState::new(active.host, active.ext, active.seat, active.focus);
-    state.committed.enabled = true;
-    state.committed.surrounding_text = active
-        .surrounding_text
-        .map(|(text, cursor, anchor)| (text.to_string(), cursor, anchor));
+    let ext = active.ext.map(|id| HostExt {
+        id,
+        version: ctx.shadow_table.host_object_version_or_unknown(id),
+        manager: ctx.host_text_input_extension_v1_id.unwrap_or_default(),
+    });
+    let host = HostTi {
+        v1: active.host,
+        ext,
+    };
+    let ti = TiId(guest);
+    let focus = active.focus.map(SurfaceId);
+    ctx.ime.insert(ti, SeatId(active.seat), host, focus);
+    let t = ctx.ime.get_mut(ti).expect("just inserted");
+    t.set_link_for_test(LinkState::Attached { content_type: None });
+    if let Some(committed) = t.committed_mut_for_test() {
+        committed.enabled = true;
+        committed.surrounding_text = active
+            .surrounding_text
+            .map(|(text, cursor, anchor)| (text.to_string(), cursor, anchor));
+    }
     if let Some(preedit) = active.preedit {
-        state.current_preedit = ShownPreedit::at_end(preedit);
+        t.show_for_test(preedit);
     }
-    state.set_guest_commits(active.commits);
+    t.set_commits_for_test(active.commits);
     if active.pending {
-        state.pending = V3Pending {
-            enabled: Some(true),
-            surrounding_text: Some(state.committed.surrounding_text.clone()),
-            content_type: None,
-            cursor_rect: Some((1, 2, 3, 4)),
-        };
-        state.pending_preedit_cursor = Some(1);
-        state.pending_preedit_selection = Some((0, 1));
-        state.pending_cursor_position = Some((1, 1));
+        let surrounding_text = t
+            .field()
+            .map(|(_, committed)| committed.surrounding_text.clone());
+        if let Some(pending) = t.pending_mut() {
+            *pending = V3Pending {
+                enabled: Some(true),
+                surrounding_text,
+                content_type: None,
+                cursor_rect: Some((1, 2, 3, 4)),
+            };
+        }
+        t.set_assembly_for_test(Assembly {
+            cursor: Some(1),
+            selection: Some((0, 1)),
+        });
     }
-    state.host = HostApplied::Active { content_type: None };
-    ctx.text_inputs.insert(guest, state);
 }
 
 /// What the host text input has applied.
@@ -126,34 +147,34 @@ pub(crate) struct View {
 
 /// What the proxy holds for text input `guest`.
 pub(crate) fn view(ctx: &Context, guest: u32) -> View {
-    let state = &ctx.text_inputs[&guest];
+    let t = ctx.ime.get(TiId(guest)).expect("a text input");
+    let committed = t.field().map(|(_, committed)| committed);
     View {
-        focus: state.active_surface,
-        enabled: state.committed.enabled,
-        surrounding_text: state.committed.surrounding_text.clone(),
-        host: match state.host {
-            HostApplied::Inactive => Host::Inactive,
-            HostApplied::Active { .. } => Host::Active,
-            HostApplied::Draining { callback } => Host::Draining(callback),
+        focus: t.focused_surface().map(|surface| surface.0),
+        enabled: t.is_enabled(),
+        surrounding_text: committed.and_then(|committed| committed.surrounding_text.clone()),
+        host: match t.link() {
+            LinkState::Detached => Host::Inactive,
+            LinkState::Attached { .. } => Host::Active,
+            LinkState::Draining { barrier } => Host::Draining(
+                ctx.internal_callbacks
+                    .awaits(InternalCallback::TextInput { token: barrier })
+                    .expect("a drain waits for its callback"),
+            ),
         },
-        preedit: state
-            .current_preedit
-            .has_text()
-            .then(|| state.current_preedit.text.clone()),
-        commits: state.guest_commit_serial(),
-        pending: state.pending != V3Pending::default()
-            || state.pending_preedit_cursor.is_some()
-            || state.pending_preedit_selection.is_some()
-            || state.pending_cursor_position.is_some(),
+        preedit: t.shown_for_test().map(str::to_string),
+        commits: t.serial().get(),
+        pending: *t.pending_for_test() != V3Pending::default()
+            || t.assembly_for_test() != Assembly::default(),
     }
 }
 
 /// All the proxy holds for a text input, to check that something left it
 /// untouched.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Snapshot(TextInputState);
+pub(crate) struct Snapshot(TextInput);
 
 /// All the proxy holds for text input `guest`.
 pub(crate) fn snapshot(ctx: &Context, guest: u32) -> Snapshot {
-    Snapshot(ctx.text_inputs[&guest].clone())
+    Snapshot(ctx.ime.get(TiId(guest)).expect("a text input").clone())
 }

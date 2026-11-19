@@ -46,11 +46,9 @@ use xkbcommon::xkb;
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
-    reconcile, ActivationStep, ConfirmPreeditPlan, CursorRect, GuestKeyDecision, GuestKeyDelivery,
-    GuestKeyEvent, GuestKeyOwner, HostApplied, HostCommitPlan, HostContentType, HostPreeditContext,
-    HostPreeditPlan, HostTarget, KeyGenerationRegistry, KeyboardFocus, KeyboardFocusRegistry,
-    KeyboardFocusUpdate, PeekKeyProvenance, PointerFocus, PreeditRegionPlan, SeatFocusChange,
-    ShownPreedit, TextInputState, V3Committed, V3Pending,
+    CursorRect, GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostContentType,
+    KeyGenerationRegistry, KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate,
+    PeekKeyProvenance, PointerFocus, SeatFocusChange, V3Committed, V3Pending,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::objects::{DeletedHostId, Link, ShadowTable};
@@ -370,7 +368,7 @@ pub struct Context {
     /// Every guest `zwp_text_input_v3`, ordered by ID: a focus change
     /// reaches them in that order (INVARIANTS "Nothing the proxy sends
     /// depends on hash order").
-    pub text_inputs: BTreeMap<u32, TextInputState>,
+    pub ime: crate::ime::ImeCore,
     pub keyboard_to_seat: BTreeMap<u32, u32>,
     pub keyboard_focus: KeyboardFocusRegistry,
     pub pointer_focus: PointerFocus,
@@ -1044,7 +1042,7 @@ impl Context {
             render_buffers: RenderBufferRegistry::default(),
             pending_native_creates: BTreeMap::new(),
             surfaces: BTreeMap::new(),
-            text_inputs: BTreeMap::new(),
+            ime: crate::ime::ImeCore::default(),
             keyboard_to_seat: BTreeMap::new(),
             keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),

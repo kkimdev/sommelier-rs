@@ -25,6 +25,7 @@ limitations under the License.
 use std::collections::BTreeMap;
 
 use super::HostId;
+use crate::ime::BarrierToken;
 
 /// What an internal callback waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,16 +36,10 @@ pub(crate) enum InternalCallback {
     /// The internal `zaura_shell` bind has reached the compositor, so the
     /// synthetic `gtk_shell1` (guest ID) may announce its capabilities.
     GtkShellCapabilities { gtk_shell: u32 },
-    /// The reused host text-input-v1 object (`host_text_input`) of guest
-    /// `text_input` has delivered every event of its previous activation.
-    TextInputDrained {
-        text_input: u32,
-        host_text_input: u32,
-    },
-    /// The host text input of guest `text_input` has delivered every event
-    /// it sent before it handled the `reset` a press sent it
-    /// (`TextInputState::reset_fence`).
-    TextInputResetFence { text_input: u32 },
+    /// A host text input has delivered every event it sent before the
+    /// request this barrier of the IME core follows: the `deactivate` of
+    /// its drain, or the `reset` of a press's fence.
+    TextInput { token: BarrierToken },
     /// Exo has processed the `set_window_bounds` that placement sent to this
     /// host `zaura_toplevel`.
     WindowBoundsBarrier { zaura_toplevel: u32 },
@@ -83,6 +78,14 @@ impl InternalCallbacks {
         self.by_callback
             .values()
             .any(|waits_for| *waits_for == InternalCallback::DmabufCapabilities { generation })
+    }
+
+    /// The pending callback that waits for `waits_for`, if any.
+    #[cfg(test)]
+    pub(crate) fn awaits(&self, waits_for: InternalCallback) -> Option<HostId> {
+        self.by_callback
+            .iter()
+            .find_map(|(&callback, &pending)| (pending == waits_for).then_some(callback))
     }
 
     #[cfg(test)]

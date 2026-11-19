@@ -35,11 +35,18 @@ mod step;
 mod tests;
 
 // Shared with the old handlers until the staged switch deletes them.
-pub(crate) use guest::{delete_lengths, lengths_around_cursor, resolve_preedit_cursor};
+#[cfg(test)]
+pub(crate) use guest::delete_lengths;
+pub(crate) use host::content_type_requests;
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
-pub(crate) use host::{content_type_requests, takes_surrounding_text_support};
-use state::TextInput;
+// The storage switch's window (docs/IME_REDESIGN.md, C3a to C3c): the old
+// handlers keep their shape, and reach the state through these.
+pub(crate) use guest::TooLong;
+pub(crate) use host::{reconcile, target, ActivationStep};
+#[cfg(test)]
+pub(crate) use state::Assembly;
+pub(crate) use state::{Confirm, DeleteDrop, LinkState, RegionDrop, TextInput};
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -60,7 +67,7 @@ pub struct SurfaceId(pub u32);
 pub struct BarrierToken(u64);
 
 /// The host objects behind a guest text input, fixed at its creation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostTi {
     /// The host `zwp_text_input_v1`.
     pub v1: u32,
@@ -68,7 +75,7 @@ pub struct HostTi {
     pub ext: Option<HostExt>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostExt {
     pub id: u32,
     /// Its version; an unknown one is the largest, which allows every
@@ -255,6 +262,66 @@ pub struct ImeCore {
     /// change it.
     by_ext: BTreeMap<u32, TiId>,
     next_barrier: u64,
+}
+
+/// The storage switch's window (docs/IME_REDESIGN.md, C3a to C3c): the
+/// old handlers keep their shape and own when each text input is
+/// reconciled, and they reach the state through these until `step` does.
+impl ImeCore {
+    /// G1: text input `ti` of `seat`, with the host objects `host`, focused
+    /// on `surface`, if any.
+    pub(crate) fn insert(
+        &mut self,
+        ti: TiId,
+        seat: SeatId,
+        host: HostTi,
+        surface: Option<SurfaceId>,
+    ) {
+        debug_assert!(!self.inputs.contains_key(&ti), "{ti:?} exists already");
+        if let Some(ext) = host.ext {
+            self.by_ext.insert(ext.id, ti);
+        }
+        self.inputs.insert(ti, TextInput::new(seat, host, surface));
+    }
+
+    /// Forget text input `ti`, and its extension.
+    pub(crate) fn forget(&mut self, ti: TiId) -> Option<TextInput> {
+        let t = self.inputs.remove(&ti)?;
+        if let Some(ext) = t.host().ext {
+            self.by_ext.remove(&ext.id);
+        }
+        Some(t)
+    }
+
+    pub(crate) fn get(&self, ti: TiId) -> Option<&TextInput> {
+        self.inputs.get(&ti)
+    }
+
+    pub(crate) fn get_mut(&mut self, ti: TiId) -> Option<&mut TextInput> {
+        self.inputs.get_mut(&ti)
+    }
+
+    /// Every text input, in `TiId` order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (TiId, &TextInput)> {
+        self.inputs.iter().map(|(&ti, t)| (ti, t))
+    }
+
+    /// Every text input, in `TiId` order.
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (TiId, &mut TextInput)> {
+        self.inputs.iter_mut().map(|(&ti, t)| (ti, t))
+    }
+
+    /// The text input of host extension `ext`.
+    pub(crate) fn by_ext(&self, ext: u32) -> Option<TiId> {
+        self.by_ext.get(&ext).copied()
+    }
+
+    /// A barrier no text input has waited for.
+    pub(crate) fn new_barrier(&mut self) -> BarrierToken {
+        let barrier = BarrierToken(self.next_barrier);
+        self.next_barrier += 1;
+        barrier
+    }
 }
 
 impl ImeCore {

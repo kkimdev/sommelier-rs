@@ -315,7 +315,7 @@ pub(super) fn on_keysym(ctx: &mut Context, serial: u32, time: u32, sym: u32, sta
         state
     );
 
-    let guest_seat = ctx.text_inputs.get(&guest_id).map(|state| state.guest_seat);
+    let guest_seat = ctx.ime.get(crate::ime::TiId(guest_id)).map(|t| t.seat().0);
     let keyboard = guest_seat.and_then(|seat| keyboard_for_keysym(ctx, seat, sym));
     if let Some((keyboard_id, host_keyboard_id)) = keyboard {
         if !matches!(
@@ -557,9 +557,8 @@ mod tests {
         ];
         for (case, event) in cases {
             let mut ime = Ime::with_keyboard();
-            let state = ime.state();
-            state.committed.surrounding_text = Some(("가나다".to_string(), 9, 9));
-            state.current_preedit = crate::state::ShownPreedit::at_end("가");
+            ime.committed().surrounding_text = Some(("가나다".to_string(), 9, 9));
+            ime.state().show_for_test("가");
             ime.lease_backspace_repeat(TI);
 
             event(&mut ime);
@@ -570,7 +569,7 @@ mod tests {
     #[test]
     fn input_mode_switch_boundary_clears_stale_repeat_before_empty_confirmation() {
         let mut ime = Ime::with_keyboard();
-        ime.state().committed.surrounding_text = Some(("english".to_string(), 7, 7));
+        ime.committed().surrounding_text = Some(("english".to_string(), 7, 7));
         ime.lease_backspace_repeat(TI);
         end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
 
@@ -581,7 +580,7 @@ mod tests {
             "a routine empty confirmation must not become a synthetic Backspace"
         );
         assert_eq!(
-            ime.state().committed.surrounding_text,
+            ime.committed().surrounding_text,
             Some(("english".to_string(), 7, 7))
         );
     }
@@ -593,7 +592,7 @@ mod tests {
     fn held_backspace_repeats_over_committed_korean_without_preedit() {
         let mut ime = Ime::with_keyboard();
         ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 700, 100);
-        ime.state().committed.surrounding_text = Some(("가나다라".to_string(), 12, 12));
+        ime.committed().surrounding_text = Some(("가나다라".to_string(), 12, 12));
 
         for _ in 0..3 {
             ime.confirm();
@@ -695,8 +694,8 @@ mod tests {
     fn emptied_preedit_enables_held_backspace_fallback_for_committed_text() {
         let mut ime = Ime::with_keyboard();
         ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 701, 101);
-        ime.state().set_guest_commits(2);
-        ime.state().committed.surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.state().set_commits_for_test(2);
+        ime.committed().surrounding_text = Some(("A가".to_string(), 4, 4));
         ime.preedit("가", "");
         ime.preedit("", "");
         ime.events();
@@ -712,7 +711,7 @@ mod tests {
                 ]
             );
             assert_eq!(
-                ime.state().committed.surrounding_text,
+                ime.committed().surrounding_text,
                 Some(("A가".to_string(), 4, 4))
             );
         }
@@ -732,8 +731,8 @@ mod tests {
         assert!(ime
             .ctx
             .claim_guest_key(HOST_KEYBOARD, BACKSPACE, GuestKeyOwner::Physical));
-        ime.state().current_preedit = crate::state::ShownPreedit::at_end("가");
-        ime.state().committed.surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.state().show_for_test("가");
+        ime.committed().surrounding_text = Some(("A가".to_string(), 4, 4));
         ime.preedit("", "");
         assert!(ime.repeat_active());
         ime.events();
