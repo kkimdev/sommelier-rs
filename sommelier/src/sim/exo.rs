@@ -44,8 +44,11 @@ limitations under the License.
 //! or `components/exo/wayland/zwp_text_input_manager.cc` (the request
 //! handlers) at Chromium revision 137f56b0d966 (2026-11-17), IMA's rules
 //! cite the functions of `input_method_ash.cc` at Chromium `main`
-//! (2026-11-18), and the key path cites `components/exo/keyboard.cc`
-//! (`Keyboard::OnKeyEvent`) and `components/exo/wayland/serial_tracker.cc`.
+//! (2026-11-18), the tracker's rules cite the functions of
+//! `ui/base/ime/surrounding_text_tracker.cc` at Chromium `main`
+//! (2026-11-19; last changed in a89e336612fb), and the key path cites
+//! `components/exo/keyboard.cc` (`Keyboard::OnKeyEvent`) and
+//! `components/exo/wayland/serial_tracker.cc`.
 //! Exo has one seat, and so does the model. Not modelled:
 //! - Exo's forced `TEXT_INPUT_TYPE_NULL` for a field without surrounding
 //!   text under an xkb input method (`ShouldUseNullInputType`), which
@@ -70,12 +73,6 @@ limitations under the License.
 //!
 //! IMA drops a handled release: it reaches the extension as a `peek_key`
 //! only, as its press did, and no `wl_keyboard.key` follows.
-//!
-//! Where the model's output differs from Exo's: the tracker's prediction
-//! keeps a selection as a cursor only (`state.cursor == anchor` when it
-//! names a report), so a report with a selection never names a predicted
-//! state and replaces the prediction, where Exo's tracker would match
-//! the range.
 //!
 //! Where the model is stricter than Exo: it keeps the surrounding text's
 //! cursor and anchor as sent, where Exo keeps the range between them, and
@@ -231,15 +228,36 @@ pub(super) enum RegionOutcome {
     Refused,
 }
 
+/// A `gfx::Range` selection in bytes, which keeps its direction: `end` is
+/// where the cursor is, and it may lie before `start`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Selection {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Selection {
+    /// An empty selection, a cursor at `at`.
+    fn caret(at: usize) -> Self {
+        Self { start: at, end: at }
+    }
+
+    /// The bytes it covers, whatever its direction (`GetMin`, `GetMax`).
+    fn range(self) -> Range<usize> {
+        self.start.min(self.end)..self.start.max(self.end)
+    }
+}
+
 /// What `SurroundingTextTracker` (`ui/base/ime/surrounding_text_tracker.cc`)
-/// predicts a field holds.
+/// predicts a field holds: a `State`, whose `utf16_offset` is 0, as the
+/// proxy never sends an offset.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Predicted {
+pub(super) struct Predicted {
     /// The text, with the composition in it.
-    text: String,
-    cursor: usize,
+    pub text: String,
+    pub selection: Selection,
     /// Where the composition is in `text`, if there is one.
-    composition: Option<Range<usize>>,
+    pub composition: Option<Range<usize>>,
 }
 
 impl Predicted {
@@ -249,31 +267,59 @@ impl Predicted {
             .map_or("", |range| &self.text[range])
     }
 
-    /// Puts `text` in place of the composition, or at the cursor, with the
-    /// cursor after it; returns where it is.
-    fn replace(&mut self, text: &str) -> Range<usize> {
-        let range = self.composition.take().unwrap_or(self.cursor..self.cursor);
-        self.text.replace_range(range.clone(), text);
-        self.cursor = range.start + text.len();
-        range.start..self.cursor
+    /// Ends the composition before an edit of `range`, as `OnInsertText`
+    /// and `OnExtendSelectionAndDelete` do: where the two meet
+    /// ([`intersects`]), the edit takes the composition too; otherwise the
+    /// composition goes, and `range` moves with the text after it. Returns
+    /// the range to edit.
+    fn take_composition(&mut self, range: Range<usize>) -> Range<usize> {
+        let Some(composition) = self.composition.take() else {
+            return range;
+        };
+        if intersects(&composition, &range) {
+            return range.start.min(composition.start)..range.end.max(composition.end);
+        }
+        self.text.replace_range(composition.clone(), "");
+        match range.start > composition.start {
+            true => range.start - composition.len()..range.end - composition.len(),
+            false => range,
+        }
     }
+
+    /// Where the cursor is: the selection's `end`, from which Exo measures
+    /// a preedit region (`zwp_text_input_manager.cc`
+    /// `SetCompositionFromExistingText`).
+    fn cursor(&self) -> usize {
+        self.selection.end
+    }
+}
+
+/// `gfx::Range::Intersects` of forward ranges: they overlap, or one holds
+/// the other, where an empty range at a non-empty one's end is not held.
+fn intersects(a: &Range<usize>, b: &Range<usize>) -> bool {
+    let holds = |outer: &Range<usize>, inner: &Range<usize>| {
+        outer.start <= inner.start
+            && inner.end <= outer.end
+            && (inner.end != outer.end || inner.is_empty() == outer.is_empty())
+    };
+    a.start.max(b.start) < a.end.min(b.end) || holds(a, b) || holds(b, a)
 }
 
 /// `SurroundingTextTracker`: the prediction, and the states that the input
 /// method's edits since the last report led to, oldest first.
-#[derive(Default)]
-struct Tracker {
-    predicted: Predicted,
-    expected: Vec<Predicted>,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Tracker {
+    pub predicted: Predicted,
+    pub expected: Vec<Predicted>,
     /// A report it could not match dropped the composition, and nothing
     /// composed since (E4).
-    dropped: bool,
+    pub dropped: bool,
     /// While the composition is a region composed from existing text for a
     /// text input without an extension, which its client never sees, and
     /// nothing has changed it since: the composition the client still
     /// shows, the one that stood before the first such region, since
     /// nothing tells the client to drop it.
-    hidden: Option<String>,
+    pub hidden: Option<String>,
 }
 
 impl Tracker {
@@ -281,10 +327,16 @@ impl Tracker {
     /// led to is the client catching up, which keeps the prediction, since
     /// the edits after that state lead to it; any other replaces the
     /// prediction, and with it the composition.
+    ///
+    /// The report's selection is the range between its cursor and anchor,
+    /// with no direction (`SetSurroundingTextImpl`'s `minmax`), which only
+    /// a forward state's selection equals.
     fn update(&mut self, text: String, cursor: usize, anchor: usize) {
-        let named = |state: &Predicted| {
-            state.text == text && state.cursor == cursor && state.cursor == anchor
+        let selection = Selection {
+            start: cursor.min(anchor),
+            end: cursor.max(anchor),
         };
+        let named = |state: &Predicted| state.text == text && state.selection == selection;
         match self.expected.iter().position(named) {
             Some(state) => drop(self.expected.drain(..state)),
             None => {
@@ -292,7 +344,7 @@ impl Tracker {
                 self.hidden = None;
                 self.predicted = Predicted {
                     text,
-                    cursor,
+                    selection,
                     composition: None,
                 };
                 self.expected = vec![self.predicted.clone()];
@@ -300,17 +352,31 @@ impl Tracker {
         }
     }
 
-    /// `OnSetCompositionText`.
-    fn set_composition(&mut self, text: &str) {
+    /// `OnSetCompositionText`: `text` replaces the composition, or else
+    /// the selection, even with no text, and the selection becomes
+    /// `selection`, which is within `text` and keeps its direction.
+    fn set_composition(&mut self, text: &str, selection: Selection) {
         self.dropped = false;
         self.hidden = None;
-        let range = self.predicted.replace(text);
-        self.predicted.composition = (!range.is_empty()).then_some(range);
+        let predicted = &mut self.predicted;
+        let replaced = predicted
+            .composition
+            .take()
+            .unwrap_or(predicted.selection.range());
+        let start = replaced.start;
+        predicted.text.replace_range(replaced, text);
+        predicted.selection = Selection {
+            start: start + selection.start,
+            end: start + selection.end,
+        };
+        predicted.composition = (!text.is_empty()).then_some(start..start + text.len());
         self.expected.push(self.predicted.clone());
     }
 
     /// `OnExtendSelectionAndDelete`: the text in `range`, where it lies in
-    /// the prediction, goes, and the cursor goes to its start.
+    /// the prediction, goes, with a composition it meets; a composition
+    /// apart from it goes too. The cursor, with no selection, goes to the
+    /// start of what went.
     fn delete(&mut self, range: Range<usize>) {
         let predicted = &mut self.predicted;
         let text = &predicted.text;
@@ -320,9 +386,9 @@ impl Tracker {
         {
             return;
         }
+        let range = predicted.take_composition(range);
         predicted.text.replace_range(range.clone(), "");
-        predicted.cursor = range.start;
-        predicted.composition = None;
+        predicted.selection = Selection::caret(range.start);
         self.hidden = None;
         self.expected.push(self.predicted.clone());
     }
@@ -341,10 +407,17 @@ impl Tracker {
         composed
     }
 
-    /// `OnInsertText`.
+    /// `OnInsertText`, with the cursor after the text, as
+    /// `TextInput::InsertText` always asks: `text` replaces the selection,
+    /// and the composition as well where they meet; a composition apart
+    /// from the selection goes.
     fn insert(&mut self, text: &str) {
         self.hidden = None;
-        self.predicted.replace(text);
+        let range = self
+            .predicted
+            .take_composition(self.predicted.selection.range());
+        self.predicted.text.replace_range(range.clone(), text);
+        self.predicted.selection = Selection::caret(range.start + text.len());
         self.expected.push(self.predicted.clone());
     }
 
@@ -356,14 +429,14 @@ impl Tracker {
         self.expected.push(self.predicted.clone());
     }
 
-    /// `CancelComposition`: the composition stays, as text, and the states
-    /// the edits led to are forgotten, so that the next report that does
-    /// not name the prediction replaces it as `ResetInternal` does, and the
-    /// prediction is the only state to catch up to.
+    /// `CancelComposition`: the composition stays, as text, and the
+    /// history empties, the prediction too, so that the next report
+    /// replaces the prediction as `ResetInternal` does, whatever it names,
+    /// and an edit before it leaves only the state it led to.
     fn cancel(&mut self) {
         self.hidden = None;
         self.predicted.composition = None;
-        self.expected = vec![self.predicted.clone()];
+        self.expected.clear();
     }
 }
 
@@ -537,6 +610,10 @@ pub(crate) struct Exo {
     /// The ranges IMA held for a key and sent after that key's commit, so
     /// that they compose the committed text.
     pub(super) regions_stale: u64,
+    /// Each text input's tracker when the display answered a
+    /// `wl_display.sync`, with the sync's callback, in order
+    /// ([`Exo::snapshot_trackers`]).
+    pub(super) synced: Vec<(u32, BTreeMap<u32, Tracker>)>,
 }
 
 impl Exo {
@@ -791,7 +868,7 @@ impl Exo {
             return;
         };
         let predicted = &self.text_inputs[&client].text.predicted;
-        let before = predicted.text[..predicted.cursor].to_owned();
+        let before = predicted.text[..predicted.cursor()].to_owned();
         let id = self.next_key;
         self.next_key += 1;
         self.in_engine.push_back(PendingKey {
@@ -949,6 +1026,19 @@ impl Exo {
             }
         }
         detached
+    }
+
+    /// The display answers the `wl_display.sync` of `callback`: every
+    /// request before it has changed the trackers, and nothing after it
+    /// has, so a model of them that the requests and events up to its
+    /// `done` drive must hold the same ([`Exo::synced`]).
+    pub(super) fn snapshot_trackers(&mut self, callback: u32) {
+        let trackers = self
+            .text_inputs
+            .iter()
+            .map(|(&id, text_input)| (id, text_input.text.clone()))
+            .collect();
+        self.synced.push((callback, trackers));
     }
 
     /// The events Exo sent since the last call, in order. Whoever plays the
@@ -1280,12 +1370,15 @@ impl Exo {
 
     /// `TextInput::ConfirmCompositionText(keep_selection = true)`: with
     /// `confirm_preedit` on `extension`, leaving the selection unchanged; or
-    /// else, by the delegate's fallback, the cursor as `cursor_position`,
-    /// then a `commit_string` of the composition.
+    /// else, by the delegate's fallback, the selection as `cursor_position`
+    /// (its `end` the index, its `start` the anchor), then a
+    /// `commit_string` of the composition.
     fn confirm_composition_text(&mut self, id: u32, extension: Option<u32>) {
         let text = &mut self.text_input(id).text;
         let composition = text.predicted.composition().to_owned();
-        let cursor = i32::try_from(text.predicted.cursor).expect("a short text");
+        let selection = text.predicted.selection;
+        let [index, anchor] =
+            [selection.end, selection.start].map(|at| i32::try_from(at).expect("a short text"));
         text.confirm();
         if let Some(extension) = extension {
             let unchanged = extended::CONFIRM_PREEDIT_SELECTION_BEHAVIOR_UNCHANGED;
@@ -1294,7 +1387,7 @@ impl Exo {
             return;
         }
         self.events
-            .push(zwp_text_input_v1::evt::cursor_position(id, cursor, cursor));
+            .push(zwp_text_input_v1::evt::cursor_position(id, index, anchor));
         let serial = self.next_serial();
         let event = zwp_text_input_v1::evt::commit_string(id, serial, &composition);
         self.events.push(event.expect("a commit fits a message"));
@@ -1375,13 +1468,15 @@ impl Exo {
         }
     }
 
-    /// `TextInput::DeleteSurroundingText`: the UTF-16 units `before` the
-    /// cursor of Exo's prediction and `after` it, clamped to it, which it
+    /// `TextInput::ExtendSelectionAndDelete`: the selection of Exo's
+    /// prediction, with the UTF-16 units `before` it and `after` it,
+    /// clamped to the text, which it
     /// deletes, as a `delete_surrounding_text` with the absolute byte
     /// index of their start and no `commit_string` (E10).
     fn delete_surrounding_text(&mut self, id: u32, before: usize, after: usize) {
         let text = &mut self.text_input(id).text;
-        let (range, _) = utf16_span(&text.predicted, before, after);
+        let selection = text.predicted.selection.range();
+        let (range, _) = utf16_span(&text.predicted.text, selection, before, after);
         let (index, length) = (range.start, range.len());
         text.delete(range);
         let index = i32::try_from(index).expect("a short text");
@@ -1399,11 +1494,11 @@ impl Exo {
     /// refusal, not of one when IMA sends a range it held for a key.
     fn set_composition_from_existing_text(&mut self, id: u32, before: usize, after: usize) -> bool {
         let text = &mut self.text_input(id).text;
-        let (range, within) = utf16_span(&text.predicted, before, after);
+        let cursor = text.predicted.cursor();
+        let (range, within) = utf16_span(&text.predicted.text, cursor..cursor, before, after);
         if !within {
             return false;
         }
-        let cursor = text.predicted.cursor;
         let truth = RegionTruth {
             text: text.predicted.text.clone(),
             cursor,
@@ -1455,7 +1550,8 @@ impl Exo {
         let serial = self.next_serial();
         let event = zwp_text_input_v1::evt::preedit_string(id, serial, text, text);
         self.events.push(event.expect("a preedit fits a message"));
-        self.text_input(id).text.set_composition(text);
+        let selection = Selection::caret(text.len());
+        self.text_input(id).text.set_composition(text, selection);
     }
 
     /// One transition of `key` on the keyboard, if it is on a surface: a
@@ -1573,14 +1669,18 @@ impl Exo {
     }
 }
 
-/// The bytes of `predicted`'s text from `before` UTF-16 units before its
-/// cursor to `after` units after it, clamped to the text, and whether they
-/// lay within it.
-fn utf16_span(predicted: &Predicted, before: usize, after: usize) -> (Range<usize>, bool) {
-    let (text, cursor) = (&predicted.text, predicted.cursor);
-    let mut start = cursor;
+/// The bytes of `text` from `before` UTF-16 units before `range` to
+/// `after` units after it, clamped to the text, and whether they lay
+/// within it.
+fn utf16_span(
+    text: &str,
+    range: Range<usize>,
+    before: usize,
+    after: usize,
+) -> (Range<usize>, bool) {
+    let mut start = range.start;
     let mut units = 0;
-    for c in text[..cursor].chars().rev() {
+    for c in text[..range.start].chars().rev() {
         if units >= before {
             break;
         }
@@ -1588,9 +1688,9 @@ fn utf16_span(predicted: &Predicted, before: usize, after: usize) -> (Range<usiz
         start -= c.len_utf8();
     }
     let within_before = units >= before;
-    let mut end = cursor;
+    let mut end = range.end;
     let mut units = 0;
-    for c in text[cursor..].chars() {
+    for c in text[range.end..].chars() {
         if units >= after {
             break;
         }
@@ -1881,7 +1981,7 @@ mod tests {
         let text = text.to_owned();
         Predicted {
             text,
-            cursor,
+            selection: Selection::caret(cursor),
             composition,
         }
     }
@@ -2056,10 +2156,10 @@ mod tests {
             }
             exo
         };
-        // A reset leaves the prediction as the one state to catch up to,
-        // so a report of an earlier state replaces it.
+        // A reset leaves no state to catch up to, so a report of an
+        // earlier state replaces the prediction.
         let mut exo = typed(false);
-        assert_eq!(exo.text_inputs[&TI].text.expected.len(), 1);
+        assert_eq!(exo.text_inputs[&TI].text.expected.len(), 0);
         send(&mut exo, TI, surrounding("a가b", 4));
         assert_eq!(*predicted(&exo), predicts("a가b", 4, None));
         // A confirmation adds a state, and the report is still catching up.
@@ -2067,6 +2167,127 @@ mod tests {
         assert_eq!(exo.text_inputs[&TI].text.expected.len(), 4);
         send(&mut exo, TI, surrounding("a가b", 4));
         assert_eq!(*predicted(&exo), predicts("a가ㄴb", 7, None));
+    }
+
+    /// `SurroundingTextTracker::CancelComposition` clears
+    /// `expected_updates_` and pushes nothing, so `Update` finds no state:
+    /// even a report of the prediction resets it (`ResetInternal`), and
+    /// one of the state before a later edit undoes that edit.
+    #[test]
+    fn cancel_empties_the_history() {
+        let mut tracker = Tracker::default();
+        tracker.update("ab".to_owned(), 1, 1);
+        tracker.set_composition("x", Selection::caret(1));
+        tracker.cancel();
+        assert_eq!(tracker.expected, []);
+        assert_eq!(tracker.predicted, predicts("axb", 2, None));
+        tracker.update("axb".to_owned(), 2, 2);
+        assert_eq!(tracker.expected, [predicts("axb", 2, None)]);
+        // An edit after a cancel leaves a history of its own state only.
+        tracker.cancel();
+        tracker.insert("y");
+        assert_eq!(tracker.expected, [predicts("axyb", 3, None)]);
+        tracker.update("axb".to_owned(), 2, 2);
+        assert_eq!(tracker.predicted, predicts("axb", 2, None));
+        assert!(!tracker.dropped);
+    }
+
+    /// `SetSurroundingTextImpl` reports `minmax(cursor, anchor)`, and
+    /// `SurroundingTextTracker::Update` compares selections with
+    /// `gfx::Range::operator==`: a report matches a state with that range
+    /// whichever way the client drew it, and resets with it.
+    #[test]
+    fn update_keeps_a_reported_selection_as_its_range() {
+        let mut tracker = Tracker::default();
+        tracker.update("abcd".to_owned(), 3, 1);
+        let selected = Selection { start: 1, end: 3 };
+        assert_eq!(tracker.predicted.selection, selected);
+        tracker.set_composition("x", Selection::caret(1));
+        assert_eq!(tracker.predicted.text, "axd");
+        // A report of the state before the edit, drawn the other way, is the
+        // client catching up.
+        tracker.update("abcd".to_owned(), 1, 3);
+        assert_eq!(tracker.expected.len(), 2);
+        assert_eq!(tracker.predicted.composition(), "x");
+    }
+
+    /// `OnSetCompositionText` replaces the selection when nothing is
+    /// composed, even with an empty composition, and sets the selection
+    /// it is given, reversed or not, within the composition.
+    #[test]
+    fn set_composition_replaces_the_selection_and_keeps_a_directed_one() {
+        let mut tracker = Tracker::default();
+        tracker.update("abcd".to_owned(), 1, 3);
+        tracker.set_composition("", Selection::caret(0));
+        assert_eq!(tracker.predicted, predicts("ad", 1, None));
+        tracker.set_composition("xy", Selection { start: 2, end: 0 });
+        let reversed = Selection { start: 3, end: 1 };
+        assert_eq!(tracker.predicted.selection, reversed);
+        assert_eq!(tracker.predicted.composition(), "xy");
+        // A report's range is forward, so it names no reversed state.
+        tracker.update("axyd".to_owned(), 1, 3);
+        assert_eq!(tracker.expected.len(), 1);
+        assert!(tracker.dropped);
+    }
+
+    /// `OnInsertText` replaces the selection, with a composition it meets
+    /// (`gfx::Range::Intersects`), and erases one apart from it, which the
+    /// selection then follows.
+    #[test]
+    fn insert_replaces_the_selection_and_ends_the_composition() {
+        let mut tracker = Tracker::default();
+        tracker.update("abcd".to_owned(), 3, 1);
+        tracker.insert("x");
+        assert_eq!(tracker.predicted, predicts("axd", 2, None));
+        tracker.update("abc".to_owned(), 3, 3);
+        tracker.compose_existing(0..1, false);
+        tracker.insert("x");
+        assert_eq!(tracker.predicted, predicts("bcx", 3, None));
+        tracker.update("abc".to_owned(), 1, 1);
+        tracker.compose_existing(1..2, false);
+        tracker.insert("x");
+        assert_eq!(tracker.predicted, predicts("axc", 2, None));
+    }
+
+    /// `OnExtendSelectionAndDelete` widens the deleted range over a
+    /// composition it meets, and otherwise erases the composition and
+    /// moves the range with the text after it, where Exo's own
+    /// `delete_surrounding_text` names only the range.
+    #[test]
+    fn delete_ends_the_composition_with_its_text() {
+        let composed = |range: Range<usize>| {
+            let mut tracker = Tracker::default();
+            tracker.update("abcde".to_owned(), 3, 3);
+            tracker.compose_existing(range, false);
+            tracker
+        };
+        // Apart: the composition "a" goes, and so does "d", after it.
+        let mut tracker = composed(0..1);
+        tracker.delete(3..4);
+        assert_eq!(tracker.predicted, predicts("bce", 2, None));
+        // Apart, after the range, and with nothing deleted.
+        let mut tracker = composed(3..4);
+        tracker.delete(1..2);
+        assert_eq!(tracker.predicted, predicts("ace", 1, None));
+        let mut tracker = composed(1..3);
+        tracker.delete(3..3);
+        assert_eq!(tracker.predicted, predicts("ade", 1, None));
+        // Met: the range takes the whole composition.
+        let mut tracker = composed(1..3);
+        tracker.delete(2..4);
+        assert_eq!(tracker.predicted, predicts("ae", 1, None));
+        assert_eq!(tracker.expected.len(), 3);
+    }
+
+    #[test]
+    fn intersects_follows_gfx_range() {
+        // Overlap; an empty range inside or at the start; none at the end.
+        assert!(intersects(&(0..2), &(1..3)));
+        assert!(intersects(&(1..3), &(1..1)));
+        assert!(intersects(&(1..3), &(2..2)));
+        assert!(!intersects(&(1..3), &(3..3)));
+        assert!(!intersects(&(1..3), &(3..5)));
+        assert!(!intersects(&(1..3), &(0..1)));
     }
 
     /// The text and the handled callback of key `id`.

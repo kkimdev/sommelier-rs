@@ -19,7 +19,9 @@ limitations under the License.
 //! The Exo model ([`super::exo`]) plays the seat's keyboard and the text
 //! inputs, and leaves the display to its caller. [`Display`] plays it: it
 //! advertises the globals, answers each `wl_display.sync` with
-//! `wl_callback.done` and `delete_id`, and each destructor with its
+//! `wl_callback.done` and `delete_id`, once the model has kept a snapshot
+//! of its trackers for it ([`Exo::snapshot_trackers`]), and each destructor
+//! with its
 //! `delete_id`. It hands every request to the model and takes the model's
 //! events after each one, before it answers a later sync, so that the
 //! sync's `done` follows every event of earlier requests (E11). It also
@@ -150,6 +152,7 @@ impl Display {
         }
         match *request {
             AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) => {
+                exo.snapshot_trackers(callback);
                 events.push(wl_callback::evt::done(callback, 0));
                 events.push(self.delete(callback));
             }
@@ -322,6 +325,37 @@ mod tests {
         ];
         assert_eq!(answers(&mut display, &requests), expected);
         assert_eq!(display.surfaces.host(0), Some(7));
+    }
+
+    #[test]
+    fn a_sync_keeps_a_snapshot_of_the_trackers_it_follows() {
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+        let mut display = Display::new(None, Surfaces::new(&[30], &[]));
+        let mut exo = Exo::default();
+        let report = |text: &str| zwp_text_input_v1::Request::SetSurroundingText {
+            text: text.into(),
+            cursor: 1,
+            anchor: 1,
+        };
+        let requests: [(u32, AnyRequest); 5] = [
+            (
+                3,
+                zwp_text_input_manager_v1::Request::CreateTextInput { id: 5 }.into(),
+            ),
+            (5, report("ab").into()),
+            (1, wl_display::Request::Sync { callback: 8 }.into()),
+            (5, report("cd").into()),
+            (1, wl_display::Request::Sync { callback: 9 }.into()),
+        ];
+        for (sender, request) in &requests {
+            display.request(*sender, request, &mut exo);
+        }
+        let synced: Vec<(u32, &str)> = exo
+            .synced
+            .iter()
+            .map(|(callback, trackers)| (*callback, trackers[&5].predicted.text.as_str()))
+            .collect();
+        assert_eq!(synced, [(8, "ab"), (9, "cd")]);
     }
 
     #[test]
