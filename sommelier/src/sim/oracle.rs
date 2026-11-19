@@ -2084,6 +2084,90 @@ mod tests {
         assert_eq!(spec.wrong_decisions, Vec::<String>::new());
     }
 
+    /// A step: the guest destroys field `field`'s surface, and the proxy
+    /// sends `decisions`.
+    fn destroy(spec: &mut SpecText, field: usize, decisions: &[AnyRequest]) {
+        spec.surfaces.destroy(field);
+        spec.see(Seen::SurfaceDestroyed { field });
+        decisions
+            .iter()
+            .for_each(|request| spec.see(Seen::ToHost(request)));
+        spec.see(Seen::StepEnd);
+    }
+
+    #[test]
+    fn a_destroyed_surface_loses_the_focus_and_its_input_goes_nowhere() {
+        // F2: the text input leaves the focused surface the guest destroys
+        // and the field detaches, dropping the preedit; the seat focuses
+        // no surface now.
+        let mut spec = attached(&["0", "1"]);
+        preedit(&mut spec, "가");
+        destroy(&mut spec, 0, &[deactivate(), sync()]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        assert_eq!(spec.focus, None);
+        assert_eq!(
+            (
+                spec.counts.surface_destroys,
+                spec.counts.focused_surface_destroys
+            ),
+            (1, 1)
+        );
+        host(
+            &mut spec,
+            wl_callback::Event::Done { callback_data: 0 },
+            &[],
+        );
+        // The proxy drops the input that names the destroyed surface.
+        host(&mut spec, enter(0), &[]);
+        assert_eq!(spec.focus, None);
+        host(&mut spec, tap(0, Target::Start), &[]);
+        let pointer = wl_pointer::Event::Enter {
+            serial: 2,
+            surface: HOST[0],
+            surface_x: keymap::position(Target::Start),
+            surface_y: 0,
+        };
+        host(&mut spec, pointer, &[]);
+        let press = wl_pointer::Event::Button {
+            serial: 3,
+            time: 0,
+            button: 0x110,
+            state: wl_pointer::BUTTON_STATE_PRESSED,
+        };
+        host(&mut spec, press, &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        // Exo focuses the field's new surface, and the field attaches anew.
+        spec.surfaces.add_host(Some(0), 22);
+        let enter = wl_keyboard::Event::Enter {
+            serial: 3,
+            surface: 22,
+            keys: Vec::new(),
+        };
+        host(&mut spec, enter, &[]);
+        assert_eq!(spec.focus, Some(0));
+        let activate = v1::Request::Activate {
+            seat: 1,
+            surface: 22,
+        };
+        guest(&mut spec, &enable(), &[activate.into(), reported("0", 1)]);
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+        // Destroying an unfocused surface changes no focus.
+        destroy(&mut spec, 1, &[]);
+        assert_eq!(spec.focus, Some(0));
+        assert_eq!(
+            (
+                spec.counts.surface_destroys,
+                spec.counts.focused_surface_destroys
+            ),
+            (2, 1)
+        );
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+        // A destroy the proxy does not leave is a wrong step.
+        let mut spec = attached(&["0", "1"]);
+        destroy(&mut spec, 0, &[]);
+        assert_ne!(spec.wrong_decisions, Vec::<String>::new());
+    }
+
     /// The guest reports `text` with the cursor at `cursor`, and commits.
     fn report(spec: &mut SpecText, text: &str, cursor: i32) {
         let surrounding = v3::Request::SetSurroundingText {
