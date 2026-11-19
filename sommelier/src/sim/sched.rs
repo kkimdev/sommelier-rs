@@ -679,7 +679,10 @@ impl<'t> World<'t> {
         };
         spec.see(seen);
         shadow.see(seen);
-        if let (Seen::StepEnd, Some(failed)) = (seen, oracle::step(spec, shadow)) {
+        if !matches!(seen, Seen::StepEnd) {
+            return;
+        }
+        if let Some(failed) = oracle::step(spec, shadow) {
             if self.steps.len() < 3 {
                 let at = self.now.0 as f64 / 1_000.0;
                 self.steps.push(format!("{at:.3} ms {failed}"));
