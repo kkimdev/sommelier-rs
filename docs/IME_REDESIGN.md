@@ -1244,6 +1244,7 @@ sommelier/src/sim/            #[cfg(test)]
   user.rs        The user action generator, free and settled modes     ~150
   display.rs     The display D4 plays: syncs, delete_id and globals    ~100
   oracle.rs      The exact oracle (SpecText) and the user-intent oracle  ~300
+  surfaces.rs    Each field's surfaces, a generation each (F2)         ~170
   golden.rs      Golden trace hashes for the staged switch (C3-pre to C3c)  ~80
   shrink.rs      Minimizing a failing case                             ~150
   regressions.rs Replays: minimized cases and from_log                 grows
@@ -1598,8 +1599,9 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
   after the start, to delete.
 - **Mix.** About 59% keys (jamo for syllable patterns, plus Space and
   Backspace), 2% accepted suggestions, 2% reconversions (4.4), 15%
-  clicks, 8% taps, 7% focus changes, 2% restarts of the input method and
-  5% `Settle`. A case has 10 to 60 actions and two fields.
+  clicks, 8% taps, 7% focus changes, 2% restarts of the input method,
+  2% windows that open again (free cases only, below) and the rest
+  `Settle`. A case has 10 to 60 actions and two fields.
 - **Restarts.** `UserAction::RestartInputMethod` destroys Exo's input
   method (`Exo::destroy_input_method`), which confirms and detaches on
   its own (E2, E6); its confirmation resets the engine only if a text
@@ -1617,7 +1619,25 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
   first, so the proxy has already deactivated when Exo's `leave` comes
   (H2'). A surface the guest destroys (F2) cannot reach H2 either: the
   proxy resets the field and deactivates in the step that forwards the
-  destroy, before Exo learns of it. The DST does not generate F2.
+  destroy, before Exo learns of it.
+- **Windows that open again (F2).** `UserAction::Reopen` closes a
+  field's window and opens it again on a new surface, with the same
+  text, as a client recreates a window. The client model blurs if the
+  field had the focus, forgets what it reported, and moves the field to
+  the new surface (`Client::reopen`); it destroys the old surface and
+  creates the new one. Exo drops the destroyed surface's focus with no
+  keyboard `leave` and deactivates its text inputs; the pointer leaves
+  it. If the field had the seat's focus, the new surface takes it, as a
+  window manager focuses a new window. Input that Exo sent to the old
+  surface before it learned of the destroy reaches the proxy, which
+  drops what names that surface; a key it forwards before the client's
+  close was heard goes nowhere. A `Settle` follows each reopen. One map,
+  `sim::surfaces::Surfaces`, holds every field's guest and host
+  surfaces, a generation each, and the host surfaces the guest
+  destroyed until the proxy reuses their IDs; the display, the world,
+  `SpecText` and the shadow share it. Reopens run in free cases only:
+  the reference has no window to close, and the focus the new window
+  takes is the window manager's, not the user's.
 
 There are two generator modes:
 
@@ -1668,7 +1688,16 @@ Each mode gets half of the cases.
   - forwarded `wl_keyboard.key`, through `insert_key` (raw keys
     included);
   - F1 and F2 on focus changes, as the specification says today. C5
-    changes the reference with the proxy.
+    changes the reference with the proxy. At F2, `SpecText` sees the
+    guest's `wl_surface.destroy`: a text input focused on that surface
+    must leave it in the same step, while it is valid, and the field
+    detaches, since the seat's focus projected again is no surface. It
+    then skips the keyboard `enter` and `leave`, the pointer `enter` and
+    the touch `down` that name a destroyed host surface, which the proxy
+    drops; a press with no pointer surface lands nowhere. A repair that
+    stays on the same surface cannot happen at F2: the focus registry
+    retires every keyboard on the destroyed surface before the repair
+    reads the seat's focus.
 - **Shadow.** `oracle::Shadow` is an ideal `TextModel` per field fed the
   proxy's **actual** `P→C` output: transactions at `done`, keys and
   presses. It has no client drops.
@@ -1693,6 +1722,7 @@ Each mode gets half of the cases.
   - autorepeats the engine got; empty confirmations that recovered a held
     key, skipped its pair as `wl_keyboard.key` had delivered it, or found
     no eligible key (X2'); Backspace leases armed, and ended;
+  - surfaces the guest destroyed, and those that had the focus (F2);
   - client drops, by reason;
   - one counter per draw.
 
