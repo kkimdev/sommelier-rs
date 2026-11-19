@@ -55,7 +55,7 @@ use super::editor::{Target, TextModel, UserAction};
 use super::engine::{Engine, EngineIn, Lag};
 use super::exo::{Answer, Exo};
 use super::keymap;
-use super::oracle::{Origin, Seen, Shadow, SpecText};
+use super::oracle::{self, Origin, Seen, Shadow, SpecText};
 use super::ClientKind;
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{
@@ -284,6 +284,8 @@ pub(super) struct World<'t> {
     /// The oracle's two readers, from the end of the setup.
     pub spec: Option<SpecText>,
     pub shadow: Option<Shadow>,
+    /// The first steps whose output tier 1 failed ([`oracle::step`]).
+    pub steps: Vec<String>,
     /// The proxy ended the session.
     pub ended: bool,
     trace: &'t mut Vec<Line>,
@@ -319,6 +321,7 @@ impl<'t> World<'t> {
             surfaces: Vec::new(),
             spec: None,
             shadow: None,
+            steps: Vec::new(),
             ended: false,
             trace,
         };
@@ -482,7 +485,7 @@ impl<'t> World<'t> {
         };
         let surface = self.display.surfaces()[field];
         if self.exo.focus() != Some(surface) {
-            self.exo.move_focus(Some(surface), &mut self.choices);
+            self.exo.move_focus(Some(surface));
         }
         let presses = match action {
             UserAction::Click { at, .. } => self.display.click(surface, at, time),
@@ -669,11 +672,21 @@ impl<'t> World<'t> {
         self.guest(requests);
     }
 
-    /// The oracle's readers follow `seen`.
+    /// The oracle's readers follow `seen`, and check each step's output.
     fn see(&mut self, seen: Seen<'_>) {
-        if let (Some(spec), Some(shadow)) = (&mut self.spec, &mut self.shadow) {
-            spec.see(seen);
-            shadow.see(seen);
+        let (Some(spec), Some(shadow)) = (&mut self.spec, &mut self.shadow) else {
+            return;
+        };
+        spec.see(seen);
+        shadow.see(seen);
+        if !matches!(seen, Seen::StepEnd) {
+            return;
+        }
+        if let Some(failed) = oracle::step(spec, shadow) {
+            if self.steps.len() < 3 {
+                let at = self.now.0 as f64 / 1_000.0;
+                self.steps.push(format!("{at:.3} ms {failed}"));
+            }
         }
     }
 
