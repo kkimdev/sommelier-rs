@@ -81,6 +81,10 @@ assert_eq!(
   a comment. Every batch that keeps the session checks that no state
   outlives its object.
 - A handler test decodes a queue with `test_support::decoded`.
+- A handler test outside `handler/text_input.rs` that sets up or reads
+  text-input state no peer can observe goes through
+  `test_support::text_input`, so that the IME core's storage switch
+  rewrites one module.
 - Use `MessageBuilder` only for frames no encoder builds, such as
   malformed ones.
 - [INVARIANTS.md](docs/INVARIANTS.md) and [DESIGN.md](docs/DESIGN.md)
