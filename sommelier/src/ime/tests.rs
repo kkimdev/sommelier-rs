@@ -1316,10 +1316,10 @@ fn row_X1_a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
 }
 
 /// The old code's `a_region_that_does_not_cover_a_host_preedit_is_dropped`:
-/// a region that does not cover the host preedit the guest shows, an
-/// empty one included, is dropped, since Exo would leave the rest of that
-/// preedit as text. One that covers it on both sides deletes the bytes
-/// beyond it on each.
+/// a non-empty region that does not cover the host preedit the guest
+/// shows is dropped, since Exo would leave the rest of that preedit as
+/// text. One that covers it on both sides deletes the bytes beyond it on
+/// each.
 #[test]
 fn row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped() {
     let mut ime = Ime::enabled();
@@ -1330,7 +1330,7 @@ fn row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped() {
     let out = ime.compose("x");
     assert_eq!(out.guest, [preedit_at("x", 1, 1), done(2)]);
 
-    for (index, length) in [(0, 0), (-2, 1), (0, 1)] {
+    for (index, length) in [(-2, 1), (0, 1)] {
         let out = ime.ext(region(index, length));
         let dropped = out.guest.is_empty() && out.keys.is_empty();
         assert!(dropped, "region {index}+{length}");
@@ -1338,6 +1338,36 @@ fn row_X1_a_region_that_does_not_cover_a_host_preedit_is_dropped() {
     let out = ime.ext(region(-2, 3));
     let expected = [no_preedit(), delete(1, 1), preedit_at("axb", 2, 2), done(2)];
     assert_eq!(out.guest, expected);
+}
+
+/// The old code's `an_empty_region_over_a_held_preedit_commits_it`: an
+/// empty region at Exo's cursor ends Exo's composition and leaves the
+/// preedit it held as text, so the guest commits it, as at a confirmation:
+/// a host preedit or a region's, which gives the region's bytes back. With
+/// Exo's cursor inside the preedit, where no commit leaves the guest's, the
+/// region is dropped.
+#[test]
+fn row_X1_an_empty_region_over_a_held_preedit_commits_it() {
+    let mut ime = Ime::enabled();
+    ime.report("abcdef", 4);
+    let region = |index, length| HostIme::PreeditRegion { index, length };
+    assert_eq!(ime.compose("x").guest, [preedit("x"), done(2)]);
+    let out = ime.ext(region(0, 0));
+    assert_eq!(out.guest, [no_preedit(), commit("x"), done(2)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+
+    // A region's preedit, "d" of "abcd|ef".
+    let out = ime.ext(region(-1, 1));
+    assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
+    let out = ime.ext(region(0, 0));
+    assert_eq!(out.guest, [no_preedit(), commit("d"), done(2)]);
+    let out = ime.ext(region(-2, 2));
+    assert_eq!(out.guest, [delete(2, 0), preedit_at("cd", 2, 2), done(2)]);
+
+    ime.v1(HostIme::PreeditCursor(1));
+    assert_eq!(ime.compose("xy").guest, [preedit_at("xy", 1, 1), done(2)]);
+    let out = ime.ext(region(0, 0));
+    assert!(out.guest.is_empty() && out.keys.is_empty());
 }
 
 /// The old code's `an_empty_preedit_has_no_hidden_cursor`, for a region: a

@@ -637,7 +637,8 @@ impl<'a> Current<'a> {
     /// It is not gated by the text being ahead, on purpose (INVARIANTS
     /// "Exo's deletes are absolute and stand alone"). The region must
     /// cover the preedit Exo holds, which the guest does not have as text,
-    /// and deletes only the bytes beyond it.
+    /// and deletes only the bytes beyond it; an empty one at Exo's cursor
+    /// after that preedit commits it.
     pub(super) fn region(
         self,
         index: i32,
@@ -655,10 +656,17 @@ impl<'a> Current<'a> {
         let (before, after) = lengths_around_cursor(&exo.text, exo_cursor, start, length)
             .ok_or(RegionDrop::NotAroundCursor)?;
         let region = exo.cursor - before as usize..exo.cursor + after as usize;
+        let held = &exo.held;
+        // An empty region ends Exo's composition and leaves the preedit it
+        // held as text, as a confirmation does, so the guest commits it.
+        // Only with Exo's cursor after that preedit, where the guest's is
+        // after a commit.
+        if region.is_empty() && !held.is_empty() && held.end == exo.cursor {
+            return Ok(self.commit_shown());
+        }
         // The guest does not have the preedit Exo holds as text, so it is
         // not deleted. A region that does not cover it would leave its
         // rest lost or shown twice.
-        let held = &exo.held;
         let (Some(delete_before), Some(delete_after)) = (
             held.start.checked_sub(region.start),
             region.end.checked_sub(held.end),
@@ -740,7 +748,7 @@ impl<'a> Current<'a> {
         planned
     }
 
-    /// The commit of the shown preedit (X2, F4).
+    /// The commit of the shown preedit (X1, X2, F4).
     fn commit_shown(self) -> Planned<'a> {
         let text = self.shown().map(|shown| shown.text().to_string());
         let txn = GuestTxn {
