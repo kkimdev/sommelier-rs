@@ -202,19 +202,39 @@ struct TextInput {
 }
 
 /// What Exo did of a `set_preedit_region` it sent, for the oracle to judge
-/// the proxy's translation of it by.
+/// the proxy's translation of it by; and of a `delete_surrounding_text`,
+/// which composes nothing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct RegionTruth {
     /// Its tracker's predicted text and cursor when it made the region,
-    /// with the composition it held there, empty for none.
+    /// with the composition it held there, empty for none, and where they
+    /// are.
     pub text: String,
     pub cursor: usize,
     pub held: String,
+    pub selection: Selection,
+    pub composition: Option<Range<usize>>,
     /// A report it could not match had dropped the composition it held
     /// before, and nothing composed since (E4).
     pub dropped: bool,
     /// The text it composed, which the guest must then show.
     pub composed: String,
+}
+
+impl RegionTruth {
+    /// What `tracker` predicts before an event, which composes nothing.
+    fn of(tracker: &Tracker) -> Self {
+        let predicted = &tracker.predicted;
+        Self {
+            text: predicted.text.clone(),
+            cursor: predicted.cursor(),
+            held: predicted.composition().to_owned(),
+            selection: predicted.selection,
+            composition: predicted.composition.clone(),
+            dropped: tracker.dropped,
+            composed: String::new(),
+        }
+    }
 }
 
 /// What became of a region the engine asked for, which the engine learns
@@ -1083,6 +1103,14 @@ impl Exo {
         self.text_inputs[&id].text.hidden.clone()
     }
 
+    /// Whether a report Exo could not match dropped the composition of the
+    /// text input attached on the focused surface (E4), and nothing
+    /// composed since.
+    pub(super) fn composition_dropped(&self) -> bool {
+        let id = self.composing_text_inputs().first().copied();
+        id.is_some_and(|id| self.text_inputs[&id].text.dropped)
+    }
+
     /// The host text inputs an input method is attached to on the focused
     /// surface: the ones whose preedits and presses matter.
     pub(crate) fn composing_text_inputs(&self) -> Vec<u32> {
@@ -1475,6 +1503,7 @@ impl Exo {
     /// index of their start and no `commit_string` (E10).
     fn delete_surrounding_text(&mut self, id: u32, before: usize, after: usize) {
         let text = &mut self.text_input(id).text;
+        let truth = RegionTruth::of(text);
         let selection = text.predicted.selection.range();
         let (range, _) = utf16_span(&text.predicted.text, selection, before, after);
         let (index, length) = (range.start, range.len());
@@ -1482,6 +1511,7 @@ impl Exo {
         let index = i32::try_from(index).expect("a short text");
         let length = u32::try_from(length).expect("a short text");
         let event = zwp_text_input_v1::evt::delete_surrounding_text(id, index, length);
+        self.region_truths.push((self.events.len(), truth));
         self.events.push(event);
     }
 
@@ -1499,13 +1529,7 @@ impl Exo {
         if !within {
             return false;
         }
-        let truth = RegionTruth {
-            text: text.predicted.text.clone(),
-            cursor,
-            held: text.predicted.composition().to_owned(),
-            dropped: text.dropped,
-            composed: String::new(),
-        };
+        let truth = RegionTruth::of(text);
         let hidden = self.extension_of(id).is_none();
         let composed = self
             .text_input(id)

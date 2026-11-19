@@ -18,13 +18,17 @@ limitations under the License.
 //! reconcile of every text input, then removals. Each arm decides, which
 //! includes encoding, before it changes anything (design 3.5).
 
+use super::exo_view::{Edit, Frame};
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
-use super::state::{Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput, V3Pending};
-use super::{
-    BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, Input, KeyEffect, LeaseOutcome,
-    SeatId, SurfaceId, TiId,
+use super::state::{
+    Confirm, Deferral, DeleteDrop, LinkState, Planned, RegionDrop, TextInput, V3Pending,
 };
+use super::{
+    BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, ImeMode, Input, KeyEffect,
+    LeaseOutcome, SeatId, SurfaceId, TiId,
+};
+use crate::connection::MAX_BYTES_PER_SEND;
 use crate::protocols::text_input_extension_unstable_v1::{
     zcr_extended_text_input_v1, zcr_text_input_extension_v1,
 };
@@ -36,6 +40,9 @@ use crate::wire::{IndexedString, Outgoing};
 /// answer of [`Env`] the step reads, and every effect. It carries the
 /// user's text, so it is only ever at `trace`.
 const TRACE: &str = "sommelier::ime";
+
+/// The length of a `wl_display.sync`: a header and its `new_id`.
+const SYNC_LEN: usize = crate::wire::MessageHeader::LEN + 4;
 
 /// When a planned host composition event takes the assembly, as the old
 /// handlers did (B3, design H9).
@@ -50,12 +57,12 @@ enum Takes {
 }
 
 /// What a guest commit sends the host besides its reconciled state: the
-/// surrounding text, already encoded, and the cursor rectangle it states.
-/// Exo keeps both with or without an input method, so each statement is
-/// forwarded rather than reconciled.
+/// surrounding text, already encoded, with what it reports, and the cursor
+/// rectangle it states. Exo keeps both with or without an input method,
+/// so each statement is forwarded rather than reconciled.
 struct GuestCommit {
     ti: TiId,
-    surrounding_text: Option<Outgoing>,
+    surrounding_text: Option<(Outgoing, (String, u32, u32))>,
     cursor_rect: Option<(i32, i32, i32, i32)>,
 }
 
@@ -67,6 +74,7 @@ impl ImeCore {
         let env = &Traced(env);
         let mut fx = Effects::default();
         let mut commit = None;
+        let mut handled = None;
         let mut ending = None;
         match input {
             Input::Create {
@@ -84,7 +92,10 @@ impl ImeCore {
                 self.update_pending(ti, |p| p.content_type = Some(content_type))
             }
             Input::CursorRect(ti, rect) => self.update_pending(ti, |p| p.cursor_rect = Some(rect)),
-            Input::Commit(ti) => commit = self.commit(ti, &mut fx),
+            Input::Commit(ti) => {
+                commit = self.commit(ti, &mut fx);
+                handled = Some(ti);
+            }
             Input::Destroy { ti, host_deleted } => ending = self.destroy(ti, host_deleted, &mut fx),
             Input::HostLeave(ti) => self.host_leave(ti, &mut fx),
             Input::V1(ti, event) => self.host_event(ti, event, &mut fx),
@@ -94,9 +105,10 @@ impl ImeCore {
             },
             // W1 and W2: a token is one text input's drain or fence, or a
             // removed one's, which is ignored.
-            Input::BarrierDone(token) => {
-                self.inputs.values_mut().for_each(|t| t.barrier_done(token))
-            }
+            Input::BarrierDone(token) => self
+                .inputs
+                .iter_mut()
+                .for_each(|(&ti, t)| t.barrier_done(ti, token)),
             Input::FocusChanged {
                 seat,
                 surface,
@@ -107,8 +119,16 @@ impl ImeCore {
             // carry.
             Input::SeatBound(seat) => log::debug!("Guest seat {} bound", seat.0),
             Input::Press { surface, resend } => self.press(surface, resend, &mut fx),
+            Input::GuestKey(seat) => self
+                .inputs
+                .values_mut()
+                .filter(|t| t.seat() == seat)
+                .for_each(|t| t.exo_mut().guest_edited()),
         }
         self.reconcile_all(commit, env, &mut fx);
+        if let Some(t) = handled.and_then(|ti| self.inputs.get_mut(&ti)) {
+            t.exo_mut().commit_handled();
+        }
         if let Some(ti) = ending {
             self.remove(ti, &mut fx);
         }
@@ -195,6 +215,9 @@ impl ImeCore {
         let t = self.inputs.get_mut(&ti)?;
         t.count_commit();
         let pending = t.take_pending()?;
+        if pending.surrounding_text.is_none() {
+            t.exo_mut().unchanged();
+        }
         // Encode the one request that can fail before changing anything.
         let surrounding_text = match &pending.surrounding_text {
             None => None,
@@ -203,14 +226,11 @@ impl ImeCore {
                     text.as_ref().map_or(("", 0, 0), |(text, cursor, anchor)| {
                         (text, *cursor, *anchor)
                     });
-                let request = zwp_text_input_v1::req::set_surrounding_text(
-                    t.host().v1,
-                    text,
-                    cursor as u32,
-                    anchor as u32,
-                );
+                let (cursor, anchor) = (cursor as u32, anchor as u32);
+                let request =
+                    zwp_text_input_v1::req::set_surrounding_text(t.host().v1, text, cursor, anchor);
                 match request {
-                    Ok(request) => Some(request),
+                    Ok(request) => Some((request, (text.to_owned(), cursor, anchor))),
                     // G9b: the commit counted and its pending state is
                     // spent, but nothing else changes.
                     Err(error) => {
@@ -287,11 +307,16 @@ impl ImeCore {
         }
     }
 
-    /// H4 to H9, X1 and X2.
+    /// H4 to H9, X1 and X2. The Exo mirror takes every event first, before
+    /// the gate, as each changed Exo's text (design exo-mirror 2.2); then
+    /// the guest is in step with Exo after a tracker-changing event only if
+    /// its transaction reached the guest and left the two alike (3.2).
     fn host_event(&mut self, ti: TiId, event: HostIme, fx: &mut Effects) {
         let Some(t) = self.inputs.get_mut(&ti) else {
             return;
         };
+        let frame = t.exo().frame(t.shown());
+        t.exo_mut().observe(ti, &event);
         match event {
             HostIme::PreeditStyling {
                 index,
@@ -323,93 +348,11 @@ impl ImeCore {
             | HostIme::Commit { .. }
             | HostIme::Delete { .. }
             | HostIme::PreeditRegion { .. }
-            | HostIme::Confirm => {}
+            | HostIme::Confirm { .. } => {}
         }
-        let count = t.serial().get();
-        let Some(mut cur) = t.current(ti) else {
-            // B3: a preedit and a region take the assembly they apply
-            // whatever becomes of them, a stale one included.
-            if matches!(
-                event,
-                HostIme::Preedit { .. } | HostIme::PreeditRegion { .. }
-            ) {
-                t.take_assembly();
-            }
-            log::debug!("Ignoring a stale composition event of text input {}", ti.0);
-            return;
-        };
-        let (planned, takes) = match event {
-            HostIme::Preedit {
-                serial,
-                text,
-                commit,
-            } => {
-                log_host_serial(serial, count);
-                let assembly = cur.take_assembly();
-                // The assembly's offsets index the text, which replacing
-                // an invalid sequence would move.
-                let IndexedString::Utf8(text) = text else {
-                    log::debug!("Ignoring a host preedit that is not UTF-8");
-                    return;
-                };
-                (cur.preedit(text, commit, assembly), Takes::Before)
-            }
-            HostIme::Commit { serial, text } => {
-                log_host_serial(serial, count);
-                (cur.host_commit(text), Takes::IfApplied)
-            }
-            HostIme::Delete { index, length } => match cur.delete(index, length) {
-                Ok(planned) => (planned, Takes::IfApplied),
-                Err(drop) => return log_delete_drop(ti, t, index, length, drop),
-            },
-            HostIme::PreeditRegion { index, length } => {
-                let assembly = cur.take_assembly();
-                match cur.region(index, length, assembly) {
-                    Ok(planned) => (planned, Takes::Before),
-                    Err(RegionDrop::Uncovered) => {
-                        log::debug!(
-                            "Ignoring a preedit region {index}+{length} of text input {} that \
-                             does not cover the preedit it shows",
-                            ti.0
-                        );
-                        return;
-                    }
-                    Err(drop) => {
-                        log::warn!(
-                            "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
-                            ti.0
-                        );
-                        return;
-                    }
-                }
-            }
-            HostIme::Confirm => match cur.confirm() {
-                Confirm::Commit(planned) => (planned, Takes::Planned),
-                Confirm::RecoverHeldKey(recover) => return fx.keys.push(recover),
-            },
-            HostIme::PreeditStyling { .. }
-            | HostIme::PreeditCursor(_)
-            | HostIme::CursorPosition { .. } => unreachable!("handled above"),
-        };
-        let applied = planned.apply();
-        let take = match takes {
-            Takes::Before => false,
-            Takes::IfApplied => applied.is_ok(),
-            Takes::Planned => true,
-        };
-        if take {
-            t.take_assembly();
-        }
-        match applied {
-            Ok((events, lease)) => {
-                fx.to_guest.extend(events);
-                fx.keys.push(lease);
-            }
-            Err(TooLong) => log::warn!(
-                "Dropping a host event of text input {}: its text does not fit a message",
-                ti.0
-            ),
-        }
+        let measuring = frame.clone().filter(|_| t.exo().measures());
+        let edit = composition_event(ti, t, event, measuring.as_ref(), fx);
+        t.exo_after(frame.as_ref(), edit);
     }
 
     /// F1, per text input of the seat, in `TiId` order. The field the
@@ -453,6 +396,8 @@ impl ImeCore {
             if t.focused_surface() != Some(surface) {
                 continue;
             }
+            // The press may move the guest's cursor.
+            t.exo_mut().guest_edited();
             let Some(cur) = t.current(ti).filter(|cur| cur.shown().is_some()) else {
                 continue;
             };
@@ -466,10 +411,12 @@ impl ImeCore {
                     log::debug!("A press ended the composition of text input {}", ti.0);
                     fx.to_guest.extend(events);
                     fx.to_guest.push(resend);
+                    // Glued, as the mirror applies the reset at its fence.
                     fx.to_host.extend([
                         HostOut::Request(zwp_text_input_v1::req::reset(t.host().v1)),
-                        HostOut::Barrier(fence),
+                        HostOut::GluedBarrier(fence),
                     ]);
+                    t.exo_mut().cancel_sent(fence);
                     fx.keys.push(lease);
                 }
                 Err(TooLong) => {
@@ -549,7 +496,16 @@ impl ImeCore {
                     Some(c) => (true, c.surrounding_text, c.cursor_rect),
                     None => (false, None, None),
                 };
-            fx.to_host.extend(surrounding_text.map(HostOut::Request));
+            // A report applies at the barrier glued to it, which places it
+            // among Exo's events for the mirror (design exo-mirror 2.3).
+            if let Some((request, report)) = surrounding_text {
+                let barrier = BarrierToken(self.next_barrier);
+                self.next_barrier += 1;
+                let one_read = request.0.len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
+                fx.to_host
+                    .extend([HostOut::Request(request), HostOut::GluedBarrier(barrier)]);
+                t.exo_mut().report_sent(barrier, report, one_read);
+            }
             if let Some(content_type) = steps.content_type {
                 let ext = host.ext.map(|e| (e.id, e.version));
                 let requests = host::content_type_requests(host.v1, ext, content_type);
@@ -573,6 +529,172 @@ impl ImeCore {
     }
 }
 
+/// H7 to H9, X1 and X2 through the gate: plan the event's transaction and
+/// send it. In Mirror mode a delete and a region are measured in `frame`,
+/// Exo's text before the event, and dropped without one; Legacy mode
+/// measures them in the committed text, and logs where the mirror would
+/// differ. Returns what reached the guest, if the event did.
+fn composition_event(
+    ti: TiId,
+    t: &mut TextInput,
+    event: HostIme,
+    frame: Option<&Frame>,
+    fx: &mut Effects,
+) -> Option<Edit> {
+    let count = t.serial().get();
+    let mode = t.exo().mode();
+    let Some(mut cur) = t.current(ti) else {
+        // B3: a preedit and a region take the assembly they apply
+        // whatever becomes of them, a stale one included.
+        if matches!(
+            event,
+            HostIme::Preedit { .. } | HostIme::PreeditRegion { .. }
+        ) {
+            t.take_assembly();
+        }
+        log::debug!("Ignoring a stale composition event of text input {}", ti.0);
+        return None;
+    };
+    let (planned, takes) = match event {
+        HostIme::Preedit {
+            serial,
+            text,
+            commit,
+        } => {
+            log_host_serial(serial, count);
+            let assembly = cur.take_assembly();
+            // The assembly's offsets index the text, which replacing
+            // an invalid sequence would move.
+            let IndexedString::Utf8(text) = text else {
+                log::debug!("Ignoring a host preedit that is not UTF-8");
+                return None;
+            };
+            (cur.preedit(text, commit, assembly), Takes::Before)
+        }
+        HostIme::Commit { serial, text } => {
+            log_host_serial(serial, count);
+            (cur.host_commit(text), Takes::IfApplied)
+        }
+        HostIme::Delete { index, length } => {
+            let planned = match (mode, frame) {
+                // A negative index keeps the v1 XML's reading, from the
+                // guest's cursor.
+                (ImeMode::Mirror, _) if index < 0 => cur.delete(index, length),
+                (ImeMode::Mirror, Some(frame)) => frame.delete(index, length).map(|lengths| {
+                    let txn = GuestTxn {
+                        delete: Some(lengths),
+                        ..GuestTxn::default()
+                    };
+                    cur.measured(txn, None)
+                }),
+                (ImeMode::Mirror, None) => Err(DeleteDrop::OutOfStep),
+                (ImeMode::Legacy, _) => {
+                    let mirror = frame.and_then(|frame| frame.delete(index, length).ok());
+                    let mirror = mirror.map(|lengths| GuestTxn {
+                        delete: Some(lengths),
+                        ..GuestTxn::default()
+                    });
+                    let legacy = cur.delete(index, length);
+                    log_decision_diff(ti, "delete", mirror, &legacy);
+                    legacy
+                }
+            };
+            match planned {
+                Ok(planned) => (planned, Takes::IfApplied),
+                Err(drop) => {
+                    log_delete_drop(ti, t, index, length, drop);
+                    return None;
+                }
+            }
+        }
+        HostIme::PreeditRegion { index, length } => {
+            let assembly = cur.take_assembly();
+            let planned = match (mode, frame) {
+                (ImeMode::Mirror, Some(frame)) => frame
+                    .region(index, length, assembly)
+                    .map(|(txn, held)| cur.measured(txn, held)),
+                (ImeMode::Mirror, None) => Err(RegionDrop::OutOfStep),
+                (ImeMode::Legacy, _) => {
+                    let mirror = frame.and_then(|frame| frame.region(index, length, assembly).ok());
+                    let legacy = cur.region(index, length, assembly);
+                    log_decision_diff(ti, "region", mirror.map(|(txn, _)| txn), &legacy);
+                    legacy
+                }
+            };
+            match planned {
+                Ok(planned) => (planned, Takes::Before),
+                Err(drop @ (RegionDrop::Uncovered | RegionDrop::OutOfStep)) => {
+                    log::debug!(
+                        "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
+                        ti.0
+                    );
+                    return None;
+                }
+                Err(drop) => {
+                    log::warn!(
+                        "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
+                        ti.0
+                    );
+                    return None;
+                }
+            }
+        }
+        HostIme::Confirm { .. } => match cur.confirm() {
+            Confirm::Commit(planned) => (planned, Takes::Planned),
+            Confirm::RecoverHeldKey(recover) => {
+                fx.keys.push(recover);
+                return Some(Edit::default());
+            }
+        },
+        HostIme::PreeditStyling { .. }
+        | HostIme::PreeditCursor(_)
+        | HostIme::CursorPosition { .. } => unreachable!("handled by the caller"),
+    };
+    let edit = planned.edit();
+    let applied = planned.apply();
+    let take = match takes {
+        Takes::Before => false,
+        Takes::IfApplied => applied.is_ok(),
+        Takes::Planned => true,
+    };
+    if take {
+        t.take_assembly();
+    }
+    match applied {
+        Ok((events, lease)) => {
+            fx.to_guest.extend(events);
+            fx.keys.push(lease);
+            Some(edit)
+        }
+        Err(TooLong) => {
+            log::warn!(
+                "Dropping a host event of text input {}: its text does not fit a message",
+                ti.0
+            );
+            None
+        }
+    }
+}
+
+/// Legacy mode: where the Exo mirror, had the guest been in step, would
+/// have sent `mirror` for a host `what`, and Legacy mode sends another
+/// transaction or drops it (design exo-mirror 6, the decision diff).
+fn log_decision_diff<E>(
+    ti: TiId,
+    what: &str,
+    mirror: Option<GuestTxn>,
+    legacy: &Result<Planned, E>,
+) {
+    let legacy = legacy.as_ref().ok().map(Planned::txn);
+    if mirror.as_ref() != legacy {
+        log::debug!(
+            "Text input {}: the Exo mirror would send {mirror:?} for a {what}, Legacy mode sends \
+             {legacy:?}",
+            ti.0
+        );
+    }
+}
+
 /// F1 and H2: a field that loses the focus or its input method commits
 /// the preedit the guest shows, if its composition is current, as mutter
 /// and ibus do at a focus-out and as Exo's detach confirms it (E6).
@@ -584,6 +706,8 @@ fn commit_shown(ti: TiId, t: &mut TextInput, fx: &mut Effects) {
         Ok((events, lease)) => {
             fx.to_guest.extend(events);
             fx.keys.push(lease);
+            // An edit with no event of Exo's, which may not hold the text.
+            t.exo_mut().step_lost();
         }
         Err(TooLong) => log::warn!(
             "Dropping the commit of text input {}'s preedit: too long",

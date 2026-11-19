@@ -26,10 +26,9 @@ use std::collections::BTreeMap;
 
 use crate::wire::{IndexedString, Outgoing};
 
+mod exo_view;
 mod guest;
 mod host;
-// Exo's tracker, not wired in yet: PR M2 of the mirror plan does that.
-#[cfg_attr(not(test), expect(dead_code))]
 mod mirror;
 mod serial;
 mod state;
@@ -83,6 +82,32 @@ pub struct HostExt {
     pub version: u32,
     /// The host `zcr_text_input_extension_v1` it is created from.
     pub manager: u32,
+}
+
+/// How a text input measures Exo's deletes (H9) and preedit regions (X1),
+/// fixed at its creation (G1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImeMode {
+    /// In the surrounding text the guest last committed (`ime/legacy.rs`).
+    /// The Exo mirror runs beside it, in shadow, and only logs.
+    Legacy,
+    /// In the Exo mirror, while the guest is in step with it.
+    Mirror,
+}
+
+impl ImeMode {
+    /// [`Self::Mirror`] from v11 of the host's text-input extension, the
+    /// first whose confirmations are `confirm_preedit` and not a
+    /// `cursor_position` and `commit_string` pair the mirror could misread,
+    /// unless `shadow`, the kill switch, keeps every text input in Legacy
+    /// mode.
+    pub fn of(ext_version: Option<u32>, shadow: bool) -> Self {
+        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
+        match ext_version {
+            Some(version) if !shadow && version >= ext::EVT_CONFIRM_PREEDIT_SINCE => Self::Mirror,
+            _ => Self::Legacy,
+        }
+    }
 }
 
 /// One message the core handles. Every trigger of an IME change is one of
@@ -145,6 +170,9 @@ pub enum Input {
         surface: SurfaceId,
         resend: Outgoing,
     },
+    /// The keyboard concern forwarded a key press or repeat to the guest on
+    /// this seat, which may edit the guest's text where Exo does not see.
+    GuestKey(SeatId),
 }
 
 /// A host input-method event of a text input, from its v1 object or its
@@ -178,7 +206,10 @@ pub enum HostIme {
         index: i32,
         length: u32,
     },
-    Confirm,
+    Confirm {
+        /// `confirm_preedit`'s selection behavior is `unchanged`.
+        keep_selection: bool,
+    },
 }
 
 /// What one step asks the adapter to send and do, each in order.
@@ -204,6 +235,10 @@ pub enum HostOut {
     /// Queue a host `wl_display.sync` here. Its `done` comes back as
     /// [`Input::BarrierDone`].
     Barrier(BarrierToken),
+    /// A [`Self::Barrier`] that the previous request and it reach the host
+    /// in one submission, which Exo dispatches in one read, so that no
+    /// event of Exo's falls between them.
+    GluedBarrier(BarrierToken),
     /// Retire the host object the previous request destroyed.
     Retire(u32),
 }
@@ -266,9 +301,20 @@ pub struct ImeCore {
     /// change it.
     by_ext: BTreeMap<u32, TiId>,
     next_barrier: u64,
+    /// The kill switch: every text input is in [`ImeMode::Legacy`].
+    shadow: bool,
 }
 
 impl ImeCore {
+    /// The text inputs of a new connection, every one of them in
+    /// [`ImeMode::Legacy`] if `shadow`.
+    pub fn new(shadow: bool) -> Self {
+        Self {
+            shadow,
+            ..Self::default()
+        }
+    }
+
     /// G1: text input `ti` of `seat`, with the host objects `host`, focused
     /// on `surface`, if any.
     fn insert(&mut self, ti: TiId, seat: SeatId, host: HostTi, surface: Option<SurfaceId>) {
@@ -280,8 +326,9 @@ impl ImeCore {
         if let Some(ext) = host.ext {
             self.by_ext.insert(ext.id, ti);
         }
+        let mode = ImeMode::of(host.ext.map(|ext| ext.version), self.shadow);
         self.inputs
-            .insert(ti, state::TextInput::new(seat, host, surface));
+            .insert(ti, state::TextInput::new(seat, host, surface, mode));
     }
 
     /// Forget text input `ti`, and its extension.
@@ -300,7 +347,8 @@ impl ImeCore {
 #[cfg(test)]
 impl ImeCore {
     /// Text input `ti` as [`Input::Create`] makes it, without its host
-    /// requests.
+    /// requests, in Legacy mode: the state its tests set up directly is
+    /// none the Exo mirror could have followed.
     pub(crate) fn insert_for_test(
         &mut self,
         ti: TiId,
@@ -308,7 +356,9 @@ impl ImeCore {
         host: HostTi,
         surface: Option<SurfaceId>,
     ) {
+        let shadow = std::mem::replace(&mut self.shadow, true);
         self.insert(ti, seat, host, surface);
+        self.shadow = shadow;
     }
 
     pub(crate) fn get(&self, ti: TiId) -> Option<&TextInput> {
@@ -323,7 +373,33 @@ impl ImeCore {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (TiId, &TextInput)> {
         self.inputs.iter().map(|(&ti, t)| (ti, t))
     }
+
+    /// The Exo mirror of host text input `v1`, if it says it is exact: its
+    /// prediction and its history, oldest first, each a text, a directed
+    /// selection and a composition, empty for none.
+    pub(crate) fn exact_mirror_for_test(&self, v1: u32) -> Option<MirrorForTest> {
+        let t = self.inputs.values().find(|t| t.host().v1 == v1)?;
+        let mirror = t.exo().mirror();
+        if mirror.health() != mirror::Health::Exact {
+            return None;
+        }
+        let state = |state: &mirror::ExoState| {
+            let selection = (state.selection.start, state.selection.end);
+            (state.text.clone(), selection, state.composition.clone())
+        };
+        let history = mirror.expected().iter().map(|(s, _)| state(s)).collect();
+        Some((state(mirror.predicted()), history))
+    }
 }
+
+/// A tracker state for tests: its text, its directed selection, and its
+/// composition, empty for none.
+#[cfg(test)]
+pub(crate) type StateForTest = (String, (usize, usize), std::ops::Range<usize>);
+
+/// An Exo mirror for tests: its prediction and its history.
+#[cfg(test)]
+pub(crate) type MirrorForTest = (StateForTest, Vec<StateForTest>);
 
 impl ImeCore {
     /// H10: the seat of the text input whose host keysyms reach the
@@ -343,6 +419,8 @@ impl ImeCore {
     pub fn recovery_done(&mut self, ti: TiId) -> Option<Vec<Outgoing>> {
         let input = self.inputs.get_mut(&ti)?;
         input.current(ti)?;
+        // The key may edit the guest's text.
+        input.exo_mut().guest_edited();
         Some(input.answer(ti))
     }
 

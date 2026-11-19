@@ -55,6 +55,7 @@ mod user;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use crate::ime::ImeMode;
 use crate::test_support::Rng;
 use editor::{Reference, TextModel, Typing, UserAction};
 use engine::Lag;
@@ -217,7 +218,16 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
             failures.extend(oracle::lost(start, actions, settles, world.client()));
             failures.extend(oracle::intended(&case.reference(extension), world.client()));
         }
-        outcome.known = oracle::classify(&failures, &spec.counts);
+        if !world.mirrors.is_empty() {
+            failures.push(Failure {
+                tier: Tier::Exact,
+                check: "mirror",
+                field: None,
+                detail: world.mirrors.join("\n"),
+            });
+        }
+        let mirror = ImeMode::of(extension, crate::handler::text_input::mirror_shadowed());
+        outcome.known = oracle::classify(&failures, &spec.counts, mirror == ImeMode::Mirror);
         if outcome.known.is_empty() {
             outcome.failures = failures;
         }
@@ -357,8 +367,9 @@ impl Coverage {
 #[derive(Debug, Default)]
 struct Summary {
     cases: u64,
-    /// The cases a known issue explains, with the issue.
-    known: Vec<(u64, KnownIssue)>,
+    /// The cases a known issue explains, with the host's text-input
+    /// extension and the issue.
+    known: Vec<(u64, Option<u32>, KnownIssue)>,
     counts: Counts,
     coverage: Coverage,
     /// The reports of the cases that failed.
@@ -421,9 +432,12 @@ fn run_all(cases: &[Case]) -> Summary {
             }
         }
         summary.cases += 1;
-        summary
-            .known
-            .extend(outcome.known.iter().map(|&issue| (case.seed, issue)));
+        summary.known.extend(
+            outcome
+                .known
+                .iter()
+                .map(|&issue| (case.seed, outcome.extension, issue)),
+        );
         summary.counts += outcome.counts;
         summary.coverage.count(case, &outcome);
         if let Some(first) = outcome.failures.first() {
@@ -481,13 +495,18 @@ fn check(test: &str, settled: bool) {
             failed,
         } = &summary;
         println!("{cases} cases, {counts:?}, {coverage:?}");
-        let mut issues: Vec<KnownIssue> = known.iter().map(|&(_, issue)| issue).collect();
+        let mut issues: Vec<KnownIssue> = known.iter().map(|&(_, _, issue)| issue).collect();
         issues.sort();
         issues.dedup();
         for issue in issues {
-            let seeds: Vec<u64> = known.iter().filter(|k| k.1 == issue).map(|k| k.0).collect();
+            let seeds: Vec<u64> = known.iter().filter(|k| k.2 == issue).map(|k| k.0).collect();
+            let by_extension = [None, Some(7), Some(10), Some(11)].map(|extension| {
+                let cases = known.iter().filter(|k| k.2 == issue && k.1 == extension);
+                (extension, cases.count())
+            });
             println!(
-                "known issue {issue:?} in {} cases, seeds {seeds:?}: {}; tracked in {}",
+                "known issue {issue:?} in {} cases, by extension {by_extension:?}, seeds \
+                 {seeds:?}: {}; tracked in {}",
                 seeds.len(),
                 issue.reason(),
                 issue.tracking()

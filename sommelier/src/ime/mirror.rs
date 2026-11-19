@@ -16,7 +16,9 @@ limitations under the License.
 
 //! The Exo mirror: a replica of the `ui::SurroundingTextTracker` that Exo
 //! keeps for one host `zwp_text_input_v1`, driven only by the wire. It is
-//! pure and not wired in yet.
+//! pure: the core feeds it every request it sends and every event Exo
+//! sends, and reads it to measure Exo's deletes and preedit regions
+//! (`docs/IME_REDESIGN.md` 2.2, X1 and H9).
 //!
 //! Sources, all at Chromium `main` **`6975bb48a8cd`** (2026-11-19), which
 //! line numbers below refer to: `ui/base/ime/surrounding_text_tracker.cc`
@@ -53,6 +55,7 @@ use std::ops::Range;
 
 use super::BarrierToken;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
+use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 
 /// The most history states the mirror keeps. Evicting one makes it
 /// [`Health::Uncertain`], since Exo still has it and could match it.
@@ -218,8 +221,12 @@ pub(super) enum Sent {
 pub(super) enum Health {
     Exact,
     /// Something the mirror cannot see may have happened: a history state
-    /// was evicted, or the text grew over [`TEXT_CAP`]. Clears only at a
-    /// reset point (see [`Self::Healing`]).
+    /// was evicted, the text grew over [`TEXT_CAP`], a composition had a
+    /// selection, a report may have been read apart from its barrier, or
+    /// an event could be read two ways; and a host without the extension
+    /// composes existing text with no event (`SetCompositionFromExistingText`,
+    /// TI 483-508), so its mirror starts so. Clears only at a reset point
+    /// (see [`Self::Healing`]).
     Uncertain,
     /// An event did not agree with the mirror's state (an echo check
     /// failed), and the mirror did not apply it. Clears only at a reset
@@ -234,19 +241,40 @@ pub(super) enum Health {
     Healing,
 }
 
+/// What a request did once Exo processed it ([`ExoMirror::barrier_done`]),
+/// which tells where the guest's report put the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Applied {
+    /// A report matched a history state: the guest is at the first equal
+    /// state with no composition from there, and `in_step` if it has no
+    /// selection and every transaction after it kept the guest in step.
+    Matched { in_step: bool },
+    /// A report matched none and reset Exo to it; `cursor` if its
+    /// selection is empty.
+    Reset { cursor: bool },
+    /// A `reset` emptied the history.
+    Cancel,
+}
+
 /// Exo's tracker for one host text input, as the wire shows it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ExoMirror {
     /// `predicted_state_` after every message Exo has processed so far.
     predicted: ExoState,
     /// `expected_updates_`, states only, oldest first, at most
-    /// [`HISTORY_CAP`].
-    expected: VecDeque<ExoState>,
+    /// [`HISTORY_CAP`]; each with whether the transaction that led to it
+    /// kept a guest in step with Exo if it was ([`Self::mark`]).
+    expected: VecDeque<(ExoState, bool)>,
+    /// The newest state has not been marked yet.
+    unmarked: bool,
     /// Requests sent and not yet known to be processed, each with the
     /// barrier sent after it, oldest first.
     in_flight: VecDeque<(BarrierToken, Sent)>,
     /// The `preedit_cursor` since the last `preedit_string`.
     preedit_cursor: Option<i32>,
+    /// The highlight `preedit_styling` spans since the last
+    /// `preedit_string`.
+    highlights: Vec<Span>,
     /// The `cursor_position(index, anchor)` since the last
     /// `commit_string`.
     cursor_position: Option<(i32, i32)>,
@@ -268,11 +296,16 @@ impl ExoMirror {
         let mut mirror = Self {
             predicted: ExoState::default(),
             expected: VecDeque::new(),
+            unmarked: false,
             in_flight: VecDeque::new(),
             preedit_cursor: None,
+            highlights: Vec::new(),
             cursor_position: None,
             dropped: false,
-            health: Health::Exact,
+            health: match ext_version {
+                Some(_) => Health::Exact,
+                None => Health::Uncertain,
+            },
             blind: false,
             ext_version,
         };
@@ -284,8 +317,51 @@ impl ExoMirror {
         &self.predicted
     }
 
-    pub(super) fn expected(&self) -> &VecDeque<ExoState> {
+    pub(super) fn expected(&self) -> &VecDeque<(ExoState, bool)> {
         &self.expected
+    }
+
+    /// Records whether the transaction that led to the newest state kept a
+    /// guest in step, if no state has been marked since it was pushed.
+    pub(super) fn mark(&mut self, in_step: bool) {
+        if std::mem::take(&mut self.unmarked) {
+            if let Some((_, step)) = self.expected.back_mut() {
+                *step = in_step;
+            }
+        }
+    }
+
+    /// Something the mirror cannot see may have happened.
+    pub(super) fn uncertain(&mut self) {
+        self.degrade(Health::Uncertain);
+    }
+
+    /// Whether a report the proxy sent and Exo has yet to process will
+    /// match no state Exo has now, or follows a `reset` that will empty
+    /// the history: the guest made an edit Exo has yet to see.
+    pub(super) fn report_crosses(&self) -> bool {
+        let mut from = 0;
+        for (at, (_, sent)) in self.in_flight.iter().enumerate() {
+            let Sent::Report {
+                text,
+                cursor,
+                anchor,
+            } = sent
+            else {
+                let mut rest = self.in_flight.iter().skip(at);
+                return rest.any(|(_, sent)| matches!(sent, Sent::Report { .. }));
+            };
+            let Some(selection) = report_selection(text, *cursor, *anchor) else {
+                continue;
+            };
+            let matches =
+                |(state, _): &(ExoState, bool)| state.selection == selection && state.text == *text;
+            match self.expected.iter().skip(from).position(matches) {
+                Some(at) => from += at,
+                None => return true,
+            }
+        }
+        false
     }
 
     pub(super) fn health(&self) -> Health {
@@ -298,6 +374,17 @@ impl ExoMirror {
 
     // The wire. Each event Exo sends is matched to the tracker call that
     // sent it, and applied if it agrees with the mirror (the echo check).
+
+    /// H4 `preedit_styling`: a span of the next `preedit_string`. A
+    /// highlight is IMA's composition selection (ZTIM 166-182; IMA
+    /// `ExtractCompositionText`), whose end the wire does not carry.
+    pub(super) fn preedit_styling(&mut self, index: u32, length: u32, style: u32) {
+        if style == zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT && length > 0 {
+            let start = index as usize;
+            self.highlights
+                .push(Span::new(start, start.saturating_add(length as usize)));
+        }
+    }
 
     /// H5 `preedit_cursor`: the first half of `SetCompositionText` (ZTIM
     /// 166-182).
@@ -314,8 +401,19 @@ impl ExoMirror {
     /// composition, which deletes the selection.
     ///
     /// Echo: `commit` is `text`, and the cursor is a char boundary of it.
+    /// A highlight with one end at the cursor and the other elsewhere is a
+    /// composition selection the mirror cannot know, which makes it
+    /// [`Health::Uncertain`].
     pub(super) fn preedit_string(&mut self, text: &str, commit: &str) {
         let cursor = self.preedit_cursor.take();
+        let highlights = std::mem::take(&mut self.highlights);
+        let at = cursor.map_or(Ok(text.len()), usize::try_from);
+        if highlights
+            .iter()
+            .any(|span| at.is_ok_and(|at| span.start == at || span.end == at))
+        {
+            self.uncertain();
+        }
         self.observe(|mirror| {
             let cursor = match cursor {
                 None => text.len(),
@@ -349,7 +447,8 @@ impl ExoMirror {
     ///   sends the predicted selection;
     /// - `SetEditableSelectionRange(range)`, which keeps the composition.
     ///
-    /// The pair is read as a confirm only when it can be one.
+    /// The pair is read as a confirm only when it can be one; one that can
+    /// be either while composing makes the mirror [`Health::Uncertain`].
     ///
     /// Echo, for a pair: the range is in the text, and `text` is the
     /// composition's.
@@ -372,6 +471,9 @@ impl ExoMirror {
                 .ext_version
                 .is_some_and(|version| version >= ext::EVT_CONFIRM_PREEDIT_SINCE);
             if !confirms_by_event && range == predicted.selection {
+                if !predicted.composition.is_empty() {
+                    mirror.uncertain();
+                }
                 mirror.on_confirm_composition_text(true);
             } else {
                 mirror.on_set_editable_selection_range(range);
@@ -443,6 +545,7 @@ impl ExoMirror {
     /// Applies one tracker-changing event: `apply` checks it against the
     /// mirror and changes the mirror only if it agrees.
     fn observe(&mut self, apply: impl FnOnce(&mut Self) -> bool) {
+        self.unmarked = false;
         if self.health == Health::Healing {
             self.health = Health::Uncertain;
         }
@@ -459,19 +562,19 @@ impl ExoMirror {
     }
 
     /// The barrier `token` is done, so Exo has processed the request
-    /// before it, after every event that came before this. Barriers the
-    /// mirror did not queue are not its.
-    pub(super) fn barrier_done(&mut self, token: BarrierToken) {
+    /// before it, after every event that came before this. Returns what
+    /// the request did; barriers the mirror did not queue are not its, and
+    /// a report Exo ignores did nothing.
+    pub(super) fn barrier_done(&mut self, token: BarrierToken) -> Option<Applied> {
+        self.unmarked = false;
         if self
             .in_flight
             .front()
             .is_none_or(|&(front, _)| front != token)
         {
-            return;
+            return None;
         }
-        let Some((_, sent)) = self.in_flight.pop_front() else {
-            return;
-        };
+        let (_, sent) = self.in_flight.pop_front()?;
         match sent {
             Sent::Report {
                 text,
@@ -480,9 +583,12 @@ impl ExoMirror {
             } => self.report(&text, cursor, anchor),
             Sent::Cancel => {
                 self.cancel_composition();
-                if self.health != Health::Exact {
+                // Without the extension, Exo may compose existing text
+                // unseen at any time, so nothing heals the mirror.
+                if self.health != Health::Exact && self.ext_version.is_some() {
                     self.health = Health::Healing;
                 }
+                Some(Applied::Cancel)
             }
         }
     }
@@ -491,16 +597,32 @@ impl ExoMirror {
     /// (ZTIM 506-545) takes `minmax(cursor, anchor)` as the selection, and
     /// ignores the whole request if an offset does not convert; then
     /// `TI::SetSurroundingText` calls `Update` (TI 158-175).
-    fn report(&mut self, text: &str, cursor: u32, anchor: u32) {
-        let (start, end) = (cursor.min(anchor) as usize, cursor.max(anchor) as usize);
-        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
-            return;
-        }
+    fn report(&mut self, text: &str, cursor: u32, anchor: u32) -> Option<Applied> {
+        let selection = report_selection(text, cursor, anchor)?;
         let composing = !self.predicted.composition.is_empty();
-        if self.update(text, Span::new(start, end)) == UpdateResult::Reset {
-            self.dropped |= composing;
-            if self.health == Health::Healing {
-                self.health = Health::Exact;
+        match self.update(text, selection) {
+            UpdateResult::Updated => {
+                // A v3 guest reports no preedit, so it is at the first
+                // equal state with no composition, not at one whose
+                // composition it holds as text.
+                let mut states = self.expected.iter().skip_while(|(state, _)| {
+                    !state.composition.is_empty()
+                        || state.selection != selection
+                        || state.text != text
+                });
+                let at = states.next();
+                let in_step =
+                    at.is_some() && selection.is_empty() && states.all(|&(_, in_step)| in_step);
+                Some(Applied::Matched { in_step })
+            }
+            UpdateResult::Reset => {
+                self.dropped |= composing;
+                if self.health == Health::Healing {
+                    self.health = Health::Exact;
+                }
+                Some(Applied::Reset {
+                    cursor: selection.is_empty(),
+                })
             }
         }
     }
@@ -524,7 +646,8 @@ impl ExoMirror {
             self.expected.clear();
             return;
         }
-        self.expected.push_back(self.predicted.clone());
+        self.expected.push_back((self.predicted.clone(), false));
+        self.unmarked = true;
         if self.expected.len() > HISTORY_CAP {
             self.expected.pop_front();
             self.degrade(Health::Uncertain);
@@ -541,7 +664,8 @@ impl ExoMirror {
     /// state matches when its selection and its whole text are equal, and
     /// the match is exact.
     fn update(&mut self, text: &str, selection: Span) -> UpdateResult {
-        let matches = |state: &ExoState| state.selection == selection && state.text == text;
+        let matches =
+            |(state, _): &(ExoState, bool)| state.selection == selection && state.text == text;
         match self.expected.iter().position(matches) {
             Some(at) => {
                 self.expected.drain(..at);
@@ -710,6 +834,13 @@ impl ExoMirror {
     }
 }
 
+/// A report's selection, `minmax(cursor, anchor)`, or `None` if an offset
+/// does not convert, for which Exo ignores the report (ZTIM 506-545).
+fn report_selection(text: &str, cursor: u32, anchor: u32) -> Option<Span> {
+    let (start, end) = (cursor.min(anchor) as usize, cursor.max(anchor) as usize);
+    (text.is_char_boundary(start) && text.is_char_boundary(end)).then(|| Span::new(start, end))
+}
+
 /// `ReplaceString16WithOffset` (STT 20-49) with offset 0: replaces
 /// `n` bytes at `pos`, clamped to the text, with `replacement`. The
 /// branches for a positive offset cannot run.
@@ -756,12 +887,16 @@ mod tests {
     fn at(predicted: ExoState) -> ExoMirror {
         let mut mirror = ExoMirror::new(Some(11));
         mirror.predicted = predicted.clone();
-        mirror.expected = VecDeque::from([predicted]);
+        mirror.expected = VecDeque::from([(predicted, false)]);
         mirror
     }
 
     fn history(mirror: &ExoMirror) -> Vec<ExoState> {
-        mirror.expected().iter().cloned().collect()
+        mirror
+            .expected()
+            .iter()
+            .map(|(state, _)| state.clone())
+            .collect()
     }
 
     /// The prediction is the last history state, as every STT function
@@ -769,7 +904,10 @@ mod tests {
     #[track_caller]
     fn assert_pushed(mirror: &ExoMirror, predicted: &ExoState) {
         assert_eq!(mirror.predicted(), predicted);
-        assert_eq!(mirror.expected().back(), Some(predicted));
+        assert_eq!(
+            mirror.expected().back().map(|(state, _)| state),
+            Some(predicted)
+        );
         assert!(predicted.fits(), "{predicted:?}");
     }
 
@@ -797,12 +935,14 @@ mod tests {
     /// (STT 114-116).
     #[test]
     fn a_new_mirror_holds_the_empty_text() {
-        let mirror = ExoMirror::new(None);
+        let mirror = ExoMirror::new(Some(11));
         let empty = state("", (0, 0), NO_COMPOSITION);
         assert_eq!(history(&mirror), std::slice::from_ref(&empty));
         assert_pushed(&mirror, &empty);
         assert_eq!(mirror.health(), Health::Exact);
         assert!(!mirror.dropped());
+        // Without the extension, Exo composes existing text unseen.
+        assert_eq!(ExoMirror::new(None).health(), Health::Uncertain);
     }
 
     /// `Update` (STT 131-191), exact match: the first state from the
@@ -961,7 +1101,7 @@ mod tests {
             step(&mut mirror);
             let predicted = mirror.predicted().clone();
             assert_pushed(&mirror, &predicted);
-            assert!(mirror.expected().iter().all(ExoState::fits), "{name}");
+            assert!(mirror.expected().iter().all(|(s, _)| s.fits()), "{name}");
         }
         assert_eq!(mirror.predicted(), &state("바", (3, 3), NO_COMPOSITION));
     }
@@ -1289,24 +1429,25 @@ mod tests {
     /// `cursor_position(selection)` + `commit_string(composition)` (TI
     /// 240-263); so is `SetEditableSelectionRange` (TI 386-403), which
     /// keeps the composition. The pair is a confirm only below v11 and
-    /// with the predicted selection.
+    /// with the predicted selection, where it could be either, which makes
+    /// the mirror `Uncertain`.
     #[test]
     fn a_cursor_position_pair_is_a_confirm_only_below_v11_with_the_predicted_selection() {
         let composing = state(GANADA, (6, 6), 3..6);
         let confirmed = state(GANADA, (6, 6), NO_COMPOSITION);
-        for (version, (index, anchor), expected) in [
-            (None, (6, 6), confirmed.clone()),
-            (Some(10), (6, 6), confirmed),
-            (Some(11), (6, 6), composing.clone()),
-            (Some(10), (9, 0), state(GANADA, (0, 9), 3..6)),
-            (None, (3, 3), state(GANADA, (3, 3), 3..6)),
+        for (version, (index, anchor), expected, health) in [
+            (None, (6, 6), confirmed.clone(), Health::Uncertain),
+            (Some(10), (6, 6), confirmed, Health::Uncertain),
+            (Some(11), (6, 6), composing.clone(), Health::Exact),
+            (Some(10), (9, 0), state(GANADA, (0, 9), 3..6), Health::Exact),
+            (None, (3, 3), state(GANADA, (3, 3), 3..6), Health::Exact),
         ] {
             let mut mirror = at(composing.clone());
             mirror.ext_version = version;
             mirror.cursor_position(index, anchor);
             mirror.commit_string("나");
             assert_pushed(&mirror, &expected);
-            assert_eq!(mirror.health(), Health::Exact);
+            assert_eq!(mirror.health(), health);
             // The pair is spent: the next commit is an insert.
             mirror.commit_string("라");
             assert!(mirror.predicted().text.contains('라'));
@@ -1407,7 +1548,7 @@ mod tests {
         mirror.commit_string("가");
         assert_eq!(mirror.expected().len(), HISTORY_CAP);
         assert_eq!(
-            mirror.expected().back(),
+            history(&mirror).last(),
             Some(&state("가", (3, 3), NO_COMPOSITION))
         );
         assert_eq!(mirror.health(), Health::Uncertain);
@@ -1469,6 +1610,100 @@ mod tests {
         report(&mut mirror, "라", 3, 3);
         assert_eq!(mirror.health(), Health::Exact);
         assert_eq!(history(&mirror), [state("라", (3, 3), NO_COMPOSITION)]);
+
+        // Without the extension Exo composes existing text unseen, so
+        // nothing heals the mirror.
+        let mut mirror = ExoMirror::new(None);
+        cancel(&mut mirror);
+        report(&mut mirror, "라", 3, 3);
+        assert_eq!(mirror.health(), Health::Uncertain);
+    }
+
+    /// IMA makes a composition selection from a highlight span with the
+    /// cursor at one end (`ExtractCompositionText`), whose other end the
+    /// wire does not carry: the mirror cannot know the selection.
+    #[test]
+    fn a_composition_selection_makes_it_uncertain() {
+        let highlight = zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT;
+        for (case, style, (index, length), health) in [
+            (
+                "a highlight ending at the cursor",
+                highlight,
+                (0, 3),
+                Health::Uncertain,
+            ),
+            ("one starting at it", highlight, (3, 3), Health::Uncertain),
+            ("one apart from it", highlight, (6, 3), Health::Exact),
+            (
+                "an underline",
+                zwp_text_input_v1::PREEDIT_STYLE_UNDERLINE,
+                (0, 3),
+                Health::Exact,
+            ),
+        ] {
+            let mut mirror = at(state("", (0, 0), NO_COMPOSITION));
+            mirror.preedit_styling(index, length, style);
+            mirror.preedit_cursor(3);
+            mirror.preedit_string(GANADA, GANADA);
+            assert_eq!(mirror.health(), health, "{case}");
+            // The spans are spent.
+            mirror.preedit_cursor(3);
+            mirror.preedit_string("가", "가");
+            assert_eq!(mirror.health(), health, "{case}");
+        }
+    }
+
+    /// A report on its way to Exo crosses the events since it was sent if
+    /// it will name no state then, or follows a `reset`.
+    #[test]
+    fn a_report_crosses_when_it_will_name_no_state() {
+        let mut mirror = at(state("ab", (2, 2), NO_COMPOSITION));
+        mirror.commit_string("c");
+        let sent = |text: &str, cursor| Sent::Report {
+            text: text.to_owned(),
+            cursor,
+            anchor: cursor,
+        };
+        mirror.sent(BarrierToken(1), sent("ab", 2));
+        mirror.sent(BarrierToken(2), sent("abc", 3));
+        assert!(!mirror.report_crosses());
+        mirror.sent(BarrierToken(3), sent("abX", 3));
+        assert!(mirror.report_crosses());
+
+        let mut mirror = at(state("ab", (2, 2), NO_COMPOSITION));
+        mirror.sent(BarrierToken(1), Sent::Cancel);
+        assert!(!mirror.report_crosses());
+        mirror.sent(BarrierToken(2), sent("ab", 2));
+        assert!(mirror.report_crosses());
+    }
+
+    /// A matched report puts a guest that shows no preedit at the first
+    /// equal state without a composition, and in step if every transaction
+    /// since kept it so.
+    #[test]
+    fn a_matched_report_finds_the_guest_without_a_composition() {
+        let applied = |second: bool| {
+            let mut mirror = at(state("", (0, 0), NO_COMPOSITION));
+            mirror.preedit_string("가", "가");
+            mirror.mark(false);
+            mirror.commit_string("가");
+            mirror.mark(true);
+            mirror.preedit_string("나", "나");
+            mirror.mark(second);
+            let token = BarrierToken(1);
+            let report = Sent::Report {
+                text: "가".to_owned(),
+                cursor: 3,
+                anchor: 3,
+            };
+            mirror.sent(token, report);
+            mirror.barrier_done(token)
+        };
+        // The report names the state with the composition "가" first, whose
+        // transaction did not keep the guest in step; but the guest, which
+        // reports "가" as text, committed it.
+        assert_eq!(applied(true), Some(Applied::Matched { in_step: true }));
+        assert_eq!(applied(false), Some(Applied::Matched { in_step: false }));
     }
 
     /// Korean typing, end to end on the wire: each preedit replaces the

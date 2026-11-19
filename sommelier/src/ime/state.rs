@@ -19,6 +19,7 @@ limitations under the License.
 //! or a press can change what the guest is shown only through
 //! [`Current`], which only [`TextInput::current`] makes.
 
+use super::exo_view::{Edit, ExoView, Frame};
 use super::guest::{resolve_preedit_cursor, GuestTxn, Preedit, TooLong};
 #[cfg(test)]
 use super::host;
@@ -26,7 +27,7 @@ use super::host::HostContentType;
 use super::serial::{CommitCount, Serial};
 #[cfg(test)]
 use super::Env;
-use super::{BarrierToken, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
+use super::{BarrierToken, HostTi, ImeMode, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
 use crate::wire::Outgoing;
 use legacy::ExoText;
 
@@ -87,6 +88,9 @@ pub(crate) struct TextInput {
     /// The reset fence of a press (F4) until its `done` (W2). It lives
     /// beside the link and survives every change of it.
     fence: Option<BarrierToken>,
+    /// Exo's text, which the host text input keeps for its whole life, so
+    /// it lives beside the link too.
+    exo: ExoView,
     composition: Composition,
     warned: Warned,
 }
@@ -173,7 +177,12 @@ pub(super) enum Deferral {
 }
 
 impl TextInput {
-    pub(super) fn new(seat: SeatId, host: HostTi, surface: Option<SurfaceId>) -> Self {
+    pub(super) fn new(
+        seat: SeatId,
+        host: HostTi,
+        surface: Option<SurfaceId>,
+        mode: ImeMode,
+    ) -> Self {
         Self {
             seat,
             host,
@@ -182,6 +191,7 @@ impl TextInput {
             field: Field::focused_on(surface),
             link: LinkState::Detached,
             fence: None,
+            exo: ExoView::new(mode, host.ext.map(|ext| ext.version)),
             composition: Composition::default(),
             warned: Warned::default(),
         }
@@ -234,6 +244,25 @@ impl TextInput {
         self.commits.bump();
     }
 
+    pub(super) fn exo(&self) -> &ExoView {
+        &self.exo
+    }
+
+    pub(super) fn exo_mut(&mut self) -> &mut ExoView {
+        &mut self.exo
+    }
+
+    /// The preedit the guest shows.
+    pub(super) fn shown(&self) -> Option<&Preedit> {
+        self.composition.shown.as_ref()
+    }
+
+    /// After a tracker-changing host event, with `frame` the one taken
+    /// before it and `edit` what reached the guest (`ExoView::after`).
+    pub(super) fn exo_after(&mut self, frame: Option<&Frame>, edit: Option<Edit>) {
+        self.exo.after(frame, edit, self.composition.shown.as_ref());
+    }
+
     /// The pending state a commit consumes, or `None` while unfocused
     /// (G9a), which leaves it alone.
     pub(super) fn take_pending(&mut self) -> Option<V3Pending> {
@@ -264,6 +293,9 @@ impl TextInput {
             if !enable_conflict {
                 f.committed.enabled = enabled;
             }
+        }
+        if new_field {
+            self.exo.step_lost();
         }
         if let Some(surrounding_text) = surrounding_text {
             f.committed.surrounding_text = surrounding_text;
@@ -319,6 +351,7 @@ impl TextInput {
     /// `Attached`, which ends the composition.
     pub(super) fn refocus(&mut self, surface: Option<SurfaceId>) -> Option<SurfaceId> {
         let old = self.focused_surface();
+        self.exo.step_lost();
         self.pending = V3Pending::default();
         self.field = Field::focused_on(surface);
         old
@@ -406,8 +439,10 @@ impl TextInput {
     }
 
     /// W1 and W2: the barrier `token` returned. It ends the drain or the
-    /// fence it is, in any link state.
-    pub(super) fn barrier_done(&mut self, token: BarrierToken) {
+    /// fence it is, in any link state. A fence or a report's barrier also
+    /// tells the mirror that Exo processed the request before it.
+    pub(super) fn barrier_done(&mut self, ti: TiId, token: BarrierToken) {
+        self.exo.barrier_done(ti, token);
         if self.link == (LinkState::Draining { barrier: token }) {
             self.link = LinkState::Detached;
         }
@@ -558,6 +593,11 @@ impl TextInput {
         self.composition.assembly = assembly;
     }
 
+    /// Take `other`'s view of Exo's text.
+    pub(crate) fn copy_exo_for_test(&mut self, other: &Self) {
+        self.exo = other.exo.clone();
+    }
+
     pub(crate) fn warned_for_test(&self) -> (bool, bool) {
         (self.warned.seat_missing, self.warned.delete_range)
     }
@@ -602,6 +642,9 @@ pub(super) struct Current<'a> {
 /// Why a host delete (H9) is dropped.
 #[derive(Debug)]
 pub(super) enum DeleteDrop {
+    /// Mirror mode: the guest is not in step with Exo's text, the mirror
+    /// is not exact, or a report on its way to Exo crossed the delete.
+    OutOfStep,
     NoSurroundingText,
     Selection,
     /// A non-negative index is measured against Exo's prediction of the
@@ -614,6 +657,8 @@ pub(super) enum DeleteDrop {
 /// Why a preedit region (X1') is dropped.
 #[derive(Debug)]
 pub(super) enum RegionDrop {
+    /// As [`DeleteDrop::OutOfStep`].
+    OutOfStep,
     NoSurroundingText,
     NotAroundCursor,
     /// The region does not cover the preedit Exo holds, whose rest Exo
@@ -698,6 +743,17 @@ impl<'a> Current<'a> {
         self.plan(txn, ahead, None, LeaseOutcome::End)
     }
 
+    /// Mirror mode's H9 and X1: a transaction measured in Exo's text
+    /// (`exo_view::Frame`), with `held` as a region's (X1).
+    pub(super) fn measured(self, txn: GuestTxn, held: Option<u32>) -> Planned<'a> {
+        let ahead = txn.commit.is_some()
+            || txn.preedit.is_some()
+            || txn.delete.is_some_and(|lengths| lengths != (0, 0));
+        let mut planned = self.plan(txn, ahead, None, LeaseOutcome::End);
+        planned.held = held;
+        planned
+    }
+
     /// X2 commits the shown preedit; X2', with none shown, recovers the
     /// key the input method took.
     pub(super) fn confirm(self) -> Confirm<'a> {
@@ -753,6 +809,22 @@ pub(super) struct Planned<'a> {
 }
 
 impl Planned<'_> {
+    pub(super) fn txn(&self) -> &GuestTxn {
+        &self.txn
+    }
+
+    /// What reaches the guest of the transaction, if it applies.
+    pub(super) fn edit(&self) -> Edit {
+        let txn = &self.txn;
+        let (deleted_before, deleted_after) = txn.delete.unwrap_or_default();
+        Edit {
+            deleted_before,
+            deleted: (deleted_before, deleted_after) != (0, 0),
+            committed: txn.commit.as_ref().map_or(0, String::len),
+            shown_before: self.cur.composition.shown.is_some(),
+        }
+    }
+
     /// Encode the transaction and, if it fits, make its change: the guest
     /// then shows the transaction's preedit. Returns its events and the
     /// lease effect; if it does not fit, nothing changes.

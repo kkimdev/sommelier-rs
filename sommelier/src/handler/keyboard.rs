@@ -961,6 +961,11 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             }
         };
 
+        if action == Action::Forward && state != KEY_STATE_RELEASED {
+            if let Some(guest_seat) = guest_seat {
+                crate::handler::text_input::guest_key(ctx, guest_seat);
+            }
+        }
         log::debug!("  -> action={:?}", action);
         action
     }
