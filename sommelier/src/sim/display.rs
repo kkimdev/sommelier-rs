@@ -312,6 +312,50 @@ mod tests {
     }
 
     #[test]
+    fn a_window_opens_again_on_a_new_surface_that_takes_its_focus() {
+        let surfaces = Surfaces::new(&[30, 31], &[]);
+        let mut display = Display::new(None, surfaces.clone());
+        let mut exo = Exo::default();
+        // The seat's focus after `request` from `sender`.
+        let request = |display: &mut Display, exo: &mut Exo, sender, request: AnyRequest| {
+            display.request(sender, &request, exo);
+            exo.focus()
+        };
+        let create = |id| wl_compositor::Request::CreateSurface { id }.into();
+        let destroy = || wl_surface::Request::Destroy {}.into();
+        request(
+            &mut display,
+            &mut exo,
+            4,
+            wl_seat::Request::GetPointer { id: 5 }.into(),
+        );
+        request(&mut display, &mut exo, 3, create(7));
+        request(&mut display, &mut exo, 3, create(8));
+        assert_eq!((surfaces.host(0), surfaces.host(1)), (Some(7), Some(8)));
+        exo.set_text_input_focus(Some(7));
+        display.click(7, Target::Start, 9);
+        // F2: the focused window closes and opens again; its new surface
+        // takes the focus.
+        display.reopen(0, true);
+        assert_eq!(request(&mut display, &mut exo, 7, destroy()), None);
+        assert_eq!(request(&mut display, &mut exo, 3, create(9)), Some(9));
+        assert_eq!(surfaces.host(0), Some(9));
+        assert_eq!(surfaces.field_of_host(7), Some(0));
+        // The pointer left the destroyed surface, so a click enters anew.
+        let click = display.click(9, Target::Start, 9);
+        let (_, first) = display.decode(&click[0]);
+        assert!(matches!(
+            first,
+            AnyEvent::WlPointer(wl_pointer::Event::Enter { surface: 9, .. })
+        ));
+        // An unfocused one leaves the focus where it is.
+        display.reopen(1, false);
+        assert_eq!(request(&mut display, &mut exo, 8, destroy()), Some(9));
+        assert_eq!(request(&mut display, &mut exo, 3, create(10)), Some(9));
+        assert_eq!(surfaces.host(1), Some(10));
+    }
+
+    #[test]
     fn a_sync_follows_the_events_of_earlier_requests() {
         let mut display = Display::new(Some(11), Surfaces::new(&[30], &[]));
         let mut exo = Exo::default();
