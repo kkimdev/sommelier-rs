@@ -1627,11 +1627,16 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
   the new surface (`Client::reopen`); it destroys the old surface and
   creates the new one. Exo drops the destroyed surface's focus with no
   keyboard `leave` and deactivates its text inputs; the pointer leaves
-  it. If the field had the seat's focus, the new surface takes it, as a
-  window manager focuses a new window. Input that Exo sent to the old
-  surface before it learned of the destroy reaches the proxy, which
-  drops what names that surface; a key it forwards before the client's
-  close was heard goes nowhere. A `Settle` follows each reopen. One map,
+  it. If the field had the seat's focus, the new surface takes it at
+  its first commit, as a window manager focuses a new window once
+  mapped: the display has no shell roles or buffers, so that commit
+  stands for the map. Input that Exo sent to the old surface before it
+  learned of the destroy reaches the proxy, which drops what names that
+  surface; a press whose pointer is on it lands nowhere. What the proxy
+  sent before it got the destroy reaches the client after it and goes
+  nowhere, as libwayland hands the client a null surface; after the
+  proxy's `delete_id`, an event that names the surface fails the case,
+  as does one the proxy sends after it got the destroy. A `Settle` follows each reopen. One map,
   `sim::surfaces::Surfaces`, holds every field's guest and host
   surfaces, a generation each, and the host surfaces the guest
   destroyed until the proxy reuses their IDs; the display, the world,
