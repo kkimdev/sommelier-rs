@@ -438,18 +438,14 @@ impl Exo {
     }
 
     /// Move the seat's focus, as Alt-Tab or a click on another window does:
-    /// the keyboard leaves the old surface and enters the new one, and the
-    /// text inputs follow as in [`Exo::set_text_input_focus`]. Whether the
-    /// keyboard or the text inputs hear of it first is drawn per move
-    /// (E12).
-    pub(super) fn move_focus(&mut self, focus: Option<u32>, choices: &mut impl Choose) {
+    /// the keyboard leaves the old surface and enters the new one, and then
+    /// the text inputs follow as in [`Exo::set_text_input_focus`]. The seat
+    /// tells its observers in the order they registered, and a case's
+    /// keyboard registers before its text input's first activate (E12).
+    pub(super) fn move_focus(&mut self, focus: Option<u32>) {
         let lost = self.focus;
         if lost == focus {
             return;
-        }
-        let keyboard_first = choices.pick(2) == 0;
-        if !keyboard_first {
-            self.set_text_input_focus(focus);
         }
         if let Some(Keyboard { id, .. }) = self.keyboard {
             if let Some(surface) = lost {
@@ -461,9 +457,7 @@ impl Exo {
                 self.keyboard_enter(id, surface);
             }
         }
-        if keyboard_first {
-            self.set_text_input_focus(focus);
-        }
+        self.set_text_input_focus(focus);
     }
 
     /// The user presses or releases `key` at `now`, as `state` says. While
@@ -2035,28 +2029,27 @@ mod tests {
     }
 
     #[test]
-    fn e12_a_focus_move_reaches_the_keyboard_and_text_inputs_in_the_drawn_order() {
-        for text_inputs_first in [false, true] {
-            let mut exo = active(V10);
-            exo.move_focus(Some(B), &mut |_| u32::from(text_inputs_first));
-            let keyboard_leave = wl_keyboard::Event::Leave {
-                serial: 1,
-                surface: A,
-            };
-            let keyboard_enter = wl_keyboard::Event::Enter {
-                serial: 3,
-                surface: B,
-                keys: Vec::new(),
-            };
-            let mut expected = vec![
-                (KEYBOARD, keyboard_leave.into()),
-                modifiers(KEYBOARD, 2, 0),
-                (KEYBOARD, keyboard_enter.into()),
-            ];
-            let at = if text_inputs_first { 0 } else { 3 };
-            expected.insert(at, leave());
-            assert_eq!(events(&mut exo), expected);
-        }
+    fn e12_a_focus_move_reaches_the_keyboard_before_the_text_inputs() {
+        // The keyboard registered as the seat's observer before the text
+        // input's first activate, so it hears of the focus first.
+        let mut exo = active(V10);
+        exo.move_focus(Some(B));
+        let keyboard_leave = wl_keyboard::Event::Leave {
+            serial: 1,
+            surface: A,
+        };
+        let keyboard_enter = wl_keyboard::Event::Enter {
+            serial: 3,
+            surface: B,
+            keys: Vec::new(),
+        };
+        let expected = vec![
+            (KEYBOARD, keyboard_leave.into()),
+            modifiers(KEYBOARD, 2, 0),
+            (KEYBOARD, keyboard_enter.into()),
+            leave(),
+        ];
+        assert_eq!(events(&mut exo), expected);
     }
 
     #[test]

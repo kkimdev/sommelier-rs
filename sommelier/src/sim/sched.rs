@@ -482,7 +482,7 @@ impl<'t> World<'t> {
         };
         let surface = self.display.surfaces()[field];
         if self.exo.focus() != Some(surface) {
-            self.exo.move_focus(Some(surface), &mut self.choices);
+            self.exo.move_focus(Some(surface));
         }
         let presses = match action {
             UserAction::Click { at, .. } => self.display.click(surface, at, time),
