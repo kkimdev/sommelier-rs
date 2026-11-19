@@ -19,14 +19,23 @@ limitations under the License.
 //! Each field starts with marker digits ([`Target::BeforeMarker`]) between
 //! a few letters and syllables, and the user never types a digit, so a
 //! marker names the same place to the user and to a client that lags. The
-//! actions are about 63% keys (two-set jamo, in the order syllables take,
-//! plus Space and Backspace), 15% clicks, 8% taps, 7% focus moves, 2%
-//! restarts of the input method and 5% settles; a Backspace comes only
-//! where it deletes no marker.
+//! actions are about 59% keys (two-set jamo, in the order syllables take,
+//! plus Space and Backspace), 2% accepted suggestions and 2%
+//! reconversions (in a free case, half of each followed at once by
+//! another, for a delete while the guest has not reported the first and a
+//! region over a region), 15%
+//! clicks, 8% taps, 7% focus moves, 2% restarts of the input method and 5%
+//! settles. A Backspace comes only where it deletes no marker, and a
+//! suggestion or a reconversion only where it changes something; in a
+//! settled case, also only right after a key. GTK3 reports a cursor that a
+//! click moved only with its next edit, so after a click the engine would
+//! measure the word or the region from where the cursor was; and once the
+//! guest reports a region, Exo drops it as a composition (E4), so the
+//! engine cannot grow it.
 //!
 //! A case is free or settled. A settled case is one the user-intent oracle
 //! can judge ([`settled`]): a `Settle` comes before and after every click,
-//! tap, focus move and restart. Otherwise Exo can hand the engine a key after a
+//! tap, focus move, restart, suggestion and reconversion. Otherwise Exo can hand the engine a key after a
 //! press but before the press's reset, whose result the proxy drops by
 //! design (the fence), or a key can reach the client raw while a focus
 //! move's activation is in flight (E7). A settled case also settles after
@@ -76,8 +85,29 @@ pub(super) fn actions(
     let mut reference = Reference::new(fields).typing(typing);
     let mut ima = Ima::default();
     let mut actions = Vec::new();
+    // A request a free case makes again at once.
+    let mut again = None;
+    // Whether the last action but a settle was a key, which the client
+    // reported, so that the engine knows where the cursor is.
+    let mut typed = false;
     for _ in 0..10 + rng.below(51) {
+        let asks = typed || !settled;
+        // A settled case asks so rarely right after a key that it asks then
+        // one time in eight, where it can.
+        let (takes, reconverts) = (reference.takes_suggestion(), reference.reconverts());
+        let more = settled && typed && (takes || reconverts) && rng.one_in(8);
         let action = match rng.below(100) {
+            _ if again.is_some() => again.take().expect("a request to repeat"),
+            _ if more && takes && (!reconverts || rng.one_in(2)) => UserAction::AcceptSuggestion,
+            _ if more => UserAction::Reconvert,
+            59..61 if asks && takes => {
+                again = (!settled && rng.one_in(2)).then_some(UserAction::AcceptSuggestion);
+                UserAction::AcceptSuggestion
+            }
+            61..63 if asks && reconverts => {
+                again = (!settled && rng.one_in(2)).then_some(UserAction::Reconvert);
+                UserAction::Reconvert
+            }
             0..63 => UserAction::Key(key(rng, &reference)),
             63..78 => UserAction::Click {
                 field: rng.below(FIELDS),
@@ -109,10 +139,17 @@ pub(super) fn actions(
                 ima.moved(true);
                 false
             }
-            UserAction::Settle => false,
+            // IMA's flag would not be stale after a key that a region
+            // reconverted ahead of: the key commits the region, which
+            // clears it. But the host may show no region, so the flag is
+            // kept as if there were none.
+            UserAction::AcceptSuggestion | UserAction::Reconvert | UserAction::Settle => false,
         };
         if settled && moves {
             settle(&mut actions);
+        }
+        if action != UserAction::Settle {
+            typed = matches!(action, UserAction::Key(_));
         }
         reference.apply(action);
         match action {
@@ -276,6 +313,41 @@ mod tests {
     }
 
     #[test]
+    fn a_suggestion_or_a_reconversion_comes_only_where_it_changes_something() {
+        for (texts, actions) in cases(Typing::default(), false) {
+            let fields = texts.iter().map(|text| TextModel::new(text)).collect();
+            let mut reference = Reference::new(fields);
+            for (i, &action) in actions.iter().enumerate() {
+                let again = i > 0 && actions[i - 1] == action;
+                match action {
+                    UserAction::AcceptSuggestion if !again => assert!(reference.takes_suggestion()),
+                    UserAction::Reconvert if !again => assert!(reference.reconverts()),
+                    _ => {}
+                }
+                reference.apply(action);
+            }
+        }
+    }
+
+    #[test]
+    fn a_settled_case_asks_the_engine_only_right_after_a_key() {
+        for (_, actions) in cases(Typing::default(), true) {
+            let acts: Vec<UserAction> = actions
+                .into_iter()
+                .filter(|&action| action != UserAction::Settle)
+                .collect();
+            for pair in acts.windows(2) {
+                let asks = matches!(
+                    pair[1],
+                    UserAction::AcceptSuggestion | UserAction::Reconvert
+                );
+                let after = matches!(pair[0], UserAction::Key(_));
+                assert!(!asks || after, "{pair:?}");
+            }
+        }
+    }
+
+    #[test]
     fn ima_stays_composing_after_any_composition_until_a_commit_or_a_reset() {
         // A key the engine passes with nothing ever composed, or after a
         // commit, finds IMA not composing.
@@ -322,6 +394,7 @@ mod tests {
             Typing {
                 latin: true,
                 nfd_backspace: true,
+                regionless: false,
             },
         ];
         for typing in typings {
@@ -357,6 +430,12 @@ mod tests {
         assert!((4..12).contains(&share(|a| matches!(a, UserAction::Tap { .. }))));
         assert!((4..10).contains(&share(|a| matches!(a, UserAction::Focus(_)))));
         assert!((1..4).contains(&share(|a| *a == UserAction::RestartInputMethod)));
+        assert!(actions.contains(&UserAction::AcceptSuggestion));
+        assert!(actions.contains(&UserAction::Reconvert));
+        for request in [UserAction::AcceptSuggestion, UserAction::Reconvert] {
+            let twice = actions.windows(2).any(|w| w == [request; 2]);
+            assert!(twice, "{request:?} is made twice at once");
+        }
         assert!((2..8).contains(&share(|a| *a == UserAction::Settle)));
         let backspaces = actions.contains(&UserAction::Key(Key::Backspace));
         assert!(backspaces, "a Backspace is generated");

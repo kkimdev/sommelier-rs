@@ -109,16 +109,20 @@ impl Case {
             texts,
             actions: Vec::new(),
         };
-        case.actions = user::actions(&mut rng, &case.texts, case.typing(), settled);
+        // The user does not know whether the host can show a region.
+        let typing = case.typing(Some(11));
+        case.actions = user::actions(&mut rng, &case.texts, typing, settled);
         case
     }
 
-    /// How keys reach the client's fields: GTK's Backspace leaves a
-    /// syllable's NFD prefix (C14).
-    fn typing(&self) -> Typing {
+    /// How keys reach the client's fields, through a host whose text-input
+    /// extension is `extension`: GTK's Backspace leaves a syllable's NFD
+    /// prefix (C14), and only the extension shows a reconverted region.
+    fn typing(&self, extension: Option<u32>) -> Typing {
         Typing {
             latin: self.latin,
             nfd_backspace: self.client != ClientKind::Chromium,
+            regionless: extension.is_none(),
         }
     }
 
@@ -127,15 +131,17 @@ impl Case {
         Choices::new(self.seed ^ 0x5eed_5eed)
     }
 
-    /// The reference editor on the case's fields, before any action.
-    fn reference_at_start(&self) -> Reference {
+    /// The reference editor on the case's fields, before any action, for a
+    /// host whose text-input extension is `extension`.
+    fn reference_at_start(&self, extension: Option<u32>) -> Reference {
         let fields = self.texts.iter().map(|text| TextModel::new(text)).collect();
-        Reference::new(fields).typing(self.typing())
+        Reference::new(fields).typing(self.typing(extension))
     }
 
-    /// The user's intent: the reference editor after the case's actions.
-    fn reference(&self) -> Reference {
-        let mut reference = self.reference_at_start();
+    /// The user's intent: the reference editor after the case's actions,
+    /// for a host whose text-input extension is `extension`.
+    fn reference(&self, extension: Option<u32>) -> Reference {
+        let mut reference = self.reference_at_start(extension);
         for &action in &self.actions {
             reference.apply(action);
         }
@@ -198,17 +204,17 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         let (exo, steps) = (&world.exo, &world.steps);
         let mut failures = oracle::exact(steps, spec, shadow, exo, &engine, resets, extension);
         if case.settled {
-            failures.extend(oracle::intended(&case.reference(), world.client()));
+            failures.extend(oracle::intended(&case.reference(extension), world.client()));
         }
         // P1 shows only in GTK, whose blur keeps no composition (C11).
         let gtk = case.client != ClientKind::Chromium;
         let played = oracle::Played {
             texts: &case.texts,
-            typing: case.typing(),
+            typing: case.typing(extension),
             actions: &case.actions,
             untracked_restarts: &world.untracked_restarts,
         };
-        outcome.known = oracle::classify(&failures, |issues| {
+        outcome.known = oracle::classify(&failures, &spec.counts, |issues| {
             (gtk || !issues.contains(&KnownIssue::FocusWhileComposing))
                 && oracle::issues_predict(issues, &played, world.client())
         });
@@ -323,7 +329,7 @@ impl Coverage {
             .position(|&l| l == outcome.lag);
         self.lags[lag.expect("a lag")] += 1;
         self.latin += u64::from(case.latin);
-        let mut reference = case.reference_at_start();
+        let mut reference = case.reference_at_start(outcome.extension);
         for &action in &case.actions {
             self.leaves_composing += u64::from(reference.leaves_composition(action));
             if let UserAction::Key(hangul::Key::Backspace) = action {
@@ -331,7 +337,8 @@ impl Coverage {
                 let before = field.text[..field.cursor].chars().next_back();
                 let syllable = before.is_some_and(|c| ('가'..='힣').contains(&c));
                 let passed = reference.engine_passes(hangul::Key::Backspace);
-                self.nfd_backspaces += u64::from(case.typing().nfd_backspace && passed && syllable);
+                let nfd = case.typing(outcome.extension).nfd_backspace;
+                self.nfd_backspaces += u64::from(nfd && passed && syllable);
             }
             reference.apply(action);
         }
@@ -446,10 +453,12 @@ fn pinned(test: &str, body: impl FnOnce()) {
 /// Runs the cases of one mode ([`pinned`]), prints the failed ones, and
 /// fails with the report of the first. A run of the default size or more
 /// must also have met each variant a case draws and each path the mode is
-/// there to reach: presses that end a composition and Exo's own detaches
-/// (H2); in free cases, fence drops, late answers the guest got and raw
-/// keys; in settled ones, the known issues, and no fence drop, which a
-/// settled case must not cause.
+/// there to reach: presses that end a composition, Exo's own detaches
+/// (H2), its deletes (H9) and its preedit regions (X1); in free cases,
+/// fence drops, late answers the guest got, raw keys and reports that
+/// crossed an edit (P4), and in a run of 5,000 or more the rarer region
+/// and delete paths; in settled ones, the known issues, and no fence drop,
+/// which a settled case must not cause.
 fn check(test: &str, settled: bool) {
     pinned(test, || {
         let summary = run_all(&cases(settled));
@@ -480,12 +489,35 @@ fn check(test: &str, settled: bool) {
                 .for_each(|line| println!("{line}"));
         }
         let mut reached = coverage.counters(!settled);
-        reached.extend([counts.press_commits, counts.host_detaches]);
+        reached.extend([
+            counts.press_commits,
+            counts.host_detaches,
+            counts.deletes,
+            counts.regions,
+        ]);
         match settled {
-            false => reached.extend([counts.fence_drops, counts.late_shown, counts.raw_keys]),
+            false => reached.extend([
+                counts.fence_drops,
+                counts.late_shown,
+                counts.raw_keys,
+                counts.crossed_reports,
+            ]),
             // The known issue's count drops to 0 once C5 fixes P1, which
             // then deletes it here.
             true => reached.push(known.len() as u64),
+        }
+        // Rarer paths, which a long run must reach: a region over a region
+        // the guest has not reported, or over a preedit the committed text
+        // does not hold, a dropped region, and a delete dropped while the
+        // guest's text is ahead (P4) or for its range.
+        if !settled && *cases >= 5_000 {
+            reached.extend([
+                counts.regions_over_regions,
+                counts.regions_over_preedits,
+                counts.regions_dropped,
+                counts.deletes_ahead,
+                counts.deletes_misplaced,
+            ]);
         }
         if *cases >= 300 {
             let known = known.len();

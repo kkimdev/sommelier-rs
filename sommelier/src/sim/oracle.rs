@@ -35,12 +35,9 @@ limitations under the License.
 //! proxy is known to cause is a [`KnownIssue`] ([`classify`]): the client
 //! must then show exactly what the issue predicts.
 //!
-//! The engine makes no deletes or preedit regions before D6, so `SpecText`
-//! does not track whether the guest's text is ahead of what it reported
-//! (H9, X1), and panics on either event. For the same reason no case yet
-//! needs Chromium's prediction to replay Exo's history (the design's
-//! 4.5): the text a client predicts matters only to measure a delete. Nor
-//! does Exo send `preedit_styling` (H4).
+//! `SpecText` tracks whether the guest's text is ahead of what it last
+//! reported, which drops Exo's absolute deletes (H9), and the bytes the
+//! preedit regions took since (X1). Exo sends no `preedit_styling` (H4).
 
 use super::client::Client;
 use super::editor::{Reference, Target, TextModel, Txn, Typing, UserAction};
@@ -252,6 +249,25 @@ pub(super) struct Counts {
     pub dropped: u64,
     /// Exo's own detaches while attached (H2).
     pub host_detaches: u64,
+    /// Exo's deletes the guest got (H9).
+    pub deletes: u64,
+    /// Exo's absolute deletes dropped while the guest's text was ahead of
+    /// its report (H9), which guards against P4.
+    pub deletes_ahead: u64,
+    /// Exo's deletes dropped for their range (H9).
+    pub deletes_misplaced: u64,
+    /// Preedit regions the guest got (X1), and those of them over a region
+    /// the guest had not reported.
+    pub regions: u64,
+    pub regions_over_regions: u64,
+    /// Preedit regions the guest got while it showed a preedit whose bytes
+    /// the committed text does not hold (KnownIssue::RegionOverShownPreedit).
+    pub regions_over_preedits: u64,
+    /// Preedit regions dropped for their range or for not covering a
+    /// region the guest had not reported (X1').
+    pub regions_dropped: u64,
+    /// Guest reports that crossed an edit on its way to the guest (P4).
+    pub crossed_reports: u64,
 }
 
 impl std::ops::AddAssign for Counts {
@@ -263,6 +279,14 @@ impl std::ops::AddAssign for Counts {
         self.late += other.late;
         self.dropped += other.dropped;
         self.host_detaches += other.host_detaches;
+        self.deletes += other.deletes;
+        self.deletes_ahead += other.deletes_ahead;
+        self.deletes_misplaced += other.deletes_misplaced;
+        self.regions += other.regions;
+        self.regions_over_regions += other.regions_over_regions;
+        self.regions_over_preedits += other.regions_over_preedits;
+        self.regions_dropped += other.regions_dropped;
+        self.crossed_reports += other.crossed_reports;
     }
 }
 
@@ -284,6 +308,11 @@ pub(super) struct SpecText {
     link: Link,
     fence: Fence,
     shown: Option<Shown>,
+    /// The guest's text may hold edits it has not reported (`Ahead`).
+    ahead: bool,
+    /// The bytes before and after the committed cursor that preedit
+    /// regions took since the guest last reported (X1).
+    taken: Option<(usize, usize)>,
     /// The last `preedit_cursor` since a terminal event (H5).
     assembly: Option<i32>,
     /// The step's decisions: what the specification asks, and what the
@@ -317,6 +346,8 @@ impl SpecText {
             link: Link::Detached,
             fence: Fence::Closed,
             shown: None,
+            ahead: false,
+            taken: None,
             assembly: None,
             expected: Decisions::default(),
             sent: Decisions::default(),
@@ -424,6 +455,8 @@ impl SpecText {
         };
         if let Some(text) = surrounding_text {
             field.surrounding_text = text;
+            self.ahead = false;
+            self.taken = None;
         }
         if let Some(content_type) = content_type {
             field.content_type = content_type;
@@ -476,6 +509,7 @@ impl SpecText {
                 // which a case has none.
                 self.composition_event(origin, |spec| {
                     let commit = spec.shown.take()?.text;
+                    spec.edited();
                     Some((
                         Txn {
                             commit,
@@ -485,9 +519,10 @@ impl SpecText {
                     ))
                 });
             }
-            AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion { .. }) => {
-                panic!("preedit regions come with D6")
-            }
+            &AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion {
+                index,
+                length,
+            }) => self.composition_event(origin, |spec| spec.region(index, length, origin)),
             _ => {}
         }
     }
@@ -530,6 +565,8 @@ impl SpecText {
         self.committed = None;
         self.pending = Pending::default();
         self.shown = None;
+        self.ahead = false;
+        self.taken = None;
     }
 
     /// F4: a press on the surface of the enabled, focused field while the
@@ -541,6 +578,7 @@ impl SpecText {
         if self.gate() && self.focus == Some(field) {
             if let Some(shown) = self.shown.take() {
                 self.counts.press_commits += 1;
+                self.edited();
                 self.assembly = None;
                 self.expected.reset = true;
                 let txn = Txn {
@@ -576,6 +614,10 @@ impl SpecText {
                     let shown = spec.shown.take();
                     if text.is_empty() {
                         let commit = shown.map_or_else(String::new, |_| commit.clone());
+                        // The reset commit is an edit, which leaves the
+                        // bytes regions took alone, as any preedit_string
+                        // does.
+                        spec.ahead |= !commit.is_empty();
                         let txn = Txn {
                             commit,
                             ..Txn::default()
@@ -598,6 +640,8 @@ impl SpecText {
             v1::Event::CommitString { text, .. } => {
                 self.composition_event(origin, |spec| {
                     spec.shown = None;
+                    spec.taken = None;
+                    spec.ahead |= !text.is_empty();
                     let txn = Txn {
                         commit: text.clone(),
                         ..Txn::default()
@@ -605,9 +649,103 @@ impl SpecText {
                     Some((txn, (0, 0)))
                 });
             }
-            v1::Event::DeleteSurroundingText { .. } => panic!("deletes come with D6"),
+            &v1::Event::DeleteSurroundingText { index, length } => {
+                self.composition_event(origin, |spec| spec.delete(index, length));
+            }
             _ => {}
         }
+    }
+
+    /// An edit that ends the composition reached the guest, which has yet
+    /// to report it: the bytes regions took are text again.
+    fn edited(&mut self) {
+        self.ahead = true;
+        self.taken = None;
+    }
+
+    /// The committed surrounding text and cursor, without a selection, if
+    /// the guest stated one.
+    fn surrounding(&self) -> Option<(String, usize)> {
+        let (text, cursor, anchor) = self.committed.as_ref()?.surrounding_text.clone()?;
+        (cursor == anchor).then_some((text, cursor as usize))
+    }
+
+    /// H9: Exo's delete of `length` bytes from `index` of the committed
+    /// surrounding text, or from the cursor if `index` is negative, which
+    /// must hold the cursor and lie on character boundaries; an absolute
+    /// one only while the guest's text is not ahead of its report.
+    fn delete(&mut self, index: i32, length: u32) -> Option<(Txn, (i32, i32))> {
+        let (text, cursor) = self.surrounding()?;
+        if index >= 0 && self.ahead {
+            self.counts.deletes_ahead += 1;
+            return None;
+        }
+        let start = match index {
+            ..0 => cursor as i64 + i64::from(index),
+            _ => i64::from(index),
+        };
+        let Some((before, after)) = around(&text, cursor, start, length) else {
+            self.counts.deletes_misplaced += 1;
+            return None;
+        };
+        if (before, after) == (0, 0) {
+            return None;
+        }
+        self.counts.deletes += 1;
+        self.shown = None;
+        self.edited();
+        let txn = Txn {
+            delete: (before, after),
+            ..Txn::default()
+        };
+        Some((txn, (0, 0)))
+    }
+
+    /// X1: the bytes from `index` before the committed cursor, `length`
+    /// long, become the preedit, at its cursor (H5) or where the guest's
+    /// cursor was. While the guest has not reported since a region, the
+    /// committed text still holds the bytes regions took, so the region
+    /// must cover them, and deletes only the rest.
+    fn region(&mut self, index: i32, length: u32, origin: Origin) -> Option<(Txn, (i32, i32))> {
+        let (text, cursor) = self.surrounding()?;
+        let start = cursor as i64 + i64::from(index);
+        let region = around(&text, cursor, start, length);
+        let delete = region.and_then(|(before, after)| match self.taken {
+            None => Some((before, after)),
+            Some((taken_before, taken_after)) => Some((
+                before.checked_sub(taken_before)?,
+                after.checked_sub(taken_after)?,
+            )),
+        });
+        let (Some((before, after)), Some(delete)) = (region, delete) else {
+            self.counts.regions_dropped += 1;
+            return None;
+        };
+        let preedit = text[cursor - before..cursor + after].to_owned();
+        // The committed text holds no byte of the preedit the guest shows,
+        // which Exo holds as text, ahead of its cursor.
+        let over = self.taken.is_none() && self.shown.is_some();
+        self.counts.regions_over_preedits += u64::from(over);
+        let at = self.assembly.unwrap_or(before as i32);
+        let preedit_cursor = preedit_cursor(&preedit, Some(at));
+        self.shown = None;
+        if !preedit.is_empty() {
+            self.counts.regions += 1;
+            self.counts.regions_over_regions += u64::from(self.taken.is_some());
+            self.ahead = true;
+            self.taken = Some((before, after));
+            self.shown = Some(Shown {
+                text: preedit.clone(),
+                cursor: preedit_cursor,
+                origin,
+            });
+        }
+        let txn = Txn {
+            delete,
+            preedit,
+            ..Txn::default()
+        };
+        Some((txn, preedit_cursor))
     }
 
     /// A terminal host composition event, which takes the assembly: through
@@ -635,6 +773,7 @@ impl SpecText {
     fn leave_attached(&mut self, link: Link) {
         self.link = link;
         self.shown = None;
+        self.taken = None;
         self.assembly = None;
     }
 
@@ -739,6 +878,19 @@ fn clamped(model: &TextModel, txn: &Txn) -> Txn {
         delete: (cursor - start, end - cursor),
         ..txn.clone()
     }
+}
+
+/// The bytes before and after `cursor` of the range of `text` from `start`,
+/// `length` long, if it holds the cursor and lies on character boundaries.
+fn around(text: &str, cursor: usize, start: i64, length: u32) -> Option<(usize, usize)> {
+    let start = usize::try_from(start).ok()?;
+    let end = start.checked_add(length as usize)?;
+    let fits = start <= cursor
+        && cursor <= end
+        && end <= text.len()
+        && text.is_char_boundary(start)
+        && text.is_char_boundary(end);
+    fits.then(|| (cursor - start, end - cursor))
 }
 
 /// The cursor of a preedit `text` whose `preedit_cursor` was `index`: there,
@@ -998,6 +1150,9 @@ pub(super) enum KnownIssue {
     /// A restart of the input method while the guest shows a composition
     /// that Exo no longer tracks loses it, below v11 of the extension.
     RestartLosesUntrackedComposition,
+    /// A preedit region while the guest shows a preedit whose bytes the
+    /// committed text does not hold takes other bytes than Exo composes.
+    RegionOverShownPreedit,
 }
 
 impl KnownIssue {
@@ -1020,6 +1175,14 @@ impl KnownIssue {
                  Exo's detach then confirms the composition, but the link is draining and the \
                  proxy drops the confirmation"
             }
+            Self::RegionOverShownPreedit => {
+                "Exo makes a region from its own cursor, which follows the composition it holds \
+                 as text, while the proxy measures it from the guest's reported cursor, before \
+                 the preedit the guest shows: a host preedit, or a region the guest reported, \
+                 which clears what the proxy knows of the bytes it took (X1); Chromium, which \
+                 applies a delete before it clears its preedit, also drops the region's delete \
+                 while it shows one (C3)"
+            }
             Self::RestartLosesUntrackedComposition => {
                 "a report Exo could not match to its prediction dropped the composition Exo \
                  tracks (E4), and below v11 of the extension Exo's detach confirms only a \
@@ -1036,6 +1199,10 @@ impl KnownIssue {
             Self::RestartLosesUntrackedComposition => {
                 "docs/IME_REDESIGN.md 2.2 H2; C5 decides whether H2 commits the shown preedit"
             }
+            Self::RegionOverShownPreedit => {
+                "docs/IME_REDESIGN.md 2.2 X1; the core's X1 must decide how a region over a \
+                 reported region is measured"
+            }
         }
     }
 }
@@ -1043,11 +1210,19 @@ impl KnownIssue {
 /// The known issues that explain a case's `failures`, if any do: tier 1
 /// passed, and the client shows exactly what a set of issues predicts
 /// together (`predicts`, asked of each set, the smallest first, and only
-/// then).
+/// then); or only tier 1's composition check failed, in a case with a
+/// region over a shown preedit (`counts`), whose region Exo composes
+/// elsewhere.
 pub(super) fn classify(
     failures: &[Failure],
+    counts: &Counts,
     mut predicts: impl FnMut(&[KnownIssue]) -> bool,
 ) -> Vec<KnownIssue> {
+    let composition = |f: &Failure| f.tier == Tier::Exact && f.check == "composition";
+    if !failures.is_empty() && failures.iter().all(composition) && counts.regions_over_preedits > 0
+    {
+        return vec![KnownIssue::RegionOverShownPreedit];
+    }
     let intent_only = !failures.is_empty() && failures.iter().all(|f| f.tier == Tier::Intent);
     let mut sets = KnownIssue::SETS.into_iter();
     match intent_only {
@@ -1437,6 +1612,80 @@ mod tests {
         assert_eq!(spec.wrong_decisions, Vec::<String>::new());
     }
 
+    /// The guest reports `text` with the cursor at `cursor`, and commits.
+    fn report(spec: &mut SpecText, text: &str, cursor: i32) {
+        let surrounding = v3::Request::SetSurroundingText {
+            text: IndexedString::Utf8(text.to_owned()),
+            cursor,
+            anchor: cursor,
+        };
+        guest(spec, &[surrounding, v3::Request::Commit {}], &[]);
+    }
+
+    #[test]
+    fn exos_delete_reaches_the_guest_only_from_a_reported_text_around_the_cursor() {
+        let delete = |index, length| v1::Event::DeleteSurroundingText { index, length };
+        let mut spec = attached(&["0ab"]);
+        // No surrounding text: dropped.
+        host(&mut spec, delete(1, 2), &[]);
+        assert_eq!(spec.views[0], view("0ab", 3, ""));
+        // Absolute, of bytes 1 to 3.
+        report(&mut spec, "0ab", 3);
+        host(&mut spec, delete(1, 2), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        // The guest has not reported it: an absolute delete is dropped, one
+        // from the cursor is not.
+        host(&mut spec, delete(0, 1), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+        host(&mut spec, delete(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("", 0, ""));
+        // Reported, an empty range, or one past the text, is dropped.
+        report(&mut spec, "0", 1);
+        host(&mut spec, delete(1, 0), &[]);
+        host(&mut spec, delete(1, 1), &[]);
+        let counts = (
+            spec.counts.deletes,
+            spec.counts.deletes_ahead,
+            spec.counts.deletes_misplaced,
+        );
+        assert_eq!(counts, (2, 1, 1));
+        assert_eq!(spec.wrong_decisions, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_region_over_a_region_deletes_only_what_the_guest_has() {
+        let region = |index, length| extended::Event::SetPreeditRegion { index, length };
+        let mut spec = attached(&["0ab"]);
+        report(&mut spec, "0ab", 3);
+        host(&mut spec, region(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("0a", 2, "b"));
+        // The guest still has "0a": the committed text's "b" is gone.
+        host(&mut spec, region(-2, 2), &[]);
+        assert_eq!(spec.views[0], view("0", 1, "ab"));
+        // One that does not cover the bytes regions took is dropped.
+        host(&mut spec, region(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("0", 1, "ab"));
+        let counts = |spec: &SpecText| {
+            let c = spec.counts;
+            (
+                c.regions,
+                c.regions_over_regions,
+                c.regions_dropped,
+                c.regions_over_preedits,
+            )
+        };
+        assert_eq!(counts(&spec), (2, 1, 1, 0));
+        // Once the guest reports, a region is measured from its cursor, and
+        // counts as over a shown preedit, as one over a host preedit does.
+        report(&mut spec, "0", 1);
+        host(&mut spec, region(-1, 1), &[]);
+        assert_eq!(spec.views[0], view("", 0, "0"));
+        assert_eq!(counts(&spec), (3, 1, 1, 1));
+        // A commit gives the bytes back.
+        host(&mut spec, commit("0"), &[]);
+        assert_eq!(spec.views[0], view("0", 1, ""));
+    }
+
     #[test]
     fn a_guest_commit_is_answered_with_the_shown_preedit_and_records_the_field() {
         let mut spec = attached(&["0"]);
@@ -1682,16 +1931,39 @@ mod tests {
             detail: String::new(),
         };
         let one = std::slice::from_ref(&lost);
-        assert_eq!(classify(one, |_| true), [P1]);
-        assert_eq!(classify(one, |issues| issues == [Lost]), [Lost]);
-        assert_eq!(classify(one, |issues| issues.len() == 2), [P1, Lost]);
-        assert_eq!(classify(one, |_| false), []);
-        assert_eq!(classify(&[], |_| true), []);
+        let none = Counts::default();
+        assert_eq!(classify(one, &none, |_| true), [P1]);
+        assert_eq!(classify(one, &none, |issues| issues == [Lost]), [Lost]);
+        assert_eq!(classify(one, &none, |issues| issues.len() == 2), [P1, Lost]);
+        assert_eq!(classify(one, &none, |_| false), []);
+        assert_eq!(classify(&[], &none, |_| true), []);
         let exact = Failure {
             tier: Tier::Exact,
             ..lost.clone()
         };
-        assert_eq!(classify(&[lost, exact], |_| true), []);
+        assert_eq!(classify(&[lost.clone(), exact], &none, |_| true), []);
+        // Only a composition that Exo composes elsewhere, after a region
+        // over a shown preedit.
+        let composition = Failure {
+            tier: Tier::Exact,
+            check: "composition",
+            ..lost.clone()
+        };
+        let region = Counts {
+            regions_over_preedits: 1,
+            ..Counts::default()
+        };
+        let both = [composition.clone(), lost];
+        let known = [KnownIssue::RegionOverShownPreedit];
+        assert_eq!(
+            classify(std::slice::from_ref(&composition), &region, |_| false),
+            known
+        );
+        assert_eq!(
+            classify(std::slice::from_ref(&composition), &none, |_| true),
+            []
+        );
+        assert_eq!(classify(&both, &region, |_| true), []);
         assert!(!P1.reason().is_empty() && P1.tracking().contains("C5"));
         assert!(!Lost.reason().is_empty() && Lost.tracking().contains("H2"));
     }

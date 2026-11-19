@@ -78,6 +78,9 @@ pub(super) struct Typing {
     /// ([`TextModel::backspace_to_nfd_prefix`]) rather than a whole
     /// character.
     pub nfd_backspace: bool,
+    /// The host shows no reconverted region, as it has no text-input
+    /// extension, so the input method reconverts nothing.
+    pub regionless: bool,
 }
 
 /// What the user does.
@@ -105,6 +108,16 @@ pub(super) enum UserAction {
     /// of its process does: Exo detaches it on its own, which confirms
     /// the composition, and its engine starts afresh.
     RestartInputMethod,
+    /// Accepts the input method's suggestion for the word before the
+    /// cursor ([`word_before`]), which replaces it with the word and a
+    /// `~`. With a composition, it does nothing.
+    AcceptSuggestion,
+    /// Reconverts the character before the cursor, or before the
+    /// reconverted region, which grows over it: the region becomes the
+    /// composition, and the next key commits it as it is. With a jamo
+    /// composition, or before a character that is not
+    /// [`reconvertible`], it does nothing.
+    Reconvert,
     /// Waits for the system to settle before the next action.
     Settle,
 }
@@ -243,6 +256,22 @@ fn decompose_hangul(c: char) -> Vec<char> {
     out
 }
 
+/// The word at the end of `text`: the characters after its last marker
+/// digit or whitespace, which an input method's suggestion replaces.
+pub(super) fn word_before(text: &str) -> &str {
+    let start = text
+        .char_indices()
+        .rfind(|&(_, c)| !reconvertible(c))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    &text[start..]
+}
+
+/// Whether the input method reconverts `c` or counts it in a word: any
+/// character but a marker digit or whitespace, so that a marker stays put.
+pub(super) fn reconvertible(c: char) -> bool {
+    !c.is_ascii_digit() && !c.is_whitespace()
+}
+
 /// The reference editor: what a correct system shows after the user's
 /// actions, typed through an ideal input method that handles each key at
 /// once.
@@ -258,6 +287,10 @@ fn decompose_hangul(c: char) -> Vec<char> {
 ///   focused field changes nothing.
 /// - A restart of the input method commits the composition, as Exo's
 ///   confirm on detach intends, and keeps the focus.
+/// - Accepting a suggestion replaces the word before the cursor, and a
+///   reconversion makes the characters before it the composition, as
+///   [`UserAction::AcceptSuggestion`] and [`UserAction::Reconvert`] say.
+///   A Latin layout has no engine, so it does neither.
 ///
 /// Field 0 has the focus at the start. [`Typing`] says how keys reach a
 /// field; by default the input method composes Korean and a Backspace
@@ -277,6 +310,8 @@ pub(super) struct Reference {
     focus: usize,
     /// The input method's composition, which is in the focused field.
     composer: Composer,
+    /// The reconverted region, which is the composition instead.
+    region: Option<String>,
     typing: Typing,
 }
 
@@ -288,6 +323,7 @@ impl Reference {
             fields,
             focus: 0,
             composer: Composer::default(),
+            region: None,
             typing: Typing::default(),
         }
     }
@@ -305,9 +341,11 @@ impl Reference {
                     true => Output::default(),
                     false => self.composer.key(key),
                 };
+                // A key commits a reconverted region as it is.
+                let region = self.region.take().unwrap_or_default();
                 let field = &mut self.fields[self.focus];
                 field.apply_txn(&Txn {
-                    commit: out.commit,
+                    commit: region + &out.commit,
                     preedit: out.preedit,
                     ..Txn::default()
                 });
@@ -331,7 +369,31 @@ impl Reference {
                 self.focus = field;
             }
             UserAction::RestartInputMethod => self.commit_composition(),
-            UserAction::Focus(_) | UserAction::Settle => {}
+            UserAction::AcceptSuggestion if self.takes_suggestion() => {
+                let field = &mut self.fields[self.focus];
+                let word = word_before(&field.text[..field.cursor]).to_owned();
+                field.apply_txn(&Txn {
+                    delete: (word.len(), 0),
+                    commit: format!("{word}~"),
+                    ..Txn::default()
+                });
+            }
+            UserAction::Reconvert if self.reconverts() => {
+                let field = &mut self.fields[self.focus];
+                let c = field.text[..field.cursor].chars().next_back();
+                let c = c.expect("a character to reconvert");
+                let region = format!("{c}{}", self.region.take().unwrap_or_default());
+                field.apply_txn(&Txn {
+                    delete: (c.len_utf8(), 0),
+                    preedit: region.clone(),
+                    ..Txn::default()
+                });
+                self.region = Some(region);
+            }
+            UserAction::Focus(_)
+            | UserAction::AcceptSuggestion
+            | UserAction::Reconvert
+            | UserAction::Settle => {}
         }
     }
 
@@ -341,11 +403,9 @@ impl Reference {
         let field = match action {
             UserAction::Click { field, .. } | UserAction::Tap { field, .. } => field,
             UserAction::Focus(field) => field,
-            UserAction::Key(_) | UserAction::RestartInputMethod | UserAction::Settle => {
-                return false
-            }
+            _ => return false,
         };
-        field != self.focus && !self.composer.preedit().is_empty()
+        field != self.focus && !self.composition().is_empty()
     }
 
     /// Applies `action` as [`Reference::apply`] does, except that if `lose`
@@ -354,6 +414,7 @@ impl Reference {
     pub fn apply_losing(&mut self, action: UserAction, lose: bool) {
         if lose {
             self.composer.reset();
+            self.region = None;
             self.fields[self.focus].preedit.clear();
         }
         self.apply(action);
@@ -368,6 +429,32 @@ impl Reference {
         !self.typing.latin && !out.consumed && !ends_with_space
     }
 
+    /// Whether accepting a suggestion would replace a word: one is before
+    /// the cursor, nothing is composed, and the layout has an engine.
+    pub fn takes_suggestion(&self) -> bool {
+        let field = &self.fields[self.focus];
+        let word = word_before(&field.text[..field.cursor]);
+        !self.typing.latin && self.composition().is_empty() && !word.is_empty()
+    }
+
+    /// Whether a reconversion would take a character: one it can take is
+    /// before the cursor, no jamo are composed, the layout has an engine,
+    /// and the host can show a region.
+    pub fn reconverts(&self) -> bool {
+        let field = &self.fields[self.focus];
+        let before = field.text[..field.cursor].chars().next_back();
+        let engine = !self.typing.latin && !self.typing.regionless;
+        engine && self.composer.preedit().is_empty() && before.is_some_and(reconvertible)
+    }
+
+    /// The composition: the reconverted region, or the composer's.
+    pub fn composition(&self) -> String {
+        match &self.region {
+            Some(region) => region.clone(),
+            None => self.composer.preedit(),
+        }
+    }
+
     /// The fields' models.
     pub fn fields(&self) -> &[TextModel] {
         &self.fields
@@ -380,7 +467,10 @@ impl Reference {
 
     /// Commits the composition, if any, into the focused field.
     fn commit_composition(&mut self) {
-        let commit = self.composer.confirm();
+        let commit = match self.region.take() {
+            Some(region) => region,
+            None => self.composer.confirm(),
+        };
         self.fields[self.focus].apply_txn(&Txn {
             commit,
             ..Txn::default()
@@ -683,6 +773,76 @@ mod tests {
         let mut editor = Reference::new(vec![TextModel::new("")]).typing(gtk);
         editor.apply(UserAction::Key(Key::Backspace));
         assert_eq!(editor.fields(), [model("", 0, "")]);
+    }
+
+    #[test]
+    fn a_word_runs_back_to_a_marker_or_whitespace() {
+        assert_eq!(word_before("0ab가"), "ab가");
+        assert_eq!(word_before("x 가나"), "가나");
+        assert_eq!(word_before("1"), "");
+        assert_eq!(word_before("가 "), "");
+        assert_eq!(word_before(""), "");
+    }
+
+    #[test]
+    fn a_suggestion_replaces_the_word_before_the_cursor() {
+        let actions = [vec![UserAction::AcceptSuggestion], typing("rk")].concat();
+        assert_eq!(
+            intended(&["0ab가1"], &actions),
+            [model("0ab가1", 7, "가")],
+            "a marker ends the word"
+        );
+        let mut editor = reference(&["0ab가"], &[UserAction::AcceptSuggestion]);
+        assert_eq!(editor.fields(), [model("0ab가~", 7, "")]);
+        // A composition, or a Latin layout, takes no suggestion.
+        for action in typing("rk") {
+            editor.apply(action);
+        }
+        editor.apply(UserAction::AcceptSuggestion);
+        assert_eq!(editor.fields(), [model("0ab가~", 7, "가")]);
+        let latin = Typing {
+            latin: true,
+            ..Typing::default()
+        };
+        let mut editor = Reference::new(vec![TextModel::new("0ab")]).typing(latin);
+        editor.apply(UserAction::AcceptSuggestion);
+        assert_eq!(editor.fields(), [model("0ab", 3, "")]);
+    }
+
+    #[test]
+    fn a_reconversion_composes_the_text_before_the_cursor_until_a_key() {
+        let reconvert = UserAction::Reconvert;
+        let mut editor = reference(&["0a가"], &[reconvert]);
+        assert_eq!(editor.fields(), [model("0a", 2, "가")]);
+        // A region over the region takes one more character, up to a
+        // marker.
+        for _ in 0..3 {
+            editor.apply(reconvert);
+        }
+        assert_eq!(editor.fields(), [model("0", 1, "a가")]);
+        assert_eq!(editor.composition(), "a가");
+        // A key commits it as it is, and composes afresh.
+        editor.apply(UserAction::Key(Key::Char('r')));
+        assert_eq!(editor.fields(), [model("0a가", 5, "ㄱ")]);
+        // A jamo composition is not reconverted.
+        editor.apply(reconvert);
+        assert_eq!(editor.fields(), [model("0a가", 5, "ㄱ")]);
+        // A press commits a region; a lost one takes its text.
+        let mut editor = reference(&["0a가", "1"], &[reconvert]);
+        editor.apply(UserAction::Focus(1));
+        assert_eq!(editor.fields()[0], model("0a가", 5, ""));
+        let mut editor = reference(&["0a가", "1"], &[reconvert]);
+        assert!(editor.leaves_composition(UserAction::Focus(1)));
+        editor.apply_losing(UserAction::Focus(1), true);
+        assert_eq!(editor.fields()[0], model("0a", 2, ""));
+        // A host that cannot show a region gets none.
+        let regionless = Typing {
+            regionless: true,
+            ..Typing::default()
+        };
+        let mut editor = Reference::new(vec![TextModel::new("0a가")]).typing(regionless);
+        editor.apply(reconvert);
+        assert_eq!(editor.fields(), [model("0a가", 5, "")]);
     }
 
     #[test]

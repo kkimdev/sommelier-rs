@@ -78,7 +78,7 @@ limitations under the License.
 //! or height to 0.
 
 use super::clock::Micros;
-use super::engine::{EngineIn, EngineOut, TextAction};
+use super::engine::{EngineIn, EngineOut, Request, TextAction};
 use super::hangul::Key;
 use super::keymap;
 use super::sched::Choose;
@@ -261,6 +261,40 @@ impl Tracker {
         self.expected.push(self.predicted.clone());
     }
 
+    /// `OnExtendSelectionAndDelete`: the text in `range`, where it lies in
+    /// the prediction, goes, and the cursor goes to its start.
+    fn delete(&mut self, range: Range<usize>) {
+        let predicted = &mut self.predicted;
+        let text = &predicted.text;
+        if range.end > text.len()
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        predicted.text.replace_range(range.clone(), "");
+        predicted.cursor = range.start;
+        predicted.composition = None;
+        self.expected.push(self.predicted.clone());
+    }
+
+    /// `OnSetCompositionFromExistingText`: the bytes `before` the cursor
+    /// and `after` it, where they lie in the prediction, become the
+    /// composition.
+    fn compose_existing(&mut self, before: usize, after: usize) {
+        let predicted = &mut self.predicted;
+        let range = predicted.cursor.saturating_sub(before)..predicted.cursor + after;
+        let text = &predicted.text;
+        if range.end > text.len()
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        predicted.composition = (!range.is_empty()).then_some(range);
+        self.expected.push(self.predicted.clone());
+    }
+
     /// `OnInsertText`.
     fn insert(&mut self, text: &str) {
         self.predicted.replace(text);
@@ -377,11 +411,13 @@ pub(super) enum Answer {
     Dropped,
 }
 
-/// A key handed to the engine that it has not answered.
+/// A key or a request handed to the engine that it has not answered.
 struct PendingKey {
     id: u64,
-    key: Key,
-    pressed: bool,
+    /// The key and whether it was pressed, or `None` for a request, whose
+    /// text goes out at once, as no key is in flight, and which has no key
+    /// events.
+    key: Option<(Key, bool)>,
     /// The key's time, in milliseconds.
     time: u32,
     /// Whether the engine sent the key's text.
@@ -492,8 +528,7 @@ impl Exo {
         self.next_key += 1;
         self.in_engine.push_back(PendingKey {
             id,
-            key,
-            pressed,
+            key: Some((key, pressed)),
             time,
             answered: false,
             late: false,
@@ -518,16 +553,36 @@ impl Exo {
                 let key = self.in_engine.front_mut().expect("a key the engine has");
                 assert_eq!(key.id, *id, "the engine answers in order");
                 key.answered = true;
-                if self.ima.client.is_some() {
+                let (request, late) = (key.key.is_none(), key.late);
+                let Some(client) = self.ima.client else {
+                    return Answer::Normal;
+                };
+                if !request {
                     self.buffer(actions);
+                    return Answer::Normal;
                 }
-                Answer::Normal
+                for action in actions {
+                    self.apply(client, action);
+                }
+                match late {
+                    true => Answer::Late,
+                    false => Answer::Normal,
+                }
             }
             &EngineOut::Done { id, handled } => {
-                let key = self.in_engine.pop_front().expect("a key the engine has");
-                assert_eq!(key.id, id, "the engine answers in order");
-                let PendingKey { key: k, time, .. } = key;
-                if !key.pressed {
+                let pending = self.in_engine.pop_front().expect("a key the engine has");
+                assert_eq!(pending.id, id, "the engine answers in order");
+                let PendingKey {
+                    key,
+                    time,
+                    late,
+                    dropped,
+                    ..
+                } = pending;
+                let Some((k, pressed)) = key else {
+                    return Answer::Normal;
+                };
+                if !pressed {
                     if let Some(consumed) = self.release(k) {
                         self.key_events(k, time, wl_keyboard::KEY_STATE_RELEASED, consumed);
                     }
@@ -548,15 +603,46 @@ impl Exo {
                     self.key_events(k, time, pressed, false);
                     sent
                 };
-                if key.dropped {
+                if dropped {
                     Answer::Dropped
-                } else if key.late && sent {
+                } else if late && sent {
                     Answer::Late
                 } else {
                     Answer::Normal
                 }
             }
         }
+    }
+
+    /// The user makes `request` of the engine (D6). IMA hands it over with
+    /// the text before the cursor of the text input it serves, as Exo
+    /// predicts it, but only while it serves one and has an engine; and a
+    /// reconversion only for a text input whose extension can show a
+    /// region (`set_preedit_region`).
+    pub(super) fn ask(&mut self, request: Request) {
+        let Some(client) = self.ima.client.filter(|_| !self.latin) else {
+            return;
+        };
+        if request == Request::Reconvert && self.extension_of(client).is_none() {
+            return;
+        }
+        let predicted = &self.text_inputs[&client].text.predicted;
+        let before = predicted.text[..predicted.cursor].to_owned();
+        let id = self.next_key;
+        self.next_key += 1;
+        self.in_engine.push_back(PendingKey {
+            id,
+            key: None,
+            time: 0,
+            answered: false,
+            late: false,
+            dropped: false,
+        });
+        self.to_engine.push(EngineIn::Request {
+            request,
+            id,
+            before,
+        });
     }
 
     /// What Exo handed the engine since the last call, in order. Whoever
@@ -705,6 +791,15 @@ impl Exo {
         let id = *self.composing_text_inputs().first()?;
         let tracker = &self.text_inputs[&id].text;
         Some(tracker.predicted.composition().to_owned())
+    }
+
+    /// The composition Exo tracks for the text input the input method
+    /// serves; empty if it composes nothing or serves none.
+    pub(super) fn served_composition(&self) -> String {
+        let served = self.ima.client.and_then(|id| self.text_inputs.get(&id));
+        served.map_or_else(String::new, |text_input| {
+            text_input.text.predicted.composition().to_owned()
+        })
     }
 
     /// The host text inputs an input method is attached to on the focused
@@ -928,6 +1023,9 @@ impl Exo {
                     self.ima.composing |= !text.is_empty();
                     self.ima.composition = Some(text.clone());
                 }
+                TextAction::Delete { .. } | TextAction::Region { .. } => {
+                    panic!("only a request deletes or reconverts, and no key is in flight then")
+                }
             }
         }
     }
@@ -1036,6 +1134,55 @@ impl Exo {
     fn mark_dropped(&mut self) {
         if let Some(key) = self.in_engine.front_mut().filter(|key| key.answered) {
             key.dropped = true;
+        }
+    }
+
+    /// IMA passes on `action` of a request's answer to text input `id`
+    /// at once, as no key is in flight.
+    fn apply(&mut self, id: u32, action: &TextAction) {
+        match *action {
+            TextAction::Commit(ref text) => {
+                self.insert_text(id, text);
+                self.ima.composing = false;
+            }
+            TextAction::Preedit(ref text) => {
+                self.set_composition(id, text);
+                self.ima.composing = !text.is_empty();
+            }
+            TextAction::Delete { before, after } => self.delete_surrounding_text(id, before, after),
+            TextAction::Region { before, after } => {
+                self.set_composition_from_existing_text(id, before, after);
+                self.ima.composing = true;
+            }
+        }
+    }
+
+    /// `TextInput::DeleteSurroundingText`: the bytes `before` the cursor of
+    /// Exo's prediction and `after` it, which it deletes, as a
+    /// `delete_surrounding_text` with the absolute index of their start
+    /// and no `commit_string` (E10).
+    fn delete_surrounding_text(&mut self, id: u32, before: usize, after: usize) {
+        let text = &mut self.text_input(id).text;
+        let cursor = text.predicted.cursor;
+        let range = cursor.saturating_sub(before)..cursor + after;
+        let (index, length) = (range.start, range.len());
+        text.delete(range);
+        let index = i32::try_from(index).expect("a short text");
+        let length = u32::try_from(length).expect("a short text");
+        let event = zwp_text_input_v1::evt::delete_surrounding_text(id, index, length);
+        self.events.push(event);
+    }
+
+    /// `TextInput::SetCompositionFromExistingText`: the bytes `before` the
+    /// cursor and `after` it become the composition, which the extension's
+    /// `set_preedit_region` shows, its start relative to the cursor.
+    fn set_composition_from_existing_text(&mut self, id: u32, before: usize, after: usize) {
+        self.text_input(id).text.compose_existing(before, after);
+        if let Some(extension) = self.extension_of(id) {
+            let index = -i32::try_from(before).expect("a short region");
+            let length = u32::try_from(before + after).expect("a short region");
+            let event = extended::evt::set_preedit_region(extension, index, length);
+            self.events.push(event);
         }
     }
 
@@ -1802,6 +1949,76 @@ mod tests {
         assert!(exo.destroy_input_method());
         assert_eq!(events(&mut exo), [cursor(3), commit(3, "가"), leave()]);
         assert_eq!(exo.take_engine(), [EngineIn::Reset]);
+    }
+
+    /// The engine's answer to request `id`: its text `actions`, then its
+    /// callback; returns the verdict on the text.
+    fn answer_request(exo: &mut Exo, id: u64, actions: Vec<TextAction>) -> Answer {
+        let verdict = exo.answer(&EngineOut::Text { id, actions });
+        let done = EngineOut::Done { id, handled: true };
+        assert_eq!(exo.answer(&done), Answer::Normal);
+        verdict
+    }
+
+    #[test]
+    fn e10_a_suggestion_deletes_from_an_absolute_index_then_commits() {
+        let mut exo = active(V11);
+        send(&mut exo, TI, surrounding("0ab가1", 6));
+        exo.ask(Request::AcceptSuggestion);
+        let request = EngineIn::Request {
+            request: Request::AcceptSuggestion,
+            id: 0,
+            before: "0ab가".to_owned(),
+        };
+        assert_eq!(exo.take_engine(), [request]);
+        let delete = TextAction::Delete {
+            before: 5,
+            after: 0,
+        };
+        let actions = vec![delete, commits("ab가~")];
+        // No key is in flight, so IMA sends the text at once.
+        assert_eq!(answer_request(&mut exo, 0, actions), Answer::Normal);
+        let deleted = zwp_text_input_v1::Event::DeleteSurroundingText {
+            index: 1,
+            length: 5,
+        };
+        assert_eq!(events(&mut exo), [(TI, deleted.into()), commit(1, "ab가~")]);
+        assert_eq!(*predicted(&exo), predicts("0ab가~1", 7, None));
+    }
+
+    #[test]
+    fn a_reconversion_composes_existing_text_through_the_extension() {
+        let mut exo = active(V10);
+        send(&mut exo, TI, surrounding("0a가", 5));
+        exo.ask(Request::Reconvert);
+        exo.take_engine();
+        let region = TextAction::Region {
+            before: 3,
+            after: 0,
+        };
+        answer_request(&mut exo, 0, vec![region]);
+        let event = extended::Event::SetPreeditRegion {
+            index: -3,
+            length: 3,
+        };
+        assert_eq!(events(&mut exo), [(EXT, event.into())]);
+        assert_eq!(*predicted(&exo), predicts("0a가", 5, Some(2..5)));
+        assert_eq!(exo.served_composition(), "가");
+        assert!(exo.ima.composing);
+    }
+
+    #[test]
+    fn the_engine_gets_no_request_without_a_text_input_or_for_a_region_without_an_extension() {
+        let mut exo = exo();
+        exo.ask(Request::AcceptSuggestion);
+        assert_eq!(exo.take_engine(), [], "no text input attached");
+        exo.extensions.clear();
+        send(&mut exo, TI, activate(A));
+        exo.take_engine();
+        exo.ask(Request::Reconvert);
+        assert_eq!(exo.take_engine(), [], "no extension to show a region");
+        exo.ask(Request::AcceptSuggestion);
+        assert_eq!(exo.take_engine().len(), 1);
     }
 
     #[test]

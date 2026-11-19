@@ -52,7 +52,7 @@ use super::client::{Client, Field, PressKind};
 use super::clock::Micros;
 use super::display::Display;
 use super::editor::{Target, TextModel, UserAction};
-use super::engine::{Engine, EngineIn, Lag};
+use super::engine::{Engine, EngineIn, EngineOut, Lag, Request, TextAction};
 use super::exo::{Answer, Exo};
 use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
@@ -262,7 +262,9 @@ pub(super) struct World<'t> {
     pub exo: Exo,
     engine: Engine,
     display: Display,
-    c_to_p: Channel<Outgoing>,
+    /// Each guest request, with the edits the guest had got when it sent
+    /// it.
+    c_to_p: Channel<(Outgoing, u64)>,
     /// Each event to the guest, and the press it is, if it is one: where
     /// the guest's pointer or finger is on which of its surfaces.
     p_to_c: Channel<(u32, AnyEvent, Option<Press>)>,
@@ -277,6 +279,10 @@ pub(super) struct World<'t> {
     pointer: Option<(u32, i32)>,
     /// The resets Exo handed the engine.
     resets: u64,
+    /// The transactions that edit the text (a delete or a commit) the
+    /// proxy sent the guest, and those the guest got; and whether the
+    /// transaction each is in so far edits.
+    edits: Edits,
     /// The guest's text input.
     text_input: u32,
     /// The fields' guest surfaces.
@@ -323,6 +329,7 @@ impl<'t> World<'t> {
             shift: false,
             pointer: None,
             resets: 0,
+            edits: Edits::default(),
             text_input: 0,
             surfaces: Vec::new(),
             spec: None,
@@ -434,8 +441,8 @@ impl<'t> World<'t> {
             self.now = self.now.max(sources[source].expect("a ready source"));
             match source {
                 0 => {
-                    let request = self.c_to_p.take();
-                    self.deliver_guest_request(request).await;
+                    let (request, edits) = self.c_to_p.take();
+                    self.deliver_guest_request(request, edits).await;
                 }
                 1 => {
                     let (sender, event, press) = self.p_to_c.take();
@@ -474,7 +481,8 @@ impl<'t> World<'t> {
     /// The user acts: Exo takes a key's press and release; a click or a
     /// tap focuses its field's surface, as a click on a window does, and
     /// then presses there; a focus move moves the seat's focus; a restart
-    /// destroys the input method, which Exo replaces.
+    /// destroys the input method, which Exo replaces; a suggestion or a
+    /// reconversion is a request of the engine's.
     fn act(&mut self, action: UserAction) {
         self.log(Place::User, format!("{action:?}"));
         let time = (self.now.0 / 1_000) as u32;
@@ -496,6 +504,13 @@ impl<'t> World<'t> {
                 let untracked = !confirms && tracked.is_some_and(|text| text.is_empty());
                 self.untracked_restarts.push(untracked);
                 self.exo.destroy_input_method();
+                return self.host_sends(Vec::new(), false);
+            }
+            UserAction::AcceptSuggestion | UserAction::Reconvert => {
+                self.exo.ask(match action {
+                    UserAction::AcceptSuggestion => Request::AcceptSuggestion,
+                    _ => Request::Reconvert,
+                });
                 return self.host_sends(Vec::new(), false);
             }
             UserAction::Settle => return,
@@ -537,10 +552,19 @@ impl<'t> World<'t> {
     }
 
     /// The engine answers part of the key in service, and Exo applies it.
+    /// The engine learns the text of a region it reconverted.
     fn engine_answers(&mut self) {
         let answer = self.engine.take(&mut self.choices);
         self.log(Place::Engine, format!("{answer:?}"));
         let verdict = self.exo.answer(&answer);
+        if let EngineOut::Text { actions, .. } = &answer {
+            if actions
+                .iter()
+                .any(|a| matches!(a, TextAction::Region { .. }))
+            {
+                self.engine.learn_region(self.exo.served_composition());
+            }
+        }
         if let Some(spec) = &mut self.spec {
             spec.counts.late += u64::from(verdict == Answer::Late);
             spec.counts.dropped += u64::from(verdict == Answer::Dropped);
@@ -551,12 +575,16 @@ impl<'t> World<'t> {
     /// The guest sends `requests` at once, on C→P.
     fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
         for request in requests {
-            self.c_to_p.send(self.now, request, &mut self.choices);
+            let edits = self.edits.got.0;
+            self.c_to_p
+                .send(self.now, (request, edits), &mut self.choices);
         }
     }
 
-    /// A guest request reaches the proxy.
-    async fn deliver_guest_request(&mut self, request: Outgoing) {
+    /// A guest request, sent once the guest had got `edits` edits,
+    /// reaches the proxy. A surrounding text sent before the guest got an
+    /// edit the proxy has sent crossed it (P4).
+    async fn deliver_guest_request(&mut self, request: Outgoing, edits: u64) {
         let text_input = self.text_input;
         let decoded = decode(&request.0, &mut VecDeque::new(), |msg| {
             match msg.sender_id == text_input {
@@ -567,6 +595,13 @@ impl<'t> World<'t> {
         match &decoded {
             Ok((_, request)) => {
                 self.log(Place::CToP, format!("{request:?}"));
+                let report = matches!(
+                    request,
+                    zwp_text_input_v3::Request::SetSurroundingText { .. }
+                );
+                if let Some(spec) = self.spec.as_mut().filter(|_| report) {
+                    spec.counts.crossed_reports += u64::from(edits < self.edits.sent.0);
+                }
                 self.see(Seen::Guest(request));
             }
             Err(_) => self.log(Place::CToP, "a setup request".to_owned()),
@@ -599,6 +634,7 @@ impl<'t> World<'t> {
         }
         for (sender, event) in self.session.guest_received() {
             self.log(Place::PToC, format!("{sender} {event:?}"));
+            self.edits.sent.follow(&event);
             self.see(Seen::ToGuest(&event));
             let press = self.press(&event);
             if let Some((surface, at)) = press {
@@ -644,6 +680,7 @@ impl<'t> World<'t> {
     /// Shift.
     fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>) {
         let now = self.now;
+        self.edits.got.follow(&event);
         if let AnyEvent::WlRegistry(wl_registry::Event::Global {
             name,
             interface,
@@ -713,6 +750,36 @@ impl<'t> World<'t> {
             place,
             text,
         });
+    }
+}
+
+/// The transactions that edit the text, which the proxy sent the guest
+/// (`sent`) and the guest got (`got`).
+#[derive(Default)]
+struct Edits {
+    sent: EditCount,
+    got: EditCount,
+}
+
+/// A count of the transactions that edit the text, and whether the one in
+/// progress does.
+#[derive(Default)]
+struct EditCount(u64, bool);
+
+impl EditCount {
+    /// Follows `event`, an event to the guest.
+    fn follow(&mut self, event: &AnyEvent) {
+        use zwp_text_input_v3::Event;
+        match event {
+            AnyEvent::ZwpTextInputV3(Event::DeleteSurroundingText { .. }) => self.1 = true,
+            AnyEvent::ZwpTextInputV3(Event::CommitString { text }) => {
+                self.1 |= text.as_ref().is_some_and(|text| !text.is_empty());
+            }
+            AnyEvent::ZwpTextInputV3(Event::Done { .. }) => {
+                self.0 += u64::from(std::mem::take(&mut self.1));
+            }
+            _ => {}
+        }
     }
 }
 
