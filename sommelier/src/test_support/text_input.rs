@@ -23,11 +23,13 @@ limitations under the License.
 //! module. A test that can pin what the peers receive uses
 //! `proxy::harness::Session` instead.
 
+use crate::handler::text_input::CtxEnv;
 use crate::ime::{Assembly, HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId};
 use crate::state::{Context, HostId, InternalCallback, V3Pending};
 
-/// A text input the guest enabled and committed, and the host activated,
-/// as [`insert`] sets it up.
+/// A text input the guest committed, enabled unless [`Active::enabled`]
+/// says otherwise, and the host activated if enabled, as [`insert`] sets it
+/// up.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Active<'a> {
     /// The host `zwp_text_input_v1` behind it.
@@ -37,8 +39,12 @@ pub(crate) struct Active<'a> {
     /// The guest `wl_seat` it was created for.
     pub(crate) seat: u32,
     /// The guest surface its focus is on, if any; with none, the field is
-    /// not enabled, but the host still active.
+    /// not enabled and the host not active, as no text input can be
+    /// active unless enabled and focused (the IME core's I1a).
     pub(crate) focus: Option<u32>,
+    /// Whether the guest enabled the focused field, which the host then
+    /// activated. One text input on a connection is enabled at a time.
+    pub(crate) enabled: bool,
     /// The committed surrounding text: its text, cursor and anchor.
     pub(crate) surrounding_text: Option<(&'a str, i32, i32)>,
     /// The preedit the guest shows, with the cursor at its end.
@@ -46,20 +52,21 @@ pub(crate) struct Active<'a> {
     /// The commits the guest has made.
     pub(crate) commits: u32,
     /// Whether state waits for its commit or for its host event: the
-    /// guest's next enable, surrounding text and cursor rectangle, and the
-    /// host's preedit cursor and preedit styling.
+    /// guest's next enable, surrounding text and cursor rectangle, and, if
+    /// the host is active, its preedit cursor and preedit styling.
     pub(crate) pending: bool,
 }
 
 impl Active<'_> {
     /// A text input of `seat` focused on `focus`, whose host is `host`,
-    /// after one commit, with nothing else.
+    /// enabled with one commit if focused, with nothing else.
     pub(crate) const fn new(host: u32, seat: u32, focus: Option<u32>) -> Self {
         Self {
             host,
             ext: None,
             seat,
             focus,
+            enabled: true,
             surrounding_text: None,
             preedit: None,
             commits: 1,
@@ -69,7 +76,11 @@ impl Active<'_> {
 }
 
 /// Give guest text input `guest`, whose objects the test has paired, the
-/// state `active` describes.
+/// state `active` describes. A focused one is attached with the content
+/// type its field calls for, as the reconcile of the guest commit that set
+/// its state would, so its surface and seat must be live. The state must
+/// be one the IME core can reach, which its invariants check: one text
+/// input on the connection is enabled at a time.
 pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
     let ext = active.ext.map(|id| HostExt {
         id,
@@ -83,13 +94,16 @@ pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
     let ti = TiId(guest);
     let focus = active.focus.map(SurfaceId);
     ctx.ime.insert(ti, SeatId(active.seat), host, focus);
+    let env = CtxEnv::new(&ctx.shadow_table, &ctx.keyboard_focus);
     let t = ctx.ime.get_mut(ti).expect("just inserted");
-    t.set_link_for_test(LinkState::Attached { content_type: None });
     if let Some(committed) = t.committed_mut_for_test() {
-        committed.enabled = true;
+        committed.enabled = active.enabled;
         committed.surrounding_text = active
             .surrounding_text
             .map(|(text, cursor, anchor)| (text.to_string(), cursor, anchor));
+        if active.enabled {
+            t.attach_for_test(&env);
+        }
     }
     if let Some(preedit) = active.preedit {
         t.show_for_test(preedit);
@@ -107,11 +121,16 @@ pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
                 cursor_rect: Some((1, 2, 3, 4)),
             };
         }
-        t.set_assembly_for_test(Assembly {
-            cursor: Some(1),
-            selection: Some((0, 1)),
-        });
+        // The host's events reach the field only while it is active.
+        if active.enabled {
+            t.set_assembly_for_test(Assembly {
+                cursor: Some(1),
+                selection: Some((0, 1)),
+            });
+        }
     }
+    ctx.ime
+        .assert_invariants(&CtxEnv::new(&ctx.shadow_table, &ctx.keyboard_focus));
 }
 
 /// What the host text input has applied.

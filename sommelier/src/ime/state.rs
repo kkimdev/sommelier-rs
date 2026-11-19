@@ -486,6 +486,13 @@ impl TextInput {
         self.link = link;
     }
 
+    /// Attach the host text input with the content type the field calls
+    /// for, as the reconcile of the guest commit that set its state would.
+    pub(crate) fn attach_for_test(&mut self, env: &impl Env) {
+        let content_type = Some(host::target(self, env).content_type);
+        self.link = LinkState::Attached { content_type };
+    }
+
     /// Show `text` with the cursor at its end, which Exo holds there, or
     /// show nothing for empty `text`.
     pub(crate) fn show_for_test(&mut self, text: &str) {

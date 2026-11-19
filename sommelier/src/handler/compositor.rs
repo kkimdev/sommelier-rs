@@ -1203,11 +1203,21 @@ mod tests {
 
     /// An enabled text input of `seat` focused on `surface`, whose host is
     /// active, composing over committed surrounding text with state
-    /// pending.
+    /// pending. One text input on a connection is enabled at a time.
     fn composing(host: u32, seat: u32, surface: u32) -> text_input::Active<'static> {
         text_input::Active {
             surrounding_text: Some(("한", 3, 3)),
             preedit: Some("한"),
+            pending: true,
+            ..text_input::Active::new(host, seat, Some(surface))
+        }
+    }
+
+    /// A text input of `seat` focused on `surface` that the guest has not
+    /// enabled, with state pending.
+    fn disabled(host: u32, seat: u32, surface: u32) -> text_input::Active<'static> {
+        text_input::Active {
+            enabled: false,
             pending: true,
             ..text_input::Active::new(host, seat, Some(surface))
         }
@@ -4066,19 +4076,21 @@ mod tests {
                 .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
             ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
         }
-        for (((guest_text_input, host_object, host_v1), (guest_seat, _)), active_surface) in
-            text_inputs.into_iter().zip(seats).zip([
-                destroyed_surface,
-                destroyed_surface,
-                live_surface,
-            ])
-        {
+        // Only the first is enabled: one text input on a connection can be.
+        for (
+            ((guest_text_input, host_object, host_v1), (guest_seat, _)),
+            (active_surface, state),
+        ) in text_inputs.into_iter().zip(seats).zip([
+            (destroyed_surface, composing as fn(_, _, _) -> _),
+            (destroyed_surface, disabled),
+            (live_surface, disabled),
+        ]) {
             ctx.shadow_table.insert_paired_for_test(
                 guest_text_input,
                 host_object,
                 "zwp_text_input_v3",
             );
-            let active = composing(host_v1, guest_seat, active_surface);
+            let active = state(host_v1, guest_seat, active_surface);
             text_input::insert(&mut ctx, guest_text_input, active);
         }
 
@@ -4111,9 +4123,7 @@ mod tests {
 
         let state = text_input::view(&ctx, 720);
         assert_eq!(state.focus, Some(live_surface));
-        assert!(state.enabled);
-        assert_eq!(state.host, Host::Active);
-        assert_eq!(state.preedit.as_deref(), Some("한"));
+        assert!(state.pending);
         let unaffected = text_input::snapshot(&ctx, 720);
         ctx.last_sender_id = destroyed_surface;
         assert_eq!(
@@ -4140,16 +4150,13 @@ mod tests {
             .host_to_client_queue
             .iter()
             .all(|(message, _)| msg_sender(message) != 720));
-        for host_v1 in [702, 712] {
-            assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
-                msg_sender(message) == host_v1
-                    && msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
-            }));
-        }
+        assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
+            msg_sender(message) == 702 && msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
+        }));
         assert!(ctx
             .client_to_host_queue
             .iter()
-            .all(|(message, _)| msg_sender(message) != 722));
+            .all(|(message, _)| ![712, 722].contains(&msg_sender(message))));
         assert!(ctx
             .key_generations
             .latest_peek_sequence(1, Some(destroyed_surface))
@@ -4212,15 +4219,17 @@ mod tests {
                 701,
                 composing(702, seat_with_replacement, destroyed_surface),
             ),
+            // Only the first is enabled: one text input on a connection can
+            // be.
             (
                 healthy_on_replacement,
                 711,
-                composing(712, seat_with_replacement, replacement_surface),
+                disabled(712, seat_with_replacement, replacement_surface),
             ),
             (
                 stale_without_owner,
                 721,
-                composing(722, seat_without_owner, destroyed_surface),
+                disabled(722, seat_without_owner, destroyed_surface),
             ),
         ] {
             ctx.shadow_table.insert_paired_for_test(
@@ -4257,9 +4266,7 @@ mod tests {
 
         let state = text_input::view(&ctx, healthy_on_replacement);
         assert_eq!(state.focus, Some(replacement_surface));
-        assert!(state.enabled);
-        assert_eq!(state.host, Host::Active);
-        assert_eq!(state.preedit.as_deref(), Some("한"));
+        assert!(state.pending);
         let healthy = text_input::snapshot(&ctx, healthy_on_replacement);
         ctx.last_sender_id = destroyed_surface;
         assert_eq!(
@@ -4285,16 +4292,13 @@ mod tests {
             .host_to_client_queue
             .iter()
             .all(|(message, _)| { msg_sender(message) != healthy_on_replacement }));
-        for host_text_input in [702, 722] {
-            assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
-                msg_sender(message) == host_text_input
-                    && msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
-            }));
-        }
+        assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
+            msg_sender(message) == 702 && msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
+        }));
         assert!(ctx
             .client_to_host_queue
             .iter()
-            .all(|(message, _)| { msg_sender(message) != 712 }));
+            .all(|(message, _)| ![712, 722].contains(&msg_sender(message))));
         assert!(ctx
             .key_generations
             .latest_peek_sequence(seat_with_replacement, Some(destroyed_surface))

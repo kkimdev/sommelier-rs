@@ -63,10 +63,14 @@ pub(crate) struct CtxEnv<'a> {
 
 impl<'a> CtxEnv<'a> {
     pub(crate) fn of(ctx: &'a Context) -> Self {
-        Self {
-            table: &ctx.shadow_table,
-            focus: &ctx.keyboard_focus,
-        }
+        Self::new(&ctx.shadow_table, &ctx.keyboard_focus)
+    }
+
+    /// The facts of the context whose object table is `table` and whose
+    /// keyboard focus is `focus`, borrowed apart from its IME core, which
+    /// can then step beside them.
+    pub(crate) fn new(table: &'a ShadowTable, focus: &'a KeyboardFocusRegistry) -> Self {
+        Self { table, focus }
     }
 }
 
@@ -92,10 +96,9 @@ impl Env for CtxEnv<'_> {
 ///
 /// Whether a press is to be forwarded ([`ime::Effects::forward`]).
 pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
-    let env = CtxEnv {
-        table: &ctx.shadow_table,
-        focus: &ctx.keyboard_focus,
-    };
+    // Not `CtxEnv::of`, which would borrow the whole context while its IME
+    // core steps.
+    let env = CtxEnv::new(&ctx.shadow_table, &ctx.keyboard_focus);
     let fx = ctx.ime.step(input, &env);
     ctx.host_to_client_queue.extend(fx.to_guest);
     for out in fx.to_host {
@@ -5368,11 +5371,9 @@ pub(super) mod tests {
         /// state would. A host event reconciles every text input, and
         /// would send it otherwise.
         pub(in crate::handler) fn settle(&mut self) {
-            let t = self.ctx.ime.get(TiId(TI)).expect("the text input");
-            let target = ime::target(t, &CtxEnv::of(&self.ctx));
-            let content_type = Some(target.content_type);
-            self.state()
-                .set_link_for_test(LinkState::Attached { content_type });
+            let env = CtxEnv::new(&self.ctx.shadow_table, &self.ctx.keyboard_focus);
+            let t = self.ctx.ime.get_mut(TiId(TI)).expect("the text input");
+            t.attach_for_test(&env);
         }
 
         /// The fixture with guest keyboard [`KEYBOARD`] on the seat.

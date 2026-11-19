@@ -3565,6 +3565,7 @@ mod tests {
     fn matching_leave_uses_stored_host_surface_after_mapping_is_unavailable() {
         let mut p = Proxy::new();
         p.map(KEYBOARD);
+        p.surface(SURFACE.0, SURFACE.1);
         p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
         // The guest mapping is gone, but the focus keeps the exact host
         // surface this leave names.
@@ -3786,6 +3787,7 @@ mod tests {
             .shadow_table
             .insert_paired_for_test(KEYBOARD.seat, 2, "wl_seat");
         p.surface(SURFACE.0, SURFACE.1);
+        p.surface(OTHER_SURFACE.0, OTHER_SURFACE.1);
         let stale = text_input::Active {
             surrounding_text: Some(("stale", 5, 5)),
             preedit: Some("한"),
@@ -3947,24 +3949,29 @@ mod tests {
         p.surface(SURFACE.0, SURFACE.1);
         p.surface(OTHER_SURFACE.0, OTHER_SURFACE.1);
         p.focus(KEYBOARD, SURFACE.0);
+        // One text input on the connection is enabled at a time, and only
+        // a focused one can be.
         let text_inputs = [
-            (40, Some(SURFACE.0)),
-            (41, Some(OTHER_SURFACE.0)),
-            (42, None),
+            (40, Some(SURFACE.0), true),
+            (41, Some(OTHER_SURFACE.0), false),
+            (42, None, false),
         ];
-        for (guest, active_surface) in text_inputs {
+        for (guest, active_surface, enabled) in text_inputs {
             p.ctx.shadow_table.insert_paired_with_version_for_test(
                 guest,
                 guest + 400,
                 "zwp_text_input_v3",
                 1,
             );
-            let active = text_input::Active::new(guest + 500, KEYBOARD.seat, active_surface);
+            let active = text_input::Active {
+                enabled,
+                ..text_input::Active::new(guest + 500, KEYBOARD.seat, active_surface)
+            };
             text_input::insert(&mut p.ctx, guest, active);
         }
 
         p.release(KEYBOARD);
-        for (guest, _) in text_inputs {
+        for (guest, _, _) in text_inputs {
             let state = text_input::view(&p.ctx, guest);
             assert_eq!(state.focus, None);
             assert!(!state.pending);
@@ -3977,15 +3984,18 @@ mod tests {
             2,
             "only focused text inputs should receive leave events"
         );
-        let hosts = text_inputs.map(|(guest, _)| guest + 500);
+        let hosts = text_inputs.map(|(guest, _, _)| guest + 500);
         let deactivated = p.ctx.client_to_host_queue.iter().filter(|(message, _)| {
             msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
                 && hosts.contains(&msg_sender(message))
         });
+        let deactivated: Vec<_> = deactivated
+            .map(|(message, _)| msg_sender(message))
+            .collect();
         assert_eq!(
-            deactivated.count(),
-            3,
-            "every active host v1 input must be deactivated, including a stale local None focus"
+            deactivated,
+            [540],
+            "the active host v1 input must be deactivated, and no other"
         );
 
         let guest_queue_len = p.ctx.host_to_client_queue.len();
@@ -4094,7 +4104,8 @@ mod tests {
         };
         p.map(KEYBOARD);
         p.map(other);
-        p.text_input(TEXT_INPUT, KEYBOARD.seat, UNCREATED_SURFACE);
+        p.surface(SURFACE.0, SURFACE.1);
+        p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
 
         // The IME consumed Backspace on the first keyboard.
         p.peek(KEYBOARD, 1, 500, BACKSPACE, PRESSED);
@@ -4113,7 +4124,8 @@ mod tests {
     fn forwarded_backspace_release_is_not_dropped_by_ime_repeat_fallback() {
         let mut p = Proxy::new();
         p.map(KEYBOARD);
-        p.text_input(TEXT_INPUT, KEYBOARD.seat, UNCREATED_SURFACE);
+        p.surface(SURFACE.0, SURFACE.1);
+        p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
         assert_eq!(p.key(KEYBOARD, 1, 500, BACKSPACE, PRESSED), Action::Forward);
 
         // Exo later consumes repeat confirmations. The real release still
@@ -4132,7 +4144,8 @@ mod tests {
     /// A Backspace the IME repeats, which the guest got.
     fn repeating_backspace(p: &mut Proxy, forwarded: bool) {
         p.map(KEYBOARD);
-        p.text_input(TEXT_INPUT, KEYBOARD.seat, UNCREATED_SURFACE);
+        p.surface(SURFACE.0, SURFACE.1);
+        p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
         let keyboard = HostId(KEYBOARD.host);
         p.ctx
             .key_generations
