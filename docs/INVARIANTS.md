@@ -1128,7 +1128,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   (`ui/base/ime/ash/input_method_ash.cc` 1090-1102). So the proxy sends
   each delete at once, as a v3 transaction of its own with a `done` that
   ends any preedit, never holding it for a later commit, which might
-  never come or might follow a cursor move. It measures the range against
+  never come or might follow a cursor move. In Legacy mode, below v11 of
+  the text-input extension or under the kill switch (the next rule has
+  Mirror mode), it measures the range against
   the surrounding text the guest last committed and turns it into bytes
   before and after the cursor. A negative index can only mean the v1
   XML's reading, which a host that follows it sends, so it counts from the
@@ -1208,6 +1210,74 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_reset_commit_waits_for_the_guest_to_report_it`,
   `delete_lengths_read_both_conventions`,
   `an_unconvertible_delete_is_warned_of_once`.
+- **From v11 of the extension, Exo's deletes and regions are measured in
+  the Exo mirror.** Each text input's mode is fixed when it is created
+  (`ime::ImeMode`): Mirror from v11 of the host's
+  `zcr_extended_text_input_v1`, the first that confirms with
+  `confirm_preedit` rather than a `cursor_position` and `commit_string`
+  pair the mirror could misread, unless the kill switch
+  `SOMMELIER_IME_MIRROR=shadow`, which the proxy reads once, keeps it in
+  Legacy mode. In both modes the core keeps `ime::mirror::ExoMirror`, a
+  replica of the `ui::SurroundingTextTracker` Exo keeps for the host text
+  input (`docs/IME_REDESIGN.md` 2.2 X1 and H9; Chromium `main`
+  6975bb48a8cd), and feeds it every event of the text input before the
+  gate, since stale and fenced events changed Exo's tracker too.
+  - A request applies where Exo processed it. The proxy sends a
+    `wl_display.sync` right after each surrounding text it forwards, and
+    after the `reset` of a press, glued into one queue entry, which one
+    submission carries whole (`connection::OutgoingMessages`) and Exo's
+    libwayland dispatches in one read, so no event of Exo's falls between
+    them; the mirror applies the request at that sync's `done`, after
+    every event that reached the proxy before it. A report too long for
+    one submission with its sync makes the mirror uncertain.
+  - The mirror checks each event against its state, and says whether it
+    is `Exact`. An event Exo could not have sent makes it `Diverged`; an
+    evicted history state, text over 4 KiB, a composition selection
+    (a highlight span at the preedit cursor), a pair it can read two
+    ways, a split report, or a host without the extension, which
+    composes existing text unseen, make it `Uncertain`. Only a press's
+    `reset`, which empties Exo's history, and then a report Exo must
+    reset to make it exact again; never without the extension.
+  - The guest is in step with Exo while its text is Exo's predicted text
+    without the composition Exo holds, which the guest shows, its cursor
+    at the composition's start or else at Exo's cursor, with no
+    selection (`ime::exo_view::ExoView`). A transaction keeps it in step
+    only if it reached the guest whole, deleted nothing while the guest
+    showed a preedit (Chromium drops such a delete), and left the guest's
+    cursor, computed from the transaction, where Exo's is; each history
+    state records whether its transaction did. A report Exo processed
+    restores it: one that matched a state, at the first equal state
+    without a composition, if every transaction since kept the guest in
+    step; one that reset Exo, if no edit of Exo's reached the guest since
+    the guest's commit before the report. A key or a press the proxy
+    forwards, or a recovered key, suspends it until a report the guest
+    made after it, or a guest commit that states no surrounding text and
+    so no change. A new field, a refocus, and a commit of the shown
+    preedit with no event of Exo's end it.
+  - In Mirror mode, while the guest is in step, the mirror is exact, and
+    no report on its way to Exo will name no state of Exo's (which would
+    mean an edit of the guest's that Exo made the event without), a delete
+    and a region are measured in Exo's state before the event: a delete
+    of bytes around Exo's cursor, with no composition, deletes them around
+    the guest's; a region from Exo's cursor that covers the composition,
+    or Exo's cursor, deletes the rest around the guest's cursor and shows
+    the region; an empty one commits the composition, or with none edits
+    nothing. Any other delete or region is dropped, with a debug log,
+    which costs a reconversion or a suggestion but never deletes text the
+    guest does not have; a negative delete index keeps the v1 XML's
+    reading, from the guest's cursor. Legacy mode logs at debug where the
+    mirror would have sent another transaction.
+  The DST checks at every `done` of a sync that an exact mirror equals the
+  simulated Exo's tracker.
+  Tests: `a_report_reaches_the_host_with_its_barrier`,
+  `a_reports_barrier_is_glued_into_its_entry`,
+  `a_forwarded_key_holds_back_exos_delete_until_the_guest_commits`,
+  `a_composition_selection_makes_it_uncertain`,
+  `a_report_crosses_when_it_will_name_no_state`,
+  `a_matched_report_finds_the_guest_without_a_composition`,
+  `healing_needs_a_cancel_then_a_clean_report`.
+  The core's row tests of X1 and H9 in Mirror mode are listed in the
+  design's rows (`docs/IME_REDESIGN.md` 2.2).
 - **Every commit that leaves a field enabled gets a `done`.** The proxy
   answers each such v3 `commit` with a `done` that carries its serial, as
   mutter and KWin do. The protocol has a client send its surrounding text,
