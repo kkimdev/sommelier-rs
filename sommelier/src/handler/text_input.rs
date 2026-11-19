@@ -448,13 +448,24 @@ fn live_host_seat(table: &ShadowTable, guest_seat: u32) -> Option<u32> {
 /// Backspace repeats end. `keyboard` is the guest's copy of the keyboard
 /// events that moved the focus, which the guest gets after the commit of a
 /// preedit the move ends, and before the text inputs' `leave` and `enter`,
-/// so their sender handler drops the originals. A keyboard belongs to one
-/// seat, so they go with the first change.
+/// so their sender handler drops the originals. They go with the first
+/// change, the only one, as a keyboard belongs to one seat.
 pub(crate) fn apply_keyboard_focus_changes(
     ctx: &mut Context,
     changes: &[SeatFocusChange],
     mut keyboard: Vec<Outgoing>,
 ) {
+    // Keyboard events come from one keyboard, which belongs to one seat,
+    // so at most one seat's focus changes with them.
+    debug_assert!(
+        keyboard.is_empty()
+            || changes
+                .iter()
+                .filter(|c| c.previous_surface != c.current_surface)
+                .count()
+                <= 1,
+        "keyboard events moved the focus of several seats: {changes:?}"
+    );
     for change in changes {
         if change.previous_surface == change.current_surface {
             continue;

@@ -885,11 +885,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   report it could not match dropped it (E4), so nothing confirmed it. The
   guest commits it then, with `preedit_string("")`, `commit_string` and
   `done`, which keeps the user's text where an input method that restarts
-  would lose it, and commits nothing twice. If that `leave` beats the `wl_keyboard.leave`
-  of the same focus change, the activation finds Exo unfocused and the
-  keyboard leave drains it. Exo attaches on its own only when focus
-  reaches a surface an `activate` found unfocused, after a
-  `wl_keyboard.leave` that set the proxy draining, so an `enter` while
+  would lose it, and commits nothing twice. If that `leave` beats the
+  `wl_keyboard.leave` of the same focus change, the activation finds Exo
+  unfocused and the keyboard leave drains it. Exo attaches on its own
+  only when focus reaches a surface an `activate` found unfocused, after
+  a `wl_keyboard.leave` that set the proxy draining, so an `enter` while
   active answers the proxy's own `activate` and resends nothing.
   `LinkState` is therefore sound only while every host
   `zwp_text_input_v1.leave`, `wl_keyboard.leave` and `wl_keyboard.enter`
