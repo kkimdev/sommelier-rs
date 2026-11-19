@@ -1494,6 +1494,22 @@ sees them.
   - IMA precedes every unhandled key, autorepeats included, with an
     empty `confirm_preedit` at v11 (E13, formerly U11). This exercises
     X2' and the Backspace lease.
+  - As built: a free case holds a key one action in 33, mostly Space or
+    Backspace, and may type up to two other keys before it releases it,
+    up to 1.5 s later. The key the user pressed last repeats until it is
+    up or another key is typed. The display gives each keyboard the
+    default keymap, without which the proxy recovers no key, since it
+    recovers only a key the keymap repeats. Exo's keyboard passes a press
+    only of a key it does not hold, the engine's answer included.
+  - `SpecText` follows the keyboard concern as far as X2' needs it: the
+    keys held, in the order of their peeks, which a `wl_keyboard.enter`
+    clears, and the latest peek, which a focus move forgets; which key
+    `wl_keyboard.key` delivered; and the Backspace lease, which H7 and a
+    recovered Backspace arm, and which every other composition edit, a
+    new field, a focus move and another key's press end, cancelling
+    Backspace's repeat for the rest of its press.
+  - Settled cases hold no key: the user's intent for a hold depends on
+    the client's own repeat, which the client models do not have.
 
 ### 4.5 The client models
 
@@ -1654,6 +1670,9 @@ Each mode gets half of the cases.
     while the text is ahead, or for its range; a region over a region,
     over a shown preedit, or dropped;
   - guest reports that crossed an edit in flight (P4);
+  - autorepeats the engine got; empty confirmations that recovered a held
+    key, skipped its pair as `wl_keyboard.key` had delivered it, or found
+    no eligible key (X2'); Backspace leases armed, and ended;
   - client drops, by reason;
   - one counter per draw.
 
@@ -1699,8 +1718,8 @@ DST FAILURE seed=81321 mode=free client=Gtk{v4:false} ext=11 e6=confirm e8=text-
 
 ### 4.8 The known-issue list
 
-#72 retired P2. P1 remains; reaching H2 added a second, and D6 a
-third.
+#72 retired P2. P1 remains; reaching H2 added a second, D6 a third and
+D7 a fourth.
 
 ```rust
 // sim/oracle.rs
@@ -1722,6 +1741,11 @@ enum KnownIssue {
     /// composition it holds as text; and Chromium drops such a region's
     /// delete while it shows a preedit (C3). The core's X1 decides.
     RegionOverShownPreedit,
+    /// X2': Exo's confirmation before a key the input method did not
+    /// handle (E13) comes before that key's peek (E8), so the proxy takes
+    /// it for a repeat of the key held before, which is still the latest
+    /// peek, and the guest gets one more press of it.
+    RecoveryBeforeAPress,
 }
 ```
 
@@ -1742,7 +1766,16 @@ The region over a shown preedit is a free case's issue: it shows as tier
 1's composition check, since Exo composes other bytes than the guest
 shows. It explains a case whose only failures are that check, if the
 case had such a region (`Counts::regions_over_preedits`). It occurs in
-about 1 free case in 1,000 (5 of seeds 1,000,000 to 1,009,998, even).
+about 1 free case in 1,000 to 5,000 (1 to 5 of seeds 1,000,000 to
+1,009,998, even, as the generator changed).
+
+The recovery before a press is a free case's issue too, as only free
+cases hold keys. The scheduler labels each host event with the press,
+not autorepeat, it answers, so `SpecText` counts each held key it
+recovers for a confirmation before another key's press, and tier 1
+reports a `recovery` check, which the issue then explains if nothing
+else failed. It occurs in about 1 free case in 120 (41 of seeds
+1,000,000 to 1,009,998, even).
 
 Everything else fails the run. The scenario keeps being generated, so
 any other bug on that path stays visible. The summary prints the known
