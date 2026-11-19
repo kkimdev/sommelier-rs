@@ -673,6 +673,19 @@ impl KeyGenerationRegistry {
         }
     }
 
+    /// Whether a `peek_key` press of `key` is a new press: the key is not
+    /// held, or is held only across the input method's own detach (H2),
+    /// whose generation that press retires
+    /// ([`Self::retire_stale_generation`]).
+    pub(crate) fn peek_press_is_new(&self, keyboard: HostId, key: u32) -> bool {
+        !self.physically_held(keyboard, key) || self.held_peek_is_stale(keyboard, key)
+    }
+
+    fn held_peek_is_stale(&self, keyboard: HostId, key: u32) -> bool {
+        self.physically_held(keyboard, key)
+            && self.peek(keyboard, key).is_some_and(|peek| peek.stale)
+    }
+
     /// Retire `key`'s held generation if its peek is stale, for the key's
     /// new `peek_key` press: the old press's release died with the input
     /// method (H2), so nothing of its generation, the guest's ownership,
@@ -682,9 +695,7 @@ impl KeyGenerationRegistry {
     /// Returns whether the guest still holds the old press, which
     /// `wl_keyboard` or a keysym gave it, and is owed its release.
     pub(crate) fn retire_stale_generation(&mut self, keyboard: HostId, key: u32) -> bool {
-        let stale = self.physically_held(keyboard, key)
-            && self.peek(keyboard, key).is_some_and(|peek| peek.stale);
-        if !stale {
+        if !self.held_peek_is_stale(keyboard, key) {
             return false;
         }
         let release = self.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease);

@@ -806,7 +806,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   holds the old press, which `wl_keyboard` or a keysym gave it, gets its
   release first, under the peek's serial and time, so it never sees two
   presses without a release between, and its autorepeat of the old press
-  stops.
+  stops. Being a new press, it also leaves a waiting recovery waiting, as
+  the press of a key not held does
+  (`KeyGenerationRegistry::peek_press_is_new`).
   Tests: `a_confirmation_before_an_unhandled_press_recovers_no_held_key`,
   `a_confirmation_before_a_handled_press_recovers_the_held_key`,
   `a_press_on_another_seats_keyboard_keeps_a_recovery_waiting`,
@@ -815,6 +817,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_key_held_across_a_detach_is_typed_and_recovered_again`,
   `a_press_after_a_detach_releases_the_old_press_the_guest_holds`,
   `a_recovered_key_pressed_again_after_a_detach_reaches_the_guest`,
+  `a_press_of_a_key_held_across_a_detach_keeps_a_recovery_waiting`,
   `keys_held_since_enter_are_ordered_by_their_peeks`.
 - **A key waits for at most one late release per channel.** When a key
   is pressed again before the channel that gave the guest its previous

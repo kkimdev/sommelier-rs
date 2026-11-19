@@ -539,7 +539,8 @@ pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepe
 ///
 /// - before any peek, the keyboard's `modifiers` leave it waiting: Exo
 ///   sends them right before the key they apply to;
-/// - the `peek_key` press of a key the keyboard does not hold leaves it
+/// - the `peek_key` press of a key the keyboard does not hold, or holds
+///   only across a detach ([`forget_held_keys_for_seat`]), leaves it
 ///   waiting, as that key's possible press. The keyboard may be any of the
 ///   connection's, of any guest seat: Exo has one seat, and sends each of
 ///   its keyboards the press in turn;
@@ -564,8 +565,8 @@ pub(crate) struct PendingRecovery {
     seat: SeatId,
     /// The seat's eligible held key when the confirmation came.
     held: HeldRepeatKey,
-    /// The `peek_key` press of a key not held before, since the
-    /// confirmation: its host keyboard, key and serial.
+    /// The `peek_key` press of a key not held before, or held only across
+    /// a detach, since the confirmation: its host keyboard, key and serial.
     press: Option<(HostId, u32, u32)>,
 }
 
@@ -635,9 +636,10 @@ pub(crate) fn before_host_event(
                 .copied();
             // Any keyboard of the connection: Exo has one seat, which
             // sends each keyboard of every guest seat the press in turn.
+            // A key held only across a detach is pressed anew too.
             let press = keyboard.filter(|&keyboard| {
                 state == wl_keyboard::KEY_STATE_PRESSED
-                    && !ctx.key_generations.physically_held(keyboard, key)
+                    && ctx.key_generations.peek_press_is_new(keyboard, key)
             });
             match press {
                 Some(keyboard) => {

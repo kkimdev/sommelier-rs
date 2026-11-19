@@ -4633,6 +4633,45 @@ mod tests {
         assert_eq!(kb.s.host_received(), [acked(kb.k, 702, HANDLED)]);
     }
 
+    /// The press peek of a key held only across Exo's own detach (H2) is
+    /// a new press, as that of a key not held is, so it keeps a recovery
+    /// waiting, and its `wl_keyboard.key` press shows the confirmation was
+    /// Exo's before that press (E13): the held Space, which the input
+    /// method took after the detach, is not recovered.
+    #[tokio::test]
+    async fn a_press_of_a_key_held_across_a_detach_keeps_a_recovery_waiting() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        let mut kb = Kb::new().await;
+        let ime = kb.text_input().await;
+        kb.peek(700, 700, KEY_A, PRESSED).await;
+        assert_eq!(kb.key(700, KEY_A, PRESSED).await, Route::Guest);
+        kb.detach(ime).await;
+        kb.peek(701, 1300, KEY_SPACE, PRESSED).await;
+
+        let confirm = zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0);
+        kb.s.host([confirm]).await;
+        let [(_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            kb.s.host_received()[..]
+        else {
+            panic!("no recovery waits");
+        };
+        kb.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(kb.k.ext, 702, 1400, KEY_A, PRESSED),
+            wl_keyboard::evt::key(kb.k.host, 702, 1400, KEY_A, PRESSED),
+        ])
+        .await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [
+                key_event(kb.k, 702, 1400, KEY_A, RELEASED),
+                key_event(kb.k, 702, 1400, KEY_A, PRESSED),
+            ]
+        );
+        assert_eq!(kb.s.host_received(), [acked(kb.k, 702, HANDLED)]);
+        kb.s.host([wl_callback::evt::done(callback, 0)]).await;
+        assert_eq!(kb.s.guest_received(), []);
+    }
+
     #[tokio::test]
     async fn held_space_repeats_after_ime_commit_until_physical_release() {
         let mut kb = Kb::new().await;
