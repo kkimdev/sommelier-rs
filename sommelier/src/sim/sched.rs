@@ -657,7 +657,6 @@ impl<'t> World<'t> {
             self.engine.learn_region(text);
         }
         if let Some(spec) = &mut self.spec {
-            spec.counts.regions_hidden = self.exo.regions_hidden;
             spec.counts.regions_stale = self.exo.regions_stale;
         }
         if let Some(spec) = &mut self.spec {
