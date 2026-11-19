@@ -153,24 +153,25 @@ impl V3Field {
             content_type,
             surrounding_text_supported: self.surrounding_text.is_some()
                 || extension_version < extended::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
-            surrounding_text: host_surrounding_text(self.surrounding_text.as_ref(), None),
+            surrounding_text: host_surrounding_text(self.surrounding_text.as_ref()),
             cursor_rectangle: self.cursor_rectangle.unwrap_or_default(),
         }
     }
 }
 
 /// The surrounding text the proxy reports to the host for a commit that
-/// states `stated`, while the guest shows the preedit `shown`: the text,
-/// cursor and anchor as the guest stated them, or `("", 0, 0)` for a
-/// cleared one (an enable or a disable). The one place the oracle says what
-/// a report to the host holds, per step ([`SpecText`]) and at quiescence
-/// ([`V3Field::on_host`]).
-pub(crate) fn host_surrounding_text(
-    stated: Option<&(String, u32, u32)>,
-    shown: Option<&str>,
-) -> (String, u32, u32) {
-    let _ = shown;
+/// states `stated`: the text, cursor and anchor as the guest stated them,
+/// or `("", 0, 0)` for a cleared one (an enable or a disable). The one
+/// place the oracle says what a report to the host holds, per step
+/// ([`SpecText`]) and at quiescence ([`V3Field::on_host`]).
+pub(crate) fn host_surrounding_text(stated: Option<&(String, u32, u32)>) -> (String, u32, u32) {
     stated.cloned().unwrap_or_default()
+}
+
+/// Whether `request` to the host reports a content type or the support for
+/// surrounding text.
+fn is_content_type(request: &AnyRequest) -> bool {
+    content_type_matches(request, (0, 0), false).is_some()
 }
 
 /// What a content-type request to the host must hold for a field whose
@@ -448,7 +449,8 @@ pub(super) struct SpecText {
     /// The steps whose decisions were not the specification's.
     pub wrong_decisions: Vec<String>,
     /// The surrounding text the proxy must report to the host in the step,
-    /// if a commit stated one, and the reports it sent.
+    /// if a commit stated one, and the reports it sent. An `Option`: a step
+    /// handles one request, so at most one commit.
     report: Option<(String, u32, u32)>,
     reported: Vec<(String, u32, u32)>,
     /// The content-type requests the proxy sent in the step that are not
@@ -581,8 +583,7 @@ impl SpecText {
         // The commit reports a stated surrounding text to the host, enabled
         // or not.
         if let Some(text) = &surrounding_text {
-            let shown = self.shown.as_ref().map(|shown| shown.text.as_str());
-            self.report = Some(host_surrounding_text(text.as_ref(), shown));
+            self.report = Some(host_surrounding_text(text.as_ref()));
         }
         let was_enabled = self.committed.is_some();
         let enabled = enabled.unwrap_or(was_enabled);
@@ -1067,7 +1068,7 @@ impl SpecText {
             let surrounding = field.surrounding_text.is_some();
             content_type_matches(request, field.content_type, surrounding)
         });
-        let typed = content_type_matches(request, (0, 0), false).is_some();
+        let typed = is_content_type(request);
         if typed && matches != Some(true) {
             self.typed
                 .push(format!("{request:?} for the committed {committed:?}"));
