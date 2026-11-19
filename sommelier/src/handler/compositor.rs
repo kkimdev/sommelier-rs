@@ -812,11 +812,11 @@ impl wp_viewporter::WpViewporterHandler for CompositorHandler {
                 "wl_surface already has a wp_viewport",
             );
         }
-        ctx.viewport_to_wl_surface.insert(id, surface);
         let Some(state) = ctx.surface_mut(surface) else {
             return ctx.missing_surface_state(surface);
         };
         state.pending.viewport = Some(Some(ViewportState::new()));
+        ctx.viewport_to_wl_surface.insert(id, surface);
         Action::Forward
     }
 }
@@ -1413,7 +1413,7 @@ mod tests {
     #[test]
     fn a_live_surface_without_state_ends_the_session() {
         type Request = fn(&mut CompositorHandler, &mut Context) -> Action;
-        let requests: [(&str, Request); 6] = [
+        let requests: [(&str, Request); 10] = [
             ("attach", |h, ctx| h.on_attach(ctx, 0, 0, 0)),
             ("damage", |h, ctx| h.on_damage(ctx, 0, 0, 1, 1)),
             ("damage_buffer", |h, ctx| {
@@ -1422,6 +1422,22 @@ mod tests {
             ("set_buffer_scale", |h, ctx| h.on_set_buffer_scale(ctx, 1)),
             ("offset", |h, ctx| h.on_offset(ctx, 0, 0)),
             ("commit", |h, ctx| h.on_commit(ctx)),
+            ("set_buffer_transform", |h, ctx| {
+                h.on_set_buffer_transform(ctx, 0)
+            }),
+            ("get_viewport", |h, ctx| {
+                h.on_get_viewport(ctx, 700, TEST_SURFACE)
+            }),
+            ("set_source", |h, ctx| {
+                ctx.viewport_to_wl_surface.insert(700, TEST_SURFACE);
+                ctx.last_sender_id = 700;
+                h.on_set_source(ctx, 0, 0, 1, 1)
+            }),
+            ("set_destination", |h, ctx| {
+                ctx.viewport_to_wl_surface.insert(700, TEST_SURFACE);
+                ctx.last_sender_id = 700;
+                h.on_set_destination(ctx, 1, 1)
+            }),
         ];
         for (name, request) in requests {
             let mut ctx = toplevel_ctx();
@@ -1435,6 +1451,20 @@ mod tests {
             );
             assert!(ctx.surfaces.is_empty(), "{name} recreated the state");
         }
+    }
+
+    /// A `get_viewport` for a surface without state records no viewport:
+    /// the error path changes nothing.
+    #[test]
+    fn get_viewport_without_surface_state_records_no_viewport() {
+        let mut ctx = toplevel_ctx();
+        ctx.surfaces.remove(&TEST_SURFACE);
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            CompositorHandler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
+            Action::Drop
+        );
+        assert!(ctx.viewport_to_wl_surface.is_empty());
     }
 
     /// The wl_surface that [`toplevel_ctx`] maps to a host surface.
