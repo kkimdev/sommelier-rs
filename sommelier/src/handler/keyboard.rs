@@ -1208,6 +1208,7 @@ mod tests {
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
     use crate::state::{GuestKeyEvent, OutputState};
+    use crate::test_support::text_input::{self, Host};
     use crate::test_support::{decode, msg_opcode, msg_sender, shm_pool_file};
     use crate::wire::WL_DISPLAY_ID;
     use std::os::fd::AsFd;
@@ -1347,16 +1348,27 @@ mod tests {
         /// Text input `t` of `seat`, enabled with surrounding text and
         /// active on the host, on guest surface `surface`.
         fn text_input(&mut self, t: MappedTextInput, seat: u32, surface: u32) {
+            self.text_input_showing(t, seat, surface, None);
+        }
+
+        /// [`Self::text_input`], whose guest shows `preedit`.
+        fn text_input_showing(
+            &mut self,
+            t: MappedTextInput,
+            seat: u32,
+            surface: u32,
+            preedit: Option<&str>,
+        ) {
             self.ctx
                 .shadow_table
                 .insert_paired_for_test(t.guest, t.host, "zwp_text_input_v3");
-            let mut state =
-                crate::state::TextInputState::new(t.host, Some(t.extended), seat, Some(surface));
-            state.committed.enabled = true;
-            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
-            state.set_guest_commits(1);
-            state.host = crate::state::HostApplied::Active { content_type: None };
-            self.ctx.text_inputs.insert(t.guest, state);
+            let active = text_input::Active {
+                ext: Some(t.extended),
+                surrounding_text: Some(("가", 3, 3)),
+                preedit,
+                ..text_input::Active::new(t.host, seat, Some(surface))
+            };
+            text_input::insert(&mut self.ctx, t.guest, active);
         }
 
         /// `k`'s host sends a keymap event; returns what the handler does.
@@ -2103,16 +2115,11 @@ mod tests {
 
     /// `PLACED_TEXT_INPUT`, composing a preedit on the placed surface.
     fn compose_on_placed_surface(p: &mut Proxy) {
-        p.text_input(PLACED_TEXT_INPUT, PLACING.seat, PLACED_SURFACE);
+        p.text_input_showing(PLACED_TEXT_INPUT, PLACING.seat, PLACED_SURFACE, Some("한"));
         // Text-input activation requests name the host seat.
         p.ctx
             .shadow_table
             .insert_paired_for_test(PLACING.seat, 70, "wl_seat");
-        p.ctx
-            .text_inputs
-            .get_mut(&PLACED_TEXT_INPUT.guest)
-            .unwrap()
-            .current_preedit = crate::state::ShownPreedit::at_end("한");
     }
 
     /// A matched chord belongs to Sommelier while the policy is active, so
@@ -2507,7 +2514,7 @@ mod tests {
         let mut p = placeable_shortcut();
         compose_on_placed_surface(&mut p);
         let t = PLACED_TEXT_INPUT;
-        let before = p.ctx.text_inputs[&t.guest].clone();
+        let before = text_input::snapshot(&p.ctx, t.guest);
 
         for (serial, time) in [(2, 100), (4, 200)] {
             assert_eq!(p.key(PLACING, serial, time, KEY_Q, PRESSED), Action::Drop);
@@ -2564,7 +2571,7 @@ mod tests {
                 .all(|(message, _)| msg_sender(message) != t.guest),
             "placement must not synthesize guest text-input focus or editor events"
         );
-        assert_eq!(p.ctx.text_inputs[&t.guest], before);
+        assert_eq!(text_input::snapshot(&p.ctx, t.guest), before);
         assert_eq!(
             p.ctx.keyboard_focus.surface_for_seat(PLACING.seat),
             Some(PLACED_SURFACE)
@@ -2641,23 +2648,24 @@ mod tests {
         // configures. It drains the host IME generation through its own
         // text-input barrier and the guest re-enables on the new enter.
         assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Forward);
-        let ime_barrier = p.ctx.text_inputs[&t.guest]
-            .draining_callback()
-            .expect("focus leave must drain the host IME generation");
+        let state = text_input::view(&p.ctx, t.guest);
+        let Host::Draining(ime_barrier) = state.host else {
+            panic!("focus leave must drain the host IME generation: {state:?}");
+        };
         assert_ne!(ime_barrier.0, placement_barrier);
-        assert!(!p.ctx.text_inputs[&t.guest].current_preedit.has_text());
+        assert_eq!(state.preedit, None);
         assert_eq!(p.enter(PLACING, PLACED_HOST_SURFACE, &[]), Action::Forward);
         p.ctx.last_sender_id = t.guest;
         let mut v3 = crate::handler::text_input::TextInputV3Handler;
         assert_eq!(v3.on_enable(&mut p.ctx), Action::Drop);
         assert_eq!(v3.on_commit(&mut p.ctx), Action::Drop);
-        assert!(!p.ctx.text_inputs[&t.guest].host_is_active());
+        assert_ne!(text_input::view(&p.ctx, t.guest).host, Host::Active);
 
         // The IME barrier reactivates text input without retiring the
         // placement barrier, which still gates configures.
         let queued_before = p.ctx.client_to_host_queue.len();
         complete_callback(&mut p.ctx, ime_barrier.0);
-        assert!(p.ctx.text_inputs[&t.guest].host_is_active());
+        assert_eq!(text_input::view(&p.ctx, t.guest).host, Host::Active);
         // The activation, then the committed content type it replays.
         let (activate, _) = &p.ctx.client_to_host_queue[queued_before];
         assert_eq!(
@@ -2683,7 +2691,7 @@ mod tests {
         // The placement barrier then retires without disturbing the fresh
         // IME generation.
         let host_queue_len = p.ctx.client_to_host_queue.len();
-        let state_after_activation = p.ctx.text_inputs[&t.guest].clone();
+        let state_after_activation = text_input::snapshot(&p.ctx, t.guest);
         complete_callback(&mut p.ctx, placement_barrier);
         assert!(!p
             .ctx
@@ -2691,7 +2699,10 @@ mod tests {
             .arc()
             .is_some_and(|arc| arc.has_active_barrier(aura_toplevel)));
         assert_eq!(p.ctx.client_to_host_queue.len(), host_queue_len);
-        assert_eq!(p.ctx.text_inputs[&t.guest], state_after_activation);
+        assert_eq!(
+            text_input::snapshot(&p.ctx, t.guest),
+            state_after_activation
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3563,8 +3574,9 @@ mod tests {
 
         assert_eq!(p.leave(KEYBOARD, 999), Action::Drop);
         assert_eq!(p.ctx.keyboard_focus.surface_for_seat(KEYBOARD.seat), None);
-        assert_eq!(p.ctx.text_inputs[&TEXT_INPUT.guest].active_surface, None);
-        assert!(!p.ctx.text_inputs[&TEXT_INPUT.guest].host_is_active());
+        let state = text_input::view(&p.ctx, TEXT_INPUT.guest);
+        assert_eq!(state.focus, None);
+        assert_ne!(state.host, Host::Active);
     }
 
     /// A surface keeps its mapping until the host acknowledges its destroy,
@@ -3774,36 +3786,25 @@ mod tests {
             .shadow_table
             .insert_paired_for_test(KEYBOARD.seat, 2, "wl_seat");
         p.surface(SURFACE.0, SURFACE.1);
-        let stale = {
-            let mut state = crate::state::TextInputState::new(
-                TEXT_INPUT.host,
-                None,
-                KEYBOARD.seat,
-                Some(OTHER_SURFACE.0),
-            );
-            state.pending.enabled = Some(true);
-            state.committed.enabled = true;
-            state.pending.surrounding_text = Some(Some(("stale".to_string(), 5, 5)));
-            state.committed.surrounding_text = Some(("stale".to_string(), 5, 5));
-            state.current_preedit = crate::state::ShownPreedit::at_end("한");
-            state.set_guest_commits(9);
-            state.pending_cursor_position = Some((1, 1));
-            state.host = crate::state::HostApplied::Active { content_type: None };
-            state
+        let stale = text_input::Active {
+            surrounding_text: Some(("stale", 5, 5)),
+            preedit: Some("한"),
+            commits: 9,
+            pending: true,
+            ..text_input::Active::new(TEXT_INPUT.host, KEYBOARD.seat, Some(OTHER_SURFACE.0))
         };
-        p.ctx.text_inputs.insert(TEXT_INPUT.guest, stale);
+        text_input::insert(&mut p.ctx, TEXT_INPUT.guest, stale);
 
         assert_eq!(p.enter(KEYBOARD, SURFACE.1, &[]), Action::Forward);
 
-        let state = &p.ctx.text_inputs[&TEXT_INPUT.guest];
-        assert_eq!(state.active_surface, Some(SURFACE.0));
-        assert!(state.pending.enabled.is_none());
-        assert!(!state.committed.enabled);
-        assert!(!state.host_is_active());
-        assert!(state.committed.surrounding_text.is_none());
-        assert!(!state.current_preedit.has_text());
-        assert_eq!(state.pending_cursor_position, None);
-        assert_eq!(state.guest_commit_serial(), 9);
+        let state = text_input::view(&p.ctx, TEXT_INPUT.guest);
+        assert_eq!(state.focus, Some(SURFACE.0));
+        assert!(!state.pending);
+        assert!(!state.enabled);
+        assert_ne!(state.host, Host::Active);
+        assert_eq!(state.surrounding_text, None);
+        assert_eq!(state.preedit, None);
+        assert_eq!(state.commits, 9);
         assert!(p.ctx.client_to_host_queue.iter().any(|(message, _)| {
             msg_sender(message) == TEXT_INPUT.host
                 && msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
@@ -3958,22 +3959,19 @@ mod tests {
                 "zwp_text_input_v3",
                 1,
             );
-            let mut state =
-                crate::state::TextInputState::new(guest + 500, None, KEYBOARD.seat, active_surface);
-            state.committed.enabled = true;
-            state.set_guest_commits(1);
-            state.host = crate::state::HostApplied::Active { content_type: None };
-            p.ctx.text_inputs.insert(guest, state);
+            let active = text_input::Active::new(guest + 500, KEYBOARD.seat, active_surface);
+            text_input::insert(&mut p.ctx, guest, active);
         }
 
         p.release(KEYBOARD);
-        assert!(p.ctx.text_inputs.values().all(|state| {
-            state.active_surface.is_none()
-                && state.pending.enabled.is_none()
-                && !state.committed.enabled
-                && !state.host_is_active()
-                && !state.current_preedit.has_text()
-        }));
+        for (guest, _) in text_inputs {
+            let state = text_input::view(&p.ctx, guest);
+            assert_eq!(state.focus, None);
+            assert!(!state.pending);
+            assert!(!state.enabled);
+            assert_ne!(state.host, Host::Active);
+            assert_eq!(state.preedit, None);
+        }
         assert_eq!(
             p.ctx.host_to_client_queue.len(),
             2,
