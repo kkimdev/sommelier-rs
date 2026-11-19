@@ -2853,7 +2853,15 @@ mod tests {
             let keyboard = HostId(KEYBOARD.host);
             let keys = &mut p.ctx.key_generations;
             keys.suppress_host_accelerator(keyboard, KEY_A);
-            keys.observe_peek_press(keyboard, BACKSPACE, 1, 123, true);
+            keys.peek_key(
+                keyboard,
+                BACKSPACE,
+                PeekInput::Press {
+                    serial: 1,
+                    time: 123,
+                    guest_input: true,
+                },
+            );
             keys.cancel_backspace_repeat(keyboard, BACKSPACE);
             assert!(p.ctx.claim_guest_key(keyboard, BACKSPACE, ImeRecovery));
 
@@ -3648,7 +3656,15 @@ mod tests {
         p.focus(KEYBOARD, SURFACE.0);
         let keyboard = HostId(KEYBOARD.host);
         let keys = &mut p.ctx.key_generations;
-        keys.observe_peek_press(keyboard, BACKSPACE, 1, 123, true);
+        keys.peek_key(
+            keyboard,
+            BACKSPACE,
+            PeekInput::Press {
+                serial: 1,
+                time: 123,
+                guest_input: true,
+            },
+        );
         keys.cancel_backspace_repeat(keyboard, BACKSPACE);
         keys.suppress_host_accelerator(keyboard, BACKSPACE);
         assert!(p.ctx.claim_guest_key(keyboard, BACKSPACE, ImeRecovery));

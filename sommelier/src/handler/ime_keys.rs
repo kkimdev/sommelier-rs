@@ -1079,7 +1079,15 @@ mod tests {
         // confirmation belongs to that newest generation or to no
         // recoverable key; it must never synthesize the older held Space.
         let generations = &mut ime.ctx.key_generations;
-        generations.observe_peek_press(HOST_KEYBOARD, SHIFT, 701, 101, true);
+        generations.peek_key(
+            HOST_KEYBOARD,
+            SHIFT,
+            crate::state::PeekInput::Press {
+                serial: 701,
+                time: 101,
+                guest_input: true,
+            },
+        );
         ime.confirm();
         assert_eq!(ime.events(), []);
 

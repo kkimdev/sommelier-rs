@@ -19,7 +19,7 @@ limitations under the License.
 //! state machine. [`ImeCore::step`] takes one [`Input`] and returns the
 //! [`Effects`] the adapter queues; it reads the facts it does not own
 //! through [`Env`]. The behaviour it implements is the table of section 2
-//! of the design (`docs/IME_REDESIGN.md`), whose row IDs the code and tests
+//! of the design (`docs/IME.md`), whose row IDs the code and tests
 //! cite.
 
 use std::collections::BTreeMap;

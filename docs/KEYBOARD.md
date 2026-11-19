@@ -8,10 +8,11 @@ the proxy; the rules it keeps are under
 
 A key can reach the guest four ways: a `wl_keyboard.key`, a key the
 `wl_keyboard.enter` lists, a text-input keysym, and a press and release
-the proxy recovers for an empty IME confirmation (X2'). Exo announces each
-key on `zcr_extended_keyboard_v1.peek_key` first, even one its input
-method consumes, so the proxy sees the key's physical life on two
-channels and its delivery on up to three.
+the proxy recovers for an empty IME confirmation (X2' of
+[IME.md](IME.md#22-host-events)). Exo announces each key on
+`zcr_extended_keyboard_v1.peek_key` first, even one its input method
+consumes, so the proxy sees the key's physical life on two channels and
+its delivery on up to three.
 
 ## State
 
@@ -49,10 +50,11 @@ beside the new one (`retired_guest_releases`), at most one per channel.
 
 Phase and guest delivery are independent because the channels race: a
 keysym can come before the key's peek, and a `wl_keyboard` press after
-its peek release. Within each part the old flags' illegal combinations
-cannot be written:
+its peek release. The registry's model test (see [Tests](#tests)) keeps
+each generation as independent flags; within each part, their illegal
+combinations cannot be written:
 
-| Flag before | Now |
+| Model flag | State |
 | --- | --- |
 | `physical_state` | the `KeyPhase` variant |
 | `peek`, `peek_press_serial` | `PeekRecord`, inside `Held` and `Released`; a live peek's serial is its announced serial |
@@ -81,8 +83,9 @@ keyboard's XKB state, focus), and applies the effects on the guest:
 `wl_keyboard.key` has two steps because placing a window, which a
 placement chord does before the key's delivery is decided, needs the
 whole `Context`. `admit_key` settles the events that belong to another
-generation (a late release of a retired generation, a release or press
-under another serial than the key's peek announced) and moves the phase;
+generation (a late release of a retired generation, a release under
+another serial than the key's peek release, or a press of a held key
+under another serial than its peek announced) and moves the phase;
 `transition_guest_key` decides the delivery and the `ack_key` from the
 guest owner. `peek_key` retires a stale held generation on a press, owing
 the guest its release, numbers a new peek generation, refreshes the peek
@@ -115,7 +118,7 @@ event, read as a `HostSignal`:
 | Waiting for | Event | Step |
 | --- | --- | --- |
 | `NextEvent` | `wl_keyboard.modifiers` | wait |
-| `NextEvent` | peek press of a key the keyboard does not hold, or holds stale | wait for that key's `Press` |
+| `NextEvent` | peek press, on a known host keyboard, of a key that keyboard does not hold, or holds stale | wait for that key's `Press` |
 | `Press` | that key's `wl_keyboard.key` press with the peek's serial | drop |
 | any | the text input's `leave` (E6) | drop |
 | any | anything else | recover, then handle the event |
@@ -123,9 +126,10 @@ event, read as a `HostSignal`:
 ## Tests
 
 - `key_generation_registry_matches_the_model_for_all_short_transition_sequences`
-  checks every sequence of four registry operations, the detach and the
-  retirement of a stale generation included, against a model of the flat
-  fields the states replaced.
+  checks every sequence of four registry operations, `peek_key`,
+  `admit_key`, the enter's snapshot, the detach and the retirement of a
+  stale generation included, against a model of the flat fields the
+  states replaced.
 - `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`
   checks that the delivery reducer never opens two guest presses, nor
   forwards a repeat or release without one.

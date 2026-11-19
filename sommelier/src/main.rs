@@ -25,8 +25,6 @@ mod allocator;
 mod arc_task_ids;
 mod connection;
 mod handler;
-// Not wired in yet: the staged switch (C3a to C3c) does that.
-#[cfg_attr(not(test), expect(dead_code))]
 mod ime;
 mod placement_config;
 mod proxy;

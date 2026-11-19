@@ -147,16 +147,8 @@ a content type. Whether an enable reaches the proxy before or after the
 previous activation has drained follows from the seed too: the
 compositor holds its answer to every drain barrier's sync until it
 answers anything else, and the guest sometimes waits with a second
-roundtrip, whose sync releases it. When such a case typed into text
-fields, stayed healthy and had no objects destroyed by the compositor on
-its own, Exo must end, once the proxy has closed the connection, with
-the field the guest last committed on the focused surface: the content
-type as the proxy maps it, the surrounding text and support for it, and
-the cursor rectangle, or no active text input if the field was disabled.
-The expected content type comes from the proxy's own mapping, so this
-check finds ordering and state bugs, not mapping bugs; unit tests pin
-the mapping. The run reports how many fields it checked, how many
-activations the guest's plan deferred, how many input methods
+roundtrip, whose sync releases it. What Exo holds of a field at the end
+is the DST's to check (`sim`, below). The run reports how many input methods
 restarted, how many host activations had their seat end while active,
 and how many deactivates named a destroyed seat.
 
@@ -182,13 +174,14 @@ types into models of Chromium's and GTK's text-input-v3 clients through
 a whole proxy client (`proxy::harness::Session`), with a model of Exo
 and its Korean input method behind it. Every message travels a FIFO
 channel with a drawn latency on one virtual clock, so a seed fixes the
-whole case, timing included; `docs/IME_REDESIGN.md` section 4 describes
-it. `ime_reaches_the_specified_text` holds the proxy to the
-specification, whatever the timing: after every message the proxy
-handles, the transactions the guest gets and what it then shows, the
-preedit's cursor included, and the activations and resets the proxy asks
-of the host. `ime_reaches_the_intended_text` also holds the client to
-the user's intent, in cases that settle around every click, tap, focus
+whole case, timing included; [docs/IME.md](docs/IME.md#4-the-dst-harness)
+describes it. `ime_reaches_the_specified_text` holds the proxy to the
+specification (section 2 of that document), whatever the timing:
+after every message the proxy handles, the transactions the guest gets
+and what it then shows, the preedit's cursor included, and the
+activations and resets the proxy asks of the host.
+`ime_reaches_the_intended_text` also holds the client to the user's
+intent, in cases that settle around every click, tap, focus
 move and restart of the input method, and after a key the input method
 passes while it takes the engine to compose, whose confirmation then
 resets the engine. Exo's deletes and preedit regions must reach the

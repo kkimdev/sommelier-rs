@@ -876,7 +876,7 @@ impl KeyGenerationRegistry {
             })
     }
 
-    pub(crate) fn observe_peek_press(
+    fn observe_peek_press(
         &mut self,
         keyboard: HostId,
         key: u32,
@@ -910,7 +910,7 @@ impl KeyGenerationRegistry {
 
     /// A peek repeat, or a legacy duplicate peek press, of a held key
     /// announces its next `wl_keyboard.key`.
-    pub(crate) fn refresh_peek(&mut self, keyboard: HostId, key: u32, serial: u32, time: u32) {
+    fn refresh_peek(&mut self, keyboard: HostId, key: u32, serial: u32, time: u32) {
         if let Some(KeyPhase::Held { peek, .. }) = self
             .entries
             .get_mut(&keyboard)
@@ -921,7 +921,7 @@ impl KeyGenerationRegistry {
         }
     }
 
-    pub(crate) fn observe_peek_release(&mut self, keyboard: HostId, key: u32, serial: u32) {
+    fn observe_peek_release(&mut self, keyboard: HostId, key: u32, serial: u32) {
         self.observe_physical_event(keyboard, key, 0, Some(serial));
     }
 
@@ -2995,6 +2995,141 @@ mod tests {
                     Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
                 ) && !generation.host_accelerator_suppressed
             }
+
+            fn held(&self, key: u32) -> Option<ModelGeneration> {
+                self.keys
+                    .get(&key)
+                    .copied()
+                    .filter(|generation| generation.physical_state == PhysicalKeyState::Held)
+            }
+
+            /// A peek repeat, or a duplicate peek press, of a held key.
+            fn refresh_peek(&mut self, key: u32, serial: u32, time: u32) {
+                if let Some(generation) = self
+                    .keys
+                    .get_mut(&key)
+                    .filter(|generation| generation.physical_state == PhysicalKeyState::Held)
+                {
+                    generation.peek_press_serial = Some(serial);
+                    if let Some(provenance) = generation.peek.as_mut() {
+                        provenance.serial = serial;
+                        provenance.time = time;
+                    }
+                }
+            }
+
+            fn peek_key(&mut self, key: u32, input: PeekInput) -> PeekOutcome {
+                match input {
+                    PeekInput::Press {
+                        serial,
+                        time,
+                        guest_input,
+                    } => {
+                        let owes_release = self.retire_stale(key);
+                        let held = self.held(key);
+                        if held.is_some_and(|generation| generation.peek.is_some()) {
+                            self.refresh_peek(key, serial, time);
+                            return PeekOutcome {
+                                owes_release,
+                                ..PeekOutcome::default()
+                            };
+                        }
+                        let consumed_by_shortcut = held.is_some_and(|generation| {
+                            generation.guest_owner == Some(GuestKeyOwner::CompositorShortcut)
+                        });
+                        let suppressed = self
+                            .keys
+                            .get(&key)
+                            .is_some_and(|generation| generation.host_accelerator_suppressed);
+                        let eligible = guest_input && !consumed_by_shortcut && !suppressed;
+                        self.peek_press(key, serial, time, eligible);
+                        PeekOutcome {
+                            owes_release,
+                            numbered: Some(self.next_generation),
+                            ignored: false,
+                        }
+                    }
+                    PeekInput::Repeat { serial, time } => {
+                        if self.held(key).is_none() {
+                            return PeekOutcome {
+                                ignored: true,
+                                ..PeekOutcome::default()
+                            };
+                        }
+                        self.refresh_peek(key, serial, time);
+                        PeekOutcome::default()
+                    }
+                    PeekInput::Release { serial, time } => {
+                        let peek = self.keys.get(&key).and_then(|generation| generation.peek);
+                        if peek.is_some_and(|press| {
+                            !serial_is_after(serial, press.serial)
+                                && (serial != press.serial || serial_is_after(press.time, time))
+                        }) {
+                            return PeekOutcome {
+                                ignored: true,
+                                ..PeekOutcome::default()
+                            };
+                        }
+                        self.peek_release(key, serial);
+                        PeekOutcome::default()
+                    }
+                }
+            }
+
+            fn admit_key(&mut self, key: u32, state: u32, serial: u32) -> KeyAdmission {
+                let generation = self.keys.get(&key).copied();
+                let peek_press_serial =
+                    generation.and_then(|generation| generation.peek_press_serial);
+                let dropped = KeyAdmission::Settled {
+                    handled: false,
+                    forward: false,
+                };
+                if state == 0 {
+                    let pending = (key, GuestKeyOwner::Physical);
+                    if self
+                        .retired_guest_releases
+                        .get(&pending)
+                        .is_some_and(|release| release.release_serial == Some(serial))
+                    {
+                        self.retired_guest_releases.remove(&pending);
+                        return KeyAdmission::Settled {
+                            handled: true,
+                            forward: true,
+                        };
+                    }
+                    if peek_press_serial.is_some()
+                        && generation.and_then(|generation| generation.physical_release_serial)
+                            != Some(serial)
+                    {
+                        return dropped;
+                    }
+                    self.release(key, Some(serial));
+                } else {
+                    if self.held(key).is_some()
+                        && peek_press_serial.is_some_and(|peek_serial| peek_serial != serial)
+                    {
+                        return dropped;
+                    }
+                    let delayed_released_peek_press = generation.is_some_and(|generation| {
+                        generation.physical_state == PhysicalKeyState::Released
+                    }) && peek_press_serial == Some(serial);
+                    if !delayed_released_peek_press {
+                        self.press(key, None);
+                    }
+                }
+                KeyAdmission::Current
+            }
+
+            /// A `wl_keyboard.enter` lists `keys` held, in its order.
+            fn enter(&mut self, keys: &[u32]) {
+                self.keys.clear();
+                self.retired_guest_releases.clear();
+                for &key in keys {
+                    let generation = self.ensure(key);
+                    generation.physical_state = PhysicalKeyState::Held;
+                    generation.guest_owner = Some(GuestKeyOwner::Physical);
+                }
+            }
         }
 
         #[derive(Clone, Copy)]
@@ -3002,9 +3137,18 @@ mod tests {
             Press(u32),
             Repeat(u32),
             Release(u32),
+            /// `peek_key` press, with whether it is guest input.
             PeekPress(u32, bool),
-            PeekRelease(u32),
-            RefreshPeek(u32),
+            PeekRepeat(u32),
+            /// `peek_key` release, under an older serial if true.
+            PeekRelease(u32, bool),
+            /// `wl_keyboard` press, under the key's peek serial if true.
+            AdmitPress(u32, bool),
+            /// `wl_keyboard` release, under a release serial the registry
+            /// knows (a retired generation's or the key's own) if true.
+            AdmitRelease(u32, bool),
+            /// `wl_keyboard.enter` with both keys held.
+            EnterSnapshot,
             InvalidatePeek(u32),
             CancelRepeat(u32),
             ArmImeRepeat(u32, u32),
@@ -3032,9 +3176,16 @@ mod tests {
             Operation::Release(KEY_A),
             Operation::Release(KEY_B),
             Operation::PeekPress(KEY_A, true),
-            Operation::PeekPress(KEY_B, false),
-            Operation::PeekRelease(KEY_A),
-            Operation::RefreshPeek(KEY_A),
+            Operation::PeekPress(KEY_A, false),
+            Operation::PeekPress(KEY_B, true),
+            Operation::PeekRepeat(KEY_A),
+            Operation::PeekRelease(KEY_A, false),
+            Operation::PeekRelease(KEY_A, true),
+            Operation::AdmitPress(KEY_A, false),
+            Operation::AdmitPress(KEY_A, true),
+            Operation::AdmitRelease(KEY_A, false),
+            Operation::AdmitRelease(KEY_A, true),
+            Operation::EnterSnapshot,
             Operation::InvalidatePeek(KEY_B),
             Operation::CancelRepeat(KEY_A),
             Operation::ArmImeRepeat(KEY_A, 77),
@@ -3082,26 +3233,56 @@ mod tests {
                         registry.observe_physical_state(keyboard, key, 0);
                         model.release(key, None);
                     }
-                    Operation::PeekPress(key, eligible) => {
-                        registry.observe_peek_press(keyboard, key, serial, time, eligible);
-                        model.peek_press(key, serial, time, eligible);
+                    Operation::PeekPress(key, guest_input) => {
+                        let input = PeekInput::Press {
+                            serial,
+                            time,
+                            guest_input,
+                        };
+                        let actual = registry.peek_key(keyboard, key, input);
+                        assert_eq!(actual, model.peek_key(key, input));
                     }
-                    Operation::PeekRelease(key) => {
-                        registry.observe_peek_release(keyboard, key, serial);
-                        model.peek_release(key, serial);
+                    Operation::PeekRepeat(key) => {
+                        let input = PeekInput::Repeat { serial, time };
+                        let actual = registry.peek_key(keyboard, key, input);
+                        assert_eq!(actual, model.peek_key(key, input));
                     }
-                    Operation::RefreshPeek(key) => {
-                        registry.refresh_peek(keyboard, key, serial, time);
-                        // Only a held key has a peek repeat.
-                        if let Some(peek) = model.keys.get_mut(&key).filter(|generation| {
-                            generation.physical_state == PhysicalKeyState::Held
-                        }) {
-                            peek.peek_press_serial = Some(serial);
-                            if let Some(provenance) = peek.peek.as_mut() {
-                                provenance.serial = serial;
-                                provenance.time = time;
-                            }
-                        }
+                    Operation::PeekRelease(key, older) => {
+                        let serial = if older {
+                            serial.wrapping_sub(2)
+                        } else {
+                            serial
+                        };
+                        let input = PeekInput::Release { serial, time };
+                        let actual = registry.peek_key(keyboard, key, input);
+                        assert_eq!(actual, model.peek_key(key, input));
+                    }
+                    Operation::AdmitPress(key, under_peek) => {
+                        let serial = model
+                            .keys
+                            .get(&key)
+                            .and_then(|generation| generation.peek_press_serial)
+                            .filter(|_| under_peek)
+                            .unwrap_or(serial);
+                        let actual = registry.admit_key(keyboard, key, 1, serial);
+                        assert_eq!(actual, model.admit_key(key, 1, serial));
+                    }
+                    Operation::AdmitRelease(key, known) => {
+                        let generation = model.keys.get(&key);
+                        let serial = model
+                            .retired_guest_releases
+                            .get(&(key, GuestKeyOwner::Physical))
+                            .and_then(|release| release.release_serial)
+                            .or(generation
+                                .and_then(|generation| generation.physical_release_serial))
+                            .filter(|_| known)
+                            .unwrap_or(serial);
+                        let actual = registry.admit_key(keyboard, key, 0, serial);
+                        assert_eq!(actual, model.admit_key(key, 0, serial));
+                    }
+                    Operation::EnterSnapshot => {
+                        registry.install_enter_snapshot(keyboard, [KEY_B, KEY_A]);
+                        model.enter(&[KEY_B, KEY_A]);
                     }
                     Operation::InvalidatePeek(key) => {
                         registry.invalidate_peek(keyboard, key);

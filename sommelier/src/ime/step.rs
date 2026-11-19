@@ -314,7 +314,7 @@ impl ImeCore {
     }
 
     /// H4 to H9, X1 and X2. The Exo mirror takes every event first, before
-    /// the gate, as each changed Exo's text (design exo-mirror 2.2); then
+    /// the gate, as each changed Exo's text; then
     /// the guest is in step with Exo after a tracker-changing event only if
     /// its transaction reached the guest and left the two alike (3.2).
     fn host_event(&mut self, ti: TiId, event: HostIme, fx: &mut Effects) {
@@ -504,7 +504,7 @@ impl ImeCore {
                     None => (false, None, None),
                 };
             // A report applies at the barrier glued to it, which places it
-            // among Exo's events for the mirror (design exo-mirror 2.3). One
+            // among Exo's events for the mirror. One
             // the guest stated that Exo could only drop its composition for is
             // withheld (5); the rest of the commit still goes out.
             let surrounding_text = surrounding_text.filter(|(_, (report, stated))| {
@@ -551,8 +551,8 @@ impl ImeCore {
 
 /// H7 to H9, X1 and X2 through the gate: plan the event's transaction and
 /// send it. A delete and a region are measured in the frame `measuring`
-/// holds, Exo's text before the event, or dropped (design single-exo-model
-/// 3.4). Returns what reached the guest, if the event did.
+/// holds, Exo's text before the event, or dropped. Returns what reached
+/// the guest, if the event did.
 fn composition_event(
     ti: TiId,
     t: &mut TextInput,
@@ -630,7 +630,7 @@ fn composition_event(
                 // Exo ends its composition at an empty region, measured or
                 // not, and leaves it as text: the guest commits what it
                 // shows, which at worst doubles text the next preedit
-                // would otherwise replace (design single-exo-model 3.4).
+                // would otherwise replace.
                 Err(drop) if length == 0 && cur.shown().is_some() => {
                     dropped = Some((index, length, drop));
                     (cur.commit_shown(), Takes::Before)
@@ -685,9 +685,8 @@ fn composition_event(
 
 /// The core drops a host `what`, a delete or a region, as the Exo mirror
 /// cannot measure it, for `why`. The event did not reach the guest, which
-/// is then out of step with Exo until its next report (design
-/// single-exo-model 3.4). The first drop for want of a mirror warns, as it
-/// is the host's limit.
+/// is then out of step with Exo until its next report. The first drop for
+/// want of a mirror warns, as it is the host's limit.
 fn log_unmeasured(ti: TiId, t: &mut TextInput, what: &str, why: Unmeasured) {
     #[cfg(test)]
     DROPS.with(|drops| {
