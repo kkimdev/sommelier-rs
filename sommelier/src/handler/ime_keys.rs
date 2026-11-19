@@ -650,6 +650,26 @@ mod tests {
         );
     }
 
+    /// Keys held since `wl_keyboard.enter` are ordered by their peeks, not
+    /// by the order the enter listed them in: an empty confirmation stands
+    /// for the key peeked last. The guest holds both from the enter, so it
+    /// gets no pair, only the `done` of a held key found.
+    #[test]
+    fn keys_held_since_enter_are_ordered_by_their_peeks() {
+        const TAB: u32 = 15;
+        const SPACE: u32 = 57;
+        let mut ime = Ime::with_extended_keyboard();
+        let generations = &mut ime.ctx.key_generations;
+        generations.install_enter_snapshot(HOST_KEYBOARD, [TAB, SPACE]);
+        let repeatable = ime.ctx.keyboard_repeatable_keys.entry(HOST_KEYBOARD);
+        repeatable.or_default().extend([TAB, SPACE]);
+
+        ime.peek(SPACE, PRESSED, 700, 100);
+        ime.peek(TAB, PRESSED, 701, 101);
+        ime.confirm();
+        assert_eq!(ime.events(), [uncommitted_done()]);
+    }
+
     #[test]
     fn empty_confirmation_prefers_the_keyboard_focused_on_the_current_surface() {
         let mut ime = Ime::with_keyboard();

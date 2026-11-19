@@ -609,8 +609,12 @@ impl KeyGenerationRegistry {
             // Released is the only unambiguous boundary for a new generation.
             self.observe_physical_press(keyboard, key, Some(serial));
         }
+        // The peek numbers the generation as it arrives, so that the latest
+        // peek has the highest sequence, a key held since `enter` included,
+        // which the enter numbered in the order it listed the keys.
+        let sequence = self.allocate_generation();
         let generation = self.ensure_generation(keyboard, key);
-        let sequence = generation.id;
+        generation.id = sequence;
         generation.peek_press_serial = Some(serial);
         generation.peek = Some(PeekKeyProvenance {
             serial,
@@ -2434,12 +2438,16 @@ mod tests {
                 {
                     self.press(key, Some(serial));
                 }
+                self.ensure(key);
+                self.next_generation = self.next_generation.wrapping_add(1).max(1);
+                let sequence = self.next_generation;
                 let generation = self.ensure(key);
+                generation.id = sequence;
                 generation.peek_press_serial = Some(serial);
                 generation.peek = Some(PeekKeyProvenance {
                     serial,
                     time,
-                    sequence: generation.id,
+                    sequence,
                     eligible,
                 });
             }

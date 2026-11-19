@@ -4039,10 +4039,15 @@ mod tests {
     fn a_duplicate_pressed_peek_keeps_its_generation() {
         let mut p = Proxy::new();
         p.map(KEYBOARD);
+        let sequence = |p: &Proxy| {
+            let press = p.ctx.key_generations.peek(HostId(KEYBOARD.host), KEY_SPACE);
+            press.map(|press| press.sequence)
+        };
         assert_eq!(p.peek(KEYBOARD, 1, 100, KEY_SPACE, PRESSED), Action::Drop);
+        let first = sequence(&p);
+        assert!(first.is_some());
         assert_eq!(p.peek(KEYBOARD, 2, 200, KEY_SPACE, PRESSED), Action::Drop);
-        let press = p.ctx.key_generations.peek(HostId(KEYBOARD.host), KEY_SPACE);
-        assert_eq!(press.map(|press| press.sequence), Some(1));
+        assert_eq!(sequence(&p), first);
     }
 
     #[test]
