@@ -540,11 +540,13 @@ pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepe
 /// - before any peek, the keyboard's `modifiers` leave it waiting: Exo
 ///   sends them right before the key they apply to;
 /// - the `peek_key` press of a key the keyboard does not hold leaves it
-///   waiting, as that key's possible press;
-/// - that key's `wl_keyboard.key` press, with the peek's serial, shows that
-///   the input method did not handle the press, so the confirmation was
-///   its own: no key is recovered, as when a confirmation finds no held
-///   key;
+///   waiting, as that key's possible press. The keyboard may be any of the
+///   connection's, of any guest seat: Exo has one seat, and sends each of
+///   its keyboards the press in turn;
+/// - that key's `wl_keyboard.key` press on that keyboard, with the peek's
+///   serial, shows that the input method did not handle the press, so the
+///   confirmation was its own: no key is recovered, as when a confirmation
+///   finds no held key;
 /// - the text input's `leave` shows that the confirmation was the one Exo
 ///   sends as it detaches the input method (E6): no key is recovered
 ///   either, and the detach ends the recovery of every key held
@@ -631,13 +633,10 @@ pub(crate) fn before_host_event(
                 .extended_keyboard_to_keyboard
                 .get(&HostId(sender))
                 .copied();
+            // Any keyboard of the connection: Exo has one seat, which
+            // sends each keyboard of every guest seat the press in turn.
             let press = keyboard.filter(|&keyboard| {
-                let seat = ctx
-                    .shadow_table
-                    .get_guest_id(keyboard.0)
-                    .and_then(|guest| ctx.keyboard_to_seat.get(&guest));
                 state == wl_keyboard::KEY_STATE_PRESSED
-                    && seat == Some(&pending.seat.0)
                     && !ctx.key_generations.physically_held(keyboard, key)
             });
             match press {

@@ -4427,6 +4427,49 @@ mod tests {
         }
     }
 
+    /// ChromeOS has one physical seat, which every guest `wl_seat` stands
+    /// for, and Exo sends each keyboard of the client its key events in
+    /// turn, so another seat's keyboard may hear of a press first. Its
+    /// peek keeps a recovery waiting as one on the held key's keyboard
+    /// would, and its key press, with the peek's serial, shows the
+    /// confirmation was Exo's before that press (E13): the held Space is
+    /// not recovered.
+    #[tokio::test]
+    async fn a_press_on_another_seats_keyboard_keeps_a_recovery_waiting() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        let mut kb = Kb::new().await;
+        let ime = kb.text_input().await;
+        let (_, other) = kb.s.keyboard().await;
+        let other = Keyboard {
+            id: other.id,
+            host: other.host,
+            ext: 0,
+        };
+        let surface = kb.surface;
+        let other = kb.first_enter(other, surface).await;
+        kb.peek(700, 1234, KEY_SPACE, PRESSED).await;
+
+        let confirm = zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0);
+        kb.s.host([confirm]).await;
+        let [(_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            kb.s.host_received()[..]
+        else {
+            panic!("no recovery waits");
+        };
+        kb.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(other.ext, 701, 1300, KEY_A, PRESSED),
+            wl_keyboard::evt::key(other.host, 701, 1300, KEY_A, PRESSED),
+        ])
+        .await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [key_event(other, 701, 1300, KEY_A, PRESSED)]
+        );
+        assert_eq!(kb.s.host_received(), [acked(other, 701, HANDLED)]);
+        kb.s.host([wl_callback::evt::done(callback, 0)]).await;
+        assert_eq!(kb.s.guest_received(), []);
+    }
+
     #[tokio::test]
     async fn held_space_repeats_after_ime_commit_until_physical_release() {
         let mut kb = Kb::new().await;

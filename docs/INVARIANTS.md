@@ -776,11 +776,13 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   (`ime_keys::PendingRecovery`), and decides it before it handles the
   host's next event. Before any peek, `wl_keyboard.modifiers` leave it
   waiting, and so does the `peek_key` press of a key the keyboard does not
-  hold. That key's `wl_keyboard.key` press, with the peek's serial, drops
-  it, as a confirmation that finds no held key, and so does the text
-  input's `leave`: Exo confirms as it detaches the input method (E6). Any
-  other host event recovers the key first, so that its pair and `done`
-  precede that event.
+  hold, from any keyboard of the connection: Exo has one seat, which every
+  guest `wl_seat` stands for, and sends each keyboard the press in turn.
+  That key's `wl_keyboard.key` press on the same keyboard, with the peek's
+  serial, drops it, as a confirmation that finds no held key, and so does
+  the text input's `leave`: Exo confirms as it detaches the input method
+  (E6). Any other host event recovers the key first, so that its pair and
+  `done` precede that event.
   With a recovery that waits the proxy sends the host a `wl_display.sync`,
   whose `done` follows the whole task (E11), so one round trip decides it
   at the latest, with no timer. The pair goes only if the text input still
@@ -798,6 +800,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   a restart.
   Tests: `a_confirmation_before_an_unhandled_press_recovers_no_held_key`,
   `a_confirmation_before_a_handled_press_recovers_the_held_key`,
+  `a_press_on_another_seats_keyboard_keeps_a_recovery_waiting`,
   `a_waiting_recovery_ends_with_its_text_input_or_keyboard`,
   `an_input_method_detach_ends_the_recovery_of_held_keys`,
   `a_key_held_across_a_detach_is_typed_and_recovered_again`,
