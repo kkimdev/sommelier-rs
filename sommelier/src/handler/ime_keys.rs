@@ -297,7 +297,7 @@ pub(super) fn on_keysym(ctx: &mut Context, serial: u32, time: u32, sym: u32, sta
     let sym_char = std::char::from_u32(sym)
         .map(|c| c.to_string())
         .unwrap_or_default();
-    let Some(guest_id) = active_guest_for_host_text_input(ctx, host_id) else {
+    let Some((guest_id, guest_seat)) = active_guest_for_host_text_input(ctx, host_id) else {
         log::debug!(
             "Ignoring stale keysym for inactive host text input {}",
             host_id
@@ -315,8 +315,7 @@ pub(super) fn on_keysym(ctx: &mut Context, serial: u32, time: u32, sym: u32, sta
         state
     );
 
-    let guest_seat = ctx.ime.get(crate::ime::TiId(guest_id)).map(|t| t.seat().0);
-    let keyboard = guest_seat.and_then(|seat| keyboard_for_keysym(ctx, seat, sym));
+    let keyboard = keyboard_for_keysym(ctx, guest_seat, sym);
     if let Some((keyboard_id, host_keyboard_id)) = keyboard {
         if !matches!(
             state,
@@ -364,9 +363,7 @@ pub(super) fn on_keysym(ctx: &mut Context, serial: u32, time: u32, sym: u32, sta
                 || (decision.ends_repeat
                     && keycode == crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
             {
-                if let Some(guest_seat) = guest_seat {
-                    end_backspace_repeat_for_seat(ctx, guest_seat);
-                }
+                end_backspace_repeat_for_seat(ctx, guest_seat);
             }
             log::debug!(
                 "  -> forwarding wl_keyboard.key: keyboard_id={}, serial={}, time={}, keycode={}, state={}",

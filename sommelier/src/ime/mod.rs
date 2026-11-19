@@ -34,16 +34,15 @@ mod step;
 #[cfg(test)]
 mod tests;
 
-// Shared with the old handlers until the staged switch deletes them.
+// What handler tests outside the core use: two pure helpers they test, and
+// the state they set up and read directly, as no peer can
+// (`test_support::text_input`).
 #[cfg(test)]
 pub(crate) use guest::delete_lengths;
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
 #[cfg(test)]
-pub(crate) use state::Assembly;
-#[cfg(test)]
-pub(crate) use state::LinkState;
-pub(crate) use state::TextInput;
+pub(crate) use state::{Assembly, LinkState, TextInput};
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -254,26 +253,17 @@ pub trait Env {
 /// The text inputs of one connection.
 #[derive(Debug, Default)]
 pub struct ImeCore {
-    inputs: BTreeMap<TiId, TextInput>,
+    inputs: BTreeMap<TiId, state::TextInput>,
     /// Each extension object's text input. Only `Create` and removal
     /// change it.
     by_ext: BTreeMap<u32, TiId>,
     next_barrier: u64,
 }
 
-/// The storage switch's window (docs/IME_REDESIGN.md, C3a to C3c): the
-/// old handlers keep their shape and own when each text input is
-/// reconciled, and they reach the state through these until `step` does.
 impl ImeCore {
     /// G1: text input `ti` of `seat`, with the host objects `host`, focused
     /// on `surface`, if any.
-    pub(crate) fn insert(
-        &mut self,
-        ti: TiId,
-        seat: SeatId,
-        host: HostTi,
-        surface: Option<SurfaceId>,
-    ) {
+    fn insert(&mut self, ti: TiId, seat: SeatId, host: HostTi, surface: Option<SurfaceId>) {
         // The guest cannot reuse a live text input's ID. Should one be
         // replaced anyway, its extension goes with it, so that `by_ext`
         // names only live text inputs (I4).
@@ -282,16 +272,35 @@ impl ImeCore {
         if let Some(ext) = host.ext {
             self.by_ext.insert(ext.id, ti);
         }
-        self.inputs.insert(ti, TextInput::new(seat, host, surface));
+        self.inputs
+            .insert(ti, state::TextInput::new(seat, host, surface));
     }
 
     /// Forget text input `ti`, and its extension.
-    pub(crate) fn forget(&mut self, ti: TiId) -> Option<TextInput> {
+    fn forget(&mut self, ti: TiId) -> Option<state::TextInput> {
         let t = self.inputs.remove(&ti)?;
         if let Some(ext) = t.host().ext {
             self.by_ext.remove(&ext.id);
         }
         Some(t)
+    }
+}
+
+/// What handler tests outside the core set up and read directly, as no
+/// peer can (`test_support::text_input` and the tests of
+/// `handler/text_input.rs`).
+#[cfg(test)]
+impl ImeCore {
+    /// Text input `ti` as [`Input::Create`] makes it, without its host
+    /// requests.
+    pub(crate) fn insert_for_test(
+        &mut self,
+        ti: TiId,
+        seat: SeatId,
+        host: HostTi,
+        surface: Option<SurfaceId>,
+    ) {
+        self.insert(ti, seat, host, surface);
     }
 
     pub(crate) fn get(&self, ti: TiId) -> Option<&TextInput> {

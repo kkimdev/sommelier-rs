@@ -18,10 +18,9 @@ limitations under the License.
 //! `handler/text_input.rs` that set up or read state no peer can observe.
 //!
 //! This is the only handler test code outside that file which touches the
-//! text-input storage, the IME core's ([`crate::ime::ImeCore`]), so the
-//! core's switch from the old handlers to `step` rewrites only this
-//! module. A test that can pin what the peers receive uses
-//! `proxy::harness::Session` instead.
+//! text-input storage, the IME core's ([`crate::ime::ImeCore`]), so a
+//! change of that storage rewrites only this module. A test that can pin
+//! what the peers receive uses `proxy::harness::Session` instead.
 
 use crate::handler::text_input::CtxEnv;
 use crate::ime::{Assembly, HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId};
@@ -93,7 +92,8 @@ pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
     };
     let ti = TiId(guest);
     let focus = active.focus.map(SurfaceId);
-    ctx.ime.insert(ti, SeatId(active.seat), host, focus);
+    ctx.ime
+        .insert_for_test(ti, SeatId(active.seat), host, focus);
     let env = CtxEnv::new(&ctx.shadow_table, &ctx.keyboard_focus);
     let t = ctx.ime.get_mut(ti).expect("just inserted");
     if let Some(committed) = t.committed_mut_for_test() {

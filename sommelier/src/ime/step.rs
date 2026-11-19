@@ -20,7 +20,7 @@ limitations under the License.
 
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
-use super::state::{Assembly, Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput};
+use super::state::{Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput};
 use super::{
     BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, Input, KeyEffect, LeaseOutcome,
     SeatId, SurfaceId, TiId,
@@ -37,6 +37,18 @@ use crate::wire::{IndexedString, Outgoing};
 /// answer of [`Env`] the step reads, and every effect. It carries the
 /// user's text, so it is only ever at `trace`.
 const TRACE: &str = "sommelier::ime";
+
+/// When a planned host composition event takes the assembly, as the old
+/// handlers did (B3, design H9).
+enum Takes {
+    /// It took it before it was planned: a preedit and a region, which
+    /// apply it.
+    Before,
+    /// Once it reaches the guest: a commit and a delete.
+    IfApplied,
+    /// Whether or not it fits a message: a confirmation of a preedit.
+    Planned,
+}
 
 /// What a guest commit sends the host besides its reconciled state: the
 /// surrounding text, already encoded, and the cursor rectangle it states.
@@ -271,7 +283,7 @@ impl ImeCore {
         let Some(t) = self.inputs.get_mut(&ti) else {
             return;
         };
-        let assembly = match event {
+        match event {
             HostIme::PreeditStyling {
                 index,
                 length,
@@ -294,72 +306,76 @@ impl ImeCore {
             }
             HostIme::CursorPosition { index, anchor } => {
                 // Exo sends it only before a commit_string.
-                // H6: the old handlers recorded it for the next commit and
-                // only logged it there.
+                // H6: v3 has no cursor position apart from the preedit's.
                 log::debug!("Cannot represent v1 cursor_position({index}, {anchor}) in v3");
                 return;
             }
-            // B3: a preedit and a region, which apply the assembly, take it
-            // first, whatever becomes of them.
-            HostIme::Preedit { .. } | HostIme::PreeditRegion { .. } => t.take_assembly(),
-            // A commit and a delete take it only once they reach the guest,
-            // and a confirmation once it has a preedit to commit (below), as
-            // the old handlers did (design H9).
-            HostIme::Commit { .. } | HostIme::Delete { .. } | HostIme::Confirm => {
-                Assembly::default()
-            }
-        };
-        // Whether the event keeps the assembly if it is dropped, as a
-        // commit and a delete do.
-        let keeps_if_dropped = matches!(event, HostIme::Commit { .. } | HostIme::Delete { .. });
+            HostIme::Preedit { .. }
+            | HostIme::Commit { .. }
+            | HostIme::Delete { .. }
+            | HostIme::PreeditRegion { .. }
+            | HostIme::Confirm => {}
+        }
         let count = t.serial().get();
-        let Some(cur) = t.current(ti) else {
+        let Some(mut cur) = t.current(ti) else {
+            // B3: a preedit and a region take the assembly they apply
+            // whatever becomes of them, a stale one included.
+            if matches!(
+                event,
+                HostIme::Preedit { .. } | HostIme::PreeditRegion { .. }
+            ) {
+                t.take_assembly();
+            }
             log::debug!("Ignoring a stale composition event of text input {}", ti.0);
             return;
         };
-        let planned = match event {
+        let (planned, takes) = match event {
             HostIme::Preedit {
                 serial,
                 text,
                 commit,
             } => {
                 log_host_serial(serial, count);
+                let assembly = cur.take_assembly();
                 // The assembly's offsets index the text, which replacing
                 // an invalid sequence would move.
                 let IndexedString::Utf8(text) = text else {
                     log::debug!("Ignoring a host preedit that is not UTF-8");
                     return;
                 };
-                cur.preedit(text, commit, assembly)
+                (cur.preedit(text, commit, assembly), Takes::Before)
             }
             HostIme::Commit { serial, text } => {
                 log_host_serial(serial, count);
-                cur.host_commit(text)
+                (cur.host_commit(text), Takes::IfApplied)
             }
             HostIme::Delete { index, length } => match cur.delete(index, length) {
-                Ok(planned) => planned,
+                Ok(planned) => (planned, Takes::IfApplied),
                 Err(drop) => return log_delete_drop(ti, t, index, length, drop),
             },
-            HostIme::PreeditRegion { index, length } => match cur.region(index, length, assembly) {
-                Ok(planned) => planned,
-                Err(RegionDrop::Uncovered) => {
-                    log::debug!(
-                        "Ignoring a preedit region {index}+{length} of text input {} that does \
-                         not cover the preedit it shows",
-                        ti.0
-                    );
-                    return;
+            HostIme::PreeditRegion { index, length } => {
+                let assembly = cur.take_assembly();
+                match cur.region(index, length, assembly) {
+                    Ok(planned) => (planned, Takes::Before),
+                    Err(RegionDrop::Uncovered) => {
+                        log::debug!(
+                            "Ignoring a preedit region {index}+{length} of text input {} that \
+                             does not cover the preedit it shows",
+                            ti.0
+                        );
+                        return;
+                    }
+                    Err(drop) => {
+                        log::warn!(
+                            "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
+                            ti.0
+                        );
+                        return;
+                    }
                 }
-                Err(drop) => {
-                    log::warn!(
-                        "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
-                        ti.0
-                    );
-                    return;
-                }
-            },
+            }
             HostIme::Confirm => match cur.confirm() {
-                Confirm::Commit(planned) => planned,
+                Confirm::Commit(planned) => (planned, Takes::Planned),
                 Confirm::RecoverHeldKey(recover) => return fx.keys.push(recover),
             },
             HostIme::PreeditStyling { .. }
@@ -367,7 +383,12 @@ impl ImeCore {
             | HostIme::CursorPosition { .. } => unreachable!("handled above"),
         };
         let applied = planned.apply();
-        if applied.is_ok() || !keeps_if_dropped {
+        let take = match takes {
+            Takes::Before => false,
+            Takes::IfApplied => applied.is_ok(),
+            Takes::Planned => true,
+        };
+        if take {
             t.take_assembly();
         }
         match applied {

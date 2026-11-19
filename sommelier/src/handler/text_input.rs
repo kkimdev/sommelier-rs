@@ -159,9 +159,12 @@ fn recover_held_key(ctx: &mut Context, ti: TiId, seat: SeatId, done: Outgoing) {
     ctx.host_to_client_queue.push(done);
 }
 
-pub(super) fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<u32> {
+/// The guest text input of host text input `host_id`, and its guest seat,
+/// while its host keysyms reach the guest (H10).
+pub(super) fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<(u32, u32)> {
     let guest_id = ctx.shadow_table.get_guest_id(host_id)?;
-    ctx.ime.keysym_target(TiId(guest_id)).map(|_| guest_id)
+    let seat = ctx.ime.keysym_target(TiId(guest_id))?;
+    Some((guest_id, seat.0))
 }
 
 /// Apply what the IME core asks of the Backspace repeat leased to a text
@@ -4938,7 +4941,7 @@ pub(super) mod tests {
             };
             let ti = TiId(TI);
             ctx.ime
-                .insert(ti, SeatId(SEAT), host, Some(SurfaceId(SURFACE)));
+                .insert_for_test(ti, SeatId(SEAT), host, Some(SurfaceId(SURFACE)));
             let mut ime = Self { ctx };
             ime.committed().enabled = true;
             ime.settle();
