@@ -250,6 +250,8 @@ pub(super) struct Counts {
     pub late: u64,
     /// Engine answers whose text a reset dropped (E5's outcome (b)).
     pub dropped: u64,
+    /// Exo's own detaches while attached (H2).
+    pub host_detaches: u64,
 }
 
 impl std::ops::AddAssign for Counts {
@@ -260,6 +262,7 @@ impl std::ops::AddAssign for Counts {
         self.raw_keys += other.raw_keys;
         self.late += other.late;
         self.dropped += other.dropped;
+        self.host_detaches += other.host_detaches;
     }
 }
 
@@ -556,6 +559,7 @@ impl SpecText {
         match event {
             v1::Event::Leave {} if self.link == Link::Attached => {
                 // H2: Exo detached on its own.
+                self.counts.host_detaches += 1;
                 if self.shown.is_some() {
                     self.apply(&Txn::default(), (0, 0));
                 }
@@ -975,9 +979,22 @@ pub(super) enum KnownIssue {
     /// P1: a focus move away from a field that composes loses the
     /// composition in a client that does not keep it itself (GTK).
     FocusWhileComposing,
+    /// A restart of the input method while the guest shows a composition
+    /// that Exo no longer tracks loses it, below v11 of the extension.
+    RestartLosesUntrackedComposition,
 }
 
 impl KnownIssue {
+    /// The sets of issues a case can show, the smallest first.
+    const SETS: [&'static [Self]; 3] = [
+        &[Self::FocusWhileComposing],
+        &[Self::RestartLosesUntrackedComposition],
+        &[
+            Self::FocusWhileComposing,
+            Self::RestartLosesUntrackedComposition,
+        ],
+    ];
+
     /// Why the proxy fails the user here.
     pub fn reason(self) -> &'static str {
         match self {
@@ -987,6 +1004,12 @@ impl KnownIssue {
                  Exo's detach then confirms the composition, but the link is draining and the \
                  proxy drops the confirmation"
             }
+            Self::RestartLosesUntrackedComposition => {
+                "a report Exo could not match to its prediction dropped the composition Exo \
+                 tracks (E4), and below v11 of the extension Exo's detach confirms only a \
+                 tracked composition (E6), so it confirms nothing; at its `leave` the proxy \
+                 clears the preedit the guest shows (H2)"
+            }
         }
     }
 
@@ -994,35 +1017,66 @@ impl KnownIssue {
     pub fn tracking(self) -> &'static str {
         match self {
             Self::FocusWhileComposing => "docs/IME_REDESIGN.md 1.3 P1; fixed by C5",
+            Self::RestartLosesUntrackedComposition => {
+                "docs/IME_REDESIGN.md 2.2 H2; C5 decides whether H2 commits the shown preedit"
+            }
         }
     }
 }
 
-/// The known issue that explains a case's `failures`, if one does: tier 1
-/// passed, and the client shows exactly what the issue predicts
-/// (`predicts`, asked only then).
+/// The known issues that explain a case's `failures`, if any do: tier 1
+/// passed, and the client shows exactly what a set of issues predicts
+/// together (`predicts`, asked of each set, the smallest first, and only
+/// then).
 pub(super) fn classify(
     failures: &[Failure],
-    predicts: impl FnOnce() -> bool,
-) -> Option<KnownIssue> {
+    mut predicts: impl FnMut(&[KnownIssue]) -> bool,
+) -> Vec<KnownIssue> {
     let intent_only = !failures.is_empty() && failures.iter().all(|f| f.tier == Tier::Intent);
-    (intent_only && predicts()).then_some(KnownIssue::FocusWhileComposing)
+    let mut sets = KnownIssue::SETS.into_iter();
+    match intent_only {
+        true => sets.find(|set| predicts(set)).unwrap_or_default().to_vec(),
+        false => Vec::new(),
+    }
 }
 
-/// Whether `client` shows exactly what P1 predicts of `actions` on fields
-/// holding `texts`, typed as `typing` says: the user's intent, except that
-/// each focus move away from a composing field loses the composition
-/// instead of committing it.
-pub(super) fn focus_moves_lose_composition(
-    texts: &[String],
-    typing: Typing,
-    actions: &[UserAction],
-    client: &dyn Client,
-) -> bool {
-    let fields = texts.iter().map(|text| TextModel::new(text)).collect();
-    let mut reference = Reference::new(fields).typing(typing);
-    for &action in actions {
-        reference.apply_losing_composition(action);
+/// What the user did in a case, and what the host did of it that a known
+/// issue's prediction needs.
+pub(super) struct Played<'a> {
+    /// The fields' initial texts.
+    pub texts: &'a [String],
+    pub typing: Typing,
+    pub actions: &'a [UserAction],
+    /// For each restart of the input method, whether Exo's detach confirmed
+    /// no composition there.
+    pub untracked_restarts: &'a [bool],
+}
+
+/// Whether `client` shows exactly what `issues` predict of `played`: the
+/// user's intent, except that each issue loses the composition where it
+/// strikes instead of committing it. P1 strikes at each focus move away
+/// from a composing field; the lost restart at each restart whose detach
+/// confirmed nothing.
+pub(super) fn issues_predict(issues: &[KnownIssue], played: &Played, client: &dyn Client) -> bool {
+    let fields = played
+        .texts
+        .iter()
+        .map(|text| TextModel::new(text))
+        .collect();
+    let mut reference = Reference::new(fields).typing(played.typing);
+    let mut restarts = played.untracked_restarts.iter();
+    for &action in played.actions {
+        let lose = match action {
+            UserAction::RestartInputMethod => {
+                let untracked = restarts.next().copied().unwrap_or(false);
+                untracked && issues.contains(&KnownIssue::RestartLosesUntrackedComposition)
+            }
+            action => {
+                issues.contains(&KnownIssue::FocusWhileComposing)
+                    && reference.leaves_composition(action)
+            }
+        };
+        reference.apply_losing(action, lose);
     }
     intended(&reference, client).is_empty()
 }
@@ -1339,11 +1393,13 @@ mod tests {
 
     #[test]
     fn exo_or_the_proxy_detaching_or_a_focus_change_drops_the_preedit() {
-        // H2: Exo's own detach clears the preedit, committing nothing.
+        // H2: Exo's own detach clears the preedit, committing nothing, and
+        // counts.
         let mut spec = attached(&["0", "1"]);
         preedit(&mut spec, "가");
         host(&mut spec, v1::Event::Leave {}, &[activate(0)]);
         assert_eq!(spec.views[0], view("0", 1, ""));
+        assert_eq!(spec.counts.host_detaches, 1);
         // F1: the keyboard leaves; the guest drops the preedit at the text
         // input's leave.
         let mut spec = attached(&["0", "1"]);
@@ -1358,6 +1414,10 @@ mod tests {
         preedit(&mut spec, "각");
         host(&mut spec, enter(0), &[]);
         assert_eq!(spec.views[0], view("0", 1, ""));
+        // A leave that answers the proxy's deactivate is not Exo's own
+        // (H2').
+        host(&mut spec, v1::Event::Leave {}, &[]);
+        assert_eq!(spec.counts.host_detaches, 0);
         assert_eq!(spec.wrong_decisions, Vec::<String>::new());
     }
 
@@ -1540,35 +1600,66 @@ mod tests {
 
     #[test]
     fn a_known_issue_must_predict_exactly_what_the_client_shows() {
+        use KnownIssue::{FocusWhileComposing as P1, RestartLosesUntrackedComposition as Lost};
         // The user typed 가 in field 0 and moved to field 1: P1 loses it.
         let actions = [
             UserAction::Key(Key::Char('r')),
             UserAction::Key(Key::Char('k')),
             UserAction::Focus(1),
         ];
-        let fields = texts(&["0", "1"]);
-        let predicts = |client: &Gtk| {
-            focus_moves_lose_composition(&fields, Typing::default(), &actions, client)
+        let texts = texts(&["0", "1"]);
+        let played = Played {
+            texts: &texts,
+            typing: Typing::default(),
+            actions: &actions,
+            untracked_restarts: &[],
         };
-        assert!(predicts(&gtk(["0", "1"], 1)));
-        assert!(!predicts(&gtk(["0가", "1"], 1)), "it kept the syllable");
-        assert!(!predicts(&gtk(["0", "1x"], 1)), "and lost something else");
+        let predicts =
+            |issues: &[KnownIssue], client: &Gtk| issues_predict(issues, &played, client);
+        assert!(predicts(&[P1], &gtk(["0", "1"], 1)));
+        assert!(!predicts(&[], &gtk(["0", "1"], 1)), "no issue keeps it");
+        assert!(
+            !predicts(&[P1], &gtk(["0가", "1"], 1)),
+            "it kept the syllable"
+        );
+        assert!(
+            !predicts(&[P1], &gtk(["0", "1x"], 1)),
+            "and lost something else"
+        );
+        // A restart loses 가 only where Exo's detach confirmed nothing.
+        let actions = [
+            UserAction::Key(Key::Char('r')),
+            UserAction::Key(Key::Char('k')),
+            UserAction::RestartInputMethod,
+            UserAction::Focus(1),
+        ];
+        let lost = |untracked_restarts| Played {
+            untracked_restarts,
+            actions: &actions,
+            ..played
+        };
+        let client = gtk(["0", "1"], 1);
+        assert!(issues_predict(&[Lost], &lost(&[true]), &client));
+        assert!(!issues_predict(&[Lost], &lost(&[false]), &client));
+        assert!(!issues_predict(&[P1], &lost(&[true]), &client), "not P1's");
         let lost = Failure {
             tier: Tier::Intent,
             check: "text",
             field: Some(0),
             detail: String::new(),
         };
-        let known = Some(KnownIssue::FocusWhileComposing);
-        assert_eq!(classify(std::slice::from_ref(&lost), || true), known);
-        assert_eq!(classify(std::slice::from_ref(&lost), || false), None);
-        assert_eq!(classify(&[], || true), None);
+        let one = std::slice::from_ref(&lost);
+        assert_eq!(classify(one, |_| true), [P1]);
+        assert_eq!(classify(one, |issues| issues == [Lost]), [Lost]);
+        assert_eq!(classify(one, |issues| issues.len() == 2), [P1, Lost]);
+        assert_eq!(classify(one, |_| false), []);
+        assert_eq!(classify(&[], |_| true), []);
         let exact = Failure {
             tier: Tier::Exact,
             ..lost.clone()
         };
-        assert_eq!(classify(&[lost, exact], || true), None);
-        let issue = KnownIssue::FocusWhileComposing;
-        assert!(!issue.reason().is_empty() && issue.tracking().contains("C5"));
+        assert_eq!(classify(&[lost, exact], |_| true), []);
+        assert!(!P1.reason().is_empty() && P1.tracking().contains("C5"));
+        assert!(!Lost.reason().is_empty() && Lost.tracking().contains("H2"));
     }
 }

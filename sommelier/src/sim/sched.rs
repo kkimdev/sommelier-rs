@@ -288,6 +288,12 @@ pub(super) struct World<'t> {
     pub steps: Vec<String>,
     /// The proxy ended the session.
     pub ended: bool,
+    /// The host's text-input extension, if it has one.
+    extension: Option<u32>,
+    /// For each restart of the input method, whether Exo's detach confirms
+    /// no composition there: below v11 of the extension it confirms only
+    /// one it tracks (E6), and it tracked none.
+    pub untracked_restarts: Vec<bool>,
     trace: &'t mut Vec<Line>,
 }
 
@@ -323,6 +329,8 @@ impl<'t> World<'t> {
             shadow: None,
             steps: Vec::new(),
             ended: false,
+            extension: setup.extension,
+            untracked_restarts: Vec::new(),
             trace,
         };
         let registry = world.session.new_id();
@@ -465,7 +473,8 @@ impl<'t> World<'t> {
 
     /// The user acts: Exo takes a key's press and release; a click or a
     /// tap focuses its field's surface, as a click on a window does, and
-    /// then presses there; a focus move moves the seat's focus.
+    /// then presses there; a focus move moves the seat's focus; a restart
+    /// destroys the input method, which Exo replaces.
     fn act(&mut self, action: UserAction) {
         self.log(Place::User, format!("{action:?}"));
         let time = (self.now.0 / 1_000) as u32;
@@ -479,6 +488,14 @@ impl<'t> World<'t> {
                 ] {
                     self.exo.key(self.now, key, state);
                 }
+                return self.host_sends(Vec::new(), false);
+            }
+            UserAction::RestartInputMethod => {
+                let confirms = self.extension >= Some(11);
+                let tracked = self.exo.composition();
+                let untracked = !confirms && tracked.is_some_and(|text| text.is_empty());
+                self.untracked_restarts.push(untracked);
+                self.exo.destroy_input_method();
                 return self.host_sends(Vec::new(), false);
             }
             UserAction::Settle => return,

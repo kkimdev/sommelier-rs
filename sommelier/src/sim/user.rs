@@ -19,13 +19,14 @@ limitations under the License.
 //! Each field starts with marker digits ([`Target::BeforeMarker`]) between
 //! a few letters and syllables, and the user never types a digit, so a
 //! marker names the same place to the user and to a client that lags. The
-//! actions are about 65% keys (two-set jamo, in the order syllables take,
-//! plus Space and Backspace), 15% clicks, 8% taps, 7% focus moves and 5%
-//! settles; a Backspace comes only where it deletes no marker.
+//! actions are about 63% keys (two-set jamo, in the order syllables take,
+//! plus Space and Backspace), 15% clicks, 8% taps, 7% focus moves, 2%
+//! restarts of the input method and 5% settles; a Backspace comes only
+//! where it deletes no marker.
 //!
 //! A case is free or settled. A settled case is one the user-intent oracle
 //! can judge ([`settled`]): a `Settle` comes before and after every click,
-//! tap and focus move. Otherwise Exo can hand the engine a key after a
+//! tap, focus move and restart. Otherwise Exo can hand the engine a key after a
 //! press but before the press's reset, whose result the proxy drops by
 //! design (the fence), or a key can reach the client raw while a focus
 //! move's activation is in flight (E7). A settled case also settles after
@@ -77,16 +78,17 @@ pub(super) fn actions(
     let mut actions = Vec::new();
     for _ in 0..10 + rng.below(51) {
         let action = match rng.below(100) {
-            0..65 => UserAction::Key(key(rng, &reference)),
-            65..80 => UserAction::Click {
+            0..63 => UserAction::Key(key(rng, &reference)),
+            63..78 => UserAction::Click {
                 field: rng.below(FIELDS),
                 at: target(rng),
             },
-            80..88 => UserAction::Tap {
+            78..86 => UserAction::Tap {
                 field: rng.below(FIELDS),
                 at: target(rng),
             },
-            88..95 => UserAction::Focus(rng.below(FIELDS)),
+            86..93 => UserAction::Focus(rng.below(FIELDS)),
+            93..95 => UserAction::RestartInputMethod,
             _ => UserAction::Settle,
         };
         let moves = !matches!(action, UserAction::Key(_) | UserAction::Settle);
@@ -100,6 +102,11 @@ pub(super) fn actions(
                 if field != reference.focus() {
                     ima.moved(true);
                 }
+                false
+            }
+            // A new input method takes the engine to compose nothing.
+            UserAction::RestartInputMethod => {
+                ima.moved(true);
                 false
             }
             UserAction::Settle => false,
@@ -119,8 +126,8 @@ pub(super) fn actions(
     actions
 }
 
-/// Whether `actions` make a settled case: each click, tap and focus move
-/// has a `Settle` just before it and just after it, where the start and
+/// Whether `actions` make a settled case: each click, tap, focus move and
+/// restart has a `Settle` just before it and just after it, where the start and
 /// the end of the case count as settled.
 pub(super) fn settled(actions: &[UserAction]) -> bool {
     let settles = |at: Option<&UserAction>| matches!(at, None | Some(UserAction::Settle));
@@ -161,9 +168,10 @@ impl Ima {
         false
     }
 
-    /// A press, or a focus move `away` to another field. A focus move
-    /// detaches IMA, which resets; a press resets it only if it ends a
-    /// composition, as only then does the proxy reset the host (F4).
+    /// A press, or a focus move `away` to another field or a restart of the
+    /// input method. A focus move detaches IMA, which resets, and a restart
+    /// replaces it; a press resets it only if it ends a composition, as
+    /// only then does the proxy reset the host (F4).
     fn moved(&mut self, away: bool) {
         if away || !self.composer.preedit().is_empty() {
             self.composing = false;
@@ -241,6 +249,7 @@ mod tests {
         assert!(settled(&[click, UserAction::Settle, key]));
         assert!(!settled(&[key, click]));
         assert!(!settled(&[UserAction::Focus(1), key]));
+        assert!(!settled(&[key, UserAction::RestartInputMethod]));
         assert!(!settled(&[
             key,
             UserAction::Tap {
@@ -299,6 +308,7 @@ mod tests {
                         ima.moved(true);
                         focus = field;
                     }
+                    UserAction::RestartInputMethod => ima.moved(true),
                     _ => {}
                 }
             }
@@ -346,6 +356,7 @@ mod tests {
         assert!((10..20).contains(&share(|a| matches!(a, UserAction::Click { .. }))));
         assert!((4..12).contains(&share(|a| matches!(a, UserAction::Tap { .. }))));
         assert!((4..10).contains(&share(|a| matches!(a, UserAction::Focus(_)))));
+        assert!((1..4).contains(&share(|a| *a == UserAction::RestartInputMethod)));
         assert!((2..8).contains(&share(|a| *a == UserAction::Settle)));
         let backspaces = actions.contains(&UserAction::Key(Key::Backspace));
         assert!(backspaces, "a Backspace is generated");

@@ -148,8 +148,8 @@ impl Case {
 struct Outcome {
     /// The checks that failed, unless a known issue explains them.
     failures: Vec<Failure>,
-    /// The known issue that explains the failures, if one does.
-    known: Option<KnownIssue>,
+    /// The known issues that explain the failures, if any do.
+    known: Vec<KnownIssue>,
     counts: Counts,
     /// The text-input extension the host had, and the engine's lag.
     extension: Option<u32>,
@@ -178,7 +178,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         world.run(&case.actions).await;
         let mut outcome = Outcome {
             failures: Vec::new(),
-            known: None,
+            known: Vec::new(),
             counts: Counts::default(),
             extension,
             lag,
@@ -202,11 +202,17 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         }
         // P1 shows only in GTK, whose blur keeps no composition (C11).
         let gtk = case.client != ClientKind::Chromium;
-        outcome.known = oracle::classify(&failures, || {
-            let (texts, typing, actions) = (&case.texts, case.typing(), &case.actions);
-            gtk && oracle::focus_moves_lose_composition(texts, typing, actions, world.client())
+        let played = oracle::Played {
+            texts: &case.texts,
+            typing: case.typing(),
+            actions: &case.actions,
+            untracked_restarts: &world.untracked_restarts,
+        };
+        outcome.known = oracle::classify(&failures, |issues| {
+            (gtk || !issues.contains(&KnownIssue::FocusWhileComposing))
+                && oracle::issues_predict(issues, &played, world.client())
         });
-        if outcome.known.is_none() {
+        if outcome.known.is_empty() {
             outcome.failures = failures;
         }
         outcome
@@ -375,7 +381,7 @@ fn run_all(cases: &[Case]) -> Summary {
                 };
                 let outcome = Outcome {
                     failures: Vec::new(),
-                    known: None,
+                    known: Vec::new(),
                     counts: Counts::default(),
                     extension: None,
                     lag: Lag::Fast,
@@ -408,7 +414,7 @@ fn run_all(cases: &[Case]) -> Summary {
         summary.cases += 1;
         summary
             .known
-            .extend(outcome.known.map(|issue| (case.seed, issue)));
+            .extend(outcome.known.iter().map(|&issue| (case.seed, issue)));
         summary.counts += outcome.counts;
         summary.coverage.count(case, &outcome);
         if !outcome.failures.is_empty() {
@@ -440,10 +446,10 @@ fn pinned(test: &str, body: impl FnOnce()) {
 /// Runs the cases of one mode ([`pinned`]), prints the failed ones, and
 /// fails with the report of the first. A run of the default size or more
 /// must also have met each variant a case draws and each path the mode is
-/// there to reach: in free cases, presses that end a composition, fence
-/// drops, late answers the guest got and raw keys; in settled ones,
-/// presses and the known issue, and no fence drop, which a settled case
-/// must not cause.
+/// there to reach: presses that end a composition and Exo's own detaches
+/// (H2); in free cases, fence drops, late answers the guest got and raw
+/// keys; in settled ones, the known issues, and no fence drop, which a
+/// settled case must not cause.
 fn check(test: &str, settled: bool) {
     pinned(test, || {
         let summary = run_all(&cases(settled));
@@ -474,16 +480,12 @@ fn check(test: &str, settled: bool) {
                 .for_each(|line| println!("{line}"));
         }
         let mut reached = coverage.counters(!settled);
+        reached.extend([counts.press_commits, counts.host_detaches]);
         match settled {
-            false => reached.extend([
-                counts.press_commits,
-                counts.fence_drops,
-                counts.late_shown,
-                counts.raw_keys,
-            ]),
+            false => reached.extend([counts.fence_drops, counts.late_shown, counts.raw_keys]),
             // The known issue's count drops to 0 once C5 fixes P1, which
             // then deletes it here.
-            true => reached.extend([counts.press_commits, known.len() as u64]),
+            true => reached.push(known.len() as u64),
         }
         if *cases >= 300 {
             let known = known.len();
@@ -607,7 +609,7 @@ fn coverage_counts_each_draw_and_the_rare_paths() {
     .collect();
     let outcome = Outcome {
         failures: Vec::new(),
-        known: None,
+        known: Vec::new(),
         counts: Counts::default(),
         extension: Some(10),
         lag: Lag::Slow,

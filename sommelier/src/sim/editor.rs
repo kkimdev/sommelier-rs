@@ -101,6 +101,10 @@ pub(super) enum UserAction {
     },
     /// Moves the keyboard focus to a field's surface, as Alt-Tab does.
     Focus(usize),
+    /// Restarts the input method, as a switch of input methods or a crash
+    /// of its process does: Exo detaches it on its own, which confirms
+    /// the composition, and its engine starts afresh.
+    RestartInputMethod,
     /// Waits for the system to settle before the next action.
     Settle,
 }
@@ -252,6 +256,8 @@ fn decompose_hangul(c: char) -> Vec<char> {
 /// - A focus move to another field commits the composition in the field it
 ///   leaves, as Exo's confirm on detach intends. A focus move to the
 ///   focused field changes nothing.
+/// - A restart of the input method commits the composition, as Exo's
+///   confirm on detach intends, and keeps the focus.
 ///
 /// Field 0 has the focus at the start. [`Typing`] says how keys reach a
 /// field; by default the input method composes Korean and a Backspace
@@ -324,6 +330,7 @@ impl Reference {
                 self.commit_composition();
                 self.focus = field;
             }
+            UserAction::RestartInputMethod => self.commit_composition(),
             UserAction::Focus(_) | UserAction::Settle => {}
         }
     }
@@ -334,16 +341,18 @@ impl Reference {
         let field = match action {
             UserAction::Click { field, .. } | UserAction::Tap { field, .. } => field,
             UserAction::Focus(field) => field,
-            UserAction::Key(_) | UserAction::Settle => return false,
+            UserAction::Key(_) | UserAction::RestartInputMethod | UserAction::Settle => {
+                return false
+            }
         };
         field != self.focus && !self.composer.preedit().is_empty()
     }
 
-    /// Applies `action` as [`Reference::apply`] does, except that a move of
-    /// the focus away from a composing field loses the composition rather
-    /// than committing it, as the proxy's known issue P1 does.
-    pub fn apply_losing_composition(&mut self, action: UserAction) {
-        if self.leaves_composition(action) {
+    /// Applies `action` as [`Reference::apply`] does, except that if `lose`
+    /// the composition is lost first rather than committed, as the proxy's
+    /// known issues lose it.
+    pub fn apply_losing(&mut self, action: UserAction, lose: bool) {
+        if lose {
             self.composer.reset();
             self.fields[self.focus].preedit.clear();
         }
@@ -612,14 +621,33 @@ mod tests {
         };
         assert!(!editor.leaves_composition(tap), "a tap in the same field");
         assert!(editor.leaves_composition(UserAction::Focus(1)));
-        editor.apply_losing_composition(UserAction::Focus(1));
+        assert!(!editor.leaves_composition(UserAction::RestartInputMethod));
+        editor.apply_losing(UserAction::Focus(1), true);
         assert_eq!(editor.fields(), [model("0", 1, ""), model("1", 1, "")]);
         // The next syllable starts afresh.
         for action in typing("sk") {
-            editor.apply_losing_composition(action);
+            editor.apply_losing(action, false);
         }
         assert_eq!(editor.fields()[1], model("1", 1, "나"));
         assert!(!editor.leaves_composition(UserAction::Focus(1)));
+    }
+
+    #[test]
+    fn a_restart_of_the_input_method_commits_and_keeps_the_focus() {
+        let actions = [
+            typing("rk"),
+            vec![UserAction::RestartInputMethod],
+            typing("k"),
+        ]
+        .concat();
+        let editor = reference(&["0", "1"], &actions);
+        assert_eq!(editor.fields(), [model("0가", 4, "ㅏ"), model("1", 1, "")]);
+        assert_eq!(editor.focus(), 0);
+        // Or it loses the composition, which the next jamo does not join.
+        let mut editor = reference(&["0", "1"], &typing("rk"));
+        editor.apply_losing(UserAction::RestartInputMethod, true);
+        editor.apply(UserAction::Key(Key::Char('k')));
+        assert_eq!(editor.fields(), [model("0", 1, "ㅏ"), model("1", 1, "")]);
     }
 
     #[test]
