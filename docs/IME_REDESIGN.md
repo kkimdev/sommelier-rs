@@ -1554,9 +1554,18 @@ The actions are #73's `UserAction` and `Target`, used unchanged:
 - **Markers.** The generator keeps the markers. It generates a Backspace
   only when the `Reference` has something after the last marker, or
   after the start, to delete.
-- **Mix.** About 65% keys (jamo for syllable patterns, plus Space and
-  Backspace), 15% clicks, 8% taps, 7% focus changes and 5% `Settle`. A
-  case has 10 to 60 actions and two fields.
+- **Mix.** About 63% keys (jamo for syllable patterns, plus Space and
+  Backspace), 15% clicks, 8% taps, 7% focus changes, 2% restarts of the
+  input method and 5% `Settle`. A case has 10 to 60 actions and two
+  fields.
+- **Restarts.** `UserAction::RestartInputMethod` destroys Exo's input
+  method (`Exo::destroy_input_method`), which confirms and detaches on
+  its own (E2, E6), and starts its engine afresh. It is the only action
+  that reaches H2: since E12, a focus move always reaches the keyboard
+  first, so the proxy has already deactivated when Exo's `leave` comes
+  (H2'). A surface the guest destroys (F2) cannot reach H2 either: the
+  proxy resets the field and deactivates in the step that forwards the
+  destroy, before Exo learns of it. The DST does not generate F2.
 
 There are two generator modes:
 
@@ -1570,7 +1579,7 @@ There are two generator modes:
     every key.
   - **Every `Focus` is preceded by a `Settle`, and followed by one.**
     The activation needs a round trip, and keys typed inside it go raw
-    (E7).
+    (E7). So is every restart, for the same reason.
 
 Each mode gets half of the cases.
 
@@ -1671,7 +1680,7 @@ DST FAILURE seed=81321 mode=free client=Gtk{v4:false} ext=11 e6=confirm e8=text-
 
 ### 4.8 The known-issue list
 
-Only P1 remains, since #72 retired P2.
+#72 retired P2. P1 remains, and reaching H2 added a second.
 
 ```rust
 // sim/oracle.rs
@@ -1681,15 +1690,26 @@ enum KnownIssue {
     /// P1: a focus change while the client shows a preedit loses or
     /// keeps the syllable depending on Exo's event order. C5 fixes it.
     FocusWhileComposing,
+    /// H2: below v11 of the extension, Exo's detach confirms only a
+    /// composition it tracks, and a report it cannot match drops that
+    /// (E4); at the leave the proxy clears the preedit the guest shows.
+    /// C5 decides whether H2 commits it.
+    RestartLosesUntrackedComposition,
 }
 ```
 
-A failure is classified as known only when all three hold:
+A failure is classified as known only when tier 1 passed, every failure
+is of tier 2, and the client shows exactly what a set of known issues
+predicts, the smallest set that does. Each issue's prediction is the
+user's intent with the composition lost, not committed, where the issue
+strikes:
 
-- tier 1 passed;
-- tier 2 failed on the text of a field that a `Focus` (or a click or tap
-  on the other field) left while that field's client showed a preedit;
-- no other check failed.
+- P1, in GTK only, at each `Focus` (or click or tap on the other field)
+  that leaves a field while it composes;
+- the lost restart, at each restart where the world recorded that Exo
+  could confirm nothing: the extension is below v11 and Exo tracked no
+  composition. It occurs in about 1 settled case in 100 (54 of seeds
+  1,000,001 to 1,009,999, odd), so the run does not require it.
 
 Everything else fails the run. The scenario keeps being generated, so
 any other bug on that path stays visible. The summary prints the known

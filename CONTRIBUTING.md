@@ -183,18 +183,20 @@ whole case, timing included; `docs/IME_REDESIGN.md` section 4 describes
 it. `ime_reaches_the_specified_text` holds the proxy to the
 specification, whatever the timing: after every message the proxy
 handles, the transactions the guest gets and what it then shows, the
-preedit's cursor included, and the activations and resets the proxy
-asks of the host. `ime_reaches_the_intended_text` also holds the client
-to the user's intent, in cases that settle around every click, tap and
-focus move, and after a key the input method passes while it takes the
-engine to compose, whose confirmation then resets the engine. A failure
-that a known issue explains exactly, such as focus loss while
-composing, is counted, not failed, and the summary lists its seeds. Each
-test runs in a process of its own, with the XKB defaults pinned.
+preedit's cursor included, and the activations and resets the proxy asks
+of the host. `ime_reaches_the_intended_text` also holds the client to
+the user's intent, in cases that settle around every click, tap, focus
+move and restart of the input method, and after a key the input method
+passes while it takes the engine to compose, whose confirmation then
+resets the engine. A failure that a known issue explains exactly, such
+as focus loss while composing, is counted, not failed, and the summary
+lists its seeds. Each test runs in a process of its own, with the XKB
+defaults pinned.
 
 The suite runs 600 seeds from seed 0, an even seed free and an odd one
 settled, in about 5 s; two cases in 50 run twice and must leave the same
-trace, and a run fails if it never met a variant a case draws. Run more
+trace, and a run fails if it never met a variant a case draws or a path
+the mode is there to reach, such as Exo's own detach (H2). Run more
 after changing the IME code or a model:
 
 ```bash
