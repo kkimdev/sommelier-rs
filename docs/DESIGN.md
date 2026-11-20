@@ -10,8 +10,6 @@ Feature documents own their own design:
 - [Window placement shortcuts](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md):
   the placement contract, configuration resolution and reload, and a code
   map of every placement owner.
-- [ARC task and session IDs](../sommelier/docs/ARC_TASK_AND_SESSION_IDS.md):
-  why placement needs an ARC application ID, and the task-ID allocator.
 - [Keyboard shortcut inhibition](../sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md):
   how Exo routes keys and what `zcr_keyboard_extension_v1` changes.
 
@@ -26,34 +24,31 @@ handler intercepts the ones whose meaning changes across the boundary.
 
 ## Process and connections
 
-- `main.rs` parses the command line, installs the `SIGHUP` handler and
-  raises the open-file soft limit (`prepare_process`), and resolves every
-  process-wide setting once, before the first client connects: the VM
+- `main.rs` parses the command line, raises the open-file soft limit
+  (`raise_open_file_limit`), and resolves every process-wide setting
+  once, before the first client connects: the VM
   identifier (`state::vm_identifier_from_environment`), the virtio-gpu
   render node (`VirtGpuNode::from_environment`, which reads
   `SOMMELIER_DRM_DEVICE`; the node opens when a client first needs it,
   and one that fails to open is tried again for the next client until it
   opens; test: `a_render_node_that_fails_to_open_is_tried_again_then_kept`),
-  the placement configuration (`PlacementConfig::from_environment`) and
+  the placement configuration (`PlacementConfig::from_environment`, which
+  finds and loads the bindings file, which connections then refresh) and
   which clients get wheel steps for touchpad scrolling
   (`client_kind::WheelFromTouchpad::from_environment`).
   Connections receive the results; `client_kind.rs`, the one owner of
   whether a client is Wine, decides that per client from its process when
   it connects ([pointer scrolling](INVARIANTS.md#pointer-scrolling)).
   `Context::new` and the test constructors read no environment
-  (test: `test_contexts_read_no_environment`), with one exception below
-  `main`: the ARC task-ID reservation reads `XDG_RUNTIME_DIR`
-  (`arc_task_ids.rs`).
+  (test: `test_contexts_read_no_environment`).
 - `proxy::run` claims the socket through its lock file, then `serve`
   accepts guest clients and gives each a `Client` with its own guest
   connection, host connection and `Context`. All clients run on one
   current-thread Tokio runtime inside a `LocalSet`. Each `Context` holds
   xkb state, which is `!Send`; keeping every task on one thread avoids
-  locks and makes that requirement part of the future's type. `SIGHUP`
-  reloads run in a task of their own on the same thread, so a reload never
-  races a key event and never waits for an accept. One thread also means
-  that a call that waits for a peer stalls every client, so nothing on it
-  waits on a guest client or on host data (see
+  locks and makes that requirement part of the future's type. One thread
+  also means that a call that waits for a peer stalls every client, so
+  nothing on it waits on a guest client or on host data (see
   [process invariants](INVARIANTS.md#process)).
 - The host side is VirtWL (`virtwl_channel.rs`, ioctls in `virtwl.rs`) or,
   for debugging only, a local compositor socket (`--local-compositor`).
@@ -240,7 +235,7 @@ encode wire bytes ad hoc.
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
-| Window placement | `window_placement.rs` and a submodule per backend | `window_placement.rs` and a submodule per backend |
+| Window placement | `window_placement.rs` | `window_placement.rs` |
 
 Two mechanisms let a handler act outside its own message:
 
@@ -254,32 +249,45 @@ Two mechanisms let a handler act outside its own message:
 
 ### Window placement
 
-Window placement is opt-in and experimental, and it is built so that
-the rest of the proxy does not depend on how a window is moved. The
-contract is in
+Window placement is opt-in and experimental: a connection has it exactly
+when the bindings file is valid as the connection starts, and Sommelier
+binds no chord of its own. The contract is in
 [Window placement shortcuts](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
 
-- **One boundary.** `handler/window_placement.rs` is the only placement
+- **Configuration.** `placement_config.rs` owns where the bindings file
+  is, when it changed, and what it binds. Each key press on a connection
+  with placement on costs one `stat` of it; a changed file is loaded
+  before the press is classified, and one that cannot be used keeps the
+  last good bindings (tests:
+  `a_bindings_file_edit_takes_effect_on_the_next_press`,
+  `refresh_follows_the_file`,
+  `refresh_follows_a_link_to_files_of_the_same_mtime`,
+  `a_connection_takes_placement_from_the_file_when_it_starts`).
+
+- **One module.** `handler/window_placement.rs` is the only placement
   code the protocol handlers call, one entry point per event; the table
-  in its module docs is the one list of them. Each dispatches on the
-  connection's `WindowPlacementState` and does nothing while placement is
-  off.
-- **Shared target resolution.** Which toplevel the keyboard focuses, the
-  output it entered last, and the bounds the bound rectangle maps to in
-  that output's work area (`resolve_target`) are the same for every
-  backend; a backend gets the resolved `PlacementTarget` and only moves
-  the window.
-- **Backends own their state.** `WindowPlacementState` has one variant
-  per backend and `Off`, the default, which holds nothing. A backend's
-  per-connection state (`state/window_placement/<backend>.rs`), its host
-  objects and its requests (`handler/window_placement/<backend>.rs`) are
-  reachable only through its variant, so another backend, or placement
-  off, cannot touch them. The one backend is `arc`: an ARC policy
-  identity, a host-only `zaura_toplevel` and `set_window_bounds`.
-- **What a backend needs from the host.** It needs `zaura_shell` for the
-  work area (`shell_bound`, `output_bound`).
-- **Lifecycle through the boundary.** A backend's per-object state ends
-  through the boundary's `release_toplevel` and `forget_surface`, which
+  in its module docs is the one list of them. Each does nothing while
+  placement is off.
+- **Target resolution.** Which toplevel the keyboard focuses, the output
+  it entered last, and the bounds the bound rectangle maps to in that
+  output's work area (`resolve_target`).
+- **The move.** Exo lets only ARC windows set their bounds, and an ARC
+  window loses the ChromeOS IME, so placement moves a window with
+  `zaura_surface.set_parent(self, dx, dy)` and sizes it with a configure
+  the proxy sends the guest. A placement takes three steps (restore,
+  move, resize), each ended by a host barrier
+  (`InternalCallback::PlacementBarrier`), because the offset and the
+  size depend on the origin Exo reports after the step before. Every XDG
+  toplevel gets a host-only `zaura_toplevel` in screen coordinates, so
+  that Exo reports origins, and its configures replace the XDG ones,
+  which placement translates for the guest.
+- **State.** `state/window_placement.rs` owns, per connection, each
+  toplevel's Aura toplevel, its last reported origin, the states and
+  serial of its newest configure, and the placement in flight; it is
+  reachable only while placement is on.
+- **What placement needs from the host.** `zaura_shell` new enough for
+  the work area (`shell_bound`, `output_bound`).
+- **Lifecycle.** Per-toplevel state ends through `release_toplevel`, which
   the owners' `forget_*` functions call from `forget_object` (see
   [Object ends](#object-ends)), and `WindowPlacementState::assert_no_orphans`
   checks it after every batch in tests.
@@ -383,8 +391,8 @@ that ends aborts its pumps (`Client::run`), and its `Context` frees the
 rest.
 
 Encoded output, a `wire::Outgoing`, never outlives its message. State
-that a later message releases, such as the configures a placement barrier
-holds or a text-input drain, stays structured, and the message that
+that a later message releases, such as a placement's next step or a
+text-input drain, stays structured, and the message that
 releases it encodes it into its own effects.
 
 ### Double-buffered state
@@ -583,8 +591,7 @@ xkbcommon to classify chords; chords listed in
   forwarded through `zaura_surface.set_application_id` as
   `org.chromium.guest_os.<vm-id>.wayland.<app-id>`, so the ChromeOS shelf
   matches windows to the guest's `.desktop` files.
-  `window_placement::set_aura_application_id` is the one place that chooses
-  this ID or the ARC identity placement needs.
+  `aura_objects::set_application_id` is the one place that sends it.
 - **Aura objects.** `aura_objects.rs` creates, versions and releases every
   host-only Aura child (`zaura_surface`, `zaura_toplevel`, `zaura_output`)
   from one table. The guest never sees them.

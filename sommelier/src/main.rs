@@ -22,7 +22,6 @@ use clap::Parser;
 
 mod accelerator;
 mod allocator;
-mod arc_task_ids;
 mod client_kind;
 mod connection;
 mod handler;
@@ -104,17 +103,6 @@ struct Args {
     #[arg(long)]
     virtio_wl: Option<String>,
 
-    /// Read window placement shortcut bindings from a versioned TOML file.
-    ///
-    /// Used only while a placement backend is active
-    /// (SOMMELIER_WINDOW_PLACEMENT_BACKEND), and mutually exclusive with
-    /// SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS. An unusable file is logged and
-    /// leaves placement shortcuts disabled; SIGHUP reloads it and keeps the
-    /// previous bindings if the new file is invalid. See
-    /// <https://github.com/kkimdev/sommelier-rs/blob/virtwl/sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md>
-    #[arg(long, value_name = "PATH")]
-    window_shortcuts_config: Option<std::path::PathBuf>,
-
     /// The display name (e.g. wayland-proxy-0)
     #[arg(default_value = "wayland-proxy-0")]
     display: String,
@@ -131,14 +119,10 @@ async fn main() {
     let gpu_accel = args.gpu_accel;
     let xdg_decoration = args.xdg_decoration;
     let mut virtio_wl = args.virtio_wl;
-    let shortcuts_file = args.window_shortcuts_config.as_deref();
-    // Before the shortcut file is first read (see `prepare_process`).
-    let reload_signal = prepare_process();
+    raise_open_file_limit();
     // Never fatal: a configuration problem is logged once and leaves
-    // placement shortcuts disabled, because this proxy serves every app.
-    let placement = Arc::new(placement_config::PlacementConfig::from_environment(
-        shortcuts_file,
-    ));
+    // placement off, because this proxy serves every app.
+    let placement = Arc::new(placement_config::PlacementConfig::from_environment());
     let vm_identifier = state::vm_identifier_from_environment();
     let virtgpu = allocator::VirtGpuNode::from_environment();
     let wheel_from_touchpad = client_kind::WheelFromTouchpad::from_environment();
@@ -163,7 +147,6 @@ async fn main() {
         virtgpu,
         placement,
         wheel_from_touchpad,
-        reload_signal,
     )
     .await;
 }
@@ -206,31 +189,4 @@ fn raise_open_file_limit() {
         "Raised the open-file limit from {soft} to {}",
         limit.rlim_max
     );
-}
-
-/// Prepare the process to serve, before anything slow happens.
-///
-/// First installs the `SIGHUP` reload handler in every configuration: from
-/// here on a `SIGHUP` reloads the shortcut configuration (a logged no-op
-/// when there is none) instead of taking the default action, which would
-/// end the proxy and every Linux GUI app with it. Then raises the
-/// open-file limit.
-fn prepare_process() -> Option<tokio::signal::unix::Signal> {
-    let reload_signal = proxy::install_reload_signal();
-    raise_open_file_limit();
-    reload_signal
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn sighup_after_process_preparation_reaches_the_reload_handler() {
-        let mut reload_signal = super::prepare_process().expect("install the SIGHUP handler");
-        // Without the handler, this would terminate the test process.
-        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
-        tokio::time::timeout(std::time::Duration::from_secs(5), reload_signal.recv())
-            .await
-            .expect("the handler receives the signal")
-            .expect("the signal stream stays open");
-    }
 }

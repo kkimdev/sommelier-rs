@@ -553,7 +553,6 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   gated on a version is off.
   Tests: `child_objects_inherit_their_manager_versions`,
   `an_extension_of_unknown_version_gives_no_input_method`,
-  `unset_snap_is_sent_only_to_an_aura_surface_that_has_it`,
   `every_forwarded_global_is_capped_at_its_xml_version`.
 
 ## Surfaces, damage and SHM
@@ -1572,8 +1571,7 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
 
 ## Process
 
-The proxy serves every Linux GUI app, so no single client and no signal may
-end it.
+The proxy serves every Linux GUI app, so no single client may end it.
 
 - **One client's failure ends only that client.** Setting up an accepted
   client returns errors instead of panicking. A failed accept (such as
@@ -1647,15 +1645,6 @@ end it.
   `pump_writes_into_a_regular_file`,
   `pump_refuses_a_character_device`,
   `pump_copies_a_large_transfer_whole`.
-- **`SIGHUP` never ends the proxy.** `prepare_process` in `main` installs
-  the handler first, in every configuration, before the shortcut file is
-  first read. Reloads run in their own task, so they never wait for the
-  accept loop. If that task ever ends, an error is logged; no test covers
-  that log.
-  Tests: `sighup_after_process_preparation_reaches_the_reload_handler`,
-  `a_real_sighup_reloads_the_shortcuts_file`,
-  `a_no_op_reload_keeps_the_proxy_and_its_reloads`,
-  `reload_does_not_wait_for_the_accept_retry_pause`.
 - **The socket belongs to the process holding its lock.** Like libwayland,
   the proxy takes `flock(LOCK_EX | LOCK_NB)` on `<socket>.lock` for its
   lifetime and only then removes a stale socket. If another process holds
@@ -1681,13 +1670,16 @@ clients:
 - Every `xdg_toplevel.set_app_id` (and GTK application ID) retrieves or
   creates the surface's host `zaura_surface` and sends the formatted ID
   through `zaura_surface.set_application_id`.
-- The one exception is the opt-in ARC placement policy, which sends an ARC
-  identity instead; see
-  [ARC task and session IDs](../sommelier/docs/ARC_TASK_AND_SESSION_IDS.md).
+- Window placement never changes it. An ARC application ID would let Exo
+  accept bounds requests, but Chrome then sends the window's keys past the
+  ChromeOS IME, so placement moves windows with
+  `zaura_surface.set_parent` instead and leaves the IME alone.
 
 Tests: `set_app_id_creates_zaura_surface_and_sets_app_id`,
 `dbus_application_id_is_namespaced_on_aura_surface`,
-`set_app_id_uses_arc_namespace_when_bounds_policy_is_enabled`.
+`set_app_id_keeps_the_guest_os_namespace_with_placement_on`,
+`placement_shortcuts_leave_the_focused_ime_generation_untouched`,
+`a_placement_moves_the_window_with_set_parent_and_resizes_it`.
 
 ## Manual verification
 

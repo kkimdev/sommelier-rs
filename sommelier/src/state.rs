@@ -64,11 +64,8 @@ pub(crate) use self::render::{
     RenderBufferUse, ShmPool, StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceMapping,
     SurfaceRect, SurfaceState, ViewportState,
 };
-#[cfg(test)]
-pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
 pub(crate) use self::window_placement::{
-    ArcPlacementState, PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure,
-    WindowPlacementState,
+    Placement, PlacementState, PlacementStep, Point, WindowPlacementState,
 };
 pub(crate) use self::xdg_roles::XdgRoles;
 use crate::placement_config::PlacementConfig;
@@ -468,9 +465,9 @@ pub struct Context {
     /// than after it, and not again with a new keymap, so focus changes and
     /// keymaps must not reset them.
     pub(crate) keyboard_modifiers: BTreeMap<HostId, KeyboardModifiers>,
-    /// The process-wide placement configuration: host accelerators, the
-    /// ARC bounds policy, and the placement bindings. Shared, never copied:
-    /// a reloaded binding generation is visible to the next lookup.
+    /// The process-wide placement configuration: host accelerators and the
+    /// placement bindings. Shared, never copied:
+    /// bindings reloaded on any connection are visible to the next lookup.
     placement: Arc<PlacementConfig>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: BTreeMap<u32, HostGlobal>,
@@ -531,7 +528,7 @@ pub struct Context {
     /// VM identifier for ChromeOS guest_os app ID formatting, resolved once
     /// in `main` (see [`vm_identifier_from_environment`]).
     pub vm_identifier: String,
-    /// This connection's ARC bounds policy state (see
+    /// This connection's window placement state (see
     /// [`WindowPlacementState`] for what it owns). Built from `placement`.
     pub(crate) window_placement: WindowPlacementState,
     /// This connection's bound host outputs (see [`OutputRegistry`] for what
@@ -980,7 +977,9 @@ impl Context {
     /// * `virtgpu` - the process's virtio-gpu render node, if it has one
     ///   (see [`crate::allocator::VirtGpuNode`]).
     /// * `placement` - the process-wide placement configuration; `Context`
-    ///   never reads placement variables itself.
+    ///   never reads placement variables itself. It is refreshed first, so
+    ///   a client that connects after the bindings file appeared gets
+    ///   placement, and one that connects after it went does not.
     pub fn new(
         gpu_accel: bool,
         xdg_decoration: bool,
@@ -988,7 +987,8 @@ impl Context {
         virtgpu: Option<Arc<VirtGpuDevice>>,
         placement: Arc<PlacementConfig>,
     ) -> Self {
-        let window_placement = WindowPlacementState::new(placement.backend());
+        placement.refresh();
+        let window_placement = WindowPlacementState::new(placement.is_active());
         Self {
             shadow_table: ShadowTable::new(),
             pools: BTreeMap::new(),
@@ -1063,11 +1063,10 @@ impl Context {
         }
     }
 
-    /// Test-only constructor that reads no environment variable, probes no
-    /// DRM device and reserves no ARC task-ID block.
+    /// Test-only constructor that reads no environment variable and probes
+    /// no DRM device.
     ///
-    /// The ARC bounds policy is off and `accelerators` are the host
-    /// accelerators. The VM identifier is the default `termina`, and there
+    /// Placement is off and `accelerators` are the host accelerators. The VM identifier is the default `termina`, and there
     /// is no virtio-gpu device.
     #[cfg(test)]
     pub fn new_for_test(
@@ -1085,7 +1084,7 @@ impl Context {
     }
 
     /// Test-only constructor from an explicit placement configuration, for
-    /// example `PlacementConfig::arc_bounds_for_test`. Like `new_for_test`,
+    /// example `PlacementConfig::active_for_test`. Like `new_for_test`,
     /// it reads no environment variable and has no virtio-gpu device.
     #[cfg(test)]
     pub(crate) fn with_placement_for_test(placement: impl Into<Arc<PlacementConfig>>) -> Self {
@@ -1105,17 +1104,30 @@ impl Context {
 
     /// Return the placement action bound to a chord.
     ///
-    /// `None` unless the ARC bounds policy is active and the current binding
-    /// generation binds the chord. A generation published by a reload is
-    /// adopted here, on the next lookup, so every key press sees one complete
-    /// generation. Keys already captured as compositor shortcuts are tracked
-    /// by key ownership, not by binding, so a dropped binding cannot strand
-    /// a held key.
+    /// `None` unless placement is on for this connection and the current
+    /// bindings bind the chord. Bindings that a
+    /// [`refresh_placement_bindings`](Self::refresh_placement_bindings)
+    /// adopted, on any connection, are seen here on the next lookup. Keys
+    /// already captured as compositor shortcuts are tracked by key
+    /// ownership, not by binding, so a dropped binding cannot strand a held
+    /// key.
     pub(crate) fn placement_action_for(
         &self,
         chord: &crate::accelerator::Accelerator,
     ) -> Option<crate::window_layout::WindowLayoutAction> {
+        if !self.window_placement.is_active() {
+            return None;
+        }
         self.placement.action_for(chord)
+    }
+
+    /// Load the bindings file again if it changed: one `stat` while
+    /// placement is on for this connection, nothing otherwise. The keyboard
+    /// calls it once per key press, before it classifies the key.
+    pub(crate) fn refresh_placement_bindings(&self) {
+        if self.window_placement.is_active() {
+            self.placement.refresh();
+        }
     }
 }
 
@@ -1161,58 +1173,47 @@ mod tests {
         crate::accelerator::parse_accelerator("<Alt>q").unwrap()
     }
 
+    /// Placement is decided per connection when it starts: a connection
+    /// that started while the file was missing stays off when the file
+    /// appears, and the next connection is on. One that started on keeps
+    /// placement when the file goes, with no bindings.
     #[test]
-    fn context_adopts_only_valid_reloads_on_the_next_lookup() {
+    fn a_connection_takes_placement_from_the_file_when_it_starts() {
         use crate::window_layout::WindowLayoutAction;
-        let dir = crate::test_support::TempDir::new("context-shortcut-follow");
-        let path = dir.write(
-            "shortcuts.toml",
-            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
-        );
-        let placement = Arc::new(PlacementConfig::resolve_for_test(
-            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
-            Some(&path),
-            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
-        ));
-        let ctx = Context::with_placement_for_test(Arc::clone(&placement));
-        assert_eq!(
-            ctx.placement_action_for(&alt_q()),
-            Some(WindowLayoutAction::Left)
-        );
-
-        dir.write("shortcuts.toml", b"version = 1\nbindings = 3\n");
-        assert!(placement.reload().unwrap().is_err());
-        assert_eq!(
-            ctx.placement_action_for(&alt_q()),
-            Some(WindowLayoutAction::Left),
-            "an invalid reload keeps the last known-good bindings"
-        );
+        let dir = crate::test_support::TempDir::new("context-placement-file");
+        let path = dir.path().join("window-placement.toml");
+        let placement = Arc::new(PlacementConfig::file_for_test(&path));
+        let before = Context::with_placement_for_test(Arc::clone(&placement));
+        assert!(!before.window_placement.is_active());
 
         dir.write(
-            "shortcuts.toml",
-            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"right\"\n",
+            "window-placement.toml",
+            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
         );
-        placement.reload().unwrap().unwrap();
-        assert_eq!(
-            ctx.placement_action_for(&alt_q()),
-            Some(WindowLayoutAction::Right),
-            "the next lookup adopts the reloaded generation"
-        );
+        before.refresh_placement_bindings();
         assert!(
-            ctx.window_placement.arc().is_some(),
-            "reload never changes the gate"
+            !placement.is_active(),
+            "a connection that is off checks nothing"
         );
-    }
-
-    #[test]
-    fn shortcuts_are_ignored_without_an_active_arc_policy() {
-        let ctx = Context::with_placement_for_test(PlacementConfig::resolve_for_test(
-            &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left")],
+        let after = Context::with_placement_for_test(Arc::clone(&placement));
+        assert!(after.window_placement.is_active());
+        assert_eq!(
+            after.placement_action_for(&alt_q()),
+            Some(WindowLayoutAction::Left)
+        );
+        assert_eq!(
+            before.placement_action_for(&alt_q()),
             None,
-            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
-        ));
-        assert_eq!(ctx.placement_action_for(&alt_q()), None);
-        assert!(ctx.window_placement.arc().is_none());
+            "a connection that is off binds nothing"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        after.refresh_placement_bindings();
+        assert_eq!(after.placement_action_for(&alt_q()), None);
+        assert!(after.window_placement.is_active());
+        assert!(!Context::with_placement_for_test(placement)
+            .window_placement
+            .is_active());
     }
 
     #[test]
@@ -1229,10 +1230,13 @@ mod tests {
     }
 
     /// The test constructors ignore every `SOMMELIER_*` variable, which a
-    /// developer's environment may set (Crostini sets some). The test sets
-    /// all of them, in a child process, so a constructor that read one
-    /// fails here wherever the test runs. It also checks that it sets every
-    /// variable the sources name, so a new one cannot be left out.
+    /// developer's environment may set (Crostini sets some), and the
+    /// placement bindings file a developer may have under `XDG_CONFIG_HOME`
+    /// or `HOME`. The test sets all of them, in a child process, with a
+    /// bindings file in both places, so a constructor that read one fails
+    /// here wherever the test runs. It also checks that it sets every
+    /// `SOMMELIER_*` variable the sources name, so a new one cannot be left
+    /// out.
     #[test]
     fn test_contexts_read_no_environment() {
         const VARIABLES: &[(&str, &str)] = &[
@@ -1243,9 +1247,6 @@ mod tests {
             ("SOMMELIER_DRM_DEVICE", "/dev/dri/renderD128"),
             ("SOMMELIER_VM_IDENTIFIER", "penguin-vm"),
             ("SOMMELIER_WHEEL_FROM_TOUCHPAD", "all"),
-            ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
-            ("SOMMELIER_WINDOW_PLACEMENT_BACKEND", "arc"),
-            ("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left"),
         ];
         // Variables only tests read.
         const TEST_ONLY: &[&str] = &["SOMMELIER_DST_", "SOMMELIER_FUZZ_", "SOMMELIER_TEST_"];
@@ -1278,9 +1279,23 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(set, named, "the test sets every SOMMELIER_* variable");
 
+        let dir = crate::test_support::TempDir::new("no-environment");
+        let (config_home, home) = (dir.path().join("xdg"), dir.path().join("home"));
+        for config_home in [&config_home, &home.join(".config")] {
+            let file = config_home.join("sommelier-rs/window-placement.toml");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(
+                file,
+                "version = 1\n[[bindings]]\nchord = \"<Alt>e\"\naction = \"left\"\n",
+            )
+            .unwrap();
+        }
+        let (config_home, home) = (config_home.to_str().unwrap(), home.to_str().unwrap());
+        let mut env = VARIABLES.to_vec();
+        env.extend([("XDG_CONFIG_HOME", config_home), ("HOME", home)]);
         crate::test_support::in_own_process_with_env(
             "state::tests::test_contexts_read_no_environment",
-            VARIABLES,
+            &env,
             test_contexts_read_no_environment_in_child,
         );
     }
@@ -1313,13 +1328,28 @@ mod tests {
         assert!(ctx.gpu_accel);
         assert!(ctx.is_host_accelerator(&alt_q()));
         assert_eq!(ctx.placement_action_for(&alt_q()), None);
-        assert!(ctx.window_placement.arc().is_none());
+        assert!(!ctx.window_placement.is_active());
         assert_eq!(ctx.vm_identifier, "termina");
         assert!(ctx.virtgpu.is_none(), "no DRM device is probed");
 
         let ctx = Context::with_placement_for_test(PlacementConfig::for_test(Vec::new()));
         assert_eq!(ctx.vm_identifier, "termina");
         assert!(ctx.virtgpu.is_none(), "no DRM device is probed");
+
+        let alt_e = crate::accelerator::parse_accelerator("<Alt>e").unwrap();
+        assert_eq!(
+            PlacementConfig::from_environment().action_for(&alt_e),
+            Some(crate::window_layout::WindowLayoutAction::Left),
+            "the child has a bindings file"
+        );
+        assert_eq!(ctx.placement_action_for(&alt_e), None);
+        assert!(!ctx.window_placement.is_active());
+        let ctx = Context::with_placement_for_test(PlacementConfig::active_for_test(&[]));
+        assert_eq!(
+            ctx.placement_action_for(&alt_e),
+            None,
+            "no binding of the file"
+        );
     }
 
     fn awaiting_release(has_detached_use: bool) -> RenderBufferUse {

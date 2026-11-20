@@ -74,6 +74,14 @@ impl XdgRoles {
         self.by_xdg_surface.get(&xdg_surface)?.toplevel
     }
 
+    /// The xdg_surface an xdg_toplevel was created from.
+    pub(crate) fn xdg_surface_of_toplevel(&self, xdg_toplevel: u32) -> Option<u32> {
+        self.by_xdg_surface
+            .iter()
+            .find(|(_, role)| role.toplevel == Some(xdg_toplevel))
+            .map(|(&xdg_surface, _)| xdg_surface)
+    }
+
     /// The wl_surface an xdg_toplevel gives its role to.
     pub(crate) fn wl_surface_of_toplevel(&self, xdg_toplevel: u32) -> Option<u32> {
         self.by_xdg_surface

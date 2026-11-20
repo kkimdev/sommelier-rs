@@ -275,7 +275,7 @@ pub(crate) mod fixture {
     /// a `zaura_output`.
     pub(crate) fn context() -> Context {
         let mut ctx = Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
+            crate::placement_config::PlacementConfig::active_for_test(&[]),
         );
         for registry in [1, 2] {
             ctx.shadow_table

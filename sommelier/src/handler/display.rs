@@ -203,7 +203,7 @@ mod tests {
         use crate::protocols::aura_shell::zaura_output;
         use crate::protocols::wayland::wl_registry::WlRegistryHandler;
         let mut ctx = Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
+            crate::placement_config::PlacementConfig::active_for_test(&[]),
         );
         ctx.last_sender_id = 1;
         ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");

@@ -1504,7 +1504,7 @@ mod tests {
     /// A context whose window placement uses Aura, for output and toplevel
     /// tests.
     fn aura_placement_context() -> Context {
-        let placement = PlacementConfig::arc_bounds_for_test("");
+        let placement = PlacementConfig::active_for_test(&[]);
         with_registries(Context::with_placement_for_test(placement), &[A])
     }
 
@@ -2037,20 +2037,11 @@ mod tests {
         );
     }
 
-    /// Bind zaura_shell after one XDG toplevel (guest 13 on wl_surface 12)
-    /// already exists, and return whether the retry attached its Aura
-    /// toplevel.
-    fn late_zaura_shell_attaches_existing_toplevel(arc_identity_available: bool) -> bool {
-        let arc_ids = if arc_identity_available {
-            crate::arc_task_ids::ArcIdAllocator::block_for_test()
-        } else {
-            crate::arc_task_ids::ArcIdAllocator::exhausted_for_test()
-        };
-        let placement = PlacementConfig::resolve_for_test(
-            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
-            None,
-            arc_ids,
-        );
+    /// A toplevel created before zaura_shell is bound gets its Aura
+    /// toplevel when the shell is bound.
+    #[test]
+    fn late_zaura_shell_binding_attaches_existing_toplevels() {
+        let placement = PlacementConfig::active_for_test(&[]);
         let mut ctx = with_registries(Context::with_placement_for_test(placement), &[A]);
         ctx.shadow_table
             .insert_paired_for_test(12, 22, "wl_surface");
@@ -2059,33 +2050,12 @@ mod tests {
         ctx.xdg_roles.add_toplevel_role_for_test(13 + 1000, 12, 13);
 
         assert_eq!(A.global(&mut ctx, 11, "zaura_shell", 38), Action::Drop);
-        let attached = ctx
-            .window_placement
-            .arc()
-            .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(13))
-            .is_some();
-        if attached {
-            assert!(
-                ctx.window_placement
-                    .arc_mut()
-                    .and_then(|arc| arc.arc_application_id(12))
-                    .is_some(),
-                "an attached toplevel's surface carries an ARC identity"
-            );
-        }
-        attached
-    }
-
-    #[test]
-    fn late_zaura_shell_binding_attaches_toplevels_only_with_an_arc_identity() {
         assert!(
-            late_zaura_shell_attaches_existing_toplevel(true),
+            ctx.window_placement
+                .active()
+                .and_then(|state| state.aura_toplevel(13))
+                .is_some(),
             "late shell binding must attach every recorded toplevel"
-        );
-        assert!(
-            !late_zaura_shell_attaches_existing_toplevel(false),
-            "a toplevel without an ARC identity can never be placed, so it \
-             must not get an Aura toplevel"
         );
     }
 

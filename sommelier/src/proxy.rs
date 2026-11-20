@@ -1255,11 +1255,7 @@ mod tests {
         let served = tokio::task::LocalSet::new()
             .run_until(tokio::time::timeout(
                 window,
-                serve(
-                    listener,
-                    test_client_config(),
-                    None::<tokio::signal::unix::Signal>,
-                ),
+                serve(listener, test_client_config()),
             ))
             .await;
         let cpu = thread_cpu_time() - cpu_before;
@@ -1269,158 +1265,6 @@ mod tests {
             cpu < window / 4,
             "the accept loop used {cpu:?} of CPU in {window:?} of failing accepts"
         );
-    }
-
-    /// A reload without a shortcuts file is a logged no-op: the proxy keeps
-    /// serving, and keeps taking reloads. Tests send reloads through a
-    /// channel; `SIGHUP` is the process's, so only `main`'s test and
-    /// `a_real_sighup_reloads_the_shortcuts_file` raise it.
-    #[tokio::test(start_paused = true)]
-    async fn a_no_op_reload_keeps_the_proxy_and_its_reloads() {
-        let dir = crate::test_support::TempDir::new("sighup");
-        let listener = UnixListener::bind(dir.path().join("socket")).expect("bind listener");
-        let config = test_client_config();
-        assert!(config.placement.reload().is_none(), "no file to reload");
-        let (reload, reloads) = tokio::sync::mpsc::channel(1);
-        let local = tokio::task::LocalSet::new();
-        let serving = local.spawn_local(serve(listener, config, Some(reloads)));
-        local
-            .run_until(async {
-                // The channel holds one reload, so each send after the
-                // first waits until the reload task has taken the one
-                // before. The clock is paused, so it moves only once every
-                // task waits: the timeout fails a reload nothing takes.
-                for reload_number in 1..=3 {
-                    tokio::time::timeout(std::time::Duration::from_secs(1), reload.send(()))
-                        .await
-                        .unwrap_or_else(|_| panic!("reload {reload_number} is never taken"))
-                        .expect("the reload task takes reloads");
-                }
-            })
-            .await;
-        assert!(!serving.is_finished(), "the proxy keeps serving");
-    }
-
-    /// A real `SIGHUP` reaches a reload task, as `serve` runs one;
-    /// `reload_does_not_wait_for_the_accept_retry_pause` covers `serve`
-    /// running it. The signal is the process's, so any other test
-    /// listening for it only reloads a configuration of its own once more.
-    #[tokio::test]
-    async fn a_real_sighup_reloads_the_shortcuts_file() {
-        use crate::window_layout::WindowLayoutAction;
-
-        let alt_q = crate::accelerator::parse_accelerator("<Alt>q").unwrap();
-        let dir = crate::test_support::TempDir::new("sighup");
-        let bind_alt_q = |action: &str| {
-            dir.write(
-                "shortcuts.toml",
-                format!("version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"{action}\"\n")
-                    .as_bytes(),
-            )
-        };
-        let shortcuts = bind_alt_q("left");
-        let placement = Arc::new(PlacementConfig::resolve_for_test(
-            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
-            Some(&shortcuts),
-            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
-        ));
-        let reloads = reload_on_signal(
-            install_reload_signal().expect("install the SIGHUP handler"),
-            Arc::clone(&placement),
-        );
-        bind_alt_q("right");
-        // Without the handler this would terminate the test process.
-        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
-        let applied = async {
-            while placement.action_for(&alt_q) != Some(WindowLayoutAction::Right) {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                () = reloads => panic!("the SIGHUP stream ended"),
-                () = applied => {}
-            }
-        })
-        .await
-        .expect("the SIGHUP reload applies");
-    }
-
-    /// A reload must not wait for the accept loop's retry pause, and every
-    /// reload applies the file as it is then.
-    #[tokio::test(start_paused = true)]
-    async fn reload_does_not_wait_for_the_accept_retry_pause() {
-        use crate::window_layout::WindowLayoutAction;
-        use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
-
-        let alt_q = crate::accelerator::parse_accelerator("<Alt>q").unwrap();
-        let dir = crate::test_support::TempDir::new("reload-during-retry");
-        let bind_alt_q = |action: &str| {
-            dir.write(
-                "shortcuts.toml",
-                format!("version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"{action}\"\n")
-                    .as_bytes(),
-            )
-        };
-        let shortcuts = bind_alt_q("left");
-        let placement = Arc::new(PlacementConfig::resolve_for_test(
-            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
-            Some(&shortcuts),
-            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
-        ));
-        assert_eq!(placement.action_for(&alt_q), Some(WindowLayoutAction::Left));
-        let config = ClientConfig {
-            placement: Arc::clone(&placement),
-            ..test_client_config()
-        };
-        // Every accept on a socket that never listened fails at once, so the
-        // accept loop is in its retry pause from the first step on.
-        let not_listening = socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-            None,
-        )
-        .expect("create a socket");
-        let listener =
-            UnixListener::from_std(std::os::unix::net::UnixListener::from(not_listening))
-                .expect("register the socket");
-
-        let (reload, reloads) = tokio::sync::mpsc::channel(1);
-        let local = tokio::task::LocalSet::new();
-        local.spawn_local(serve(listener, config, Some(reloads)));
-        local
-            .run_until(async {
-                tokio::task::yield_now().await;
-                for (name, action) in [
-                    ("right", WindowLayoutAction::Right),
-                    ("left", WindowLayoutAction::Left),
-                ] {
-                    let started = tokio::time::Instant::now();
-                    bind_alt_q(name);
-                    reload
-                        .send(())
-                        .await
-                        .expect("the reload task takes reloads");
-                    // The clock is paused, so it moves only while every task
-                    // waits; the timeout fails a reload that never applies
-                    // instead of hanging.
-                    let applied = async {
-                        while placement.action_for(&alt_q) != Some(action) {
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                        }
-                    };
-                    tokio::time::timeout(ACCEPT_RETRY_DELAY * 10, applied)
-                        .await
-                        .unwrap_or_else(|_| panic!("the reload to {action:?} applies"));
-                    assert!(
-                        started.elapsed() < ACCEPT_RETRY_DELAY,
-                        "the reload waited {:?} for the accept loop",
-                        started.elapsed()
-                    );
-                }
-            })
-            .await;
     }
 
     /// A burst of requests longer than one fairness batch reaches the host
@@ -3329,7 +3173,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(guest_proxy.into()).expect("register test socket"),
             WaylandConnection::new(host_proxy.into()).expect("register test socket"),
-            Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test("")),
+            Context::with_placement_for_test(PlacementConfig::active_for_test(&[])),
         );
         let ctx = &mut client.ctx;
         ctx.bind_aura_shell_for_test(ZAURA_SHELL_HOST);
@@ -3374,8 +3218,8 @@ mod tests {
             client
                 .ctx
                 .window_placement
-                .arc()
-                .map_or(0, |arc| arc.aura_toplevel_count())
+                .active()
+                .map_or(0, |state| state.toplevel_count())
                 == 0,
             "failed get_toplevel requests must not leave an internal Aura child"
         );
@@ -3407,8 +3251,8 @@ mod tests {
         let aura_toplevel = client
             .ctx
             .window_placement
-            .arc()
-            .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(XDG_TOPLEVEL))
+            .active()
+            .and_then(|state| state.aura_toplevel(XDG_TOPLEVEL))
             .expect("placement Aura toplevel");
         drop(client);
 
@@ -3449,8 +3293,8 @@ mod tests {
             client
                 .ctx
                 .window_placement
-                .arc()
-                .map_or(0, |arc| arc.aura_toplevel_count()),
+                .active()
+                .map_or(0, |state| state.toplevel_count()),
             0
         );
     }
@@ -3474,8 +3318,8 @@ mod tests {
             client
                 .ctx
                 .window_placement
-                .arc()
-                .map_or(0, |arc| arc.aura_toplevel_count()),
+                .active()
+                .map_or(0, |state| state.toplevel_count()),
             0
         );
     }
@@ -4217,7 +4061,6 @@ pub async fn run(
     virtgpu: VirtGpuNode,
     placement: Arc<PlacementConfig>,
     wheel_from_touchpad: WheelFromTouchpad,
-    reload_signal: Option<tokio::signal::unix::Signal>,
 ) {
     if let Some(path) = &virtio_wayland {
         if let Err(e) = std::fs::OpenOptions::new()
@@ -4268,7 +4111,7 @@ pub async fn run(
     // this function's future type: callers cannot accidentally move the
     // proxy's client tasks to another executor thread.
     tokio::task::LocalSet::new()
-        .run_until(serve(listener, config, reload_signal))
+        .run_until(serve(listener, config))
         .await;
 }
 
@@ -4308,28 +4151,11 @@ fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flo
     Ok(lock)
 }
 
-/// Accept guest clients for the life of the process, and reload the
-/// shortcut configuration on each of `reload_signal`'s requests.
+/// Accept guest clients for the life of the process.
 ///
 /// A failure concerning one client is logged and ends only that client.
 /// Must run inside a `LocalSet`, like the clients it spawns.
-async fn serve(
-    listener: UnixListener,
-    config: ClientConfig,
-    reload_signal: Option<impl ReloadRequests>,
-) {
-    if let Some(signal) = reload_signal {
-        let reloads =
-            tokio::task::spawn_local(reload_on_signal(signal, Arc::clone(&config.placement)));
-        // SIGHUP stays handled after the task ends (its signal stream
-        // closed, or a reload panicked), so say that reloads have stopped.
-        tokio::task::spawn_local(async move {
-            match reloads.await {
-                Ok(()) => log::error!("SIGHUP reloads have stopped: the signal stream ended"),
-                Err(error) => log::error!("SIGHUP reloads have stopped: {error}"),
-            }
-        });
-    }
+async fn serve(listener: UnixListener, config: ClientConfig) {
     // Log a run of failed accepts once, not every retry.
     let mut accept_failing = false;
     loop {
@@ -4410,60 +4236,4 @@ async fn connect_host(
     };
     let stream = UnixStream::connect(path).await?;
     Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
-}
-
-/// Install the `SIGHUP` handler that reloads the shortcut configuration file.
-///
-/// Once installed, `SIGHUP` no longer terminates the process. Tokio delivers
-/// the signal through its own self-pipe; [`reload_on_signal`] runs the
-/// reload. `main` installs it before anything else can take long, whatever
-/// the configuration.
-///
-/// # Returns
-///
-/// `None` when the handler cannot be installed. That is logged and is not
-/// fatal: the proxy runs without reloads.
-pub(crate) fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
-    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .inspect_err(|error| {
-            log::error!(
-                "Failed to install the SIGHUP shortcut reload handler; reloads are disabled: {}",
-                error
-            );
-        })
-        .ok()
-}
-
-/// Where requests to reload the shortcut configuration come from: the
-/// process's `SIGHUP`, or, in tests, a channel, since a signal reaches
-/// every test in the process.
-trait ReloadRequests: 'static {
-    /// Wait for the next request; `None` once no more can come.
-    async fn recv(&mut self) -> Option<()>;
-}
-
-impl ReloadRequests for tokio::signal::unix::Signal {
-    async fn recv(&mut self) -> Option<()> {
-        tokio::signal::unix::Signal::recv(self).await
-    }
-}
-
-#[cfg(test)]
-impl ReloadRequests for tokio::sync::mpsc::Receiver<()> {
-    async fn recv(&mut self) -> Option<()> {
-        tokio::sync::mpsc::Receiver::recv(self).await
-    }
-}
-
-/// Reload the shortcut configuration on each of `signal`'s requests.
-///
-/// A task of its own, so a reload never waits behind the accept loop (its
-/// retry pause, or a client's host connection). It runs on the proxy's one
-/// thread between other tasks' steps, so it never races a key event.
-/// `PlacementConfig::reload_and_log` owns what a reload means, including
-/// the logged no-op when there is no file.
-async fn reload_on_signal(mut signal: impl ReloadRequests, placement: Arc<PlacementConfig>) {
-    while signal.recv().await.is_some() {
-        placement.reload_and_log();
-    }
 }

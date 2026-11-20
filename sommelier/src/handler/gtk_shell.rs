@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::aura_objects::ensure_host_zaura_surface;
+use crate::handler::aura_objects::{self, ensure_host_zaura_surface};
 use crate::handler::compositor::native_wayland_app_id;
-use crate::handler::window_placement::set_aura_application_id;
 use crate::protocols::aura_shell::zaura_surface;
 use crate::protocols::gtk::gtk_shell1::{self, GtkShell1Handler};
 use crate::protocols::gtk::gtk_surface1::{self, GtkSurface1Handler};
@@ -145,7 +144,7 @@ impl GtkSurface1Handler for GtkShellHandler {
             return Action::Drop;
         };
         let application_id = native_wayland_app_id(&ctx.vm_identifier, application_id);
-        set_aura_application_id(ctx, wl_surface_id, &application_id);
+        aura_objects::set_application_id(ctx, wl_surface_id, &application_id);
         Action::Drop
     }
 
@@ -282,7 +281,14 @@ mod tests {
     /// GTK names the application of a surface with or without a role.
     #[test]
     fn dbus_application_id_is_namespaced_on_aura_surface() {
-        for (case, mut ctx) in [("toplevel", setup_ctx()), ("no role", roleless_ctx())] {
+        let placed = setup_ctx_with(crate::placement_config::PlacementConfig::active_for_test(
+            &[],
+        ));
+        for (case, mut ctx) in [
+            ("toplevel", setup_ctx()),
+            ("no role", roleless_ctx()),
+            ("placement on", placed),
+        ] {
             ctx.last_sender_id = GTK_SHELL;
             let mut handler = GtkShellHandler;
             handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
@@ -378,62 +384,6 @@ mod tests {
                 (zaura_surface, zaura_surface::REQ_SET_STARTUP_ID),
                 (zaura_surface, REQ_SET_APPLICATION_ID),
             ]
-        );
-    }
-
-    #[test]
-    fn gtk_surface_creation_does_not_allocate_an_arc_identity() {
-        let mut ctx =
-            setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
-        ctx.last_sender_id = GTK_SHELL;
-        GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
-        assert!(
-            !ctx.window_placement
-                .arc()
-                .is_some_and(|arc| arc.has_arc_application_ids()),
-            "identities are allocated lazily by the paths that send them"
-        );
-    }
-
-    #[test]
-    fn dbus_application_id_preserves_arc_policy_for_window_bounds() {
-        let mut ctx =
-            setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
-        ctx.last_sender_id = GTK_SHELL;
-        let mut handler = GtkShellHandler;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
-        ctx.client_to_host_queue.clear();
-        ctx.last_sender_id = GTK_SURFACE;
-
-        assert_eq!(
-            handler.on_set_dbus_properties(
-                &mut ctx,
-                &Some("com.example.Terminal".to_string()),
-                &None,
-                &None,
-                &None,
-                &None,
-                &None,
-            ),
-            Action::Drop
-        );
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        let message = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_opcode(message), REQ_SET_APPLICATION_ID);
-        let application_id = nullable_string(message).expect("ARC application identity");
-        assert!(application_id.starts_with(crate::state::ARC_APPLICATION_ID_PREFIX));
-        assert!(!application_id.starts_with("org.chromium.arc.session."));
-        assert!(application_id
-            .strip_prefix(crate::state::ARC_APPLICATION_ID_PREFIX)
-            .unwrap()
-            .parse::<u32>()
-            .is_ok());
-        assert_eq!(
-            Some(application_id.as_str()),
-            ctx.window_placement
-                .arc_mut()
-                .and_then(|arc| arc.arc_application_id(SURFACE.guest))
-                .as_deref()
         );
     }
 

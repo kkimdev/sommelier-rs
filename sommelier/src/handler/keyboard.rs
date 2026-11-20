@@ -80,8 +80,8 @@ fn take_no_keyboard_extension_log_level() -> log::Level {
 enum KeyClass {
     /// Listed in `SOMMELIER_ACCELERATORS`: the host runs the accelerator.
     HostAccelerator,
-    /// Bound to a placement action while the ARC bounds policy is active:
-    /// Sommelier owns the chord.
+    /// Bound to a placement action while placement is on: Sommelier owns
+    /// the chord.
     Placement(WindowLayoutAction),
     /// Ordinary guest input.
     Guest,
@@ -320,8 +320,8 @@ impl KeyboardHandler {
     /// Decide who owns a key from its chord alone.
     ///
     /// Both key channels (`wl_keyboard.key` and `peek_key`) ask this one
-    /// classification. `PlacementConfig` holds bindings only while the ARC
-    /// bounds policy is active, and its validator rejects a chord that is
+    /// classification. `Context::placement_action_for` binds a chord only
+    /// while placement is on, and the validator rejects a chord that is
     /// both a host accelerator and a binding; if one slipped through, the
     /// host keeps its accelerator.
     fn classify_key(ctx: &Context, host_keyboard_id: HostId, key: u32) -> KeyClass {
@@ -794,7 +794,14 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
 
         let guest_owner = ctx.key_generations.guest_owner(host_keyboard_id, key);
         let key_class = match state {
-            KEY_STATE_PRESSED => Self::classify_key(ctx, host_keyboard_id, key),
+            KEY_STATE_PRESSED => {
+                // The one check of the bindings file per press: a release
+                // or a duplicate press (settled above) needs no binding,
+                // and Exo sends no repeats. A `peek_key` of this press,
+                // which may come first, sees the bindings as they were.
+                ctx.refresh_placement_bindings();
+                Self::classify_key(ctx, host_keyboard_id, key)
+            }
             _ => KeyClass::Guest,
         };
         // Only the press that claims an unowned key generation for a
@@ -1105,10 +1112,11 @@ fn is_modifier_keysym(sym: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arc_task_ids::ArcIdAllocator;
-    use crate::handler::window_placement::{place_focused, PlacementSkip};
+    use crate::handler::window_placement::{
+        attach_toplevel, place_focused, surface_configured, translate_aura_configure, PlacementSkip,
+    };
     use crate::placement_config::PlacementConfig;
-    use crate::protocols::aura_shell::{zaura_surface, zaura_toplevel};
+    use crate::protocols::aura_shell::zaura_surface;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::{
         ZcrExtendedKeyboardV1Handler, HANDLED_STATE_HANDLED as HANDLED,
         HANDLED_STATE_NOT_HANDLED as NOT_HANDLED,
@@ -1122,6 +1130,7 @@ mod tests {
     use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::protocols::wayland::{wl_callback, wl_display, wl_registry, wl_seat};
+    use crate::protocols::xdg_shell::xdg_toplevel;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
     use crate::state::{GuestKeyEvent, OutputState};
@@ -1825,30 +1834,27 @@ mod tests {
     #[test]
     fn chord_classification_follows_the_configuration() {
         use WindowLayoutAction::*;
-        let arc = |spec: &str| Arc::new(PlacementConfig::arc_bounds_for_test(spec));
-        let resolve = |variables: &[(&str, &str)]| {
-            Arc::new(PlacementConfig::resolve_for_test(
-                variables,
-                None,
-                ArcIdAllocator::block_for_test(),
-            ))
-        };
-        let nine = arc(
-            "<Alt>q=top-left,<Alt>w=top,<Alt>e=top-right,<Alt>a=left,<Alt>s=fullscreen,\
-             <Alt>d=right,<Alt>z=bottom-left,<Alt>x=bottom,<Alt>c=bottom-right",
-        );
-        let alt_q = arc("<Alt>q=top-left");
-        let control_q = arc("<Control>q=top-left");
-        // The ARC bounds policy is off, so the binding is ignored.
-        let ungated = resolve(&[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left")]);
-        let both = resolve(&[
-            ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
-            ("SOMMELIER_ACCELERATORS", "<Control>a"),
-            (
-                "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS",
-                "<Control>q=top-left",
-            ),
+        let active =
+            |bindings: &[(&str, &str)]| Arc::new(PlacementConfig::active_for_test(bindings));
+        let nine = active(&[
+            ("<Alt>q", "top-left"),
+            ("<Alt>w", "top"),
+            ("<Alt>e", "top-right"),
+            ("<Alt>a", "left"),
+            ("<Alt>s", "fullscreen"),
+            ("<Alt>d", "right"),
+            ("<Alt>z", "bottom-left"),
+            ("<Alt>x", "bottom"),
+            ("<Alt>c", "bottom-right"),
         ]);
+        let alt_q = active(&[("<Alt>q", "top-left")]);
+        let control_q = active(&[("<Control>q", "top-left")]);
+        // Placement is off, so nothing is bound.
+        let off = Arc::new(PlacementConfig::for_test(Vec::new()));
+        let both = Arc::new(PlacementConfig::loaded_for_test(
+            vec![crate::accelerator::parse_accelerator("<Control>a").unwrap()],
+            &[("<Control>q", "top-left")],
+        ));
         let cases = [
             (&nine, ALT, KEY_Q, KeyClass::Placement(TopLeft)),
             (&nine, ALT, KEY_W, KeyClass::Placement(Top)),
@@ -1863,7 +1869,7 @@ mod tests {
             (&alt_q, 0, KEY_Q, KeyClass::Guest),
             (&alt_q, ALT | SHIFT, KEY_Q, KeyClass::Guest),
             (&control_q, CONTROL, KEY_Q, KeyClass::Placement(TopLeft)),
-            (&ungated, ALT, KEY_Q, KeyClass::Guest),
+            (&off, ALT, KEY_Q, KeyClass::Guest),
             (&both, CONTROL, KEY_A, KeyClass::HostAccelerator),
             (&both, CONTROL, KEY_Q, KeyClass::Placement(TopLeft)),
             (&both, CONTROL, KEY_Z, KeyClass::Guest),
@@ -1983,58 +1989,52 @@ mod tests {
     /// [`placeable`] with `<Alt>q=top-left` configured.
     fn placeable_shortcut() -> Proxy {
         placeable(
-            PlacementConfig::arc_bounds_for_test("<Alt>q=top-left"),
+            PlacementConfig::active_for_test(&[("<Alt>q", "top-left")]),
             placeable_output(),
         )
     }
 
     /// A placement configuration whose bindings come from a file.
     fn file_placement(dir: &crate::test_support::TempDir, document: &[u8]) -> Arc<PlacementConfig> {
-        let path = dir.write("shortcuts.toml", document);
-        Arc::new(PlacementConfig::resolve_for_test(
-            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
-            Some(&path),
-            ArcIdAllocator::block_for_test(),
-        ))
+        let path = dir.write("window-placement.toml", document);
+        Arc::new(PlacementConfig::file_for_test(&path))
     }
 
-    /// The `[x, y, width, height]` of each `set_window_bounds` queued for
-    /// the placed window.
-    fn queued_bounds(ctx: &Context) -> Vec<[i32; 4]> {
-        let Some(aura_toplevel) = ctx
-            .window_placement
-            .arc()
-            .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(PLACED_TOPLEVEL))
-        else {
-            return Vec::new();
-        };
+    /// The placed window's host xdg_toplevel.
+    const PLACED_HOST_TOPLEVEL: u32 = 23;
+
+    /// How many placements of the placed window were queued: each starts
+    /// with `xdg_toplevel.unset_maximized`.
+    fn placements_started(ctx: &Context) -> usize {
         ctx.client_to_host_queue
             .iter()
-            .filter(|(message, _)| msg_sender(message) == aura_toplevel)
-            .filter_map(|(message, _)| {
-                match decode(
-                    message,
-                    &mut Default::default(),
-                    zaura_toplevel::Request::from_wire,
-                ) {
-                    Ok((
-                        _,
-                        zaura_toplevel::Request::SetWindowBounds {
-                            x,
-                            y,
-                            width,
-                            height,
-                            ..
-                        },
-                    )) => Some([x, y, width, height]),
-                    _ => None,
-                }
+            .filter(|(message, _)| {
+                msg_sender(message) == PLACED_HOST_TOPLEVEL
+                    && msg_opcode(message) == xdg_toplevel::REQ_UNSET_MAXIMIZED
             })
-            .collect()
+            .count()
     }
 
+    /// The placement in flight for the placed window.
+    fn placement_in_flight(ctx: &Context) -> Option<crate::state::Placement> {
+        ctx.window_placement.active()?.placement(PLACED_TOPLEVEL)
+    }
+
+    /// How many placements were queued, and the `[x, y, width, height]` of
+    /// the one in flight.
+    fn queued_bounds(ctx: &Context) -> (usize, Option<[i32; 4]>) {
+        let target = placement_in_flight(ctx).map(|placement| {
+            let bounds = placement.target;
+            [bounds.x, bounds.y, bounds.width, bounds.height]
+        });
+        (placements_started(ctx), target)
+    }
+
+    /// No placement was queued.
+    const NOT_PLACED: (usize, Option<[i32; 4]>) = (0, None);
+
     /// Where the `<Alt>q=top-left` placement puts the placed window.
-    const TOP_LEFT_BOUNDS: [i32; 4] = [0, 0, 1920, 1080];
+    const TOP_LEFT_BOUNDS: (usize, Option<[i32; 4]>) = (1, Some([0, 0, 1920, 1080]));
 
     /// The host completes internal callback `callback`.
     fn complete_callback(ctx: &mut Context, callback: u32) {
@@ -2066,7 +2066,7 @@ mod tests {
             ..placeable_output()
         };
         let mut p = placeable(
-            PlacementConfig::arc_bounds_for_test("<Alt>q=top-left"),
+            PlacementConfig::active_for_test(&[("<Alt>q", "top-left")]),
             output,
         );
         assert_eq!(p.classify(PLACING, KEY_Q), KeyClass::Placement(TopLeft));
@@ -2082,8 +2082,8 @@ mod tests {
         assert_eq!(
             p.ctx
                 .window_placement
-                .arc()
-                .map_or(0, |arc| arc.aura_toplevel_count()),
+                .active()
+                .map_or(0, |state| state.toplevel_count()),
             0
         );
         assert_eq!(p.ctx.aura_surfaces.count(), 0);
@@ -2125,7 +2125,7 @@ mod tests {
             Err(PlacementSkip::NoUsableOutput)
         );
         assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-        assert!(queued_bounds(&p.ctx).is_empty());
+        assert_eq!(queued_bounds(&p.ctx), NOT_PLACED);
     }
 
     /// The press and release of a matched chord stay with Sommelier
@@ -2142,14 +2142,8 @@ mod tests {
         no_toplevel.ctx.xdg_roles = crate::state::XdgRoles::default();
         let sliver_binding =
             b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.0001, 0.0, 0.9999, 1.0]\n";
-        let no_arc_identity = PlacementConfig::resolve_for_test(
-            &[
-                ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
-                ("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left"),
-            ],
-            None,
-            ArcIdAllocator::exhausted_for_test(),
-        );
+        let mut no_shell = placeable_shortcut();
+        no_shell.ctx.host_zaura_shell = None;
         let cases = [
             (no_toplevel, TopLeft, PlacementSkip::NoFocusedToplevel),
             (
@@ -2157,11 +2151,7 @@ mod tests {
                 sliver,
                 PlacementSkip::RectNotRepresentable,
             ),
-            (
-                placeable(no_arc_identity, placeable_output()),
-                TopLeft,
-                PlacementSkip::NoAuraToplevel,
-            ),
+            (no_shell, TopLeft, PlacementSkip::NoAuraToplevel),
         ];
         for (mut p, action, skip) in cases {
             assert_eq!(
@@ -2173,7 +2163,7 @@ mod tests {
                 Action::Drop,
                 "{skip:?}"
             );
-            assert!(queued_bounds(&p.ctx).is_empty(), "{skip:?}");
+            assert_eq!(queued_bounds(&p.ctx), NOT_PLACED, "{skip:?}");
             assert_eq!(
                 p.owner(PLACING, KEY_Q),
                 Some(CompositorShortcut),
@@ -2189,8 +2179,8 @@ mod tests {
             assert_eq!(
                 p.ctx
                     .window_placement
-                    .arc()
-                    .map_or(0, |arc| arc.aura_toplevel_count()),
+                    .active()
+                    .map_or(0, |state| state.toplevel_count()),
                 0,
                 "{skip:?}"
             );
@@ -2207,43 +2197,61 @@ mod tests {
         );
     }
 
+    /// Each press checks the bindings file once, before it is classified,
+    /// so an edit takes effect on the next press; a release or a repeat
+    /// checks nothing.
     #[test]
-    fn shortcut_config_reload_takes_effect_on_the_next_press() {
+    fn a_bindings_file_edit_takes_effect_on_the_next_press() {
         let dir = crate::test_support::TempDir::new("keyboard-shortcut-reload");
         let placement = file_placement(&dir, b"version = 1\n");
         let mut p = placeable(Arc::clone(&placement), placeable_output());
         assert_eq!(
             p.classify(PLACING, KEY_Q),
             KeyClass::Guest,
-            "the file is the only binding source"
+            "the file binds nothing"
         );
 
-        dir.write(
-            "shortcuts.toml",
-            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.25, 0.0, 0.5, 1.0]\n",
-        );
-        placement.reload().unwrap().unwrap();
+        let bind_alt_q = |dir: &crate::test_support::TempDir| {
+            dir.write(
+                "window-placement.toml",
+                b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.25, 0.0, 0.5, 1.0]\n",
+            );
+        };
+        bind_alt_q(&dir);
         assert_eq!(
             p.key(PLACING, 1, 100, KEY_Q, PRESSED),
             Action::Drop,
-            "the reloaded chord is consumed by the compositor"
+            "the new chord is consumed by the compositor"
         );
-        assert_eq!(queued_bounds(&p.ctx), [[960, 0, 1920, 2160]]);
+        assert_eq!(queued_bounds(&p.ctx), (1, Some([960, 0, 1920, 2160])));
         assert_eq!(p.owner(PLACING, KEY_Q), Some(CompositorShortcut));
 
         // Removing the binding while the key is held still suppresses the
         // matching release: ownership, not the binding, owns the release.
-        dir.write("shortcuts.toml", b"version = 1\n");
-        placement.reload().unwrap().unwrap();
+        // Neither the release nor a repeat checks the file.
+        dir.write("window-placement.toml", b"version = 1\n");
         assert_eq!(p.key(PLACING, 2, 101, KEY_Q, RELEASED), Action::Drop);
         assert_eq!(p.owner(PLACING, KEY_Q), None);
+        p.key(PLACING, 3, 102, KEY_A, wl_keyboard::KEY_STATE_REPEATED);
+        assert_eq!(
+            placement.refresh(),
+            crate::placement_config::Refresh::Loaded,
+            "the edit waits for a press"
+        );
+
+        bind_alt_q(&dir);
+        p.ctx.client_to_host_queue.clear();
+        p.key(PLACING, 4, 103, KEY_Q, PRESSED);
+        p.key(PLACING, 5, 104, KEY_Q, RELEASED);
+        assert_eq!(placements_started(&p.ctx), 1, "the press adopted the edit");
+        dir.write("window-placement.toml", b"version = 1\n");
         p.ctx.client_to_host_queue.clear();
         assert_eq!(
-            p.key(PLACING, 3, 102, KEY_Q, PRESSED),
+            p.key(PLACING, 6, 105, KEY_Q, PRESSED),
             Action::Forward,
             "a removed binding is delivered to the guest"
         );
-        assert!(queued_bounds(&p.ctx).is_empty());
+        assert_eq!(placements_started(&p.ctx), 0);
     }
 
     /// Contract: whoever delivers a key generation to the guest first owns
@@ -2275,12 +2283,12 @@ mod tests {
         assert_eq!(
             p.ctx
                 .window_placement
-                .arc()
-                .map_or(0, |arc| arc.aura_toplevel_count()),
+                .active()
+                .map_or(0, |state| state.toplevel_count()),
             0
         );
         assert_eq!(p.ctx.internal_callbacks.count(), 0);
-        assert!(queued_bounds(&p.ctx).is_empty());
+        assert_eq!(queued_bounds(&p.ctx), NOT_PLACED);
     }
 
     #[test]
@@ -2307,7 +2315,7 @@ mod tests {
         );
         assert_eq!(
             queued_bounds(&p.ctx),
-            [TOP_LEFT_BOUNDS],
+            TOP_LEFT_BOUNDS,
             "the window is placed"
         );
         assert_eq!(p.owner(PLACING, KEY_Q), Some(CompositorShortcut));
@@ -2335,12 +2343,12 @@ mod tests {
             "nothing reaches the guest"
         );
         assert_eq!(p.owner(PLACING, KEY_Q), None);
-        assert!(queued_bounds(&p.ctx).is_empty());
+        assert_eq!(queued_bounds(&p.ctx), NOT_PLACED);
         assert_eq!(
             p.ctx
                 .window_placement
-                .arc()
-                .map_or(0, |arc| arc.aura_toplevel_count()),
+                .active()
+                .map_or(0, |state| state.toplevel_count()),
             0
         );
     }
@@ -2349,7 +2357,7 @@ mod tests {
     fn duplicate_shortcut_press_does_not_queue_another_placement() {
         let mut p = placeable_shortcut();
         assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-        assert_eq!(queued_bounds(&p.ctx), [TOP_LEFT_BOUNDS]);
+        assert_eq!(queued_bounds(&p.ctx), TOP_LEFT_BOUNDS);
         let barriers = p.ctx.internal_callbacks.count();
 
         assert_eq!(
@@ -2359,7 +2367,7 @@ mod tests {
         );
         assert_eq!(
             queued_bounds(&p.ctx),
-            [TOP_LEFT_BOUNDS],
+            TOP_LEFT_BOUNDS,
             "a duplicate press must not place the window again"
         );
         assert_eq!(p.ctx.internal_callbacks.count(), barriers);
@@ -2374,7 +2382,7 @@ mod tests {
         let mut p = placeable_shortcut();
         let keyboard = HostId(PLACING.host);
         assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-        assert_eq!(queued_bounds(&p.ctx), [TOP_LEFT_BOUNDS]);
+        assert_eq!(queued_bounds(&p.ctx), TOP_LEFT_BOUNDS);
 
         // The extension's peek for the same generation trails the
         // wl_keyboard press.
@@ -2400,18 +2408,21 @@ mod tests {
         assert_eq!(p.owner(PLACING, KEY_Q), None);
     }
 
+    /// Placement moves a window with `zaura_surface.set_parent` and sizes
+    /// it with a configure, so it never changes the surface's application
+    /// ID (an ARC ID would make Chrome bypass the IME) and never touches
+    /// the focused IME generation, an in-progress composition included.
     #[test]
     fn placement_shortcuts_leave_the_focused_ime_generation_untouched() {
-        // The old generation-safe stack (#8) reset, deactivated, and replayed
-        // the host text-input generation around each shortcut because its
-        // transient ARC identity and self-parent paths changed Aura metadata
-        // per placement. The bounds-only design installs the ARC identity at
-        // most once per surface, so repeated placements must not touch the
-        // focused IME generation, including an in-progress composition.
         let mut p = placeable_shortcut();
         compose_on_placed_surface(&mut p);
         let t = PLACED_TEXT_INPUT;
         let before = text_input::snapshot(&p.ctx, t.guest);
+        // Exo reports the window at (100, 50), with xdg_surface 1013's
+        // configure serial 1.
+        let aura_toplevel = attach_toplevel(&mut p.ctx, PLACED_TOPLEVEL).expect("an Aura toplevel");
+        translate_aura_configure(&mut p.ctx, aura_toplevel, 100, 50, 800, 600, &[]);
+        surface_configured(&mut p.ctx, 1013, 1);
 
         for (serial, time) in [(2, 100), (4, 200)] {
             assert_eq!(p.key(PLACING, serial, time, KEY_Q, PRESSED), Action::Drop);
@@ -2419,40 +2430,38 @@ mod tests {
                 p.key(PLACING, serial + 1, time + 1, KEY_Q, RELEASED),
                 Action::Drop
             );
-            let aura_toplevel = p
-                .ctx
-                .window_placement
-                .arc()
-                .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(PLACED_TOPLEVEL))
-                .expect("placement must create the Aura toplevel");
-            let barrier = p
-                .ctx
-                .window_placement
-                .arc()
-                .and_then(|arc| arc.active_barrier_for_toplevel(aura_toplevel))
-                .expect("placement must order its bounds behind a barrier");
-            complete_callback(&mut p.ctx, barrier);
-            assert!(!p
-                .ctx
-                .window_placement
-                .arc()
-                .is_some_and(|arc| arc.has_active_barrier(aura_toplevel)));
+            // Restore, then move: Exo reports the window at the target.
+            for origin in [None, Some((0, 0))] {
+                if let Some((x, y)) = origin {
+                    translate_aura_configure(&mut p.ctx, aura_toplevel, x, y, 800, 600, &[]);
+                }
+                let barrier = placement_in_flight(&p.ctx)
+                    .expect("each step waits on a barrier")
+                    .barrier;
+                complete_callback(&mut p.ctx, barrier);
+            }
+            assert_eq!(placement_in_flight(&p.ctx), None, "the window is placed");
         }
-        assert_eq!(queued_bounds(&p.ctx), [TOP_LEFT_BOUNDS; 2]);
-
+        assert_eq!(placements_started(&p.ctx), 2);
         let aura_surface = p
             .ctx
             .aura_surfaces
             .get(PLACED_HOST_SURFACE)
             .expect("placement must create the Aura surface");
-        let identities = p.ctx.client_to_host_queue.iter().filter(|(message, _)| {
+        let moves = p.ctx.client_to_host_queue.iter().filter(|(message, _)| {
             msg_sender(message) == aura_surface
-                && msg_opcode(message) == zaura_surface::REQ_SET_APPLICATION_ID
+                && msg_opcode(message) == zaura_surface::REQ_SET_PARENT
         });
-        assert_eq!(
-            identities.count(),
-            1,
-            "the ARC identity is installed once, not changed per placement"
+        assert_eq!(moves.count(), 2, "each placement moves the window");
+        assert!(
+            p.ctx
+                .client_to_host_queue
+                .iter()
+                .all(
+                    |(message, _)| msg_opcode(message) != zaura_surface::REQ_SET_APPLICATION_ID
+                        || msg_sender(message) != aura_surface
+                ),
+            "placement must not change the application ID"
         );
         assert!(
             p.ctx
@@ -2498,7 +2507,7 @@ mod tests {
         assert_eq!(p.owner(PLACING, KEY_Q), Some(Physical));
         assert_eq!(p.key(PLACING, 7, 301, KEY_Q, RELEASED), Action::Forward);
         assert_eq!(p.owner(PLACING, KEY_Q), None);
-        assert_eq!(queued_bounds(&p.ctx), [TOP_LEFT_BOUNDS]);
+        assert_eq!(queued_bounds(&p.ctx), TOP_LEFT_BOUNDS);
     }
 
     #[test]
@@ -2517,7 +2526,7 @@ mod tests {
         assert_eq!(p.owner(PLACING, KEY_Q), Some(Physical));
         assert_eq!(p.key(PLACING, 5, 101, KEY_Q, RELEASED), Action::Forward);
         assert_eq!(p.owner(PLACING, KEY_Q), None);
-        assert_eq!(queued_bounds(&p.ctx), [TOP_LEFT_BOUNDS]);
+        assert_eq!(queued_bounds(&p.ctx), TOP_LEFT_BOUNDS);
     }
 
     #[test]
@@ -2528,21 +2537,12 @@ mod tests {
         compose_on_placed_surface(&mut p);
         let t = PLACED_TEXT_INPUT;
         assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-        let aura_toplevel = p
-            .ctx
-            .window_placement
-            .arc()
-            .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(PLACED_TOPLEVEL))
-            .expect("placement must create the Aura toplevel");
-        let placement_barrier = p
-            .ctx
-            .window_placement
-            .arc()
-            .and_then(|arc| arc.active_barrier_for_toplevel(aura_toplevel))
-            .expect("placement must order its bounds behind a barrier");
+        let placement_barrier = placement_in_flight(&p.ctx)
+            .expect("placement must wait on a barrier")
+            .barrier;
 
-        // A real host focus cycle lands while the placement barrier holds
-        // configures. It drains the host IME generation through its own
+        // A real host focus cycle lands while the placement barrier is
+        // pending. It drains the host IME generation through its own
         // text-input barrier and the guest re-enables on the new enter.
         assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Drop);
         let state = text_input::view(&p.ctx, t.guest);
@@ -2559,7 +2559,7 @@ mod tests {
         assert_ne!(text_input::view(&p.ctx, t.guest).host, Host::Active);
 
         // The IME barrier reactivates text input without retiring the
-        // placement barrier, which still gates configures.
+        // placement barrier.
         let queued_before = p.ctx.client_to_host_queue.len();
         complete_callback(&mut p.ctx, ime_barrier.0);
         assert_eq!(text_input::view(&p.ctx, t.guest).host, Host::Active);
@@ -2579,22 +2579,15 @@ mod tests {
                 }
             ))
         );
-        assert!(p
-            .ctx
-            .window_placement
-            .arc()
-            .is_some_and(|arc| arc.has_active_barrier(aura_toplevel)));
+        assert!(placement_in_flight(&p.ctx).is_some());
 
         // The placement barrier then retires without disturbing the fresh
         // IME generation.
         let host_queue_len = p.ctx.client_to_host_queue.len();
         let state_after_activation = text_input::snapshot(&p.ctx, t.guest);
+        // Exo has reported no origin here, so the placement ends.
         complete_callback(&mut p.ctx, placement_barrier);
-        assert!(!p
-            .ctx
-            .window_placement
-            .arc()
-            .is_some_and(|arc| arc.has_active_barrier(aura_toplevel)));
+        assert_eq!(placement_in_flight(&p.ctx), None);
         assert_eq!(p.ctx.client_to_host_queue.len(), host_queue_len);
         assert_eq!(
             text_input::snapshot(&p.ctx, t.guest),

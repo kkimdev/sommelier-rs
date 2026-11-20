@@ -67,7 +67,7 @@ impl WlCallbackHandler for CallbackHandler {
                 // Every host event, this `done` included, has decided the
                 // pending recovery before it is handled.
                 InternalCallback::KeyRecovery => {}
-                InternalCallback::WindowBoundsBarrier { zaura_toplevel } => {
+                InternalCallback::PlacementBarrier { zaura_toplevel } => {
                     crate::handler::window_placement::complete_barrier(
                         ctx,
                         host_id,
@@ -103,19 +103,10 @@ impl WlCallbackHandler for CallbackHandler {
 mod tests {
     use super::CallbackHandler;
     use crate::handler::display::DisplayHandler;
-    use crate::handler::window_placement::register_window_bounds_barrier_for_test;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::state::{Context, HostId, InternalCallback};
     use crate::wire::Action;
-
-    /// A context whose placement uses the ARC backend, whose barriers these
-    /// tests complete.
-    fn arc_context() -> Context {
-        Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
-        )
-    }
 
     #[test]
     fn internal_sync_is_a_tracked_host_callback() {
@@ -194,23 +185,28 @@ mod tests {
         assert!(ctx.shadow_table.is_host_id_available(host_id));
     }
 
+    /// A placement barrier retires at its `done`, even for a toplevel
+    /// placement no longer knows, and its ID stays reserved until the
+    /// host's `delete_id`.
     #[test]
-    fn window_bounds_barrier_completes_and_reserves_callback_until_delete_id() {
-        let zaura_toplevel_id = 77;
+    fn placement_barrier_completes_and_reserves_callback_until_delete_id() {
         let callback_id = 40;
-        let mut ctx = arc_context();
+        let mut ctx = Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::active_for_test(&[]),
+        );
         ctx.shadow_table
             .insert_host_only_for_test(callback_id, "wl_callback", 1);
-        register_window_bounds_barrier_for_test(&mut ctx, callback_id, zaura_toplevel_id);
+        ctx.internal_callbacks.register(
+            HostId(callback_id),
+            InternalCallback::PlacementBarrier { zaura_toplevel: 77 },
+        );
         ctx.last_sender_id = callback_id;
 
         let mut handler = CallbackHandler;
         assert_eq!(handler.on_done(&mut ctx, 123), Action::Drop);
         assert_eq!(ctx.internal_callbacks.count(), 0);
-        assert!(!ctx
-            .window_placement
-            .arc()
-            .is_some_and(|arc| arc.has_active_barrier(zaura_toplevel_id)));
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert!(ctx.host_to_client_queue.is_empty());
         assert!(ctx.shadow_table.is_retired_host(callback_id));
         assert!(!ctx.shadow_table.is_host_id_available(callback_id));
 
@@ -220,45 +216,5 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.shadow_table.is_host_id_available(callback_id));
-    }
-
-    #[test]
-    fn stale_window_bounds_barrier_does_not_clear_newer_barrier() {
-        let zaura_toplevel_id = 77;
-        let old_callback_id = 40;
-        let new_callback_id = 41;
-        let mut ctx = arc_context();
-        for callback_id in [old_callback_id, new_callback_id] {
-            ctx.shadow_table
-                .insert_host_only_for_test(callback_id, "wl_callback", 1);
-        }
-        register_window_bounds_barrier_for_test(&mut ctx, old_callback_id, zaura_toplevel_id);
-        register_window_bounds_barrier_for_test(&mut ctx, new_callback_id, zaura_toplevel_id);
-
-        let mut handler = CallbackHandler;
-        ctx.last_sender_id = old_callback_id;
-        assert_eq!(handler.on_done(&mut ctx, 1), Action::Drop);
-        assert_eq!(
-            ctx.window_placement
-                .arc()
-                .and_then(|arc| arc.active_barrier_for_toplevel(zaura_toplevel_id)),
-            Some(new_callback_id)
-        );
-        assert!(ctx.shadow_table.is_retired_host(old_callback_id));
-        assert_eq!(
-            ctx.internal_callbacks.get(HostId(new_callback_id)),
-            Some(InternalCallback::WindowBoundsBarrier {
-                zaura_toplevel: zaura_toplevel_id
-            })
-        );
-
-        ctx.last_sender_id = new_callback_id;
-        assert_eq!(handler.on_done(&mut ctx, 2), Action::Drop);
-        assert!(!ctx
-            .window_placement
-            .arc()
-            .is_some_and(|arc| arc.has_active_barrier(zaura_toplevel_id)));
-        assert_eq!(ctx.internal_callbacks.count(), 0);
-        assert!(ctx.shadow_table.is_retired_host(new_callback_id));
     }
 }
