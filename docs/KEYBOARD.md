@@ -6,13 +6,14 @@ pressed. [DESIGN.md](DESIGN.md#keyboard-and-ime) places the concern in
 the proxy; the rules it keeps are under
 [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 
-A key can reach the guest four ways: a `wl_keyboard.key`, a key the
-`wl_keyboard.enter` lists, a text-input keysym, and a press and release
-the proxy recovers for an empty IME confirmation (X2' of
-[IME.md](IME.md#22-host-events)). Exo announces each key on
+A key can reach the guest three ways: a `wl_keyboard.key`, a key the
+`wl_keyboard.enter` lists, and a press and release the proxy recovers
+for an empty IME confirmation (X2' of [IME.md](IME.md#22-host-events)).
+Text-input keysyms reach the guest as nothing (INVARIANTS "Host keysyms
+are dropped"). Exo announces each key on
 `zcr_extended_keyboard_v1.peek_key` first, even one its input method
 consumes, so the proxy sees the key's physical life on two channels and
-its delivery on up to three.
+its delivery on up to two.
 
 ## State
 
@@ -23,8 +24,7 @@ generation is three independent parts, each an enum whose variants carry
 only the data that exists in them:
 
 - `phase: KeyPhase`, what the host has shown of the key:
-  - `Unseen`: a keysym (or a test's claim) came before any physical
-    event;
+  - `Unseen`: a claim or a suppression came before any physical event;
   - `Held { peek, lease, stale }`: `lease` is the IME's Backspace repeat
     lease (`RepeatLease::Free`, `Leased { text_input }` or `Cancelled`
     for the rest of the hold); `stale` marks a key held across the input
@@ -34,23 +34,20 @@ only the data that exists in them:
   serial }` (a peek repeat of a key held since `enter`, or a generation
   whose keyboard has since held no key) or `Live(PeekKeyProvenance)`, the
   serial, time, sequence and eligibility of a peek press, which makes the
-  generation a candidate for recovery and keysym routing.
+  generation a candidate for recovery.
 - `guest: GuestPress`, who gave the guest the key: `None`, `Physical`,
-  `Keysym { press_serial }`, `Shortcut` (Sommelier placed a window), or
-  `Recovered { keysym_press_serial }`, a tombstone for a balanced pair
-  that suppresses late duplicates.
+  `Shortcut` (Sommelier placed a window), or `Recovered`, a tombstone for
+  a recovered pair that suppresses late duplicates.
 - `host_accelerator_suppressed`: a `wl_keyboard` press that no channel
   gave the guest was a host accelerator. It is independent of the rest:
-  its release and the generation's keysyms are dropped whatever the
-  phase.
+  its release is dropped whatever the phase.
 
-When a key is pressed again before the channel that gave the guest its
-previous press released it, the retired generation's release waits
-beside the new one (`retired_guest_releases`), at most one per channel.
+When a key is pressed again before `wl_keyboard` released the guest's
+previous press of it, the retired generation's release waits beside the
+new one (`retired_guest_releases`), at most one per key.
 
 Phase and guest delivery are independent because the channels race: a
-keysym can come before the key's peek, and a `wl_keyboard` press after
-its peek release. The registry's model test (see [Tests](#tests)) keeps
+`wl_keyboard` press can come after its peek release. The registry's model test (see [Tests](#tests)) keeps
 each generation as independent flags; within each part, their illegal
 combinations cannot be written:
 
@@ -61,7 +58,7 @@ combinations cannot be written:
 | `physical_release_serial` | `Released { release_serial }` only |
 | `backspace_repeat_cancelled`, `ime_repeat_owner` | `RepeatLease`, inside `Held` only: never both, and a release ends it |
 | `stale` | `Held { stale }` only: a release ends it |
-| `guest_owner`, `guest_press_serial` | `GuestPress`: a serial only on a keysym press or its tombstone |
+| `guest_owner` | `GuestPress` |
 
 ## Transitions
 
@@ -73,7 +70,6 @@ keyboard's XKB state, focus), and applies the effects on the guest:
 | --- | --- | --- |
 | `peek_key` press, repeat, release | `peek_key(PeekInput)` → `PeekOutcome` | `on_peek_key` |
 | `wl_keyboard.key` | `admit_key` (physical), then `transition_guest_key` (delivery) | `on_key` |
-| keysym press, repeat, release | `transition_guest_key(TextInput*)` | `ime_keys::on_keysym` |
 | recovered pair | `transition_guest_key(RecoverIme)` | `ime_keys::recover_pending` |
 | `wl_keyboard.enter` | `install_enter_snapshot`: every listed key `Held`, `Physical` | `on_enter` |
 | leave, keyboard end | `clear_keyboard` of each keyboard that lost its focus or ended | `on_leave`, `forget_keyboard` |
@@ -94,7 +90,6 @@ than the peek.
 
 The phase moves:
 
-- idle → `Unseen`: a keysym press comes first.
 - idle or `Unseen` → `Held`: a press on either channel, or the enter.
 - `Held` → `Released`: a release on either channel; it ends the lease
   and the detach marker.

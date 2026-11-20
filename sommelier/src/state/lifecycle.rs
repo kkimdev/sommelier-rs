@@ -278,7 +278,6 @@ impl Context {
             .keys()
             .chain(self.extended_keyboard_to_keyboard.values())
             .chain(self.keyboard_repeatable_keys.keys())
-            .chain(self.keyboard_keysym_to_keycode.keys())
             .chain(self.keyboard_keymaps.keys())
             .chain(self.keyboard_xkb_states.keys())
             .chain(self.keyboard_modifiers.keys())

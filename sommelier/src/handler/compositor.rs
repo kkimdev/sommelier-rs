@@ -3983,13 +3983,16 @@ mod tests {
             14,
             crate::state::GuestKeyOwner::ImeRecovery
         ));
-        assert!(ctx
-            .key_generations
-            .claim_text_input_owner(host_keyboard_id, 30, 1));
-        ctx.key_generations
-            .observe_physical_state(host_keyboard_id, 30, 0);
-        ctx.key_generations
-            .observe_physical_state(host_keyboard_id, 30, 1);
+        // Key 30's guest press waits for its release beside a new press.
+        let keys = &mut ctx.key_generations;
+        keys.observe_physical_state(host_keyboard_id, 30, 1);
+        assert!(keys.claim_guest_owner(
+            host_keyboard_id,
+            30,
+            crate::state::GuestKeyOwner::Physical
+        ));
+        keys.observe_physical_event(host_keyboard_id, 30, 0, Some(2));
+        keys.observe_physical_state(host_keyboard_id, 30, 1);
         ctx.keyboard_focus
             .set_for_test(crate::state::HostId(701), 2, 999, 1999);
         ctx.last_sender_id = wl_surface_guest_id;
@@ -4016,7 +4019,7 @@ mod tests {
         );
         assert!(
             !ctx.key_generations
-                .take_pending_text_input_release(host_keyboard_id, 30, 2),
+                .take_pending_physical_release(host_keyboard_id, 30, 2),
             "surface destruction must discard retired guest releases"
         );
         assert!(

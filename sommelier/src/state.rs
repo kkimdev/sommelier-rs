@@ -474,11 +474,6 @@ pub struct Context {
     /// than after it, and not again with a new keymap, so focus changes and
     /// keymaps must not reset them.
     pub(crate) keyboard_modifiers: BTreeMap<HostId, KeyboardModifiers>,
-    /// Effective keysym → evdev keycode mappings from each host keyboard's
-    /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
-    /// physical keycode, so the IME bridge uses this per-keyboard map when it
-    /// synthesizes a wl_keyboard event.
-    pub keyboard_keysym_to_keycode: BTreeMap<HostId, BTreeMap<u32, u32>>,
     /// The process-wide placement configuration: host accelerators, the
     /// ARC bounds policy, and the placement bindings. Shared, never copied:
     /// a reloaded binding generation is visible to the next lookup.
@@ -1086,7 +1081,6 @@ impl Context {
             keyboard_keymaps: BTreeMap::new(),
             keyboard_xkb_states: BTreeMap::new(),
             keyboard_modifiers: BTreeMap::new(),
-            keyboard_keysym_to_keycode: BTreeMap::new(),
             placement,
             supported_formats: BTreeSet::new(),
             host_globals: BTreeMap::new(),

@@ -26,9 +26,8 @@ pub struct PeekKeyProvenance {
     pub time: u32,
     pub sequence: u64,
     /// The generation is guest input, which may recover an IME-consumed
-    /// repeat or reach the guest as a keysym. Host accelerators and
-    /// placement chords permanently clear this bit for the lifetime of the
-    /// generation.
+    /// repeat. Host accelerators and placement chords permanently clear
+    /// this bit for the lifetime of the generation.
     pub eligible: bool,
 }
 
@@ -48,14 +47,13 @@ struct PeekWatermark {
 /// Exclusive guest-side ownership of one evdev key generation.
 ///
 /// A key can have at most one owner: either a real `wl_keyboard` press is
-/// awaiting its release, a text-input keysym press is awaiting its release, or
-/// IME recovery already emitted a balanced pair and later host events must be
+/// awaiting its release, Sommelier consumed it as a shortcut, or IME
+/// recovery already emitted a balanced pair and later host events must be
 /// suppressed. Encoding these states as one enum prevents the parallel-set
 /// inconsistencies that previously caused duplicate and stuck keys.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub enum GuestKeyOwner {
     Physical,
-    TextInputKeysym,
     /// Sommelier consumed an application window-layout shortcut. The
     /// matching release is acknowledged as handled and never reaches the
     /// guest client.
@@ -84,8 +82,7 @@ impl GuestKeyOwner {
 ///
 /// Handlers decode protocol-specific fields and provide policy facts, while
 /// the key-generation registry alone decides ownership, forwarding, and
-/// wl_keyboard ACK semantics. The sum type prevents impossible combinations
-/// such as attaching a host ACK to a text-input keysym.
+/// wl_keyboard ACK semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestKeyEvent {
     PhysicalPress {
@@ -96,13 +93,6 @@ pub enum GuestKeyEvent {
     PhysicalRelease,
     CompositorShortcutPress,
     CompositorShortcutRelease,
-    TextInputPress {
-        serial: u32,
-    },
-    TextInputRepeat,
-    TextInputRelease {
-        serial: u32,
-    },
     RecoverIme,
 }
 
@@ -118,9 +108,6 @@ pub struct GuestKeyDecision {
     pub delivery: GuestKeyDelivery,
     /// Present only for real wl_keyboard events.
     pub ack_handled: Option<bool>,
-    /// The event closes the current generation's repeat session. Retired
-    /// delayed releases deliberately leave a newer session untouched.
-    pub ends_repeat: bool,
 }
 
 /// One `zcr_extended_keyboard_v1.peek_key` of a key
@@ -172,19 +159,6 @@ pub enum KeyAdmission {
     Current,
 }
 
-/// A guest press from a retired physical generation whose release channel has
-/// not arrived yet.
-///
-/// Physical releases can be matched exactly to the preceding peek release.
-/// Text-input releases only carry their own serial, so they are matched by
-/// wrap-aware ordering against the press serial.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RetiredGuestRelease {
-    press_serial: Option<u32>,
-    release_serial: Option<u32>,
-    next_press_serial: Option<u32>,
-}
-
 /// The kind of a generation's [`KeyPhase`], without its data.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PhysicalKeyState {
@@ -198,13 +172,12 @@ enum PhysicalKeyState {
 ///
 /// `peek_key` promises that the `wl_keyboard.key` after it has its serial,
 /// so the serial names the event the latest peek announced. Only a peek
-/// press numbers a generation for recovery and keysym routing
-/// ([`PeekKeyProvenance`]); the provenance lasts while its keyboard holds a
+/// press numbers a generation for recovery ([`PeekKeyProvenance`]); the provenance lasts while its keyboard holds a
 /// key, and the serial as long as the generation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PeekRecord {
     /// No peek press or repeat: the key is held since `wl_keyboard.enter`,
-    /// or only `wl_keyboard` or a keysym showed it.
+    /// or only `wl_keyboard` showed it.
     #[default]
     None,
     /// A peek announced `serial`, but the generation has no provenance: a
@@ -276,7 +249,7 @@ enum RepeatLease {
 /// released.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KeyPhase {
-    /// No physical event yet: a keysym, or a claim, came first.
+    /// No physical event yet: a claim, or a suppression, came first.
     Unseen,
     Held {
         peek: PeekRecord,
@@ -336,7 +309,7 @@ impl KeyPhase {
 
 /// Which channel gave the guest the generation's key, if any. A key has
 /// at most one: two would deliver it twice, and none could leave it
-/// stuck. Only a keysym press carries the host serial it was sent under.
+/// stuck.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum GuestPress {
     #[default]
@@ -344,24 +317,19 @@ enum GuestPress {
     /// A `wl_keyboard.key` press, or one the enter listed, awaits its
     /// release.
     Physical,
-    /// A text-input keysym press awaits its release.
-    Keysym { press_serial: Option<u32> },
     /// Sommelier consumed the key as a window-layout shortcut.
     Shortcut,
-    /// The guest got a balanced pair (an IME recovery, or a keysym press
-    /// and its release); this tombstone suppresses later duplicates.
-    Recovered { keysym_press_serial: Option<u32> },
+    /// The guest got a balanced pair from an IME recovery; this tombstone
+    /// suppresses later duplicates.
+    Recovered,
 }
 
 impl GuestPress {
     fn of(owner: GuestKeyOwner) -> Self {
         match owner {
             GuestKeyOwner::Physical => Self::Physical,
-            GuestKeyOwner::TextInputKeysym => Self::Keysym { press_serial: None },
             GuestKeyOwner::CompositorShortcut => Self::Shortcut,
-            GuestKeyOwner::ImeRecovery => Self::Recovered {
-                keysym_press_serial: None,
-            },
+            GuestKeyOwner::ImeRecovery => Self::Recovered,
         }
     }
 
@@ -369,19 +337,8 @@ impl GuestPress {
         match self {
             Self::None => None,
             Self::Physical => Some(GuestKeyOwner::Physical),
-            Self::Keysym { .. } => Some(GuestKeyOwner::TextInputKeysym),
             Self::Shortcut => Some(GuestKeyOwner::CompositorShortcut),
-            Self::Recovered { .. } => Some(GuestKeyOwner::ImeRecovery),
-        }
-    }
-
-    fn press_serial(self) -> Option<u32> {
-        match self {
-            Self::Keysym { press_serial } => press_serial,
-            Self::Recovered {
-                keysym_press_serial,
-            } => keysym_press_serial,
-            Self::None | Self::Physical | Self::Shortcut => None,
+            Self::Recovered => Some(GuestKeyOwner::ImeRecovery),
         }
     }
 }
@@ -400,7 +357,7 @@ struct KeyGeneration {
     phase: KeyPhase,
     guest: GuestPress,
     /// A `wl_keyboard` press of a generation no channel gave the guest was
-    /// a host accelerator: its release is dropped too, and no keysym may
+    /// a host accelerator: its release is dropped too, and no recovery may
     /// deliver it. Only the generation's release, an `enter` or the
     /// keyboard's end takes it.
     host_accelerator_suppressed: bool,
@@ -464,10 +421,6 @@ impl KeyGeneration {
         self.guest.owner()
     }
 
-    fn guest_press_serial(self) -> Option<u32> {
-        self.guest.press_serial()
-    }
-
     fn stale(self) -> bool {
         matches!(self.phase, KeyPhase::Held { stale: true, .. })
     }
@@ -478,16 +431,13 @@ impl KeyGeneration {
 pub struct KeyGenerationRegistry {
     next_generation: u64,
     entries: BTreeMap<HostId, BTreeMap<u32, KeyGeneration>>,
-    /// Releases that retired generations of each keyboard's key still owe
-    /// the guest, at most one per channel that pressed them (`Physical` or
-    /// `TextInputKeysym`); the current generation's lives in `entries`. A
-    /// newer retired release replaces the older one. Exo sends each
-    /// `wl_keyboard.key` right after its `peek_key`, so a replaced
-    /// `wl_keyboard` release is not coming; it sends no keysym releases, so
-    /// a keysym entry only waits, and the bound stops such entries piling
-    /// up. See INVARIANTS "A key waits for at most one late release per
-    /// channel".
-    retired_guest_releases: BTreeMap<(HostId, u32, GuestKeyOwner), RetiredGuestRelease>,
+    /// The serial of the `wl_keyboard` release that a retired generation
+    /// of each keyboard's key still owes the guest, at most one per key;
+    /// the current generation's lives in `entries`. A newer retired release
+    /// replaces the older one: Exo sends each `wl_keyboard.key` right after
+    /// its `peek_key`, so a replaced release is not coming. See INVARIANTS
+    /// "A key waits for at most one late release".
+    retired_guest_releases: BTreeMap<(HostId, u32), u32>,
     latest_peek_sequences: BTreeMap<(u32, Option<u32>), PeekWatermark>,
 }
 
@@ -545,7 +495,7 @@ impl KeyGenerationRegistry {
             .chain(
                 self.retired_guest_releases
                     .keys()
-                    .map(|&(keyboard, _, _)| keyboard),
+                    .map(|&(keyboard, _)| keyboard),
             )
             .chain(
                 self.latest_peek_sequences
@@ -568,7 +518,7 @@ impl KeyGenerationRegistry {
     pub(crate) fn clear_keyboard(&mut self, keyboard: HostId) {
         self.entries.remove(&keyboard);
         self.retired_guest_releases
-            .retain(|(pending_keyboard, _, _), _| *pending_keyboard != keyboard);
+            .retain(|(pending_keyboard, _), _| *pending_keyboard != keyboard);
         self.latest_peek_sequences
             .retain(|_, watermark| watermark.keyboard != keyboard);
     }
@@ -639,58 +589,17 @@ impl KeyGenerationRegistry {
             })
     }
 
+    /// Take the release a retired generation of `key` owes the guest, if
+    /// it is the one under `serial`.
     pub(crate) fn take_pending_physical_release(
         &mut self,
         keyboard: HostId,
         key: u32,
         serial: u32,
     ) -> bool {
-        self.take_retired_guest_release(keyboard, key, GuestKeyOwner::Physical, |release| {
-            release.release_serial == Some(serial)
-        })
-    }
-
-    pub(crate) fn take_pending_text_input_release(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        serial: u32,
-    ) -> bool {
-        let current_press_serial = self
-            .entries
-            .get(&keyboard)
-            .and_then(|keys| keys.get(&key))
-            .and_then(|generation| {
-                generation
-                    .guest
-                    .press_serial()
-                    .or(generation.phase.peek().serial())
-            });
-        self.take_retired_guest_release(keyboard, key, GuestKeyOwner::TextInputKeysym, |release| {
-            release
-                .press_serial
-                .is_some_and(|press_serial| serial_is_after(serial, press_serial))
-                && release
-                    .next_press_serial
-                    .or(current_press_serial)
-                    .is_none_or(|current_serial| !serial_is_after(serial, current_serial))
-        })
-    }
-
-    fn take_retired_guest_release(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        owner: GuestKeyOwner,
-        matches: impl FnOnce(&RetiredGuestRelease) -> bool,
-    ) -> bool {
-        let map_key = (keyboard, key, owner);
-        let taken = self
-            .retired_guest_releases
-            .get(&map_key)
-            .is_some_and(matches);
+        let taken = self.retired_guest_releases.get(&(keyboard, key)) == Some(&serial);
         if taken {
-            self.retired_guest_releases.remove(&map_key);
+            self.retired_guest_releases.remove(&(keyboard, key));
         }
         taken
     }
@@ -720,7 +629,7 @@ impl KeyGenerationRegistry {
         serial: Option<u32>,
     ) {
         match state {
-            1 => self.observe_physical_press(keyboard, key, None),
+            1 => self.observe_physical_press(keyboard, key),
             // A repeat is evidence about an existing physical generation,
             // never permission to invent one after a missing press, and
             // changes nothing.
@@ -771,69 +680,39 @@ impl KeyGenerationRegistry {
         }
     }
 
-    fn observe_physical_press(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        next_press_serial: Option<u32>,
-    ) {
-        self.retire_released_generation(keyboard, key, next_press_serial);
+    fn observe_physical_press(&mut self, keyboard: HostId, key: u32) {
+        self.retire_released_generation(keyboard, key);
         let generation = self.ensure_generation(keyboard, key);
         if generation.phase == KeyPhase::Unseen {
             generation.phase = KeyPhase::HELD;
         }
     }
 
-    fn retire_released_generation(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        next_press_serial: Option<u32>,
-    ) -> bool {
+    /// Retire `key`'s released generation, if it has one, for a new
+    /// press; the guest's press of it waits for its release beside the new
+    /// generation.
+    fn retire_released_generation(&mut self, keyboard: HostId, key: u32) {
         let Some(generation) = self
             .entries
             .get(&keyboard)
             .and_then(|keys| keys.get(&key))
             .copied()
         else {
-            return false;
+            return;
         };
         let KeyPhase::Released { release_serial, .. } = generation.phase else {
-            return false;
+            return;
         };
-        let retired_release = match generation.guest {
-            GuestPress::Physical => release_serial.map(|release_serial| {
-                (
-                    GuestKeyOwner::Physical,
-                    RetiredGuestRelease {
-                        press_serial: None,
-                        release_serial: Some(release_serial),
-                        next_press_serial,
-                    },
-                )
-            }),
-            GuestPress::Keysym { press_serial } => press_serial.map(|press_serial| {
-                (
-                    GuestKeyOwner::TextInputKeysym,
-                    RetiredGuestRelease {
-                        press_serial: Some(press_serial),
-                        release_serial: None,
-                        next_press_serial,
-                    },
-                )
-            }),
-            GuestPress::Recovered { .. } | GuestPress::Shortcut | GuestPress::None => None,
-        };
-        if let Some((owner, retired_release)) = retired_release {
-            // Replaces the channel's older retired release, if any; see
+        if let (GuestPress::Physical, Some(release_serial)) = (generation.guest, release_serial) {
+            // Replaces the key's older retired release, if any; see
             // `retired_guest_releases`.
             if let Some(replaced) = self
                 .retired_guest_releases
-                .insert((keyboard, key, owner), retired_release)
+                .insert((keyboard, key), release_serial)
             {
                 log::debug!(
-                    "key {key} of keyboard {}: a newer {owner:?} retired release \
-                     replaces {replaced:?}, whose release has not come",
+                    "key {key} of keyboard {}: a newer retired release replaces the one \
+                     under serial {replaced}, which has not come",
                     keyboard.0
                 );
             }
@@ -841,7 +720,6 @@ impl KeyGenerationRegistry {
         if let Some(keys) = self.entries.get_mut(&keyboard) {
             keys.remove(&key);
         }
-        true
     }
 
     pub(crate) fn install_enter_snapshot<I>(&mut self, keyboard: HostId, keys: I)
@@ -885,10 +763,8 @@ impl KeyGenerationRegistry {
         eligible: bool,
     ) -> u64 {
         if !self.physically_held(keyboard, key) {
-            // Unseen means a synthetic text-input channel arrived first and
-            // this physical observation belongs to that same generation.
-            // Released is the only unambiguous boundary for a new generation.
-            self.observe_physical_press(keyboard, key, Some(serial));
+            // A released generation is retired for a new one.
+            self.observe_physical_press(keyboard, key);
         }
         // The peek numbers the generation as it arrives, so that the latest
         // peek has the highest sequence, a key held since `enter` included,
@@ -981,7 +857,7 @@ impl KeyGenerationRegistry {
     /// new press. The old press ends as a physical release would end it.
     ///
     /// Returns whether the guest still holds the old press, which
-    /// `wl_keyboard` or a keysym gave it, and is owed its release.
+    /// `wl_keyboard` or the enter gave it, and is owed its release.
     pub(crate) fn retire_stale_generation(&mut self, keyboard: HostId, key: u32) -> bool {
         if !self.held_key_is_stale(keyboard, key) {
             return false;
@@ -1001,8 +877,8 @@ impl KeyGenerationRegistry {
     /// A press of a key held across a detach retires that generation
     /// first ([`Self::retire_stale_generation`]). A press of a key not
     /// held, or held without a peek press, numbers the generation; it is
-    /// eligible for recovery and keysyms only if it is guest input that no
-    /// host accelerator or compositor shortcut has taken. A press of a key
+    /// eligible for recovery only if it is guest input that no host
+    /// accelerator or compositor shortcut has taken. A press of a key
     /// already peeked (a legacy duplicate) and a repeat refresh the peek's
     /// serial and time. A release closes the generation unless it is older
     /// than the key's latest peek: ChromeOS may reuse one serial across
@@ -1215,13 +1091,6 @@ impl KeyGenerationRegistry {
             .and_then(|generation| generation.guest.owner())
     }
 
-    pub(crate) fn guest_press_serial(&self, keyboard: HostId, key: u32) -> Option<u32> {
-        self.entries
-            .get(&keyboard)
-            .and_then(|keys| keys.get(&key))
-            .and_then(|generation| generation.guest.press_serial())
-    }
-
     pub(crate) fn claim_guest_owner(
         &mut self,
         keyboard: HostId,
@@ -1234,60 +1103,6 @@ impl KeyGenerationRegistry {
         }
         generation.guest = GuestPress::of(owner);
         true
-    }
-
-    pub(crate) fn claim_text_input_owner(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        serial: u32,
-    ) -> bool {
-        let (starts_new, released) = self
-            .entries
-            .get(&keyboard)
-            .and_then(|keys| keys.get(&key))
-            .map_or((false, false), |generation| {
-                let newer_than_guest_press = generation
-                    .guest
-                    .press_serial()
-                    .is_none_or(|press_serial| serial_is_after(serial, press_serial));
-                let (released, after_release_boundary) = match generation.phase {
-                    KeyPhase::Released { release_serial, .. } => (
-                        true,
-                        release_serial
-                            .is_some_and(|release_serial| serial_is_after(serial, release_serial)),
-                    ),
-                    KeyPhase::Unseen | KeyPhase::Held { .. } => (false, false),
-                };
-                let owner_can_start_next = match generation.guest {
-                    GuestPress::Keysym { .. } => released,
-                    GuestPress::Recovered { .. } | GuestPress::Shortcut => {
-                        generation.phase == KeyPhase::Unseen || released
-                    }
-                    GuestPress::Physical | GuestPress::None => false,
-                };
-                (
-                    owner_can_start_next
-                        && newer_than_guest_press
-                        && (!released || after_release_boundary),
-                    released,
-                )
-            });
-        if starts_new {
-            if released {
-                let retired = self.retire_released_generation(keyboard, key, Some(serial));
-                debug_assert!(retired, "released generation was checked above");
-            } else if let Some(keys) = self.entries.get_mut(&keyboard) {
-                keys.remove(&key);
-            }
-        }
-        let claimed = self.claim_guest_owner(keyboard, key, GuestKeyOwner::TextInputKeysym);
-        if claimed {
-            self.ensure_generation(keyboard, key).guest = GuestPress::Keysym {
-                press_serial: Some(serial),
-            };
-        }
-        claimed
     }
 
     pub(crate) fn take_guest_owner(&mut self, keyboard: HostId, key: u32) -> Option<GuestKeyOwner> {
@@ -1316,26 +1131,6 @@ impl KeyGenerationRegistry {
             return false;
         }
         self.take_guest_owner(keyboard, key) == Some(expected)
-    }
-
-    pub(crate) fn complete_guest_owner_if(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        expected: GuestKeyOwner,
-    ) -> bool {
-        let Some(generation) = self
-            .entries
-            .get_mut(&keyboard)
-            .and_then(|keys| keys.get_mut(&key))
-            .filter(|generation| generation.guest.owner() == Some(expected))
-        else {
-            return false;
-        };
-        generation.guest = GuestPress::Recovered {
-            keysym_press_serial: generation.guest.press_serial(),
-        };
-        true
     }
 
     pub(crate) fn suppress_host_accelerator(&mut self, keyboard: HostId, key: u32) {
@@ -1419,10 +1214,7 @@ impl KeyGenerationRegistry {
                 ime_repeat_active,
             } => {
                 let owner = self.guest_owner(keyboard, key);
-                let forwarded = matches!(
-                    owner,
-                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
-                );
+                let forwarded = owner == Some(GuestKeyOwner::Physical);
                 let ime_recovered = owner == Some(GuestKeyOwner::ImeRecovery);
                 let suppress_for_ime = ime_recovered || (ime_repeat_active && !forwarded);
                 if suppress_for_ime && owner.is_none() {
@@ -1438,21 +1230,18 @@ impl KeyGenerationRegistry {
                     return GuestKeyDecision {
                         delivery: GuestKeyDelivery::Drop,
                         ack_handled: Some(false),
-                        ends_repeat: false,
                     };
                 }
                 if suppress_for_ime {
                     return GuestKeyDecision {
                         delivery: GuestKeyDelivery::Drop,
                         ack_handled: Some(false),
-                        ends_repeat: false,
                     };
                 }
                 if forwarded && !repeated {
                     return GuestKeyDecision {
                         delivery: GuestKeyDelivery::Drop,
                         ack_handled: Some(true),
-                        ends_repeat: false,
                     };
                 }
                 if repeated {
@@ -1463,7 +1252,6 @@ impl KeyGenerationRegistry {
                             GuestKeyDelivery::Drop
                         },
                         ack_handled: Some(forwarded),
-                        ends_repeat: false,
                     };
                 }
 
@@ -1472,17 +1260,13 @@ impl KeyGenerationRegistry {
                 GuestKeyDecision {
                     delivery: GuestKeyDelivery::Forward,
                     ack_handled: Some(true),
-                    ends_repeat: false,
                 }
             }
             GuestKeyEvent::PhysicalRelease => {
                 let accelerator_suppressed = self.take_host_accelerator_suppression(keyboard, key);
                 let owner = self.guest_owner(keyboard, key);
                 let ime_recovered = owner == Some(GuestKeyOwner::ImeRecovery);
-                let forwarded = matches!(
-                    owner,
-                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
-                );
+                let forwarded = owner == Some(GuestKeyOwner::Physical);
                 if !ime_recovered {
                     self.take_guest_owner(keyboard, key);
                 }
@@ -1493,7 +1277,6 @@ impl KeyGenerationRegistry {
                         GuestKeyDelivery::Drop
                     },
                     ack_handled: Some(forwarded),
-                    ends_repeat: true,
                 }
             }
             GuestKeyEvent::CompositorShortcutPress => {
@@ -1510,7 +1293,6 @@ impl KeyGenerationRegistry {
                 GuestKeyDecision {
                     delivery: GuestKeyDelivery::Drop,
                     ack_handled: Some(true),
-                    ends_repeat: false,
                 }
             }
             GuestKeyEvent::CompositorShortcutRelease => {
@@ -1519,75 +1301,6 @@ impl KeyGenerationRegistry {
                 GuestKeyDecision {
                     delivery: GuestKeyDelivery::Drop,
                     ack_handled: Some(true),
-                    ends_repeat: true,
-                }
-            }
-            GuestKeyEvent::TextInputPress { serial } => {
-                let accelerator_generation = self.host_accelerator_suppressed(keyboard, key)
-                    || (self.physically_held(keyboard, key)
-                        && self
-                            .peek(keyboard, key)
-                            .is_some_and(|press| !press.eligible))
-                    || self.guest_owner(keyboard, key) == Some(GuestKeyOwner::CompositorShortcut);
-                if accelerator_generation
-                    || self.guest_owner(keyboard, key) == Some(GuestKeyOwner::Physical)
-                    || !self.claim_text_input_owner(keyboard, key, serial)
-                {
-                    GuestKeyDecision {
-                        delivery: GuestKeyDelivery::Drop,
-                        ack_handled: None,
-                        ends_repeat: false,
-                    }
-                } else {
-                    GuestKeyDecision {
-                        delivery: GuestKeyDelivery::Forward,
-                        ack_handled: None,
-                        ends_repeat: false,
-                    }
-                }
-            }
-            GuestKeyEvent::TextInputRepeat => GuestKeyDecision {
-                delivery: if matches!(
-                    self.guest_owner(keyboard, key),
-                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
-                ) {
-                    GuestKeyDelivery::Forward
-                } else {
-                    GuestKeyDelivery::Drop
-                },
-                ack_handled: None,
-                ends_repeat: false,
-            },
-            GuestKeyEvent::TextInputRelease { serial } => {
-                let retired = self.take_pending_text_input_release(keyboard, key, serial);
-                let current = if retired {
-                    true
-                } else {
-                    let serial_is_current = self
-                        .guest_press_serial(keyboard, key)
-                        .is_none_or(|press_serial| serial_is_after(serial, press_serial));
-                    serial_is_current
-                        && self.complete_guest_owner_if(
-                            keyboard,
-                            key,
-                            GuestKeyOwner::TextInputKeysym,
-                        )
-                };
-                if !current {
-                    log::debug!(
-                        "dropping keysym release {serial} of key {key} of keyboard {}: \
-                         it matches no pending keysym press",
-                        keyboard.0
-                    );
-                }
-                GuestKeyDecision {
-                    delivery: if current {
-                        GuestKeyDelivery::Forward
-                    } else {
-                        GuestKeyDelivery::Drop
-                    },
-                    ack_handled: None,
-                    ends_repeat: current && !retired,
                 }
             }
             GuestKeyEvent::RecoverIme => {
@@ -1597,16 +1310,11 @@ impl KeyGenerationRegistry {
                 // after Sommelier already acted on it.
                 if matches!(
                     owner,
-                    Some(
-                        GuestKeyOwner::Physical
-                            | GuestKeyOwner::TextInputKeysym
-                            | GuestKeyOwner::CompositorShortcut
-                    )
+                    Some(GuestKeyOwner::Physical | GuestKeyOwner::CompositorShortcut)
                 ) {
                     return GuestKeyDecision {
                         delivery: GuestKeyDelivery::Drop,
                         ack_handled: None,
-                        ends_repeat: false,
                     };
                 }
                 if owner.is_none() {
@@ -1616,7 +1324,6 @@ impl KeyGenerationRegistry {
                 GuestKeyDecision {
                     delivery: GuestKeyDelivery::EmitBalancedPair,
                     ack_handled: None,
-                    ends_repeat: false,
                 }
             }
         }
@@ -2302,11 +2009,9 @@ mod tests {
 
         let operations = [
             Operation::Claim(GuestKeyOwner::Physical),
-            Operation::Claim(GuestKeyOwner::TextInputKeysym),
             Operation::Claim(GuestKeyOwner::ImeRecovery),
             Operation::Claim(GuestKeyOwner::CompositorShortcut),
             Operation::Take(GuestKeyOwner::Physical),
-            Operation::Take(GuestKeyOwner::TextInputKeysym),
             Operation::Take(GuestKeyOwner::ImeRecovery),
             Operation::Take(GuestKeyOwner::CompositorShortcut),
         ];
@@ -2350,7 +2055,6 @@ mod tests {
             (None, true),
             (Some(GuestKeyOwner::CompositorShortcut), true),
             (Some(GuestKeyOwner::Physical), false),
-            (Some(GuestKeyOwner::TextInputKeysym), false),
             (Some(GuestKeyOwner::ImeRecovery), false),
         ] {
             assert_eq!(
@@ -2377,19 +2081,17 @@ mod tests {
         ime_repeat_active: false,
     };
 
-    fn forwarded(ack_handled: Option<bool>, ends_repeat: bool) -> GuestKeyDecision {
+    fn forwarded(ack_handled: Option<bool>) -> GuestKeyDecision {
         GuestKeyDecision {
             delivery: GuestKeyDelivery::Forward,
             ack_handled,
-            ends_repeat,
         }
     }
 
-    fn dropped(ack_handled: Option<bool>, ends_repeat: bool) -> GuestKeyDecision {
+    fn dropped(ack_handled: Option<bool>) -> GuestKeyDecision {
         GuestKeyDecision {
             delivery: GuestKeyDelivery::Drop,
             ack_handled,
-            ends_repeat,
         }
     }
 
@@ -2426,7 +2128,7 @@ mod tests {
             &mut registry,
             key,
             GuestKeyEvent::CompositorShortcutPress,
-            dropped(Some(true), false),
+            dropped(Some(true)),
         );
         registry
     }
@@ -2437,11 +2139,7 @@ mod tests {
     #[test]
     fn compositor_shortcut_press_is_rejected_for_another_owner() {
         let key = 16;
-        for owner in [
-            GuestKeyOwner::Physical,
-            GuestKeyOwner::TextInputKeysym,
-            GuestKeyOwner::ImeRecovery,
-        ] {
+        for owner in [GuestKeyOwner::Physical, GuestKeyOwner::ImeRecovery] {
             // `reference` gets the physical events the shortcut stands for.
             let owned = || {
                 let mut registry = KeyGenerationRegistry::default();
@@ -2463,7 +2161,7 @@ mod tests {
             );
             assert_eq!(
                 decision,
-                dropped(Some(owner != GuestKeyOwner::ImeRecovery), false),
+                dropped(Some(owner != GuestKeyOwner::ImeRecovery)),
                 "{owner:?}"
             );
             assert_eq!(registry.guest_owner(KEYBOARD_A, key), Some(owner));
@@ -2490,7 +2188,7 @@ mod tests {
         let key = 16;
         let mut registry = shortcut_consumed(key);
         for event in [PRESS, REPEAT] {
-            assert_decision(&mut registry, key, event, dropped(Some(true), false));
+            assert_decision(&mut registry, key, event, dropped(Some(true)));
             assert_eq!(
                 registry.guest_owner(KEYBOARD_A, key),
                 Some(GuestKeyOwner::CompositorShortcut)
@@ -2500,7 +2198,7 @@ mod tests {
             &mut registry,
             key,
             GuestKeyEvent::PhysicalRelease,
-            dropped(Some(true), true),
+            dropped(Some(true)),
         );
         assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
     }
@@ -2512,12 +2210,7 @@ mod tests {
 
         // A consumed shortcut key must not reach the guest as a recovered
         // pair, and recovery must leave its ownership for the release.
-        assert_decision(
-            &mut registry,
-            key,
-            GuestKeyEvent::RecoverIme,
-            dropped(None, false),
-        );
+        assert_decision(&mut registry, key, GuestKeyEvent::RecoverIme, dropped(None));
         assert_eq!(
             registry.guest_owner(KEYBOARD_A, key),
             Some(GuestKeyOwner::CompositorShortcut)
@@ -2526,7 +2219,7 @@ mod tests {
             &mut registry,
             key,
             GuestKeyEvent::CompositorShortcutRelease,
-            dropped(Some(true), true),
+            dropped(Some(true)),
         );
         assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
     }
@@ -2540,20 +2233,14 @@ mod tests {
             &mut registry,
             physical_key,
             &[
-                (PRESS, forwarded(Some(true), false)),
-                // A second protocol channel cannot duplicate the press.
-                (
-                    GuestKeyEvent::TextInputPress { serial: 1 },
-                    dropped(None, false),
-                ),
-                (REPEAT, forwarded(Some(true), false)),
-                (GuestKeyEvent::PhysicalRelease, forwarded(Some(true), true)),
+                (PRESS, forwarded(Some(true))),
+                (REPEAT, forwarded(Some(true))),
+                (GuestKeyEvent::PhysicalRelease, forwarded(Some(true))),
                 (
                     GuestKeyEvent::RecoverIme,
                     GuestKeyDecision {
                         delivery: GuestKeyDelivery::EmitBalancedPair,
                         ack_handled: None,
-                        ends_repeat: false,
                     },
                 ),
                 // A delayed physical press cannot duplicate the recovered
@@ -2564,7 +2251,7 @@ mod tests {
                         host_accelerator: false,
                         ime_repeat_active: true,
                     },
-                    dropped(Some(false), false),
+                    dropped(Some(false)),
                 ),
             ],
         );
@@ -2575,79 +2262,9 @@ mod tests {
             &mut registry,
             accelerator_key,
             &[
-                (ACCELERATOR_PRESS, dropped(Some(false), false)),
-                (GuestKeyEvent::PhysicalRelease, dropped(Some(false), true)),
+                (ACCELERATOR_PRESS, dropped(Some(false))),
+                (GuestKeyEvent::PhysicalRelease, dropped(Some(false))),
             ],
-        );
-
-        // Each synthetic press has exactly one releasable owner.
-        let keysym_key = 32;
-        assert_decisions(
-            &mut registry,
-            keysym_key,
-            &[
-                (
-                    GuestKeyEvent::TextInputPress { serial: 10 },
-                    forwarded(None, false),
-                ),
-                (GuestKeyEvent::TextInputRepeat, forwarded(None, false)),
-                (
-                    GuestKeyEvent::TextInputRelease { serial: 11 },
-                    forwarded(None, true),
-                ),
-                (
-                    GuestKeyEvent::TextInputRelease { serial: 12 },
-                    dropped(None, false),
-                ),
-            ],
-        );
-    }
-
-    #[test]
-    fn guest_key_reducer_prevents_keysym_from_bypassing_accelerator_generation() {
-        let key = 57;
-        let mut registry = KeyGenerationRegistry::default();
-
-        // An ineligible held peek generation is already known to be a host
-        // accelerator.
-        registry.observe_peek_press(KEYBOARD_A, key, 10, 100, false);
-        assert_decision(
-            &mut registry,
-            key,
-            GuestKeyEvent::TextInputPress { serial: 10 },
-            dropped(None, false),
-        );
-        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
-
-        // The text-input channel must also honor explicit accelerator
-        // suppression.
-        assert_decisions(
-            &mut registry,
-            key,
-            &[
-                (ACCELERATOR_PRESS, dropped(Some(false), false)),
-                (
-                    GuestKeyEvent::TextInputPress { serial: 11 },
-                    dropped(None, false),
-                ),
-            ],
-        );
-        registry.observe_peek_release(KEYBOARD_A, key, 12);
-        assert_decision(
-            &mut registry,
-            key,
-            GuestKeyEvent::PhysicalRelease,
-            dropped(Some(false), true),
-        );
-        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
-
-        // Accelerator suppression must not leak into the next released
-        // generation.
-        assert_decision(
-            &mut registry,
-            key,
-            GuestKeyEvent::TextInputPress { serial: 13 },
-            forwarded(None, false),
         );
     }
 
@@ -2658,9 +2275,6 @@ mod tests {
             PhysicalPress,
             PhysicalRepeat,
             PhysicalRelease,
-            TextPress,
-            TextRepeat,
-            TextRelease,
             Recover,
             ShortcutPress,
             ShortcutRelease,
@@ -2670,9 +2284,6 @@ mod tests {
             Operation::PhysicalPress,
             Operation::PhysicalRepeat,
             Operation::PhysicalRelease,
-            Operation::TextPress,
-            Operation::TextRepeat,
-            Operation::TextRelease,
             Operation::Recover,
             Operation::ShortcutPress,
             Operation::ShortcutRelease,
@@ -2685,19 +2296,14 @@ mod tests {
         for mut encoded in 0..sequence_count {
             let mut registry = KeyGenerationRegistry::default();
             let mut guest_press_open = false;
-            let mut serial = 0_u32;
 
             for _ in 0..sequence_len {
                 let operation = operations[encoded % operations.len()];
                 encoded /= operations.len();
-                serial = serial.wrapping_add(1);
                 let event = match operation {
                     Operation::PhysicalPress => PRESS,
                     Operation::PhysicalRepeat => REPEAT,
                     Operation::PhysicalRelease => GuestKeyEvent::PhysicalRelease,
-                    Operation::TextPress => GuestKeyEvent::TextInputPress { serial },
-                    Operation::TextRepeat => GuestKeyEvent::TextInputRepeat,
-                    Operation::TextRelease => GuestKeyEvent::TextInputRelease { serial },
                     Operation::Recover => GuestKeyEvent::RecoverIme,
                     Operation::ShortcutPress => GuestKeyEvent::CompositorShortcutPress,
                     Operation::ShortcutRelease => GuestKeyEvent::CompositorShortcutRelease,
@@ -2720,56 +2326,25 @@ mod tests {
                         | Operation::PhysicalRelease
                         | Operation::ShortcutRelease => Some(matches!(
                             owner_before,
-                            Some(
-                                GuestKeyOwner::Physical
-                                    | GuestKeyOwner::TextInputKeysym
-                                    | GuestKeyOwner::CompositorShortcut
-                            )
+                            Some(GuestKeyOwner::Physical | GuestKeyOwner::CompositorShortcut)
                         )),
-                        Operation::TextPress
-                        | Operation::TextRepeat
-                        | Operation::TextRelease
-                        | Operation::Recover => None,
+                        Operation::Recover => None,
                     },
                     "ACK policy must remain coupled to the generation owner"
                 );
-                assert_eq!(
-                    decision.ends_repeat,
-                    match operation {
-                        Operation::PhysicalRelease | Operation::ShortcutRelease => true,
-                        Operation::TextRelease => {
-                            owner_before == Some(GuestKeyOwner::TextInputKeysym)
-                        }
-                        Operation::PhysicalPress
-                        | Operation::PhysicalRepeat
-                        | Operation::TextPress
-                        | Operation::TextRepeat
-                        | Operation::Recover
-                        | Operation::ShortcutPress => false,
-                    },
-                    "only the release that closes the current generation may end repeat"
-                );
                 match (operation, decision.delivery) {
-                    (
-                        Operation::PhysicalPress | Operation::TextPress,
-                        GuestKeyDelivery::Forward,
-                    ) => {
+                    (Operation::PhysicalPress, GuestKeyDelivery::Forward) => {
                         assert!(!guest_press_open, "a second press cannot be forwarded");
                         guest_press_open = true;
                     }
-                    (
-                        Operation::PhysicalRepeat | Operation::TextRepeat,
-                        GuestKeyDelivery::Forward,
-                    ) => {
+                    (Operation::PhysicalRepeat, GuestKeyDelivery::Forward) => {
                         assert!(
                             guest_press_open,
                             "repeat forwarding requires an open guest press"
                         );
                     }
                     (
-                        Operation::PhysicalRelease
-                        | Operation::TextRelease
-                        | Operation::ShortcutRelease,
+                        Operation::PhysicalRelease | Operation::ShortcutRelease,
                         GuestKeyDelivery::Forward,
                     ) => {
                         assert!(
@@ -2810,10 +2385,7 @@ mod tests {
                 }
 
                 assert_eq!(
-                    matches!(
-                        registry.guest_owner(keyboard, key),
-                        Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
-                    ),
+                    registry.guest_owner(keyboard, key) == Some(GuestKeyOwner::Physical),
                     guest_press_open,
                     "registry ownership must exactly match the observer's open pair"
                 );
@@ -2833,7 +2405,6 @@ mod tests {
             backspace_repeat_cancelled: bool,
             ime_repeat_owner: Option<u32>,
             guest_owner: Option<GuestKeyOwner>,
-            guest_press_serial: Option<u32>,
             host_accelerator_suppressed: bool,
             stale: bool,
         }
@@ -2853,7 +2424,8 @@ mod tests {
         struct Model {
             next_generation: u64,
             keys: BTreeMap<u32, ModelGeneration>,
-            retired_guest_releases: BTreeMap<(u32, GuestKeyOwner), RetiredGuestRelease>,
+            /// Each key's retired release serial.
+            retired_guest_releases: BTreeMap<u32, u32>,
         }
 
         impl Model {
@@ -2872,54 +2444,25 @@ mod tests {
                     .retain(|_, generation| !generation.is_unreferenced());
             }
 
-            fn press(&mut self, key: u32, next_press_serial: Option<u32>) {
-                self.retire_released(key, next_press_serial);
+            fn press(&mut self, key: u32) {
+                self.retire_released(key);
                 self.ensure(key).physical_state = PhysicalKeyState::Held;
             }
 
-            fn retire_released(&mut self, key: u32, next_press_serial: Option<u32>) -> bool {
+            fn retire_released(&mut self, key: u32) {
                 let Some(generation) =
                     self.keys.get(&key).copied().filter(|generation| {
                         generation.physical_state == PhysicalKeyState::Released
                     })
                 else {
-                    return false;
+                    return;
                 };
-                let retired_release = match generation.guest_owner {
-                    Some(owner @ GuestKeyOwner::Physical) => {
-                        generation.physical_release_serial.map(|release_serial| {
-                            (
-                                owner,
-                                RetiredGuestRelease {
-                                    press_serial: generation.guest_press_serial,
-                                    release_serial: Some(release_serial),
-                                    next_press_serial,
-                                },
-                            )
-                        })
-                    }
-                    Some(owner @ GuestKeyOwner::TextInputKeysym) => {
-                        generation.guest_press_serial.map(|press_serial| {
-                            (
-                                owner,
-                                RetiredGuestRelease {
-                                    press_serial: Some(press_serial),
-                                    release_serial: None,
-                                    next_press_serial,
-                                },
-                            )
-                        })
-                    }
-                    Some(GuestKeyOwner::ImeRecovery | GuestKeyOwner::CompositorShortcut) | None => {
-                        None
-                    }
-                };
-                if let Some((owner, retired_release)) = retired_release {
-                    self.retired_guest_releases
-                        .insert((key, owner), retired_release);
+                if let (Some(GuestKeyOwner::Physical), Some(release_serial)) =
+                    (generation.guest_owner, generation.physical_release_serial)
+                {
+                    self.retired_guest_releases.insert(key, release_serial);
                 }
                 self.keys.remove(&key);
-                true
             }
 
             fn repeat(&mut self, key: u32) {
@@ -2959,7 +2502,7 @@ mod tests {
                     .get(&key)
                     .is_some_and(|generation| generation.physical_state == PhysicalKeyState::Held)
                 {
-                    self.press(key, Some(serial));
+                    self.press(key);
                 }
                 self.ensure(key);
                 self.next_generation = self.next_generation.wrapping_add(1).max(1);
@@ -2998,10 +2541,8 @@ mod tests {
                     return false;
                 };
                 self.keys.remove(&key);
-                matches!(
-                    generation.guest_owner,
-                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
-                ) && !generation.host_accelerator_suppressed
+                generation.guest_owner == Some(GuestKeyOwner::Physical)
+                    && !generation.host_accelerator_suppressed
             }
 
             fn held(&self, key: u32) -> Option<ModelGeneration> {
@@ -3093,13 +2634,8 @@ mod tests {
                     forward: false,
                 };
                 if state == 0 {
-                    let pending = (key, GuestKeyOwner::Physical);
-                    if self
-                        .retired_guest_releases
-                        .get(&pending)
-                        .is_some_and(|release| release.release_serial == Some(serial))
-                    {
-                        self.retired_guest_releases.remove(&pending);
+                    if self.retired_guest_releases.get(&key) == Some(&serial) {
+                        self.retired_guest_releases.remove(&key);
                         return KeyAdmission::Settled {
                             handled: true,
                             forward: true,
@@ -3122,7 +2658,7 @@ mod tests {
                         generation.physical_state == PhysicalKeyState::Released
                     }) && peek_press_serial == Some(serial);
                     if !delayed_released_peek_press {
-                        self.press(key, None);
+                        self.press(key);
                     }
                 }
                 KeyAdmission::Current
@@ -3164,10 +2700,7 @@ mod tests {
             SuppressAccelerator(u32),
             TakeAcceleratorSuppression(u32),
             ClaimOwner(u32, GuestKeyOwner),
-            ClaimTextInput(u32),
-            CompleteTextInput(u32),
             TakePendingPhysicalRelease(u32),
-            TakePendingTextInputRelease(u32),
             TakeOwner(u32),
             MarkStale,
             RetireStale(u32),
@@ -3203,13 +2736,9 @@ mod tests {
             Operation::SuppressAccelerator(KEY_B),
             Operation::TakeAcceleratorSuppression(KEY_B),
             Operation::ClaimOwner(KEY_A, GuestKeyOwner::Physical),
-            Operation::ClaimOwner(KEY_A, GuestKeyOwner::TextInputKeysym),
             Operation::ClaimOwner(KEY_A, GuestKeyOwner::ImeRecovery),
             Operation::ClaimOwner(KEY_A, GuestKeyOwner::CompositorShortcut),
-            Operation::ClaimTextInput(KEY_A),
-            Operation::CompleteTextInput(KEY_A),
             Operation::TakePendingPhysicalRelease(KEY_A),
-            Operation::TakePendingTextInputRelease(KEY_A),
             Operation::TakeOwner(KEY_A),
             Operation::MarkStale,
             Operation::RetireStale(KEY_A),
@@ -3231,7 +2760,7 @@ mod tests {
                 match operation {
                     Operation::Press(key) => {
                         registry.observe_physical_state(keyboard, key, 1);
-                        model.press(key, None);
+                        model.press(key);
                     }
                     Operation::Repeat(key) => {
                         registry.observe_physical_state(keyboard, key, 2);
@@ -3279,8 +2808,8 @@ mod tests {
                         let generation = model.keys.get(&key);
                         let serial = model
                             .retired_guest_releases
-                            .get(&(key, GuestKeyOwner::Physical))
-                            .and_then(|release| release.release_serial)
+                            .get(&key)
+                            .copied()
                             .or(generation
                                 .and_then(|generation| generation.physical_release_serial))
                             .filter(|_| known)
@@ -3362,106 +2891,14 @@ mod tests {
                         }
                         assert_eq!(actual, expected);
                     }
-                    Operation::ClaimTextInput(key) => {
-                        let actual = registry.claim_text_input_owner(keyboard, key, serial);
-                        let (starts_new, released) =
-                            model.keys.get(&key).map_or((false, false), |generation| {
-                                let newer_than_guest_press =
-                                    generation.guest_press_serial.is_none_or(|press_serial| {
-                                        serial_is_after(serial, press_serial)
-                                    });
-                                let released =
-                                    generation.physical_state == PhysicalKeyState::Released;
-                                let after_release_boundary =
-                                    generation.physical_release_serial.is_some_and(
-                                        |release_serial| serial_is_after(serial, release_serial),
-                                    );
-                                let owner_can_start_next = match generation.guest_owner {
-                                    Some(GuestKeyOwner::TextInputKeysym) => released,
-                                    Some(
-                                        GuestKeyOwner::ImeRecovery
-                                        | GuestKeyOwner::CompositorShortcut,
-                                    ) => {
-                                        generation.physical_state == PhysicalKeyState::Unseen
-                                            || released
-                                    }
-                                    Some(GuestKeyOwner::Physical) | None => false,
-                                };
-                                (
-                                    owner_can_start_next
-                                        && newer_than_guest_press
-                                        && (!released || after_release_boundary),
-                                    released,
-                                )
-                            });
-                        if starts_new {
-                            if released {
-                                assert!(model.retire_released(key, Some(serial)));
-                            } else {
-                                model.keys.remove(&key);
-                            }
-                        }
-                        let generation = model.ensure(key);
-                        let expected = generation.guest_owner.is_none();
-                        if expected {
-                            generation.guest_owner = Some(GuestKeyOwner::TextInputKeysym);
-                            generation.guest_press_serial = Some(serial);
-                        }
-                        assert_eq!(actual, expected);
-                    }
-                    Operation::TakePendingTextInputRelease(key) => {
-                        let actual =
-                            registry.take_pending_text_input_release(keyboard, key, serial);
-                        let current_press_serial = model.keys.get(&key).and_then(|generation| {
-                            generation
-                                .guest_press_serial
-                                .or(generation.peek_press_serial)
-                        });
-                        let pending = (key, GuestKeyOwner::TextInputKeysym);
-                        let expected =
-                            model
-                                .retired_guest_releases
-                                .get(&pending)
-                                .is_some_and(|release| {
-                                    release.press_serial.is_some_and(|press_serial| {
-                                        serial_is_after(serial, press_serial)
-                                    }) && release
-                                        .next_press_serial
-                                        .or(current_press_serial)
-                                        .is_none_or(|current_serial| {
-                                            !serial_is_after(serial, current_serial)
-                                        })
-                                });
-                        if expected {
-                            model.retired_guest_releases.remove(&pending);
-                        }
-                        assert_eq!(actual, expected);
-                    }
                     Operation::TakePendingPhysicalRelease(key) => {
                         let release_serial = serial.wrapping_sub(2);
                         let actual =
                             registry.take_pending_physical_release(keyboard, key, release_serial);
-                        let pending = (key, GuestKeyOwner::Physical);
-                        let expected = model
-                            .retired_guest_releases
-                            .get(&pending)
-                            .is_some_and(|release| release.release_serial == Some(release_serial));
+                        let expected =
+                            model.retired_guest_releases.get(&key) == Some(&release_serial);
                         if expected {
-                            model.retired_guest_releases.remove(&pending);
-                        }
-                        assert_eq!(actual, expected);
-                    }
-                    Operation::CompleteTextInput(key) => {
-                        let actual = registry.complete_guest_owner_if(
-                            keyboard,
-                            key,
-                            GuestKeyOwner::TextInputKeysym,
-                        );
-                        let expected = model.keys.get(&key).is_some_and(|generation| {
-                            generation.guest_owner == Some(GuestKeyOwner::TextInputKeysym)
-                        });
-                        if expected {
-                            model.ensure(key).guest_owner = Some(GuestKeyOwner::ImeRecovery);
+                            model.retired_guest_releases.remove(&key);
                         }
                         assert_eq!(actual, expected);
                     }
@@ -3469,7 +2906,6 @@ mod tests {
                         registry.take_guest_owner(keyboard, key);
                         if let Some(generation) = model.keys.get_mut(&key) {
                             generation.guest_owner = None;
-                            generation.guest_press_serial = None;
                         }
                         model.prune();
                     }
@@ -3520,7 +2956,6 @@ mod tests {
                     );
                     assert_eq!(actual.ime_repeat_owner(), expected.ime_repeat_owner);
                     assert_eq!(actual.guest_owner(), expected.guest_owner);
-                    assert_eq!(actual.guest_press_serial(), expected.guest_press_serial);
                     // A detach marks only a held key; a release ends it.
                     assert_eq!(
                         actual.stale(),
@@ -3535,8 +2970,8 @@ mod tests {
                     registry
                         .retired_guest_releases
                         .iter()
-                        .filter(|((pending_keyboard, _, _), _)| *pending_keyboard == keyboard)
-                        .map(|(&(_, key, owner), &release)| ((key, owner), release))
+                        .filter(|((pending_keyboard, _), _)| *pending_keyboard == keyboard)
+                        .map(|(&(_, key), &release)| (key, release))
                         .collect::<BTreeMap<_, _>>(),
                     model.retired_guest_releases
                 );
@@ -3576,174 +3011,75 @@ mod tests {
         assert!(peek.eligible);
     }
 
-    /// A physical press that reaches the proxy after the IME's keysym press
-    /// of the same key joins that press's generation.
+    /// A late `wl_keyboard` release of a retired generation still closes
+    /// the guest's press of it once the key is pressed again, also across
+    /// the serial's wrap, and leaves the new generation held.
     #[test]
-    fn delayed_physical_press_preserves_keysym_release_owner() {
-        type ObservePress = fn(&mut KeyGenerationRegistry, u32);
-        let channels: [(&str, ObservePress); 2] = [
-            ("wl_keyboard", |registry, key| {
-                registry.observe_physical_state(KEYBOARD_A, key, 1)
-            }),
-            ("peek", |registry, key| {
-                registry.observe_peek_press(KEYBOARD_A, key, 1, 10, true);
-            }),
-        ];
-        let key = 30;
-        for (channel, observe_press) in channels {
-            let mut registry = KeyGenerationRegistry::default();
-            assert!(registry.claim_guest_owner(KEYBOARD_A, key, GuestKeyOwner::TextInputKeysym));
-            observe_press(&mut registry, key);
-
-            assert!(registry.physically_held(KEYBOARD_A, key), "{channel}");
-            assert_eq!(
-                registry.guest_owner(KEYBOARD_A, key),
-                Some(GuestKeyOwner::TextInputKeysym),
-                "a delayed {channel} press must not orphan the synthetic press"
-            );
-        }
-    }
-
-    #[test]
-    fn retired_releases_match_generation_intervals_and_serial_wrap() {
+    fn a_retired_release_closes_its_press_across_the_serial_wrap() {
         let keyboard = HostId(10);
-        let text_key = 30;
-        let physical_key = 57;
+        let key = 57;
         let mut registry = KeyGenerationRegistry::default();
 
-        registry.observe_peek_press(keyboard, text_key, 10, 100, true);
-        assert!(registry.claim_text_input_owner(keyboard, text_key, 10));
-        registry.observe_peek_release(keyboard, text_key, 11);
-        registry.observe_peek_press(keyboard, text_key, 20, 200, true);
-        assert!(registry.claim_text_input_owner(keyboard, text_key, 20));
-        registry.observe_peek_release(keyboard, text_key, 21);
-        registry.observe_peek_press(keyboard, text_key, 30, 300, true);
-
+        registry.observe_peek_press(keyboard, key, u32::MAX - 1, 400, true);
+        assert!(registry.claim_guest_owner(keyboard, key, GuestKeyOwner::Physical));
+        registry.observe_peek_release(keyboard, key, u32::MAX);
+        registry.observe_peek_press(keyboard, key, 0, 500, true);
         assert!(
-            registry.take_pending_text_input_release(keyboard, text_key, 21),
-            "a release must match the retired interval immediately before it"
-        );
-        assert!(
-            !registry.take_pending_text_input_release(keyboard, text_key, 11),
-            "a newer retired release of the channel replaces the older one"
-        );
-        assert!(
-            !registry.take_pending_text_input_release(keyboard, text_key, 21),
-            "each retired press must be released exactly once"
-        );
-
-        registry.observe_peek_press(keyboard, physical_key, u32::MAX - 1, 400, true);
-        assert!(registry.claim_guest_owner(keyboard, physical_key, GuestKeyOwner::Physical));
-        registry.observe_peek_release(keyboard, physical_key, u32::MAX);
-        registry.observe_peek_press(keyboard, physical_key, 0, 500, true);
-        assert!(
-            registry.take_pending_physical_release(keyboard, physical_key, u32::MAX),
+            registry.take_pending_physical_release(keyboard, key, u32::MAX),
             "a physical release must survive the next generation across serial wrap"
         );
-        assert!(registry.physically_held(keyboard, physical_key));
+        assert!(
+            !registry.take_pending_physical_release(keyboard, key, u32::MAX),
+            "each retired press must be released exactly once"
+        );
+        assert!(registry.physically_held(keyboard, key));
     }
 
-    /// A host that never sends a channel's release of a key the guest got
-    /// leaves one retired release of that key pending, however often the
-    /// key is pressed again: the channel's newer retired release replaces
+    /// A host that never sends the `wl_keyboard` release of a key the
+    /// guest got leaves one retired release of that key pending, however
+    /// often the key is pressed again: the newer retired release replaces
     /// the older one.
     #[test]
-    fn a_channel_keeps_one_pending_release_per_key() {
-        type Press = fn(&mut KeyGenerationRegistry, u32, u32);
-        type TakeRelease = fn(&mut KeyGenerationRegistry, u32, u32) -> bool;
-        let channels: [(&str, Press, TakeRelease); 2] = [
-            (
-                "wl_keyboard",
-                |registry, key, _| {
-                    let decision = registry.transition_guest_key(KEYBOARD_A, key, PRESS);
-                    assert_eq!(decision, forwarded(Some(true), false));
-                },
-                |registry, key, serial| {
-                    registry.take_pending_physical_release(KEYBOARD_A, key, serial)
-                },
-            ),
-            (
-                "keysym",
-                |registry, key, serial| {
-                    assert!(registry.claim_text_input_owner(KEYBOARD_A, key, serial));
-                },
-                |registry, key, serial| {
-                    registry.take_pending_text_input_release(KEYBOARD_A, key, serial)
-                },
-            ),
-        ];
+    fn a_key_keeps_one_pending_release() {
         let key = 30;
         let generations = 100;
-        for (channel, press, take_release) in channels {
-            let mut registry = KeyGenerationRegistry::default();
-            // Generation g is pressed with serial 10g on the peek channel
-            // and on `channel`, and released with 10g + 1 on the peek
-            // channel only.
-            for generation in 1..=generations {
-                let serial = 10 * generation;
-                registry.observe_peek_press(KEYBOARD_A, key, serial, serial, true);
-                press(&mut registry, key, serial);
-                registry.observe_peek_release(KEYBOARD_A, key, serial + 1);
-            }
-            let next = 10 * (generations + 1);
-            registry.observe_peek_press(KEYBOARD_A, key, next, next, true);
+        let mut registry = KeyGenerationRegistry::default();
+        // Generation g is pressed with serial 10g on the peek channel and
+        // on `wl_keyboard`, and released with 10g + 1 on the peek channel
+        // only.
+        for generation in 1..=generations {
+            let serial = 10 * generation;
+            registry.observe_peek_press(KEYBOARD_A, key, serial, serial, true);
+            let decision = registry.transition_guest_key(KEYBOARD_A, key, PRESS);
+            assert_eq!(decision, forwarded(Some(true)));
+            registry.observe_peek_release(KEYBOARD_A, key, serial + 1);
+        }
+        let next = 10 * (generations + 1);
+        registry.observe_peek_press(KEYBOARD_A, key, next, next, true);
 
-            for generation in 1..generations {
-                assert!(
-                    !take_release(&mut registry, key, 10 * generation + 1),
-                    "{channel}: generation {generation}'s release must not be taken"
-                );
-            }
+        for generation in 1..generations {
             assert!(
-                take_release(&mut registry, key, 10 * generations + 1),
-                "{channel}: the last generation must still take its release"
+                !registry.take_pending_physical_release(KEYBOARD_A, key, 10 * generation + 1),
+                "generation {generation}'s release must not be taken"
             );
         }
-    }
-
-    #[test]
-    fn released_generation_rejects_delayed_press_before_release_boundary() {
-        let keyboard = HostId(10);
-        let key = 30;
-        let mut registry = KeyGenerationRegistry::default();
-
-        registry.observe_peek_press(keyboard, key, u32::MAX - 3, 100, true);
-        assert!(registry.claim_text_input_owner(keyboard, key, u32::MAX - 2));
-        registry.observe_peek_release(keyboard, key, 0);
-
         assert!(
-            !registry.claim_text_input_owner(keyboard, key, u32::MAX - 1),
-            "a delayed press from before the physical release must remain in the old generation"
+            registry.take_pending_physical_release(KEYBOARD_A, key, 10 * generations + 1),
+            "the last generation must still take its release"
         );
-        assert_eq!(
-            registry.guest_press_serial(keyboard, key),
-            Some(u32::MAX - 2)
-        );
-        assert!(
-            registry.claim_text_input_owner(keyboard, key, 1),
-            "a press after the wrapped release boundary must open the next generation"
-        );
-        assert_eq!(registry.guest_press_serial(keyboard, key), Some(1));
-
-        let raw_key = 57;
-        assert!(registry.claim_text_input_owner(keyboard, raw_key, 10));
-        registry.observe_physical_event(keyboard, raw_key, 0, Some(20));
-        assert!(
-            !registry.claim_text_input_owner(keyboard, raw_key, 15),
-            "the regular wl_keyboard release must also bound delayed text-input presses"
-        );
-        assert!(registry.claim_text_input_owner(keyboard, raw_key, 21));
     }
 
     #[test]
     fn clearing_guest_keys_is_scoped_to_one_keyboard() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         assert!(ctx.claim_guest_key(HostId(10), 57, GuestKeyOwner::ImeRecovery));
-        assert!(ctx.claim_guest_key(HostId(11), 57, GuestKeyOwner::TextInputKeysym));
+        assert!(ctx.claim_guest_key(HostId(11), 57, GuestKeyOwner::Physical));
         for keyboard in [HostId(10), HostId(11)] {
-            assert!(ctx.key_generations.claim_text_input_owner(keyboard, 30, 1));
-            ctx.key_generations.observe_physical_state(keyboard, 30, 0);
-            ctx.key_generations.observe_physical_state(keyboard, 30, 1);
+            let keys = &mut ctx.key_generations;
+            keys.observe_physical_state(keyboard, 30, 1);
+            assert!(keys.claim_guest_owner(keyboard, 30, GuestKeyOwner::Physical));
+            keys.observe_physical_event(keyboard, 30, 0, Some(2));
+            keys.observe_physical_state(keyboard, 30, 1);
         }
 
         ctx.key_generations.clear_keyboard(HostId(10));
@@ -3751,16 +3087,16 @@ mod tests {
         assert!(ctx.guest_key_owner(HostId(10), 57).is_none());
         assert_eq!(
             ctx.guest_key_owner(HostId(11), 57),
-            Some(GuestKeyOwner::TextInputKeysym)
+            Some(GuestKeyOwner::Physical)
         );
         assert!(
             !ctx.key_generations
-                .take_pending_text_input_release(HostId(10), 30, 2),
+                .take_pending_physical_release(HostId(10), 30, 2),
             "clearing a keyboard must discard its retired releases"
         );
         assert!(
             ctx.key_generations
-                .take_pending_text_input_release(HostId(11), 30, 2),
+                .take_pending_physical_release(HostId(11), 30, 2),
             "clearing one keyboard must preserve another keyboard's retired releases"
         );
     }
