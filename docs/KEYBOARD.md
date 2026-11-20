@@ -9,11 +9,11 @@ the proxy; the rules it keeps are under
 A key can reach the guest three ways: a `wl_keyboard.key`, a key the
 `wl_keyboard.enter` lists, and a press and release the proxy recovers
 for an empty IME confirmation (X2' of [IME.md](IME.md#22-host-events)).
-Text-input keysyms reach the guest as nothing (INVARIANTS "Host keysyms
-are dropped"). Exo announces each key on
-`zcr_extended_keyboard_v1.peek_key` first, even one its input method
-consumes, so the proxy sees the key's physical life on two channels and
-its delivery on up to two.
+Text-input keysyms and key repeats reach the guest as nothing
+(INVARIANTS "Host keysyms and repeats are dropped"). Exo announces each
+key on `zcr_extended_keyboard_v1.peek_key` first, even one its input
+method consumes, so the proxy sees the key's physical life on two
+channels and its delivery on up to two.
 
 ## State
 
@@ -24,17 +24,17 @@ generation is three independent parts, each an enum whose variants carry
 only the data that exists in them:
 
 - `phase: KeyPhase`, what the host has shown of the key:
-  - `Unseen`: a claim or a suppression came before any physical event;
+  - `Unseen`: a claim or a suppression came before any physical event,
+    which only the registry's tests make;
   - `Held { peek, lease, stale }`: `lease` is the IME's Backspace repeat
     lease (`RepeatLease::Free`, `Leased { text_input }` or `Cancelled`
     for the rest of the hold); `stale` marks a key held across the input
     method's own detach (H2);
   - `Released { peek, release_serial }`.
 - `peek: PeekRecord`, inside `Held` and `Released`: `None`, `Announced {
-  serial }` (a peek repeat of a key held since `enter`, or a generation
-  whose keyboard has since held no key) or `Live(PeekKeyProvenance)`, the
-  serial, time, sequence and eligibility of a peek press, which makes the
-  generation a candidate for recovery.
+  serial }` (a generation whose keyboard has since held no key) or
+  `Live(PeekKeyProvenance)`, the serial, time, sequence and eligibility of
+  a peek press, which makes the generation a candidate for recovery.
 - `guest: GuestPress`, who gave the guest the key: `None`, `Physical`,
   `Shortcut` (Sommelier placed a window), or `Recovered`, a tombstone for
   a recovered pair that suppresses late duplicates.
@@ -68,7 +68,7 @@ keyboard's XKB state, focus), and applies the effects on the guest:
 
 | Input | Transition | Handler |
 | --- | --- | --- |
-| `peek_key` press, repeat, release | `peek_key(PeekInput)` → `PeekOutcome` | `on_peek_key` |
+| `peek_key` press, release | `peek_key(PeekInput)` → `PeekOutcome` | `on_peek_key` |
 | `wl_keyboard.key` | `admit_key` (physical), then `transition_guest_key` (delivery) | `on_key` |
 | recovered pair | `transition_guest_key(RecoverIme)` | `ime_keys::recover_pending` |
 | `wl_keyboard.enter` | `install_enter_snapshot`: every listed key `Held`, `Physical` | `on_enter` |
@@ -129,7 +129,7 @@ confirmation alone (`held_repeat_key_for_seat`).
   states replaced.
 - `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`
   checks that the delivery reducer never opens two guest presses, nor
-  forwards a repeat or release without one.
+  forwards a release without one.
 - `a_waiting_recovery_is_decided_by_the_hosts_next_event` pins the
   recovery's transition table.
 - The handler tests in `keyboard.rs`, `ime_keys.rs` and `text_input.rs`

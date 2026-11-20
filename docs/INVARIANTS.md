@@ -747,15 +747,19 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   domain of the real keyboard events, never wall-clock time.
   Tests: `ime_repeat_state_is_scoped_to_the_originating_keyboard`,
   `an_empty_confirmation_recovers_the_latest_eligible_held_key`.
-- **Host keysyms are dropped.** A `zwp_text_input_v1.keysym` reaches no
-  peer and changes no key state. Exo sends none for a physical key: its
+- **Host keysyms and repeats are dropped.** A `zwp_text_input_v1.keysym`
+  reaches no peer and changes no key state. Exo sends none for a physical key: its
   one `SendKey` caller, `TextInput::InsertChar`, sends a key its input
   method handled with no `DomCode` as `commit_string` instead, and it
   never sends a keysym release, so a keysym delivered as a key would stay
   pressed in the guest. The keys the input method consumes reach the
   guest through the recovery of an empty confirmation (X2'). The first
-  keysym of a process is logged, at debug level.
-  Test: `a_keysym_reaches_no_peer`.
+  keysym of a process is logged, at debug level. A `wl_keyboard.key` or
+  `peek_key` of any state but pressed or released, such as a repeat, is
+  dropped too, unacknowledged: `wl_keyboard` has no repeat before version
+  10, beyond the version 5 the proxy binds `wl_seat` at, and Exo's
+  `Keyboard::OnKeyEvent` drops every repeat before either is sent.
+  Tests: `a_keysym_reaches_no_peer`, `a_repeated_key_state_reaches_no_peer`.
 - **A recovered key carries the host's serial.** When an empty IME
   confirmation stands for a held key the input method consumed, the guest
   gets a `wl_keyboard.key` press and release the host never sent. Both

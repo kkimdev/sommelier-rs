@@ -33,7 +33,6 @@ use crate::protocols::keyboard_extension_unstable_v1::{
 };
 use crate::protocols::wayland::wl_keyboard::{
     self, KEYMAP_FORMAT_NO_KEYMAP, KEYMAP_FORMAT_XKB_V1, KEY_STATE_PRESSED, KEY_STATE_RELEASED,
-    KEY_STATE_REPEATED,
 };
 use crate::state::{
     Context, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyAdmission, KeyboardFocus,
@@ -397,7 +396,7 @@ impl KeyboardHandler {
     /// flushed in the same proxy loop iteration as the forwarded `wl_keyboard.enter`
     /// event. Exo enables `SetNeedKeyboardKeyAcks(true)` upon processing
     /// `get_extended_keyboard`. Any key events queued by the compositor *before*
-    /// this request is processed (e.g. auto-repeat already in-flight) will not have
+    /// this request is processed (e.g. a key already in flight) will not have
     /// an active TTL in `pending_key_acks_`; Exo will apply its default policy for
     /// those keys. This mirrors the behavior of the C sommelier reference.
     pub(crate) fn ensure_extended_keyboard_bound(ctx: &mut Context, host_keyboard_id: HostId) {
@@ -799,15 +798,13 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
 
         let guest_owner = ctx.guest_key_owner(host_keyboard_id, key);
         let key_class = match state {
-            KEY_STATE_PRESSED | KEY_STATE_REPEATED => {
-                Self::classify_key(ctx, host_keyboard_id, key)
-            }
+            KEY_STATE_PRESSED => Self::classify_key(ctx, host_keyboard_id, key),
             _ => KeyClass::Guest,
         };
         // Only the press that claims an unowned key generation for a
         // placement chord is routed here, because it runs placement (a side
-        // effect) first. A duplicate press, a repeat and a release are sent
-        // as physical events: the reducer's `arbitrate` routes them to the
+        // effect) first. A duplicate press and a release are sent as
+        // physical events: the reducer's `arbitrate` routes them to the
         // channel that owns the generation (see
         // `GuestKeyOwner::admits_compositor_shortcut`).
         let claims_shortcut = match (state, guest_owner, key_class) {
@@ -832,8 +829,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         };
 
         let decision = match state {
-            KEY_STATE_PRESSED | KEY_STATE_REPEATED => {
-                let repeated = state == KEY_STATE_REPEATED;
+            KEY_STATE_PRESSED => {
                 if key != EVDEV_KEY_BACKSPACE {
                     Self::cancel_backspace_repeat(ctx, host_keyboard_id);
                     if let Some(guest_seat) = guest_seat {
@@ -854,7 +850,6 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     GuestKeyEvent::CompositorShortcutPress
                 } else {
                     GuestKeyEvent::PhysicalPress {
-                        repeated,
                         host_accelerator,
                         ime_repeat_active: backspace_repeat_active,
                     }
@@ -871,6 +866,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 }
                 decision
             }
+            // Exo sends no repeats, and `wl_keyboard` has none before
+            // version 10, beyond the version 5 the proxy binds `wl_seat` at.
             other => {
                 log::warn!("on_key: received unknown key state {}, ignoring", other);
                 return Action::Drop;
@@ -1022,8 +1019,8 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                 time,
                 guest_input: key_class == Some(KeyClass::Guest),
             },
-            KEY_STATE_REPEATED => PeekInput::Repeat { serial, time },
             KEY_STATE_RELEASED => PeekInput::Release { serial, time },
+            // Exo sends no repeats.
             other => {
                 log::warn!("peek_key: received unknown key state {}, ignoring", other);
                 return crate::wire::Action::Drop;
@@ -1073,12 +1070,6 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             }
         }
         match input {
-            PeekInput::Repeat { .. } if outcome.ignored => {
-                log::warn!(
-                    "peek_key: ignoring repeated key {} without a preceding press",
-                    key
-                );
-            }
             // The press of another key ends the Backspace repeat lease.
             PeekInput::Press { .. } if key != EVDEV_KEY_BACKSPACE => {
                 Self::cancel_backspace_repeat(ctx, host_keyboard_id);
@@ -1163,7 +1154,6 @@ mod tests {
 
     const PRESSED: u32 = KEY_STATE_PRESSED;
     const RELEASED: u32 = KEY_STATE_RELEASED;
-    const REPEATED: u32 = KEY_STATE_REPEATED;
 
     // -----------------------------------------------------------------------
     // Handler fixture: for state no peer sees
@@ -2125,7 +2115,7 @@ mod tests {
         assert!(queued_bounds(&p.ctx).is_empty());
     }
 
-    /// The press, repeat and release of a matched chord stay with Sommelier
+    /// The press and release of a matched chord stay with Sommelier
     /// even when its placement is skipped, for every reason to skip it.
     #[test]
     fn a_skipped_placement_still_consumes_its_chord() {
@@ -2174,11 +2164,6 @@ mod tests {
             assert_eq!(
                 p.owner(PLACING, KEY_Q),
                 Some(CompositorShortcut),
-                "{skip:?}"
-            );
-            assert_eq!(
-                p.key(PLACING, 2, 130, KEY_Q, REPEATED),
-                Action::Drop,
                 "{skip:?}"
             );
             assert_eq!(
@@ -2875,16 +2860,10 @@ mod tests {
     async fn each_key_generation_reaches_the_guest_once() {
         use Route::*;
         // Each event, where it goes, and whether the key is down after it:
-        // from its press to its release, wherever they go, but not from a
-        // repeat the host keeps.
+        // from its press to its release, wherever they go.
         type Event = (u32, Route, bool);
-        let cases: [(&str, u32, &[Event]); 5] = [
+        let cases: [(&str, u32, &[Event]); 4] = [
             ("an untracked release", KEY_A, &[(RELEASED, Host, false)]),
-            (
-                "a repeat without a press",
-                KEY_A,
-                &[(REPEATED, Host, false), (RELEASED, Host, false)],
-            ),
             (
                 "a duplicate press",
                 KEY_A,
@@ -2897,11 +2876,7 @@ mod tests {
             (
                 "a held key",
                 KEY_A,
-                &[
-                    (PRESSED, Guest, true),
-                    (REPEATED, Guest, true),
-                    (RELEASED, Guest, false),
-                ],
+                &[(PRESSED, Guest, true), (RELEASED, Guest, false)],
             ),
             (
                 "a host accelerator",
@@ -2919,6 +2894,21 @@ mod tests {
                 assert_eq!(keys.physically_held(HostId(kb.k.host), key), held, "{case}");
             }
         }
+    }
+
+    /// `wl_keyboard` has no repeated key state before version 10, beyond
+    /// the version 5 the proxy binds `wl_seat` at, and Exo sends no
+    /// repeats: such an event reaches no peer, even for a key the guest
+    /// holds, and changes nothing of the key.
+    #[tokio::test]
+    async fn a_repeated_key_state_reaches_no_peer() {
+        let mut kb = Kb::new().await;
+        assert_eq!(kb.key(2, KEY_A, PRESSED).await, Route::Guest);
+        let repeat = wl_keyboard::evt::key(kb.k.host, 3, 3, KEY_A, wl_keyboard::KEY_STATE_REPEATED);
+        kb.s.host([repeat]).await;
+        assert_eq!(kb.s.guest_received(), []);
+        assert_eq!(kb.s.host_received(), []);
+        assert_eq!(kb.key(4, KEY_A, RELEASED).await, Route::Guest);
     }
 
     /// The proxy creates a keyboard's extended keyboard at its first enter
@@ -3956,21 +3946,10 @@ mod tests {
         p.map(KEYBOARD);
         let keyboard = HostId(KEYBOARD.host);
 
-        assert_eq!(p.peek(KEYBOARD, 11, 21, BACKSPACE, REPEATED), Action::Drop);
-        assert!(!p.held(KEYBOARD, BACKSPACE), "a repeat without a press");
         assert!(p.ctx.key_generations.peek(keyboard, BACKSPACE).is_none());
-
         assert_eq!(p.peek(KEYBOARD, 10, 20, BACKSPACE, PRESSED), Action::Drop);
         assert!(p.held(KEYBOARD, BACKSPACE));
-        p.ctx
-            .key_generations
-            .cancel_backspace_repeat(keyboard, BACKSPACE);
-        assert_eq!(p.peek(KEYBOARD, 11, 21, BACKSPACE, REPEATED), Action::Drop);
-        assert!(p.held(KEYBOARD, BACKSPACE), "a repeat keeps the key down");
-        assert!(
-            p.cancelled(KEYBOARD),
-            "a repeat must not re-arm a cancelled IME fallback"
-        );
+        assert!(p.ctx.key_generations.peek(keyboard, BACKSPACE).is_some());
 
         assert_eq!(p.peek(KEYBOARD, 12, 22, BACKSPACE, RELEASED), Action::Drop);
         assert!(!p.held(KEYBOARD, BACKSPACE));
@@ -4198,7 +4177,7 @@ mod tests {
         };
         // ChromeOS may share one serial among the transitions of keys.
         let shared = 18_857;
-        let cases: [(&str, Vec<Step>, Option<Replay>); 8] = [
+        let cases: [(&str, Vec<Step>, Option<Replay>); 7] = [
             (
                 "a held key",
                 vec![peek(1, 1234, BACKSPACE, PRESSED)],
@@ -4206,18 +4185,6 @@ mod tests {
                     key: BACKSPACE,
                     serial: 1,
                     time: 1234,
-                }),
-            ),
-            (
-                "a repeated peek",
-                vec![
-                    peek(1, 100, KEY_SPACE, PRESSED),
-                    peek(2, 200, KEY_SPACE, REPEATED),
-                ],
-                Some(Replay {
-                    key: KEY_SPACE,
-                    serial: 2,
-                    time: 200,
                 }),
             ),
             (
@@ -4585,7 +4552,6 @@ mod tests {
         );
 
         assert_eq!(kb.key(1, KEY_SPACE, PRESSED).await, Route::Host);
-        assert_eq!(kb.key(3, KEY_SPACE, REPEATED).await, Route::Host);
         kb.peek(4, 503, KEY_SPACE, RELEASED).await;
         assert_eq!(kb.key(4, KEY_SPACE, RELEASED).await, Route::Host);
 

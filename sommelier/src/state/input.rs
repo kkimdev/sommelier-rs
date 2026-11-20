@@ -70,8 +70,8 @@ impl GuestKeyOwner {
     ///
     /// A compositor shortcut may own a key generation only while no channel
     /// owns it (the first press, which also places the window) or while it
-    /// already owns it (a duplicate press, or a repeat of the consumed
-    /// chord). A generation that another channel delivered or recovered
+    /// already owns it (a duplicate press of the consumed chord). A
+    /// generation that another channel delivered or recovered
     /// belongs to that channel, and the chord is not acted on.
     pub(crate) const fn admits_compositor_shortcut(owner: Option<Self>) -> bool {
         matches!(owner, None | Some(Self::CompositorShortcut))
@@ -86,7 +86,6 @@ impl GuestKeyOwner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestKeyEvent {
     PhysicalPress {
-        repeated: bool,
         host_accelerator: bool,
         ime_repeat_active: bool,
     },
@@ -121,11 +120,6 @@ pub enum PeekInput {
         time: u32,
         guest_input: bool,
     },
-    /// A protocol v10 repeat.
-    Repeat {
-        serial: u32,
-        time: u32,
-    },
     Release {
         serial: u32,
         time: u32,
@@ -142,8 +136,8 @@ pub struct PeekOutcome {
     /// The press numbered a new peek generation with this sequence, which
     /// its seat records as its latest.
     pub numbered: Option<u64>,
-    /// The peek changed nothing: a repeat of a key not held, or a release
-    /// older than the key's latest peek.
+    /// The peek changed nothing: a release older than the key's latest
+    /// peek.
     pub ignored: bool,
 }
 
@@ -168,7 +162,7 @@ enum PhysicalKeyState {
     Released,
 }
 
-/// What the generation's latest `peek_key` press or repeat announced.
+/// What the generation's latest `peek_key` press announced.
 ///
 /// `peek_key` promises that the `wl_keyboard.key` after it has its serial,
 /// so the serial names the event the latest peek announced. Only a peek
@@ -176,16 +170,15 @@ enum PhysicalKeyState {
 /// key, and the serial as long as the generation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PeekRecord {
-    /// No peek press or repeat: the key is held since `wl_keyboard.enter`,
-    /// or only `wl_keyboard` showed it.
+    /// No peek press: the key is held since `wl_keyboard.enter`, or only
+    /// `wl_keyboard` showed it.
     #[default]
     None,
-    /// A peek announced `serial`, but the generation has no provenance: a
-    /// peek repeat of a key held since `enter`, or a generation whose
-    /// keyboard has since held no key.
+    /// A peek announced `serial`, but the generation has no provenance:
+    /// its keyboard has since held no key.
     Announced { serial: u32 },
     /// A peek press numbered the generation; `provenance.serial` is the
-    /// latest peek press or repeat's.
+    /// latest peek press's.
     Live(PeekKeyProvenance),
 }
 
@@ -202,18 +195,6 @@ impl PeekRecord {
         match self {
             Self::Live(provenance) => Some(provenance),
             Self::None | Self::Announced { .. } => None,
-        }
-    }
-
-    /// A peek press or repeat announced `serial` at `time`.
-    fn refreshed(self, serial: u32, time: u32) -> Self {
-        match self {
-            Self::Live(provenance) => Self::Live(PeekKeyProvenance {
-                serial,
-                time,
-                ..provenance
-            }),
-            Self::None | Self::Announced { .. } => Self::Announced { serial },
         }
     }
 
@@ -570,8 +551,8 @@ impl KeyGenerationRegistry {
             .is_some_and(|generation| generation.phase.kind() == PhysicalKeyState::Released)
     }
 
-    /// The serial of the latest peek press or repeat of `key`'s generation
-    /// (see [`PeekRecord`]).
+    /// The serial of the latest peek press of `key`'s generation (see
+    /// [`PeekRecord`]).
     pub(crate) fn peek_press_serial(&self, keyboard: HostId, key: u32) -> Option<u32> {
         self.entries
             .get(&keyboard)
@@ -630,10 +611,6 @@ impl KeyGenerationRegistry {
     ) {
         match state {
             1 => self.observe_physical_press(keyboard, key),
-            // A repeat is evidence about an existing physical generation,
-            // never permission to invent one after a missing press, and
-            // changes nothing.
-            2 => {}
             0 => {
                 if let Some(generation) = self
                     .entries
@@ -784,16 +761,20 @@ impl KeyGenerationRegistry {
         sequence
     }
 
-    /// A peek repeat, or a legacy duplicate peek press, of a held key
-    /// announces its next `wl_keyboard.key`.
+    /// A legacy duplicate peek press of a held, peeked key announces its
+    /// next `wl_keyboard.key`.
     fn refresh_peek(&mut self, keyboard: HostId, key: u32, serial: u32, time: u32) {
-        if let Some(KeyPhase::Held { peek, .. }) = self
+        if let Some(KeyPhase::Held {
+            peek: PeekRecord::Live(provenance),
+            ..
+        }) = self
             .entries
             .get_mut(&keyboard)
             .and_then(|keys| keys.get_mut(&key))
             .map(|generation| &mut generation.phase)
         {
-            *peek = peek.refreshed(serial, time);
+            provenance.serial = serial;
+            provenance.time = time;
         }
     }
 
@@ -879,8 +860,8 @@ impl KeyGenerationRegistry {
     /// held, or held without a peek press, numbers the generation; it is
     /// eligible for recovery only if it is guest input that no host
     /// accelerator or compositor shortcut has taken. A press of a key
-    /// already peeked (a legacy duplicate) and a repeat refresh the peek's
-    /// serial and time. A release closes the generation unless it is older
+    /// already peeked (a legacy duplicate) refreshes the peek's serial and
+    /// time. A release closes the generation unless it is older
     /// than the key's latest peek: ChromeOS may reuse one serial across
     /// several key transitions, so within one serial the time orders them,
     /// but a newer time alone does not, as an old serial can arrive late
@@ -917,16 +898,6 @@ impl KeyGenerationRegistry {
                     numbered: Some(sequence),
                     ignored: false,
                 }
-            }
-            PeekInput::Repeat { serial, time } => {
-                if !self.physically_held(keyboard, key) {
-                    return PeekOutcome {
-                        ignored: true,
-                        ..PeekOutcome::default()
-                    };
-                }
-                self.refresh_peek(keyboard, key, serial, time);
-                PeekOutcome::default()
             }
             PeekInput::Release { serial, time } => {
                 if let Some(press) = self.peek(keyboard, key) {
@@ -1007,7 +978,7 @@ impl KeyGenerationRegistry {
                     self.observe_physical_event(keyboard, key, state, Some(serial));
                 }
             }
-            // A repeat changes no physical state.
+            // The handler drops any other state.
             _ => {}
         }
         KeyAdmission::Current
@@ -1182,7 +1153,6 @@ impl KeyGenerationRegistry {
             {
                 log::warn!("rejecting a compositor shortcut press of a key owned by {owner:?}");
                 GuestKeyEvent::PhysicalPress {
-                    repeated: false,
                     host_accelerator: false,
                     ime_repeat_active: false,
                 }
@@ -1209,7 +1179,6 @@ impl KeyGenerationRegistry {
     ) -> GuestKeyDecision {
         match Self::arbitrate(event, self.guest_owner(keyboard, key)) {
             GuestKeyEvent::PhysicalPress {
-                repeated,
                 host_accelerator,
                 ime_repeat_active,
             } => {
@@ -1238,20 +1207,11 @@ impl KeyGenerationRegistry {
                         ack_handled: Some(false),
                     };
                 }
-                if forwarded && !repeated {
+                if forwarded {
+                    // A duplicate press.
                     return GuestKeyDecision {
                         delivery: GuestKeyDelivery::Drop,
                         ack_handled: Some(true),
-                    };
-                }
-                if repeated {
-                    return GuestKeyDecision {
-                        delivery: if forwarded {
-                            GuestKeyDelivery::Forward
-                        } else {
-                            GuestKeyDelivery::Drop
-                        },
-                        ack_handled: Some(forwarded),
                     };
                 }
 
@@ -2066,17 +2026,10 @@ mod tests {
     }
 
     const PRESS: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
-        repeated: false,
-        host_accelerator: false,
-        ime_repeat_active: false,
-    };
-    const REPEAT: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
-        repeated: true,
         host_accelerator: false,
         ime_repeat_active: false,
     };
     const ACCELERATOR_PRESS: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
-        repeated: false,
         host_accelerator: true,
         ime_repeat_active: false,
     };
@@ -2187,13 +2140,11 @@ mod tests {
     fn physical_events_of_a_consumed_shortcut_stay_with_the_shortcut() {
         let key = 16;
         let mut registry = shortcut_consumed(key);
-        for event in [PRESS, REPEAT] {
-            assert_decision(&mut registry, key, event, dropped(Some(true)));
-            assert_eq!(
-                registry.guest_owner(KEYBOARD_A, key),
-                Some(GuestKeyOwner::CompositorShortcut)
-            );
-        }
+        assert_decision(&mut registry, key, PRESS, dropped(Some(true)));
+        assert_eq!(
+            registry.guest_owner(KEYBOARD_A, key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
         assert_decision(
             &mut registry,
             key,
@@ -2234,7 +2185,6 @@ mod tests {
             physical_key,
             &[
                 (PRESS, forwarded(Some(true))),
-                (REPEAT, forwarded(Some(true))),
                 (GuestKeyEvent::PhysicalRelease, forwarded(Some(true))),
                 (
                     GuestKeyEvent::RecoverIme,
@@ -2247,7 +2197,6 @@ mod tests {
                 // pair.
                 (
                     GuestKeyEvent::PhysicalPress {
-                        repeated: false,
                         host_accelerator: false,
                         ime_repeat_active: true,
                     },
@@ -2273,7 +2222,6 @@ mod tests {
         #[derive(Clone, Copy)]
         enum Operation {
             PhysicalPress,
-            PhysicalRepeat,
             PhysicalRelease,
             Recover,
             ShortcutPress,
@@ -2282,7 +2230,6 @@ mod tests {
 
         let operations = [
             Operation::PhysicalPress,
-            Operation::PhysicalRepeat,
             Operation::PhysicalRelease,
             Operation::Recover,
             Operation::ShortcutPress,
@@ -2302,7 +2249,6 @@ mod tests {
                 encoded /= operations.len();
                 let event = match operation {
                     Operation::PhysicalPress => PRESS,
-                    Operation::PhysicalRepeat => REPEAT,
                     Operation::PhysicalRelease => GuestKeyEvent::PhysicalRelease,
                     Operation::Recover => GuestKeyEvent::RecoverIme,
                     Operation::ShortcutPress => GuestKeyEvent::CompositorShortcutPress,
@@ -2322,9 +2268,7 @@ mod tests {
                         Operation::ShortcutPress => {
                             Some(owner_before != Some(GuestKeyOwner::ImeRecovery))
                         }
-                        Operation::PhysicalRepeat
-                        | Operation::PhysicalRelease
-                        | Operation::ShortcutRelease => Some(matches!(
+                        Operation::PhysicalRelease | Operation::ShortcutRelease => Some(matches!(
                             owner_before,
                             Some(GuestKeyOwner::Physical | GuestKeyOwner::CompositorShortcut)
                         )),
@@ -2336,12 +2280,6 @@ mod tests {
                     (Operation::PhysicalPress, GuestKeyDelivery::Forward) => {
                         assert!(!guest_press_open, "a second press cannot be forwarded");
                         guest_press_open = true;
-                    }
-                    (Operation::PhysicalRepeat, GuestKeyDelivery::Forward) => {
-                        assert!(
-                            guest_press_open,
-                            "repeat forwarding requires an open guest press"
-                        );
                     }
                     (
                         Operation::PhysicalRelease | Operation::ShortcutRelease,
@@ -2465,16 +2403,6 @@ mod tests {
                 self.keys.remove(&key);
             }
 
-            fn repeat(&mut self, key: u32) {
-                if let Some(generation) = self
-                    .keys
-                    .get_mut(&key)
-                    .filter(|generation| generation.physical_state == PhysicalKeyState::Held)
-                {
-                    generation.physical_state = PhysicalKeyState::Held;
-                }
-            }
-
             fn release(&mut self, key: u32, serial: Option<u32>) {
                 if let Some(generation) = self.keys.get_mut(&key) {
                     generation.physical_state = PhysicalKeyState::Released;
@@ -2552,7 +2480,7 @@ mod tests {
                     .filter(|generation| generation.physical_state == PhysicalKeyState::Held)
             }
 
-            /// A peek repeat, or a duplicate peek press, of a held key.
+            /// A duplicate peek press of a held key.
             fn refresh_peek(&mut self, key: u32, serial: u32, time: u32) {
                 if let Some(generation) = self
                     .keys
@@ -2597,16 +2525,6 @@ mod tests {
                             numbered: Some(self.next_generation),
                             ignored: false,
                         }
-                    }
-                    PeekInput::Repeat { serial, time } => {
-                        if self.held(key).is_none() {
-                            return PeekOutcome {
-                                ignored: true,
-                                ..PeekOutcome::default()
-                            };
-                        }
-                        self.refresh_peek(key, serial, time);
-                        PeekOutcome::default()
                     }
                     PeekInput::Release { serial, time } => {
                         let peek = self.keys.get(&key).and_then(|generation| generation.peek);
@@ -2679,11 +2597,9 @@ mod tests {
         #[derive(Clone, Copy)]
         enum Operation {
             Press(u32),
-            Repeat(u32),
             Release(u32),
             /// `peek_key` press, with whether it is guest input.
             PeekPress(u32, bool),
-            PeekRepeat(u32),
             /// `peek_key` release, under an older serial if true.
             PeekRelease(u32, bool),
             /// `wl_keyboard` press, under the key's peek serial if true.
@@ -2713,13 +2629,11 @@ mod tests {
         let operations = [
             Operation::Press(KEY_A),
             Operation::Press(KEY_B),
-            Operation::Repeat(KEY_A),
             Operation::Release(KEY_A),
             Operation::Release(KEY_B),
             Operation::PeekPress(KEY_A, true),
             Operation::PeekPress(KEY_A, false),
             Operation::PeekPress(KEY_B, true),
-            Operation::PeekRepeat(KEY_A),
             Operation::PeekRelease(KEY_A, false),
             Operation::PeekRelease(KEY_A, true),
             Operation::AdmitPress(KEY_A, false),
@@ -2762,10 +2676,6 @@ mod tests {
                         registry.observe_physical_state(keyboard, key, 1);
                         model.press(key);
                     }
-                    Operation::Repeat(key) => {
-                        registry.observe_physical_state(keyboard, key, 2);
-                        model.repeat(key);
-                    }
                     Operation::Release(key) => {
                         registry.observe_physical_state(keyboard, key, 0);
                         model.release(key, None);
@@ -2776,11 +2686,6 @@ mod tests {
                             time,
                             guest_input,
                         };
-                        let actual = registry.peek_key(keyboard, key, input);
-                        assert_eq!(actual, model.peek_key(key, input));
-                    }
-                    Operation::PeekRepeat(key) => {
-                        let input = PeekInput::Repeat { serial, time };
                         let actual = registry.peek_key(keyboard, key, input);
                         assert_eq!(actual, model.peek_key(key, input));
                     }

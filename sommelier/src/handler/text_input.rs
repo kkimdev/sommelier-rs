@@ -122,7 +122,7 @@ fn glue_last_two(queue: &mut Vec<Outgoing>) {
     into_fds.extend(fds);
 }
 
-/// The keyboard concern forwarded a key press or repeat to the guest on
+/// The keyboard concern forwarded a key press to the guest on
 /// guest seat `seat`, which may edit its text where Exo does not see.
 pub(crate) fn guest_key(ctx: &mut Context, seat: u32) {
     ime(ctx, Input::GuestKey(SeatId(seat)));
@@ -3852,19 +3852,10 @@ pub(super) mod tests {
         let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
-        let repeat = Stroke {
-            state: REPEATED,
-            serial: 705,
-            time: 1_300,
-            ..space
-        };
-        for held in [space, repeat] {
-            if held.state == REPEATED {
-                f.s.host([f.peek(held)]).await;
-            }
+        for _ in 0..2 {
             f.s.host([f.confirm()]).await;
             f.answer_recovery_syncs().await;
-            assert_eq!(f.s.guest_received(), f.recovered(held), "{held:?}");
+            assert_eq!(f.s.guest_received(), f.recovered(space));
         }
     }
 
@@ -4554,8 +4545,8 @@ pub(super) mod tests {
     }
 
     /// A release delayed past a wrapped serial's next press ends only its
-    /// own generation: the new press stays held and owned, repeats, and
-    /// gets its own release, and every key gets one `ack_key`. Then a key
+    /// own generation: the new press stays held and owned, and gets its
+    /// own release, and every key gets one `ack_key`. Then a key
     /// is held as the focus leaves, which drains the field: a confirmation
     /// recovers nothing.
     #[tokio::test]
@@ -4592,15 +4583,6 @@ pub(super) mod tests {
         assert!(f.held(SPACE));
         assert_eq!(f.owner(SPACE), Some(GuestKeyOwner::Physical));
 
-        let repeat = Stroke {
-            state: REPEATED,
-            serial: 2,
-            time: 210,
-            ..old_press
-        };
-        f.s.host([f.key(repeat)]).await;
-        assert_eq!(f.s.guest_received(), [f.guest_key(repeat)]);
-        assert_eq!(f.host_received().await, [f.ack(repeat.serial, true)]);
         let new_release = Stroke {
             state: RELEASED,
             serial: 3,
@@ -4724,7 +4706,6 @@ pub(super) mod tests {
     pub(in crate::handler) const BACKSPACE: u32 = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
     pub(in crate::handler) const PRESSED: u32 = wl_keyboard::KEY_STATE_PRESSED;
     pub(in crate::handler) const RELEASED: u32 = wl_keyboard::KEY_STATE_RELEASED;
-    pub(in crate::handler) const REPEATED: u32 = wl_keyboard::KEY_STATE_REPEATED;
 
     /// Handler tests of key and IME state that the peers of a [`Session`]
     /// cannot set up exactly: the guest text input [`TI`] of seat [`SEAT`]
