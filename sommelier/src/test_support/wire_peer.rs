@@ -45,7 +45,8 @@ limitations under the License.
 //!
 //! The proxy is the client of the host and the server of the guest, so a
 //! test's guest is a [`Role::Client`] peer and its host a [`Role::Server`]
-//! one. The two peers of `proxy::harness::Session` each hold one.
+//! one. The two peers of `proxy::harness::Session`, and the host display
+//! the DST and the fuzzer share (`sim::display`), each hold one.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::OwnedFd;
@@ -190,6 +191,19 @@ impl Peer {
         self.objects.insert(id, object);
     }
 
+    /// The interface of `id`, if the peer has it, live or not.
+    pub(crate) fn interface(&self, id: u32) -> Option<&str> {
+        self.objects
+            .get(&id)
+            .map(|object| object.interface.as_str())
+    }
+
+    /// The interface of `id`, if it is a live object.
+    pub(crate) fn live_interface(&self, id: u32) -> Option<&str> {
+        let object = self.objects.get(&id)?;
+        (object.life == Life::Live).then_some(object.interface.as_str())
+    }
+
     /// Whether the server ended `id` on its own, and the client has not
     /// used its ID again.
     pub(crate) fn deleted(&self, id: u32) -> bool {
@@ -206,6 +220,14 @@ impl Peer {
             .filter(|(_, object)| live(object))
             .map(|(&id, _)| id)
             .collect()
+    }
+
+    /// A free server ID for an object this server creates: the lowest one
+    /// free, else the next fresh one.
+    pub(crate) fn free_server_id(&self) -> u32 {
+        (SERVER_ID_START..SERVER_ID_START + self.spans[1])
+            .find(|&id| self.reusable(id))
+            .unwrap_or(SERVER_ID_START + self.spans[1])
     }
 
     /// Decode `message`, sent by an object this peer has, by its sender's

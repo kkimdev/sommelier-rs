@@ -252,6 +252,22 @@ impl Session {
         self.guest.wire.server_may_end(may_end);
     }
 
+    /// `event`, which the host sends, decoded as the proxy will read it:
+    /// by the host objects the proxy has told the host about, and the ones
+    /// the host's earlier events created.
+    ///
+    /// # Panics
+    ///
+    /// If it does not decode so.
+    pub(crate) fn decode_host_event(&self, (message, fds): &Outgoing) -> (u32, AnyEvent) {
+        let mut fds = fds
+            .iter()
+            .map(|fd| fd.try_clone().expect("duplicate a descriptor"))
+            .collect();
+        let decoded = self.host.wire.decode(message, &mut fds);
+        decoded.unwrap_or_else(|error| panic!("the host sends {message:?}: {error}"))
+    }
+
     /// The guest sends `request`, which creates one object; returns the host
     /// ID of the object its forward creates. The forward is not kept for
     /// [`Self::host_received`].

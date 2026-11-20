@@ -50,15 +50,16 @@ use super::client::chromium::Chromium;
 use super::client::gtk::Gtk;
 use super::client::{Client, Field, PressKind};
 use super::clock::Micros;
-use super::display::Display;
+use super::display::{self, Display};
 use super::editor::{Target, TextModel, UserAction};
 use super::engine::{Engine, EngineIn, Lag, Request};
 use super::exo::{Answer, Exo, Predicted, RegionOutcome, RegionTruth};
 use super::hangul::Key;
 use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
-use super::surfaces::Surfaces;
+use super::surfaces::{Surfaces, Windows};
 use super::ClientKind;
+use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{
@@ -319,6 +320,8 @@ pub(super) struct World<'t> {
     pub exo: Exo,
     engine: Engine,
     display: Display,
+    /// The fields' windows on the host.
+    windows: Windows,
     /// Each guest request, with the edits the guest had got when it sent
     /// it.
     c_to_p: Channel<(Outgoing, u64)>,
@@ -361,7 +364,7 @@ pub(super) struct World<'t> {
     /// The guest's text input and compositor.
     text_input: u32,
     compositor: u32,
-    /// Which field each surface is, shared with the display, the
+    /// Which field each surface is, shared with the windows, the
     /// specification and the shadow.
     surfaces: Surfaces,
     /// The oracle's two readers, from the end of the setup.
@@ -398,7 +401,9 @@ impl<'t> World<'t> {
             client: None,
             exo,
             engine: Engine::new(setup.lag),
-            display: Display::new(surfaces.clone()),
+            display: Display::new(display::exo_globals())
+                .unanswered(&[zcr_extended_keyboard_v1::NAME]),
+            windows: Windows::new(surfaces.clone()),
             c_to_p: Channel::new(GUEST_LATENCY),
             p_to_c: Channel::new(GUEST_LATENCY),
             p_to_e: Channel::new(HOST_LATENCY),
@@ -542,6 +547,7 @@ impl<'t> World<'t> {
                 Source::HostRequests => {
                     for (sender, request) in self.p_to_e.take() {
                         self.reports_got += u64::from(is_report(&request));
+                        self.windows.request(sender, &request, &mut self.exo);
                         let events = self.display.request(sender, &request, &mut self.exo);
                         self.host_sends(events, false);
                     }
@@ -669,8 +675,15 @@ impl<'t> World<'t> {
             self.exo.move_focus(Some(surface));
         }
         let presses = match action {
-            UserAction::Click { at, .. } => self.display.click(surface, at, time),
-            UserAction::Tap { at, .. } => self.display.tap(surface, at, time),
+            UserAction::Click { at, .. } => {
+                let pointer = *self.display.pointers().first().expect("a pointer");
+                self.display
+                    .click(pointer, surface, keymap::position(at), time)
+            }
+            UserAction::Tap { at, .. } => {
+                let touch = *self.display.touches().first().expect("a touch");
+                self.display.tap(touch, surface, keymap::position(at), time)
+            }
             _ => Vec::new(),
         };
         self.host_sends(presses, false);
@@ -683,7 +696,7 @@ impl<'t> World<'t> {
         let old = self.surfaces.guest(field);
         let new = self.session.new_id();
         let refocus = self.exo.focus().is_some() && self.exo.focus() == self.surfaces.host(field);
-        self.display.reopen(field, refocus);
+        self.windows.reopen(field, refocus);
         self.surfaces.add_guest(field, new);
         let now = self.now;
         let client = self.client.as_mut().expect("a client model");
@@ -812,7 +825,7 @@ impl<'t> World<'t> {
         truth: Option<RegionTruth>,
         reports: u64,
     ) {
-        let (sender, decoded) = self.display.decode(&event);
+        let (sender, decoded) = self.session.decode_host_event(&event);
         let region = matches!(
             decoded,
             AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion { .. })

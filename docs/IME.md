@@ -663,8 +663,8 @@ user actions.
 | `client/` | The `Client` trait and the Chromium and GTK models |
 | `editor.rs` | `TextModel`, `Txn`, `Target`, `UserAction` and `Reference`, the ideal editor |
 | `user.rs` | The user action generator, free and settled |
-| `display.rs` | The host display the DST plays: syncs, `delete_id` and globals |
-| `surfaces.rs` | Each field's surfaces, a generation each (F2) |
+| `display.rs` | The host display, which the fuzzer drives too: globals, syncs, `delete_id`, keymaps, the focus of the keyboards Exo does not play, pointers and touches, and the objects a compositor creates of its own |
+| `surfaces.rs` | Each field's surfaces, a generation each (F2), and the host windows that take them (`Windows`) |
 | `oracle.rs` | The exact oracle (`SpecText`, `Shadow`) and the user-intent oracle |
 | `shrink.rs` | Minimizing a failing case |
 | `regressions.rs` | Shrunk cases kept as regressions |
@@ -713,8 +713,11 @@ for user actions (U→E), and the mojo pipe between Exo and the engine
   seat and the input method, goes into one queue in the order Exo sends
   it.
 - **No display.** The model does not answer `wl_display.sync` or a
-  destructor's `delete_id`; whoever plays the display does (the fuzzer's
-  compositor, or `sim/display.rs`). The display takes the model's events
+  destructor's `delete_id`; the host display does (`sim/display.rs`),
+  which the DST and the fuzzer share. The DST's display leaves out the
+  `delete_id` of a destroyed `zcr_extended_keyboard_v1`, as its model
+  always has, so that the shrunk regressions replay their schedules
+  (HANDOVER, "Known issues and debt"). The display takes the model's events
   after each input and before it answers any later sync, so that a
   sync's `done` follows every event of earlier requests (E11). It reads
   a surrounding text or a `reset` and the sync glued to it in one go, as
