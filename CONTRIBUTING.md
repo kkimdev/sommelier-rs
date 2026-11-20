@@ -26,6 +26,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 python3 -I scripts/check-cited-tests.py
+python3 -I scripts/check-doc-links.py
 git diff --check
 ```
 

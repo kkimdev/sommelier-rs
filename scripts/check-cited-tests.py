@@ -93,7 +93,8 @@ def tracked(*pathspecs: str) -> list[pathlib.Path]:
         capture_output=True,
         text=True,
     ).stdout.split("\0")
-    return [ROOT / file for file in files if file]
+    # A file deleted in the work tree is not checked.
+    return [ROOT / file for file in files if file and (ROOT / file).exists()]
 
 
 def defined_tests() -> dict[str, list[str]]:

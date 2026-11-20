@@ -46,6 +46,9 @@ jobs:
       - name: Check the tests the design documents cite
         run: python3 -I scripts/check-cited-tests.py
 
+      - name: Check the documents' links and quoted rules
+        run: python3 -I scripts/check-doc-links.py
+
       - name: Build
         run: cargo build --locked --workspace --verbose
 
