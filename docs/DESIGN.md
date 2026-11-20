@@ -80,15 +80,23 @@ produce for each peer (`to_host`, `to_guest`), appended in the order a
 send per batch would have sent it, and sends it in as few transport
 submissions as the 28-descriptor and VirtWL transaction-size limits
 allow, each ending at a message boundary: a submission once a later
-message no longer fits it, the rest (`Client::flush`) once everything
-received is dispatched, before `run` waits, and when the session ends.
-Each submission is a synchronous VirtWL round trip, so a burst costs
-about one per 3,980 bytes rather than one per batch; per-message VirtWL
-ioctls would add latency without changing the byte and descriptor order
-(see
+message no longer fits it, the rest (`Client::flush`) before a batch in
+the other direction, before a fifth batch in the same one
+(`MAX_BATCHES_PER_FLUSH`), before `run` waits, and when the session
+ends. Each submission is a synchronous VirtWL round trip, so a burst in
+one direction costs about one per 3,980 bytes rather than one per batch;
+per-message VirtWL ioctls would add latency without changing the byte
+and descriptor order (see
 [transport invariants](INVARIANTS.md#transport-and-file-descriptors)).
-Output therefore waits at most until the proxy has dispatched what it has
-already received.
+A batch's output therefore waits behind no batch in the other direction,
+so a host key event goes out before the next guest batch, as fair
+dispatch intends, and behind at most three more batches in its own. A
+long one-way stream still awaits a send every four batches, where it
+awaited one every batch; as before, Tokio's cooperative budget decides
+when such an await lets another client run. Interleaved directions send
+once per switch, as one send per batch did. `proxy::harness::Session`
+dispatches what one peer sent and then flushes, so tests of the
+interleaving drive `Client::handle_msgs` directly.
 
 ### Descriptors
 

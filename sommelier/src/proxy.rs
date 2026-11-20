@@ -52,9 +52,17 @@ type DispatchResult = Result<Option<Outgoing>, ProtocolError>;
 // Keep the fairness quantum short enough that a render burst cannot hold a
 // keyboard or text-input event behind several frames.  Ghostty can emit a
 // dozen small requests per frame at 4K; 32 messages bound the opposite
-// direction to roughly one frame of work. A batch's output waits for the
-// next ones' (see `Client::flush`), so the quantum costs no send.
+// direction to roughly one frame of work. A batch's output may wait for the
+// next ones' in the same direction (see `Client::flush`), so the quantum
+// costs no send of its own.
 const MAX_MESSAGES_PER_BATCH: usize = 32;
+
+/// The most batches whose output waits unsent: before a further batch in
+/// the same direction, `Client::handle_msgs` sends what they produced. A
+/// batch in the other direction sends it first whatever the count, so no
+/// output waits behind the other peer's stream, and a long one-way stream
+/// still sends, and so awaits, every few batches.
+const MAX_BATCHES_PER_FLUSH: usize = 4;
 
 /// How long the accept loop waits after a failed accept.
 ///
@@ -280,6 +288,11 @@ struct Client {
     /// yet, in the order they produced it (see [`Self::flush`]).
     to_host: OutgoingMessages,
     to_guest: OutgoingMessages,
+    /// The direction of the batches whose output is pending, and how many
+    /// there are; the next batch sends it first if it goes the other way
+    /// or would make more than [`MAX_BATCHES_PER_FLUSH`].
+    pending_from: Option<Direction>,
+    pending_batches: usize,
 }
 
 impl Client {
@@ -294,6 +307,8 @@ impl Client {
             parked: None,
             to_host: OutgoingMessages::default(),
             to_guest: OutgoingMessages::default(),
+            pending_from: None,
+            pending_batches: 0,
         }
     }
 
@@ -498,6 +513,14 @@ impl Client {
 
     async fn handle_msgs(&mut self, direction: Direction) -> bool {
         if self.ended {
+            return false;
+        }
+        // What earlier batches produced goes out before a batch in the other
+        // direction, so a key event, say, never waits behind the guest's
+        // render requests, and after a few batches in the same one.
+        let other_direction = self.pending_from.is_some_and(|from| from != direction);
+        if (other_direction || self.pending_batches >= MAX_BATCHES_PER_FLUSH) && !self.flush().await
+        {
             return false;
         }
         // A parked request is the first in the guest stream (see
@@ -842,14 +865,20 @@ impl Client {
 
         conn.read_buf.drain(..offset);
         self.ended = !success;
+        self.pending_from = Some(direction);
+        self.pending_batches += 1;
         success
     }
 
     /// Send all the output the batches dispatched so far left for either
-    /// peer, as `run` does before it waits and when the session ends; the
-    /// peers' streams are independent, so only each one's order matters.
-    /// Returns whether the session goes on: a failed send ends it.
+    /// peer, as `run` does before it waits and when the session ends, and
+    /// `handle_msgs` before a batch in the other direction or after
+    /// [`MAX_BATCHES_PER_FLUSH`]; the peers' streams are independent, so
+    /// only each one's order matters. Returns whether the session goes on:
+    /// a failed send ends it.
     async fn flush(&mut self) -> bool {
+        self.pending_from = None;
+        self.pending_batches = 0;
         let to_host = self.host_conn.send_messages(&mut self.to_host).await;
         let to_guest = self.client_conn.send_messages(&mut self.to_guest).await;
         if to_host.is_err() || to_guest.is_err() {
@@ -1467,6 +1496,85 @@ mod tests {
         let sizes: Vec<usize> = submissions.iter().map(Vec::len).collect();
         assert_eq!(sizes, [forwarded.len()], "bytes per submission");
         assert_eq!(submissions.concat(), forwarded);
+    }
+
+    /// A host batch's output reaches the guest before the proxy dispatches
+    /// a guest batch: a key or IME event must not wait behind the rest of
+    /// a render burst the guest has already sent. (`harness::Session`
+    /// dispatches one direction and then flushes, so it cannot show this.)
+    #[tokio::test]
+    async fn a_host_batchs_output_reaches_the_guest_before_the_next_guest_batch() {
+        use crate::protocols::wayland::{wl_pointer, wl_region};
+        use std::io::Read;
+
+        const GUEST_POINTER: u32 = 30;
+        const HOST_POINTER: u32 = 31;
+        const GUEST_REGION: u32 = 32;
+        const HOST_REGION: u32 = 33;
+        let (mut client, guest_peer, _host_peer) = client_with_socket_peers();
+        let table = &mut client.ctx.shadow_table;
+        table.insert_paired_for_test(GUEST_POINTER, HOST_POINTER, "wl_pointer");
+        table.insert_paired_for_test(GUEST_REGION, HOST_REGION, "wl_region");
+
+        // An event from the host, and a render burst longer than a batch
+        // from the guest.
+        let (motion, _) = wl_pointer::evt::motion(HOST_POINTER, 1, 2, 3);
+        client.host_conn.read_buf.extend(motion);
+        for x in 0..=MAX_MESSAGES_PER_BATCH as i32 {
+            let (add, _) = wl_region::req::add(GUEST_REGION, x, 0, 1, 1);
+            client.client_conn.read_buf.extend(add);
+        }
+        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert!(client.client_conn.has_complete_message());
+
+        guest_peer
+            .set_nonblocking(true)
+            .expect("a non-blocking guest peer");
+        let mut received = [0u8; 64];
+        let len = (&guest_peer)
+            .read(&mut received)
+            .expect("the guest has the event");
+        let (forwarded, _) = wl_pointer::evt::motion(GUEST_POINTER, 1, 2, 3);
+        assert_eq!(received[..len], forwarded);
+    }
+
+    /// A long stream in one direction still sends what it produced every
+    /// `MAX_BATCHES_PER_FLUSH` batches, though no submission is full.
+    #[tokio::test]
+    async fn a_one_way_stream_sends_every_few_batches() {
+        use crate::connection::MAX_BYTES_PER_SEND;
+        use crate::protocols::wayland::wl_region;
+        use std::io::Read;
+
+        const GUEST_REGION: u32 = 30;
+        const HOST_REGION: u32 = 31;
+        let (mut client, _guest_peer, host_peer) = client_with_socket_peers();
+        client
+            .ctx
+            .shadow_table
+            .insert_paired_for_test(GUEST_REGION, HOST_REGION, "wl_region");
+        let batches = MAX_BATCHES_PER_FLUSH + 1;
+        for x in 0..(batches * MAX_MESSAGES_PER_BATCH) as i32 {
+            let (add, _) = wl_region::req::add(GUEST_REGION, x, 0, 1, 1);
+            client.client_conn.read_buf.extend(add);
+        }
+        let (add, _) = wl_region::req::add(GUEST_REGION, 0, 0, 1, 1);
+        let sent = MAX_BATCHES_PER_FLUSH * MAX_MESSAGES_PER_BATCH * add.len();
+        // The batches' output fits one submission, so only the count sends it.
+        assert!(sent < MAX_BYTES_PER_SEND);
+        for _ in 0..batches {
+            assert!(client.handle_msgs(Direction::ClientToHost).await);
+        }
+
+        host_peer
+            .set_nonblocking(true)
+            .expect("a non-blocking host peer");
+        let mut received = vec![0u8; 8 * 4096];
+        let len = (&host_peer)
+            .read(&mut received)
+            .expect("the host has the first batches");
+        assert_eq!(len, sent);
     }
 
     /// A VirtWL transaction carries at most 28 descriptors, so a batch that

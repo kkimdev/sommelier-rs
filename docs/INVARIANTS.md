@@ -71,15 +71,21 @@ always consumed; a configuration problem never stops the proxy) is owned by
   batches is coalesced too: a fairness batch costs no send of its own.
   The proxy keeps what the batches produce for each peer, in the order a
   send per batch would have sent it, and sends a submission once a later
-  message no longer fits it, and the rest before it waits for input and
-  when the session ends ([Fair dispatch](DESIGN.md#fair-dispatch)). So
-  each peer gets the same bytes and descriptors in the same order, and
-  output waits at most until what the proxy has received is dispatched.
+  message no longer fits it, and the rest before a batch in the other
+  direction, before a fifth batch in the same one
+  (`MAX_BATCHES_PER_FLUSH`), before it waits for input and when the
+  session ends ([Fair dispatch](DESIGN.md#fair-dispatch)). So each peer
+  gets the same bytes and descriptors in the same order, and a batch's
+  output waits behind no batch in the other direction, and behind at
+  most three more in its own: a key event never waits behind the rest of
+  a guest's render burst.
   A send fails only when its peer is gone, which ends the session as a
   lost transport (see [Wire messages](#wire-messages)); by then the proxy
   may have dispatched batches after the one whose output failed.
   Tests: `a_burst_of_batches_reaches_the_host_in_one_submission`,
-  `kept_submissions_wait_for_the_messages_that_fill_them`.
+  `kept_submissions_wait_for_the_messages_that_fill_them`,
+  `a_host_batchs_output_reaches_the_guest_before_the_next_guest_batch`,
+  `a_one_way_stream_sends_every_few_batches`.
 - **A submission carries at most 28 descriptors and ends at a message
   boundary.** 28 is the VirtWL transaction limit
   (`VIRTWL_SEND_MAX_ALLOCS`) and libwayland's `MAX_FDS_OUT`, and

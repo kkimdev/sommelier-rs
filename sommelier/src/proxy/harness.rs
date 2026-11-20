@@ -358,7 +358,10 @@ impl Session {
     /// Queue `messages` on the proxy's connection to their sender and
     /// dispatch them as `Client::run` does, up to a guest request that
     /// waits for a fence ([`Self::resume`]); returns whether the session
-    /// goes on.
+    /// goes on. It dispatches one direction and then sends everything, so
+    /// it never interleaves directions, and cannot show when a batch's
+    /// output leaves relative to the other peer's batches; the tests of
+    /// that drive `Client::handle_msgs` directly.
     async fn send(
         &mut self,
         direction: Direction,
