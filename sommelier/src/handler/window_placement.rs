@@ -58,10 +58,13 @@ limitations under the License.
 //! and in `zaura_toplevel.origin_change`. So while placement is on, every
 //! XDG toplevel gets a host-only Aura toplevel in screen coordinates when
 //! it is created, and this module translates its configures for the guest.
-//! Its per-connection state is [`crate::state::WindowPlacementState`].
+//! Its per-connection state is [`crate::state::WindowPlacement`].
 //!
 //! Protocol handlers translate wire events and call in here, one entry
-//! point per event. Each does nothing while placement is off, the default:
+//! point per event. Placement is on for the whole life of a connection or
+//! not at all, so each step takes the connection's placement state
+//! (`Context::placement_mut`) where it needs it, and does nothing while
+//! placement is off, the default:
 //!
 //! | Caller | Entry point |
 //! | :--- | :--- |
@@ -90,9 +93,10 @@ use crate::protocols::aura_shell::zaura_toplevel::{
 };
 use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
 use crate::state::{
-    Context, HostId, InternalCallback, OutputState, Placement, PlacementState, PlacementStep, Point,
+    Context, GuestId, HostId, InternalCallback, OutputState, Placement, PlacementStep, Point,
 };
-use crate::window_layout::{Rect, WindowLayoutAction};
+use crate::warn_once::WarnOnce;
+use crate::window_layout::{NormalizedRect, Rect};
 use crate::wire::queue_or_drop;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -116,22 +120,22 @@ const _: () = assert!(
 /// Whether [`warn_if_shell_cannot_place`] has warned. Every client
 /// connection binds the same host shell, so one warning per process says
 /// it all.
-static OLD_SHELL_WARNED: AtomicBool = AtomicBool::new(false);
+static OLD_SHELL: WarnOnce = WarnOnce::new();
 
 /// What this process has seen of Exo's `set_parent` moves. Exo honours
 /// `set_parent` for every window or for none, so one log per process
 /// serves every connection.
 static MOVES: MoveLog = MoveLog::new();
 
-/// Warn, once per `warned` (the process's [`OLD_SHELL_WARNED`], or a
-/// test's own flag), that placement is disabled because the host
-/// `zaura_shell` is older than [`PLACEMENT_SHELL_SINCE`].
+/// Warn, once per `once` (the process's [`OLD_SHELL`], or a test's own),
+/// that placement is disabled because the host `zaura_shell` is older than
+/// [`PLACEMENT_SHELL_SINCE`].
 ///
 /// # Returns
 ///
 /// Whether this call logged the warning.
-fn warn_if_shell_cannot_place(warned: &AtomicBool, shell_version: u32) -> bool {
-    if shell_version >= PLACEMENT_SHELL_SINCE || warned.swap(true, Ordering::Relaxed) {
+fn warn_if_shell_cannot_place(once: &WarnOnce, shell_version: u32) -> bool {
+    if shell_version >= PLACEMENT_SHELL_SINCE || !once.first() {
         return false;
     }
     log::warn!(
@@ -156,14 +160,14 @@ struct MoveLog {
     /// Whether a move has put a window at its target.
     placed: AtomicBool,
     /// Whether an ignored move has been warned about.
-    warned: AtomicBool,
+    warned: WarnOnce,
 }
 
 impl MoveLog {
     const fn new() -> Self {
         Self {
             placed: AtomicBool::new(false),
-            warned: AtomicBool::new(false),
+            warned: WarnOnce::new(),
         }
     }
 
@@ -190,11 +194,7 @@ impl MoveLog {
             );
             return log::Level::Info;
         }
-        let level = if self.warned.swap(true, Ordering::Relaxed) {
-            log::Level::Debug
-        } else {
-            log::Level::Warn
-        };
+        let level = self.warned.level();
         log::log!(
             level,
             "Window placement did not move xdg_toplevel {}: Exo ignored \
@@ -209,21 +209,6 @@ impl MoveLog {
     }
 }
 
-/// The connection's placement state. Only paths that run while placement
-/// is on call this.
-fn state(ctx: &Context) -> &PlacementState {
-    ctx.window_placement
-        .active()
-        .expect("placement is on for this connection")
-}
-
-/// [`state`], mutably.
-fn state_mut(ctx: &mut Context) -> &mut PlacementState {
-    ctx.window_placement
-        .active_mut()
-        .expect("placement is on for this connection")
-}
-
 /// Set up what placement needs from a newly bound `zaura_shell` of
 /// `shell_version`.
 ///
@@ -232,7 +217,7 @@ fn state_mut(ctx: &mut Context) -> &mut PlacementState {
 /// could not do yet: every live output's Aura output, and every recorded
 /// toplevel's Aura toplevel.
 pub(crate) fn shell_bound(ctx: &mut Context, shell_version: u32) {
-    if !ctx.window_placement.is_active() {
+    if ctx.placement().is_none() {
         return;
     }
     for output_host_id in ctx.outputs.live_outputs() {
@@ -241,14 +226,14 @@ pub(crate) fn shell_bound(ctx: &mut Context, shell_version: u32) {
     for (xdg_toplevel_guest_id, _) in ctx.xdg_roles.toplevels() {
         attach_toplevel(ctx, xdg_toplevel_guest_id);
     }
-    warn_if_shell_cannot_place(&OLD_SHELL_WARNED, shell_version);
+    warn_if_shell_cannot_place(&OLD_SHELL, shell_version);
 }
 
 /// Create the host-only Aura output of a newly bound guest `wl_output`,
 /// whose scale factors and insets the work area needs. A missing shell is
 /// retried by [`shell_bound`].
 pub(crate) fn output_bound(ctx: &mut Context, output_host_id: u32) {
-    if ctx.window_placement.is_active() {
+    if ctx.placement().is_some() {
         aura_objects::ensure_zaura_output(ctx, output_host_id);
     }
 }
@@ -314,14 +299,14 @@ fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedTo
     })
 }
 
-/// Resolve the screen bounds for a placement action on an output.
+/// Resolve the screen bounds of a bound rectangle on an output.
 ///
-/// The action's normalized rectangle is mapped into the output work area
-/// by [`crate::window_layout::NormalizedRect::to_work_area_bounds`], which
-/// owns the rounding rule. Returns `None` when the output has no usable
-/// work area or the rectangle cannot be represented in it.
-fn bounds_for_action(action: WindowLayoutAction, output: OutputState) -> Option<Rect> {
-    action.rect().to_work_area_bounds(output.work_area()?)
+/// The rectangle is mapped into the output work area by
+/// [`NormalizedRect::to_work_area_bounds`], which owns the rounding rule.
+/// Returns `None` when the output has no usable work area or the rectangle
+/// cannot be represented in it.
+fn bounds_for(rect: NormalizedRect, output: OutputState) -> Option<Rect> {
+    rect.to_work_area_bounds(output.work_area()?)
 }
 
 /// What one placement moves, and where.
@@ -337,12 +322,11 @@ struct PlacementTarget {
 }
 
 /// Resolve the toplevel that `host_keyboard_id` focuses, the output it
-/// entered last, and the bounds `action` maps to in that output's work
-/// area.
+/// entered last, and the bounds `rect` maps to in that output's work area.
 fn resolve_target(
     ctx: &Context,
     host_keyboard_id: HostId,
-    action: WindowLayoutAction,
+    rect: NormalizedRect,
 ) -> Result<PlacementTarget, PlacementSkip> {
     let FocusedToplevel {
         xdg_toplevel_guest_id,
@@ -353,7 +337,7 @@ fn resolve_target(
         .get_host_id(wl_surface_guest_id)
         .and_then(|host_surface_id| ctx.outputs.for_surface(host_surface_id))
         .ok_or(PlacementSkip::NoUsableOutput)?;
-    let bounds = bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
+    let bounds = bounds_for(rect, output).ok_or(PlacementSkip::RectNotRepresentable)?;
     Ok(PlacementTarget {
         xdg_toplevel_guest_id,
         wl_surface_guest_id,
@@ -373,7 +357,7 @@ fn resolve_target(
 /// # Arguments
 ///
 /// * `host_keyboard_id` - the keyboard whose chord was consumed.
-/// * `action` - the placement bound to the chord.
+/// * `rect` - where the chord's binding places the window.
 ///
 /// # Errors
 ///
@@ -383,10 +367,10 @@ fn resolve_target(
 pub(crate) fn place_focused(
     ctx: &mut Context,
     host_keyboard_id: HostId,
-    action: WindowLayoutAction,
+    rect: NormalizedRect,
 ) -> Result<(), PlacementSkip> {
     debug_assert!(
-        ctx.window_placement.is_active(),
+        ctx.placement().is_some(),
         "classify_key yields placement actions only while placement is on"
     );
     let PlacementTarget {
@@ -394,7 +378,7 @@ pub(crate) fn place_focused(
         wl_surface_guest_id,
         output_host_id,
         bounds,
-    } = resolve_target(ctx, host_keyboard_id, action)?;
+    } = resolve_target(ctx, host_keyboard_id, rect)?;
     // `XdgRoles` records only mapped toplevels, and every path that unmaps
     // one removes its record first, so the lookup cannot miss.
     let host_xdg_toplevel_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id);
@@ -422,7 +406,7 @@ pub(crate) fn place_focused(
     );
     log::info!(
         "window layout {:?}: xdg_toplevel={} bounds=({}, {}, {}, {}) output={}",
-        action,
+        rect,
         xdg_toplevel_guest_id,
         bounds.x,
         bounds.y,
@@ -448,14 +432,16 @@ fn start_step(
             zaura_toplevel: aura_toplevel,
         },
     );
-    state_mut(ctx).start(
-        xdg_toplevel,
-        Placement {
-            barrier: barrier.0,
-            target,
-            step,
-        },
-    );
+    if let Some(placement) = ctx.placement_mut() {
+        placement.start(
+            GuestId(xdg_toplevel),
+            Placement {
+                barrier,
+                target,
+                step,
+            },
+        );
+    }
 }
 
 /// Handle `wl_callback.done` of a placement barrier
@@ -463,15 +449,16 @@ fn start_step(
 /// has already retired: take the next step of the placement it ends,
 /// unless a newer placement replaced it or its toplevel ended.
 pub(crate) fn complete_barrier(ctx: &mut Context, callback_host_id: u32, zaura_toplevel: u32) {
-    let Some(state) = ctx.window_placement.active_mut() else {
+    let Some(state) = ctx.placement_mut() else {
         return;
     };
-    let Some(xdg_toplevel) = state.xdg_toplevel(zaura_toplevel) else {
+    let Some(xdg_toplevel) = state.xdg_toplevel(HostId(zaura_toplevel)) else {
         return;
     };
-    let Some(placement) = state.take_placement(xdg_toplevel, callback_host_id) else {
+    let Some(placement) = state.take_placement(xdg_toplevel, HostId(callback_host_id)) else {
         return;
     };
+    let xdg_toplevel = xdg_toplevel.0;
     match placement.step {
         PlacementStep::Restore => {
             move_window(ctx, xdg_toplevel, zaura_toplevel, placement.target);
@@ -569,7 +556,10 @@ fn client_size(target: Rect, origin: Point) -> (i32, i32) {
 /// The second step: move the window with `set_parent` from the origin Exo
 /// reported once it was restored, and ask for its new origin.
 fn move_window(ctx: &mut Context, xdg_toplevel: u32, aura_toplevel: u32, target: Rect) {
-    let Some(origin) = state(ctx).origin(xdg_toplevel) else {
+    let Some(origin) = ctx
+        .placement()
+        .and_then(|state| state.origin(GuestId(xdg_toplevel)))
+    else {
         log::info!(
             "Window placement did not move xdg_toplevel {}: Exo reported no origin for it",
             xdg_toplevel
@@ -628,8 +618,10 @@ fn move_window(ctx: &mut Context, xdg_toplevel: u32, aura_toplevel: u32, target:
 /// guest's ack of that serial reaches Exo, which accepts an ack of a
 /// serial it already had acked.
 fn resize_window(ctx: &mut Context, xdg_toplevel: u32, target: Rect, from: Point, offset: Point) {
-    let state = state(ctx);
-    let Some(origin) = state.origin(xdg_toplevel) else {
+    let Some(state) = ctx.placement() else {
+        return;
+    };
+    let Some(origin) = state.origin(GuestId(xdg_toplevel)) else {
         return;
     };
     match MoveOutcome::of(target, from, origin) {
@@ -641,7 +633,7 @@ fn resize_window(ctx: &mut Context, xdg_toplevel: u32, target: Rect, from: Point
         MoveOutcome::AlreadyPlaced | MoveOutcome::MovedElsewhere => {}
     }
     let Some((states, serial)) = state
-        .last_configure(xdg_toplevel)
+        .last_configure(GuestId(xdg_toplevel))
         .map(|(states, serial)| (states.to_vec(), serial))
     else {
         return;
@@ -686,9 +678,11 @@ fn resize_window(ctx: &mut Context, xdg_toplevel: u32, target: Rect, from: Point
 /// The Aura toplevel, or `None` while placement is off or the host has no
 /// `zaura_shell` new enough for placement.
 pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Option<u32> {
-    let state = ctx.window_placement.active()?;
-    if let Some(aura_toplevel) = state.aura_toplevel(xdg_toplevel_guest_id) {
-        return Some(aura_toplevel);
+    if let Some(aura_toplevel) = ctx
+        .placement()?
+        .aura_toplevel(GuestId(xdg_toplevel_guest_id))
+    {
+        return Some(aura_toplevel.0);
     }
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
     if ctx
@@ -702,7 +696,8 @@ pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> 
         .push(zaura_toplevel::req::set_supports_screen_coordinates(
             aura_toplevel,
         ));
-    state_mut(ctx).attach(xdg_toplevel_guest_id, aura_toplevel);
+    ctx.placement_mut()?
+        .attach(GuestId(xdg_toplevel_guest_id), HostId(aura_toplevel));
     Some(aura_toplevel)
 }
 
@@ -712,11 +707,11 @@ pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> 
 /// before the role's own destructor is queued. A barrier still in flight
 /// stays pending until its `done`, which then finds nothing to continue.
 pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
-    let Some(state) = ctx.window_placement.active_mut() else {
+    let Some(state) = ctx.placement_mut() else {
         return;
     };
-    if let Some(aura_toplevel) = state.take(xdg_toplevel_guest_id) {
-        aura_objects::release(ctx, AuraChild::TOPLEVEL, aura_toplevel);
+    if let Some(aura_toplevel) = state.take(GuestId(xdg_toplevel_guest_id)) {
+        aura_objects::release(ctx, AuraChild::TOPLEVEL, aura_toplevel.0);
     }
 }
 
@@ -757,16 +752,15 @@ pub(crate) fn translate_aura_configure(
     states: &[u8],
 ) {
     let Some(xdg_toplevel) = ctx
-        .window_placement
-        .active()
-        .and_then(|state| state.xdg_toplevel(zaura_toplevel_host_id))
+        .placement()
+        .and_then(|state| state.xdg_toplevel(HostId(zaura_toplevel_host_id)))
     else {
         return;
     };
     log::debug!(
         "zaura_toplevel.configure host={} guest={} bounds={}x{} origin=({}, {})",
         zaura_toplevel_host_id,
-        xdg_toplevel,
+        xdg_toplevel.0,
         width,
         height,
         x,
@@ -776,7 +770,7 @@ pub(crate) fn translate_aura_configure(
     // xdg_toplevel client understands are delivered.
     let guest_version = ctx
         .shadow_table
-        .guest_object_version(xdg_toplevel)
+        .guest_object_version(xdg_toplevel.0)
         .unwrap_or(1);
     let states = guest_xdg_toplevel_states(states, guest_version);
     // The states array is host data, so its encoder is fallible. It is a
@@ -784,10 +778,12 @@ pub(crate) fn translate_aura_configure(
     // a failure means corrupted state and is only logged.
     queue_or_drop(
         &mut ctx.host_to_client_queue,
-        xdg_toplevel::evt::configure(xdg_toplevel, width, height, &states),
-        format_args!("the configure of xdg_toplevel {xdg_toplevel}"),
+        xdg_toplevel::evt::configure(xdg_toplevel.0, width, height, &states),
+        format_args!("the configure of xdg_toplevel {}", xdg_toplevel.0),
     );
-    state_mut(ctx).configured(xdg_toplevel, (x, y), states);
+    if let Some(state) = ctx.placement_mut() {
+        state.configured(xdg_toplevel, (x, y), states);
+    }
 }
 
 /// Record a host `zaura_toplevel.origin_change`: the window moved without
@@ -799,10 +795,10 @@ pub(crate) fn origin_changed(ctx: &mut Context, zaura_toplevel_host_id: u32, x: 
         x,
         y
     );
-    let Some(state) = ctx.window_placement.active_mut() else {
+    let Some(state) = ctx.placement_mut() else {
         return;
     };
-    if let Some(xdg_toplevel) = state.xdg_toplevel(zaura_toplevel_host_id) {
+    if let Some(xdg_toplevel) = state.xdg_toplevel(HostId(zaura_toplevel_host_id)) {
         state.moved(xdg_toplevel, (x, y));
     }
 }
@@ -813,8 +809,8 @@ pub(crate) fn surface_configured(ctx: &mut Context, guest_xdg_surface_id: u32, s
     let Some(xdg_toplevel) = ctx.xdg_roles.toplevel_of_xdg_surface(guest_xdg_surface_id) else {
         return;
     };
-    if let Some(state) = ctx.window_placement.active_mut() {
-        state.serial_sent(xdg_toplevel, serial);
+    if let Some(state) = ctx.placement_mut() {
+        state.serial_sent(GuestId(xdg_toplevel), serial);
     }
 }
 
@@ -881,11 +877,19 @@ mod fixture {
         ctx
     }
 
-    /// Place the focused toplevel with `action`; returns what it sends the
-    /// host.
-    pub(super) fn place(ctx: &mut Context, action: WindowLayoutAction) -> Vec<(u32, AnyRequest)> {
+    /// The named preset `name`.
+    pub(super) fn preset(name: &str) -> NormalizedRect {
+        NormalizedRect::preset(name).unwrap_or_else(|| panic!("no preset {name:?}"))
+    }
+
+    /// Place the focused toplevel at the named preset `name`; returns what
+    /// it sends the host.
+    pub(super) fn place(ctx: &mut Context, name: &str) -> Vec<(u32, AnyRequest)> {
         ctx.client_to_host_queue.clear();
-        assert_eq!(place_focused(ctx, HostId(KEYBOARD.host), action), Ok(()));
+        assert_eq!(
+            place_focused(ctx, HostId(KEYBOARD.host), preset(name)),
+            Ok(())
+        );
         host_requests(ctx)
     }
 
@@ -940,11 +944,11 @@ mod fixture {
         )
     }
 
-    /// Deliver the host `wl_callback.done` of `callback_host_id`.
-    pub(super) fn done(ctx: &mut Context, callback_host_id: u32) {
+    /// Deliver the host `wl_callback.done` of `callback`.
+    pub(super) fn done(ctx: &mut Context, callback: HostId) {
         use crate::protocols::wayland::wl_callback::WlCallbackHandler;
 
-        ctx.last_sender_id = callback_host_id;
+        ctx.last_sender_id = callback.0;
         assert_eq!(
             crate::handler::callback::CallbackHandler.on_done(ctx, 0),
             Action::Drop
@@ -997,7 +1001,7 @@ mod fixture {
 
     /// The placement in flight for [`TOPLEVEL`].
     pub(super) fn in_flight(ctx: &Context) -> Option<Placement> {
-        ctx.window_placement.active()?.placement(TOPLEVEL.guest)
+        ctx.placement()?.placement(GuestId(TOPLEVEL.guest))
     }
 
     /// A whole proxy session for placement tests, with the objects
@@ -1182,42 +1186,38 @@ mod tests {
 
     #[test]
     fn grid_bounds_use_two_by_two_work_area_cells() {
-        use WindowLayoutAction::{
-            Bottom, BottomLeft, BottomRight, Fullscreen, Left, Right, Top, TopLeft, TopRight,
-        };
-        for (action, bounds) in [
-            (TopLeft, Rect::new(0, 0, 1920, 1080)),
-            (Top, Rect::new(0, 0, 3840, 1080)),
-            (TopRight, Rect::new(1920, 0, 1920, 1080)),
-            (Left, Rect::new(0, 0, 1920, 2160)),
-            (Fullscreen, Rect::new(0, 0, 3840, 2160)),
-            (BottomLeft, Rect::new(0, 1080, 1920, 1080)),
-            (Bottom, Rect::new(0, 1080, 3840, 1080)),
-            (BottomRight, Rect::new(1920, 1080, 1920, 1080)),
-            (Right, Rect::new(1920, 0, 1920, 2160)),
+        for (name, bounds) in [
+            ("top-left", Rect::new(0, 0, 1920, 1080)),
+            ("top", Rect::new(0, 0, 3840, 1080)),
+            ("top-right", Rect::new(1920, 0, 1920, 1080)),
+            ("left", Rect::new(0, 0, 1920, 2160)),
+            ("fullscreen", Rect::new(0, 0, 3840, 2160)),
+            ("bottom-left", Rect::new(0, 1080, 1920, 1080)),
+            ("bottom", Rect::new(0, 1080, 3840, 1080)),
+            ("bottom-right", Rect::new(1920, 1080, 1920, 1080)),
+            ("right", Rect::new(1920, 0, 1920, 2160)),
         ] {
             assert_eq!(
-                bounds_for_action(action, output(0, (3840, 2160))),
+                bounds_for(preset(name), output(0, (3840, 2160))),
                 Some(bounds),
-                "{action:?}"
+                "{name}"
             );
         }
     }
 
     #[test]
     fn grid_bounds_reject_coordinate_overflow() {
-        use WindowLayoutAction::{BottomRight, Fullscreen, Right, TopLeft, TopRight};
         let far_right = output(i32::MAX, (4, 4));
-        for action in [TopRight, BottomRight, Right] {
-            assert_eq!(bounds_for_action(action, far_right), None, "{action:?}");
+        for name in ["top-right", "bottom-right", "right"] {
+            assert_eq!(bounds_for(preset(name), far_right), None, "{name}");
         }
         assert_eq!(
-            bounds_for_action(TopLeft, output(0, (1, 1))),
+            bounds_for(preset("top-left"), output(0, (1, 1))),
             None,
             "split layouts must never emit zero-sized bounds"
         );
         assert_eq!(
-            bounds_for_action(Fullscreen, output(0, (1, 1))),
+            bounds_for(preset("fullscreen"), output(0, (1, 1))),
             Some(Rect::new(0, 0, 1, 1))
         );
     }
@@ -1238,8 +1238,8 @@ mod tests {
         let external = dock(&mut ctx, 1, 11, 31, EXTERNAL);
         // Where placing the toplevel on the right half puts it.
         let place_right = |ctx: &mut Context| {
-            let target = resolve_target(ctx, HostId(KEYBOARD.host), WindowLayoutAction::Right)
-                .expect("a target");
+            let target =
+                resolve_target(ctx, HostId(KEYBOARD.host), preset("right")).expect("a target");
             (target.bounds, target.output_host_id)
         };
 
@@ -1270,14 +1270,11 @@ mod tests {
     fn an_old_shell_is_reported_once_per_process() {
         // The test's own flag: the process's belongs to the sessions that
         // other tests run in parallel.
-        let warned = AtomicBool::new(false);
-        assert!(!warn_if_shell_cannot_place(&warned, PLACEMENT_SHELL_SINCE));
-        assert!(warn_if_shell_cannot_place(
-            &warned,
-            PLACEMENT_SHELL_SINCE - 1
-        ));
+        let once = WarnOnce::new();
+        assert!(!warn_if_shell_cannot_place(&once, PLACEMENT_SHELL_SINCE));
+        assert!(warn_if_shell_cannot_place(&once, PLACEMENT_SHELL_SINCE - 1));
         assert!(!warn_if_shell_cannot_place(
-            &warned,
+            &once,
             PLACEMENT_SHELL_SINCE - 1
         ));
     }
@@ -1359,7 +1356,7 @@ mod tests {
         let moves = MoveLog::new();
         moves.placed();
         assert_eq!(moves.ignored(1, (5, 0)), Info);
-        assert!(!moves.warned.load(Ordering::Relaxed));
+        assert!(!moves.warned.logged());
     }
 
     // ── The placement on the wire ─────────────────────────────────────────
@@ -1671,9 +1668,9 @@ mod tests {
         let aura_toplevel = aura_toplevel(&mut ctx);
         aura_configure(&mut ctx, aura_toplevel, (100, 100), (640, 480), &[]);
         ctx.host_to_client_queue.clear();
-        place(&mut ctx, WindowLayoutAction::TopLeft);
+        place(&mut ctx, "top-left");
         let older = in_flight(&ctx).expect("a placement").barrier;
-        place(&mut ctx, WindowLayoutAction::Right);
+        place(&mut ctx, "right");
         let newer = in_flight(&ctx).expect("a placement");
         assert_eq!(newer.target, Rect::new(1920, 0, 1920, 2160));
 
@@ -1710,7 +1707,7 @@ mod tests {
         let mut ctx = focused_ctx();
         let aura_toplevel = aura_toplevel(&mut ctx);
         aura_configure(&mut ctx, aura_toplevel, (100, 100), (640, 480), &[]);
-        place(&mut ctx, WindowLayoutAction::TopLeft);
+        place(&mut ctx, "top-left");
         let barrier = in_flight(&ctx).expect("a placement").barrier;
         release_toplevel(&mut ctx, TOPLEVEL.guest);
         ctx.client_to_host_queue.clear();
@@ -1761,9 +1758,8 @@ mod tests {
         release_toplevel(&mut ctx, TOPLEVEL.guest);
         assert!(ctx.client_to_host_queue.is_empty());
         assert_eq!(
-            ctx.window_placement
-                .active()
-                .and_then(|state| state.aura_toplevel(TOPLEVEL.guest)),
+            ctx.placement()
+                .and_then(|state| state.aura_toplevel(GuestId(TOPLEVEL.guest))),
             None
         );
         assert_eq!(ctx.shadow_table.get_host_interface(aura_id), None);
@@ -1801,10 +1797,9 @@ mod tests {
             Some(SURFACE.guest)
         );
         assert_eq!(
-            ctx.window_placement
-                .active()
-                .and_then(|state| state.aura_toplevel(second_toplevel)),
-            Some(second_aura)
+            ctx.placement()
+                .and_then(|state| state.aura_toplevel(GuestId(second_toplevel))),
+            Some(HostId(second_aura))
         );
     }
 
@@ -1845,9 +1840,8 @@ mod tests {
             Action::Drop
         );
         assert_eq!(
-            ctx.window_placement
-                .active()
-                .and_then(|state| state.aura_toplevel(TOPLEVEL.guest)),
+            ctx.placement()
+                .and_then(|state| state.aura_toplevel(GuestId(TOPLEVEL.guest))),
             None
         );
         // Child-first: the Aura extension is released before its xdg role.
@@ -1896,9 +1890,13 @@ mod tests {
                 "v{guest_version} {states:?}"
             );
             // A placement repeats what the guest got.
-            let state = ctx.window_placement.active().expect("placement on");
-            assert_eq!(state.origin(TOPLEVEL.guest), Some((10, 20)));
-            assert_eq!(state.last_configure(TOPLEVEL.guest), None, "no serial yet");
+            let state = ctx.placement().expect("placement on");
+            assert_eq!(state.origin(GuestId(TOPLEVEL.guest)), Some((10, 20)));
+            assert_eq!(
+                state.last_configure(GuestId(TOPLEVEL.guest)),
+                None,
+                "no serial yet"
+            );
         }
     }
 
@@ -1924,9 +1922,8 @@ mod tests {
         );
         assert!(ctx.host_to_client_queue.is_empty());
         assert_eq!(
-            ctx.window_placement
-                .active()
-                .and_then(|state| state.origin(TOPLEVEL.guest)),
+            ctx.placement()
+                .and_then(|state| state.origin(GuestId(TOPLEVEL.guest))),
             Some((123, 456))
         );
     }
@@ -1942,7 +1939,7 @@ mod tests {
         use crate::protocols::xdg_shell::xdg_wm_base;
         use crate::proxy::harness::Session;
 
-        let placement = PlacementConfig::for_test(Vec::new());
+        let placement = PlacementConfig::for_test();
         let mut s = Session::with_context(Context::with_placement_for_test(placement));
         let registry = s.registry().await;
 

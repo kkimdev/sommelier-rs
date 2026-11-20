@@ -143,7 +143,7 @@ impl GtkSurface1Handler for GtkShellHandler {
         else {
             return Action::Drop;
         };
-        let application_id = native_wayland_app_id(&ctx.vm_identifier, application_id);
+        let application_id = native_wayland_app_id(&ctx.settings().vm_id, application_id);
         aura_objects::set_application_id(ctx, wl_surface_id, &application_id);
         Action::Drop
     }
@@ -191,9 +191,8 @@ mod tests {
 
     /// [`setup_ctx`], but [`SURFACE`] has no role.
     fn roleless_ctx() -> Context {
-        let mut ctx = Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::for_test(Vec::new()),
-        );
+        let mut ctx =
+            Context::with_placement_for_test(crate::placement_config::PlacementConfig::for_test());
         add_surface(&mut ctx);
         bind_shell(&mut ctx);
         add_gtk_shell(&mut ctx);
@@ -201,9 +200,7 @@ mod tests {
     }
 
     fn setup_ctx() -> Context {
-        setup_ctx_with(crate::placement_config::PlacementConfig::for_test(
-            Vec::new(),
-        ))
+        setup_ctx_with(crate::placement_config::PlacementConfig::for_test())
     }
 
     fn nullable_string(message: &[u8]) -> Option<String> {
@@ -316,7 +313,7 @@ mod tests {
                 Some(
                     format!(
                         "org.chromium.guest_os.{}.wayland.com.example.Terminal",
-                        ctx.vm_identifier
+                        ctx.settings().vm_id
                     )
                     .as_str()
                 ),

@@ -16,8 +16,6 @@ limitations under the License.
 
 #![deny(clippy::debug_assert_with_mut_call)]
 
-use std::sync::Arc;
-
 use clap::Parser;
 
 mod accelerator;
@@ -28,6 +26,7 @@ mod handler;
 mod ime;
 mod placement_config;
 mod proxy;
+mod settings;
 #[cfg(test)]
 mod sim;
 mod state;
@@ -35,6 +34,7 @@ mod state;
 mod test_support;
 mod virtwl;
 mod virtwl_channel;
+mod warn_once;
 mod window_layout;
 mod wire;
 
@@ -80,75 +80,20 @@ mod protocols {
     include!(concat!(env!("OUT_DIR"), "/protocol_routing.rs"));
 }
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// Connect to a local compositor at PATH, used for debug only
-    #[arg(long)]
-    local_compositor: Option<String>,
-
-    /// Enable host GPU buffer allocation through VirtWL linux-dmabuf.
-    ///
-    /// Guest wl_shm buffers are copied into host-backed PRIME buffers. If the
-    /// kernel does not expose VirtWL dma-buf allocation, the proxy falls back
-    /// to its validated shared-memory path.
-    #[arg(long, default_value_t = false)]
-    gpu_accel: bool,
-
-    /// Enable XDG Decoration support
-    #[arg(long)]
-    xdg_decoration: bool,
-
-    /// Use virtio-wayland channel at PATH (defaults to /dev/wl0 if --local-compositor is not specified)
-    #[arg(long)]
-    virtio_wl: Option<String>,
-
-    /// The display name (e.g. wayland-proxy-0)
-    #[arg(default_value = "wayland-proxy-0")]
-    display: String,
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let env = env_logger::Env::default().default_filter_or("info");
     env_logger::Builder::from_env(env).init();
 
-    let args = Args::parse();
-
-    let local_compositor = args.local_compositor;
-    let gpu_accel = args.gpu_accel;
-    let xdg_decoration = args.xdg_decoration;
-    let mut virtio_wl = args.virtio_wl;
+    // The only reads of the command line and the environment.
+    let settings =
+        settings::Settings::resolve(settings::Cli::parse(), |name| std::env::var_os(name))
+            .unwrap_or_else(|error| {
+                log::error!("{error}");
+                std::process::exit(1);
+            });
     raise_open_file_limit();
-    // Never fatal: a configuration problem is logged once and leaves
-    // placement off, because this proxy serves every app.
-    let placement = Arc::new(placement_config::PlacementConfig::from_environment());
-    let vm_identifier = state::vm_identifier_from_environment();
-    let virtgpu = allocator::VirtGpuNode::from_environment();
-    let wheel_from_touchpad = client_kind::WheelFromTouchpad::from_environment();
-
-    if local_compositor.is_none() && virtio_wl.is_none() {
-        virtio_wl = Some("/dev/wl0".to_string());
-    }
-
-    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|error| {
-        log::error!("Cannot read XDG_RUNTIME_DIR, which holds the Wayland socket: {error}");
-        std::process::exit(1);
-    });
-    let socket_path = format!("{}/{}", xdg_runtime, args.display);
-
-    proxy::run(
-        &socket_path,
-        local_compositor,
-        gpu_accel,
-        xdg_decoration,
-        virtio_wl,
-        vm_identifier,
-        virtgpu,
-        placement,
-        wheel_from_touchpad,
-    )
-    .await;
+    proxy::run(settings).await;
 }
 
 /// Raise the soft open-file limit to the hard limit.

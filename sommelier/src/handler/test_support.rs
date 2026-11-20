@@ -80,7 +80,7 @@ pub(crate) fn toplevel_ctx_with(placement: PlacementConfig) -> Context {
 
 /// [`toplevel_ctx_with`] placement off, the default.
 pub(crate) fn toplevel_ctx() -> Context {
-    toplevel_ctx_with(PlacementConfig::for_test(Vec::new()))
+    toplevel_ctx_with(PlacementConfig::for_test())
 }
 
 /// The lifecycle of render buffer `guest_id`, while it has one.

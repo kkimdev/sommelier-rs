@@ -16,16 +16,18 @@ limitations under the License.
 
 //! One connection's window placement state.
 //!
-//! [`WindowPlacementState`] is `Off`, the default, which holds nothing, or
-//! `Active` when the bindings file was valid as the connection started
-//! (`crate::placement_config::PlacementConfig::is_active`), decided once
-//! per connection.
-//! [`PlacementState`] is the single owner of what placement knows of each
+//! [`WindowPlacement`] exists only while placement is on for a connection,
+//! which is decided once, as it connects: `Context` holds an `Option` of
+//! it, and placement off is its absence, which holds nothing. It holds the
+//! process's bindings ([`PlacementConfig`], live through reloads) and
+//! [`PlacementState`], the single owner of what placement knows of each
 //! XDG toplevel: its host-only Aura toplevel, where Exo last said the
 //! window is, the configure the guest last got, and the placement in
-//! flight. Its maps are private, so a handler cannot update one side of the
-//! toplevel ↔ Aura toplevel association, or retire a toplevel, without the
-//! matching cleanup. An object's end reaches it only through
+//! flight. Its maps are private and keyed by [`GuestId`] and [`HostId`],
+//! so a handler can neither update one side of the toplevel ↔ Aura
+//! toplevel association, or retire a toplevel, without the matching
+//! cleanup, nor look a toplevel up by a host ID. An object's end reaches
+//! it only through
 //! `crate::handler::window_placement::release_toplevel` (see
 //! `crate::state::lifecycle`).
 //!
@@ -33,65 +35,32 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
-use crate::window_layout::Rect;
+use crate::accelerator::Accelerator;
+use crate::placement_config::PlacementConfig;
+use crate::state::{GuestId, HostId};
+use crate::window_layout::{NormalizedRect, Rect};
 
-/// One connection's window placement state.
+/// One connection's window placement, while it is on.
 #[derive(Debug)]
-pub(crate) enum WindowPlacementState {
-    /// Placement is off: the proxy behaves and sends exactly as it would
-    /// without placement.
-    Off,
-    /// Placement is on.
-    Active(Box<PlacementState>),
+pub(crate) struct WindowPlacement {
+    /// The process's bindings, as the last reload left them.
+    bindings: PlacementConfig,
+    pub(crate) state: PlacementState,
 }
 
-impl WindowPlacementState {
-    /// Create one connection's placement state.
-    ///
-    /// # Arguments
-    ///
-    /// * `active` - `PlacementConfig::is_active`: whether the bindings
-    ///   file is valid.
-    pub(crate) fn new(active: bool) -> Self {
-        if active {
-            Self::Active(Box::default())
-        } else {
-            Self::Off
-        }
+impl WindowPlacement {
+    /// A new connection's placement: on exactly while `bindings` holds a
+    /// valid bindings file.
+    pub(crate) fn connect(bindings: PlacementConfig) -> Option<Self> {
+        bindings.is_active().then(|| Self {
+            bindings,
+            state: PlacementState::default(),
+        })
     }
 
-    /// Return whether placement is on.
-    pub(crate) const fn is_active(&self) -> bool {
-        matches!(self, Self::Active(_))
-    }
-
-    /// The placement state, while placement is on.
-    pub(crate) fn active(&self) -> Option<&PlacementState> {
-        match self {
-            Self::Active(state) => Some(state),
-            Self::Off => None,
-        }
-    }
-
-    /// The placement state, while placement is on.
-    pub(crate) fn active_mut(&mut self) -> Option<&mut PlacementState> {
-        match self {
-            Self::Active(state) => Some(state),
-            Self::Off => None,
-        }
-    }
-
-    /// Panic if placement state outlived its object, checking with `guest`
-    /// and `host_only` as `Context::assert_no_orphans` does.
-    #[cfg(test)]
-    pub(crate) fn assert_no_orphans(
-        &self,
-        guest: &dyn Fn(&str, u32, &str),
-        host_only: &dyn Fn(&str, u32, &str),
-    ) {
-        if let Self::Active(state) = self {
-            state.assert_no_orphans(guest, host_only);
-        }
+    /// Where `chord` places the focused window under the current bindings.
+    pub(crate) fn rect_for(&self, chord: &Accelerator) -> Option<NormalizedRect> {
+        self.bindings.rect_for(chord)
     }
 }
 
@@ -117,7 +86,7 @@ pub(crate) enum PlacementStep {
 pub(crate) struct Placement {
     /// The host `wl_callback` whose `done` starts the next step. Only the
     /// newest placement's barrier does: a newer chord replaces this one.
-    pub(crate) barrier: u32,
+    pub(crate) barrier: HostId,
     /// The window's new bounds in screen DIPs, its frame included.
     pub(crate) target: Rect,
     pub(crate) step: PlacementStep,
@@ -128,7 +97,7 @@ pub(crate) struct Placement {
 struct PlacedToplevel {
     /// The host-only `zaura_toplevel` in screen coordinates, through which
     /// Exo reports the window's origin.
-    aura_toplevel: u32,
+    aura_toplevel: HostId,
     /// The screen origin of the window's client area, from the newest
     /// `zaura_toplevel.configure` or `origin_change`; `None` before the
     /// first.
@@ -144,11 +113,11 @@ struct PlacedToplevel {
 /// One client connection's placement state.
 #[derive(Debug, Default)]
 pub(crate) struct PlacementState {
-    /// Guest xdg_toplevel ID → what placement knows of it.
-    toplevels: BTreeMap<u32, PlacedToplevel>,
-    /// Host zaura_toplevel ID → guest xdg_toplevel ID, the reverse of
+    /// Guest xdg_toplevel → what placement knows of it.
+    toplevels: BTreeMap<GuestId, PlacedToplevel>,
+    /// Host zaura_toplevel → guest xdg_toplevel, the reverse of
     /// `toplevels`' Aura toplevels, which routes host Aura events.
-    xdg_toplevel_by_aura_toplevel: BTreeMap<u32, u32>,
+    xdg_toplevel_by_aura_toplevel: BTreeMap<HostId, GuestId>,
 }
 
 impl PlacementState {
@@ -166,12 +135,12 @@ impl PlacementState {
     }
 
     /// The Aura toplevel of a guest xdg_toplevel.
-    pub(crate) fn aura_toplevel(&self, xdg_toplevel: u32) -> Option<u32> {
+    pub(crate) fn aura_toplevel(&self, xdg_toplevel: GuestId) -> Option<HostId> {
         Some(self.toplevels.get(&xdg_toplevel)?.aura_toplevel)
     }
 
     /// The guest xdg_toplevel of a host Aura toplevel.
-    pub(crate) fn xdg_toplevel(&self, aura_toplevel: u32) -> Option<u32> {
+    pub(crate) fn xdg_toplevel(&self, aura_toplevel: HostId) -> Option<GuestId> {
         self.xdg_toplevel_by_aura_toplevel
             .get(&aura_toplevel)
             .copied()
@@ -179,7 +148,7 @@ impl PlacementState {
 
     /// Record the one-to-one xdg_toplevel ↔ Aura toplevel association of a
     /// newly created Aura toplevel.
-    pub(crate) fn attach(&mut self, xdg_toplevel: u32, aura_toplevel: u32) {
+    pub(crate) fn attach(&mut self, xdg_toplevel: GuestId, aura_toplevel: HostId) {
         debug_assert!(
             !self.toplevels.contains_key(&xdg_toplevel)
                 && !self
@@ -211,7 +180,7 @@ impl PlacementState {
     ///
     /// The Aura toplevel whose host teardown the caller must perform.
     #[must_use = "the returned Aura toplevel ID identifies host teardown work"]
-    pub(crate) fn take(&mut self, xdg_toplevel: u32) -> Option<u32> {
+    pub(crate) fn take(&mut self, xdg_toplevel: GuestId) -> Option<HostId> {
         let placed = self.toplevels.remove(&xdg_toplevel)?;
         self.xdg_toplevel_by_aura_toplevel
             .remove(&placed.aura_toplevel);
@@ -221,7 +190,7 @@ impl PlacementState {
 
     /// Record a `zaura_toplevel.configure` of `xdg_toplevel`: the window's
     /// client-area origin, and the states the guest gets with it.
-    pub(crate) fn configured(&mut self, xdg_toplevel: u32, origin: Point, states: Vec<u8>) {
+    pub(crate) fn configured(&mut self, xdg_toplevel: GuestId, origin: Point, states: Vec<u8>) {
         if let Some(placed) = self.toplevels.get_mut(&xdg_toplevel) {
             placed.origin = Some(origin);
             placed.states = states;
@@ -229,7 +198,7 @@ impl PlacementState {
     }
 
     /// Record a `zaura_toplevel.origin_change` of `xdg_toplevel`.
-    pub(crate) fn moved(&mut self, xdg_toplevel: u32, origin: Point) {
+    pub(crate) fn moved(&mut self, xdg_toplevel: GuestId, origin: Point) {
         if let Some(placed) = self.toplevels.get_mut(&xdg_toplevel) {
             placed.origin = Some(origin);
         }
@@ -237,27 +206,27 @@ impl PlacementState {
 
     /// Record the serial of a host `xdg_surface.configure` of
     /// `xdg_toplevel`'s surface.
-    pub(crate) fn serial_sent(&mut self, xdg_toplevel: u32, serial: u32) {
+    pub(crate) fn serial_sent(&mut self, xdg_toplevel: GuestId, serial: u32) {
         if let Some(placed) = self.toplevels.get_mut(&xdg_toplevel) {
             placed.serial = Some(serial);
         }
     }
 
     /// The window's client-area origin, as Exo last reported it.
-    pub(crate) fn origin(&self, xdg_toplevel: u32) -> Option<Point> {
+    pub(crate) fn origin(&self, xdg_toplevel: GuestId) -> Option<Point> {
         self.toplevels.get(&xdg_toplevel)?.origin
     }
 
     /// The states and serial of the newest configure, which a configure the
     /// proxy makes repeats; `None` before the host's first.
-    pub(crate) fn last_configure(&self, xdg_toplevel: u32) -> Option<(&[u8], u32)> {
+    pub(crate) fn last_configure(&self, xdg_toplevel: GuestId) -> Option<(&[u8], u32)> {
         let placed = self.toplevels.get(&xdg_toplevel)?;
         Some((&placed.states, placed.serial?))
     }
 
     /// Make `placement` the one in flight for `xdg_toplevel`, replacing any
     /// older one.
-    pub(crate) fn start(&mut self, xdg_toplevel: u32, placement: Placement) {
+    pub(crate) fn start(&mut self, xdg_toplevel: GuestId, placement: Placement) {
         if let Some(placed) = self.toplevels.get_mut(&xdg_toplevel) {
             placed.placement = Some(placement);
         }
@@ -265,7 +234,11 @@ impl PlacementState {
 
     /// Take the placement in flight for `xdg_toplevel` if `barrier` is its
     /// barrier: a replaced placement's barrier finds none.
-    pub(crate) fn take_placement(&mut self, xdg_toplevel: u32, barrier: u32) -> Option<Placement> {
+    pub(crate) fn take_placement(
+        &mut self,
+        xdg_toplevel: GuestId,
+        barrier: HostId,
+    ) -> Option<Placement> {
         let placed = self.toplevels.get_mut(&xdg_toplevel)?;
         if placed.placement?.barrier != barrier {
             return None;
@@ -275,7 +248,7 @@ impl PlacementState {
 
     /// The placement in flight for `xdg_toplevel`.
     #[cfg(test)]
-    pub(crate) fn placement(&self, xdg_toplevel: u32) -> Option<Placement> {
+    pub(crate) fn placement(&self, xdg_toplevel: GuestId) -> Option<Placement> {
         self.toplevels.get(&xdg_toplevel)?.placement
     }
 
@@ -288,18 +261,18 @@ impl PlacementState {
     /// object and `host_only` a live object only the proxy uses, as
     /// `Context::assert_no_orphans` does.
     #[cfg(test)]
-    fn assert_no_orphans(
+    pub(crate) fn assert_no_orphans(
         &self,
         guest: &dyn Fn(&str, u32, &str),
         host_only: &dyn Fn(&str, u32, &str),
     ) {
         for (&xdg_toplevel, placed) in &self.toplevels {
-            guest("Aura toplevel", xdg_toplevel, "xdg_toplevel");
-            host_only("Aura toplevel", placed.aura_toplevel, "zaura_toplevel");
+            guest("Aura toplevel", xdg_toplevel.0, "xdg_toplevel");
+            host_only("Aura toplevel", placed.aura_toplevel.0, "zaura_toplevel");
         }
         for (&aura_toplevel, &xdg_toplevel) in &self.xdg_toplevel_by_aura_toplevel {
-            guest("Aura toplevel", xdg_toplevel, "xdg_toplevel");
-            host_only("Aura toplevel", aura_toplevel, "zaura_toplevel");
+            guest("Aura toplevel", xdg_toplevel.0, "xdg_toplevel");
+            host_only("Aura toplevel", aura_toplevel.0, "zaura_toplevel");
         }
     }
 }
@@ -308,33 +281,36 @@ impl PlacementState {
 mod tests {
     use super::*;
 
+    const XDG: GuestId = GuestId(10);
+    const AURA: HostId = HostId(70);
+
     fn placement(barrier: u32) -> Placement {
         Placement {
-            barrier,
+            barrier: HostId(barrier),
             target: Rect::new(0, 0, 10, 20),
             step: PlacementStep::Restore,
         }
     }
 
+    /// Placement is on for a connection exactly when the bindings file was
+    /// valid as it connected; off holds nothing.
     #[test]
-    fn placement_off_holds_nothing() {
-        let state = WindowPlacementState::new(false);
-        assert!(!state.is_active());
-        assert!(state.active().is_none());
-        assert!(WindowPlacementState::new(true).is_active());
+    fn placement_is_on_only_under_valid_bindings() {
+        assert!(WindowPlacement::connect(PlacementConfig::for_test()).is_none());
+        assert!(WindowPlacement::connect(PlacementConfig::active_for_test(&[])).is_some());
     }
 
     #[test]
     fn toplevel_association_resolves_both_directions_until_taken() {
         let mut state = PlacementState::default();
-        state.attach(10, 70);
-        assert_eq!(state.aura_toplevel(10), Some(70));
-        assert_eq!(state.xdg_toplevel(70), Some(10));
+        state.attach(XDG, AURA);
+        assert_eq!(state.aura_toplevel(XDG), Some(AURA));
+        assert_eq!(state.xdg_toplevel(AURA), Some(XDG));
 
-        assert_eq!(state.take(10), Some(70));
-        assert_eq!(state.aura_toplevel(10), None);
-        assert_eq!(state.xdg_toplevel(70), None);
-        assert_eq!(state.take(10), None, "release is idempotent");
+        assert_eq!(state.take(XDG), Some(AURA));
+        assert_eq!(state.aura_toplevel(XDG), None);
+        assert_eq!(state.xdg_toplevel(AURA), None);
+        assert_eq!(state.take(XDG), None, "release is idempotent");
     }
 
     /// The newest configure's origin, states and serial are what a
@@ -342,21 +318,22 @@ mod tests {
     #[test]
     fn the_newest_report_wins() {
         let mut state = PlacementState::default();
-        state.attach(10, 70);
-        assert_eq!(state.origin(10), None);
-        assert_eq!(state.last_configure(10), None, "no serial yet");
+        state.attach(XDG, AURA);
+        assert_eq!(state.origin(XDG), None);
+        assert_eq!(state.last_configure(XDG), None, "no serial yet");
 
-        state.configured(10, (5, 6), vec![4, 0, 0, 0]);
-        state.serial_sent(10, 9);
-        state.moved(10, (7, 8));
-        assert_eq!(state.origin(10), Some((7, 8)));
-        assert_eq!(state.last_configure(10), Some((&[4, 0, 0, 0][..], 9)));
+        state.configured(XDG, (5, 6), vec![4, 0, 0, 0]);
+        state.serial_sent(XDG, 9);
+        state.moved(XDG, (7, 8));
+        assert_eq!(state.origin(XDG), Some((7, 8)));
+        assert_eq!(state.last_configure(XDG), Some((&[4, 0, 0, 0][..], 9)));
 
         // Reports of an unknown toplevel change nothing.
-        state.configured(11, (1, 1), Vec::new());
-        state.moved(11, (1, 1));
-        state.serial_sent(11, 1);
-        assert_eq!(state.origin(11), None);
+        let unknown = GuestId(11);
+        state.configured(unknown, (1, 1), Vec::new());
+        state.moved(unknown, (1, 1));
+        state.serial_sent(unknown, 1);
+        assert_eq!(state.origin(unknown), None);
     }
 
     /// A newer placement replaces the older one, whose barrier then finds
@@ -364,15 +341,15 @@ mod tests {
     #[test]
     fn only_the_newest_placement_continues() {
         let mut state = PlacementState::default();
-        state.attach(10, 70);
-        state.start(10, placement(40));
-        state.start(10, placement(41));
-        assert_eq!(state.take_placement(10, 40), None);
-        assert_eq!(state.take_placement(10, 41), Some(placement(41)));
-        assert_eq!(state.take_placement(10, 41), None, "taken once");
+        state.attach(XDG, AURA);
+        state.start(XDG, placement(40));
+        state.start(XDG, placement(41));
+        assert_eq!(state.take_placement(XDG, HostId(40)), None);
+        assert_eq!(state.take_placement(XDG, HostId(41)), Some(placement(41)));
+        assert_eq!(state.take_placement(XDG, HostId(41)), None, "taken once");
 
-        state.start(10, placement(42));
-        assert_eq!(state.take(10), Some(70));
-        assert_eq!(state.take_placement(10, 42), None);
+        state.start(XDG, placement(42));
+        assert_eq!(state.take(XDG), Some(AURA));
+        assert_eq!(state.take_placement(XDG, HostId(42)), None);
     }
 }

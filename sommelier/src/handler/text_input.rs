@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::warn_once::WarnOnce;
 
 use crate::handler::callback::queue_internal_sync;
 use crate::handler::ime_keys::{
@@ -202,14 +202,8 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         state: u32,
         _modifiers: u32,
     ) -> Action {
-        static LOGGED: AtomicBool = AtomicBool::new(false);
-        // At the default level, so a host that does send keysyms shows it.
-        if !LOGGED.swap(true, Ordering::Relaxed) {
-            log::info!(
-                "Dropping zwp_text_input_v1.keysym {sym:#x} (state {state}), which Exo is not \
-                 known to send; later ones are dropped unlogged"
-            );
-        }
+        static KEYSYM: WarnOnce = WarnOnce::new();
+        log_dropped_keysym(&KEYSYM, sym, state);
         Action::Drop
     }
 
@@ -476,17 +470,35 @@ fn host_text_input_managers(ctx: &Context) -> Option<(u32, u32)> {
         .then_some((manager, ext_manager))
 }
 
+/// Log, once per `once` (the process's, or a test's own), that a
+/// `zwp_text_input_v1.keysym` was dropped: at the default level, so a host
+/// that does send keysyms shows it.
+///
+/// # Returns
+///
+/// Whether this call logged.
+fn log_dropped_keysym(once: &WarnOnce, sym: u32, state: u32) -> bool {
+    if !once.first() {
+        return false;
+    }
+    log::info!(
+        "Dropping zwp_text_input_v1.keysym {sym:#x} (state {state}), which Exo is not known to \
+         send; later ones are dropped unlogged"
+    );
+    true
+}
+
 /// Whether [`warn_no_input_method`] has warned. Every client connection
 /// binds the same host globals, so one warning per process says it all.
-static NO_INPUT_METHOD_WARNED: AtomicBool = AtomicBool::new(false);
+static NO_INPUT_METHOD_WARNED: WarnOnce = WarnOnce::new();
 
 /// Warn, once per `warned`, that text inputs get no input method.
 ///
 /// # Returns
 ///
 /// Whether this call logged the warning.
-fn warn_no_input_method(warned: &AtomicBool) -> bool {
-    if warned.swap(true, Ordering::Relaxed) {
+fn warn_no_input_method(warned: &WarnOnce) -> bool {
+    if !warned.first() {
         return false;
     }
     log::warn!(
@@ -2267,9 +2279,17 @@ pub(super) mod tests {
             let delete_id = wl_display::Event::DeleteId { id: ti };
             assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
         }
-        let warned = AtomicBool::new(false);
+        let warned = crate::warn_once::WarnOnce::new();
         assert!(warn_no_input_method(&warned));
         assert!(!warn_no_input_method(&warned));
+    }
+
+    /// A dropped keysym is logged once, with the test's own flag.
+    #[test]
+    fn a_dropped_keysym_is_logged_once() {
+        let once = crate::warn_once::WarnOnce::new();
+        assert!(log_dropped_keysym(&once, 0x61, 1));
+        assert!(!log_dropped_keysym(&once, 0x61, 1));
     }
 
     /// An extension whose version the proxy cannot find gives no input

@@ -45,7 +45,7 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
             fd.as_raw_fd()
         );
 
-        if let Some(virtwl) = &ctx.virtwayland_channel {
+        if let Some(virtwl) = ctx.virtwayland_channel().cloned() {
             debug!("Using virtwl for clipboard receive");
 
             // Beyond the cap the request is dropped, which closes the

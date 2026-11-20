@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use crate::virtwl::DMA_BUF_SYNC_READ;
 
-const DRM_DEVICE_ENV: &str = "SOMMELIER_DRM_DEVICE";
 const DRM_DEVICE_DIR: &str = "/dev/dri";
 const VIRTIO_GPU_DRIVER: &str = "virtio_gpu";
 const DRM_COMMAND_BASE: u8 = 64;
@@ -404,12 +403,9 @@ pub struct VirtGpuNode {
 }
 
 impl VirtGpuNode {
-    /// The node `SOMMELIER_DRM_DEVICE` names, or else the first virtio-gpu
-    /// render node; `main` reads the variable once, here.
-    pub fn from_environment() -> Self {
-        let configured = std::env::var_os(DRM_DEVICE_ENV)
-            .map(PathBuf::from)
-            .filter(|path| !path.as_os_str().is_empty());
+    /// The node `configured` names (`Settings::drm_device`), or else the
+    /// first virtio-gpu render node.
+    pub fn new(configured: Option<PathBuf>) -> Self {
         Self::with_opener(move || VirtGpuDevice::open(configured.clone()))
     }
 

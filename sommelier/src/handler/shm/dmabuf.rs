@@ -93,8 +93,7 @@ pub(super) fn allocate_virtwl_dmabuf(
     format: u32,
 ) -> io::Result<DmabufAllocation> {
     let Some(channel) = ctx
-        .virtwayland_channel
-        .as_ref()
+        .virtwayland_channel()
         .filter(|channel| channel.supports_dmabuf())
     else {
         return Err(io::Error::new(

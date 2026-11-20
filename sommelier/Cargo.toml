@@ -25,6 +25,7 @@ nix = { version = "0.31", features = [
     "fs",
     "ioctl",
     "mman",
+    "inotify",
 ] }
 tokio = { version = "1.49", features = ["full"] }
 libc = "0.2"

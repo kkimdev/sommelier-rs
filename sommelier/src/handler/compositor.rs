@@ -163,7 +163,7 @@ fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> std::io::Result<DmabufFe
             },
         );
     }
-    crate::allocator::dmabuf_fence(plane, ctx.virtgpu.as_deref())
+    crate::allocator::dmabuf_fence(plane, ctx.virtgpu())
 }
 
 impl WlCompositorHandler for CompositorHandler {
@@ -962,7 +962,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         };
         // The host XDG role and the Aura surface both get the ID in the Guest
         // OS namespace.
-        let native_app_id = native_wayland_app_id(&ctx.vm_identifier, app_id);
+        let native_app_id = native_wayland_app_id(&ctx.settings().vm_id, app_id);
 
         // The host xdg_toplevel carries the app ID used by ordinary Exo
         // shelf/application matching. Keep that request namespaced as in the

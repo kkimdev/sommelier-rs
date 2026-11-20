@@ -66,7 +66,7 @@ pub(super) fn guest_shm_format_available(ctx: &Context, format: u32) -> bool {
     // `select_shm_backing`), so only the formats it lists count. VirtWL also
     // sends some buffers through the host's linux-dmabuf.
     MANDATORY_SHM_FORMATS.contains(&format)
-        || if ctx.virtwayland_channel.is_some() {
+        || if ctx.virtwayland_channel().is_some() {
             host_reported_shm_format(ctx, format)
         } else {
             ctx.host_wl_shm_formats.contains(&format)

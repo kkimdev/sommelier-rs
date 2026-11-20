@@ -1545,27 +1545,34 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   sends a touchpad scroll as `wl_pointer.axis` with `axis_source` finger
   and no `axis_discrete`, and Wine's Wayland driver ignores `axis`: it
   scrolls only on `axis_discrete`. So a client that
-  `client_kind::WheelFromTouchpad` chooses when it connects
+  `client_kind::WheelFromTouchpad` chooses
   (`SOMMELIER_WHEEL_FROM_TOUCHPAD`; by default a Wine process, by its
   executable or its loader's environment through `SO_PEERCRED` and
-  `/proc`, read on a detached thread that the client's task waits for,
-  before it handles a message, at most 500 ms (`DETECTION_TIMEOUT`); a
-  client whose read takes longer is not taken for Wine, with an info
-  log, so a hung read stalls no client) gets one `axis_discrete` step, signed like the
-  scroll, per 10 units of finger or continuous scrolling on an axis,
-  just before the `axis` that crosses it, as the protocol orders them.
-  10 is Exo's distance for one wheel notch (`kWaylandScrollUnit`). The
-  rest carries over until that axis's `axis_stop`, the pointer's `enter`
-  or `leave`, or its end. Every other client, and every wheel scroll, which comes
-  with Exo's own `axis_discrete`, gets the events as the host sent them.
-  A source, and so a step, reaches only a pointer of v5 or later, which
-  has `axis_discrete`: the dispatcher rejects a newer event for an older
-  object.
+  `/proc`) gets one `axis_discrete` step, signed like the scroll, per 10
+  units of finger or continuous scrolling on an axis, just before the
+  `axis` that crosses it, as the protocol orders them. 10 is Exo's
+  distance for one wheel notch (`kWaylandScrollUnit`). The rest carries
+  over until that axis's `axis_stop`, the pointer's `enter` or `leave`,
+  or its end (`WheelStepper`, pure arithmetic). Every other client, and
+  every wheel scroll, which comes with Exo's own `axis_discrete`, gets
+  the events as the host sent them. A source, and so a step, reaches
+  only a pointer of v5 or later, which has `axis_discrete`: the
+  dispatcher rejects a newer event for an older object.
+- **Nothing waits to learn whether a client is Wine.** The `/proc` read
+  (a `ClientProbe`) runs on a detached thread that starts as the client
+  connects, because a stalled process can hold the lock its `environ`
+  needs. The client's messages are handled from the start; its first
+  `axis_source` after the read answered settles the choice
+  (`WheelClient::settle`), and until then it scrolls as the host sent it.
+  A read that never answers leaves the client without steps and stalls
+  no one.
   Tests: `a_wine_client_gets_wheel_steps_from_touchpad_scrolling`,
   `wheel_steps_leave_other_clients_and_wheels_alone`,
+  `a_pending_detection_leaves_scrolls_alone_until_it_answers`,
+  `a_stepper_carries_the_rest_over_per_axis`,
   `wine_is_recognised_by_its_executable_or_its_loader_environment`,
   `the_setting_chooses_wine_every_client_or_none`,
-  `a_detection_that_does_not_answer_in_time_is_not_wine`,
+  `a_client_scrolls_unchanged_until_its_detection_answers`,
   `event_since_guard_rejects_a_newer_event_for_an_old_host_object`.
 
 ## Process

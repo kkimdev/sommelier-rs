@@ -47,7 +47,7 @@ pub struct LinuxDmabufHandler;
 /// The virtio-gpu render node's `dev_t`, in native byte order, as the
 /// feedback's `main_device` carries it.
 fn local_device_id(ctx: &Context) -> io::Result<Vec<u8>> {
-    let virtgpu = ctx.virtgpu.as_deref().ok_or_else(|| {
+    let virtgpu = ctx.virtgpu().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "no virtio-gpu render node for synthetic dmabuf feedback",
@@ -694,7 +694,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         // the forwarded ADD request importable by the host compositor while
         // leaving non-virtio and unsupported-kernel paths unchanged.
         let (stride, modifier_hi, modifier_lo) = if plane_idx == 0 {
-            if let Some(allocator) = ctx.virtgpu.as_deref() {
+            if let Some(allocator) = ctx.virtgpu() {
                 let guest_modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
                 let fixup = allocator.fixup_dmabuf_plane0(fd, stride, guest_modifier);
                 (

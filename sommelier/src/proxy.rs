@@ -15,19 +15,21 @@ limitations under the License.
 */
 
 use crate::allocator::{PendingFence, VirtGpuNode};
-use crate::client_kind::WheelFromTouchpad;
+use crate::client_kind;
 use crate::connection::{LastSubmission, OutgoingMessages, WaylandConnection};
-use crate::placement_config::PlacementConfig;
+use crate::placement_config::{self, PlacementConfig};
 use crate::protocols;
 use crate::protocols::aura_shell::{zaura_output, zaura_toplevel};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::wayland::wl_buffer;
-use crate::state::{Context, PostDispatch, SessionEnd};
+use crate::settings::{HostTransport, Settings};
+use crate::state::{ConnectionFacts, Context, PostDispatch, SessionEnd};
 use crate::virtwl_channel::VirtWaylandChannel;
+use crate::warn_once::WarnOnce;
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 use std::io;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
@@ -208,7 +210,7 @@ enum ParkedFence {
 /// Whether a sync_file has failed to register with the event loop yet.
 /// Only the first failure warns, so a kernel that refuses every one does
 /// not flood the log.
-static FENCE_REGISTRATION_FAILED: AtomicBool = AtomicBool::new(false);
+static FENCE_REGISTRATION_FAILED: WarnOnce = WarnOnce::new();
 
 impl ParkedRequest {
     /// Park a request that waits for the first time.
@@ -230,11 +232,10 @@ impl ParkedRequest {
                 match AsyncFd::with_interest(sync_file, Interest::READABLE) {
                     Ok(sync_file) => ParkedFence::Readable(sync_file),
                     Err(error) => {
-                        if FENCE_REGISTRATION_FAILED.swap(true, Ordering::Relaxed) {
-                            log::debug!("Polling a dma-buf fence that cannot be awaited: {error}");
-                        } else {
-                            log::warn!("Polling a dma-buf fence that cannot be awaited: {error}");
-                        }
+                        log::log!(
+                            FENCE_REGISTRATION_FAILED.level(),
+                            "Polling a dma-buf fence that cannot be awaited: {error}"
+                        );
                         poll_at()
                     }
                 }
@@ -1219,16 +1220,11 @@ mod tests {
         std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
     }
 
-    fn test_client_config() -> ClientConfig {
-        ClientConfig {
-            local_compositor: None,
-            virtio_wayland: None,
-            gpu_accel: false,
-            xdg_decoration: false,
-            vm_identifier: "termina".to_string(),
+    fn test_shared() -> Shared {
+        Shared {
+            settings: Rc::new(Settings::for_test()),
             virtgpu: VirtGpuNode::absent_for_test(),
-            placement: Arc::new(PlacementConfig::for_test(Vec::new())),
-            wheel_from_touchpad: WheelFromTouchpad::Off,
+            placement: PlacementConfig::for_test(),
         }
     }
 
@@ -1253,10 +1249,7 @@ mod tests {
         let window = std::time::Duration::from_millis(500);
         let cpu_before = thread_cpu_time();
         let served = tokio::task::LocalSet::new()
-            .run_until(tokio::time::timeout(
-                window,
-                serve(listener, test_client_config()),
-            ))
+            .run_until(tokio::time::timeout(window, serve(listener, test_shared())))
             .await;
         let cpu = thread_cpu_time() - cpu_before;
 
@@ -3217,8 +3210,7 @@ mod tests {
         assert!(
             client
                 .ctx
-                .window_placement
-                .active()
+                .placement()
                 .map_or(0, |state| state.toplevel_count())
                 == 0,
             "failed get_toplevel requests must not leave an internal Aura child"
@@ -3250,10 +3242,10 @@ mod tests {
         );
         let aura_toplevel = client
             .ctx
-            .window_placement
-            .active()
-            .and_then(|state| state.aura_toplevel(XDG_TOPLEVEL))
-            .expect("placement Aura toplevel");
+            .placement()
+            .and_then(|state| state.aura_toplevel(crate::state::GuestId(XDG_TOPLEVEL)))
+            .expect("placement Aura toplevel")
+            .0;
         drop(client);
 
         assert_eq!(
@@ -3292,8 +3284,7 @@ mod tests {
         assert_eq!(
             client
                 .ctx
-                .window_placement
-                .active()
+                .placement()
                 .map_or(0, |state| state.toplevel_count()),
             0
         );
@@ -3317,8 +3308,7 @@ mod tests {
         assert_eq!(
             client
                 .ctx
-                .window_placement
-                .active()
+                .placement()
                 .map_or(0, |state| state.toplevel_count()),
             0
         );
@@ -4037,73 +4027,77 @@ protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
 });
 impl protocols::gtk::ProtocolHandler for SommelierHandler {}
 
-/// What every client connection needs from the proxy's configuration.
-struct ClientConfig {
-    local_compositor: Option<String>,
-    virtio_wayland: Option<String>,
-    gpu_accel: bool,
-    xdg_decoration: bool,
-    vm_identifier: String,
+/// What every client connection shares: the process's settings and the
+/// resources built from them once.
+struct Shared {
+    settings: Rc<Settings>,
     virtgpu: VirtGpuNode,
-    placement: Arc<PlacementConfig>,
-    /// Which clients get wheel steps from touchpad scrolling.
-    wheel_from_touchpad: WheelFromTouchpad,
+    placement: PlacementConfig,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    display: &str,
-    local_compositor: Option<String>,
-    gpu_accel: bool,
-    xdg_decoration: bool,
-    virtio_wayland: Option<String>,
-    vm_identifier: String,
-    virtgpu: VirtGpuNode,
-    placement: Arc<PlacementConfig>,
-    wheel_from_touchpad: WheelFromTouchpad,
-) {
-    if let Some(path) = &virtio_wayland {
-        if let Err(e) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-        {
-            log::error!("Failed to open virtio-wayland device {}: {}", path, e);
-            std::process::exit(1);
+impl Shared {
+    /// Build what the connections share from `settings`, and start
+    /// watching the placement bindings file on the current `LocalSet`.
+    fn new(settings: Settings) -> Self {
+        let settings = Rc::new(settings);
+        Self {
+            virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
+            placement: placement_config::load_and_watch(&settings),
+            settings,
         }
-    } else if let Some(path) = &local_compositor {
-        if let Err(e) = std::os::unix::net::UnixStream::connect(path) {
-            log::error!(
-                "Failed to connect to local compositor socket {}: {}",
-                path,
-                e
-            );
-            std::process::exit(1);
+    }
+}
+
+/// Serve guest clients on `settings.socket` for the life of the process.
+///
+/// Exits the process when the host cannot be reached or the socket cannot
+/// be claimed, before any client connects.
+pub(crate) async fn run(settings: Settings) {
+    match &settings.host {
+        HostTransport::VirtWl(path) => {
+            if let Err(e) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
+                log::error!(
+                    "Failed to open virtio-wayland device {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+        HostTransport::Local(path) => {
+            if let Err(e) = std::os::unix::net::UnixStream::connect(path) {
+                log::error!(
+                    "Failed to connect to local compositor socket {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
         }
     }
 
+    let display = settings.socket.clone();
     // Held until the process exits, like the socket itself.
-    let _socket_lock =
-        claim_display_socket(std::path::Path::new(display)).unwrap_or_else(|error| {
-            log::error!("Cannot claim the Wayland socket {display}: {error}");
-            std::process::exit(1);
-        });
-    let listener = UnixListener::bind(display).unwrap_or_else(|error| {
-        log::error!("Cannot bind the Wayland socket {display}: {error}");
+    let _socket_lock = claim_display_socket(&display).unwrap_or_else(|error| {
+        log::error!(
+            "Cannot claim the Wayland socket {}: {error}",
+            display.display()
+        );
         std::process::exit(1);
     });
-    log::info!("Listening on {}", display);
+    let listener = UnixListener::bind(&display).unwrap_or_else(|error| {
+        log::error!(
+            "Cannot bind the Wayland socket {}: {error}",
+            display.display()
+        );
+        std::process::exit(1);
+    });
+    log::info!("Listening on {}", display.display());
 
-    let config = ClientConfig {
-        local_compositor,
-        virtio_wayland,
-        gpu_accel,
-        xdg_decoration,
-        vm_identifier,
-        virtgpu,
-        placement,
-        wheel_from_touchpad,
-    };
     // Each client's Context holds xkb state, which is !Send. Keep each
     // client task on this executor's thread instead of using `tokio::spawn`
     // (whose Send bound would require an unsound manual Send implementation).
@@ -4111,7 +4105,7 @@ pub async fn run(
     // this function's future type: callers cannot accidentally move the
     // proxy's client tasks to another executor thread.
     tokio::task::LocalSet::new()
-        .run_until(serve(listener, config))
+        .run_until(async move { serve(listener, Shared::new(settings)).await })
         .await;
 }
 
@@ -4155,7 +4149,7 @@ fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flo
 ///
 /// A failure concerning one client is logged and ends only that client.
 /// Must run inside a `LocalSet`, like the clients it spawns.
-async fn serve(listener: UnixListener, config: ClientConfig) {
+async fn serve(listener: UnixListener, shared: Shared) {
     // Log a run of failed accepts once, not every retry.
     let mut accept_failing = false;
     loop {
@@ -4165,7 +4159,7 @@ async fn serve(listener: UnixListener, config: ClientConfig) {
                     log::info!("Accepting clients again");
                 }
                 log::info!("New client connected");
-                if let Err(error) = start_client(stream, &config).await {
+                if let Err(error) = start_client(stream, &shared).await {
                     log::error!("Closing the new client: {error}");
                 }
             }
@@ -4183,57 +4177,51 @@ async fn serve(listener: UnixListener, config: ClientConfig) {
 
 /// Pair an accepted guest connection with a new host connection and serve
 /// the pair on its own task.
-async fn start_client(stream: UnixStream, config: &ClientConfig) -> io::Result<()> {
+async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
     // The peer's process, as it was when it connected.
     let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
     let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
-    let (host_conn, virtwayland_channel) = connect_host(config).await?;
-    let mut client = Client::new(
+    let (host_conn, virtwl) = connect_host(&shared.settings.host).await?;
+    let facts = ConnectionFacts {
+        virtwl,
+        virtgpu: shared.virtgpu.get(),
+        wheel: shared
+            .settings
+            .wheel_from_touchpad
+            .decide(pid, client_kind::is_wine_process),
+        placement: shared.placement.clone(),
+    };
+    let client = Client::new(
         client_conn,
         host_conn,
-        Context::new(
-            config.gpu_accel,
-            config.xdg_decoration,
-            config.vm_identifier.clone(),
-            config.virtgpu.get(),
-            Arc::clone(&config.placement),
-        ),
+        Context::new(Rc::clone(&shared.settings), facts),
     );
-    client.ctx.virtwayland_channel = virtwayland_channel;
-    let wheel_from_touchpad = config.wheel_from_touchpad;
     tokio::task::spawn_local(async move {
-        // Off the accept loop, and before the client handles its first
-        // message, so before any pointer event.
-        let wheel_steps = wheel_from_touchpad.applies_to(pid).await;
-        client.ctx.wheel_steps = wheel_steps.then(Default::default);
         client.run().await;
         log::info!("Client disconnected");
     });
     Ok(())
 }
 
-/// Open this client's connection to the host compositor: a VirtWL channel
-/// when configured, else (or when that fails) the local compositor socket.
+/// Open this client's connection to the host compositor over `host`,
+/// with its VirtWL channel when there is one.
 async fn connect_host(
-    config: &ClientConfig,
+    host: &HostTransport,
 ) -> io::Result<(WaylandConnection, Option<Arc<VirtWaylandChannel>>)> {
-    if let Some(path) = &config.virtio_wayland {
-        match VirtWaylandChannel::new(path) {
-            Ok(channel) => {
-                let channel = Arc::new(channel);
-                let conn = WaylandConnection::new_virtwayland(Arc::clone(&channel));
-                return Ok((conn, Some(channel)));
-            }
-            Err(e) => {
-                log::error!("Failed to open virtio-wayland channel at {}: {}", path, e);
-            }
+    match host {
+        HostTransport::VirtWl(path) => {
+            let channel = Arc::new(VirtWaylandChannel::new(path).map_err(|error| {
+                io::Error::other(format!(
+                    "cannot open a virtio-wayland channel at {}: {error}",
+                    path.display()
+                ))
+            })?);
+            let conn = WaylandConnection::new_virtwayland(Arc::clone(&channel));
+            Ok((conn, Some(channel)))
+        }
+        HostTransport::Local(path) => {
+            let stream = UnixStream::connect(path).await?;
+            Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
         }
     }
-    let Some(path) = &config.local_compositor else {
-        return Err(io::Error::other(
-            "no host connection: virtio-wayland is unavailable and no local compositor is set",
-        ));
-    };
-    let stream = UnixStream::connect(path).await?;
-    Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
 }

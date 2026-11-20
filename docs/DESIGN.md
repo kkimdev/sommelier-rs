@@ -24,23 +24,28 @@ handler intercepts the ones whose meaning changes across the boundary.
 
 ## Process and connections
 
-- `main.rs` parses the command line, raises the open-file soft limit
-  (`raise_open_file_limit`), and resolves every process-wide setting
-  once, before the first client connects: the VM
-  identifier (`state::vm_identifier_from_environment`), the virtio-gpu
-  render node (`VirtGpuNode::from_environment`, which reads
-  `SOMMELIER_DRM_DEVICE`; the node opens when a client first needs it,
-  and one that fails to open is tried again for the next client until it
-  opens; test: `a_render_node_that_fails_to_open_is_tried_again_then_kept`),
-  the placement configuration (`PlacementConfig::from_environment`, which
-  finds and loads the bindings file, which connections then refresh) and
-  which clients get wheel steps for touchpad scrolling
-  (`client_kind::WheelFromTouchpad::from_environment`).
-  Connections receive the results; `client_kind.rs`, the one owner of
-  whether a client is Wine, decides that per client from its process when
-  it connects ([pointer scrolling](INVARIANTS.md#pointer-scrolling)).
-  `Context::new` and the test constructors read no environment
-  (test: `test_contexts_read_no_environment`).
+- `main.rs` is the only code that reads the command line and the
+  environment. It hands both to `Settings::resolve` (`settings.rs`, the
+  one list of the variables the proxy reads and of what a value that
+  cannot be used falls back to), raises the open-file soft limit
+  (`raise_open_file_limit`), and passes the immutable `Settings` to
+  `proxy::run` (test: `only_main_reads_the_environment`). The host is one
+  `HostTransport`, a VirtWL device or, for debugging, a local
+  compositor socket; the command line rejects both at once
+  (test: `the_host_is_one_transport`).
+- `proxy::run` builds what every connection shares (`Shared`): the
+  settings behind an `Rc`, the virtio-gpu render node (`VirtGpuNode`;
+  the node opens when a client first needs it, and one that fails to
+  open is tried again for the next client until it opens; test:
+  `a_render_node_that_fails_to_open_is_tried_again_then_kept`) and the
+  placement configuration. Each connection's `Context::new` takes the
+  settings and its `ConnectionFacts`: its VirtWL channel, the render
+  node, whether its client gets wheel steps (`client_kind.rs`, the one
+  owner of whether a client is Wine, starts deciding that from the
+  client's process when it connects;
+  [pointer scrolling](INVARIANTS.md#pointer-scrolling)) and the
+  placement configuration. A `Context` is whole when it is built; no
+  setting of it changes later.
 - `proxy::run` claims the socket through its lock file, then `serve`
   accepts guest clients and gives each a `Client` with its own guest
   connection, host connection and `Context`. All clients run on one
@@ -255,13 +260,24 @@ binds no chord of its own. The contract is in
 [Window placement shortcuts](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
 
 - **Configuration.** `placement_config.rs` owns where the bindings file
-  is, when it changed, and what it binds. Each key press on a connection
-  with placement on costs one `stat` of it; a changed file is loaded
-  before the press is classified, and one that cannot be used keeps the
-  last good bindings (tests:
+  is, what it binds (`Bindings`, one validated version, each named action
+  resolved to its rectangle) and which version is current
+  (`PlacementConfig`, which every connection shares). The one writer is
+  `BindingsFile::reload`, which an inotify watch on the event loop calls
+  as the path, or a path its links lead to, changes
+  (`placement_config/watch.rs`); it swaps the version
+  whole, between two messages, and one that cannot be used keeps the last
+  good bindings. The key path reads no file (tests:
+  `the_watcher_follows_every_change_of_the_file`,
+  `the_watcher_follows_a_swap_of_the_directory_link`,
+  `a_new_file_is_read_once_written`,
+  `a_file_being_written_is_not_read_for_another_event`,
+  `the_watcher_follows_the_target_of_a_link`,
+  `a_chain_follows_each_link_on_the_path`,
+  `load_and_watch_reloads_on_the_event_loop`,
   `a_bindings_file_edit_takes_effect_on_the_next_press`,
-  `refresh_follows_the_file`,
-  `refresh_follows_a_link_to_files_of_the_same_mtime`,
+  `reload_follows_the_file`,
+  `reload_follows_a_link_to_files_of_the_same_mtime`,
   `a_connection_takes_placement_from_the_file_when_it_starts`).
 
 - **One module.** `handler/window_placement.rs` is the only placement
@@ -283,13 +299,15 @@ binds no chord of its own. The contract is in
   which placement translates for the guest.
 - **State.** `state/window_placement.rs` owns, per connection, each
   toplevel's Aura toplevel, its last reported origin, the states and
-  serial of its newest configure, and the placement in flight; it is
-  reachable only while placement is on.
+  serial of its newest configure, and the placement in flight, keyed by
+  `GuestId` and `HostId`. It exists only while placement is on: an entry
+  point takes it with `Context::placement_mut`, which is `None` while
+  placement is off, so no path can reach it then.
 - **What placement needs from the host.** `zaura_shell` new enough for
   the work area (`shell_bound`, `output_bound`).
 - **Lifecycle.** Per-toplevel state ends through `release_toplevel`, which
   the owners' `forget_*` functions call from `forget_object` (see
-  [Object ends](#object-ends)), and `WindowPlacementState::assert_no_orphans`
+  [Object ends](#object-ends)), and `PlacementState::assert_no_orphans`
   checks it after every batch in tests.
 - **Off is the absence of placement.** With placement off a session's
   traffic is what it would be without placement (test:
@@ -613,11 +631,11 @@ moment it is closed, so a test that checks a descriptor was closed checks
 that no descriptor still refers to its object
 (`test_support::any_fd_has_identity`), never its number; the randomized
 `proxy::fuzz` test, which counts every open descriptor, runs its cases in
-a child process of its own. A flag that makes a warning once per
-process, such as `window_placement`'s `OLD_SHELL_WARNED`, is the
-process's too: no test resets one. A test passes the function that reads
-it a flag of its own, or runs in its own process
-(`test_support::in_own_process`). `proxy::harness::Session` drives a whole
+a child process of its own. A flag that makes a message once per
+process (`warn_once::WarnOnce`, the one such flag, such as
+`window_placement`'s `OLD_SHELL`) is the process's too: no test resets
+one. A test passes the function that reads it a `WarnOnce` of its own, or
+runs in its own process (`test_support::in_own_process`). `proxy::harness::Session` drives a whole
 `Client` as its guest and host, decoding what the proxy sends each into
 the generated message types; CONTRIBUTING says how to write a test with
 it. `proxy::frame_cost` measures what a steady stream of frames costs a

@@ -18,19 +18,18 @@ limitations under the License.
 //!
 //! This module owns *where* a placement shortcut puts a window:
 //!
-//! * [`WindowLayoutAction`] - the placement vocabulary: nine named presets
-//!   plus an arbitrary configured rectangle, and the one parser for the
-//!   preset names ([`WindowLayoutAction::from_name`]).
 //! * [`NormalizedRect`] - `[x, y, width, height]` as fractions of the output
-//!   work area. Every action resolves to one ([`WindowLayoutAction::rect`]),
-//!   and every placement goes through [`NormalizedRect::to_work_area_bounds`],
-//!   so there is exactly one rounding rule.
+//!   work area: what a placement binding places a window at, whether the
+//!   binding names a preset ([`NormalizedRect::preset`], the one list of
+//!   the nine named presets) or a rectangle. Every placement goes through
+//!   [`NormalizedRect::to_work_area_bounds`], so there is exactly one
+//!   rounding rule.
 //! * [`Rect`] - an integer rectangle in logical screen coordinates: the work
 //!   area a placement maps into and the window bounds it produces.
 //!
 //! The module depends on nothing else in the crate. The configuration
-//! parser (`placement_config`) builds actions; `Context` and the keyboard
-//! handler pass them on; the output registry (`state::outputs`) returns
+//! parser (`placement_config`) builds the rectangles; `Context` and the
+//! keyboard handler pass them on; the output registry (`state::outputs`) returns
 //! work areas as [`Rect`]; and the placement handler
 //! (`handler::window_placement`) maps one into the other.
 //!
@@ -82,26 +81,6 @@ impl Rect {
     }
 }
 
-/// Actions that may be bound to compositor-owned window placement shortcuts.
-///
-/// Every action resolves to a normalized work-area rectangle through
-/// [`WindowLayoutAction::rect`], so named presets and configured rectangles
-/// share one rounding rule.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum WindowLayoutAction {
-    TopLeft,
-    Top,
-    TopRight,
-    Left,
-    Fullscreen,
-    Right,
-    BottomLeft,
-    Bottom,
-    BottomRight,
-    /// An arbitrary validated rectangle from the shortcut configuration file.
-    Rect(NormalizedRect),
-}
-
 /// Reasons a rectangle is not a valid normalized work-area rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum RectError {
@@ -119,7 +98,8 @@ pub(crate) enum RectError {
     ExceedsWorkArea,
 }
 
-/// A rectangle expressed as fractions of the active output work area.
+/// A rectangle expressed as fractions of the active output work area: where
+/// a placement binding puts a window.
 ///
 /// Instances are always validated: every edge is finite and inside `[0, 1]`
 /// with `left < right` and `top < bottom` (before pixel rounding). The fields
@@ -248,66 +228,47 @@ fn edge(fraction: f64, extent: i32) -> Option<i32> {
     Some(offset)
 }
 
-impl WindowLayoutAction {
-    /// Resolve a named preset, case-insensitively.
-    ///
-    /// This is the one parser for preset names; both configuration sources
-    /// use it.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - a preset name, optionally surrounded by whitespace. This
-    ///   function's `match` is the list of names; the "Named actions" table
-    ///   in `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md` presents it.
+/// The named presets, by name, in the order of the "Named actions" table in
+/// `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`, which presents them.
+///
+/// They are exact binary fractions inside the unit square, so validation
+/// could not change them; a test proves that each equals
+/// [`NormalizedRect::new`] of its values.
+const PRESETS: [(&str, NormalizedRect); 9] = {
+    const fn preset(x: f64, y: f64, width: f64, height: f64) -> NormalizedRect {
+        NormalizedRect {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
+        }
+    }
+    [
+        ("top-left", preset(0.0, 0.0, 0.5, 0.5)),
+        ("top", preset(0.0, 0.0, 1.0, 0.5)),
+        ("top-right", preset(0.5, 0.0, 0.5, 0.5)),
+        ("left", preset(0.0, 0.0, 0.5, 1.0)),
+        ("fullscreen", preset(0.0, 0.0, 1.0, 1.0)),
+        ("right", preset(0.5, 0.0, 0.5, 1.0)),
+        ("bottom-left", preset(0.0, 0.5, 0.5, 0.5)),
+        ("bottom", preset(0.0, 0.5, 1.0, 0.5)),
+        ("bottom-right", preset(0.5, 0.5, 0.5, 0.5)),
+    ]
+};
+
+impl NormalizedRect {
+    /// The named preset `name`, case-insensitively and ignoring
+    /// surrounding whitespace: the one parser of preset names.
     ///
     /// # Returns
     ///
-    /// The matching preset, or `None` for any other spelling.
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "top-left" => Some(Self::TopLeft),
-            "top" => Some(Self::Top),
-            "top-right" => Some(Self::TopRight),
-            "left" => Some(Self::Left),
-            "fullscreen" => Some(Self::Fullscreen),
-            "right" => Some(Self::Right),
-            "bottom-left" => Some(Self::BottomLeft),
-            "bottom" => Some(Self::Bottom),
-            "bottom-right" => Some(Self::BottomRight),
-            _ => None,
-        }
-    }
-
-    /// Return the normalized work-area rectangle for this action.
-    ///
-    /// This function's `match` defines the named presets' rectangles; the
-    /// "Named actions" table in
-    /// `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md` presents them. A
-    /// configured [`WindowLayoutAction::Rect`] returns its own rectangle.
-    pub(crate) fn rect(self) -> NormalizedRect {
-        // The presets are exact binary fractions inside the unit square, so
-        // validation could not change them; a test proves that this
-        // infallible shortcut equals `NormalizedRect::new` of each preset.
-        const fn preset(x: f64, y: f64, width: f64, height: f64) -> NormalizedRect {
-            NormalizedRect {
-                left: x,
-                top: y,
-                right: x + width,
-                bottom: y + height,
-            }
-        }
-        match self {
-            Self::TopLeft => preset(0.0, 0.0, 0.5, 0.5),
-            Self::Top => preset(0.0, 0.0, 1.0, 0.5),
-            Self::TopRight => preset(0.5, 0.0, 0.5, 0.5),
-            Self::Left => preset(0.0, 0.0, 0.5, 1.0),
-            Self::Fullscreen => preset(0.0, 0.0, 1.0, 1.0),
-            Self::Right => preset(0.5, 0.0, 0.5, 1.0),
-            Self::BottomLeft => preset(0.0, 0.5, 0.5, 0.5),
-            Self::Bottom => preset(0.0, 0.5, 1.0, 0.5),
-            Self::BottomRight => preset(0.5, 0.5, 0.5, 0.5),
-            Self::Rect(rect) => rect,
-        }
+    /// The preset's rectangle, or `None` for any other spelling.
+    pub(crate) fn preset(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        PRESETS
+            .iter()
+            .find(|(preset, _)| *preset == name)
+            .map(|&(_, rect)| rect)
     }
 }
 
@@ -315,102 +276,102 @@ impl WindowLayoutAction {
 mod tests {
     use super::*;
 
-    const PRESETS: [WindowLayoutAction; 9] = [
-        WindowLayoutAction::TopLeft,
-        WindowLayoutAction::Top,
-        WindowLayoutAction::TopRight,
-        WindowLayoutAction::Left,
-        WindowLayoutAction::Fullscreen,
-        WindowLayoutAction::Right,
-        WindowLayoutAction::BottomLeft,
-        WindowLayoutAction::Bottom,
-        WindowLayoutAction::BottomRight,
+    /// The preset names, in [`PRESETS`]' order.
+    const NAMES: [&str; 9] = [
+        "top-left",
+        "top",
+        "top-right",
+        "left",
+        "fullscreen",
+        "right",
+        "bottom-left",
+        "bottom",
+        "bottom-right",
     ];
+
+    fn preset(name: &str) -> NormalizedRect {
+        NormalizedRect::preset(name).unwrap_or_else(|| panic!("no preset {name:?}"))
+    }
 
     /// The integer half-split formula the presets used before they were
     /// expressed as normalized rectangles. It is the reference oracle that
     /// proves the generalized mapping did not move any named placement.
-    fn legacy_preset_bounds(action: WindowLayoutAction, work_area: Rect) -> Option<Rect> {
+    fn legacy_preset_bounds(name: &str, work_area: Rect) -> Option<Rect> {
         let Rect {
             x,
             y,
             width,
             height,
         } = work_area;
-        use WindowLayoutAction::{
-            Bottom, BottomLeft, BottomRight, Fullscreen, Left, Right, Top, TopLeft, TopRight,
-        };
         if width <= 0 || height <= 0 {
             return None;
         }
         let half_width = width / 2;
         let half_height = height / 2;
         if matches!(
-            action,
-            TopLeft | TopRight | BottomLeft | BottomRight | Left | Right
+            name,
+            "top-left" | "top-right" | "bottom-left" | "bottom-right" | "left" | "right"
         ) && half_width <= 0
         {
             return None;
         }
         if matches!(
-            action,
-            TopLeft | Top | TopRight | BottomLeft | Bottom | BottomRight
+            name,
+            "top-left" | "top" | "top-right" | "bottom-left" | "bottom" | "bottom-right"
         ) && half_height <= 0
         {
             return None;
         }
-        match action {
-            TopLeft => Some(Rect::new(x, y, half_width, half_height)),
-            Top => Some(Rect::new(x, y, width, half_height)),
-            TopRight => Some(Rect::new(
+        match name {
+            "top-left" => Some(Rect::new(x, y, half_width, half_height)),
+            "top" => Some(Rect::new(x, y, width, half_height)),
+            "top-right" => Some(Rect::new(
                 x.checked_add(half_width)?,
                 y,
                 width - half_width,
                 half_height,
             )),
-            BottomLeft => Some(Rect::new(
+            "bottom-left" => Some(Rect::new(
                 x,
                 y.checked_add(half_height)?,
                 half_width,
                 height - half_height,
             )),
-            Bottom => Some(Rect::new(
+            "bottom" => Some(Rect::new(
                 x,
                 y.checked_add(half_height)?,
                 width,
                 height - half_height,
             )),
-            BottomRight => Some(Rect::new(
+            "bottom-right" => Some(Rect::new(
                 x.checked_add(half_width)?,
                 y.checked_add(half_height)?,
                 width - half_width,
                 height - half_height,
             )),
-            Left => Some(Rect::new(x, y, half_width, height)),
-            Fullscreen => Some(Rect::new(x, y, width, height)),
-            Right => Some(Rect::new(
+            "left" => Some(Rect::new(x, y, half_width, height)),
+            "fullscreen" => Some(Rect::new(x, y, width, height)),
+            "right" => Some(Rect::new(
                 x.checked_add(half_width)?,
                 y,
                 width - half_width,
                 height,
             )),
-            WindowLayoutAction::Rect(_) => {
-                unreachable!("only named presets have a legacy formula")
-            }
+            _ => unreachable!("{name:?} is no preset"),
         }
     }
 
     #[test]
     fn presets_match_legacy_half_split_bounds_for_every_small_work_area() {
-        for action in PRESETS {
+        for name in NAMES {
             for width in 0..=257 {
                 for height in [0, 1, 2, 3, 99, 100, 101, 1079, 1080, 2160] {
                     for origin in [(0, 0), (37, -12)] {
                         let work_area = Rect::new(origin.0, origin.1, width, height);
                         assert_eq!(
-                            action.rect().to_work_area_bounds(work_area),
-                            legacy_preset_bounds(action, work_area),
-                            "{action:?} diverged for work area {work_area:?}"
+                            preset(name).to_work_area_bounds(work_area),
+                            legacy_preset_bounds(name, work_area),
+                            "{name} diverged for work area {work_area:?}"
                         );
                     }
                 }
@@ -422,16 +383,16 @@ mod tests {
     fn presets_match_legacy_bounds_at_extreme_extents_and_origins() {
         let extents = [1, 2, 3, 4097, i32::MAX - 1, i32::MAX];
         let origins = [i32::MIN, -1, 0, 1, i32::MAX - 3, i32::MAX];
-        for action in PRESETS {
+        for name in NAMES {
             for &width in &extents {
                 for &height in &extents {
                     for &ox in &origins {
                         for &oy in &origins {
                             let work_area = Rect::new(ox, oy, width, height);
                             assert_eq!(
-                                action.rect().to_work_area_bounds(work_area),
-                                legacy_preset_bounds(action, work_area),
-                                "{action:?} diverged for work area {work_area:?}"
+                                preset(name).to_work_area_bounds(work_area),
+                                legacy_preset_bounds(name, work_area),
+                                "{name} diverged for work area {work_area:?}"
                             );
                         }
                     }
@@ -506,14 +467,14 @@ mod tests {
             right_nine_tenths.to_work_area_bounds(Rect::new(0, 0, 10, 5)),
             Some(Rect::new(1, 0, 9, 5))
         );
-        let full = WindowLayoutAction::Fullscreen.rect();
+        let full = preset("fullscreen");
         assert_eq!(full.to_work_area_bounds(Rect::new(0, 0, 0, 10)), None);
         assert_eq!(full.to_work_area_bounds(Rect::new(0, 0, 10, -1)), None);
         assert_eq!(
             full.to_work_area_bounds(Rect::new(0, 0, 1, 1)),
             Some(Rect::new(0, 0, 1, 1))
         );
-        let right = WindowLayoutAction::Right.rect();
+        let right = preset("right");
         assert_eq!(
             right.to_work_area_bounds(Rect::new(i32::MAX, 0, 4, 4)),
             None
@@ -533,12 +494,6 @@ mod tests {
             rect.to_work_area_bounds(Rect::new(0, 0, 7, 9)),
             Some(Rect::new(0, 0, 7, 9))
         );
-    }
-
-    #[test]
-    fn configured_rect_action_maps_its_own_rectangle() {
-        let rect = NormalizedRect::new(0.1, 0.2, 0.3, 0.4).unwrap();
-        assert_eq!(WindowLayoutAction::Rect(rect).rect(), rect);
     }
 
     #[test]
@@ -577,28 +532,29 @@ mod tests {
         );
     }
 
-    /// The preset table, written independently of `WindowLayoutAction::rect`.
-    const PRESET_COMPONENTS: [(WindowLayoutAction, [f64; 4]); 9] = [
-        (WindowLayoutAction::TopLeft, [0.0, 0.0, 0.5, 0.5]),
-        (WindowLayoutAction::Top, [0.0, 0.0, 1.0, 0.5]),
-        (WindowLayoutAction::TopRight, [0.5, 0.0, 0.5, 0.5]),
-        (WindowLayoutAction::Left, [0.0, 0.0, 0.5, 1.0]),
-        (WindowLayoutAction::Fullscreen, [0.0, 0.0, 1.0, 1.0]),
-        (WindowLayoutAction::Right, [0.5, 0.0, 0.5, 1.0]),
-        (WindowLayoutAction::BottomLeft, [0.0, 0.5, 0.5, 0.5]),
-        (WindowLayoutAction::Bottom, [0.0, 0.5, 1.0, 0.5]),
-        (WindowLayoutAction::BottomRight, [0.5, 0.5, 0.5, 0.5]),
+    /// The preset table, written independently of [`PRESETS`].
+    const PRESET_COMPONENTS: [(&str, [f64; 4]); 9] = [
+        ("top-left", [0.0, 0.0, 0.5, 0.5]),
+        ("top", [0.0, 0.0, 1.0, 0.5]),
+        ("top-right", [0.5, 0.0, 0.5, 0.5]),
+        ("left", [0.0, 0.0, 0.5, 1.0]),
+        ("fullscreen", [0.0, 0.0, 1.0, 1.0]),
+        ("right", [0.5, 0.0, 0.5, 1.0]),
+        ("bottom-left", [0.0, 0.5, 0.5, 0.5]),
+        ("bottom", [0.0, 0.5, 1.0, 0.5]),
+        ("bottom-right", [0.5, 0.5, 0.5, 0.5]),
     ];
 
     /// The `const fn` preset shortcut must never drift from validation.
     #[test]
     fn presets_equal_the_validated_rect_of_the_same_values() {
-        assert_eq!(PRESET_COMPONENTS.map(|(action, _)| action), PRESETS);
-        for (action, [x, y, width, height]) in PRESET_COMPONENTS {
+        assert_eq!(PRESET_COMPONENTS.map(|(name, _)| name), NAMES);
+        assert_eq!(PRESETS.map(|(name, _)| name), NAMES);
+        for (name, [x, y, width, height]) in PRESET_COMPONENTS {
             assert_eq!(
                 NormalizedRect::new(x, y, width, height),
-                Ok(action.rect()),
-                "{action:?}"
+                Ok(preset(name)),
+                "{name}"
             );
         }
     }
@@ -608,7 +564,7 @@ mod tests {
     #[test]
     fn named_actions_doc_table_matches_the_presets() {
         const DOC: &str = include_str!("../docs/WINDOW_SHORTCUT_CONFIGURATION.md");
-        let rows: Vec<(WindowLayoutAction, [f64; 4])> = DOC
+        let rows: Vec<(&str, [f64; 4])> = DOC
             .lines()
             .skip_while(|line| line.trim() != "### Named actions")
             .skip(1)
@@ -625,8 +581,6 @@ mod tests {
                 let [name, rect] = cells[..] else {
                     panic!("a row has an action and a rectangle: {line:?}");
                 };
-                let action = WindowLayoutAction::from_name(name)
-                    .unwrap_or_else(|| panic!("unknown action {name:?}"));
                 let values: Vec<f64> = rect
                     .trim_start_matches('[')
                     .trim_end_matches(']')
@@ -636,23 +590,23 @@ mod tests {
                 let rect = values
                     .try_into()
                     .unwrap_or_else(|_| panic!("four values: {line:?}"));
-                (action, rect)
+                (name, rect)
             })
             .collect();
 
-        assert_eq!(rows.len(), PRESETS.len(), "one row per preset");
-        for preset in PRESETS {
+        assert_eq!(rows.len(), NAMES.len(), "one row per preset");
+        for name in NAMES {
             assert_eq!(
-                rows.iter().filter(|(action, _)| *action == preset).count(),
+                rows.iter().filter(|(row, _)| *row == name).count(),
                 1,
-                "{preset:?} appears once"
+                "{name} appears once"
             );
         }
-        for (action, [x, y, width, height]) in rows {
+        for (name, [x, y, width, height]) in rows {
             assert_eq!(
                 NormalizedRect::new(x, y, width, height),
-                Ok(action.rect()),
-                "{action:?}"
+                Ok(preset(name)),
+                "{name}"
             );
         }
     }
@@ -682,26 +636,15 @@ mod tests {
 
     #[test]
     fn preset_names_parse_case_insensitively_and_reject_others() {
-        let names = [
-            "top-left",
-            "top",
-            "top-right",
-            "left",
-            "fullscreen",
-            "right",
-            "bottom-left",
-            "bottom",
-            "bottom-right",
-        ];
-        for (name, action) in names.into_iter().zip(PRESETS) {
-            assert_eq!(WindowLayoutAction::from_name(name), Some(action));
+        for (name, rect) in PRESETS {
+            assert_eq!(NormalizedRect::preset(name), Some(rect), "{name}");
         }
         assert_eq!(
-            WindowLayoutAction::from_name(" Top-Left "),
-            Some(WindowLayoutAction::TopLeft)
+            NormalizedRect::preset(" Top-Left "),
+            Some(preset("top-left"))
         );
         for other in ["", "tile", "top_left", "window.place"] {
-            assert_eq!(WindowLayoutAction::from_name(other), None, "{other:?}");
+            assert_eq!(NormalizedRect::preset(other), None, "{other:?}");
         }
     }
 

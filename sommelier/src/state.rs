@@ -65,10 +65,12 @@ pub(crate) use self::render::{
     SurfaceRect, SurfaceState, ViewportState,
 };
 pub(crate) use self::window_placement::{
-    Placement, PlacementState, PlacementStep, Point, WindowPlacementState,
+    Placement, PlacementState, PlacementStep, Point, WindowPlacement,
 };
 pub(crate) use self::xdg_roles::XdgRoles;
 use crate::placement_config::PlacementConfig;
+use crate::settings::Settings;
+use std::rc::Rc;
 
 /// A Wayland object ID allocated by the **guest** (client) side, as
 /// [`ShadowTable`] keys guest objects.
@@ -369,9 +371,9 @@ pub struct Context {
     pub keyboard_to_seat: BTreeMap<u32, u32>,
     pub keyboard_focus: KeyboardFocusRegistry,
     pub pointer_focus: PointerFocus,
-    /// Wheel steps from touchpad scrolling, for a connection whose client
-    /// [`crate::client_kind`] chose when it connected; `None` otherwise.
-    pub(crate) wheel_steps: Option<crate::handler::pointer::WheelSteps>,
+    /// Wheel steps from touchpad scrolling, which the client gets if
+    /// [`crate::client_kind`] chooses it.
+    pub(crate) wheel_steps: crate::handler::pointer::WheelSteps,
     pub last_sender_id: u32,
     /// Requests the message being dispatched sends the host besides its
     /// forward (an ack_key or a bind, say); part of its [`Effects`].
@@ -388,8 +390,10 @@ pub struct Context {
     /// The fence the message being dispatched waits for, if it does; see
     /// [`Self::wait_for_fence`].
     fence_wait: Option<FenceWait>,
+    /// The process's settings, shared by every connection.
+    settings: Rc<Settings>,
     /// The process's virtio-gpu render node, shared by every client.
-    pub virtgpu: Option<Arc<VirtGpuDevice>>,
+    virtgpu: Option<Arc<VirtGpuDevice>>,
     /// Test-only capability override for exercising synthetic dma-buf
     /// feedback lifecycle without depending on the runner's `/dev/dri`.
     #[cfg(test)]
@@ -399,7 +403,8 @@ pub struct Context {
     /// until it is readable (see `handler::compositor::plane_fence`).
     #[cfg(test)]
     pub plane_fences_for_test: Option<PlaneFenceForTest>,
-    pub virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
+    /// This connection's VirtWL channel to the host, if it has one.
+    virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
     pub host_dmabuf_id: Option<u32>,
     /// Global name that produced the currently bound internal dmabuf object.
     pub host_dmabuf_global_name: Option<u32>,
@@ -465,10 +470,6 @@ pub struct Context {
     /// than after it, and not again with a new keymap, so focus changes and
     /// keymaps must not reset them.
     pub(crate) keyboard_modifiers: BTreeMap<HostId, KeyboardModifiers>,
-    /// The process-wide placement configuration: host accelerators and the
-    /// placement bindings. Shared, never copied:
-    /// bindings reloaded on any connection are visible to the next lookup.
-    placement: Arc<PlacementConfig>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
@@ -520,17 +521,12 @@ pub struct Context {
     /// Guest dmabuf factory ID to the host-global generation from which it was
     /// bound. Global removal does not invalidate an already-bound factory.
     pub dmabuf_guest_generations: BTreeMap<u32, u64>,
-    pub gpu_accel: bool,
-    pub xdg_decoration: bool,
     /// The internal host zaura_shell binding (not exposed to the guest), if
     /// one is bound.
     pub(crate) host_zaura_shell: Option<HostAuraShell>,
-    /// VM identifier for ChromeOS guest_os app ID formatting, resolved once
-    /// in `main` (see [`vm_identifier_from_environment`]).
-    pub vm_identifier: String,
-    /// This connection's window placement state (see
-    /// [`WindowPlacementState`] for what it owns). Built from `placement`.
-    pub(crate) window_placement: WindowPlacementState,
+    /// This connection's window placement, while it is on (see
+    /// [`WindowPlacement`] for what it owns); decided as it connects.
+    window_placement: Option<WindowPlacement>,
     /// This connection's bound host outputs (see [`OutputRegistry`] for what
     /// it owns).
     pub(crate) outputs: OutputRegistry,
@@ -966,29 +962,22 @@ impl Context {
             .take_guest_owner_if(host_keyboard_id, key, expected)
     }
 
-    /// Create the state for one client connection from inputs `main`
-    /// resolved once for the process; reads no environment.
+    /// Create the state of one client connection.
     ///
     /// # Arguments
     ///
-    /// * `gpu_accel`, `xdg_decoration` - the command-line feature switches.
-    /// * `vm_identifier` - the VM namespace of application IDs (see
-    ///   [`vm_identifier_from_environment`]).
-    /// * `virtgpu` - the process's virtio-gpu render node, if it has one
-    ///   (see [`crate::allocator::VirtGpuNode`]).
-    /// * `placement` - the process-wide placement configuration; `Context`
-    ///   never reads placement variables itself. It is refreshed first, so
-    ///   a client that connects after the bindings file appeared gets
+    /// * `settings` - the process's settings.
+    /// * `facts` - what the connection learned as it was set up. It has
+    ///   placement exactly while the shared bindings are valid now, so a
+    ///   client that connects after the bindings file appeared gets
     ///   placement, and one that connects after it went does not.
-    pub fn new(
-        gpu_accel: bool,
-        xdg_decoration: bool,
-        vm_identifier: String,
-        virtgpu: Option<Arc<VirtGpuDevice>>,
-        placement: Arc<PlacementConfig>,
-    ) -> Self {
-        placement.refresh();
-        let window_placement = WindowPlacementState::new(placement.is_active());
+    pub(crate) fn new(settings: Rc<Settings>, facts: ConnectionFacts) -> Self {
+        let ConnectionFacts {
+            virtwl,
+            virtgpu,
+            wheel,
+            placement,
+        } = facts;
         Self {
             shadow_table: ShadowTable::new(),
             pools: BTreeMap::new(),
@@ -999,19 +988,20 @@ impl Context {
             keyboard_to_seat: BTreeMap::new(),
             keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),
-            wheel_steps: None,
+            wheel_steps: crate::handler::pointer::WheelSteps::new(wheel),
             last_sender_id: 0,
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),
             session_end: None,
             post_dispatch: Vec::new(),
             fence_wait: None,
+            settings,
             virtgpu,
             #[cfg(test)]
             synthetic_feedback_available_for_test: false,
             #[cfg(test)]
             plane_fences_for_test: None,
-            virtwayland_channel: None,
+            virtwayland_channel: virtwl,
             host_dmabuf_id: None,
             host_dmabuf_global_name: None,
             host_shm_id: None,
@@ -1032,7 +1022,6 @@ impl Context {
             keyboard_repeatable_keys: BTreeMap::new(),
             keyboard_xkb_states: BTreeMap::new(),
             keyboard_modifiers: BTreeMap::new(),
-            placement,
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
             registries: BTreeMap::new(),
@@ -1048,11 +1037,8 @@ impl Context {
             internal_callbacks: InternalCallbacks::default(),
             pending_dmabuf_globals: Vec::new(),
             dmabuf_guest_generations: BTreeMap::new(),
-            gpu_accel,
-            xdg_decoration,
             host_zaura_shell: None,
-            vm_identifier,
-            window_placement,
+            window_placement: WindowPlacement::connect(placement),
             outputs: OutputRegistry::default(),
             gtk_shells: BTreeMap::new(),
             gtk_surfaces: BTreeMap::new(),
@@ -1063,105 +1049,114 @@ impl Context {
         }
     }
 
-    /// Test-only constructor that reads no environment variable and probes
-    /// no DRM device.
-    ///
-    /// Placement is off and `accelerators` are the host accelerators. The VM identifier is the default `termina`, and there
-    /// is no virtio-gpu device.
+    /// A test's connection: [`Settings::for_test`] with the given switches
+    /// and host accelerators, and [`ConnectionFacts::for_test`].
     #[cfg(test)]
     pub fn new_for_test(
         gpu_accel: bool,
         xdg_decoration: bool,
         accelerators: Vec<crate::accelerator::Accelerator>,
     ) -> Self {
-        Self::new(
+        let settings = Settings {
             gpu_accel,
             xdg_decoration,
-            resolve_vm_identifier(None),
-            None,
-            Arc::new(PlacementConfig::for_test(accelerators)),
+            host_accelerators: accelerators.into(),
+            ..Settings::for_test()
+        };
+        Self::new(Rc::new(settings), ConnectionFacts::for_test())
+    }
+
+    /// A test's connection with the placement configuration `placement`,
+    /// for example `PlacementConfig::active_for_test`.
+    #[cfg(test)]
+    pub(crate) fn with_placement_for_test(placement: PlacementConfig) -> Self {
+        Self::for_test(Settings::for_test(), placement)
+    }
+
+    /// A test's connection with `settings` and the placement
+    /// configuration `placement`.
+    #[cfg(test)]
+    pub(crate) fn for_test(settings: Settings, placement: PlacementConfig) -> Self {
+        Self::new(
+            Rc::new(settings),
+            ConnectionFacts {
+                placement,
+                ..ConnectionFacts::for_test()
+            },
         )
     }
 
-    /// Test-only constructor from an explicit placement configuration, for
-    /// example `PlacementConfig::active_for_test`. Like `new_for_test`,
-    /// it reads no environment variable and has no virtio-gpu device.
-    #[cfg(test)]
-    pub(crate) fn with_placement_for_test(placement: impl Into<Arc<PlacementConfig>>) -> Self {
-        Self::new(
-            false,
-            false,
-            resolve_vm_identifier(None),
-            None,
-            placement.into(),
-        )
+    /// The process's settings.
+    pub(crate) fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// The process's virtio-gpu render node, if it has opened.
+    pub(crate) fn virtgpu(&self) -> Option<&VirtGpuDevice> {
+        self.virtgpu.as_deref()
+    }
+
+    /// This connection's VirtWL channel to the host, if it has one.
+    pub(crate) fn virtwayland_channel(&self) -> Option<&Arc<VirtWaylandChannel>> {
+        self.virtwayland_channel.as_ref()
     }
 
     /// Return whether the host keeps this chord (`SOMMELIER_ACCELERATORS`).
     pub(crate) fn is_host_accelerator(&self, chord: &crate::accelerator::Accelerator) -> bool {
-        self.placement.is_host_accelerator(chord)
+        self.settings.host_accelerators.contains(chord)
     }
 
-    /// Return the placement action bound to a chord.
+    /// Where the placement bound to `chord` puts the focused window.
     ///
     /// `None` unless placement is on for this connection and the current
-    /// bindings bind the chord. Bindings that a
-    /// [`refresh_placement_bindings`](Self::refresh_placement_bindings)
-    /// adopted, on any connection, are seen here on the next lookup. Keys
-    /// already captured as compositor shortcuts are tracked by key
-    /// ownership, not by binding, so a dropped binding cannot strand a held
-    /// key.
-    pub(crate) fn placement_action_for(
+    /// bindings bind the chord. A reload of the bindings file replaces them
+    /// between two messages, so one message sees one version. Keys already
+    /// captured as compositor shortcuts are tracked by key ownership, not
+    /// by binding, so a dropped binding cannot strand a held key.
+    pub(crate) fn placement_rect_for(
         &self,
         chord: &crate::accelerator::Accelerator,
-    ) -> Option<crate::window_layout::WindowLayoutAction> {
-        if !self.window_placement.is_active() {
-            return None;
-        }
-        self.placement.action_for(chord)
+    ) -> Option<crate::window_layout::NormalizedRect> {
+        self.window_placement.as_ref()?.rect_for(chord)
     }
 
-    /// Load the bindings file again if it changed: one `stat` while
-    /// placement is on for this connection, nothing otherwise. The keyboard
-    /// calls it once per key press, before it classifies the key.
-    pub(crate) fn refresh_placement_bindings(&self) {
-        if self.window_placement.is_active() {
-            self.placement.refresh();
-        }
+    /// This connection's placement state, while placement is on for it.
+    pub(crate) fn placement(&self) -> Option<&PlacementState> {
+        Some(&self.window_placement.as_ref()?.state)
+    }
+
+    /// [`placement`](Self::placement), mutably.
+    pub(crate) fn placement_mut(&mut self) -> Option<&mut PlacementState> {
+        Some(&mut self.window_placement.as_mut()?.state)
     }
 }
 
-/// The variable that names the VM in ChromeOS application IDs.
-const VM_IDENTIFIER_VARIABLE: &str = "SOMMELIER_VM_IDENTIFIER";
-
-/// Read the VM namespace of ChromeOS application IDs from
-/// [`VM_IDENTIFIER_VARIABLE`] (see [`resolve_vm_identifier`]).
-///
-/// A value that is not UTF-8 is logged and replaced by the default.
-pub(crate) fn vm_identifier_from_environment() -> String {
-    let value = std::env::var_os(VM_IDENTIFIER_VARIABLE).and_then(|value| {
-        value
-            .into_string()
-            .inspect_err(|value| {
-                warn!(
-                    "Ignoring non-UTF-8 {}={:?}; using the default",
-                    VM_IDENTIFIER_VARIABLE, value
-                );
-            })
-            .ok()
-    });
-    resolve_vm_identifier(value)
+/// What one connection learned as it was set up, besides the process's
+/// [`Settings`]: everything [`Context::new`] needs that differs between
+/// connections.
+pub(crate) struct ConnectionFacts {
+    /// Its VirtWL channel to the host, when the host is a VirtWL device.
+    pub(crate) virtwl: Option<Arc<VirtWaylandChannel>>,
+    /// The process's virtio-gpu render node, if it has opened.
+    pub(crate) virtgpu: Option<Arc<VirtGpuDevice>>,
+    /// Whether its client gets wheel steps from touchpad scrolling.
+    pub(crate) wheel: crate::client_kind::WheelClient,
+    /// The process's window placement configuration.
+    pub(crate) placement: PlacementConfig,
 }
 
-/// Resolve the VM namespace used in ChromeOS application IDs.
-///
-/// An exported-but-empty environment variable is equivalent to an unset one.
-/// This mirrors ChromiumOS Sommelier's `strlen(vm_id) != 0` fallback and keeps
-/// generated IDs valid (`org.chromium.guest_os.termina.wayland.<app-id>`).
-fn resolve_vm_identifier(value: Option<String>) -> String {
-    value
-        .filter(|identifier| !identifier.is_empty())
-        .unwrap_or_else(|| "termina".to_string())
+#[cfg(test)]
+impl ConnectionFacts {
+    /// A test connection's: no VirtWL channel or render node, no wheel
+    /// steps, and placement off.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            virtwl: None,
+            virtgpu: None,
+            wheel: crate::client_kind::WheelClient::No,
+            placement: PlacementConfig::for_test(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1179,41 +1174,34 @@ mod tests {
     /// placement when the file goes, with no bindings.
     #[test]
     fn a_connection_takes_placement_from_the_file_when_it_starts() {
-        use crate::window_layout::WindowLayoutAction;
         let dir = crate::test_support::TempDir::new("context-placement-file");
         let path = dir.path().join("window-placement.toml");
-        let placement = Arc::new(PlacementConfig::file_for_test(&path));
-        let before = Context::with_placement_for_test(Arc::clone(&placement));
-        assert!(!before.window_placement.is_active());
+        let (mut file, placement) = crate::placement_config::BindingsFile::loaded_for_test(&path);
+        let before = Context::with_placement_for_test(placement.clone());
+        assert!(before.placement().is_none());
 
         dir.write(
             "window-placement.toml",
             b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
         );
-        before.refresh_placement_bindings();
-        assert!(
-            !placement.is_active(),
-            "a connection that is off checks nothing"
-        );
-        let after = Context::with_placement_for_test(Arc::clone(&placement));
-        assert!(after.window_placement.is_active());
+        file.reload();
+        let after = Context::with_placement_for_test(placement.clone());
+        assert!(after.placement().is_some());
+        let left = crate::window_layout::NormalizedRect::preset("left");
+        assert_eq!(after.placement_rect_for(&alt_q()), left);
         assert_eq!(
-            after.placement_action_for(&alt_q()),
-            Some(WindowLayoutAction::Left)
-        );
-        assert_eq!(
-            before.placement_action_for(&alt_q()),
+            before.placement_rect_for(&alt_q()),
             None,
             "a connection that is off binds nothing"
         );
 
         std::fs::remove_file(&path).unwrap();
-        after.refresh_placement_bindings();
-        assert_eq!(after.placement_action_for(&alt_q()), None);
-        assert!(after.window_placement.is_active());
-        assert!(!Context::with_placement_for_test(placement)
-            .window_placement
-            .is_active());
+        file.reload();
+        assert_eq!(after.placement_rect_for(&alt_q()), None);
+        assert!(after.placement().is_some());
+        assert!(Context::with_placement_for_test(placement)
+            .placement()
+            .is_none());
     }
 
     #[test]
@@ -1227,129 +1215,6 @@ mod tests {
         // A second retirement means the bookkeeping diverged.
         ctx.retire_destroyed_host_object(host_id);
         assert!(ctx.is_fatal());
-    }
-
-    /// The test constructors ignore every `SOMMELIER_*` variable, which a
-    /// developer's environment may set (Crostini sets some), and the
-    /// placement bindings file a developer may have under `XDG_CONFIG_HOME`
-    /// or `HOME`. The test sets all of them, in a child process, with a
-    /// bindings file in both places, so a constructor that read one fails
-    /// here wherever the test runs. It also checks that it sets every
-    /// `SOMMELIER_*` variable the sources name, so a new one cannot be left
-    /// out.
-    #[test]
-    fn test_contexts_read_no_environment() {
-        const VARIABLES: &[(&str, &str)] = &[
-            ("SOMMELIER_ACCELERATORS", "<Alt>w"),
-            // A probe of this node is seen (as an allocator) only where it
-            // is a virtio-gpu render node, as in a Crostini container;
-            // elsewhere a probe fails unseen.
-            ("SOMMELIER_DRM_DEVICE", "/dev/dri/renderD128"),
-            ("SOMMELIER_VM_IDENTIFIER", "penguin-vm"),
-            ("SOMMELIER_WHEEL_FROM_TOUCHPAD", "all"),
-        ];
-        // Variables only tests read.
-        const TEST_ONLY: &[&str] = &["SOMMELIER_DST_", "SOMMELIER_FUZZ_", "SOMMELIER_TEST_"];
-        let named = source_files(std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src"
-        )))
-        .into_iter()
-        .flat_map(|path| {
-            let source = std::fs::read_to_string(&path).expect("read a source file");
-            source
-                .split("\"SOMMELIER_")
-                .skip(1)
-                .filter_map(|rest| {
-                    let (name, _) = rest.split_once('"')?;
-                    // A whole literal of a variable's name, not a message.
-                    (!name.is_empty()
-                        && name
-                            .bytes()
-                            .all(|byte| byte.is_ascii_uppercase() || byte == b'_'))
-                    .then(|| format!("SOMMELIER_{name}"))
-                })
-                .collect::<Vec<_>>()
-        })
-        .filter(|name| !TEST_ONLY.iter().any(|prefix| name.starts_with(prefix)))
-        .collect::<std::collections::BTreeSet<_>>();
-        let set = VARIABLES
-            .iter()
-            .map(|&(name, _)| name.to_string())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(set, named, "the test sets every SOMMELIER_* variable");
-
-        let dir = crate::test_support::TempDir::new("no-environment");
-        let (config_home, home) = (dir.path().join("xdg"), dir.path().join("home"));
-        for config_home in [&config_home, &home.join(".config")] {
-            let file = config_home.join("sommelier-rs/window-placement.toml");
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(
-                file,
-                "version = 1\n[[bindings]]\nchord = \"<Alt>e\"\naction = \"left\"\n",
-            )
-            .unwrap();
-        }
-        let (config_home, home) = (config_home.to_str().unwrap(), home.to_str().unwrap());
-        let mut env = VARIABLES.to_vec();
-        env.extend([("XDG_CONFIG_HOME", config_home), ("HOME", home)]);
-        crate::test_support::in_own_process_with_env(
-            "state::tests::test_contexts_read_no_environment",
-            &env,
-            test_contexts_read_no_environment_in_child,
-        );
-    }
-
-    /// Every `.rs` file under `dir`.
-    fn source_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(dir)
-            .expect("read a source directory")
-            .map(|entry| entry.expect("a source directory entry").path())
-            .flat_map(|path| {
-                if path.is_dir() {
-                    source_files(&path)
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    vec![path]
-                } else {
-                    Vec::new()
-                }
-            })
-            .collect()
-    }
-
-    fn test_contexts_read_no_environment_in_child() {
-        assert_eq!(
-            std::env::var("SOMMELIER_VM_IDENTIFIER").as_deref(),
-            Ok("penguin-vm"),
-            "the child has the variables"
-        );
-        let accelerators = vec![alt_q()];
-        let ctx = Context::new_for_test(true, false, accelerators);
-        assert!(ctx.gpu_accel);
-        assert!(ctx.is_host_accelerator(&alt_q()));
-        assert_eq!(ctx.placement_action_for(&alt_q()), None);
-        assert!(!ctx.window_placement.is_active());
-        assert_eq!(ctx.vm_identifier, "termina");
-        assert!(ctx.virtgpu.is_none(), "no DRM device is probed");
-
-        let ctx = Context::with_placement_for_test(PlacementConfig::for_test(Vec::new()));
-        assert_eq!(ctx.vm_identifier, "termina");
-        assert!(ctx.virtgpu.is_none(), "no DRM device is probed");
-
-        let alt_e = crate::accelerator::parse_accelerator("<Alt>e").unwrap();
-        assert_eq!(
-            PlacementConfig::from_environment().action_for(&alt_e),
-            Some(crate::window_layout::WindowLayoutAction::Left),
-            "the child has a bindings file"
-        );
-        assert_eq!(ctx.placement_action_for(&alt_e), None);
-        assert!(!ctx.window_placement.is_active());
-        let ctx = Context::with_placement_for_test(PlacementConfig::active_for_test(&[]));
-        assert_eq!(
-            ctx.placement_action_for(&alt_e),
-            None,
-            "no binding of the file"
-        );
     }
 
     fn awaiting_release(has_detached_use: bool) -> RenderBufferUse {
@@ -1418,16 +1283,6 @@ mod tests {
         // Every ready task runs before this one resumes.
         tokio::task::yield_now().await;
         assert!(ctx.clipboard_pumps.slot().is_some());
-    }
-
-    #[test]
-    fn empty_or_missing_vm_identifier_defaults_to_termina() {
-        assert_eq!(resolve_vm_identifier(None), "termina");
-        assert_eq!(resolve_vm_identifier(Some(String::new())), "termina");
-        assert_eq!(
-            resolve_vm_identifier(Some("penguin".to_string())),
-            "penguin"
-        );
     }
 
     #[test]
