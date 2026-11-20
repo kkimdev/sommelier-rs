@@ -288,7 +288,7 @@ invariants, and how each guarantee is enforced.
 | `host.rs` | `HostTarget`, `target`, `reconcile` over `LinkState`, and the content-type mapping and requests |
 | `guest.rs` | `Preedit` and `GuestTxn`, whose `encode` is the only builder of the v3 transaction events |
 | `mirror.rs` | `ExoMirror`, the replica of Exo's `SurroundingTextTracker` |
-| `exo_view.rs` | `ExoView`: a text input's mirror and whether the guest is in step with Exo; `Frame`, which measures X1 and H9, and `Unmeasured`, why the core drops one |
+| `exo_view.rs` | `ExoView`: a text input's mirror and whether the guest is in step with Exo; `Observation`, a host edit the mirror took; `Frame`, which measures X1 and H9, and `Unmeasured`, why the core drops one |
 | `tests.rs` | The row tests of section 2, the encoder table and the source tests |
 
 `ime` imports nothing from `handler`. From the rest of the crate it
@@ -385,10 +385,24 @@ pending and the field is focused. `Current`'s fields are private to
 `state.rs`, so no other module can forge one. Each of its methods plans
 the transaction of one row: `preedit` (H7), `host_commit` (H8), `plan`
 (H9 and X1, a transaction `exo_view::Frame` measured), `confirm` (X2, or
-X2' with nothing shown), `press_commit` (F4) and `commit_shown` (F1,
-H2). A plan (`Planned`) changes nothing until `Planned::apply`, which
-encodes the transaction and makes its change only if the encoding fits.
-So no arm can apply a change whose encoding failed.
+X2' with nothing shown), `commit_composition` (X1's empty region, X2),
+`press_commit` (F4) and `commit_shown` (F1, H2). A plan (`Planned`)
+changes nothing until `Planned::apply`, which encodes the transaction
+and makes its change only if the encoding fits. So no arm can apply a
+change whose encoding failed.
+
+**The Exo view's order.** `TextInput::observe` hands a host edit to the
+Exo view before the gate: it makes the edit's frame, lets the mirror
+take the edit, and then finds whether the frame measures it. It returns
+an `exo_view::Observation`, which only `ExoView::finish` consumes, with
+what reached the guest. Every path of the edit hands the observation on:
+`Current`'s row methods take it, `Planned::apply` finishes it whether
+the transaction fits or not, and `Current::drop_edit`,
+`Current::edits_nothing` and `TextInput::stale` finish the edits that
+plan nothing. `Current` borrows the view, so `Planned::apply` also
+records a press's `reset` (F4) and an edit with no event of Exo's (F1,
+H2). A report the core withholds is decided by a pure query
+(`ExoView::withholding`), and applied by `ExoView::withhold`.
 
 **Invariants.** `ImeCore::assert_invariants(&self, env)` checks I1a to
 I3, I6 and I7 after every `step` in tests, and

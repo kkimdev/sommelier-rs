@@ -18,7 +18,7 @@ limitations under the License.
 //! reconcile of every text input, then removals. Each arm decides, which
 //! includes encoding, before it changes anything (design 3.5).
 
-use super::exo_view::{Frame, Reached, Unmeasured};
+use super::exo_view::{Frame, Observation, Unmeasured};
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
 use super::state::{Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput, V3Pending};
@@ -318,11 +318,8 @@ impl ImeCore {
             HostIme::Edit(edit) => edit,
         };
         let pieces = t.take_pieces();
-        let frame = t.exo().frame(t.shown(), &edit);
-        t.exo_mut().observe(ti, &edit, &pieces);
-        let measuring = t.exo().measuring(&frame);
-        let reached = composition_event(ti, t, edit, &pieces, measuring, fx);
-        t.exo_after(frame.as_ref().ok(), reached);
+        let observation = t.observe(ti, &edit, &pieces);
+        composition_event(ti, t, edit, &pieces, observation, fx);
     }
 
     /// X2': the guest gets the recovered key's `pair`, then G9c's answer,
@@ -397,7 +394,6 @@ impl ImeCore {
                         request: zwp_text_input_v1::req::reset(t.host().v1),
                         barrier: fence,
                     });
-                    t.exo_mut().cancel_sent(fence);
                     fx.keys.push(lease);
                 }
                 Err(TooLong) => {
@@ -478,26 +474,27 @@ impl ImeCore {
                     None => (false, None, None),
                 };
             // A report applies at the barrier glued to it, which places it
-            // among Exo's events for the mirror. One
-            // the guest stated that Exo could only drop its composition for is
-            // withheld (5); the rest of the commit still goes out.
-            let surrounding_text = surrounding_text.filter(|(_, (report, stated))| {
-                let withheld = *stated && t.withholds_report(report);
-                if withheld {
-                    log::debug!(
-                        "Withholding the surrounding text of text input {}: Exo holds it \
-                         with the composition the guest shows",
-                        ti.0
-                    );
-                }
-                !withheld
-            });
+            // among Exo's events for the mirror. One the guest stated that
+            // Exo could only drop its composition for is withheld (5); the
+            // rest of the commit still goes out.
             if let Some((request, (report, stated))) = surrounding_text {
-                let barrier = BarrierToken(self.next_barrier);
-                self.next_barrier += 1;
-                let one_read = request.0.len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
-                fx.to_host.push(HostOut::Glued { request, barrier });
-                t.exo_mut().report_sent(barrier, report, one_read, stated);
+                match stated.then(|| t.withholding(&report)).flatten() {
+                    Some(withheld) => {
+                        log::debug!(
+                            "Withholding the surrounding text of text input {}: Exo holds it \
+                             with the composition the guest shows",
+                            ti.0
+                        );
+                        t.exo_mut().withhold(withheld);
+                    }
+                    None => {
+                        let barrier = BarrierToken(self.next_barrier);
+                        self.next_barrier += 1;
+                        let one_read = request.0.len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
+                        fx.to_host.push(HostOut::Glued { request, barrier });
+                        t.exo_mut().report_sent(barrier, report, one_read, stated);
+                    }
+                }
             }
             if let Some(content_type) = steps.content_type {
                 let requests = host::content_type_requests(host.ext.id, content_type);
@@ -523,20 +520,21 @@ impl ImeCore {
 
 /// H7 to H9, X1 and X2 through the gate: plan the edit's transaction, with
 /// the pieces Exo sent before it, and send it. A delete and a region are
-/// measured in the frame `measuring` holds, Exo's text before the edit, or
-/// dropped. Returns what reached the guest, if the edit did.
+/// measured in the frame of `observation`, Exo's text before the edit, or
+/// dropped. Every path finishes the observation with what reached the
+/// guest.
 fn composition_event(
     ti: TiId,
     t: &mut TextInput,
     edit: Edit,
     pieces: &V1Pieces,
-    measuring: Result<&Frame, Unmeasured>,
+    observation: Observation,
     fx: &mut Effects,
-) -> Option<Reached> {
+) {
     let count = t.serial().get();
     let Some(cur) = t.current(ti) else {
         log::debug!("Ignoring a stale composition event of text input {}", ti.0);
-        return None;
+        return t.stale(observation);
     };
     // A region dropped, whose empty range commits the shown preedit.
     let mut dropped = None;
@@ -547,16 +545,17 @@ fn composition_event(
             // invalid sequence would move.
             let IndexedString::Utf8(text) = text else {
                 log::debug!("Ignoring a host preedit that is not UTF-8");
-                return None;
+                return cur.drop_edit(observation);
             };
-            cur.preedit(text, pieces)
+            cur.preedit(text, pieces, observation)
         }
         Edit::Commit { serial, text } => {
             log_host_serial(serial, count);
-            cur.host_commit(text)
+            cur.host_commit(text, observation)
         }
         Edit::Delete { index, length } => {
-            let lengths = measuring
+            let lengths = observation
+                .measuring()
                 .map_err(DeleteDrop::Unmeasured)
                 .and_then(Frame::delete);
             match lengths {
@@ -565,52 +564,47 @@ fn composition_event(
                         delete: Some(lengths),
                         ..GuestTxn::default()
                     };
-                    cur.plan(txn, LeaseOutcome::End)
+                    cur.plan(txn, LeaseOutcome::End, observation)
                 }
-                // An empty delete edits nothing, so the guest stays as
-                // Exo is.
-                Err(DeleteDrop::Empty) => return Some(Reached::default()),
+                Err(DeleteDrop::Empty) => return cur.edits_nothing(observation),
                 Err(drop) => {
                     log_delete_drop(ti, index, length, drop);
                     // Exo edited its text, unless the range was empty.
                     if length > 0 {
-                        fx.keys.push(lease(ti, t, LeaseOutcome::End));
+                        fx.keys.push(cur.lease(LeaseOutcome::End));
                     }
-                    return None;
+                    return cur.drop_edit(observation);
                 }
             }
         }
         Edit::PreeditRegion { index, length } => {
-            let txn = measuring
+            let txn = observation
+                .measuring()
                 .map_err(RegionDrop::Unmeasured)
                 .and_then(|frame| frame.region(pieces));
             match txn {
-                Ok(txn) => cur.plan(txn, LeaseOutcome::End),
+                Ok(txn) => cur.plan(txn, LeaseOutcome::End, observation),
                 // Exo ends its composition at an empty region, measured or
                 // not, and leaves it as text: the guest commits what it
                 // shows, which at worst doubles text the next preedit
                 // would otherwise replace.
                 Err(drop) if length == 0 && cur.shown().is_some() => {
                     dropped = Some((index, length, drop));
-                    cur.commit_shown()
+                    cur.commit_composition(observation)
                 }
                 Err(drop) => {
                     log_region_drop(ti, index, length, drop);
                     // Exo edited its composition all the same.
-                    fx.keys.push(lease(ti, t, LeaseOutcome::End));
-                    return None;
+                    fx.keys.push(cur.lease(LeaseOutcome::End));
+                    return cur.drop_edit(observation);
                 }
             }
         }
-        Edit::Confirm { .. } => match cur.confirm() {
+        Edit::Confirm { .. } => match cur.confirm(observation) {
             Confirm::Commit(planned) => planned,
-            Confirm::RecoverHeldKey(recover) => {
-                fx.keys.push(recover);
-                return Some(Reached::default());
-            }
+            Confirm::RecoverHeldKey(recover) => return fx.keys.push(recover),
         },
     };
-    let reached = planned.reached();
     let applied = planned.apply();
     if let Some((index, length, drop)) = dropped {
         log_region_drop(ti, index, length, drop);
@@ -619,15 +613,11 @@ fn composition_event(
         Ok((events, lease)) => {
             fx.to_guest.extend(events);
             fx.keys.push(lease);
-            Some(reached)
         }
-        Err(TooLong) => {
-            log::warn!(
-                "Dropping a host event of text input {}: its text does not fit a message",
-                ti.0
-            );
-            None
-        }
+        Err(TooLong) => log::warn!(
+            "Dropping a host event of text input {}: its text does not fit a message",
+            ti.0
+        ),
     }
 }
 
@@ -712,8 +702,6 @@ fn commit_shown(ti: TiId, t: &mut TextInput, fx: &mut Effects) {
         Ok((events, lease)) => {
             fx.to_guest.extend(events);
             fx.keys.push(lease);
-            // An edit with no event of Exo's, which may not hold the text.
-            t.exo_mut().step_lost();
         }
         Err(TooLong) => log::warn!(
             "Dropping the commit of text input {}'s preedit: too long",

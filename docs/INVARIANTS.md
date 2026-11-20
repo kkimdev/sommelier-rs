@@ -1315,7 +1315,7 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
     never deletes or loses the guest's text, and the guest's next report,
     which names no state of Exo's, resets Exo to the guest's text.
   - With a mirror, a guest report that would only drop Exo's composition
-    is withheld (`ime::exo_view::ExoView::withholds`; G9c of
+    is withheld (`ime::exo_view::ExoView::withholding`; G9c of
     [IME.md](IME.md#21-guest-requests)).
     A v3 guest reports its text without
     the preedit it shows, while every state Exo predicted since the
