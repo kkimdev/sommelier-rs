@@ -45,6 +45,8 @@ mod frame_cost;
 mod fuzz;
 #[cfg(test)]
 pub(crate) mod harness;
+#[cfg(test)]
+mod replay;
 
 // A frame can generate many small Wayland requests (damage, attach, commit,
 // callbacks, and buffer bookkeeping).  Keep one client from processing an

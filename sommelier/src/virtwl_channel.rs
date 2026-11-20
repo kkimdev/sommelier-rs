@@ -270,6 +270,9 @@ pub struct VirtWaylandChannel {
     // We wrap it in AsyncFd for polling
     ctx_fd: AsyncFd<OwnedFd>,
     supports_dmabuf: bool,
+    /// A test's stand-in for a channel ([`Self::stand_in_for_test`]).
+    #[cfg(test)]
+    stand_in: bool,
 }
 
 impl VirtWaylandChannel {
@@ -313,6 +316,27 @@ impl VirtWaylandChannel {
             dev_file,
             ctx_fd: AsyncFd::new(ctx_fd)?,
             supports_dmabuf,
+            #[cfg(test)]
+            stand_in: false,
+        })
+    }
+
+    /// A stand-in for a channel, with no device behind it, for a test that
+    /// needs the proxy to have one, as a replay of a trace recorded over a
+    /// channel does (`proxy::replay`): where the device allocates shared
+    /// memory or a pipe, the stand-in allocates a memfd or a pipe, which
+    /// reach the host as the device's would, as descriptors; it allocates
+    /// no dma-buf, and carries no traffic.
+    #[cfg(test)]
+    pub(crate) fn stand_in_for_test(supports_dmabuf: bool) -> io::Result<Self> {
+        use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+        let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+        let (ctx_fd, _) = socketpair(AddressFamily::Unix, SockType::Stream, None, flags)?;
+        Ok(Self {
+            dev_file: File::open("/dev/null")?,
+            ctx_fd: AsyncFd::new(ctx_fd)?,
+            supports_dmabuf,
+            stand_in: true,
         })
     }
 
@@ -321,6 +345,12 @@ impl VirtWaylandChannel {
     }
 
     pub fn allocate(&self, size: u32) -> io::Result<OwnedFd> {
+        #[cfg(test)]
+        if self.stand_in {
+            let file = crate::test_support::shm_pool_file(&[]);
+            file.set_len(size.into())?;
+            return Ok(file.into());
+        }
         let mut new_alloc = crate::virtwl::virtwl_ioctl_new::new_alloc(size);
         let ioctl_result = unsafe { virtwl_ioctl_new(self.dev_file.as_raw_fd(), &mut new_alloc) };
         take_returned_fd(ioctl_result, new_alloc.fd, "VIRTWL_IOCTL_NEW_ALLOC")
@@ -374,6 +404,10 @@ impl VirtWaylandChannel {
 
     /// A pipe the host writes and the guest reads.
     pub fn create_read_pipe(&self) -> io::Result<OwnedFd> {
+        #[cfg(test)]
+        if self.stand_in {
+            return Ok(crate::test_support::pipe().0);
+        }
         let mut new_pipe = crate::virtwl::virtwl_ioctl_new::new_pipe_read();
         let ioctl_result = unsafe { virtwl_ioctl_new(self.dev_file.as_raw_fd(), &mut new_pipe) };
         take_returned_fd(ioctl_result, new_pipe.fd, "VIRTWL_IOCTL_NEW_PIPE")

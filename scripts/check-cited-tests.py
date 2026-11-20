@@ -11,6 +11,10 @@ the only test of that name, and not a test of the DST's models or harness
 in sommelier/src/sim/, which pins those rather than the proxy; the DST's
 runs and its regressions may be cited.
 
+A "Trace:" or "Traces:" clause cites recorded host traces the same way:
+every backticked name in it must be a tracked file in traces/, which the
+replay test of the corpus replays.
+
 Usage: python3 -I scripts/check-cited-tests.py
 """
 
@@ -21,6 +25,9 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLAUSE = re.compile(r"\b[Tt]ests?:")
+# Not a path such as `trace::Recorder`.
+TRACE_CLAUSE = re.compile(r"\b[Tt]races?:(?!:)")
+TRACES = "traces/"
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # A function under `#[test]` or `#[tokio::test(...)]` at the start of a
 # line, not in a comment, past any other attributes and doc comments.
@@ -69,12 +76,12 @@ def clause_names(text: str, start: int) -> list[str]:
     return names
 
 
-def cited_names(doc: pathlib.Path) -> list[str]:
+def cited_names(doc: pathlib.Path, clause: re.Pattern = CLAUSE) -> list[str]:
     text = doc.read_text(encoding="utf-8")
     return [
         name
-        for clause in CLAUSE.finditer(text)
-        for name in clause_names(text, clause.end())
+        for found in clause.finditer(text)
+        for name in clause_names(text, found.end())
     ]
 
 
@@ -100,10 +107,15 @@ def defined_tests() -> dict[str, list[str]]:
 
 def main() -> int:
     tests = defined_tests()
+    traces = {path.relative_to(ROOT).as_posix() for path in tracked(TRACES)}
     failed = False
     total = 0
     for doc in tracked("*.md", ":(exclude)third_party"):
         relative = doc.relative_to(ROOT)
+        for name in cited_names(doc, TRACE_CLAUSE):
+            if TRACES + name not in traces or not name.endswith(".trace"):
+                print(f"{relative} cites `{name}`, which is no trace in {TRACES}")
+                failed = True
         for name in cited_names(doc):
             total += 1
             if not NAME.fullmatch(name):
