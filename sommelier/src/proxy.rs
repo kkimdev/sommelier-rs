@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::allocator::PendingFence;
+use crate::allocator::{PendingFence, VirtGpuDevice};
 use crate::client_kind::WheelFromTouchpad;
 use crate::connection::{OutgoingMessages, WaylandConnection};
 use crate::placement_config::PlacementConfig;
@@ -1166,6 +1166,7 @@ mod tests {
             gpu_accel: false,
             xdg_decoration: false,
             vm_identifier: "termina".to_string(),
+            virtgpu: None,
             placement: Arc::new(PlacementConfig::for_test(Vec::new())),
             wheel_from_touchpad: WheelFromTouchpad::Off,
         }
@@ -4005,6 +4006,7 @@ struct ClientConfig {
     gpu_accel: bool,
     xdg_decoration: bool,
     vm_identifier: String,
+    virtgpu: Option<Arc<VirtGpuDevice>>,
     placement: Arc<PlacementConfig>,
     /// Which clients get wheel steps from touchpad scrolling.
     wheel_from_touchpad: WheelFromTouchpad,
@@ -4018,6 +4020,7 @@ pub async fn run(
     xdg_decoration: bool,
     virtio_wayland: Option<String>,
     vm_identifier: String,
+    virtgpu: Option<VirtGpuDevice>,
     placement: Arc<PlacementConfig>,
     wheel_from_touchpad: WheelFromTouchpad,
     reload_signal: Option<tokio::signal::unix::Signal>,
@@ -4060,6 +4063,7 @@ pub async fn run(
         gpu_accel,
         xdg_decoration,
         vm_identifier,
+        virtgpu: virtgpu.map(Arc::new),
         placement,
         wheel_from_touchpad,
     };
@@ -4172,6 +4176,7 @@ async fn start_client(stream: UnixStream, config: &ClientConfig) -> io::Result<(
             config.gpu_accel,
             config.xdg_decoration,
             config.vm_identifier.clone(),
+            config.virtgpu.clone(),
             Arc::clone(&config.placement),
         ),
     );

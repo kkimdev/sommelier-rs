@@ -163,7 +163,7 @@ fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> std::io::Result<DmabufFe
             },
         );
     }
-    crate::allocator::dmabuf_fence(plane, ctx.allocator.as_ref())
+    crate::allocator::dmabuf_fence(plane, ctx.virtgpu.as_deref())
 }
 
 impl WlCompositorHandler for CompositorHandler {

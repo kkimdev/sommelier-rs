@@ -1,6 +1,5 @@
 {
   lib,
-  libgbm,
   libxkbcommon,
   pkg-config,
   rustPlatform,
@@ -18,7 +17,6 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [
-    libgbm
     libxkbcommon
   ];
 

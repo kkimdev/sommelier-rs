@@ -159,7 +159,6 @@ sudo apt-get install --yes \
   pkg-config \
   libdrm-dev \
   libexpat1-dev \
-  libgbm-dev \
   libxkbcommon-dev
 ```
 

@@ -25,7 +25,7 @@ use log::{debug, error};
 use nix::sys::memfd::MFdFlags;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 /// `DRM_FORMAT_MOD_INVALID` is the legacy implicit-modifier marker used by
 /// the linux-dmabuf v3 format events. Keep this local instead of depending on
@@ -44,28 +44,16 @@ const MAX_TRANCHE_INDICES_PER_EVENT: usize = (MessageHeader::MAX_LEN - MessageHe
 
 pub struct LinuxDmabufHandler;
 
+/// The virtio-gpu render node's `dev_t`, in native byte order, as the
+/// feedback's `main_device` carries it.
 fn local_device_id(ctx: &Context) -> io::Result<Vec<u8>> {
-    let allocator = ctx.allocator.as_ref().ok_or_else(|| {
+    let virtgpu = ctx.virtgpu.as_deref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "GBM allocator unavailable for synthetic dmabuf feedback",
+            "no virtio-gpu render node for synthetic dmabuf feedback",
         )
     })?;
-    let mut device = vec![0u8; std::mem::size_of::<libc::dev_t>()];
-
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(allocator.device.as_fd().as_raw_fd(), &mut stat) } == 0 {
-        let raw = unsafe {
-            std::slice::from_raw_parts(
-                (&stat.st_rdev as *const libc::dev_t).cast::<u8>(),
-                std::mem::size_of::<libc::dev_t>(),
-            )
-        };
-        device.copy_from_slice(raw);
-        Ok(device)
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    Ok(virtgpu.device_number()?.to_ne_bytes().to_vec())
 }
 
 fn feedback_pairs(ctx: &Context, generation: u64) -> Vec<(u32, u64)> {
@@ -706,7 +694,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         // the forwarded ADD request importable by the host compositor while
         // leaving non-virtio and unsupported-kernel paths unchanged.
         let (stride, modifier_hi, modifier_lo) = if plane_idx == 0 {
-            if let Some(allocator) = ctx.allocator.as_ref() {
+            if let Some(allocator) = ctx.virtgpu.as_deref() {
                 let guest_modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
                 let fixup = allocator.fixup_dmabuf_plane0(fd, stride, guest_modifier);
                 (
@@ -1182,8 +1170,8 @@ mod tests {
         );
     }
 
-    /// Feedback the proxy cannot allocate (here, without a GBM device to
-    /// name) is the compositor running out of resources, not a client
+    /// Feedback the proxy cannot allocate (here, without a virtio-gpu device
+    /// to name) is the compositor running out of resources, not a client
     /// error: libwayland reports that as `wl_display.no_memory`.
     #[test]
     fn unallocatable_feedback_is_a_no_memory_error() {

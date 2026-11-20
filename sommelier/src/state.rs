@@ -38,7 +38,7 @@ pub(crate) use self::host_mapping::HostMapping;
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::MAX_PENDING_DAMAGE_RECTS;
-use crate::allocator::{Allocator, PendingFence};
+use crate::allocator::{PendingFence, VirtGpuDevice};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Outgoing};
 use log::{debug, error, warn};
@@ -389,7 +389,8 @@ pub struct Context {
     /// The fence the message being dispatched waits for, if it does; see
     /// [`Self::wait_for_fence`].
     fence_wait: Option<FenceWait>,
-    pub allocator: Option<Allocator>,
+    /// The process's virtio-gpu render node, shared by every client.
+    pub virtgpu: Option<Arc<VirtGpuDevice>>,
     /// Test-only capability override for exercising synthetic dma-buf
     /// feedback lifecycle without depending on the runner's `/dev/dri`.
     #[cfg(test)]
@@ -961,45 +962,23 @@ impl Context {
             .take_guest_owner_if(host_keyboard_id, key, expected)
     }
 
-    /// Create the state for one client connection.
+    /// Create the state for one client connection from inputs `main`
+    /// resolved once for the process; reads no environment.
     ///
     /// # Arguments
     ///
     /// * `gpu_accel`, `xdg_decoration` - the command-line feature switches.
-    /// * `vm_identifier` - the VM namespace of application IDs, resolved
-    ///   once in `main` (see [`vm_identifier_from_environment`]).
-    /// * `placement` - the process-wide placement configuration, resolved
-    ///   once in `main`; `Context` never reads placement variables itself.
+    /// * `vm_identifier` - the VM namespace of application IDs (see
+    ///   [`vm_identifier_from_environment`]).
+    /// * `virtgpu` - the process's virtio-gpu render node, if it has one
+    ///   (see [`VirtGpuDevice::from_environment`]).
+    /// * `placement` - the process-wide placement configuration; `Context`
+    ///   never reads placement variables itself.
     pub fn new(
         gpu_accel: bool,
         xdg_decoration: bool,
         vm_identifier: String,
-        placement: Arc<PlacementConfig>,
-    ) -> Self {
-        // `Allocator::new` reads `SOMMELIER_DRM_DEVICE` and probes the DRM
-        // render nodes; without one, buffers fall back to VirtWL or SHM.
-        let allocator = match Allocator::new() {
-            Ok(alloc) => Some(alloc),
-            Err(e) => {
-                warn!("Failed to initialize GBM allocator: {}", e);
-                None
-            }
-        };
-        Self::from_parts(
-            gpu_accel,
-            xdg_decoration,
-            vm_identifier,
-            allocator,
-            placement,
-        )
-    }
-
-    /// Build the state from resolved inputs; reads no environment.
-    fn from_parts(
-        gpu_accel: bool,
-        xdg_decoration: bool,
-        vm_identifier: String,
-        allocator: Option<Allocator>,
+        virtgpu: Option<Arc<VirtGpuDevice>>,
         placement: Arc<PlacementConfig>,
     ) -> Self {
         let window_placement = WindowPlacementState::new(placement.backend());
@@ -1020,7 +999,7 @@ impl Context {
             session_end: None,
             post_dispatch: Vec::new(),
             fence_wait: None,
-            allocator,
+            virtgpu,
             #[cfg(test)]
             synthetic_feedback_available_for_test: false,
             #[cfg(test)]
@@ -1082,14 +1061,14 @@ impl Context {
     ///
     /// The ARC bounds policy is off and `accelerators` are the host
     /// accelerators. The VM identifier is the default `termina`, and there
-    /// is no GBM allocator.
+    /// is no virtio-gpu device.
     #[cfg(test)]
     pub fn new_for_test(
         gpu_accel: bool,
         xdg_decoration: bool,
         accelerators: Vec<crate::accelerator::Accelerator>,
     ) -> Self {
-        Self::from_parts(
+        Self::new(
             gpu_accel,
             xdg_decoration,
             resolve_vm_identifier(None),
@@ -1100,10 +1079,10 @@ impl Context {
 
     /// Test-only constructor from an explicit placement configuration, for
     /// example `PlacementConfig::arc_bounds_for_test`. Like `new_for_test`,
-    /// it reads no environment variable and has no GBM allocator.
+    /// it reads no environment variable and has no virtio-gpu device.
     #[cfg(test)]
     pub(crate) fn with_placement_for_test(placement: impl Into<Arc<PlacementConfig>>) -> Self {
-        Self::from_parts(
+        Self::new(
             false,
             false,
             resolve_vm_identifier(None),
@@ -1329,11 +1308,11 @@ mod tests {
         assert_eq!(ctx.placement_action_for(&alt_q()), None);
         assert!(ctx.window_placement.arc().is_none());
         assert_eq!(ctx.vm_identifier, "termina");
-        assert!(ctx.allocator.is_none(), "no DRM device is probed");
+        assert!(ctx.virtgpu.is_none(), "no DRM device is probed");
 
         let ctx = Context::with_placement_for_test(PlacementConfig::for_test(Vec::new()));
         assert_eq!(ctx.vm_identifier, "termina");
-        assert!(ctx.allocator.is_none(), "no DRM device is probed");
+        assert!(ctx.virtgpu.is_none(), "no DRM device is probed");
     }
 
     fn awaiting_release(has_detached_use: bool) -> RenderBufferUse {

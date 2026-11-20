@@ -309,7 +309,7 @@ fn has_extended_virtgpu_resource_info(fd: RawFd) -> bool {
 /// A borrowed DRM device view used only for querying libdrm metadata.
 ///
 /// `drm::Device` is intentionally a trait rather than a concrete file wrapper;
-/// keeping this adapter local avoids changing the allocator's owned `File`
+/// keeping this adapter local avoids changing the device's owned `File`
 /// representation while still allowing the ChromiumOS-style driver probe.
 struct DrmFile<'a>(&'a File);
 
@@ -378,23 +378,35 @@ fn open_drm_device(path: &Path) -> io::Result<File> {
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {}", path.display(), error)))
 }
 
-/// The GBM device of the guest's virtio-gpu render node, which guest
-/// dma-buf imports use: for the virtio-gpu plane-0 fixup, the fence check's
-/// virtio-gpu fallback and the synthetic dma-buf feedback's main device.
-pub struct Allocator {
-    pub device: gbm::Device<File>,
+/// The guest's virtio-gpu render node, which guest dma-buf imports use: for
+/// the virtio-gpu plane-0 fixup, the fence check's virtio-gpu fallback and
+/// the synthetic dma-buf feedback's main device.
+///
+/// The process opens it once, in `main`, and every client shares it. Each
+/// use imports and closes its GEM handle within one call, and all clients
+/// run on one thread, so no use sees another's handle.
+pub struct VirtGpuDevice {
+    device: File,
     drm_has_virtgpu_resource_info_type: bool,
 }
 
-impl Allocator {
-    /// Creates a new Allocator instance.
+impl VirtGpuDevice {
+    /// The process's render node, or `None`, with a warning, when there is
+    /// none: buffers then fall back to VirtWL or SHM.
+    pub fn from_environment() -> Option<Self> {
+        Self::open()
+            .inspect_err(|error| log::warn!("No virtio-gpu render node: {error}"))
+            .ok()
+    }
+
+    /// Open the render node.
     ///
     /// `SOMMELIER_DRM_DEVICE` can force a particular render node. Without it,
     /// all `/dev/dri/renderD*` nodes are tried in numeric order, but only
     /// nodes backed by the `virtio_gpu` DRM driver are accepted. This mirrors
     /// ChromiumOS Sommelier's `open_virtgpu()` probe and avoids selecting a
     /// software or secondary GPU node merely because it sorts first.
-    pub fn new() -> io::Result<Self> {
+    fn open() -> io::Result<Self> {
         let configured = std::env::var_os(DRM_DEVICE_ENV)
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty());
@@ -453,29 +465,12 @@ impl Allocator {
                 }
             }
 
-            match gbm::Device::new(file) {
-                Ok(device) => {
-                    let drm_has_virtgpu_resource_info_type =
-                        has_extended_virtgpu_resource_info(device.as_fd().as_raw_fd());
-                    return Ok(Self {
-                        device,
-                        drm_has_virtgpu_resource_info_type,
-                    });
-                }
-                Err(error) => {
-                    // An accessible render node is not necessarily a GBM
-                    // device (for example a software or auxiliary node).
-                    // Keep trying deterministic candidates instead of making
-                    // allocator initialization depend on directory order.
-                    let error = io::Error::other(error);
-                    log::debug!(
-                        "Unable to initialize GBM on render node {}: {}",
-                        path.display(),
-                        error
-                    );
-                    last_error = Some(error);
-                }
-            }
+            let drm_has_virtgpu_resource_info_type =
+                has_extended_virtgpu_resource_info(file.as_raw_fd());
+            return Ok(Self {
+                device: file,
+                drm_has_virtgpu_resource_info_type,
+            });
         }
 
         Err(last_error.unwrap_or_else(|| {
@@ -484,6 +479,13 @@ impl Allocator {
                 format!("no usable DRM render nodes found in {DRM_DEVICE_DIR}"),
             )
         }))
+    }
+
+    /// The render node's device number (`st_rdev`).
+    pub fn device_number(&self) -> io::Result<libc::dev_t> {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(self.device.metadata()?.rdev())
     }
 
     /// Query virtio-gpu classic PRIME metadata and apply ChromiumOS' plane-0
@@ -501,7 +503,7 @@ impl Allocator {
         };
         let prime_result = unsafe {
             libc::ioctl(
-                self.device.as_fd().as_raw_fd(),
+                self.device.as_raw_fd(),
                 DRM_IOCTL_PRIME_FD_TO_HANDLE as _,
                 std::ptr::from_mut(&mut prime),
             )
@@ -522,7 +524,7 @@ impl Allocator {
             union_words: [VIRTGPU_RESOURCE_INFO_TYPE_EXTENDED, 0, 0, 0],
             ..VirtGpuResourceInfo::default()
         };
-        let info_result = ioctl_resource_info(self.device.as_fd().as_raw_fd(), &mut info);
+        let info_result = ioctl_resource_info(self.device.as_raw_fd(), &mut info);
 
         // The imported GEM handle is local to this query and must always be
         // released, including when the resource-info ioctl fails.
@@ -532,7 +534,7 @@ impl Allocator {
         };
         let _ = unsafe {
             libc::ioctl(
-                self.device.as_fd().as_raw_fd(),
+                self.device.as_raw_fd(),
                 DRM_IOCTL_GEM_CLOSE as _,
                 std::ptr::from_mut(&mut close),
             )
@@ -555,7 +557,7 @@ impl Allocator {
         };
         let import_result = unsafe {
             libc::ioctl(
-                self.device.as_fd().as_raw_fd(),
+                self.device.as_raw_fd(),
                 DRM_IOCTL_PRIME_FD_TO_HANDLE as _,
                 std::ptr::from_mut(&mut prime),
             )
@@ -570,7 +572,7 @@ impl Allocator {
         };
         let wait_result = unsafe {
             libc::ioctl(
-                self.device.as_fd().as_raw_fd(),
+                self.device.as_raw_fd(),
                 DRM_IOCTL_VIRTGPU_WAIT as _,
                 std::ptr::from_mut(&mut wait),
             )
@@ -583,7 +585,7 @@ impl Allocator {
         };
         let close_result = unsafe {
             libc::ioctl(
-                self.device.as_fd().as_raw_fd(),
+                self.device.as_raw_fd(),
                 DRM_IOCTL_GEM_CLOSE as _,
                 std::ptr::from_mut(&mut close),
             )
@@ -654,27 +656,27 @@ fn dmabuf_sync_capability_unavailable(error: &io::Error) -> bool {
 /// without waiting.
 ///
 /// Exporting and polling the dma-buf's sync file requires only the plane fd,
-/// so it is always attempted. A DRM allocator is an optional compatibility
+/// so it is always attempted. The virtio-gpu device is an optional compatibility
 /// fallback for kernels that require the virtio-gpu GEM wait path. Kernels
 /// which implement neither mechanism retain ChromiumOS Sommelier's implicit
 /// synchronization compatibility path; actual I/O failures remain fatal.
 pub(crate) fn dmabuf_fence(
     fd: BorrowedFd<'_>,
-    allocator: Option<&Allocator>,
+    virtgpu: Option<&VirtGpuDevice>,
 ) -> io::Result<DmabufFence> {
     let fd = fd.as_raw_fd();
     match export_dmabuf_read_fence(fd) {
         Ok(sync_file) => sync_file_fence(sync_file),
         Err(export_error) => {
             let export_capability_missing = dmabuf_sync_capability_unavailable(&export_error);
-            let Some(allocator) = allocator else {
+            let Some(virtgpu) = virtgpu else {
                 return if export_capability_missing {
                     Ok(DmabufFence::ImplicitSyncFallback)
                 } else {
                     Err(export_error)
                 };
             };
-            match allocator.virtgpu_resource_idle(fd) {
+            match virtgpu.virtgpu_resource_idle(fd) {
                 Ok(true) => Ok(DmabufFence::Signalled),
                 Ok(false) => Ok(DmabufFence::Pending(PendingFence::Busy)),
                 Err(fallback_error)

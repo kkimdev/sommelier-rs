@@ -783,7 +783,7 @@ fn can_synthesize_dmabuf_feedback(ctx: &Context, version: u32) -> bool {
     if version < LINUX_DMABUF_CAPABILITY_VERSION {
         return false;
     }
-    if ctx.allocator.is_some() {
+    if ctx.virtgpu.is_some() {
         return true;
     }
     #[cfg(test)]
@@ -974,9 +974,9 @@ fn dmabuf_global(ctx: &mut Context, name: u32, version: u32) -> Action {
     let client_version = if can_synthesize_feedback {
         GUEST_DMABUF_VERSION
     } else {
-        if version >= LINUX_DMABUF_CAPABILITY_VERSION && ctx.allocator.is_none() {
+        if version >= LINUX_DMABUF_CAPABILITY_VERSION && ctx.virtgpu.is_none() {
             log::warn!(
-                "GBM allocator unavailable; exposing linux-dmabuf v3 without synthetic \
+                "No virtio-gpu render node; exposing linux-dmabuf v3 without synthetic \
                  device feedback"
             );
         }
