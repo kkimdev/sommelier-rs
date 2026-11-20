@@ -57,7 +57,9 @@ handler intercepts the ones whose meaning changes across the boundary.
   [process invariants](INVARIANTS.md#process)).
 - The host side is VirtWL (`virtwl_channel.rs`, ioctls in `virtwl.rs`) or,
   for debugging only, a local compositor socket (`--local-compositor`).
-  `connection.rs` hides the difference behind `WaylandConnection`.
+  `connection.rs` hides the difference behind `WaylandConnection`, which
+  lends every receive and send one buffer of its own, a Unix socket's
+  control buffer or a VirtWL `Transaction`, so neither allocates.
   `wire::MessageHeader::frame` cuts the received byte stream into messages,
   both for `Client::handle_msgs` and for the connection's readiness check.
 
