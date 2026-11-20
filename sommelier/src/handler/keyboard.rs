@@ -33,6 +33,7 @@ limitations under the License.
 //!
 //! See `sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
+use crate::handler::ime_keys::lease;
 use crate::protocols::keyboard_extension_unstable_v1::{
     zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
 };
@@ -41,7 +42,7 @@ use crate::protocols::wayland::wl_keyboard::{
 };
 use crate::state::{
     ChordClass, Context, HostId, KeyAdmission, KeyVerdict, KeyboardFocus, KeyboardModifiers,
-    PeekInput, PhysicalKey,
+    LeaseInput, PeekInput, PhysicalKey,
 };
 use crate::warn_once::WarnOnce;
 use crate::window_layout::NormalizedRect;
@@ -49,8 +50,7 @@ use crate::wire::Action;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use xkbcommon::xkb;
 
-/// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
-pub(crate) const EVDEV_KEY_BACKSPACE: u32 = 14;
+pub(crate) use crate::state::EVDEV_KEY_BACKSPACE;
 
 /// The largest `wl_keyboard.keymap` the proxy maps and compiles, in bytes.
 /// Exo's keymaps are about 60 KiB. The size of a VirtWL keymap cannot be
@@ -792,10 +792,10 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // Read before the physical transition: a press that starts a new
         // generation of Backspace holds no lease.
         let backspace_repeat_active = key == EVDEV_KEY_BACKSPACE
-            && crate::handler::ime_keys::backspace_repeat_active_for_keyboard(
-                ctx,
-                host_keyboard_id,
-            );
+            && ctx
+                .key_generations
+                .backspace_lease(host_keyboard_id)
+                .is_some();
         if let KeyAdmission::Settled(verdict) =
             ctx.key_generations
                 .admit_key(host_keyboard_id, key, state, serial)
@@ -807,11 +807,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         let (event, class) = match state {
             KEY_STATE_PRESSED => {
                 if key != EVDEV_KEY_BACKSPACE {
-                    ctx.key_generations
-                        .cancel_backspace_repeat(host_keyboard_id, EVDEV_KEY_BACKSPACE);
-                    if let Some(guest_seat) = guest_seat {
-                        crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
-                    }
+                    let keyboard = host_keyboard_id;
+                    lease(ctx, guest_seat, LeaseInput::OtherPress { keyboard });
                 }
                 let class = Self::classify_key(ctx, host_keyboard_id, key);
                 (
@@ -850,9 +847,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             }
         }
         if state == KEY_STATE_RELEASED && key == EVDEV_KEY_BACKSPACE {
-            if let Some(guest_seat) = guest_seat {
-                crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
-            }
+            lease(ctx, guest_seat, LeaseInput::BackspaceRelease);
         }
         Self::send_ack_key(ctx, host_keyboard_id, serial, verdict.handled());
         let action = Self::action(verdict);
@@ -1044,17 +1039,12 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
         match input {
             // The press of another key ends the Backspace repeat lease.
             PeekInput::Press { .. } if key != EVDEV_KEY_BACKSPACE => {
-                ctx.key_generations
-                    .cancel_backspace_repeat(host_keyboard_id, EVDEV_KEY_BACKSPACE);
-                if let Some(guest_seat) = guest_seat {
-                    crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
-                }
+                let keyboard = host_keyboard_id;
+                lease(ctx, guest_seat, LeaseInput::OtherPress { keyboard });
             }
             // A Backspace release ends the Backspace repeat lease.
             PeekInput::Release { .. } if !outcome.ignored && key == EVDEV_KEY_BACKSPACE => {
-                if let Some(guest_seat) = guest_seat {
-                    crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
-                }
+                lease(ctx, guest_seat, LeaseInput::BackspaceRelease);
             }
             _ => {}
         }
@@ -1347,7 +1337,7 @@ mod tests {
         fn cancelled(&self, k: Mapped) -> bool {
             self.ctx
                 .key_generations
-                .backspace_repeat_cancelled(HostId(k.host), BACKSPACE)
+                .backspace_repeat_cancelled(HostId(k.host))
         }
 
         fn classify(&self, k: Mapped, key: u32) -> KeyClass {
@@ -2704,7 +2694,7 @@ mod tests {
                     guest_input: true,
                 },
             );
-            keys.cancel_backspace_repeat(keyboard, BACKSPACE);
+            keys.cancel_lease_for_test(keyboard);
             assert!(p.ctx.claim_guest_key(keyboard, BACKSPACE, ImeRecovery));
 
             assert_eq!(
@@ -3487,7 +3477,7 @@ mod tests {
                 guest_input: true,
             },
         );
-        keys.cancel_backspace_repeat(keyboard, BACKSPACE);
+        keys.cancel_lease_for_test(keyboard);
         keys.suppress_host_accelerator(keyboard, BACKSPACE);
         assert!(p.ctx.claim_guest_key(keyboard, BACKSPACE, ImeRecovery));
         let held = KeyboardModifiers {
@@ -3547,9 +3537,7 @@ mod tests {
         p.ctx
             .key_generations
             .observe_physical_state(keyboard, BACKSPACE, PRESSED);
-        p.ctx
-            .key_generations
-            .cancel_backspace_repeat(keyboard, BACKSPACE);
+        p.ctx.key_generations.cancel_lease_for_test(keyboard);
         assert!(p.ctx.claim_guest_key(keyboard, BACKSPACE, ImeRecovery));
 
         assert_eq!(p.enter(OTHER_KEYBOARD, SURFACE.1, &[]), Action::Drop);
@@ -3567,7 +3555,7 @@ mod tests {
             Some(SURFACE.0)
         );
         assert!(
-            !crate::handler::ime_keys::backspace_pressed_for_seat(&p.ctx, KEYBOARD.seat),
+            !p.held(KEYBOARD, BACKSPACE) && !p.held(OTHER_KEYBOARD, BACKSPACE),
             "a dead keyboard must not keep the seat's Backspace fallback armed"
         );
     }
@@ -3584,13 +3572,10 @@ mod tests {
         p.ctx
             .key_generations
             .observe_physical_state(keyboard, BACKSPACE, PRESSED);
-        assert!(p
-            .ctx
+        p.ctx
             .key_generations
-            .arm_ime_repeat(keyboard, BACKSPACE, TEXT_INPUT.guest));
-        let repeating = |p: &Proxy| {
-            crate::handler::ime_keys::backspace_repeat_active_for_keyboard(&p.ctx, keyboard)
-        };
+            .lease_for_test(keyboard, TEXT_INPUT.guest);
+        let repeating = |p: &Proxy| p.ctx.key_generations.backspace_lease(keyboard).is_some();
 
         // The keyboard reports leaving a surface it no longer focuses.
         assert_eq!(p.leave(KEYBOARD, OTHER_SURFACE.1), Action::Drop);
@@ -3660,9 +3645,7 @@ mod tests {
         assert_eq!(p.key(KEYBOARD, 2, 10, KEY_A, PRESSED), Action::Forward);
         assert!(p.held(KEYBOARD, BACKSPACE));
         assert!(p.cancelled(KEYBOARD));
-        let repeating = |p: &Proxy| {
-            crate::handler::ime_keys::backspace_repeat_active_for_keyboard(&p.ctx, keyboard)
-        };
+        let repeating = |p: &Proxy| p.ctx.key_generations.backspace_lease(keyboard).is_some();
         assert!(!repeating(&p));
 
         // Its release clears the cancellation, so the next Backspace, which
@@ -3673,10 +3656,9 @@ mod tests {
             .extended_keyboard_to_keyboard
             .insert(HostId(KEYBOARD.extended), keyboard);
         assert_eq!(p.peek(KEYBOARD, 6, 14, BACKSPACE, PRESSED), Action::Drop);
-        assert!(p
-            .ctx
+        p.ctx
             .key_generations
-            .arm_ime_repeat(keyboard, BACKSPACE, TEXT_INPUT.guest));
+            .lease_for_test(keyboard, TEXT_INPUT.guest);
         assert_eq!(p.key(KEYBOARD, 6, 14, BACKSPACE, PRESSED), Action::Drop);
         assert!(p.held(KEYBOARD, BACKSPACE));
         assert_eq!(p.peek(KEYBOARD, 7, 15, BACKSPACE, RELEASED), Action::Drop);
@@ -3821,9 +3803,7 @@ mod tests {
         p.ctx
             .key_generations
             .observe_physical_state(other, BACKSPACE, PRESSED);
-        p.ctx
-            .key_generations
-            .cancel_backspace_repeat(other, BACKSPACE);
+        p.ctx.key_generations.cancel_lease_for_test(other);
 
         p.release(KEYBOARD);
         assert!(p.held(OTHER_KEYBOARD, BACKSPACE));
@@ -3998,11 +3978,9 @@ mod tests {
 
         // The IME consumed Backspace on the first keyboard.
         p.peek(KEYBOARD, 1, 500, BACKSPACE, PRESSED);
-        assert!(p.ctx.key_generations.arm_ime_repeat(
-            HostId(KEYBOARD.host),
-            BACKSPACE,
-            TEXT_INPUT.guest
-        ));
+        p.ctx
+            .key_generations
+            .lease_for_test(HostId(KEYBOARD.host), TEXT_INPUT.guest);
         assert_eq!(p.key(KEYBOARD, 1, 500, BACKSPACE, PRESSED), Action::Drop);
 
         // Its IME repeat must not swallow a Backspace of the other.
@@ -4019,11 +3997,9 @@ mod tests {
 
         // Exo later consumes repeat confirmations. The real release still
         // has to reach the guest to close the press/release pair.
-        assert!(p.ctx.key_generations.arm_ime_repeat(
-            HostId(KEYBOARD.host),
-            BACKSPACE,
-            TEXT_INPUT.guest
-        ));
+        p.ctx
+            .key_generations
+            .lease_for_test(HostId(KEYBOARD.host), TEXT_INPUT.guest);
         assert_eq!(
             p.key(KEYBOARD, 2, 501, BACKSPACE, RELEASED),
             Action::Forward
@@ -4042,10 +4018,9 @@ mod tests {
         if forwarded {
             assert!(p.ctx.claim_guest_key(keyboard, BACKSPACE, Physical));
         }
-        assert!(p
-            .ctx
+        p.ctx
             .key_generations
-            .arm_ime_repeat(keyboard, BACKSPACE, TEXT_INPUT.guest));
+            .lease_for_test(keyboard, TEXT_INPUT.guest);
     }
 
     #[test]
@@ -4058,12 +4033,11 @@ mod tests {
             p.held(KEYBOARD, BACKSPACE),
             "pressing another key must not falsify the physical Backspace state"
         );
-        assert!(
-            !crate::handler::ime_keys::backspace_repeat_active_for_keyboard(
-                &p.ctx,
-                HostId(KEYBOARD.host)
-            )
-        );
+        assert!(p
+            .ctx
+            .key_generations
+            .backspace_lease(HostId(KEYBOARD.host))
+            .is_none());
         assert_eq!(p.confirm(TEXT_INPUT), Action::Drop);
         assert!(
             p.ctx.host_to_client_queue.is_empty(),

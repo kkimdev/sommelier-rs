@@ -78,7 +78,7 @@ keyboard's XKB state, focus), and applies the effects on the guest:
 | `wl_keyboard.enter` | `install_enter_snapshot`: every listed key `Held`, `Physical` | `on_enter` |
 | leave, keyboard end | `clear_keyboard` of each keyboard that lost its focus or ended | `on_leave`, `forget_keyboard` |
 | H2 detach | `mark_held_keys_stale` | `ime_keys::forget_held_keys_for_seat` |
-| Backspace lease | `arm_ime_repeat`, `cancel_backspace_repeat(_for_owner)` | `ime_keys`, `text_input::apply_lease` |
+| Backspace lease | `lease(LeaseInput)` | `ime_keys::lease`, from `on_key`, `on_peek_key`, the IME core's `KeyEffect::Lease`, a recovery and a focus change |
 
 `wl_keyboard.key` has two steps, because only a press of the current
 generation needs its chord classified. `admit_key` settles the events
@@ -94,6 +94,16 @@ the event; `Delivery::recover` is the recovery's. `peek_key` retires a stale hel
 the guest its release, numbers a new peek generation, refreshes the peek
 of a held one, or closes it on a release, unless the release is older
 than the peek.
+
+The lease has one transition, `lease`, for the seat's keyboards and a
+`LeaseInput`: the IME core's outcome for a text input (arm the seat's
+first held Backspace whose lease is not cancelled, or end that text
+input's lease), another key's press (which cancels its keyboard's held
+Backspace for the rest of the hold), a Backspace release or a focus
+change (which end the seat's leases), and a recovery (which arms the
+recovered Backspace whose pair went, and ends the lease after another
+recovered pair, or a Backspace whose pair was skipped). A lease names
+its text input by `TiId`.
 
 The phase moves:
 

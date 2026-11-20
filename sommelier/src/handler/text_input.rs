@@ -18,12 +18,11 @@ use crate::warn_once::WarnOnce;
 
 use crate::handler::callback::{internal_sync, queue_internal_sync};
 use crate::handler::ime_keys::{
-    end_backspace_repeat_for_seat, end_backspace_repeat_for_text_input, forget_held_keys_for_seat,
-    forget_recovery_of_text_input, held_backspace_keyboard_for_seat, hold_recovery,
+    forget_held_keys_for_seat, forget_recovery_of_text_input, hold_recovery, lease,
 };
 use crate::ime::{
-    self, Edit, Env, HostExt, HostIme, HostOut, HostTi, Input, KeyEffect, LeaseOutcome, Piece,
-    SeatId, SurfaceId, TiId,
+    self, Edit, Env, HostExt, HostIme, HostOut, HostTi, Input, KeyEffect, Piece, SeatId, SurfaceId,
+    TiId,
 };
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
@@ -35,7 +34,8 @@ use crate::protocols::wayland::wl_seat;
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    Context, InternalCallback, KeyboardFocusRegistry, Link, SeatFocusChange, ShadowTable,
+    Context, InternalCallback, KeyboardFocusRegistry, LeaseInput, Link, SeatFocusChange,
+    ShadowTable,
 };
 use crate::wire::{Action, IndexedString, Outgoing};
 
@@ -128,29 +128,11 @@ pub(crate) fn guest_key(ctx: &mut Context, seat: u32) {
 /// Apply what the IME core asks of the keyboard concern.
 fn apply_key_effect(ctx: &mut Context, effect: KeyEffect) {
     match effect {
-        KeyEffect::Lease { ti, seat, outcome } => apply_lease(ctx, ti, seat, outcome),
+        KeyEffect::Lease { ti, seat, outcome } => {
+            lease(ctx, Some(seat.0), LeaseInput::Ime { ti, outcome })
+        }
         KeyEffect::RecoverHeldKey { ti, seat } => hold_recovery(ctx, ti, seat),
         KeyEffect::InputMethodDetached { seat } => forget_held_keys_for_seat(ctx, seat.0),
-    }
-}
-
-/// Apply what the IME core asks of the Backspace repeat leased to a text
-/// input.
-fn apply_lease(ctx: &mut Context, ti: TiId, seat: SeatId, outcome: LeaseOutcome) {
-    let held = match outcome {
-        LeaseOutcome::End => None,
-        LeaseOutcome::ArmIfBackspaceHeld => held_backspace_keyboard_for_seat(ctx, seat.0),
-    };
-    match held {
-        Some(host_keyboard_id) => {
-            let armed = ctx.key_generations.arm_ime_repeat(
-                host_keyboard_id,
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-                ti.0,
-            );
-            debug_assert!(armed, "held Backspace disappeared within one event");
-        }
-        None => end_backspace_repeat_for_text_input(ctx, seat.0, ti.0),
     }
 }
 
@@ -544,7 +526,7 @@ pub(crate) fn apply_keyboard_focus_changes(
         }
         ctx.key_generations
             .clear_peek_watermarks_for_seat(change.guest_seat);
-        end_backspace_repeat_for_seat(ctx, change.guest_seat);
+        lease(ctx, Some(change.guest_seat), LeaseInput::FocusLost);
         let focus = Input::FocusChanged {
             seat: SeatId(change.guest_seat),
             surface: change.current_surface.map(SurfaceId),
@@ -678,7 +660,6 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
 pub(super) mod tests {
     use super::*;
     use crate::handler::callback::CallbackHandler;
-    use crate::handler::ime_keys::backspace_repeat_active_for_keyboard;
     use crate::handler::keyboard::KeyboardHandler;
     use crate::ime::{map_v3_content_type, LinkState};
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
@@ -1433,7 +1414,9 @@ pub(super) mod tests {
         /// peer sees until the key's next confirmation.
         fn repeat_owner(&mut self, key: u32) -> Option<u32> {
             let keyboard = HostId(self.keyboard.host);
-            self.s.ctx().key_generations.ime_repeat_owner(keyboard, key)
+            assert_eq!(key, BACKSPACE, "only Backspace is leased");
+            let lease = self.s.ctx().key_generations.backspace_lease(keyboard);
+            lease.map(|ti| ti.0)
         }
 
         /// The owner the proxy assigned the guest's press of `key` on the
@@ -4903,11 +4886,14 @@ pub(super) mod tests {
         pub(in crate::handler) fn lease_backspace_repeat(&mut self, text_input: u32) {
             let generations = &mut self.ctx.key_generations;
             generations.observe_physical_state(HOST_KEYBOARD, BACKSPACE, 1);
-            assert!(generations.arm_ime_repeat(HOST_KEYBOARD, BACKSPACE, text_input));
+            generations.lease_for_test(HOST_KEYBOARD, text_input);
         }
 
         pub(in crate::handler) fn repeat_active(&self) -> bool {
-            backspace_repeat_active_for_keyboard(&self.ctx, HOST_KEYBOARD)
+            self.ctx
+                .key_generations
+                .backspace_lease(HOST_KEYBOARD)
+                .is_some()
         }
 
         /// The events queued for the guest since the last call.

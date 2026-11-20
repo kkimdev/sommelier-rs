@@ -15,27 +15,16 @@ limitations under the License.
 */
 
 use crate::handler::callback::queue_internal_sync;
+use crate::ime::LeaseOutcome;
 use crate::ime::{SeatId, TiId};
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{Context, HostId, InternalCallback, ShadowTable};
+use crate::state::{
+    Context, HostId, InternalCallback, LeaseInput, ShadowTable, EVDEV_KEY_BACKSPACE,
+};
 use crate::wire::Outgoing;
 use std::collections::BTreeMap;
-
-/// Return whether the repeat fallback belongs to this physical host
-/// keyboard. A seat may expose multiple keyboard objects; checking only the
-/// seat would let a stale IME confirmation swallow Backspace events from a
-/// different keyboard on that seat.
-pub(crate) fn backspace_repeat_active_for_keyboard(
-    ctx: &Context,
-    host_keyboard_id: HostId,
-) -> bool {
-    ctx.key_generations.ime_repeat_active(
-        host_keyboard_id,
-        crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-    )
-}
 
 /// The host keyboards of `guest_seat`, in the order of their guest IDs.
 /// It borrows only the fields it reads, so that a caller can change
@@ -52,61 +41,37 @@ fn host_keyboards_of_seat<'a>(
         .map(HostId)
 }
 
-/// The host keyboard of `guest_seat` with the lowest guest ID that holds
-/// Backspace with its repeat not cancelled, if any.
-pub(super) fn held_backspace_keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<HostId> {
-    host_keyboards_of_seat(&ctx.keyboard_to_seat, &ctx.shadow_table, guest_seat).find(
-        |host_keyboard_id| {
-            !ctx.key_generations.backspace_repeat_cancelled(
-                *host_keyboard_id,
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            ) && ctx.key_generations.physically_held(
-                *host_keyboard_id,
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            )
-        },
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn backspace_pressed_for_seat(ctx: &Context, guest_seat: u32) -> bool {
-    held_backspace_keyboard_for_seat(ctx, guest_seat).is_some()
-}
-
-pub(crate) fn end_backspace_repeat_for_seat(ctx: &mut Context, guest_seat: u32) {
-    let host_keyboards =
-        host_keyboards_of_seat(&ctx.keyboard_to_seat, &ctx.shadow_table, guest_seat);
-    // Ending the IME fallback is distinct from releasing the physical key.
-    // Keep the cancellation marker until that release arrives; otherwise the
-    // next empty confirm_preedit in the same held-key session would synthesize
-    // another Backspace after the fallback was explicitly stopped.
-    for host_keyboard_id in host_keyboards {
-        if ctx.key_generations.ime_repeat_active(
-            host_keyboard_id,
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-        ) {
-            ctx.key_generations.cancel_backspace_repeat(
-                host_keyboard_id,
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            );
-        }
-    }
-}
-
-pub(super) fn end_backspace_repeat_for_text_input(
-    ctx: &mut Context,
-    guest_seat: u32,
-    guest_text_input: u32,
-) {
-    let host_keyboards =
-        host_keyboards_of_seat(&ctx.keyboard_to_seat, &ctx.shadow_table, guest_seat);
-    for host_keyboard_id in host_keyboards {
-        ctx.key_generations.cancel_backspace_repeat_for_owner(
-            host_keyboard_id,
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            guest_text_input,
+/// Move the IME's Backspace repeat lease on the keyboards of `guest_seat`,
+/// none if the input's keyboard has no seat
+/// ([`crate::state::KeyGenerationRegistry::lease`]).
+pub(crate) fn lease(ctx: &mut Context, guest_seat: Option<u32>, input: LeaseInput) {
+    let seat: Vec<_> = guest_seat
+        .into_iter()
+        .flat_map(|seat| host_keyboards_of_seat(&ctx.keyboard_to_seat, &ctx.shadow_table, seat))
+        .collect();
+    ctx.key_generations.lease(&seat, input);
+    // One text input on a connection is enabled at a time, so the IME
+    // never arms a Backspace another text input holds.
+    if let LeaseInput::Ime {
+        ti,
+        outcome: LeaseOutcome::ArmIfBackspaceHeld,
+    } = input
+    {
+        let leases = seat
+            .iter()
+            .filter_map(|&k| ctx.key_generations.backspace_lease(k));
+        debug_assert!(
+            leases.clone().all(|leased| leased == ti),
+            "a held Backspace is leased to another text input than {ti:?}: {:?}",
+            leases.collect::<Vec<_>>()
         );
     }
+}
+
+/// End text input `ti`'s lease on `seat`: a confirmation recovered no key.
+fn end_lease(ctx: &mut Context, seat: SeatId, ti: TiId) {
+    let outcome = LeaseOutcome::End;
+    lease(ctx, Some(seat.0), LeaseInput::Ime { ti, outcome });
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,11 +152,10 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
         .keyboard_repeatable_keys
         .get(&host_keyboard_id)
         .is_some_and(|keys| keys.contains(&key));
-    let backspace_cancelled = key == crate::handler::keyboard::EVDEV_KEY_BACKSPACE
-        && ctx.key_generations.backspace_repeat_cancelled(
-            host_keyboard_id,
-            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-        );
+    let backspace_cancelled = key == EVDEV_KEY_BACKSPACE
+        && ctx
+            .key_generations
+            .backspace_repeat_cancelled(host_keyboard_id);
     if !is_latest_generation
         || !physically_held
         || !press.eligible
@@ -478,7 +442,7 @@ pub(super) fn hold_recovery(ctx: &mut Context, ti: TiId, seat: SeatId) {
         "the confirmation's own event decided the recovery before it"
     );
     let Some(held) = held_repeat_key_for_seat(ctx, seat.0) else {
-        end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
+        end_lease(ctx, seat, ti);
         log::debug!(
             "Ignoring confirm_preedit without an active preedit for guest {}",
             ti.0
@@ -530,7 +494,7 @@ fn drop_pending(ctx: &mut Context) {
          repeat of held key {}",
         held.key
     );
-    end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
+    end_lease(ctx, seat, ti);
 }
 
 /// The pending recovery's confirmation was an autorepeat of its held key:
@@ -554,7 +518,7 @@ pub(crate) fn recover_pending(ctx: &mut Context) {
             .key_generations
             .physically_held(held.host_keyboard_id, held.key);
     if !(keyboard_held && ctx.ime.admits_recovery(ti)) {
-        end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
+        end_lease(ctx, seat, ti);
         log::debug!(
             "Dropping the recovery of held key {} for text input {}, which no longer \
              passes the gate or holds the key",
@@ -563,23 +527,21 @@ pub(crate) fn recover_pending(ctx: &mut Context) {
         );
         return;
     }
-    let backspace = held.key == crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
     let pair = synthesize_ime_consumed_key_pair(ctx, held);
+    let recovered = LeaseInput::Recovered {
+        ti,
+        keyboard: held.host_keyboard_id,
+        backspace: held.key == EVDEV_KEY_BACKSPACE,
+        sent: !pair.is_empty(),
+    };
+    // A press since the confirmation may have cancelled a held Backspace's
+    // repeat, as it would have right after an immediate recovery.
+    lease(ctx, Some(seat.0), recovered);
     if !pair.is_empty() {
-        if backspace {
-            // A press since the confirmation may have cancelled the repeat,
-            // as it would have right after an immediate recovery.
-            ctx.key_generations
-                .arm_ime_repeat(held.host_keyboard_id, held.key, ti.0);
-        } else {
-            end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
-        }
         log::debug!(
             "Recovered empty IME confirmation as held key {} press/release",
             held.key
         );
-    } else if backspace {
-        end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
     }
     // GTK waits for the matching text-input transaction to finish before
     // applying a key that passed through the active IME. A v1 confirm with
@@ -701,11 +663,11 @@ mod tests {
         let generations = &mut ime.ctx.key_generations;
         generations.observe_physical_state(other, BACKSPACE, 1);
 
-        end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
+        lease(&mut ime.ctx, Some(SEAT), LeaseInput::FocusLost);
 
         let generations = &ime.ctx.key_generations;
-        assert!(generations.backspace_repeat_cancelled(HOST_KEYBOARD, BACKSPACE));
-        assert!(!generations.backspace_repeat_cancelled(other, BACKSPACE));
+        assert!(generations.backspace_repeat_cancelled(HOST_KEYBOARD));
+        assert!(!generations.backspace_repeat_cancelled(other));
         assert!(generations.physically_held(other, BACKSPACE));
     }
 
@@ -736,7 +698,7 @@ mod tests {
         let mut ime = Ime::with_keyboard();
         ime.committed().surrounding_text_support = true;
         ime.lease_backspace_repeat(TI);
-        end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
+        lease(&mut ime.ctx, Some(SEAT), LeaseInput::FocusLost);
 
         ime.confirm();
         assert_eq!(
@@ -903,7 +865,7 @@ mod tests {
             assert!(ime.committed().surrounding_text_support);
         }
 
-        end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
+        lease(&mut ime.ctx, Some(SEAT), LeaseInput::FocusLost);
         ime.confirm();
         assert_eq!(ime.events(), []);
     }

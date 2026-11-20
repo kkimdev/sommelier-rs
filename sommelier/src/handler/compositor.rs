@@ -3819,8 +3819,7 @@ mod tests {
             )
             .numbered
             .expect("a new press is numbered");
-        ctx.key_generations
-            .cancel_backspace_repeat(host_keyboard_id, 14);
+        ctx.key_generations.cancel_lease_for_test(host_keyboard_id);
         ctx.keyboard_repeatable_keys
             .insert(host_keyboard_id, [14].into_iter().collect());
         ctx.key_generations.record_latest_peek(
@@ -3865,7 +3864,7 @@ mod tests {
             !ctx.key_generations.physically_held(host_keyboard_id, 14)
                 && !ctx
                     .key_generations
-                    .backspace_repeat_cancelled(host_keyboard_id, 14)
+                    .backspace_repeat_cancelled(host_keyboard_id)
                 && ctx.key_generations.peek(host_keyboard_id, 14).is_none()
                 && ctx
                     .key_generations

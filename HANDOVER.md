@@ -199,8 +199,8 @@
 - A focus-loss commit too long for one message loses the preedit (Exo's
   confirmation is dropped while the link drains).
 - Key generations: an `Announced` peek accepts an older release, and a
-  stale held Backspace can still be leased (`arm_ime_repeat` ignores
-  `stale`).
+  stale held Backspace can still be leased (`KeyGenerationRegistry::lease`
+  ignores `stale`).
 - `on_peek_key`'s owed release of a stale press can reach the guest
   before a waiting recovery's pair.
 - Each empty confirmation while a taken key is held sends the host a

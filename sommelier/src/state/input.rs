@@ -17,6 +17,10 @@ limitations under the License.
 use std::collections::BTreeMap;
 
 use super::{serial_is_after, HostId};
+use crate::ime::{LeaseOutcome, TiId};
+
+/// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
+pub(crate) const EVDEV_KEY_BACKSPACE: u32 = 14;
 
 /// Provenance for one physical key generation observed through ChromeOS
 /// `peek_key`.
@@ -112,6 +116,34 @@ impl KeyVerdict {
     pub fn forward(self) -> bool {
         matches!(self, Self::Forward)
     }
+}
+
+/// What moves the IME's Backspace repeat lease
+/// ([`KeyGenerationRegistry::lease`]). While a text input holds a held
+/// Backspace's lease, the key's physical repeats belong to the input
+/// method's synthetic presses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeaseInput {
+    /// The IME core's outcome for text input `ti` (`ime::KeyEffect::Lease`),
+    /// or a confirmation that recovered no key (X2').
+    Ime { ti: TiId, outcome: LeaseOutcome },
+    /// A press of another key on `keyboard`: its held Backspace is not
+    /// leased again in this hold, and the seat's leases end.
+    OtherPress { keyboard: HostId },
+    /// A release of Backspace on a keyboard of the seat.
+    BackspaceRelease,
+    /// The seat's keyboard focus moved.
+    FocusLost,
+    /// X2': the recovery for `ti` of a key `keyboard` holds, Backspace or
+    /// not, whose pair went if `sent`. A held Backspace whose pair went is
+    /// leased; one whose pair was skipped, and another key whose pair went,
+    /// end the lease; another key whose pair was skipped leaves it.
+    Recovered {
+        ti: TiId,
+        keyboard: HostId,
+        backspace: bool,
+        sent: bool,
+    },
 }
 
 /// What the guest got of one key generation: who delivered it, and
@@ -336,7 +368,7 @@ enum RepeatLease {
     #[default]
     Free,
     /// Text input `text_input` holds the lease.
-    Leased { text_input: u32 },
+    Leased { text_input: TiId },
     /// The lease ended for the rest of the hold: no text input may take it
     /// again until the key is released.
     Cancelled,
@@ -468,7 +500,7 @@ impl KeyGeneration {
 
     fn ime_repeat_owner(self) -> Option<u32> {
         match self.phase.lease() {
-            RepeatLease::Leased { text_input } => Some(text_input),
+            RepeatLease::Leased { text_input } => Some(text_input.0),
             RepeatLease::Free | RepeatLease::Cancelled => None,
         }
     }
@@ -1056,75 +1088,97 @@ impl KeyGenerationRegistry {
         KeyAdmission::Current
     }
 
-    /// The held key's repeat lease ends for the rest of the hold.
-    pub(crate) fn cancel_backspace_repeat(&mut self, keyboard: HostId, backspace: u32) {
+    /// The one transition of the IME's Backspace repeat lease, for an input
+    /// on the seat whose host keyboards are `seat`, in the order of their
+    /// guest IDs ([`LeaseInput`]).
+    pub(crate) fn lease(&mut self, seat: &[HostId], input: LeaseInput) {
+        match input {
+            LeaseInput::Ime {
+                ti,
+                outcome: LeaseOutcome::End,
+            } => self.end_leases(seat, Some(ti)),
+            LeaseInput::Ime {
+                ti,
+                outcome: LeaseOutcome::ArmIfBackspaceHeld,
+            } => {
+                let held = seat.iter().copied().find(|&keyboard| {
+                    self.physically_held(keyboard, EVDEV_KEY_BACKSPACE)
+                        && !self.backspace_repeat_cancelled(keyboard)
+                });
+                match held {
+                    Some(keyboard) => self.arm(keyboard, ti),
+                    None => self.end_leases(seat, Some(ti)),
+                }
+            }
+            LeaseInput::OtherPress { keyboard } => {
+                self.set_lease(keyboard, |_| RepeatLease::Cancelled);
+                self.end_leases(seat, None);
+            }
+            LeaseInput::BackspaceRelease | LeaseInput::FocusLost => self.end_leases(seat, None),
+            LeaseInput::Recovered {
+                ti,
+                keyboard,
+                backspace,
+                sent,
+            } => match (backspace, sent) {
+                (true, true) => self.arm(keyboard, ti),
+                (true, false) | (false, true) => self.end_leases(seat, Some(ti)),
+                (false, false) => {}
+            },
+        }
+    }
+
+    /// Lease `keyboard`'s held Backspace to `ti`, unless it is cancelled or
+    /// leased to another text input.
+    fn arm(&mut self, keyboard: HostId, ti: TiId) {
+        self.set_lease(keyboard, |lease| match lease {
+            RepeatLease::Free => RepeatLease::Leased { text_input: ti },
+            other => other,
+        });
+    }
+
+    /// End the leases of `seat`'s keyboards, those of `ti` only if given,
+    /// for the rest of their holds: ending the IME's repeat is not
+    /// releasing the key, whose next empty confirmation in the same hold
+    /// must not repeat it again.
+    fn end_leases(&mut self, seat: &[HostId], ti: Option<TiId>) {
+        for &keyboard in seat {
+            self.set_lease(keyboard, |lease| match lease {
+                RepeatLease::Leased { text_input } if ti.is_none_or(|ti| ti == text_input) => {
+                    RepeatLease::Cancelled
+                }
+                other => other,
+            });
+        }
+    }
+
+    /// Move the lease of `keyboard`'s Backspace by `transition`, if it is
+    /// held.
+    fn set_lease(&mut self, keyboard: HostId, transition: impl FnOnce(RepeatLease) -> RepeatLease) {
         if let Some(KeyPhase::Held { lease, .. }) = self
             .entries
             .get_mut(&keyboard)
-            .and_then(|keys| keys.get_mut(&backspace))
+            .and_then(|keys| keys.get_mut(&EVDEV_KEY_BACKSPACE))
             .map(|generation| &mut generation.phase)
         {
-            *lease = RepeatLease::Cancelled;
+            *lease = transition(*lease);
         }
     }
 
-    pub(crate) fn backspace_repeat_cancelled(&self, keyboard: HostId, backspace: u32) -> bool {
-        self.entries
-            .get(&keyboard)
-            .and_then(|keys| keys.get(&backspace))
+    /// Whether `keyboard`'s held Backspace may not be leased again in this
+    /// hold.
+    pub(crate) fn backspace_repeat_cancelled(&self, keyboard: HostId) -> bool {
+        self.generation(keyboard, EVDEV_KEY_BACKSPACE)
             .is_some_and(|generation| generation.phase.lease() == RepeatLease::Cancelled)
     }
 
-    pub(crate) fn arm_ime_repeat(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        guest_text_input: u32,
-    ) -> bool {
-        let Some(KeyPhase::Held { lease, .. }) = self
-            .entries
-            .get_mut(&keyboard)
-            .and_then(|keys| keys.get_mut(&key))
-            .map(|generation| &mut generation.phase)
-        else {
-            return false;
-        };
-        match *lease {
-            RepeatLease::Free => {}
-            RepeatLease::Leased { text_input } if text_input == guest_text_input => {}
-            RepeatLease::Leased { .. } | RepeatLease::Cancelled => return false,
+    /// The text input `keyboard`'s Backspace is leased to, if any.
+    pub(crate) fn backspace_lease(&self, keyboard: HostId) -> Option<TiId> {
+        let generation = self.generation(keyboard, EVDEV_KEY_BACKSPACE)?;
+        match generation.phase.lease() {
+            RepeatLease::Leased { text_input } => Some(text_input),
+            RepeatLease::Free | RepeatLease::Cancelled => None,
         }
-        *lease = RepeatLease::Leased {
-            text_input: guest_text_input,
-        };
-        true
-    }
-
-    pub(crate) fn ime_repeat_active(&self, keyboard: HostId, key: u32) -> bool {
-        self.ime_repeat_owner(keyboard, key).is_some()
-    }
-
-    pub(crate) fn ime_repeat_owner(&self, keyboard: HostId, key: u32) -> Option<u32> {
-        self.entries
-            .get(&keyboard)
-            .and_then(|keys| keys.get(&key))
-            .and_then(|generation| match generation.phase.lease() {
-                RepeatLease::Leased { text_input } => Some(text_input),
-                RepeatLease::Free | RepeatLease::Cancelled => None,
-            })
-    }
-
-    pub(crate) fn cancel_backspace_repeat_for_owner(
-        &mut self,
-        keyboard: HostId,
-        backspace: u32,
-        guest_text_input: u32,
-    ) -> bool {
-        if self.ime_repeat_owner(keyboard, backspace) != Some(guest_text_input) {
-            return false;
-        }
-        self.cancel_backspace_repeat(keyboard, backspace);
-        true
     }
 
     pub(crate) fn guest_owner(&self, keyboard: HostId, key: u32) -> Option<GuestKeyOwner> {
@@ -1193,6 +1247,21 @@ impl KeyGenerationRegistry {
 /// transition.
 #[cfg(test)]
 impl KeyGenerationRegistry {
+    /// Lease `keyboard`'s held Backspace to text input `ti`, as an IME
+    /// outcome on a seat of that keyboard alone would.
+    pub(crate) fn lease_for_test(&mut self, keyboard: HostId, ti: u32) {
+        let outcome = LeaseOutcome::ArmIfBackspaceHeld;
+        let ti = TiId(ti);
+        self.lease(&[keyboard], LeaseInput::Ime { ti, outcome });
+        assert_eq!(self.backspace_lease(keyboard), Some(ti));
+    }
+
+    /// Cancel `keyboard`'s held Backspace's lease for the rest of the hold,
+    /// as a press of another key would.
+    pub(crate) fn cancel_lease_for_test(&mut self, keyboard: HostId) {
+        self.lease(&[keyboard], LeaseInput::OtherPress { keyboard });
+    }
+
     pub(crate) fn claim_guest_owner(
         &mut self,
         keyboard: HostId,
@@ -1573,28 +1642,41 @@ mod tests {
     fn ime_repeat_lease_is_generation_and_keyboard_scoped() {
         let keyboard_a = HostId(10);
         let keyboard_b = HostId(11);
-        let key = 14;
+        let seat = [keyboard_a, keyboard_b];
+        let key = EVDEV_KEY_BACKSPACE;
+        let (ti, other) = (TiId(40), TiId(41));
+        let arm = |ti| LeaseInput::Ime {
+            ti,
+            outcome: LeaseOutcome::ArmIfBackspaceHeld,
+        };
+        let end = |ti| LeaseInput::Ime {
+            ti,
+            outcome: LeaseOutcome::End,
+        };
         let mut registry = KeyGenerationRegistry::default();
         registry.observe_physical_state(keyboard_a, key, 1);
         registry.observe_physical_state(keyboard_b, key, 1);
 
-        assert!(registry.arm_ime_repeat(keyboard_a, key, 40));
-        assert!(registry.ime_repeat_active(keyboard_a, key));
-        assert_eq!(registry.ime_repeat_owner(keyboard_a, key), Some(40));
-        assert!(!registry.ime_repeat_active(keyboard_b, key));
+        // The seat's first keyboard that holds Backspace takes the lease.
+        registry.lease(&seat, arm(ti));
+        assert_eq!(registry.backspace_lease(keyboard_a), Some(ti));
+        assert_eq!(registry.backspace_lease(keyboard_b), None);
 
+        // A release ends it with the generation.
         registry.observe_physical_state(keyboard_a, key, 0);
-        assert!(!registry.ime_repeat_active(keyboard_a, key));
-        assert!(registry.arm_ime_repeat(keyboard_b, key, 41));
-        registry.clear_keyboard(keyboard_a);
-        assert!(registry.ime_repeat_active(keyboard_b, key));
-        assert_eq!(registry.ime_repeat_owner(keyboard_b, key), Some(41));
+        assert_eq!(registry.backspace_lease(keyboard_a), None);
+        registry.lease(&seat, arm(other));
+        assert_eq!(registry.backspace_lease(keyboard_b), Some(other));
 
-        assert!(!registry.cancel_backspace_repeat_for_owner(keyboard_b, key, 40));
-        assert!(registry.ime_repeat_active(keyboard_b, key));
-        assert!(registry.cancel_backspace_repeat_for_owner(keyboard_b, key, 41));
-        assert!(!registry.ime_repeat_active(keyboard_b, key));
-        assert!(!registry.arm_ime_repeat(keyboard_b, key, 41));
+        // Only the text input that holds it ends it, for the rest of the
+        // hold.
+        registry.lease(&seat, end(ti));
+        assert_eq!(registry.backspace_lease(keyboard_b), Some(other));
+        registry.lease(&seat, end(other));
+        assert_eq!(registry.backspace_lease(keyboard_b), None);
+        assert!(registry.backspace_repeat_cancelled(keyboard_b));
+        registry.lease(&seat, arm(other));
+        assert_eq!(registry.backspace_lease(keyboard_b), None);
     }
 
     const KEYBOARD_A: HostId = HostId(10);
@@ -2290,6 +2372,18 @@ mod tests {
                     && !generation.host_accelerator_suppressed
             }
 
+            /// The IME ends `owner`'s lease of `key` for the rest of its hold.
+            fn end_lease(&mut self, key: u32, owner: u32) {
+                if let Some(generation) = self
+                    .keys
+                    .get_mut(&key)
+                    .filter(|generation| generation.ime_repeat_owner == Some(owner))
+                {
+                    generation.backspace_repeat_cancelled = true;
+                    generation.ime_repeat_owner = None;
+                }
+            }
+
             fn held(&self, key: u32) -> Option<ModelGeneration> {
                 self.keys
                     .get(&key)
@@ -2421,9 +2515,12 @@ mod tests {
             /// `wl_keyboard.enter` with both keys held.
             EnterSnapshot,
             InvalidatePeek(u32),
-            CancelRepeat(u32),
-            ArmImeRepeat(u32, u32),
-            CancelRepeatOwner(u32, u32),
+            /// A press of another key: Backspace's lease is cancelled.
+            CancelRepeat,
+            /// The IME arms the lease for a text input, if Backspace is held.
+            ArmImeRepeat(u32),
+            /// The IME ends a text input's lease.
+            CancelRepeatOwner(u32),
             SuppressAccelerator(u32),
             TakeAcceleratorSuppression(u32),
             ClaimOwner(u32, GuestKeyOwner),
@@ -2434,7 +2531,8 @@ mod tests {
             Clear,
         }
 
-        const KEY_A: u32 = 30;
+        // Backspace, which the lease concerns.
+        const KEY_A: u32 = EVDEV_KEY_BACKSPACE;
         const KEY_B: u32 = 57;
         let keyboard = HostId(10);
         let operations = [
@@ -2453,11 +2551,11 @@ mod tests {
             Operation::AdmitRelease(KEY_A, true),
             Operation::EnterSnapshot,
             Operation::InvalidatePeek(KEY_B),
-            Operation::CancelRepeat(KEY_A),
-            Operation::ArmImeRepeat(KEY_A, 77),
-            Operation::ArmImeRepeat(KEY_A, 78),
-            Operation::CancelRepeatOwner(KEY_A, 77),
-            Operation::CancelRepeatOwner(KEY_A, 78),
+            Operation::CancelRepeat,
+            Operation::ArmImeRepeat(77),
+            Operation::ArmImeRepeat(78),
+            Operation::CancelRepeatOwner(77),
+            Operation::CancelRepeatOwner(78),
             Operation::SuppressAccelerator(KEY_B),
             Operation::TakeAcceleratorSuppression(KEY_B),
             Operation::ClaimOwner(KEY_A, GuestKeyOwner::Physical),
@@ -2547,45 +2645,33 @@ mod tests {
                             peek.eligible = false;
                         }
                     }
-                    Operation::CancelRepeat(key) => {
-                        registry.cancel_backspace_repeat(keyboard, key);
-                        if let Some(generation) = model.keys.get_mut(&key).filter(|generation| {
-                            generation.physical_state == PhysicalKeyState::Held
-                        }) {
+                    Operation::CancelRepeat => {
+                        registry.lease(&[keyboard], LeaseInput::OtherPress { keyboard });
+                        if model.held(KEY_A).is_some() {
+                            let generation = model.ensure(KEY_A);
                             generation.backspace_repeat_cancelled = true;
                             generation.ime_repeat_owner = None;
                         }
                     }
-                    Operation::ArmImeRepeat(key, owner) => {
-                        let actual = registry.arm_ime_repeat(keyboard, key, owner);
-                        let expected = model.keys.get_mut(&key).is_some_and(|generation| {
-                            if generation.physical_state == PhysicalKeyState::Held
-                                && !generation.backspace_repeat_cancelled
-                                && generation
-                                    .ime_repeat_owner
-                                    .is_none_or(|current| current == owner)
-                            {
-                                generation.ime_repeat_owner = Some(owner);
-                                true
-                            } else {
-                                false
+                    Operation::ArmImeRepeat(owner) => {
+                        let outcome = LeaseOutcome::ArmIfBackspaceHeld;
+                        let ti = TiId(owner);
+                        registry.lease(&[keyboard], LeaseInput::Ime { ti, outcome });
+                        match model.held(KEY_A) {
+                            Some(held) if !held.backspace_repeat_cancelled => {
+                                let generation = model.ensure(KEY_A);
+                                if generation.ime_repeat_owner.is_none() {
+                                    generation.ime_repeat_owner = Some(owner);
+                                }
                             }
-                        });
-                        assert_eq!(actual, expected);
+                            _ => model.end_lease(KEY_A, owner),
+                        }
                     }
-                    Operation::CancelRepeatOwner(key, owner) => {
-                        let actual =
-                            registry.cancel_backspace_repeat_for_owner(keyboard, key, owner);
-                        let expected = model.keys.get_mut(&key).is_some_and(|generation| {
-                            if generation.ime_repeat_owner == Some(owner) {
-                                generation.backspace_repeat_cancelled = true;
-                                generation.ime_repeat_owner = None;
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        assert_eq!(actual, expected);
+                    Operation::CancelRepeatOwner(owner) => {
+                        let outcome = LeaseOutcome::End;
+                        let ti = TiId(owner);
+                        registry.lease(&[keyboard], LeaseInput::Ime { ti, outcome });
+                        model.end_lease(KEY_A, owner);
                     }
                     Operation::SuppressAccelerator(key) => {
                         registry.suppress_host_accelerator(keyboard, key);
