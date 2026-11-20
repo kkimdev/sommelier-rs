@@ -297,6 +297,21 @@ impl GuestObject {
             Self::Paired { host, .. } => Some(*host),
         }
     }
+
+    /// The data of a live object, moved out as the object ends.
+    fn into_data(self) -> ObjectData {
+        match self {
+            Self::Local(_, data)
+            | Self::Paired {
+                state: GuestState::Live(data),
+                ..
+            } => data,
+            Self::Paired {
+                state: GuestState::DestroyPending,
+                ..
+            } => ObjectData::default(),
+        }
+    }
 }
 
 /// What holds a host ID. An ID is in use exactly while it has one.
@@ -1011,31 +1026,44 @@ impl ShadowTable {
     /// allocate or no longer tracks, changes nothing and returns
     /// [`DeletedHostId::Ignored`]. Freeing a live object's ID would hand it
     /// to a new object while the old one still holds it.
-    pub(super) fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
+    ///
+    /// # Returns
+    ///
+    /// What it ended, and the data of the guest object it ended, if it
+    /// ended one: the entry is gone by then, so this is the last chance to
+    /// hand the data to its owner. Every other outcome ends no guest object
+    /// and returns no data.
+    pub(super) fn release_deleted_host_id(&mut self, host_id: u32) -> (DeletedHostId, ObjectData) {
         let host = HostId(host_id);
         let deletable = self.hosts.get(&host).filter(|object| {
             self.host_ids.contains(host_id) && !matches!(object, HostObject::HostOnly(_))
         });
         let Some(object) = deletable else {
             warn!("Ignoring wl_display.delete_id for host ID {host_id}, which is untracked or a live host-only object");
-            return DeletedHostId::Ignored;
+            return (DeletedHostId::Ignored, ObjectData::default());
         };
         let guest = object.guest();
         self.hosts.remove(&host);
         self.host_ids.release(host_id);
         let Some(guest) = guest else {
-            return DeletedHostId::HostOnly { host };
+            return (DeletedHostId::HostOnly { host }, ObjectData::default());
         };
         let was_live = !self.is_pending_destroy_guest(guest);
-        let paired = self
-            .forget_guest_object(guest)
-            .and_then(|object| object.host());
-        debug_assert_eq!(paired, Some(host), "guest {guest:?} was not paired");
-        DeletedHostId::Paired {
-            host,
-            guest,
-            was_live,
-        }
+        let removed = self.forget_guest_object(guest);
+        debug_assert_eq!(
+            removed.as_ref().and_then(GuestObject::host),
+            Some(host),
+            "guest {guest:?} was not paired"
+        );
+        let data = removed.map(GuestObject::into_data).unwrap_or_default();
+        (
+            DeletedHostId::Paired {
+                host,
+                guest,
+                was_live,
+            },
+            data,
+        )
     }
 
     /// End guest object `guest`: the one place a guest object ends.
@@ -1457,7 +1485,7 @@ mod tests {
         assert!(table.is_retired_host(host));
         assert!(!table.get_host_interface(host).is_some());
         assert_eq!(
-            table.release_deleted_host_id(host.0),
+            table.release_deleted_host_id(host.0).0,
             DeletedHostId::HostOnly { host }
         );
         assert!(table.is_host_id_available(host));
@@ -1498,7 +1526,7 @@ mod tests {
         // The host acknowledgement is the only point at which the reservation
         // can be released.
         assert_eq!(
-            table.release_deleted_host_id(40),
+            table.release_deleted_host_id(40).0,
             DeletedHostId::HostOnly { host: HostId(40) }
         );
         assert!(!table.is_retired_host(HostId(40)));
@@ -1531,7 +1559,7 @@ mod tests {
         assert_ne!(second, first, "an ID awaiting delete_id must not be reused");
 
         assert_eq!(
-            table.release_deleted_host_id(first.0),
+            table.release_deleted_host_id(first.0).0,
             DeletedHostId::Paired {
                 host: first,
                 guest: GuestId(10),
@@ -1546,7 +1574,7 @@ mod tests {
             "a deleted ID is reused first"
         );
         assert_eq!(
-            table.release_deleted_host_id(first.0 + 100),
+            table.release_deleted_host_id(first.0 + 100).0,
             DeletedHostId::Ignored,
             "a delete_id for an ID never allocated changes nothing"
         );
@@ -1564,7 +1592,7 @@ mod tests {
         let binding = table.create_host_only(Iface::WlShm, 1);
 
         assert_eq!(
-            table.release_deleted_host_id(binding.0),
+            table.release_deleted_host_id(binding.0).0,
             DeletedHostId::Ignored
         );
         assert!(table.get_host_interface(binding).is_some());
@@ -1680,7 +1708,7 @@ mod tests {
 
         // The host's delete_id still frees it.
         assert_eq!(
-            table.release_deleted_host_id(host_id.0),
+            table.release_deleted_host_id(host_id.0).0,
             DeletedHostId::HostOnly { host: host_id }
         );
         assert!(table.is_host_id_available(host_id));

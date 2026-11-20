@@ -109,10 +109,7 @@ impl Context {
     pub(crate) fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
         let guest = self.shadow_table.guest_named_by_host(host_id);
         let interface = guest.and_then(|guest| self.shadow_table.get_interface(guest));
-        let data = guest.map_or_else(ObjectData::default, |guest| {
-            self.shadow_table.take_data(guest)
-        });
-        let deleted = self.shadow_table.release_deleted_host_id(host_id);
+        let (deleted, data) = self.shadow_table.release_deleted_host_id(host_id);
         match deleted {
             DeletedHostId::Ignored => {}
             DeletedHostId::HostOnly { host } => forget_host_id(self, host),
@@ -121,6 +118,9 @@ impl Context {
                 guest,
                 was_live,
             } => {
+                // A live guest object ends here, so the table hands back
+                // the data it kept; one the guest already destroyed kept
+                // none, and an ignored `delete_id` never took any.
                 if let (true, Some(interface)) = (was_live, interface) {
                     forget_object(self, interface, guest, Some(host), true, data);
                 }

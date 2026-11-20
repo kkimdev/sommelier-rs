@@ -1021,6 +1021,30 @@ mod tests {
         assert!(ctx.is_fatal());
     }
 
+    /// The host never deletes an object it allocated on its own, so a
+    /// `delete_id` for one is ignored: the live object keeps its data.
+    #[test]
+    fn an_ignored_delete_id_keeps_a_live_objects_data() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        // The host allocates IDs from the server range, which the proxy's
+        // allocator never holds, so a `delete_id` for one is ignored.
+        let host = HostId::for_test(0xff00_0000);
+        let guest = ctx
+            .shadow_table
+            .adopt_host_created(host, Iface::ZwpLinuxBufferParamsV1, 1);
+        assert!(ctx.shadow_table.attach(guest, ParamsData::Open(Vec::new())));
+
+        assert_eq!(
+            ctx.release_deleted_host_id(crate::wire::WireId::wire(host)),
+            DeletedHostId::Ignored
+        );
+        assert_eq!(ctx.shadow_table.link(guest), Some(Link::Host(host)));
+        assert!(
+            ctx.shadow_table.data::<ParamsData>(guest).is_some(),
+            "an ignored delete_id must not take the object's data"
+        );
+    }
+
     fn awaiting_release(has_detached_use: bool) -> RenderBufferUse {
         RenderBufferUse::AwaitingRelease { has_detached_use }
     }
