@@ -15,19 +15,18 @@ limitations under the License.
 */
 
 use crate::protocols::wayland::wl_seat;
-use crate::state::Context;
+use crate::state::{Context, HostId, Keyboard, PostDispatch};
 use crate::wire::Action;
 
 pub struct SeatHandler;
 
 impl wl_seat::WlSeatHandler for SeatHandler {
     fn on_get_keyboard(&mut self, ctx: &mut Context, id: u32) -> Action {
-        let guest_seat_id = ctx.last_sender_id;
-        ctx.keyboard_to_seat.insert(id, guest_seat_id);
-        // zcr_keyboard_extension_v1.get_extended_keyboard is sent from
-        // KeyboardHandler::on_enter (the first host→client event for this
-        // keyboard), because we need the *host* keyboard ID which is only
-        // known at that point. See keyboard.rs::bind_extended_keyboard.
+        let seat = ctx.last_sender_id;
+        // The keyboard's record is keyed by its host ID, which the forward
+        // maps. Its zcr_extended_keyboard_v1 is bound at its first enter
+        // (`keyboard::KeyboardHandler::ensure_extended_keyboard_bound`).
+        ctx.defer_until_forwarded(PostDispatch::KeyboardCreated { keyboard: id, seat });
         Action::Forward
     }
 
@@ -40,6 +39,17 @@ impl wl_seat::WlSeatHandler for SeatHandler {
         // (including a key release paired with a press sent before this
         // request).
         Action::Forward
+    }
+}
+
+/// `wl_seat.get_keyboard` of guest seat `seat` created guest keyboard
+/// `keyboard`, whose host keyboard its forward has just mapped: record it.
+pub(crate) fn keyboard_created(ctx: &mut Context, keyboard: u32, seat: u32) {
+    match ctx.shadow_table.get_host_id(keyboard) {
+        Some(host) => ctx
+            .keyboards
+            .insert(HostId(host), Keyboard::new(keyboard, seat)),
+        None => log::debug!("Guest keyboard {keyboard} has no host keyboard"),
     }
 }
 
@@ -141,7 +151,8 @@ mod tests {
             .insert_paired_for_test(guest_seat, 11, "wl_seat");
         ctx.shadow_table
             .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
+        ctx.keyboards
+            .add_for_test(guest_keyboard, host_keyboard, guest_seat);
         ctx.keyboard_focus
             .set_for_test(HostId(host_keyboard), guest_seat, 40, 41);
         ctx.key_generations
@@ -150,7 +161,7 @@ mod tests {
 
         assert_eq!(SeatHandler.on_release(&mut ctx), Action::Forward);
         assert_eq!(ctx.keyboard_focus.surface_for_seat(guest_seat), Some(40));
-        assert_eq!(ctx.keyboard_to_seat.get(&guest_keyboard), Some(&guest_seat));
+        assert_eq!(ctx.keyboards.seat(HostId(host_keyboard)), Some(guest_seat));
         assert!(ctx
             .keyboard_focus
             .focus_for_keyboard(HostId(host_keyboard))
@@ -246,7 +257,8 @@ mod tests {
             .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
         ctx.shadow_table
             .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
+        ctx.keyboards
+            .add_for_test(guest_keyboard, host_keyboard, guest_seat);
 
         // The child press was forwarded while the seat was live. Its release
         // must remain paired even if the parent seat is released first.

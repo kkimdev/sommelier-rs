@@ -207,7 +207,7 @@
   `wl_display.sync` (about 30 a second).
 - The mirror assumes Exo reads a report and its glued sync in one read;
   an IME event between them would leave it exact but wrong (never seen).
-- `is_modifier` reads only layout 0, level 0.
+- `Keymap::is_modifier` reads only layout 0, level 0.
 - Chromium's IMA keeps composing after a composition empties (ㄱ then
   Backspace), so an earlier key's text can be lost; host behaviour, not
   mitigated.

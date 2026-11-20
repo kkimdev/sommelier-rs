@@ -249,9 +249,9 @@ mod tests {
             .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
         ctx.host_keyboard_extension_id = Some(HostId(EXTENSION));
         let host = ctx.shadow_table.create_paired(20, "wl_keyboard", 1, 1);
-        ctx.keyboard_to_seat.insert(20, SEAT);
+        ctx.keyboards.add_for_test(20, host, SEAT);
         KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
-        let extended = ctx.keyboard_to_extended_keyboard[&HostId(host)];
+        let extended = ctx.keyboards.extended_for_test(HostId(host)).unwrap();
         ctx.client_to_host_queue.clear();
 
         DisplayHandler.on_delete_id(&mut ctx, host);
@@ -261,8 +261,7 @@ mod tests {
             [(extended.0, zcr_extended_keyboard_v1::REQ_DESTROY)]
         );
         assert!(ctx.shadow_table.is_retired_host(extended.0));
-        assert!(ctx.keyboard_to_seat.is_empty());
-        assert!(ctx.extended_keyboard_to_keyboard.is_empty());
+        assert!(ctx.keyboards.is_empty());
         assert!(!ctx.is_fatal());
         ctx.assert_no_orphans();
 
@@ -273,6 +272,7 @@ mod tests {
             ctx.shadow_table.create_paired(21, "wl_keyboard", 1, 1),
             host
         );
+        ctx.keyboards.add_for_test(21, host, SEAT);
         KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),

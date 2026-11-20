@@ -267,33 +267,31 @@ impl Context {
         }
 
         // Keyboards, their focus and keys, and text input.
-        for &keyboard in self.keyboard_to_seat.keys() {
-            guest("keyboard seat", keyboard, "wl_keyboard");
+        // A keyboard's record holds everything of the keyboard itself, so
+        // its host object and the guest one paired with it are all there is
+        // to check; its extended keyboard is host-only.
+        for (keyboard, record) in self.keyboards.iter() {
+            host("keyboard record", keyboard.0, "wl_keyboard");
+            assert_eq!(
+                table.get_guest_id(keyboard.0),
+                Some(record.guest),
+                "keyboard record {} names another guest keyboard",
+                keyboard.0
+            );
+            if let Some(extended) = record.extended {
+                host_only("extended keyboard", extended.0, "zcr_extended_keyboard_v1");
+            }
         }
-        let host_keyboards = self
-            .keyboard_to_extended_keyboard
-            .keys()
-            .chain(self.extended_keyboard_to_keyboard.values())
-            .chain(self.keyboard_repeatable_keys.keys())
-            .chain(self.keyboard_xkb_states.keys())
-            .chain(self.keyboard_modifiers.keys())
-            .copied()
-            .chain(self.key_generations.keyboards_for_test());
-        for keyboard in host_keyboards {
-            host("keyboard state", keyboard.0, "wl_keyboard");
+        for keyboard in self.key_generations.keyboards_for_test() {
+            host("key generations", keyboard.0, "wl_keyboard");
         }
         // A seat reference names the guest wl_seat that its keyboard or
         // text input was created from, and outlives that seat, whose ID the
         // guest may then reuse for any object (INVARIANTS "Object
-        // lifetimes"). So `keyboard_to_seat` and a text input's seat are
-        // not checked against the table, and every copy of a keyboard's
-        // seat must name it.
-        let keyboard_seat = |keyboard: HostId| {
-            table
-                .get_guest_id(keyboard.0)
-                .and_then(|keyboard| self.keyboard_to_seat.get(&keyboard))
-                .copied()
-        };
+        // lifetimes"). So a keyboard's seat and a text input's seat are not
+        // checked against the table, and every copy of a keyboard's seat
+        // must name it.
+        let keyboard_seat = |keyboard: HostId| self.keyboards.seat(keyboard);
         for (keyboard, focus) in self.keyboard_focus.focuses_for_test() {
             host("keyboard focus", keyboard.0, "wl_keyboard");
             guest("keyboard focus", focus.guest_surface, "wl_surface");

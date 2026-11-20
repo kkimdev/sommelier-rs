@@ -4791,7 +4791,7 @@ pub(super) mod tests {
             self.ctx
                 .shadow_table
                 .insert_paired_for_test(guest, host.0, "wl_keyboard");
-            self.ctx.keyboard_to_seat.insert(guest, SEAT);
+            self.ctx.keyboards.add_for_test(guest, host.0, SEAT);
         }
 
         /// Give [`HOST_KEYBOARD`] its extended keyboard, which sends
@@ -4799,12 +4799,8 @@ pub(super) mod tests {
         pub(in crate::handler) fn with_extended_keyboard() -> Self {
             let mut ime = Self::with_keyboard();
             let extended = HostId(HOST_EXTENDED_KEYBOARD);
-            ime.ctx
-                .keyboard_to_extended_keyboard
-                .insert(HOST_KEYBOARD, extended);
-            ime.ctx
-                .extended_keyboard_to_keyboard
-                .insert(extended, HOST_KEYBOARD);
+            let keyboard = ime.ctx.keyboards.get_mut(HOST_KEYBOARD).unwrap();
+            keyboard.extended = Some(extended);
             ime
         }
 
@@ -4874,11 +4870,11 @@ pub(super) mod tests {
                     guest_input: true,
                 },
             );
-            self.ctx
-                .keyboard_repeatable_keys
-                .entry(keyboard)
-                .or_default()
-                .insert(key);
+            // The default keymap repeats every key the tests hold.
+            let keymap = self.ctx.keyboards.keymap_for_test(keyboard);
+            if keymap.is_none() {
+                self.ctx.keyboards.load_default_keymap_for_test(keyboard);
+            }
         }
 
         /// Hold Backspace on [`HOST_KEYBOARD`], with its IME repeat leased

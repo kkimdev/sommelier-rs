@@ -20,35 +20,14 @@ use crate::ime::{SeatId, TiId};
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{
-    Context, HostId, InternalCallback, LeaseInput, ShadowTable, EVDEV_KEY_BACKSPACE,
-};
+use crate::state::{Context, HostId, InternalCallback, LeaseInput, EVDEV_KEY_BACKSPACE};
 use crate::wire::Outgoing;
-use std::collections::BTreeMap;
-
-/// The host keyboards of `guest_seat`, in the order of their guest IDs.
-/// It borrows only the fields it reads, so that a caller can change
-/// another field of the context as it walks them.
-fn host_keyboards_of_seat<'a>(
-    keyboard_to_seat: &'a BTreeMap<u32, u32>,
-    shadow_table: &'a ShadowTable,
-    guest_seat: u32,
-) -> impl Iterator<Item = HostId> + 'a {
-    keyboard_to_seat
-        .iter()
-        .filter(move |(_, &seat)| seat == guest_seat)
-        .filter_map(|(&guest_keyboard_id, _)| shadow_table.get_host_id(guest_keyboard_id))
-        .map(HostId)
-}
 
 /// Move the IME's Backspace repeat lease on the keyboards of `guest_seat`,
 /// none if the input's keyboard has no seat
 /// ([`crate::state::KeyGenerationRegistry::lease`]).
 pub(crate) fn lease(ctx: &mut Context, guest_seat: Option<u32>, input: LeaseInput) {
-    let seat: Vec<_> = guest_seat
-        .into_iter()
-        .flat_map(|seat| host_keyboards_of_seat(&ctx.keyboard_to_seat, &ctx.shadow_table, seat))
-        .collect();
+    let seat = guest_seat.map_or_else(Vec::new, |seat| ctx.keyboards.of_seat(seat));
     ctx.key_generations.lease(&seat, input);
     // One text input on a connection is enabled at a time, so the IME
     // never arms a Backspace another text input holds.
@@ -105,12 +84,8 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
     let mut candidates = Vec::new();
     let mut stale_key_held = false;
 
-    for (&guest_keyboard_id, &seat) in &ctx.keyboard_to_seat {
-        if seat != guest_seat {
-            continue;
-        }
-        let Some(host_keyboard_id) = ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId)
-        else {
+    for host_keyboard_id in ctx.keyboards.of_seat(guest_seat) {
+        let Some(guest_keyboard_id) = ctx.keyboards.get(host_keyboard_id).map(|k| k.guest) else {
             continue;
         };
         stale_key_held |= ctx.key_generations.holds_a_stale_key(host_keyboard_id);
@@ -149,9 +124,10 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
     let physically_held = ctx.key_generations.physically_held(host_keyboard_id, key);
     let stale = ctx.key_generations.held_key_is_stale(host_keyboard_id, key);
     let repeatable = ctx
-        .keyboard_repeatable_keys
-        .get(&host_keyboard_id)
-        .is_some_and(|keys| keys.contains(&key));
+        .keyboards
+        .get(host_keyboard_id)
+        .and_then(|keyboard| keyboard.keymap.as_ref())
+        .is_some_and(|keymap| keymap.repeats(key));
     let backspace_cancelled = key == EVDEV_KEY_BACKSPACE
         && ctx
             .key_generations
@@ -407,10 +383,7 @@ fn host_signal(
                     // which sends each keyboard of every guest seat the
                     // press in turn. A key held only across a detach is
                     // pressed anew too.
-                    let keyboard = ctx
-                        .extended_keyboard_to_keyboard
-                        .get(&HostId(sender))
-                        .copied();
+                    let keyboard = ctx.keyboards.of_extended(HostId(sender));
                     HostSignal::PeekPress {
                         keyboard,
                         key,
@@ -512,8 +485,10 @@ pub(crate) fn recover_pending(ctx: &mut Context) {
     let Some(PendingRecovery { ti, seat, held, .. }) = ctx.pending_recovery.take() else {
         return;
     };
-    let keyboard_held = ctx.shadow_table.get_host_id(held.guest_keyboard_id)
-        == Some(held.host_keyboard_id.0)
+    let keyboard_held = ctx
+        .keyboards
+        .get(held.host_keyboard_id)
+        .is_some_and(|keyboard| keyboard.guest == held.guest_keyboard_id)
         && ctx
             .key_generations
             .physically_held(held.host_keyboard_id, held.key);
@@ -558,13 +533,7 @@ pub(crate) fn recover_pending(ctx: &mut Context) {
 /// starts a generation that can be. This ends only the recovery: the keys
 /// are still guest input.
 pub(super) fn forget_held_keys_for_seat(ctx: &mut Context, guest_seat: u32) {
-    let host_keyboards: Vec<_> = ctx
-        .keyboard_to_seat
-        .iter()
-        .filter(|(_, &seat)| seat == guest_seat)
-        .filter_map(|(&guest, _)| ctx.shadow_table.get_host_id(guest).map(HostId))
-        .collect();
-    for keyboard in host_keyboards {
+    for keyboard in ctx.keyboards.of_seat(guest_seat) {
         ctx.key_generations.mark_held_keys_stale(keyboard);
     }
 }
@@ -657,7 +626,7 @@ mod tests {
     #[test]
     fn ending_one_keyboard_repeat_does_not_cancel_another_held_keyboard() {
         let mut ime = Ime::with_keyboard();
-        let other = HostId(43);
+        let other = HostId(71);
         ime.keyboard(44, other);
         ime.lease_backspace_repeat(TI);
         let generations = &mut ime.ctx.key_generations;
@@ -753,6 +722,26 @@ mod tests {
         }
     }
 
+    /// An empty confirmation recovers only a key a keyboard of its text
+    /// input's seat holds: one held on another seat's keyboard is not its.
+    #[test]
+    fn a_key_held_on_another_seats_keyboard_is_not_recovered() {
+        const OTHER_GUEST: u32 = 70;
+        let other = HostId(71);
+        let mut ime = Ime::with_keyboard();
+        ime.ctx
+            .shadow_table
+            .insert_paired_for_test(OTHER_GUEST, other.0, "wl_keyboard");
+        ime.ctx.keyboards.add_for_test(OTHER_GUEST, other.0, 9);
+        ime.hold_peeked(other, 57, 700, 100);
+        ime.confirm();
+        assert_eq!(ime.events(), []);
+        // Held on the seat's own keyboard, the key is recovered.
+        ime.hold_peeked(HOST_KEYBOARD, 57, 701, 101);
+        ime.confirm();
+        assert_ne!(ime.events(), []);
+    }
+
     #[test]
     fn empty_confirmation_does_not_fall_back_from_newest_ineligible_key() {
         const SHIFT: u32 = 42;
@@ -796,8 +785,10 @@ mod tests {
         let mut ime = Ime::with_extended_keyboard();
         let generations = &mut ime.ctx.key_generations;
         generations.install_enter_snapshot(HOST_KEYBOARD, [TAB, SPACE]);
-        let repeatable = ime.ctx.keyboard_repeatable_keys.entry(HOST_KEYBOARD);
-        repeatable.or_default().extend([TAB, SPACE]);
+        // The default keymap repeats both.
+        ime.ctx
+            .keyboards
+            .load_default_keymap_for_test(HOST_KEYBOARD);
 
         ime.peek(SPACE, PRESSED, 700, 100);
         ime.peek(TAB, PRESSED, 701, 101);
@@ -889,24 +880,5 @@ mod tests {
         ime.confirm();
         assert_eq!(ime.events(), [uncommitted_done()]);
         assert!(!ime.repeat_active());
-    }
-
-    #[test]
-    fn held_backspace_fallback_rejects_unmapped_guest_keyboard() {
-        let mut ime = Ime::new();
-        // A stale route can survive a malformed or reordered bind, but
-        // without a host keyboard there is no physical key or compositor
-        // time domain from which a synthetic pair may safely be generated,
-        // even while host keyboards, none of them its own, hold a key.
-        ime.ctx.keyboard_to_seat.insert(KEYBOARD, SEAT);
-        for keyboard in [HOST_KEYBOARD, HostId(KEYBOARD)] {
-            ime.hold_peeked(keyboard, BACKSPACE, 700, 100);
-        }
-
-        ime.confirm();
-        assert!(
-            ime.ctx.host_to_client_queue.is_empty(),
-            "synthetic Backspace must require a mapped host keyboard"
-        );
     }
 }

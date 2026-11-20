@@ -27,10 +27,11 @@ limitations under the License.
 //! file format in `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`;
 //! [`parse_accelerator`] implements that list.
 //!
-//! This module only parses. [`HostAccelerators`] is the parsed
-//! `SOMMELIER_ACCELERATORS`, which `crate::settings` reads; the keyboard
-//! decides what a host accelerator means, and `crate::placement_config`
-//! what a placement binding does.
+//! This module parses chords and computes the chord a key forms under a
+//! keyboard's XKB state ([`Accelerator::of_key`]). [`HostAccelerators`]
+//! is the parsed `SOMMELIER_ACCELERATORS`, which `crate::settings` reads;
+//! the keyboard decides what a host accelerator means, and
+//! `crate::placement_config` what a placement binding does.
 
 use xkbcommon::xkb;
 
@@ -65,6 +66,64 @@ pub(crate) fn keysym_to_lower(sym: u32) -> u32 {
 pub struct Accelerator {
     pub modifiers: u32,
     pub symbol: u32,
+}
+
+impl Accelerator {
+    /// The chord `key`, an evdev keycode, forms under the XKB state
+    /// `state`: the one place a chord is computed, so host accelerators and
+    /// placement bindings always match against the same value.
+    ///
+    /// `None` when the evdev keycode overflows the XKB offset, or when the
+    /// key has no single keysym at the current level. Such a key is never
+    /// an accelerator or a binding.
+    pub(crate) fn of_key(state: &xkb::State, key: u32) -> Option<Self> {
+        let Some(xkb_raw_keycode) = key.checked_add(8) else {
+            log::warn!("Ignoring overflowing evdev keycode {}", key);
+            return None;
+        };
+        // Use key_get_one_sym so that the full XKB state (including active shift
+        // level) is considered. key_get_syms_by_level at level 0 would always
+        // return the unshifted symbol, causing <Shift>-modified accelerators to
+        // fail to match when Shift is held.
+        //
+        // key_get_one_sym returns KEY_NoSymbol when more than one keysym is
+        // mapped to this key at the current shift level (e.g. dead keys or
+        // Unicode combining sequences). Such a key forms no chord: we'd rather
+        // forward an unknown key to the guest than accidentally suppress it.
+        let sym = state.key_get_one_sym(xkb::Keycode::new(xkb_raw_keycode));
+        if sym.raw() == xkb::keysyms::KEY_NoSymbol {
+            return None;
+        }
+        Some(Self {
+            modifiers: modifiers_of(state),
+            symbol: keysym_to_lower(sym.raw()),
+        })
+    }
+}
+
+/// The modifiers `state` holds, as this module's masks: Control, Alt, Shift
+/// and Super, depressed or latched.
+///
+/// A locked modifier does not count, as in C sommelier: an accelerator is a
+/// chord of held keys. Exo reports every active modifier as depressed,
+/// locks included, because its `XkbTracker` updates the mask with nothing
+/// latched or locked; Caps Lock and Num Lock are not among the four, so
+/// with Exo a lock never changes a chord either way.
+fn modifiers_of(state: &xkb::State) -> u32 {
+    let components = xkb::STATE_MODS_DEPRESSED | xkb::STATE_MODS_LATCHED;
+    // Use the xkbcommon logical modifier name constants (e.g. MOD_NAME_ALT = "Mod1")
+    // rather than raw X11 modifier group strings. These are the stable canonical names
+    // that match across different keyboard layouts, matching C sommelier's use of
+    // XKB_MOD_NAME_ALT, XKB_MOD_NAME_LOGO, etc.
+    [
+        (xkb::MOD_NAME_CTRL, CONTROL_MASK),
+        (xkb::MOD_NAME_ALT, ALT_MASK),
+        (xkb::MOD_NAME_SHIFT, SHIFT_MASK),
+        (xkb::MOD_NAME_LOGO, SUPER_MASK),
+    ]
+    .into_iter()
+    .filter(|&(name, _)| state.mod_name_is_active(name, components))
+    .fold(0, |modifiers, (_, mask)| modifiers | mask)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +180,7 @@ pub(crate) fn parse_accelerator(token: &str) -> Result<Accelerator, ParseError> 
     Ok(Accelerator {
         modifiers,
         // Normalise to lowercase at parse time so the Accelerator is
-        // self-contained; the match site (KeyboardHandler::current_chord) also
+        // self-contained; the match site (Accelerator::of_key) also
         // lowercases the incoming sym, but having both sides normalised makes the
         // invariant explicit and removes an implicit coupling.
         symbol: keysym_to_lower(sym.raw()),

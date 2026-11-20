@@ -19,6 +19,7 @@ mod host_mapping;
 mod id_allocator;
 mod input;
 mod internal_callbacks;
+mod keyboards;
 mod lifecycle;
 mod objects;
 mod outputs;
@@ -42,7 +43,6 @@ use crate::allocator::{PendingFence, VirtGpuDevice};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Outgoing};
 use log::{debug, error, warn};
-use xkbcommon::xkb;
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
@@ -51,6 +51,7 @@ pub(crate) use self::input::{
     PeekOutcome, PhysicalKey, PointerFocus, SeatFocusChange, EVDEV_KEY_BACKSPACE,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
+pub(crate) use self::keyboards::{Keyboard, Keyboards};
 pub use self::objects::{DeletedHostId, Link, ShadowTable};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
@@ -68,6 +69,7 @@ pub(crate) use self::window_placement::{
     Placement, PlacementState, PlacementStep, Point, WindowPlacement,
 };
 pub(crate) use self::xdg_roles::XdgRoles;
+pub(crate) use crate::keymap::KeyboardModifiers;
 use crate::placement_config::PlacementConfig;
 use crate::settings::Settings;
 use std::rc::Rc;
@@ -320,6 +322,9 @@ pub struct GtkSurfaceState {
 pub(crate) enum PostDispatch {
     /// `xdg_surface.get_toplevel` created `xdg_toplevel` from `xdg_surface`.
     XdgToplevelCreated { xdg_surface: u32, xdg_toplevel: u32 },
+    /// `wl_seat.get_keyboard` created guest keyboard `keyboard` of guest
+    /// seat `seat`, whose host keyboard its forward mapped.
+    KeyboardCreated { keyboard: u32, seat: u32 },
 }
 
 /// The proxy's internal host `zaura_shell` binding.
@@ -347,16 +352,6 @@ pub struct GuestShm {
     pub formats: BTreeSet<u32>,
 }
 
-/// The modifier and group state a host `wl_keyboard.modifiers` event
-/// carries, as XKB masks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct KeyboardModifiers {
-    pub(crate) depressed: u32,
-    pub(crate) latched: u32,
-    pub(crate) locked: u32,
-    pub(crate) group: u32,
-}
-
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: BTreeMap<u32, ShmPool>,
@@ -368,7 +363,8 @@ pub struct Context {
     /// reaches them in that order (INVARIANTS "Nothing the proxy sends
     /// depends on hash order").
     pub ime: crate::ime::ImeCore,
-    pub keyboard_to_seat: BTreeMap<u32, u32>,
+    /// Every host keyboard, one record each.
+    pub(crate) keyboards: Keyboards,
     pub keyboard_focus: KeyboardFocusRegistry,
     pub pointer_focus: PointerFocus,
     /// Wheel steps from touchpad scrolling, which the client gets if
@@ -439,17 +435,6 @@ pub struct Context {
     pub host_text_input_extension_v1_id: Option<u32>,
     /// Host-side zcr_keyboard_extension_v1 object ID (bound internally on startup).
     pub host_keyboard_extension_id: Option<HostId>,
-    /// Maps host keyboard ID → host extended-keyboard ID for `ack_key`.
-    ///
-    /// Both key and value are [`HostId`]s intentionally — using [`GuestId`] here
-    /// by mistake is a **compile error**, preventing the direction bug where a
-    /// client→host request handler reads `ctx.last_sender_id` (a guest ID) and
-    /// uses it to look up a host-keyed map.
-    pub keyboard_to_extended_keyboard: BTreeMap<HostId, HostId>,
-    /// Reverse lookup for keyboard-extension v2 events. `peek_key` is sent by
-    /// the extended-keyboard object, while the physical-key state belongs to
-    /// the corresponding host `wl_keyboard`.
-    pub extended_keyboard_to_keyboard: BTreeMap<HostId, HostId>,
     /// Physical, peek, repeat-recovery, and guest-delivery state for every
     /// keyboard/key generation.
     pub key_generations: KeyGenerationRegistry,
@@ -457,19 +442,6 @@ pub struct Context {
     /// for the host's next event to show whether the confirmation was an
     /// autorepeat or Exo's before a new press (E13).
     pub(crate) pending_recovery: Option<crate::handler::ime_keys::PendingRecovery>,
-    /// Evdev keycodes that the active XKB keymap marks as repeatable.
-    pub keyboard_repeatable_keys: BTreeMap<HostId, BTreeSet<u32>>,
-    /// XKB state for each host keyboard, which holds the keymap it was
-    /// compiled from. A client can bind keyboards from multiple seats, whose
-    /// keymaps, modifiers and layout groups must not leak.
-    /// It makes `Context` `!Send` and `!Sync`: `xkb::State` uses non-atomic
-    /// interior mutation, so a connection stays on its one thread.
-    pub(crate) keyboard_xkb_states: BTreeMap<HostId, xkb::State>,
-    /// The modifiers each host keyboard last sent, kept until the keyboard
-    /// ends. Exo sends them only when they change, before `enter` rather
-    /// than after it, and not again with a new keymap, so focus changes and
-    /// keymaps must not reset them.
-    pub(crate) keyboard_modifiers: BTreeMap<HostId, KeyboardModifiers>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
@@ -973,7 +945,7 @@ impl Context {
             pending_native_creates: BTreeMap::new(),
             surfaces: BTreeMap::new(),
             ime: crate::ime::ImeCore::default(),
-            keyboard_to_seat: BTreeMap::new(),
+            keyboards: Keyboards::default(),
             keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),
             wheel_steps: crate::handler::pointer::WheelSteps::new(wheel),
@@ -1003,13 +975,8 @@ impl Context {
             host_text_input_manager_v1_id: None,
             host_text_input_extension_v1_id: None,
             host_keyboard_extension_id: None,
-            keyboard_to_extended_keyboard: BTreeMap::new(),
-            extended_keyboard_to_keyboard: BTreeMap::new(),
             key_generations: KeyGenerationRegistry::default(),
             pending_recovery: None,
-            keyboard_repeatable_keys: BTreeMap::new(),
-            keyboard_xkb_states: BTreeMap::new(),
-            keyboard_modifiers: BTreeMap::new(),
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
             registries: BTreeMap::new(),
