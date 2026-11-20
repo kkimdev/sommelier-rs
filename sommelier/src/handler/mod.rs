@@ -66,3 +66,20 @@ impl zxdg_output_v1::ZxdgOutputV1Handler for Handlers {}
 impl zaura_shell::ZauraShellHandler for Handlers {}
 impl zaura_surface::ZauraSurfaceHandler for Handlers {}
 impl zaura_popup::ZauraPopupHandler for Handlers {}
+
+/// Whether host event `event` of `sender`, whose guest object the guest
+/// has destroyed, still reaches its handler, as the owner of the sender's
+/// interface declares: it ends what the destroy left behind. Every other
+/// event of a destroyed object reaches neither its handler nor the guest.
+pub(crate) fn outlives_destroy(
+    ctx: &crate::state::Context,
+    sender: &crate::state::EventSender,
+    event: &crate::protocols::AnyEvent,
+) -> bool {
+    use crate::protocols::AnyEvent;
+    match event {
+        AnyEvent::WlBuffer(event) => buffer::outlives_destroy(ctx, sender, event),
+        AnyEvent::ZwpLinuxBufferParamsV1(event) => linux_dmabuf::outlives_destroy(event),
+        _ => false,
+    }
+}

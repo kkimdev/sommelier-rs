@@ -693,6 +693,20 @@ pub(crate) fn forget_feedback(ctx: &mut Context, feedback_id: GuestId, feedback:
     maybe_reclaim_capabilities(ctx, feedback.global);
 }
 
+/// Whether `event` of params the guest destroyed still reaches its handler
+/// (`handler::outlives_destroy`): an asynchronous create's `created` or
+/// `failed`, which may legally follow `destroy`. The host still owns a
+/// newly created `wl_buffer` then, which `on_created` destroys; dropping
+/// the event would leak it, since the generated `new_id` mapping only runs
+/// when the event is forwarded.
+pub(crate) fn outlives_destroy(event: &zwp_linux_buffer_params_v1::Event) -> bool {
+    matches!(
+        event,
+        zwp_linux_buffer_params_v1::Event::Created { .. }
+            | zwp_linux_buffer_params_v1::Event::Failed {}
+    )
+}
+
 impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
     fn on_create_params(ctx: &mut Context, _sender: RequestSender, params_id: GuestId) -> Action {
         ctx.defer_until_forwarded(PostDispatch::Attach {

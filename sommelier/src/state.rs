@@ -508,6 +508,16 @@ impl Context {
         self.globals.bind_for_test(Singleton::AuraShell, id);
     }
 
+    /// A dispatch batch ended: each owner of state scoped to a batch resets
+    /// it here, the one place the loop calls.
+    pub(crate) fn end_batch(&mut self) {
+        // Host linux-dmabuf capability discovery emits one format event
+        // and then a long modifier stream; the handler coalesces feedback
+        // refreshes within a batch, and the next batch may publish a newer
+        // table after more capabilities have arrived.
+        self.dmabuf.end_batch();
+    }
+
     /// Take the work deferred while dispatching the current message.
     pub(crate) fn take_post_dispatch(&mut self) -> Vec<PostDispatch> {
         std::mem::take(&mut self.post_dispatch)

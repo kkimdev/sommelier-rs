@@ -193,10 +193,14 @@ it is:
   `handler::Handlers` implements.
 - The one flat dispatch: `dispatch_request`, by the resolved sender's
   `Iface`, and `dispatch_event`, by the variant of the `AnyEvent` the
-  proxy decoded the host event into. `Client::handle_msgs` decodes a host
+  proxy decoded the host event into. `proxy::dispatch` decodes a host
   event whole, once (`AnyEvent::decode`), before anything reads it: the
   keyboard core's recovery (`handler::keyboard::before_host_event`), the
-  stale-event filter, and then its handler. A host event that does not
+  stale-event filter, and then its handler. The filter drops every event
+  of an object the guest destroyed, except the ones its interface's owner
+  declares end what the destroy left (`handler::outlives_destroy`: a
+  buffer's `release` while the host shows it, and an asynchronous
+  dma-buf create's `created` or `failed`). A host event that does not
   decode ends the session before any of them sees it, unless only the
   proxy uses its object (see
   [Wire messages](INVARIANTS.md#wire-messages)).
@@ -477,16 +481,25 @@ work deferred until the forward (`defer_until_forwarded`), and, if the
 message ends the session, a `state::SessionEnd`. A handler ends one with
 `return ctx.reject(object, code, message)` for a protocol error or
 `return ctx.fail(why)` for the proxy's own failure; the first protocol
-or host error wins over an internal failure. After dispatch,
-`Client::handle_msgs` takes the message's `state::Effects` once
-(`Context::take_effects`):
+or host error wins over an internal failure.
+
+`proxy::dispatch` is that transaction without I/O: it takes one framed
+message (`Frame`: its header, its payload, and the descriptors its
+connection has queued), dispatches it, takes its `state::Effects` once
+(`Context::take_effects`), and reports whether it was handled, ends the
+session or waits for a fence, with what a trace records of it (test:
+`a_frame_dispatches_without_a_connection`).
+`Client::handle_msgs` is the shell around it: it frames each
+connection's bytes, records the trace, parks a request that waits, ends
+the batch (`Context::end_batch`, the one place batch-scoped state is
+reset) and sends. The core commits the effects:
 
 - If the message did not end the session, it queues the forward, then the
   output in the same direction, and the output back toward the message's
   source, each for its peer ([Fair dispatch](#fair-dispatch) says when it
   is sent).
 - If it did, it drops the forward and every effect, which closes their
-  descriptors, and ends the batch. After the batch's earlier, valid
+  descriptors, and the shell ends the batch. After the batch's earlier, valid
   messages, `handler::display::session_error` encodes the session's one
   `wl_display.error`. Nothing else writes one.
 - If it waits for a guest GPU fence (`return ctx.wait_for_fence(wait)`,

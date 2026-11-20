@@ -160,6 +160,21 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
     }
 }
 
+/// Whether `event` of a buffer the guest destroyed still reaches its
+/// handler (`handler::outlives_destroy`): the `release` of one the host
+/// still shows, which retires it.
+pub(crate) fn outlives_destroy(
+    ctx: &Context,
+    sender: &crate::state::EventSender,
+    event: &protocols::wayland::wl_buffer::Event,
+) -> bool {
+    match event {
+        protocols::wayland::wl_buffer::Event::Release {} => {
+            ctx.host_buffer_is_guest_destroyed(sender.host)
+        }
+    }
+}
+
 impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
     fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Destructor {
         let guest_id = sender.guest;
