@@ -101,7 +101,6 @@ use crate::state::{
 };
 use crate::warn_once::WarnOnce;
 use crate::window_layout::NormalizedRect;
-use crate::wire::queue_or_drop;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The `zaura_shell` version placement needs.
@@ -187,7 +186,7 @@ impl MoveLog {
     /// # Returns
     ///
     /// The level logged at.
-    fn ignored(&self, xdg_toplevel: u32, offset: Point) -> log::Level {
+    fn ignored(&self, xdg_toplevel: GuestId, offset: Point) -> log::Level {
         if self.placed.load(Ordering::Relaxed) {
             log::info!(
                 "Window placement did not move xdg_toplevel {}: Exo ignored \
@@ -236,7 +235,7 @@ pub(crate) fn shell_bound(ctx: &mut Context, shell_version: u32) {
 /// Create the host-only Aura output of a newly bound guest `wl_output`,
 /// whose scale factors and insets the work area needs. A missing shell is
 /// retried by [`shell_bound`].
-pub(crate) fn output_bound(ctx: &mut Context, output_host_id: u32) {
+pub(crate) fn output_bound(ctx: &mut Context, output_host_id: HostId) {
     if ctx.placement().is_some() {
         aura_objects::ensure_zaura_output(ctx, output_host_id);
     }
@@ -281,8 +280,8 @@ impl PlacementSkip {
 
 /// The xdg_toplevel a keyboard focuses, with the IDs placement needs.
 struct FocusedToplevel {
-    xdg_toplevel_guest_id: u32,
-    wl_surface_guest_id: u32,
+    xdg_toplevel_guest_id: GuestId,
+    wl_surface_guest_id: GuestId,
 }
 
 /// Resolve the xdg_toplevel that `host_keyboard_id` focuses, if any.
@@ -315,10 +314,10 @@ fn bounds_for(rect: NormalizedRect, output: OutputState) -> Option<Rect> {
 /// What one placement moves, and where.
 #[derive(Clone, Copy, Debug)]
 struct PlacementTarget {
-    xdg_toplevel_guest_id: u32,
-    wl_surface_guest_id: u32,
+    xdg_toplevel_guest_id: GuestId,
+    wl_surface_guest_id: GuestId,
     /// The host `wl_output` the window is placed on.
-    output_host_id: u32,
+    output_host_id: HostId,
     /// The window's new bounds in screen DIPs, inside that output's work
     /// area.
     bounds: Rect,
@@ -358,10 +357,7 @@ pub(crate) fn shortcut(ctx: &mut Context, host_keyboard_id: HostId, binding: Bin
     // The bindings change only between two messages, so the binding the
     // keyboard read for this key is still current.
     let Some(rect) = ctx.placement_rect(binding) else {
-        log::debug!(
-            "shortcut {binding:?} of keyboard {} is unbound",
-            host_keyboard_id.0
-        );
+        log::debug!("shortcut {binding:?} of keyboard {host_keyboard_id} is unbound");
         return;
     };
     if let Err(reason) = place_focused(ctx, host_keyboard_id, rect) {
@@ -369,7 +365,7 @@ pub(crate) fn shortcut(ctx: &mut Context, host_keyboard_id: HostId, binding: Bin
             reason.log_level(),
             "window layout {:?} skipped for keyboard {}: {:?}",
             rect,
-            host_keyboard_id.0,
+            host_keyboard_id,
             reason
         );
     }
@@ -422,7 +418,7 @@ pub(crate) fn place_focused(
     // Every check that can skip placement has run, so a skip never leaves
     // part of the step below in the host stream. The Aura objects created
     // above stay valid for the next attempt.
-    ctx.client_to_host_queue.extend([
+    ctx.send_host_all([
         xdg_toplevel::req::unset_fullscreen(host_xdg_toplevel_id),
         xdg_toplevel::req::unset_maximized(host_xdg_toplevel_id),
     ]);
@@ -450,8 +446,8 @@ pub(crate) fn place_focused(
 /// to `target`, and make it the toplevel's placement in flight.
 fn start_step(
     ctx: &mut Context,
-    xdg_toplevel: u32,
-    aura_toplevel: u32,
+    xdg_toplevel: GuestId,
+    aura_toplevel: HostId,
     target: Rect,
     step: PlacementStep,
 ) {
@@ -463,7 +459,7 @@ fn start_step(
     );
     if let Some(placement) = ctx.placement_mut() {
         placement.start(
-            GuestId(xdg_toplevel),
+            xdg_toplevel,
             Placement {
                 barrier,
                 target,
@@ -477,17 +473,20 @@ fn start_step(
 /// ([`InternalCallback::PlacementBarrier`]), which the callback handler
 /// has already retired: take the next step of the placement it ends,
 /// unless a newer placement replaced it or its toplevel ended.
-pub(crate) fn complete_barrier(ctx: &mut Context, callback_host_id: u32, zaura_toplevel: u32) {
+pub(crate) fn complete_barrier(
+    ctx: &mut Context,
+    callback_host_id: HostId,
+    zaura_toplevel: HostId,
+) {
     let Some(state) = ctx.placement_mut() else {
         return;
     };
-    let Some(xdg_toplevel) = state.xdg_toplevel(HostId(zaura_toplevel)) else {
+    let Some(xdg_toplevel) = state.xdg_toplevel(zaura_toplevel) else {
         return;
     };
-    let Some(placement) = state.take_placement(xdg_toplevel, HostId(callback_host_id)) else {
+    let Some(placement) = state.take_placement(xdg_toplevel, callback_host_id) else {
         return;
     };
-    let xdg_toplevel = xdg_toplevel.0;
     match placement.step {
         PlacementStep::Restore => {
             move_window(ctx, xdg_toplevel, zaura_toplevel, placement.target);
@@ -584,11 +583,8 @@ fn client_size(target: Rect, origin: Point) -> (i32, i32) {
 
 /// The second step: move the window with `set_parent` from the origin Exo
 /// reported once it was restored, and ask for its new origin.
-fn move_window(ctx: &mut Context, xdg_toplevel: u32, aura_toplevel: u32, target: Rect) {
-    let Some(origin) = ctx
-        .placement()
-        .and_then(|state| state.origin(GuestId(xdg_toplevel)))
-    else {
+fn move_window(ctx: &mut Context, xdg_toplevel: GuestId, aura_toplevel: HostId, target: Rect) {
+    let Some(origin) = ctx.placement().and_then(|state| state.origin(xdg_toplevel)) else {
         log::info!(
             "Window placement did not move xdg_toplevel {}: Exo reported no origin for it",
             xdg_toplevel
@@ -614,7 +610,7 @@ fn move_window(ctx: &mut Context, xdg_toplevel: u32, aura_toplevel: u32, target:
     ) else {
         return;
     };
-    ctx.client_to_host_queue.extend([
+    ctx.send_host_all([
         zaura_surface::req::set_parent(zaura_surface, Some(zaura_surface), offset.0, offset.1),
         xdg_toplevel::req::unset_fullscreen(host_xdg_toplevel),
     ]);
@@ -646,11 +642,17 @@ fn move_window(ctx: &mut Context, xdg_toplevel: u32, aura_toplevel: u32, target:
 /// The configure repeats the newest configure's states and serial. The
 /// guest's ack of that serial reaches Exo, which accepts an ack of a
 /// serial it already had acked.
-fn resize_window(ctx: &mut Context, xdg_toplevel: u32, target: Rect, from: Point, offset: Point) {
+fn resize_window(
+    ctx: &mut Context,
+    xdg_toplevel: GuestId,
+    target: Rect,
+    from: Point,
+    offset: Point,
+) {
     let Some(state) = ctx.placement() else {
         return;
     };
-    let Some(origin) = state.origin(GuestId(xdg_toplevel)) else {
+    let Some(origin) = state.origin(xdg_toplevel) else {
         return;
     };
     match MoveOutcome::of(target, from, origin) {
@@ -662,7 +664,7 @@ fn resize_window(ctx: &mut Context, xdg_toplevel: u32, target: Rect, from: Point
         MoveOutcome::AlreadyPlaced | MoveOutcome::MovedElsewhere => {}
     }
     let Some((states, serial)) = state
-        .last_configure(GuestId(xdg_toplevel))
+        .last_configure(xdg_toplevel)
         .map(|(states, serial)| (states.to_vec(), serial))
     else {
         return;
@@ -672,13 +674,11 @@ fn resize_window(ctx: &mut Context, xdg_toplevel: u32, target: Rect, from: Point
     };
     let (width, height) = client_size(target, origin);
     // The states are a copy of an array that fit the host's message.
-    if queue_or_drop(
-        &mut ctx.host_to_client_queue,
+    if ctx.send_guest_or_drop(
         xdg_toplevel::evt::configure(xdg_toplevel, width, height, &states),
         format_args!("the configure of xdg_toplevel {xdg_toplevel}"),
     ) {
-        ctx.host_to_client_queue
-            .push(xdg_surface::evt::configure(xdg_surface, serial));
+        ctx.send_guest(xdg_surface::evt::configure(xdg_surface, serial));
     }
     log::debug!(
         "window layout: xdg_toplevel={} moved to ({}, {}); configure {}x{} serial={}",
@@ -706,12 +706,9 @@ fn resize_window(ctx: &mut Context, xdg_toplevel: u32, target: Rect, from: Point
 ///
 /// The Aura toplevel, or `None` while placement is off or the host has no
 /// `zaura_shell` new enough for placement.
-pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Option<u32> {
-    if let Some(aura_toplevel) = ctx
-        .placement()?
-        .aura_toplevel(GuestId(xdg_toplevel_guest_id))
-    {
-        return Some(aura_toplevel.0);
+pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: GuestId) -> Option<HostId> {
+    if let Some(aura_toplevel) = ctx.placement()?.aura_toplevel(xdg_toplevel_guest_id) {
+        return Some(aura_toplevel);
     }
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
     if ctx
@@ -722,12 +719,11 @@ pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> 
         return None;
     }
     let aura_toplevel = aura_objects::create(ctx, AuraChild::TOPLEVEL, xdg_toplevel_host_id)?;
-    ctx.client_to_host_queue
-        .push(zaura_toplevel::req::set_supports_screen_coordinates(
-            aura_toplevel,
-        ));
+    ctx.send_host(zaura_toplevel::req::set_supports_screen_coordinates(
+        aura_toplevel,
+    ));
     ctx.placement_mut()?
-        .attach(GuestId(xdg_toplevel_guest_id), HostId(aura_toplevel));
+        .attach(xdg_toplevel_guest_id, aura_toplevel);
     Some(aura_toplevel)
 }
 
@@ -736,12 +732,12 @@ pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> 
 /// Called whenever the XDG role ends (see `XdgRoles`' remove methods),
 /// before the role's own destructor is queued. A barrier still in flight
 /// stays pending until its `done`, which then finds nothing to continue.
-pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
+pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: GuestId) {
     let Some(state) = ctx.placement_mut() else {
         return;
     };
-    if let Some(aura_toplevel) = state.take(GuestId(xdg_toplevel_guest_id)) {
-        aura_objects::release(ctx, AuraChild::TOPLEVEL, aura_toplevel.0);
+    if let Some(aura_toplevel) = state.take(xdg_toplevel_guest_id) {
+        aura_objects::release(ctx, AuraChild::TOPLEVEL, aura_toplevel);
     }
 }
 
@@ -774,7 +770,7 @@ fn guest_xdg_toplevel_states(states: &[u8], guest_version: u32) -> Vec<u8> {
 /// dropped.
 pub(crate) fn translate_aura_configure(
     ctx: &mut Context,
-    zaura_toplevel_host_id: u32,
+    zaura_toplevel_host_id: HostId,
     x: i32,
     y: i32,
     width: i32,
@@ -783,14 +779,14 @@ pub(crate) fn translate_aura_configure(
 ) {
     let Some(xdg_toplevel) = ctx
         .placement()
-        .and_then(|state| state.xdg_toplevel(HostId(zaura_toplevel_host_id)))
+        .and_then(|state| state.xdg_toplevel(zaura_toplevel_host_id))
     else {
         return;
     };
     log::debug!(
         "zaura_toplevel.configure host={} guest={} bounds={}x{} origin=({}, {})",
         zaura_toplevel_host_id,
-        xdg_toplevel.0,
+        xdg_toplevel,
         width,
         height,
         x,
@@ -800,16 +796,15 @@ pub(crate) fn translate_aura_configure(
     // xdg_toplevel client understands are delivered.
     let guest_version = ctx
         .shadow_table
-        .guest_object_version(xdg_toplevel.0)
+        .guest_object_version(xdg_toplevel)
         .unwrap_or(1);
     let states = guest_xdg_toplevel_states(states, guest_version);
     // The states array is host data, so its encoder is fallible. It is a
     // filtered copy of an array that already fit in the host's message, so
     // a failure means corrupted state and is only logged.
-    queue_or_drop(
-        &mut ctx.host_to_client_queue,
-        xdg_toplevel::evt::configure(xdg_toplevel.0, width, height, &states),
-        format_args!("the configure of xdg_toplevel {}", xdg_toplevel.0),
+    ctx.send_guest_or_drop(
+        xdg_toplevel::evt::configure(xdg_toplevel, width, height, &states),
+        format_args!("the configure of xdg_toplevel {}", xdg_toplevel),
     );
     if let Some(state) = ctx.placement_mut() {
         state.configured(xdg_toplevel, (x, y), states);
@@ -818,7 +813,7 @@ pub(crate) fn translate_aura_configure(
 
 /// Record a host `zaura_toplevel.origin_change`: the window moved without
 /// a configure. The guest gets nothing; `xdg_toplevel` has no origin.
-pub(crate) fn origin_changed(ctx: &mut Context, zaura_toplevel_host_id: u32, x: i32, y: i32) {
+pub(crate) fn origin_changed(ctx: &mut Context, zaura_toplevel_host_id: HostId, x: i32, y: i32) {
     log::debug!(
         "zaura_toplevel.origin_change host={} origin=({}, {})",
         zaura_toplevel_host_id,
@@ -828,19 +823,19 @@ pub(crate) fn origin_changed(ctx: &mut Context, zaura_toplevel_host_id: u32, x: 
     let Some(state) = ctx.placement_mut() else {
         return;
     };
-    if let Some(xdg_toplevel) = state.xdg_toplevel(HostId(zaura_toplevel_host_id)) {
+    if let Some(xdg_toplevel) = state.xdg_toplevel(zaura_toplevel_host_id) {
         state.moved(xdg_toplevel, (x, y));
     }
 }
 
 /// Record the serial of a host `xdg_surface.configure`, which the caller
 /// forwards, for the configure a placement sends the guest.
-pub(crate) fn surface_configured(ctx: &mut Context, guest_xdg_surface_id: u32, serial: u32) {
+pub(crate) fn surface_configured(ctx: &mut Context, guest_xdg_surface_id: GuestId, serial: u32) {
     let Some(xdg_toplevel) = ctx.xdg_roles.toplevel_of_xdg_surface(guest_xdg_surface_id) else {
         return;
     };
     if let Some(state) = ctx.placement_mut() {
-        state.serial_sent(GuestId(xdg_toplevel), serial);
+        state.serial_sent(xdg_toplevel, serial);
     }
 }
 
@@ -1354,15 +1349,16 @@ mod tests {
         use log::Level::{Debug, Info, Warn};
         // The tests' own logs: the process's belongs to the sessions that
         // other tests run in parallel.
+        let toplevel = GuestId::for_test(1);
         let moves = MoveLog::new();
-        assert_eq!(moves.ignored(1, (5, 0)), Warn);
-        assert_eq!(moves.ignored(1, (5, 0)), Debug);
+        assert_eq!(moves.ignored(toplevel, (5, 0)), Warn);
+        assert_eq!(moves.ignored(toplevel, (5, 0)), Debug);
         moves.placed();
-        assert_eq!(moves.ignored(1, (5, 0)), Info);
+        assert_eq!(moves.ignored(toplevel, (5, 0)), Info);
 
         let moves = MoveLog::new();
         moves.placed();
-        assert_eq!(moves.ignored(1, (5, 0)), Info);
+        assert_eq!(moves.ignored(toplevel, (5, 0)), Info);
         assert!(!moves.warned.logged());
     }
 

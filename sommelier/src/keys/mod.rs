@@ -43,8 +43,8 @@ use crate::accelerator::{Accelerator, BindingId, HostAccelerators};
 use crate::ime::{self, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
 use crate::keymap::{KeyboardModifiers, Keymap};
 use crate::protocols::wayland::wl_keyboard::{self, KEY_STATE_PRESSED, KEY_STATE_RELEASED};
-use crate::state::{HostId, KeyboardFocusUpdate};
-use crate::wire::Outgoing;
+use crate::state::{GuestId, HostId, KeyboardFocusUpdate};
+use crate::wire::ToGuest;
 use generations::{
     ChordClass, KeyAdmission, KeyGenerationRegistry, LeaseInput, PeekInput, PhysicalKey,
 };
@@ -63,8 +63,8 @@ pub(crate) enum KeyInput {
     /// `guest`, whose host keyboard `keyboard` its forward mapped.
     Created {
         keyboard: HostId,
-        guest: u32,
-        seat: u32,
+        guest: GuestId,
+        seat: GuestId,
     },
     /// The adapter bound `keyboard`'s `zcr_extended_keyboard_v1`,
     /// `extended`, through which its keys are acknowledged and peeked.
@@ -129,7 +129,7 @@ pub(crate) enum KeyInput {
     Focus {
         update: KeyboardFocusUpdate,
         enter: Option<(HostId, Vec<u32>)>,
-        keyboard: Vec<Outgoing>,
+        keyboard: Vec<ToGuest>,
     },
     /// The guest's text input `ti` ended: a recovery for it ends.
     TextInputEnded(TiId),
@@ -163,7 +163,7 @@ pub(crate) struct KeyEffects {
     /// reach the guest first.
     pub(crate) deliver: bool,
     /// Guest `wl_keyboard` events, after the event's own delivery.
-    pub(crate) to_guest: Vec<Outgoing>,
+    pub(crate) to_guest: Vec<ToGuest>,
     /// Inputs of the IME core, in order, after `to_guest`.
     pub(crate) ime: Vec<ime::Input>,
 }
@@ -175,7 +175,7 @@ pub(crate) struct KeyEffects {
 #[derive(Debug)]
 pub(crate) struct Recovered {
     pub(crate) ti: TiId,
-    pub(crate) pair: Vec<Outgoing>,
+    pub(crate) pair: Vec<ToGuest>,
 }
 
 /// A consumed shortcut chord: `keyboard` pressed the chord of `binding`.
@@ -199,9 +199,9 @@ pub(crate) struct Ack {
 /// tests use maps.
 pub(crate) trait Env {
     /// The guest surface the keyboards of guest seat `seat` focus.
-    fn seat_focus(&self, seat: u32) -> Option<u32>;
+    fn seat_focus(&self, seat: GuestId) -> Option<GuestId>;
     /// Whether host keyboard `keyboard` focuses guest surface `surface`.
-    fn focuses(&self, keyboard: HostId, surface: u32) -> bool;
+    fn focuses(&self, keyboard: HostId, surface: GuestId) -> bool;
     /// The shortcut binding of `chord`, if a subscriber binds it now.
     fn shortcut(&self, chord: &Accelerator) -> Option<BindingId>;
     /// X2': whether text input `ti` still passes the IME core's gate
@@ -426,13 +426,7 @@ impl KeyboardCore {
         } else {
             KeyClass::Guest
         };
-        log::trace!(
-            "key class: keyboard={} key={} chord={:?} class={:?}",
-            keyboard.0,
-            key,
-            chord,
-            class
-        );
+        log::trace!("key class: keyboard={keyboard} key={key} chord={chord:?} class={class:?}");
         class
     }
 
@@ -526,10 +520,7 @@ impl KeyboardCore {
         fx: &mut KeyEffects,
     ) {
         let Some(keyboard) = self.keyboards.of_extended(extended) else {
-            log::warn!(
-                "peek_key: no host keyboard mapping for extended keyboard {}",
-                extended.0
-            );
+            log::warn!("peek_key: no host keyboard mapping for extended keyboard {extended}");
             return;
         };
         let seat = self.keyboards.seat(keyboard);
@@ -568,11 +559,9 @@ impl KeyboardCore {
         if let Some(sequence) = outcome.numbered {
             if let Some(KeyClass::Shortcut(binding)) = class {
                 log::debug!(
-                    "peek_key: shortcut chord {:?} on keyboard {}; it runs only on the \
-                     matching wl_keyboard.key, so if the host IME consumes it the chord \
-                     is neither run nor delivered",
-                    binding,
-                    keyboard.0
+                    "peek_key: shortcut chord {binding:?} on keyboard {keyboard}; it runs only \
+                     on the matching wl_keyboard.key, so if the host IME consumes it the chord \
+                     is neither run nor delivered"
                 );
             }
             if let Some(seat) = seat {
@@ -601,7 +590,7 @@ impl KeyboardCore {
         &mut self,
         update: KeyboardFocusUpdate,
         enter: Option<(HostId, Vec<u32>)>,
-        mut keyboard: Vec<Outgoing>,
+        mut keyboard: Vec<ToGuest>,
         fx: &mut KeyEffects,
     ) {
         for &retired in &update.retired_keyboards {
@@ -678,7 +667,7 @@ impl KeyboardCore {
     /// Move the IME's Backspace repeat lease on the keyboards of `seat`,
     /// none if the input's keyboard has no seat
     /// (`KeyGenerationRegistry::lease`).
-    fn lease(&mut self, seat: Option<u32>, input: LeaseInput) {
+    fn lease(&mut self, seat: Option<GuestId>, input: LeaseInput) {
         let keyboards = seat.map_or_else(Vec::new, |seat| self.keyboards.of_seat(seat));
         self.generations.lease(&keyboards, input);
         // One text input on a connection is enabled at a time, so the IME
@@ -732,7 +721,11 @@ impl KeyboardCore {
     }
 
     /// The sequence of the latest peek of guest seat `seat` on `surface`.
-    pub(crate) fn latest_peek_sequence(&self, seat: u32, surface: Option<u32>) -> Option<u64> {
+    pub(crate) fn latest_peek_sequence(
+        &self,
+        seat: GuestId,
+        surface: Option<GuestId>,
+    ) -> Option<u64> {
         self.generations.latest_peek_sequence(seat, surface)
     }
 
@@ -742,13 +735,15 @@ impl KeyboardCore {
     }
 
     /// Every peek watermark's guest seat, guest surface and host keyboard.
-    pub(crate) fn peek_watermarks(&self) -> impl Iterator<Item = (u32, Option<u32>, HostId)> + '_ {
+    pub(crate) fn peek_watermarks(
+        &self,
+    ) -> impl Iterator<Item = (GuestId, Option<GuestId>, HostId)> + '_ {
         self.generations.peek_watermarks_for_test()
     }
 
     /// The guest text input, guest keyboard and host keyboard a waiting
     /// recovery names.
-    pub(crate) fn recovery_objects(&self) -> Option<(u32, u32, HostId)> {
+    pub(crate) fn recovery_objects(&self) -> Option<(GuestId, GuestId, HostId)> {
         self.recovery.map(|pending| pending.objects_for_test())
     }
 }

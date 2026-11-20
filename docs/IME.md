@@ -295,8 +295,9 @@ invariants, and how each guarantee is enforced.
 | `tests.rs` | The row tests of section 2, the encoder table and the source tests |
 
 `ime` imports nothing from `handler`. From the rest of the crate it
-uses only `wire`, the generated `protocols` and
-`connection::MAX_BYTES_PER_SEND`. Two source tests in `ime/tests.rs`
+uses only `wire`, the generated `protocols`, the object IDs
+(`state::GuestId` and `state::HostId`, which only the object table
+makes) and `connection::MAX_BYTES_PER_SEND`. Two source tests in `ime/tests.rs`
 enforce this:
 
 - Every `use crate::` line of `ime/` names only those, nothing in `ime/`

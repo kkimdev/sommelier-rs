@@ -21,7 +21,7 @@ limitations under the License.
 use super::serial::Serial;
 use super::TiId;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::wire::Outgoing;
+use crate::wire::ToGuest;
 
 /// A preedit as the guest is shown it. Its text is never empty: an empty
 /// preedit is no preedit, which [`Self::new`] makes impossible.
@@ -85,7 +85,7 @@ impl GuestTxn {
         ti: TiId,
         shown_before: bool,
         serial: Serial,
-    ) -> Result<Vec<Outgoing>, TooLong> {
+    ) -> Result<Vec<ToGuest>, TooLong> {
         use zwp_text_input_v3::evt;
         let ti = ti.0;
         let delete = self.delete.filter(|&lengths| lengths != (0, 0));
@@ -114,7 +114,7 @@ impl GuestTxn {
     /// clears the preedit the guest shows (`shown_before`), then `done`.
     /// It cannot fail: `done` has no string, and an empty string fits any
     /// message, so the clear is always built.
-    pub(super) fn bare(ti: TiId, shown_before: bool, serial: Serial) -> Vec<Outgoing> {
+    pub(super) fn bare(ti: TiId, shown_before: bool, serial: Serial) -> Vec<ToGuest> {
         use zwp_text_input_v3::evt;
         let clear = shown_before.then(|| evt::preedit_string(ti.0, Some(""), 0, 0));
         let clear = clear.into_iter().flatten();

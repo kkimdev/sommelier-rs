@@ -147,28 +147,34 @@ pub(super) trait Client {
 
     /// The keyboard focus moved to `surface`, or off the application's
     /// surfaces (`wl_keyboard.enter` and `leave`).
-    fn keyboard_focus(&mut self, now: Micros, surface: Option<u32>) -> Vec<Outgoing>;
+    fn keyboard_focus(&mut self, now: Micros, surface: Option<u32>) -> Vec<Outgoing<u32>>;
 
     /// An event of its `zwp_text_input_v3`.
-    fn event(&mut self, now: Micros, event: Event) -> Vec<Outgoing>;
+    fn event(&mut self, now: Micros, event: Event) -> Vec<Outgoing<u32>>;
 
     /// A key the input method passed reached the keyboard focus.
-    fn key(&mut self, now: Micros, key: Key) -> Vec<Outgoing>;
+    fn key(&mut self, now: Micros, key: Key) -> Vec<Outgoing<u32>>;
 
     /// The proxy's `wl_display.delete_id` of `id`.
     fn deleted(&mut self, id: u32);
 
     /// A press at `at` on `surface`.
-    fn press(&mut self, now: Micros, surface: u32, at: Target, kind: PressKind) -> Vec<Outgoing>;
+    fn press(
+        &mut self,
+        now: Micros,
+        surface: u32,
+        at: Target,
+        kind: PressKind,
+    ) -> Vec<Outgoing<u32>>;
 
     /// The release or lift that ends the last press; `dragged` if it moved
     /// past the drag threshold in between.
-    fn release(&mut self, now: Micros, dragged: bool) -> Vec<Outgoing>;
+    fn release(&mut self, now: Micros, dragged: bool) -> Vec<Outgoing<u32>>;
 
     /// The window of `field` closes and opens again on `surface`, with the
     /// same text (F2): it loses the keyboard focus, if it had it, and the
     /// client forgets what it reported of it.
-    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing>;
+    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing<u32>>;
 }
 
 /// The content type of every field: plain text.
@@ -247,7 +253,7 @@ impl Protocol {
     }
 
     /// `set_surrounding_text(text, cursor, cursor)`, recorded as sent.
-    fn surrounding_text(&mut self, text: &str, cursor: usize) -> Outgoing {
+    fn surrounding_text(&mut self, text: &str, cursor: usize) -> Outgoing<u32> {
         self.sent.push((text.to_owned(), cursor));
         let at = i32::try_from(cursor).expect("a short text");
         req::set_surrounding_text(self.text_input, text, at, at)
@@ -366,12 +372,12 @@ fn caret_rect(model: &TextModel) -> [i32; 4] {
 }
 
 /// `set_cursor_rectangle` of `rect`.
-fn cursor_rectangle(text_input: u32, [x, y, width, height]: [i32; 4]) -> Outgoing {
+fn cursor_rectangle(text_input: u32, [x, y, width, height]: [i32; 4]) -> Outgoing<u32> {
     req::set_cursor_rectangle(text_input, x, y, width, height)
 }
 
 /// `set_content_type` of [`CONTENT_TYPE`].
-fn content_type(text_input: u32) -> Outgoing {
+fn content_type(text_input: u32) -> Outgoing<u32> {
     req::set_content_type(text_input, CONTENT_TYPE.0, CONTENT_TYPE.1)
 }
 
@@ -414,7 +420,7 @@ mod script {
     }
 
     /// The requests in `out`, each checked to come from the text input.
-    pub fn requests(out: Vec<Outgoing>) -> Vec<Request> {
+    pub fn requests(out: Vec<Outgoing<u32>>) -> Vec<Request> {
         decoded(&out, Request::from_wire)
             .into_iter()
             .map(|(sender, request)| {

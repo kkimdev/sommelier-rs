@@ -22,7 +22,7 @@ limitations under the License.
 use std::collections::BTreeMap;
 
 use crate::ime::{LeaseOutcome, TiId};
-use crate::state::{serial_is_after, HostId};
+use crate::state::{serial_is_after, GuestId, HostId};
 
 /// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
 pub(crate) const EVDEV_KEY_BACKSPACE: u32 = 14;
@@ -502,7 +502,7 @@ impl KeyGeneration {
         self.phase.lease() == RepeatLease::Cancelled
     }
 
-    fn ime_repeat_owner(self) -> Option<u32> {
+    fn ime_repeat_owner(self) -> Option<GuestId> {
         match self.phase.lease() {
             RepeatLease::Leased { text_input } => Some(text_input.0),
             RepeatLease::Free | RepeatLease::Cancelled => None,
@@ -540,7 +540,7 @@ pub(super) struct KeyGenerationRegistry {
     /// its `peek_key`, so a replaced release is not coming. See INVARIANTS
     /// "A key waits for at most one late release".
     retired_guest_releases: BTreeMap<(HostId, u32), u32>,
-    latest_peek_sequences: BTreeMap<(u32, Option<u32>), PeekWatermark>,
+    latest_peek_sequences: BTreeMap<(GuestId, Option<GuestId>), PeekWatermark>,
 }
 
 impl KeyGenerationRegistry {
@@ -599,7 +599,7 @@ impl KeyGenerationRegistry {
     #[cfg(test)]
     pub(super) fn peek_watermarks_for_test(
         &self,
-    ) -> impl Iterator<Item = (u32, Option<u32>, HostId)> + '_ {
+    ) -> impl Iterator<Item = (GuestId, Option<GuestId>, HostId)> + '_ {
         self.latest_peek_sequences
             .iter()
             .map(|(&(seat, surface), watermark)| (seat, surface, watermark.keyboard))
@@ -615,8 +615,8 @@ impl KeyGenerationRegistry {
 
     pub(super) fn record_latest_peek(
         &mut self,
-        guest_seat: u32,
-        focused_surface: Option<u32>,
+        guest_seat: GuestId,
+        focused_surface: Option<GuestId>,
         keyboard: HostId,
         sequence: u64,
     ) {
@@ -628,15 +628,15 @@ impl KeyGenerationRegistry {
 
     pub(super) fn latest_peek_sequence(
         &self,
-        guest_seat: u32,
-        focused_surface: Option<u32>,
+        guest_seat: GuestId,
+        focused_surface: Option<GuestId>,
     ) -> Option<u64> {
         self.latest_peek_sequences
             .get(&(guest_seat, focused_surface))
             .map(|watermark| watermark.sequence)
     }
 
-    pub(super) fn clear_peek_watermarks_for_seat(&mut self, guest_seat: u32) {
+    pub(super) fn clear_peek_watermarks_for_seat(&mut self, guest_seat: GuestId) {
         self.latest_peek_sequences
             .retain(|(seat, _), _| *seat != guest_seat);
     }
@@ -794,9 +794,8 @@ impl KeyGenerationRegistry {
                 .insert((keyboard, key), release_serial)
             {
                 log::debug!(
-                    "key {key} of keyboard {}: a newer retired release replaces the one \
-                     under serial {replaced}, which has not come",
-                    keyboard.0
+                    "key {key} of keyboard {keyboard}: a newer retired release replaces the \
+                     one under serial {replaced}, which has not come"
                 );
             }
         }

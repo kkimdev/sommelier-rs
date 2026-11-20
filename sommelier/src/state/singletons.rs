@@ -20,6 +20,7 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
+use super::HostId;
 use crate::protocols::Iface;
 
 /// A host global the proxy binds once per connection, for its own use.
@@ -62,7 +63,7 @@ impl Singleton {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Binding {
     /// The host object.
-    pub(crate) host: u32,
+    pub(crate) host: HostId,
     /// The registry name of the global it was bound from, so that the
     /// global's `global_remove` releases exactly this binding.
     pub(crate) name: u32,
@@ -82,7 +83,7 @@ impl Singletons {
     }
 
     /// The host object of `singleton`'s binding, if the proxy has one.
-    pub(crate) fn host(&self, singleton: Singleton) -> Option<u32> {
+    pub(crate) fn host(&self, singleton: Singleton) -> Option<HostId> {
         Some(self.get(singleton)?.host)
     }
 
@@ -99,16 +100,16 @@ impl Singletons {
         Some((singleton, self.0.remove(&singleton)?))
     }
 
-    /// Bind `singleton` as host object `host`, from a global of that name,
+    /// Bind `singleton` as host object `host`, from a global named as it is,
     /// at its newest version, as the registry would.
     #[cfg(test)]
-    pub(crate) fn bind_for_test(&mut self, singleton: Singleton, host: u32) {
+    pub(crate) fn bind_for_test(&mut self, singleton: Singleton, host: HostId) {
         let version = singleton.interface().version();
         self.0.insert(
             singleton,
             Binding {
                 host,
-                name: host,
+                name: crate::wire::WireId::wire(host),
                 version,
             },
         );

@@ -18,8 +18,8 @@ use crate::handler::Handlers;
 use crate::protocols::wayland::wl_callback::{self, WlCallbackHandler};
 use crate::protocols::wayland::wl_display;
 use crate::protocols::Iface;
-use crate::state::{Context, HostId, InternalCallback};
-use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
+use crate::state::{Context, EventSender, HostId, InternalCallback};
+use crate::wire::{Action, ToHost};
 use log::debug;
 
 /// Issue a host-only `wl_display.sync` whose `done` means `waits_for` has
@@ -31,25 +31,24 @@ use log::debug;
 /// `wl_display.delete_id`.
 pub(crate) fn queue_internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> HostId {
     let (callback, sync) = internal_sync(ctx, waits_for);
-    ctx.client_to_host_queue.push(sync);
+    ctx.send_host(sync);
     callback
 }
 
 /// [`queue_internal_sync`]'s callback and its `wl_display.sync`, for the
 /// caller to send.
-pub(crate) fn internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> (HostId, Outgoing) {
-    let callback = HostId(
-        ctx.shadow_table
-            .create_host_only(Iface::WlCallback, wl_callback::VERSION),
-    );
+pub(crate) fn internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> (HostId, ToHost) {
+    let callback = ctx
+        .shadow_table
+        .create_host_only(Iface::WlCallback, wl_callback::VERSION);
     ctx.internal_callbacks.register(callback, waits_for);
-    (callback, wl_display::req::sync(WL_DISPLAY_ID, callback.0))
+    (callback, wl_display::req::sync(HostId::DISPLAY, callback))
 }
 
 impl WlCallbackHandler for Handlers {
-    fn on_done(ctx: &mut Context, callback_data: u32) -> Action {
-        let host_id = ctx.last_sender_id;
-        if let Some(waits_for) = ctx.internal_callbacks.complete(HostId(host_id)) {
+    fn on_done(ctx: &mut Context, sender: EventSender, callback_data: u32) -> Action {
+        let host_id = sender.host;
+        if let Some(waits_for) = ctx.internal_callbacks.complete(host_id) {
             // wl_callback.done destroys the host callback resource. Reserve
             // its numeric ID until wl_display.delete_id arrives, while making
             // any duplicate event undispatchable immediately.
@@ -79,19 +78,15 @@ impl WlCallbackHandler for Handlers {
             }
             return Action::Drop;
         }
-        let guest_id = ctx.shadow_table.get_guest_id(host_id).unwrap_or(0);
-
-        if guest_id != 0 {
+        if let Some(guest_id) = sender.guest_id() {
             debug!(
                 "wl_callback.done for guest_id {}, sending done and delete_id",
                 guest_id
             );
 
             // The done event, then the delete_id the guest expects for it.
-            ctx.host_to_client_queue.extend([
-                wl_callback::evt::done(guest_id, callback_data),
-                wl_display::evt::delete_id(WL_DISPLAY_ID, guest_id),
-            ]);
+            ctx.send_guest(wl_callback::evt::done(guest_id, callback_data));
+            ctx.queue_delete_id(guest_id);
 
             // The terminal event destroys the callback on both sides, but the
             // host numeric ID cannot be reused until its later delete_id.

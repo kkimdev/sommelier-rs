@@ -129,8 +129,16 @@ it generates:
 
 - Typed decoders and a handler trait per interface (`WlSurfaceHandler`)
   with one `on_*` function per message, which takes the connection's
-  `Context` and returns `Action::Forward` or `Action::Drop`; the default
-  forwards. A request in `HAND_WRITTEN_REQUESTS` has no default and
+  `Context`, the message's sender and its arguments, and returns
+  `Action::Forward` or `Action::Drop`; the default forwards. The sender
+  and every ID argument come as the object table resolved them, typed by
+  their side (see [Object translation](#object-translation)): a request
+  has a `RequestSender`, a guest object, and an object argument is a
+  `RequestObject` and a `new_id` a `GuestId`; an event has an
+  `EventSender`, a host object, an object argument is an `EventObject`
+  and a `new_id` a `HostId`. A nullable object is an `Option`; an object
+  of no interface (`wl_display.error`'s) may name anything, and stays a
+  wire `u32`. No handler reads an ambient sender. A request in `HAND_WRITTEN_REQUESTS` has no default and
   returns nothing, so the generated code never forwards it:
   `wl_registry.bind`, whose `new_id` names no interface, so only its
   handler knows what it creates. The generated code reaches the proxy
@@ -147,7 +155,11 @@ it generates:
   handler can ignore one that is not UTF-8 (see
   [Wire messages](INVARIANTS.md#wire-messages)).
 - An encoder per message, `req::<request>` and `evt::<event>`, for every
-  message the proxy builds itself (see
+  message the proxy builds itself, whose IDs, the sender's included, are
+  of one ID space: a request's a `wire::RequestId`, the proxy's a
+  `HostId`, which makes a `wire::ToHost`, and an event's a
+  `wire::EventId`, the proxy's a `GuestId`, which makes a `wire::ToGuest`.
+  A test peer names its objects by their wire `u32`s (see
   [Wire messages](INVARIANTS.md#wire-messages)).
 - Enum constants named `<ENUM>_<ENTRY>`, and `<enum>_since`, the version
   that introduced a value. A constant is `i32` when an `int` argument of
@@ -266,18 +278,24 @@ The table's API keeps those entries consistent by construction:
   before the handler runs, which validates and translates it together.
   `resolve_request` and `resolve_event` resolve a message's sender before
   anything of it is read, into a `RequestSender` or `EventSender`: its
-  `Iface`, version and paired object, which is all dispatch needs of it,
-  so a dispatcher cannot run for a sender that did not resolve.
-  `request_object` returns a `Link` (a host ID, or local), and
-  `event_object` returns the guest ID. An event that names a
+  ID, `Iface`, version and paired object, which is all dispatch and the
+  handler need of it, so a dispatcher cannot run for a sender that did
+  not resolve. `request_object` returns a `RequestObject`, the guest
+  object and its `Link` (a host object, or local), and `event_object` an
+  `EventObject`, the host object and its guest object. An event that names a
   stale object is dropped; one that names an object of another interface
   is dropped too, and the first on a connection warns, since the host
   broke the protocol (test: `an_event_object_of_another_interface_is_warned_of`).
   The warning is once per connection because each `Context` owns its own
   `ShadowTable`, which keeps the flag; later ones log at debug level.
-  A host-created object must have a fresh server ID (`accepts_host_new_id`).
+  A guest `new_id` must be a free client ID (`guest_new_id`), and a
+  host-created object must have a fresh server ID (`host_new_id`).
 
-Guest and host ID spaces are independent: the proxy allocates host IDs
+Guest and host ID spaces are independent, and so are their types: a
+`GuestId` names a guest object and a `HostId` a host one, and only the
+table makes either, from an ID it allocates or a wire value it resolves
+(above), so state keyed by one, an encoder or an effect queue cannot take
+the other. Tests make them with `for_test`. The proxy allocates host IDs
 itself, and host-created objects get guest IDs in the server range
 (`0xff000000` and above). Both come from a `state::IdAllocator`, which,
 like libwayland's object map, reuses the last freed ID before a fresh one,
@@ -432,7 +450,8 @@ and press fence wait for a pending `InternalCallback::TextInput`.
 
 Each message is a transaction. Its handler writes what the message does
 beyond its forward into the `Context`: requests for the host
-(`client_to_host_queue`), events for the guest (`host_to_client_queue`),
+(`send_host`, a `wire::ToHost`), events for the guest (`send_guest`, a
+`wire::ToGuest`),
 work deferred until the forward (`defer_until_forwarded`), and, if the
 message ends the session, a `state::SessionEnd`. A handler ends one with
 `return ctx.reject(object, code, message)` for a protocol error or
@@ -485,7 +504,8 @@ allocates a buffer's host storage and copies pixels into it. A session
 that ends aborts its pumps (`Client::run`), and its `Context` frees the
 rest.
 
-Encoded output, a `wire::Outgoing`, never outlives its message. State
+Encoded output, a `wire::ToHost` or `wire::ToGuest`, never outlives its
+message. State
 that a later message releases, such as a placement's next step or a
 text-input drain, stays structured, and the message that
 releases it encodes it into its own effects.

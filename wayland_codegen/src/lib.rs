@@ -75,11 +75,11 @@ mod tests {
         assert!(code.contains("pub enum Request"));
         assert!(code.contains("fn from_wire"));
         assert!(
-            compact.contains("adopt_host_created(id,Iface::WlDataOffer,sender.version,)"),
+            compact.contains("adopt_host_created(id,Iface::WlDataOffer,sender.version).wire()"),
             "host-generated new_id events must get a guest object"
         );
         assert!(
-            compact.contains("guest_destroyed(msg.sender_id)"),
+            compact.contains("guest_destroyed(sender.guest)"),
             "generated destructor requests must end the guest object"
         );
         // wl_display.sync is the first request arm and has a new_id.
@@ -92,7 +92,7 @@ mod tests {
             "a request's sender must be checked before its new_id is mapped"
         );
         assert!(
-            compact.contains("ctx.local_destroyed(msg.sender_id)"),
+            compact.contains("ctx.local_destroyed(sender.guest)"),
             "generated local-only destructors must synthesize a guest delete_id"
         );
         assert!(
@@ -157,7 +157,9 @@ mod tests {
             "a handler gets the IndexedString"
         );
         assert!(
-            v1.contains("pubfnpreedit_string(sender_id:u32,serial:u32,text:&str,commit:&str)"),
+            v1.contains(
+                "pubfnpreedit_string<I:EventId>(sender_id:I,serial:u32,text:&str,commit:&str)"
+            ),
             "an encoder takes a str, as the proxy builds only UTF-8"
         );
 
@@ -211,17 +213,17 @@ mod tests {
 
         // A request's sender is the guest object, with its negotiated
         // version, and an event's the host object, with its own.
-        let guard = |message: &str, since: u32| {
+        let guard = |message: &str, side: &str, since: u32| {
             compact.contains(&format!(
-                "{message}=>{{ifsender.version<{since}u32{{returnErr(ProtocolError::UnsupportedVersion{{object_id:sender.id,required:{since}u32,actual:sender.version,}});}}"
+                "{message}=>{{ifsender.version<{since}u32{{returnErr(ProtocolError::UnsupportedVersion{{object_id:sender.{side}.wire(),required:{since}u32,actual:sender.version,}});}}"
             ))
         };
         assert!(
-            guard("Request::SetReactive{}", 3),
+            guard("Request::SetReactive{}", "guest", 3),
             "generated requests must check the negotiated guest object version"
         );
         assert!(
-            guard("Event::ConfigureBounds{width,height}", 4),
+            guard("Event::ConfigureBounds{width,height}", "host", 4),
             "generated events must check the negotiated host object version"
         );
         assert!(
@@ -344,32 +346,45 @@ mod tests {
         );
     }
 
+    /// An encoder takes the IDs of one ID space, the sender's included: a
+    /// request's are a `RequestId`, the host's, and an event's an
+    /// `EventId`, the guest's.
     #[test]
     fn test_generate_typed_encoders() {
         let wayland = generate_compact("wayland.xml");
         assert!(
-            wayland
-                .contains("pubfncreate_pool(sender_id:u32,id:u32,fd:OwnedFd,size:i32)->Outgoing{"),
+            wayland.contains(
+                "pubfncreate_pool<I:RequestId>(sender_id:I,id:I,fd:OwnedFd,size:i32)->Outgoing<I>{"
+            ),
             "an encoder takes the XML arguments in order, and owns its descriptors"
         );
         assert!(
-            wayland.contains("#[must_use=\"amessagethatisnotqueuedisneversent\"]pubfncreate_pool("),
+            wayland.contains("pubfndone<I:EventId>(sender_id:I,callback_data:u32)->Outgoing<I>{"),
+            "an event encoder names guest objects"
+        );
+        assert!(
+            wayland.contains("pubfnerror<I:EventId>(sender_id:I,object_id:u32,"),
+            "an object of no interface, which may name any object, is a wire ID"
+        );
+        assert!(
+            wayland.contains("#[must_use=\"amessagethatisnotqueuedisneversent\"]pubfncreate_pool<"),
             "an unused encoder result is a warning"
         );
         assert!(
-            wayland
-                .contains("pubfnattach(sender_id:u32,buffer:Option<u32>,x:i32,y:i32)->Outgoing{"),
+            wayland.contains(
+                "pubfnattach<I:RequestId>(sender_id:I,buffer:Option<I>,x:i32,y:i32)->Outgoing<I>{"
+            ),
             "a nullable object is optional"
         );
         assert!(
             wayland.contains(
-                "pubfnbind(sender_id:u32,name:u32,interface:&str,version:u32,id:u32)->Result<Outgoing,ProtocolError>{"
+                "pubfnbind<I:RequestId>(sender_id:I,name:u32,interface:&str,version:u32,id:I)->Result<Outgoing<I>,ProtocolError>{"
             ),
             "an untyped new_id names its interface and version, and a string makes the encoder fallible"
         );
         assert!(
             wayland.contains(
-                "Ok((builder.try_build_message(sender_id,super::REQ_RECEIVE)?,vec![fd]))"
+                "letbuilder=builder.with_fds(vec![fd]);builder.try_build(sender_id,super::REQ_RECEIVE)"
             ),
             "the message owns its descriptors"
         );
@@ -387,7 +402,7 @@ mod tests {
         );
         assert!(
             wayland.contains(
-                "fnon_create_pool(_ctx:&mutContext,_id:u32,_fd:std::os::fd::BorrowedFd<'_>,_size:i32)"
+                "fnon_create_pool(_ctx:&mutContext,_sender:RequestSender,_id:GuestId,_fd:std::os::fd::BorrowedFd<'_>,_size:i32)"
             ),
             "a handler borrows the message's descriptors"
         );
@@ -457,6 +472,35 @@ mod tests {
         );
     }
 
+    /// A handler gets its sender and every object argument as the object
+    /// table resolved them, typed by their side, so it cannot take a guest
+    /// ID for a host one: a request's are guest objects with their host
+    /// objects, and an event's host objects with their guest ones.
+    #[test]
+    fn test_handlers_get_typed_senders_and_objects() {
+        let wayland = generate_compact("wayland.xml");
+        assert!(
+            wayland.contains(
+                "fnon_attach(_ctx:&mutContext,_sender:RequestSender,_buffer:Option<RequestObject>,_x:i32,_y:i32)->Action"
+            ),
+            "a request's handler gets its sender and a nullable object as typed"
+        );
+        assert!(
+            wayland.contains(
+                "fnon_enter(_ctx:&mutContext,_sender:EventSender,_output:EventObject)->Action"
+            ),
+            "an event's handler gets its sender and an object as typed"
+        );
+        assert!(
+            wayland.contains("fnon_data_offer(_ctx:&mutContext,_sender:EventSender,_id:HostId)"),
+            "an event's new_id is the host object it creates"
+        );
+        assert!(
+            !wayland.contains("last_sender_id"),
+            "no handler reads an ambient sender"
+        );
+    }
+
     #[test]
     fn test_request_object_arguments_are_validated_and_translated_at_once() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -467,7 +511,7 @@ mod tests {
 
         assert!(
             compact.contains(
-                "lettranslated_surface=ctx.shadow_table.request_object(surface,Iface::WlSurface).ok_or(ProtocolError::InvalidObjectId(surface))?;"
+                "letsurface=ctx.shadow_table.request_object(surface,Iface::WlSurface).ok_or(ProtocolError::InvalidObjectId(surface))?;"
             ),
             "an object argument must be resolved once, before the handler runs"
         );
@@ -648,7 +692,9 @@ mod tests {
     fn test_a_hand_written_request_forwards_nothing() {
         let compact = generate_compact("wayland.xml");
         assert!(
-            compact.contains("fnon_bind(ctx:&mutContext,_name:u32,_id:&(String,u32,u32));"),
+            compact.contains(
+                "fnon_bind(ctx:&mutContext,sender:RequestSender,_name:u32,_id:&(String,u32,GuestId));"
+            ),
             "a hand-written request's method has no default"
         );
         let arm = &compact[compact
@@ -661,7 +707,7 @@ mod tests {
             .expect("the end of the bind arm");
         let arm = &arm[..end];
         assert!(
-            arm.contains("H::on_bind(ctx,name,&id);") && !arm.contains("try_build"),
+            arm.contains("H::on_bind(ctx,sender,name,&id);") && !arm.contains("try_build"),
             "a hand-written request is never forwarded: {arm}"
         );
     }

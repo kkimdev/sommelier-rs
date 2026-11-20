@@ -102,7 +102,7 @@ async fn replay_on(trace: &Trace) -> Result<(), String> {
     s.record(replayed.clone());
     crate::ime::take_divergences_for_test();
     crate::ime::take_drops_for_test();
-    let mut run: Vec<Outgoing> = Vec::new();
+    let mut run: Vec<Outgoing<u32>> = Vec::new();
     let mut from = Stream::FromGuest;
     let mut goes_on = true;
     for (at, record) in trace.records.iter().enumerate() {
@@ -220,7 +220,7 @@ fn context(trace: &Trace) -> Result<Context, String> {
 
 /// `run`, messages that the peer of stream `from` sent, sent by that
 /// peer; returns whether the session goes on.
-async fn send(s: &mut Session, from: Stream, run: Vec<Outgoing>) -> bool {
+async fn send(s: &mut Session, from: Stream, run: Vec<Outgoing<u32>>) -> bool {
     let goes_on = match from {
         Stream::FromGuest => s.try_guest(run).await,
         _ => s.try_host(run).await,
@@ -234,7 +234,7 @@ async fn send(s: &mut Session, from: Stream, run: Vec<Outgoing>) -> bool {
 /// stand-ins as it carried descriptors: a keymap's own text, which must be
 /// as long as its event states unless the proxy could not read it, or a
 /// large empty memfd.
-fn stand_ins(at: usize, record: &Record) -> Result<Outgoing, String> {
+fn stand_ins(at: usize, record: &Record) -> Result<Outgoing<u32>, String> {
     let memfd = |bytes: &[u8], size: u64| {
         let file = crate::test_support::shm_pool_file(bytes);
         file.set_len(size).expect("size a stand-in");
@@ -243,7 +243,7 @@ fn stand_ins(at: usize, record: &Record) -> Result<Outgoing, String> {
     let message = record.message.clone();
     let Some(keymap) = &record.keymap else {
         let fds = (0..record.fds).map(|_| memfd(&[], STAND_IN_SIZE)).collect();
-        return Ok((message, fds));
+        return Ok(Outgoing::from_parts(message, fds));
     };
     let keymap_fd = || memfd(keymap, keymap.len() as u64);
     let mut fds = VecDeque::from([keymap_fd()]);
@@ -257,7 +257,7 @@ fn stand_ins(at: usize, record: &Record) -> Result<Outgoing, String> {
             keymap.len()
         ));
     }
-    Ok((message, vec![keymap_fd()]))
+    Ok(Outgoing::from_parts(message, vec![keymap_fd()]))
 }
 
 #[cfg(test)]
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn a_message_that_ends_the_session_replays() {
         use crate::protocols::wayland::wl_surface;
-        let unframed: Outgoing = (vec![1, 0, 0, 0, 0, 0, 4, 0], Vec::new());
+        let unframed = Outgoing::from_parts(vec![1, 0, 0, 0, 0, 0, 4, 0], Vec::new());
         for fatal in [wl_surface::req::commit(999), unframed] {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -388,14 +388,14 @@ mod tests {
         use crate::protocols::wayland::{wl_output, wl_registry};
         use crate::protocols::AnyRequest;
         /// A message from `sender` with `opcode` and `words` as its payload.
-        fn raw(sender: u32, opcode: u16, words: &[u32]) -> Outgoing {
+        fn raw(sender: u32, opcode: u16, words: &[u32]) -> Outgoing<u32> {
             let len = (8 + 4 * words.len()) as u32;
             let header = [sender, len << 16 | u32::from(opcode)];
             let bytes = header
                 .iter()
                 .chain(words)
                 .flat_map(|word| word.to_le_bytes());
-            (bytes.collect(), Vec::new())
+            Outgoing::from_parts(bytes.collect(), Vec::new())
         }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -418,11 +418,12 @@ mod tests {
                 raw(shell, zaura_shell::EVT_LAYOUT_MODE, &[1, 2]),
                 raw(0xdead, 0, &[]),
             ];
-            let mut unread: Vec<Vec<u8>> = dropped.iter().map(|event| event.0.clone()).collect();
+            let mut unread: Vec<Vec<u8>> =
+                dropped.iter().map(|event| event.bytes().to_vec()).collect();
             s.host(dropped).await;
             let output = s.bind_paired("wl_output", wl_output::VERSION).await;
             let fatal = raw(output.host, 99, &[]);
-            unread.push(fatal.0.clone());
+            unread.push(fatal.bytes().to_vec());
             s.host_fatal([fatal]).await;
             s.guest_received_and_error();
             s.host_received();
@@ -470,6 +471,7 @@ mod tests {
         let (record, sender, serial, text) = preedit.expect("Exo sent a preedit");
         record.message = zwp_text_input_v1::evt::preedit_string(sender, serial, &text, "x")
             .unwrap()
+            .into_parts()
             .0;
         let why = replay(&trace).unwrap_err();
         assert_eq!(why, "1 of Exo's events disagreed with its mirror");

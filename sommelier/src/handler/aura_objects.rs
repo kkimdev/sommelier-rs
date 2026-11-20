@@ -30,8 +30,8 @@ limitations under the License.
 
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
 use crate::protocols::Iface;
-use crate::state::{Binding, Context, Singleton};
-use crate::wire::{queue_or_drop, Outgoing};
+use crate::state::{Binding, Context, GuestId, HostId, Singleton};
+use crate::wire::ToHost;
 
 /// What the proxy needs to know about one kind of host Aura child.
 #[derive(Clone, Copy, Debug)]
@@ -39,9 +39,9 @@ pub(crate) struct AuraChild {
     interface: Iface,
     /// The `zaura_shell` request that creates the child, from the shell,
     /// the new child's ID and the object it extends.
-    get: fn(u32, u32, u32) -> Outgoing,
+    get: fn(HostId, HostId, HostId) -> ToHost,
     /// The child's destructor, which exists from `release_since` on.
-    release: fn(u32) -> Outgoing,
+    release: fn(HostId) -> ToHost,
     release_since: u32,
 }
 
@@ -73,7 +73,7 @@ impl AuraChild {
 /// recycled for an object of another interface, whose requests have other
 /// opcodes. Association owners forget a child before it ends, so that is a
 /// bookkeeping bug, which debug builds assert against.
-fn live_child_version(ctx: &Context, child: AuraChild, child_host_id: u32) -> Option<u32> {
+fn live_child_version(ctx: &Context, child: AuraChild, child_host_id: HostId) -> Option<u32> {
     let version = (ctx.shadow_table.get_host_interface(child_host_id) == Some(child.interface))
         .then(|| ctx.shadow_table.host_object_version(child_host_id))
         .flatten();
@@ -98,13 +98,16 @@ fn live_child_version(ctx: &Context, child: AuraChild, child_host_id: u32) -> Op
 /// # Returns
 ///
 /// `None`, queueing nothing, when no `zaura_shell` is bound.
-pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -> Option<u32> {
+pub(crate) fn create(
+    ctx: &mut Context,
+    child: AuraChild,
+    parent_host_id: HostId,
+) -> Option<HostId> {
     let shell = ctx.singletons.get(Singleton::AuraShell)?;
     let child_host_id = ctx
         .shadow_table
         .create_host_only(child.interface, shell.version);
-    ctx.client_to_host_queue
-        .push((child.get)(shell.host, child_host_id, parent_host_id));
+    ctx.send_host((child.get)(shell.host, child_host_id, parent_host_id));
     Some(child_host_id)
 }
 
@@ -117,7 +120,7 @@ pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -
 /// An ID that is not a live child of kind `child` (see
 /// [`live_child_version`]) is left alone: a retired or untracked one has
 /// nothing left to release, and a recycled one belongs to another object.
-pub(crate) fn release(ctx: &mut Context, child: AuraChild, child_host_id: u32) {
+pub(crate) fn release(ctx: &mut Context, child: AuraChild, child_host_id: HostId) {
     let Some(version) = live_child_version(ctx, child, child_host_id) else {
         return;
     };
@@ -152,13 +155,13 @@ pub(crate) fn release_shell(ctx: &mut Context, shell: Binding) {
 /// numeric ID stays reserved for the rest of the connection.
 fn release_host_only(
     ctx: &mut Context,
-    host_id: u32,
+    host_id: HostId,
     version: u32,
-    release: fn(u32) -> Outgoing,
+    release: fn(HostId) -> ToHost,
     release_since: u32,
 ) {
     if version >= release_since {
-        ctx.client_to_host_queue.push(release(host_id));
+        ctx.send_host(release(host_id));
         ctx.retire_destroyed_host_object(host_id);
     } else {
         ctx.shadow_table.retire_host(host_id);
@@ -175,8 +178,8 @@ fn release_host_only(
 /// no longer live.
 pub(crate) fn ensure_host_zaura_surface(
     ctx: &mut Context,
-    wl_surface_guest_id: u32,
-) -> Option<u32> {
+    wl_surface_guest_id: GuestId,
+) -> Option<HostId> {
     let wl_surface_host_id = ctx.shadow_table.get_host_id(wl_surface_guest_id)?;
     if let Some(zaura_surface_host_id) = ctx.aura_surfaces.get(wl_surface_host_id) {
         // A recorded surface that is no longer live is a bookkeeping bug
@@ -204,14 +207,13 @@ pub(crate) fn ensure_host_zaura_surface(
 ///   is dropped with a warning.
 pub(crate) fn set_application_id(
     ctx: &mut Context,
-    wl_surface_guest_id: u32,
+    wl_surface_guest_id: GuestId,
     native_application_id: &str,
 ) {
     let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id) else {
         return;
     };
-    if queue_or_drop(
-        &mut ctx.client_to_host_queue,
+    if ctx.send_host_or_drop(
         zaura_surface::req::set_application_id(zaura_surface_host_id, Some(native_application_id)),
         format_args!("the application ID of zaura_surface {zaura_surface_host_id}"),
     ) {
@@ -225,7 +227,7 @@ pub(crate) fn set_application_id(
 
 /// Release the Aura surface of a host wl_surface that is being destroyed,
 /// if it has one.
-pub(crate) fn release_host_zaura_surface(ctx: &mut Context, wl_surface_host_id: u32) {
+pub(crate) fn release_host_zaura_surface(ctx: &mut Context, wl_surface_host_id: HostId) {
     if let Some(zaura_surface_host_id) = ctx.aura_surfaces.take(wl_surface_host_id) {
         release(ctx, AuraChild::SURFACE, zaura_surface_host_id);
     }
@@ -236,7 +238,7 @@ pub(crate) fn release_host_zaura_surface(ctx: &mut Context, wl_surface_host_id: 
 /// It carries the Aura scale factors, logical transform and work-area insets
 /// that placement needs; the guest only sees the plain `wl_output`. Without a
 /// bound `zaura_shell` nothing is created, and binding one retries.
-pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) {
+pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: HostId) {
     if ctx.outputs.aura_output(wl_output_host_id).is_some()
         || !ctx.outputs.is_live(wl_output_host_id)
     {

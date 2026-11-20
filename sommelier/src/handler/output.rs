@@ -29,7 +29,9 @@ use crate::protocols::aura_shell::zaura_output::{self, ZauraOutputHandler};
 use crate::protocols::wayland::wl_output;
 use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::ZxdgOutputManagerV1Handler;
 use crate::protocols::Iface;
-use crate::state::{is_valid_transform, Context};
+use crate::state::{
+    is_valid_transform, Context, EventSender, GuestId, HostId, RequestObject, RequestSender,
+};
 use crate::wire::Action;
 
 /// Host `wl_output` events feed [`crate::state::OutputRegistry`] and are
@@ -39,6 +41,7 @@ use crate::wire::Action;
 impl crate::protocols::wayland::wl_output::WlOutputHandler for Handlers {
     fn on_geometry(
         ctx: &mut Context,
+        sender: EventSender,
         x: i32,
         y: i32,
         _physical_width: i32,
@@ -48,7 +51,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for Handlers {
         _model: &String,
         transform: i32,
     ) -> Action {
-        let host_output_id = ctx.last_sender_id;
+        let host_output_id = sender.host;
         let valid_transform = is_valid_transform(transform);
         let live = ctx.outputs.update(host_output_id, |output| {
             output.origin_x = x;
@@ -67,8 +70,15 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for Handlers {
         Action::Forward
     }
 
-    fn on_mode(ctx: &mut Context, flags: u32, width: i32, height: i32, _refresh: i32) -> Action {
-        ctx.outputs.update(ctx.last_sender_id, |output| {
+    fn on_mode(
+        ctx: &mut Context,
+        sender: EventSender,
+        flags: u32,
+        width: i32,
+        height: i32,
+        _refresh: i32,
+    ) -> Action {
+        ctx.outputs.update(sender.host, |output| {
             if flags & wl_output::MODE_CURRENT != 0
                 || output.mode_width <= 0
                 || output.mode_height <= 0
@@ -80,18 +90,14 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for Handlers {
         Action::Forward
     }
 
-    fn on_done(ctx: &mut Context) -> Action {
-        ctx.outputs.commit(ctx.last_sender_id);
+    fn on_done(ctx: &mut Context, sender: EventSender) -> Action {
+        ctx.outputs.commit(sender.host);
         Action::Forward
     }
 
-    fn on_release(ctx: &mut Context) -> Action {
-        // This is a client→host request, so `last_sender_id` is the guest
-        // wl_output ID. Translate it before touching host-side output state or
-        // queueing the destructor. Keeping the direction explicit avoids
-        // retiring an unrelated host object when the two namespaces differ.
-        let guest_output_id = ctx.last_sender_id;
-        let Some(host_output_id) = ctx.shadow_table.get_host_id(guest_output_id) else {
+    fn on_release(ctx: &mut Context, sender: RequestSender) -> Action {
+        let guest_output_id = sender.guest;
+        let Some(host_output_id) = sender.host_id() else {
             // Only an inert output, whose bind crossed its global's removal,
             // gets here without a host object. Nothing reaches the host; the
             // generated dispatcher completes the destructor locally.
@@ -102,15 +108,14 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for Handlers {
         // would put wl_output.release ahead of the queued Aura release, so
         // queue the translated destructor explicitly.
         ctx.guest_destroyed(guest_output_id);
-        ctx.client_to_host_queue
-            .push(wl_output::req::release(host_output_id));
+        ctx.send_host(wl_output::req::release(host_output_id));
         Action::Drop
     }
 }
 
 /// Forget host output `host_output_id`, which ended (see
 /// `crate::state::lifecycle`), and release its Aura child.
-pub(crate) fn forget_output(ctx: &mut Context, host_output_id: u32) {
+pub(crate) fn forget_output(ctx: &mut Context, host_output_id: HostId) {
     if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
         aura_objects::release(ctx, aura_objects::AuraChild::OUTPUT, zaura_output_host_id);
     }
@@ -120,8 +125,15 @@ pub(crate) fn forget_output(ctx: &mut Context, host_output_id: u32) {
 /// events for an unknown or no longer live output are stale and dropped
 /// (see [`crate::state::OutputRegistry::aura_event_target`]).
 impl ZauraOutputHandler for Handlers {
-    fn on_insets(ctx: &mut Context, top: i32, left: i32, bottom: i32, right: i32) -> Action {
-        let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
+    fn on_insets(
+        ctx: &mut Context,
+        sender: EventSender,
+        top: i32,
+        left: i32,
+        bottom: i32,
+        right: i32,
+    ) -> Action {
+        let Some(wl_output_id) = ctx.outputs.aura_event_target(sender.host) else {
             return Action::Drop;
         };
         if top < 0 || left < 0 || bottom < 0 || right < 0 {
@@ -147,12 +159,12 @@ impl ZauraOutputHandler for Handlers {
         Action::Drop
     }
 
-    fn on_scale(ctx: &mut Context, flags: u32, scale: u32) -> Action {
+    fn on_scale(ctx: &mut Context, sender: EventSender, flags: u32, scale: u32) -> Action {
         // Preferred scales describe choices, not the active DP geometry.
         if flags & zaura_output::SCALE_PROPERTY_CURRENT == 0 {
             return Action::Drop;
         }
-        let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
+        let Some(wl_output_id) = ctx.outputs.aura_event_target(sender.host) else {
             return Action::Drop;
         };
         if scale == 0 {
@@ -165,8 +177,8 @@ impl ZauraOutputHandler for Handlers {
         Action::Drop
     }
 
-    fn on_device_scale_factor(ctx: &mut Context, scale: u32) -> Action {
-        let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
+    fn on_device_scale_factor(ctx: &mut Context, sender: EventSender, scale: u32) -> Action {
+        let Some(wl_output_id) = ctx.outputs.aura_event_target(sender.host) else {
             return Action::Drop;
         };
         if scale == 0 {
@@ -180,7 +192,7 @@ impl ZauraOutputHandler for Handlers {
     }
 
     /// Not used: see [`crate::state::OutputState::panel_transform`].
-    fn on_logical_transform(_ctx: &mut Context, _transform: i32) -> Action {
+    fn on_logical_transform(_ctx: &mut Context, _sender: EventSender, _transform: i32) -> Action {
         Action::Drop
     }
 }
@@ -189,21 +201,21 @@ impl ZauraOutputHandler for Handlers {
 /// the IDs of its `zxdg_output_v1` children and their events, and checks
 /// each event against the child's version, which is its manager's.
 impl ZxdgOutputManagerV1Handler for Handlers {
-    fn on_get_xdg_output(ctx: &mut Context, id: u32, output: u32) -> Action {
-        if ctx.shadow_table.get_host_id(output).is_some() {
+    fn on_get_xdg_output(
+        ctx: &mut Context,
+        sender: RequestSender,
+        id: GuestId,
+        output: RequestObject,
+    ) -> Action {
+        if output.host.host().is_some() {
             return Action::Forward;
         }
         // An inert output (its bind crossed its global's removal) has no
         // host object to extend, so its xdg_output is inert too: a
-        // local-only object whose destructor completes in the proxy.
-        let manager = ctx.last_sender_id;
-        let Some(version) = ctx.shadow_table.guest_object_version(manager) else {
-            return ctx.fail(format_args!(
-                "zxdg_output_manager_v1 {manager} has no version"
-            ));
-        };
+        // local-only object whose destructor completes in the proxy. It
+        // takes its manager's version.
         ctx.shadow_table
-            .create_local(id, Iface::ZxdgOutputV1, version);
+            .create_local(id, Iface::ZxdgOutputV1, sender.version);
         Action::Drop
     }
 }
@@ -435,7 +447,7 @@ mod tests {
 
         /// The host sends `event` of the `wl_output`; returns whether the
         /// guest got it.
-        async fn output_event(&mut self, event: Outgoing) -> bool {
+        async fn output_event(&mut self, event: Outgoing<u32>) -> bool {
             self.d.s.host([event]).await;
             assert_eq!(self.d.s.host_received(), []);
             let guest = self.d.s.guest_received();
@@ -448,7 +460,7 @@ mod tests {
 
         /// The host sends `event` of the host-only `zaura_output`, which
         /// neither peer hears of.
-        async fn aura_event(&mut self, event: Outgoing) {
+        async fn aura_event(&mut self, event: Outgoing<u32>) {
             self.d.s.host([event]).await;
             assert_eq!(self.d.s.host_received(), []);
             assert_eq!(self.d.s.guest_received(), []);
@@ -962,15 +974,21 @@ mod tests {
             s.guest([get(manager.id, xdg_output, output)]).await;
             // No event can show an inert object's version.
             let table = &s.ctx().shadow_table;
+            let xdg_output = crate::state::GuestId::for_test(xdg_output);
             assert_eq!(
                 table.get_interface(xdg_output),
                 Some(crate::protocols::Iface::ZxdgOutputV1)
             );
             assert_eq!(table.guest_object_version(xdg_output), Some(3));
 
-            s.guest([zxdg_output_v1::req::destroy(xdg_output)]).await;
+            s.guest([zxdg_output_v1::req::destroy(crate::wire::WireId::wire(
+                xdg_output,
+            ))])
+            .await;
             assert_eq!(s.host_received(), []);
-            let deleted = wl_display::Event::DeleteId { id: xdg_output };
+            let deleted = wl_display::Event::DeleteId {
+                id: crate::wire::WireId::wire(xdg_output),
+            };
             assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
         }
     }

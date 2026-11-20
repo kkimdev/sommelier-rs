@@ -264,30 +264,30 @@ impl PlacementState {
     #[cfg(test)]
     pub(crate) fn assert_no_orphans(
         &self,
-        guest: &dyn Fn(&str, u32, crate::protocols::Iface),
-        host_only: &dyn Fn(&str, u32, crate::protocols::Iface),
+        guest: &dyn Fn(&str, GuestId, crate::protocols::Iface),
+        host_only: &dyn Fn(&str, HostId, crate::protocols::Iface),
     ) {
         for (&xdg_toplevel, placed) in &self.toplevels {
             guest(
                 "Aura toplevel",
-                xdg_toplevel.0,
+                xdg_toplevel,
                 crate::protocols::Iface::XdgToplevel,
             );
             host_only(
                 "Aura toplevel",
-                placed.aura_toplevel.0,
+                placed.aura_toplevel,
                 crate::protocols::Iface::ZauraToplevel,
             );
         }
         for (&aura_toplevel, &xdg_toplevel) in &self.xdg_toplevel_by_aura_toplevel {
             guest(
                 "Aura toplevel",
-                xdg_toplevel.0,
+                xdg_toplevel,
                 crate::protocols::Iface::XdgToplevel,
             );
             host_only(
                 "Aura toplevel",
-                aura_toplevel.0,
+                aura_toplevel,
                 crate::protocols::Iface::ZauraToplevel,
             );
         }
@@ -298,12 +298,12 @@ impl PlacementState {
 mod tests {
     use super::*;
 
-    const XDG: GuestId = GuestId(10);
-    const AURA: HostId = HostId(70);
+    const XDG: GuestId = GuestId::for_test(10);
+    const AURA: HostId = HostId::for_test(70);
 
     fn placement(barrier: u32) -> Placement {
         Placement {
-            barrier: HostId(barrier),
+            barrier: HostId::for_test(barrier),
             target: Rect::new(0, 0, 10, 20),
             step: PlacementStep::Restore,
         }
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(state.last_configure(XDG), Some((&[4, 0, 0, 0][..], 9)));
 
         // Reports of an unknown toplevel change nothing.
-        let unknown = GuestId(11);
+        let unknown = GuestId::for_test(11);
         state.configured(unknown, (1, 1), Vec::new());
         state.moved(unknown, (1, 1));
         state.serial_sent(unknown, 1);
@@ -361,12 +361,19 @@ mod tests {
         state.attach(XDG, AURA);
         state.start(XDG, placement(40));
         state.start(XDG, placement(41));
-        assert_eq!(state.take_placement(XDG, HostId(40)), None);
-        assert_eq!(state.take_placement(XDG, HostId(41)), Some(placement(41)));
-        assert_eq!(state.take_placement(XDG, HostId(41)), None, "taken once");
+        assert_eq!(state.take_placement(XDG, HostId::for_test(40)), None);
+        assert_eq!(
+            state.take_placement(XDG, HostId::for_test(41)),
+            Some(placement(41))
+        );
+        assert_eq!(
+            state.take_placement(XDG, HostId::for_test(41)),
+            None,
+            "taken once"
+        );
 
         state.start(XDG, placement(42));
         assert_eq!(state.take(XDG), Some(AURA));
-        assert_eq!(state.take_placement(XDG, HostId(42)), None);
+        assert_eq!(state.take_placement(XDG, HostId::for_test(42)), None);
     }
 }

@@ -35,7 +35,7 @@ use super::{Client, Direction, ParkedRequest};
 use crate::connection::WaylandConnection;
 use crate::protocols::wayland::{wl_compositor, wl_display, wl_registry};
 use crate::protocols::{AnyEvent, AnyRequest};
-use crate::state::Context;
+use crate::state::{Context, GuestId, HostId};
 use crate::test_support::counting::Counts;
 use crate::test_support::wire_peer::{self, Message, Role};
 use crate::wire::{Framing, MessageHeader, Outgoing, WL_DISPLAY_ID};
@@ -48,6 +48,18 @@ use std::os::unix::net::UnixStream;
 pub(crate) struct Object {
     pub(crate) id: u32,
     pub(crate) host: u32,
+}
+
+impl Object {
+    /// The guest object's ID, as the proxy keys it.
+    pub(crate) const fn guest_id(self) -> GuestId {
+        GuestId::for_test(self.id)
+    }
+
+    /// The host object's ID, as the proxy keys it.
+    pub(crate) const fn host_id(self) -> HostId {
+        HostId::for_test(self.host)
+    }
 }
 
 /// A [`Client`] whose guest and host are played by the test.
@@ -122,7 +134,7 @@ impl Session {
     }
 
     /// The guest sends `requests`, which must not end the session.
-    pub(crate) async fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
+    pub(crate) async fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing<u32>>) {
         assert!(
             self.send(Direction::ClientToHost, requests).await,
             "the guest's requests ended the session"
@@ -130,7 +142,7 @@ impl Session {
     }
 
     /// The guest sends `requests`, which must end the session.
-    pub(crate) async fn guest_fatal(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
+    pub(crate) async fn guest_fatal(&mut self, requests: impl IntoIterator<Item = Outgoing<u32>>) {
         assert!(
             !self.send(Direction::ClientToHost, requests).await,
             "the guest's requests did not end the session"
@@ -138,7 +150,7 @@ impl Session {
     }
 
     /// The host sends `events`, which must not end the session.
-    pub(crate) async fn host(&mut self, events: impl IntoIterator<Item = Outgoing>) {
+    pub(crate) async fn host(&mut self, events: impl IntoIterator<Item = Outgoing<u32>>) {
         assert!(
             self.send(Direction::HostToClient, events).await,
             "the host's events ended the session"
@@ -146,7 +158,7 @@ impl Session {
     }
 
     /// The host sends `events`, which must end the session.
-    pub(crate) async fn host_fatal(&mut self, events: impl IntoIterator<Item = Outgoing>) {
+    pub(crate) async fn host_fatal(&mut self, events: impl IntoIterator<Item = Outgoing<u32>>) {
         assert!(
             !self.send(Direction::HostToClient, events).await,
             "the host's events did not end the session"
@@ -155,12 +167,18 @@ impl Session {
 
     /// The guest sends `requests`; returns whether the session goes on, for
     /// a driver that reports a session's end rather than asserting it.
-    pub(crate) async fn try_guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) -> bool {
+    pub(crate) async fn try_guest(
+        &mut self,
+        requests: impl IntoIterator<Item = Outgoing<u32>>,
+    ) -> bool {
         self.send(Direction::ClientToHost, requests).await
     }
 
     /// The host sends `events`; returns whether the session goes on.
-    pub(crate) async fn try_host(&mut self, events: impl IntoIterator<Item = Outgoing>) -> bool {
+    pub(crate) async fn try_host(
+        &mut self,
+        events: impl IntoIterator<Item = Outgoing<u32>>,
+    ) -> bool {
         self.send(Direction::HostToClient, events).await
     }
 
@@ -267,7 +285,9 @@ impl Session {
         version: u32,
     ) {
         let shadow_table = &mut self.client.ctx.shadow_table;
-        shadow_table.insert_paired_with_version_for_test(id, host, interface, version);
+        let iface = crate::protocols::Iface::from_name(interface).expect("a vendored interface");
+        let (guest, host_id) = (GuestId::for_test(id), HostId::for_test(host));
+        shadow_table.insert_paired_with_version_for_test(guest, host_id, iface, version);
         self.guest.wire.adopt(id, interface, version);
         self.host.wire.adopt(host, interface, version);
     }
@@ -295,7 +315,8 @@ impl Session {
     /// # Panics
     ///
     /// If it does not decode so.
-    pub(crate) fn decode_host_event(&self, (message, fds): &Outgoing) -> (u32, AnyEvent) {
+    pub(crate) fn decode_host_event(&self, outgoing: &Outgoing<u32>) -> (u32, AnyEvent) {
+        let (message, fds) = (outgoing.bytes(), outgoing.fds());
         let mut fds = fds
             .iter()
             .map(|fd| fd.try_clone().expect("duplicate a descriptor"))
@@ -307,7 +328,7 @@ impl Session {
     /// The guest sends `request`, which creates one object; returns the host
     /// ID of the object its forward creates. The forward is not kept for
     /// [`Self::host_received`].
-    pub(crate) async fn create(&mut self, request: Outgoing) -> u32 {
+    pub(crate) async fn create(&mut self, request: Outgoing<u32>) -> u32 {
         let (_, interface) = self
             .guest
             .created::<AnyRequest>(&request)
@@ -516,7 +537,7 @@ impl Session {
     async fn send(
         &mut self,
         direction: Direction,
-        messages: impl IntoIterator<Item = Outgoing>,
+        messages: impl IntoIterator<Item = Outgoing<u32>>,
     ) -> bool {
         for message in messages {
             let peer = match direction {
@@ -555,7 +576,8 @@ impl Session {
     /// ([`Self::receive_in`]), and have the proxy receive each piece, as
     /// `Client::run` does, so that it reads them through its own
     /// transport. Returns `false` if the proxy refuses what it receives.
-    fn transmit(&mut self, direction: Direction, (bytes, fds): Outgoing) -> bool {
+    fn transmit(&mut self, direction: Direction, outgoing: Outgoing<u32>) -> bool {
+        let (bytes, fds) = outgoing.into_parts();
         let mut sent = 0;
         while sent < bytes.len() {
             let end = bytes.len().min(sent + self.piece);
@@ -963,7 +985,7 @@ impl Session {
     pub(super) fn queue(
         &mut self,
         direction: Direction,
-        messages: impl IntoIterator<Item = Outgoing>,
+        messages: impl IntoIterator<Item = Outgoing<u32>>,
     ) {
         for message in messages {
             match direction {
@@ -982,7 +1004,7 @@ impl Session {
     pub(super) fn write(
         &mut self,
         direction: Direction,
-        messages: impl IntoIterator<Item = Outgoing>,
+        messages: impl IntoIterator<Item = Outgoing<u32>>,
     ) {
         for message in messages {
             match direction {
@@ -1068,7 +1090,7 @@ pub(super) struct Running<'a> {
 
 impl Running<'_> {
     /// The host sends `events`.
-    pub(super) fn host(&mut self, events: impl IntoIterator<Item = Outgoing>) {
+    pub(super) fn host(&mut self, events: impl IntoIterator<Item = Outgoing<u32>>) {
         events.into_iter().for_each(|event| self.host.send(event));
     }
 
@@ -1149,9 +1171,9 @@ impl<M: Message> Peer<M> {
     }
 
     /// Send `message` whole, and learn from it.
-    fn send(&mut self, message: Outgoing) {
+    fn send(&mut self, message: Outgoing<u32>) {
         self.wire.send(&message);
-        let (bytes, fds) = message;
+        let (bytes, fds) = message.into_parts();
         let mut sent = self.write(&bytes, &fds);
         while sent < bytes.len() {
             sent += self.write(&bytes[sent..], &[]);
@@ -1255,7 +1277,8 @@ impl<M: Message> Peer<M> {
     /// The ID and interface of the object `message`, which this peer is
     /// about to send, creates; `None` for a malformed one, which creates
     /// none.
-    fn created<S: Message>(&self, (message, fds): &Outgoing) -> Option<(u32, String)> {
+    fn created<S: Message>(&self, outgoing: &Outgoing<u32>) -> Option<(u32, String)> {
+        let (message, fds) = (outgoing.bytes(), outgoing.fds());
         let mut fds = fds
             .iter()
             .map(|fd| fd.try_clone().expect("duplicate a descriptor"))

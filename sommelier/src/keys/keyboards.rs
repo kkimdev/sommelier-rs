@@ -25,17 +25,17 @@ limitations under the License.
 use std::collections::BTreeMap;
 
 use crate::keymap::{KeyboardModifiers, Keymap};
-use crate::state::HostId;
+use crate::state::{GuestId, HostId};
 
 /// One host `wl_keyboard`, from its guest's `wl_seat.get_keyboard` to its
 /// end.
 #[derive(Debug)]
 pub(crate) struct Keyboard {
     /// The guest `wl_keyboard`.
-    pub(crate) guest: u32,
+    pub(crate) guest: GuestId,
     /// The guest `wl_seat` it was created from, which may have ended since
     /// (INVARIANTS "Releasing a parent does not end its children").
-    pub(crate) seat: u32,
+    pub(crate) seat: GuestId,
     /// The keymap the host sent, while the proxy can use it.
     pub(crate) keymap: Option<Keymap>,
     /// The modifiers the host last sent. Exo sends them only when they
@@ -48,7 +48,7 @@ pub(crate) struct Keyboard {
 }
 
 impl Keyboard {
-    pub(super) fn new(guest: u32, seat: u32) -> Self {
+    pub(super) fn new(guest: GuestId, seat: GuestId) -> Self {
         Self {
             guest,
             seat,
@@ -66,7 +66,7 @@ pub(crate) struct Keyboards(BTreeMap<HostId, Keyboard>);
 impl Keyboards {
     pub(super) fn insert(&mut self, host: HostId, keyboard: Keyboard) {
         let replaced = self.0.insert(host, keyboard);
-        debug_assert!(replaced.is_none(), "host keyboard {} exists", host.0);
+        debug_assert!(replaced.is_none(), "host keyboard {host} exists");
     }
 
     pub(super) fn remove(&mut self, host: HostId) -> Option<Keyboard> {
@@ -82,7 +82,7 @@ impl Keyboards {
     }
 
     /// The guest seat of host keyboard `host`.
-    pub(crate) fn seat(&self, host: HostId) -> Option<u32> {
+    pub(crate) fn seat(&self, host: HostId) -> Option<GuestId> {
         self.get(host).map(|keyboard| keyboard.seat)
     }
 
@@ -95,7 +95,7 @@ impl Keyboards {
 
     /// The host keyboards of guest seat `seat`, in the order of their guest
     /// IDs.
-    pub(crate) fn of_seat(&self, seat: u32) -> Vec<HostId> {
+    pub(crate) fn of_seat(&self, seat: GuestId) -> Vec<HostId> {
         let mut keyboards: Vec<_> = self
             .0
             .iter()

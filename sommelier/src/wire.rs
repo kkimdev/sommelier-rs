@@ -18,47 +18,108 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::fmt;
+use std::marker::PhantomData;
 use std::os::fd::OwnedFd;
 
 /// The object ID of the `wl_display` singleton on every connection.
 pub const WL_DISPLAY_ID: u32 = 1;
 
-/// One encoded message and the descriptors it carries, in argument order.
+/// An object ID in one peer's ID space, which a message carries on the
+/// wire as a `u32`.
 ///
-/// The generated `req::` and `evt::` encoders and forwarding return it, and
-/// the proxy's send queues hold it until the message is sent. It owns its
-/// descriptors: dropping it, sent or not, closes them.
-pub type Outgoing = (Vec<u8>, Vec<OwnedFd>);
+/// The proxy's IDs are `state::GuestId` and `state::HostId`, which only
+/// the object table makes; a test peer, which plays a whole side, numbers
+/// its objects with plain `u32`s.
+pub trait WireId: Copy {
+    /// The ID as the wire carries it.
+    fn wire(self) -> u32;
+}
 
-/// Queue an encoded message, or log and drop one that could not be encoded.
+/// The IDs of a request: the proxy sends requests only to the host, so
+/// only a `state::HostId` is one.
+pub trait RequestId: WireId {}
+
+/// The IDs of an event: the proxy sends events only to the guest, so only
+/// a `state::GuestId` is one.
+pub trait EventId: WireId {}
+
+#[cfg(test)]
+impl WireId for u32 {
+    fn wire(self) -> u32 {
+        self
+    }
+}
+
+/// A test peer's request, which names its objects by their wire IDs.
+#[cfg(test)]
+impl RequestId for u32 {}
+
+/// A test peer's event, which names its objects by their wire IDs.
+#[cfg(test)]
+impl EventId for u32 {}
+
+/// One encoded message whose IDs are all of the ID space `I`, and the
+/// descriptors it carries, in argument order.
 ///
-/// Only the encoder of a message with a string or array fails, when the
-/// data does not fit [`MessageHeader::MAX_LEN`]. That data can come from the
-/// host or a guest, so dropping the one message keeps the session alive
-/// instead of ending it.
-///
-/// # Arguments
-///
-/// * `what` - names the message in the log, such as
-///   `format_args!("startup ID for zaura_surface {id}")`.
-///
-/// # Returns
-///
-/// Whether the message was queued.
-pub fn queue_or_drop(
-    queue: &mut Vec<Outgoing>,
-    message: Result<Outgoing, ProtocolError>,
-    what: impl fmt::Display,
-) -> bool {
-    match message {
-        Ok(message) => {
-            queue.push(message);
-            true
+/// The generated `req::` and `evt::` encoders and forwarding make it: a
+/// [`ToHost`] names only host objects and a [`ToGuest`] only guest ones,
+/// so a message cannot reach the peer whose IDs it does not carry. It
+/// owns its descriptors: dropping it, sent or not, closes them.
+#[derive(Debug)]
+pub struct Outgoing<I> {
+    message: Vec<u8>,
+    fds: Vec<OwnedFd>,
+    ids: PhantomData<I>,
+}
+
+/// A request for the host.
+pub type ToHost = Outgoing<crate::state::HostId>;
+
+/// An event for the guest.
+pub type ToGuest = Outgoing<crate::state::GuestId>;
+
+impl<I: WireId> Outgoing<I> {
+    fn new(message: Vec<u8>, fds: Vec<OwnedFd>) -> Self {
+        Self {
+            message,
+            fds,
+            ids: PhantomData,
         }
-        Err(error) => {
-            log::warn!("Dropping {what}: {error}");
-            false
-        }
+    }
+}
+
+impl<I> Outgoing<I> {
+    /// The encoded message, header included.
+    pub fn bytes(&self) -> &[u8] {
+        &self.message
+    }
+
+    /// The descriptors it carries, in argument order.
+    pub fn fds(&self) -> &[OwnedFd] {
+        &self.fds
+    }
+
+    /// `self` and then `next` as one entry of the transport's
+    /// (`connection::OutgoingMessages`), which a submission never splits.
+    pub fn glued(mut self, next: Self) -> Self {
+        self.message.extend_from_slice(&next.message);
+        self.fds.extend(next.fds);
+        self
+    }
+
+    /// The encoded message and its descriptors, for the transport that
+    /// sends them.
+    pub fn into_parts(self) -> (Vec<u8>, Vec<OwnedFd>) {
+        (self.message, self.fds)
+    }
+}
+
+#[cfg(test)]
+impl Outgoing<u32> {
+    /// A test peer's message from its parts, such as a frame no encoder
+    /// builds.
+    pub fn from_parts(message: Vec<u8>, fds: Vec<OwnedFd>) -> Self {
+        Self::new(message, fds)
     }
 }
 
@@ -563,6 +624,14 @@ impl MessageBuilder {
     pub fn write_fd(&mut self, fd: OwnedFd) {
         self.fds.push(fd);
     }
+
+    /// The builder with `fds`, the message's descriptors in argument order,
+    /// in place of any written with [`Self::write_fd`].
+    pub fn with_fds(mut self, fds: Vec<OwnedFd>) -> Self {
+        debug_assert!(self.fds.is_empty(), "descriptors written twice");
+        self.fds = fds;
+        self
+    }
 }
 
 impl MessageBuilder {
@@ -586,10 +655,22 @@ impl MessageBuilder {
 
     /// Assemble the message together with the descriptors written with
     /// [`Self::write_fd`], as generated forwarding sends it.
-    pub fn try_build(mut self, sender_id: u32, opcode: u16) -> Result<Outgoing, ProtocolError> {
+    pub fn try_build<I: WireId>(
+        mut self,
+        sender: I,
+        opcode: u16,
+    ) -> Result<Outgoing<I>, ProtocolError> {
         let fds = std::mem::take(&mut self.fds);
-        let message = self.try_build_message(sender_id, opcode)?;
-        Ok((message, fds))
+        let message = self.try_build_message(sender.wire(), opcode)?;
+        Ok(Outgoing::new(message, fds))
+    }
+
+    /// Assemble a message without strings or arrays, which always fits
+    /// ([`Self::build_message`]), with its descriptors, as a generated
+    /// encoder does.
+    pub fn build<I: WireId>(mut self, sender: I, opcode: u16) -> Outgoing<I> {
+        let fds = std::mem::take(&mut self.fds);
+        Outgoing::new(self.build_message(sender.wire(), opcode), fds)
     }
 
     /// A builder that continues `payload`, for tests that edit raw frames.
@@ -659,10 +740,11 @@ mod tests {
     /// goes on.
     #[test]
     fn oversized_host_text_is_dropped_without_panicking() {
-        let mut queue = Vec::new();
-        let offer = wl_data_offer::evt::offer(7, &"x".repeat(4_084));
-        assert!(!super::queue_or_drop(&mut queue, offer, "an offer"));
-        assert!(queue.is_empty());
+        let mut ctx = crate::state::Context::new_for_test(false, false, Vec::new());
+        let guest = crate::state::GuestId::for_test(7);
+        let offer = wl_data_offer::evt::offer(guest, &"x".repeat(4_084));
+        assert!(!ctx.send_guest_or_drop(offer, "an offer"));
+        assert!(!ctx.sends_anything());
     }
 
     /// Decoding holds for arbitrary bytes: a frame never claims more bytes
@@ -898,9 +980,10 @@ mod tests {
     /// Decode `outgoing` with `decode`, checking that its header frames the
     /// whole message and that the decoder consumes the whole payload.
     fn round_trip<T>(
-        (message, fds): Outgoing,
+        outgoing: Outgoing<u32>,
         decode: impl FnOnce(&mut WireMessage) -> Result<T, ProtocolError>,
     ) -> T {
+        let (message, fds) = outgoing.into_parts();
         let header = MessageHeader::parse(&message).expect("header");
         assert_eq!(header.len, message.len());
         let payload = &message[MessageHeader::LEN..];

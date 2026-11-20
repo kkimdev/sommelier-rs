@@ -18,11 +18,11 @@ use super::*;
 
 #[test]
 fn ime_repeat_lease_is_generation_and_keyboard_scoped() {
-    let keyboard_a = HostId(10);
-    let keyboard_b = HostId(11);
+    let keyboard_a = HostId::for_test(10);
+    let keyboard_b = HostId::for_test(11);
     let seat = [keyboard_a, keyboard_b];
     let key = EVDEV_KEY_BACKSPACE;
-    let (ti, other) = (TiId(40), TiId(41));
+    let (ti, other) = (TiId(GuestId::for_test(40)), TiId(GuestId::for_test(41)));
     let arm = |ti| LeaseInput::Ime {
         ti,
         outcome: LeaseOutcome::ArmIfBackspaceHeld,
@@ -57,8 +57,8 @@ fn ime_repeat_lease_is_generation_and_keyboard_scoped() {
     assert_eq!(registry.backspace_lease(keyboard_b), None);
 }
 
-const KEYBOARD_A: HostId = HostId(10);
-const KEYBOARD_B: HostId = HostId(11);
+const KEYBOARD_A: HostId = HostId::for_test(10);
+const KEYBOARD_B: HostId = HostId::for_test(11);
 
 const PRESS: PhysicalKey = PhysicalKey::Press {
     chord: ChordClass::Guest,
@@ -222,7 +222,7 @@ fn guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces() {
     ];
     let sequence_len = 6;
     let sequence_count = operations.len().pow(sequence_len);
-    let keyboard = HostId(10);
+    let keyboard = HostId::for_test(10);
     let key = 30;
 
     for mut encoded in 0..sequence_count {
@@ -604,7 +604,7 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
     // Backspace, which the lease concerns.
     const KEY_A: u32 = EVDEV_KEY_BACKSPACE;
     const KEY_B: u32 = 57;
-    let keyboard = HostId(10);
+    let keyboard = HostId::for_test(10);
     let operations = [
         Operation::Press(KEY_A),
         Operation::Press(KEY_B),
@@ -724,7 +724,7 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
                 }
                 Operation::ArmImeRepeat(owner) => {
                     let outcome = LeaseOutcome::ArmIfBackspaceHeld;
-                    let ti = TiId(owner);
+                    let ti = TiId(GuestId::for_test(owner));
                     registry.lease(&[keyboard], LeaseInput::Ime { ti, outcome });
                     match model.held(KEY_A) {
                         Some(held) if !held.backspace_repeat_cancelled => {
@@ -738,7 +738,7 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
                 }
                 Operation::CancelRepeatOwner(owner) => {
                     let outcome = LeaseOutcome::End;
-                    let ti = TiId(owner);
+                    let ti = TiId(GuestId::for_test(owner));
                     registry.lease(&[keyboard], LeaseInput::Ime { ti, outcome });
                     model.end_lease(KEY_A, owner);
                 }
@@ -824,7 +824,10 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
                     actual.backspace_repeat_cancelled(),
                     expected.backspace_repeat_cancelled
                 );
-                assert_eq!(actual.ime_repeat_owner(), expected.ime_repeat_owner);
+                assert_eq!(
+                    actual.ime_repeat_owner(),
+                    expected.ime_repeat_owner.map(GuestId::for_test)
+                );
                 assert_eq!(actual.guest_owner(), expected.guest_owner);
                 // A detach marks only a held key; a release ends it.
                 assert_eq!(
@@ -859,7 +862,7 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
 
 #[test]
 fn repressed_key_replaces_its_released_peek_generation() {
-    let keyboard = HostId(10);
+    let keyboard = HostId::for_test(10);
     let key_a = 30;
     let key_b = 57;
     let mut registry = KeyGenerationRegistry::default();
@@ -886,7 +889,7 @@ fn repressed_key_replaces_its_released_peek_generation() {
 /// the serial's wrap, and leaves the new generation held.
 #[test]
 fn a_retired_release_closes_its_press_across_the_serial_wrap() {
-    let keyboard = HostId(10);
+    let keyboard = HostId::for_test(10);
     let key = 57;
     let mut registry = KeyGenerationRegistry::default();
 
@@ -942,28 +945,28 @@ fn a_key_keeps_one_pending_release() {
 #[test]
 fn clearing_guest_keys_is_scoped_to_one_keyboard() {
     let mut registry = KeyGenerationRegistry::default();
-    assert!(registry.claim_guest_owner(HostId(10), 57, GuestKeyOwner::ImeRecovery));
-    assert!(registry.claim_guest_owner(HostId(11), 57, GuestKeyOwner::Physical));
-    for keyboard in [HostId(10), HostId(11)] {
+    assert!(registry.claim_guest_owner(HostId::for_test(10), 57, GuestKeyOwner::ImeRecovery));
+    assert!(registry.claim_guest_owner(HostId::for_test(11), 57, GuestKeyOwner::Physical));
+    for keyboard in [HostId::for_test(10), HostId::for_test(11)] {
         registry.observe_physical_state(keyboard, 30, 1);
         assert!(registry.claim_guest_owner(keyboard, 30, GuestKeyOwner::Physical));
         registry.observe_physical_event(keyboard, 30, 0, Some(2));
         registry.observe_physical_state(keyboard, 30, 1);
     }
 
-    registry.clear_keyboard(HostId(10));
+    registry.clear_keyboard(HostId::for_test(10));
 
-    assert!(registry.guest_owner(HostId(10), 57).is_none());
+    assert!(registry.guest_owner(HostId::for_test(10), 57).is_none());
     assert_eq!(
-        registry.guest_owner(HostId(11), 57),
+        registry.guest_owner(HostId::for_test(11), 57),
         Some(GuestKeyOwner::Physical)
     );
     assert!(
-        !registry.take_pending_physical_release(HostId(10), 30, 2),
+        !registry.take_pending_physical_release(HostId::for_test(10), 30, 2),
         "clearing a keyboard must discard its retired releases"
     );
     assert!(
-        registry.take_pending_physical_release(HostId(11), 30, 2),
+        registry.take_pending_physical_release(HostId::for_test(11), 30, 2),
         "clearing one keyboard must preserve another keyboard's retired releases"
     );
 }
@@ -981,11 +984,14 @@ fn ending_one_keyboard_repeat_does_not_cancel_another_held_keyboard() {
     registry.lease(
         &seat,
         LeaseInput::Ime {
-            ti: TiId(1),
+            ti: TiId(GuestId::for_test(1)),
             outcome,
         },
     );
-    assert_eq!(registry.backspace_lease(KEYBOARD_A), Some(TiId(1)));
+    assert_eq!(
+        registry.backspace_lease(KEYBOARD_A),
+        Some(TiId(GuestId::for_test(1)))
+    );
 
     registry.lease(&seat, LeaseInput::FocusLost);
 

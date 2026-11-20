@@ -24,20 +24,22 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
+use super::HostId;
+
 /// One connection's host `wl_surface` → host `zaura_surface` associations.
 #[derive(Debug, Default)]
 pub(crate) struct AuraSurfaces {
-    by_wl_surface: BTreeMap<u32, u32>,
+    by_wl_surface: BTreeMap<HostId, HostId>,
 }
 
 impl AuraSurfaces {
     /// Return the Aura surface of a host wl_surface, if one was created.
-    pub(crate) fn get(&self, wl_surface_host_id: u32) -> Option<u32> {
+    pub(crate) fn get(&self, wl_surface_host_id: HostId) -> Option<HostId> {
         self.by_wl_surface.get(&wl_surface_host_id).copied()
     }
 
     /// Record the Aura surface created for a host wl_surface.
-    pub(crate) fn remember(&mut self, wl_surface_host_id: u32, zaura_surface_host_id: u32) {
+    pub(crate) fn remember(&mut self, wl_surface_host_id: HostId, zaura_surface_host_id: HostId) {
         let previous = self
             .by_wl_surface
             .insert(wl_surface_host_id, zaura_surface_host_id);
@@ -53,7 +55,7 @@ impl AuraSurfaces {
     ///
     /// The Aura surface whose host teardown the caller must perform.
     #[must_use = "the returned Aura surface ID identifies host teardown work"]
-    pub(crate) fn take(&mut self, wl_surface_host_id: u32) -> Option<u32> {
+    pub(crate) fn take(&mut self, wl_surface_host_id: HostId) -> Option<HostId> {
         self.by_wl_surface.remove(&wl_surface_host_id)
     }
 
@@ -64,7 +66,7 @@ impl AuraSurfaces {
 
     /// Every host wl_surface that has an Aura surface.
     #[cfg(test)]
-    pub(super) fn wl_surfaces_for_test(&self) -> impl Iterator<Item = u32> + '_ {
+    pub(super) fn wl_surfaces_for_test(&self) -> impl Iterator<Item = HostId> + '_ {
         self.by_wl_surface.keys().copied()
     }
 }
@@ -75,15 +77,16 @@ mod tests {
 
     #[test]
     fn association_resolves_until_taken() {
+        let (wl_surface, aura_surface) = (HostId::for_test(50), HostId::for_test(60));
         let mut surfaces = AuraSurfaces::default();
-        assert_eq!(surfaces.get(50), None);
-        surfaces.remember(50, 60);
-        surfaces.remember(50, 60);
-        assert_eq!(surfaces.get(50), Some(60));
+        assert_eq!(surfaces.get(wl_surface), None);
+        surfaces.remember(wl_surface, aura_surface);
+        surfaces.remember(wl_surface, aura_surface);
+        assert_eq!(surfaces.get(wl_surface), Some(aura_surface));
         assert_eq!(surfaces.count(), 1);
 
-        assert_eq!(surfaces.take(50), Some(60));
-        assert_eq!(surfaces.get(50), None);
-        assert_eq!(surfaces.take(50), None, "take is idempotent");
+        assert_eq!(surfaces.take(wl_surface), Some(aura_surface));
+        assert_eq!(surfaces.get(wl_surface), None);
+        assert_eq!(surfaces.take(wl_surface), None, "take is idempotent");
     }
 }

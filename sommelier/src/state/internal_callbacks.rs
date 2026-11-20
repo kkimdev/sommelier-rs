@@ -24,7 +24,7 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
-use super::HostId;
+use super::{GuestId, HostId};
 use crate::ime::BarrierToken;
 
 /// What an internal callback waits for.
@@ -35,7 +35,7 @@ pub(crate) enum InternalCallback {
     DmabufCapabilities { global: u32 },
     /// The internal `zaura_shell` bind has reached the compositor, so the
     /// synthetic `gtk_shell1` (guest ID) may announce its capabilities.
-    GtkShellCapabilities { gtk_shell: u32 },
+    GtkShellCapabilities { gtk_shell: GuestId },
     /// A host text input has delivered every event it sent before the
     /// request this barrier of the IME core follows: the `deactivate` of
     /// its drain, or the `reset` of a press's fence.
@@ -48,7 +48,7 @@ pub(crate) enum InternalCallback {
     /// Exo has handled a placement step of the toplevel of this host
     /// `zaura_toplevel` (`crate::handler::window_placement`), and sent the
     /// configures it causes.
-    PlacementBarrier { zaura_toplevel: u32 },
+    PlacementBarrier { zaura_toplevel: HostId },
 }
 
 /// One connection's pending internal callbacks, keyed by host callback ID.
@@ -113,13 +113,17 @@ mod tests {
     fn a_callback_is_pending_from_register_until_complete() {
         let mut callbacks = InternalCallbacks::default();
         let waits_for = InternalCallback::DmabufCapabilities { global: 7 };
-        callbacks.register(HostId(40), waits_for);
-        assert_eq!(callbacks.get(HostId(40)), Some(waits_for));
+        callbacks.register(HostId::for_test(40), waits_for);
+        assert_eq!(callbacks.get(HostId::for_test(40)), Some(waits_for));
         assert!(callbacks.awaits_dmabuf_capabilities(7));
         assert!(!callbacks.awaits_dmabuf_capabilities(8));
 
-        assert_eq!(callbacks.complete(HostId(40)), Some(waits_for));
-        assert_eq!(callbacks.complete(HostId(40)), None, "done is terminal");
+        assert_eq!(callbacks.complete(HostId::for_test(40)), Some(waits_for));
+        assert_eq!(
+            callbacks.complete(HostId::for_test(40)),
+            None,
+            "done is terminal"
+        );
         assert!(!callbacks.awaits_dmabuf_capabilities(7));
         assert_eq!(callbacks.count(), 0);
     }

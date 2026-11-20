@@ -19,8 +19,8 @@ use crate::protocols::wayland::wl_data_device;
 use crate::protocols::wayland::wl_data_device_manager;
 use crate::protocols::wayland::wl_data_offer;
 use crate::protocols::wayland::wl_data_source;
-use crate::state::Context;
-use crate::wire::{queue_or_drop, Action};
+use crate::state::{Context, RequestSender};
+use crate::wire::Action;
 use log::{debug, error};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{send, MsgFlags};
@@ -37,7 +37,12 @@ impl wl_data_device_manager::WlDataDeviceManagerHandler for Handlers {}
 impl wl_data_device::WlDataDeviceHandler for Handlers {}
 
 impl wl_data_offer::WlDataOfferHandler for Handlers {
-    fn on_receive(ctx: &mut Context, mime_type: &String, fd: BorrowedFd<'_>) -> Action {
+    fn on_receive(
+        ctx: &mut Context,
+        sender: RequestSender,
+        mime_type: &String,
+        fd: BorrowedFd<'_>,
+    ) -> Action {
         debug!(
             "wl_data_offer.receive: mime_type={}, fd={}",
             mime_type,
@@ -79,17 +84,16 @@ impl wl_data_offer::WlDataOfferHandler for Handlers {
             // The guest client provided 'fd' to write data into.
             // We pump: virtwl_pipe (read) -> fd (write)
 
-            let sender_id = ctx.last_sender_id;
-            let Some(host_sender_id) = ctx.shadow_table.get_host_id(sender_id) else {
+            let Some(host_sender_id) = sender.host_id() else {
                 error!(
                     "Dropping wl_data_offer.receive from unmapped sender {}",
-                    sender_id
+                    sender.guest
                 );
                 return Action::Drop;
             };
             debug!(
                 "on_receive: sender_id={}, host_sender_id={}",
-                sender_id, host_sender_id
+                sender.guest, host_sender_id
             );
 
             // The host writes into a duplicate of the pipe, and the pump
@@ -101,13 +105,14 @@ impl wl_data_offer::WlDataOfferHandler for Handlers {
                     return Action::Drop;
                 }
             };
-            if !queue_or_drop(
-                &mut ctx.client_to_host_queue,
-                wl_data_offer::req::receive(host_sender_id, mime_type, virtwl_fd_dup),
-                "an oversized clipboard MIME type",
-            ) {
-                return Action::Drop;
-            }
+            let request =
+                match wl_data_offer::req::receive(host_sender_id, mime_type, virtwl_fd_dup) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        log::warn!("Dropping an oversized clipboard MIME type: {e}");
+                        return Action::Drop;
+                    }
+                };
 
             pump_slot.start(async move {
                 match pump(virtwl_pipe, client_fd).await {
@@ -115,6 +120,7 @@ impl wl_data_offer::WlDataOfferHandler for Handlers {
                     Err(e) => error!("Clipboard pump error: {}", e),
                 }
             });
+            ctx.send_host(request);
 
             // Drop original action (we handled it)
             return Action::Drop;
@@ -348,7 +354,7 @@ mod tests {
     };
     use crate::protocols::{AnyEvent, Iface};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::Context;
+    use crate::state::{Context, GuestId, HostId};
     use crate::test_support::{raw_dispatch, Rng};
     use crate::wire::{WireMessage, WL_DISPLAY_ID};
     use std::io::{self, Read, Write};
@@ -805,16 +811,22 @@ mod tests {
         const XDG_OUTPUT: u32 = 12;
         let context = || {
             let mut ctx = Context::new_for_test(false, false, Vec::new());
+            let manager = GuestId::for_test(MANAGER);
+            ctx.shadow_table.insert_paired_for_test(
+                manager,
+                HostId::for_test(20),
+                Iface::ZxdgOutputManagerV1,
+            );
+            let inert_output = GuestId::for_test(INERT_OUTPUT);
             ctx.shadow_table
-                .insert_paired_for_test(MANAGER, 20, "zxdg_output_manager_v1");
-            ctx.shadow_table
-                .create_local(INERT_OUTPUT, Iface::WlOutput, 4);
+                .create_local(inert_output, Iface::WlOutput, 4);
             ctx
         };
         // The host ID the next object takes when nothing used one up.
-        let next_host_id = context()
-            .shadow_table
-            .create_paired(13, Iface::ZxdgOutputV1, 3, 3);
+        let next_host_id =
+            context()
+                .shadow_table
+                .create_paired(GuestId::for_test(13), Iface::ZxdgOutputV1, 3, 3);
 
         let mut ctx = context();
         let payload: Vec<u8> = [XDG_OUTPUT, INERT_OUTPUT]
@@ -835,12 +847,12 @@ mod tests {
 
         assert_eq!(raw_dispatch(result), Ok(None));
         assert!(
-            ctx.shadow_table.is_guest_id_available(XDG_OUTPUT),
+            ctx.shadow_table.guest_new_id(XDG_OUTPUT).is_some(),
             "a dropped request must not map its new_id"
         );
         assert_eq!(
             ctx.shadow_table
-                .create_paired(13, Iface::ZxdgOutputV1, 3, 3),
+                .create_paired(GuestId::for_test(13), Iface::ZxdgOutputV1, 3, 3),
             next_host_id,
             "a dropped request must not use up a host ID"
         );

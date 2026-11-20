@@ -26,7 +26,7 @@ use crate::handler::text_input::CtxEnv;
 use crate::ime::{HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId, V3Pending};
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::Iface;
-use crate::state::{Context, HostId, InternalCallback};
+use crate::state::{Context, GuestId, HostId, InternalCallback};
 
 /// A text input the guest committed, enabled unless [`Active::enabled`]
 /// says otherwise, and the host activated if enabled, as [`insert`] sets it
@@ -34,16 +34,16 @@ use crate::state::{Context, HostId, InternalCallback};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Active<'a> {
     /// The host `zwp_text_input_v1` behind it.
-    pub(crate) host: u32,
+    pub(crate) host: HostId,
     /// The host `zcr_extended_text_input_v1` behind it, if the test names
     /// one; otherwise [`insert`] creates one.
-    pub(crate) ext: Option<u32>,
+    pub(crate) ext: Option<HostId>,
     /// The guest `wl_seat` it was created for.
-    pub(crate) seat: u32,
+    pub(crate) seat: GuestId,
     /// The guest surface its focus is on, if any; with none, the field is
     /// not enabled and the host not active, as no text input can be
     /// active unless enabled and focused (the IME core's I1a).
-    pub(crate) focus: Option<u32>,
+    pub(crate) focus: Option<GuestId>,
     /// Whether the guest enabled the focused field, which the host then
     /// activated. One text input on a connection is enabled at a time.
     pub(crate) enabled: bool,
@@ -61,7 +61,7 @@ pub(crate) struct Active<'a> {
 impl Active<'_> {
     /// A text input of `seat` focused on `focus`, whose host is `host`,
     /// enabled with one commit if focused, with nothing else.
-    pub(crate) const fn new(host: u32, seat: u32, focus: Option<u32>) -> Self {
+    pub(crate) const fn new(host: HostId, seat: GuestId, focus: Option<GuestId>) -> Self {
         Self {
             host,
             ext: None,
@@ -82,7 +82,7 @@ impl Active<'_> {
 /// its state would, so its surface and seat must be live. The state must
 /// be one the IME core can reach, which its invariants check: one text
 /// input on the connection is enabled at a time.
-pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
+pub(crate) fn insert(ctx: &mut Context, guest: GuestId, active: Active) {
     let id = active.ext.unwrap_or_else(|| {
         let version = zcr_extended_text_input_v1::VERSION;
         ctx.shadow_table
@@ -90,7 +90,11 @@ pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
     });
     let ext = HostExt {
         id,
-        manager: ctx.host_text_input_extension_v1_id.unwrap_or_default(),
+        // A context without the host's extension names none, as no
+        // request of the test's goes to it.
+        manager: ctx
+            .host_text_input_extension_v1_id
+            .unwrap_or(HostId::for_test(0)),
     };
     let host = HostTi {
         v1: active.host,
@@ -149,7 +153,7 @@ pub(crate) enum Host {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct View {
     /// The guest surface its focus is on, if any.
-    pub(crate) focus: Option<u32>,
+    pub(crate) focus: Option<GuestId>,
     /// Whether the committed field is enabled.
     pub(crate) enabled: bool,
     /// Whether the committed field states its surrounding text.
@@ -165,7 +169,7 @@ pub(crate) struct View {
 }
 
 /// What the proxy holds for text input `guest`.
-pub(crate) fn view(ctx: &Context, guest: u32) -> View {
+pub(crate) fn view(ctx: &Context, guest: GuestId) -> View {
     let t = ctx.ime.get(TiId(guest)).expect("a text input");
     let committed = t.field().map(|(_, committed)| committed);
     View {
@@ -194,6 +198,6 @@ pub(crate) fn view(ctx: &Context, guest: u32) -> View {
 pub(crate) struct Snapshot(TextInput);
 
 /// All the proxy holds for text input `guest`.
-pub(crate) fn snapshot(ctx: &Context, guest: u32) -> Snapshot {
+pub(crate) fn snapshot(ctx: &Context, guest: GuestId) -> Snapshot {
     Snapshot(ctx.ime.get(TiId(guest)).expect("a text input").clone())
 }

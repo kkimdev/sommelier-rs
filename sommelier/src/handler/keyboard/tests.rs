@@ -340,7 +340,7 @@ impl Kb {
     /// send.
     fn leased(&mut self, k: Keyboard) -> bool {
         let keys = &self.s.ctx().keys;
-        keys.backspace_lease(HostId(k.host)).is_some()
+        keys.backspace_lease(HostId::for_test(k.host)).is_some()
     }
 
     /// The host input method confirms its empty composition, and sends
@@ -1382,7 +1382,7 @@ async fn keymap_loads_from_non_rewound_memfd() {
 
     // Reads state no peer can observe: the compiled keymap, which the
     // test's constants name.
-    let keyboard = HostId(kb.k.host);
+    let keyboard = HostId::for_test(kb.k.host);
     let ctx = kb.s.ctx();
     let keymap = ctx.keys.keyboards().keymap_for_test(keyboard).unwrap();
     let state = keymap.state();
@@ -1634,7 +1634,7 @@ async fn each_key_generation_reaches_the_guest_once() {
             // That a key is down shows in no message until a later
             // event of it, which each row would then have to add.
             let keys = &kb.s.ctx().keys;
-            assert_eq!(keys.held(HostId(kb.k.host), key), held, "{case}");
+            assert_eq!(keys.held(HostId::for_test(kb.k.host), key), held, "{case}");
         }
     }
 }
@@ -1936,7 +1936,7 @@ async fn modifiers_carry_over_to_a_new_keymap() {
     let keymap = ctx
         .keys
         .keyboards()
-        .keymap_for_test(HostId(kb.k.host))
+        .keymap_for_test(HostId::for_test(kb.k.host))
         .unwrap();
     assert!(keymap
         .state()
@@ -2614,8 +2614,8 @@ async fn keyboard_release_does_not_cancel_another_keyboard_ime_repeat() {
     // shows only in a confirmation while Backspace is the seat's latest
     // press, which X is.
     let keys = &kb.s.ctx().keys;
-    assert!(keys.held(HostId(other.host), BACKSPACE));
-    assert!(keys.backspace_repeat_cancelled(HostId(other.host)));
+    assert!(keys.held(HostId::for_test(other.host), BACKSPACE));
+    assert!(keys.backspace_repeat_cancelled(HostId::for_test(other.host)));
 }
 
 /// Releasing the keyboard that gave a seat its focus ends the focus of
@@ -3414,8 +3414,9 @@ async fn a_seats_peek_watermarks_end_with_its_focus() {
     let surface = kb.surface;
     // Session::ctx: a watermark reaches no peer until a confirmation.
     let watermark = |kb: &mut Kb| {
-        let seat = kb.seat.id;
-        kb.s.ctx().keys.latest_peek_sequence(seat, Some(surface.id))
+        let seat = GuestId::for_test(kb.seat.id);
+        let surface = GuestId::for_test(surface.id);
+        kb.s.ctx().keys.latest_peek_sequence(seat, Some(surface))
     };
     kb.peek(2, 2, KEY_A, PRESSED).await;
     assert!(watermark(&mut kb).is_some());

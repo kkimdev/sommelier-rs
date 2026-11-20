@@ -18,6 +18,7 @@ limitations under the License.
 //! adapters (`crate::keys::recovery`).
 
 use super::*;
+use crate::wire::Outgoing;
 
 /// The evdev codes of Tab and Enter.
 const KEY_TAB: u32 = 15;
@@ -58,7 +59,7 @@ async fn report(kb: &mut Kb, mut ime: Ime) -> Ime {
 /// tombstone no longer takes Backspace's press.
 #[tokio::test]
 async fn ime_edits_end_a_stale_backspace_repeat() {
-    type Event = fn(Ime) -> Outgoing;
+    type Event = fn(Ime) -> Outgoing<u32>;
     // Each edit, and whether the guest gets a `done` for it, after the
     // preedit it shows, if any.
     type Shows = Option<Option<&'static str>>;
@@ -281,7 +282,7 @@ async fn emptied_preedit_enables_held_backspace_fallback_for_committed_text() {
         );
         // Reads state no peer can observe: the support the guest's
         // committed text gave the field, which the host has.
-        let ti = crate::ime::TiId(ime.id);
+        let ti = crate::ime::TiId(GuestId::for_test(ime.id));
         let state = kb.s.ctx().ime.get_mut(ti).expect("the text input");
         let committed = state.committed_mut_for_test().expect("a focused field");
         assert!(committed.surrounding_text_support);

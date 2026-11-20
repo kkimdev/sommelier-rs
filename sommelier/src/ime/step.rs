@@ -32,7 +32,8 @@ use crate::protocols::text_input_extension_unstable_v1::{
 };
 use crate::protocols::text_input_unstable_v1::{zwp_text_input_manager_v1, zwp_text_input_v1};
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::wire::{IndexedString, Outgoing};
+use crate::state::HostId;
+use crate::wire::{IndexedString, ToGuest, ToHost};
 
 /// The log target of the replayable trace (design 3.3): every input, every
 /// answer of [`Env`] the step reads, and every effect. It carries the
@@ -53,7 +54,7 @@ type Report = ((String, u32, u32), bool);
 /// so each statement is forwarded rather than reconciled.
 struct GuestCommit {
     ti: TiId,
-    surrounding_text: Option<(Outgoing, Report)>,
+    surrounding_text: Option<(ToHost, Report)>,
     cursor_rect: Option<(i32, i32, i32, i32)>,
 }
 
@@ -134,7 +135,7 @@ impl ImeCore {
         ti: TiId,
         seat: SeatId,
         host: HostTi,
-        manager: u32,
+        manager: HostId,
         env: &impl Env,
         fx: &mut Effects,
     ) {
@@ -323,7 +324,7 @@ impl ImeCore {
     /// X2': the guest gets the recovered key's `pair`, then G9c's answer,
     /// if the text input still passes the gate, which the keyboard concern
     /// checked before it recovered the key.
-    fn held_key_recovered(&mut self, ti: TiId, pair: Vec<Outgoing>, fx: &mut Effects) {
+    fn held_key_recovered(&mut self, ti: TiId, pair: Vec<ToGuest>, fx: &mut Effects) {
         let Some(t) = self.inputs.get_mut(&ti).filter(|t| t.is_current()) else {
             log::debug!("Text input {} no longer admits its recovered key", ti.0);
             return;
@@ -341,7 +342,7 @@ impl ImeCore {
         &mut self,
         seat: SeatId,
         surface: Option<SurfaceId>,
-        keyboard: Vec<Outgoing>,
+        keyboard: Vec<ToGuest>,
         fx: &mut Effects,
     ) {
         for (&ti, t) in self.inputs.iter_mut().filter(|(_, t)| t.seat() == seat) {
@@ -370,7 +371,7 @@ impl ImeCore {
 
     /// F4: a press on the surface of a current composition commits it,
     /// resets the host behind a fence, and then re-sends the press.
-    fn press(&mut self, surface: SurfaceId, resend: Outgoing, fx: &mut Effects) {
+    fn press(&mut self, surface: SurfaceId, resend: ToGuest, fx: &mut Effects) {
         for (&ti, t) in &mut self.inputs {
             if t.focused_surface() != Some(surface) {
                 continue;
@@ -488,7 +489,7 @@ impl ImeCore {
                     None => {
                         let barrier = BarrierToken(self.next_barrier);
                         self.next_barrier += 1;
-                        let one_read = request.0.len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
+                        let one_read = request.bytes().len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
                         fx.to_host.push(HostOut::Glued { request, barrier });
                         t.exo_mut().report_sent(barrier, report, one_read, stated);
                     }
@@ -769,13 +770,13 @@ fn log_delete_drop(ti: TiId, index: i32, length: u32, drop: DeleteDrop) {
 struct Traced<'a, E>(&'a E);
 
 impl<E: Env> Env for Traced<'_, E> {
-    fn host_surface(&self, surface: SurfaceId) -> Option<u32> {
+    fn host_surface(&self, surface: SurfaceId) -> Option<HostId> {
         let answer = self.0.host_surface(surface);
         log::trace!(target: TRACE, "env host_surface({}) = {answer:?}", surface.0);
         answer
     }
 
-    fn host_seat(&self, seat: SeatId) -> Option<u32> {
+    fn host_seat(&self, seat: SeatId) -> Option<HostId> {
         let answer = self.0.host_seat(seat);
         log::trace!(target: TRACE, "env host_seat({}) = {answer:?}", seat.0);
         answer

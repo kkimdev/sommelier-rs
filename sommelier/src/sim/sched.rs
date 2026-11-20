@@ -327,7 +327,7 @@ pub(super) struct World<'t> {
     windows: Windows,
     /// Each guest request, with the edits the guest had got when it sent
     /// it.
-    c_to_p: Channel<(Outgoing, u64)>,
+    c_to_p: Channel<(Outgoing<u32>, u64)>,
     /// Each event to the guest, the press it is, if it is one: where the
     /// guest's pointer or finger is on which of its surfaces; and whether
     /// it is a key that reaches no window ([`World::keyboard_gone`]).
@@ -338,7 +338,7 @@ pub(super) struct World<'t> {
     p_to_e: Channel<Vec<(u32, AnyRequest)>>,
     /// Each host event, what engine text it carries, and how many of the
     /// proxy's surrounding texts Exo had got when it sent the event.
-    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>, u64)>,
+    e_to_p: Channel<(Outgoing<u32>, Origin, Option<RegionTruth>, u64)>,
     to_engine: Channel<EngineIn>,
     /// The guest's surrounding texts the proxy sent the host, and those
     /// that reached Exo.
@@ -717,7 +717,7 @@ impl<'t> World<'t> {
     /// and what Exo handed the engine goes to the engine. Exo's events carry
     /// a late answer if `late`, made before the resets this input hands the
     /// engine.
-    fn host_sends(&mut self, events: Vec<Outgoing>, late: bool) {
+    fn host_sends(&mut self, events: Vec<Outgoing<u32>>, late: bool) {
         self.host_sends_of(events, late, (None, None));
     }
 
@@ -725,7 +725,7 @@ impl<'t> World<'t> {
     /// autorepeat of `repeat`.
     fn host_sends_of(
         &mut self,
-        events: Vec<Outgoing>,
+        events: Vec<Outgoing<u32>>,
         late: bool,
         (press, repeat): (Option<Key>, Option<Key>),
     ) {
@@ -775,7 +775,7 @@ impl<'t> World<'t> {
     }
 
     /// The guest sends `requests` at once, on C→P.
-    fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
+    fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing<u32>>) {
         for request in requests {
             let edits = self.edits.got.0;
             self.c_to_p
@@ -786,9 +786,9 @@ impl<'t> World<'t> {
     /// A guest request, sent once the guest had got `edits` edits,
     /// reaches the proxy. A surrounding text sent before the guest got an
     /// edit the proxy has sent crossed it (P4).
-    async fn deliver_guest_request(&mut self, request: Outgoing, edits: u64) {
+    async fn deliver_guest_request(&mut self, request: Outgoing<u32>, edits: u64) {
         let text_input = self.text_input;
-        let decoded = decode(&request.0, &mut VecDeque::new(), |msg| {
+        let decoded = decode(request.bytes(), &mut VecDeque::new(), |msg| {
             match msg.sender_id == text_input {
                 true => zwp_text_input_v3::Request::from_wire(msg),
                 false => Err(crate::wire::ProtocolError::InvalidSender(msg.sender_id)),
@@ -811,7 +811,7 @@ impl<'t> World<'t> {
         }
         // A field's surface the guest destroys (F2).
         let surfaces = self.surfaces.clone();
-        let destroyed = decode(&request.0, &mut VecDeque::new(), |msg| {
+        let destroyed = decode(request.bytes(), &mut VecDeque::new(), |msg| {
             let surface = msg.sender_id;
             match surfaces.field_of_guest(surface) {
                 Some(field) => wl_surface::Request::from_wire(msg).map(|r| (surface, field, r)),
@@ -835,7 +835,7 @@ impl<'t> World<'t> {
     /// report the proxy has sent did not reach in time crossed it.
     async fn deliver_host_event(
         &mut self,
-        event: Outgoing,
+        event: Outgoing<u32>,
         origin: Origin,
         truth: Option<RegionTruth>,
         reports: u64,
@@ -897,7 +897,8 @@ impl<'t> World<'t> {
             let history: Vec<_> = tracker.expected.iter().map(state).collect();
             // The mirror is the proxy's own state, which no peer sees.
             let ime = &self.session.ctx().ime;
-            let Some(mirror) = ime.mirror_differs_for_test(id, &predicted, &history) else {
+            let v1 = crate::state::HostId::for_test(id);
+            let Some(mirror) = ime.mirror_differs_for_test(v1, &predicted, &history) else {
                 continue;
             };
             if self.mirrors.len() < 3 {

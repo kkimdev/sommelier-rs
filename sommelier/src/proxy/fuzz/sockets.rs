@@ -205,7 +205,7 @@ fn send_all(
         then_await,
     } in sends
     {
-        let submission = (bytes, fds);
+        let submission = Outgoing::from_parts(bytes, fds);
         peer.lock().expect("the guest's objects").send(&submission);
         if send(socket, submission).is_err() {
             return;
@@ -218,7 +218,8 @@ fn send_all(
 }
 
 /// Write `bytes` to `socket`, with `fds` on their first byte.
-fn send(socket: &UnixStream, (bytes, fds): Outgoing) -> io::Result<()> {
+fn send(socket: &UnixStream, outgoing: Outgoing<u32>) -> io::Result<()> {
+    let (bytes, fds) = outgoing.into_parts();
     let raw: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
     let rights = [ControlMessage::ScmRights(&raw)];
     let cmsgs: &[ControlMessage] = if raw.is_empty() { &[] } else { &rights };

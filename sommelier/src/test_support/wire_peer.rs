@@ -251,7 +251,8 @@ impl Peer {
     /// complete creates and ends what it does. A message that does not
     /// decode is skipped, and a stream that cannot be framed is not read
     /// further.
-    pub(crate) fn send(&mut self, (bytes, fds): &Outgoing) {
+    pub(crate) fn send(&mut self, outgoing: &Outgoing<u32>) {
+        let (bytes, fds) = (outgoing.bytes(), outgoing.fds());
         self.unsent.extend_from_slice(bytes);
         let fds = fds
             .iter()
@@ -820,17 +821,17 @@ mod tests {
     #[test]
     fn a_peer_learns_from_what_it_sends_in_any_pieces() {
         let mut client = Peer::new(Role::Client);
-        let (mut bytes, _) = wl_display::req::get_registry(WL_DISPLAY_ID, 2);
-        bytes.extend(wl_display::req::sync(WL_DISPLAY_ID, 3).0);
+        let (mut bytes, _) = wl_display::req::get_registry(WL_DISPLAY_ID, 2).into_parts();
+        bytes.extend(wl_display::req::sync(WL_DISPLAY_ID, 3).bytes());
         let (first, rest) = bytes.split_at(5);
-        client.send(&(first.to_vec(), Vec::new()));
+        client.send(&Outgoing::from_parts(first.to_vec(), Vec::new()));
         assert_eq!(client.live(wl_registry::NAME), []);
-        client.send(&(rest.to_vec(), Vec::new()));
+        client.send(&Outgoing::from_parts(rest.to_vec(), Vec::new()));
         assert_eq!(client.live(wl_registry::NAME), [2]);
         assert_eq!(client.live(wl_callback::NAME), [3]);
         // A stream that cannot be framed teaches nothing more.
-        client.send(&(vec![0xff; 8], Vec::new()));
-        client.send(&(wl_display::req::sync(WL_DISPLAY_ID, 4).0, Vec::new()));
+        client.send(&Outgoing::from_parts(vec![0xff; 8], Vec::new()));
+        client.send(&wl_display::req::sync(WL_DISPLAY_ID, 4));
         assert_eq!(client.live(wl_callback::NAME), [3]);
     }
 

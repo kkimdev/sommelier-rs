@@ -19,7 +19,7 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
-use super::HostId;
+use super::{GuestId, HostId};
 
 /// One `wl_keyboard` focus generation.
 ///
@@ -28,27 +28,27 @@ use super::HostId;
 /// after the guest mapping has been retired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyboardFocus {
-    pub guest_seat: u32,
-    pub guest_surface: u32,
-    pub host_surface: u32,
+    pub guest_seat: GuestId,
+    pub guest_surface: GuestId,
+    pub host_surface: HostId,
 }
 
 /// The guest surface each host `wl_pointer` has entered. A
 /// `wl_pointer.button` names no surface, and a press on the surface of a
 /// composition ends it (`handler::text_input::end_composition_on_press`).
 #[derive(Debug, Default)]
-pub struct PointerFocus(BTreeMap<HostId, u32>);
+pub struct PointerFocus(BTreeMap<HostId, GuestId>);
 
 impl PointerFocus {
     /// `pointer` entered guest surface `surface`.
-    pub fn enter(&mut self, pointer: HostId, surface: u32) {
+    pub fn enter(&mut self, pointer: HostId, surface: GuestId) {
         self.0.insert(pointer, surface);
     }
 
     /// `pointer` left guest surface `surface`. A `leave` of a surface it
     /// is not on, which a host can deliver late, changes nothing, as for
     /// a keyboard ([`KeyboardFocusRegistry::leave`]).
-    pub fn leave(&mut self, pointer: HostId, surface: u32) {
+    pub fn leave(&mut self, pointer: HostId, surface: GuestId) {
         if self.surface(pointer) == Some(surface) {
             self.0.remove(&pointer);
         }
@@ -60,17 +60,17 @@ impl PointerFocus {
     }
 
     /// The surface `pointer` is on, if any.
-    pub fn surface(&self, pointer: HostId) -> Option<u32> {
+    pub fn surface(&self, pointer: HostId) -> Option<GuestId> {
         self.0.get(&pointer).copied()
     }
 
     /// Guest surface `surface` ended: no pointer is on it.
-    pub fn forget_surface(&mut self, surface: u32) {
+    pub fn forget_surface(&mut self, surface: GuestId) {
         self.0.retain(|_, &mut entered| entered != surface);
     }
 
     #[cfg(test)]
-    pub(super) fn focuses_for_test(&self) -> impl Iterator<Item = (HostId, u32)> + '_ {
+    pub(super) fn focuses_for_test(&self) -> impl Iterator<Item = (HostId, GuestId)> + '_ {
         self.0.iter().map(|(&pointer, &surface)| (pointer, surface))
     }
 }
@@ -78,9 +78,9 @@ impl PointerFocus {
 /// One authoritative seat focus transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SeatFocusChange {
-    pub guest_seat: u32,
-    pub previous_surface: Option<u32>,
-    pub current_surface: Option<u32>,
+    pub guest_seat: GuestId,
+    pub previous_surface: Option<GuestId>,
+    pub current_surface: Option<GuestId>,
 }
 
 /// Result of mutating keyboard focus ownership.
@@ -110,14 +110,14 @@ pub struct KeyboardFocusRegistry {
     /// enter on the same keyboard supersedes its older generation without a
     /// tombstone because forwarding that delayed leave would clear the newer
     /// resource focus.
-    retired_guest_enters: BTreeMap<(HostId, u32), KeyboardFocus>,
+    retired_guest_enters: BTreeMap<(HostId, HostId), KeyboardFocus>,
 }
 
 impl KeyboardFocusRegistry {
     /// The surface the keyboards of `guest_seat` focus. [`Self::enter`]
     /// retires every other keyboard of the seat on another surface, so
     /// they all focus the same one.
-    pub fn surface_for_seat(&self, guest_seat: u32) -> Option<u32> {
+    pub fn surface_for_seat(&self, guest_seat: GuestId) -> Option<GuestId> {
         let surfaces = || {
             self.keyboards
                 .values()
@@ -136,7 +136,7 @@ impl KeyboardFocusRegistry {
         self.keyboards.get(&host_keyboard).copied()
     }
 
-    pub fn keyboard_owns_surface(&self, host_keyboard: HostId, guest_surface: u32) -> bool {
+    pub fn keyboard_owns_surface(&self, host_keyboard: HostId, guest_surface: GuestId) -> bool {
         self.focus_for_keyboard(host_keyboard)
             .is_some_and(|focus| focus.guest_surface == guest_surface)
     }
@@ -158,9 +158,9 @@ impl KeyboardFocusRegistry {
     pub fn set_for_test(
         &mut self,
         host_keyboard: HostId,
-        guest_seat: u32,
-        guest_surface: u32,
-        host_surface: u32,
+        guest_seat: GuestId,
+        guest_surface: GuestId,
+        host_surface: HostId,
     ) {
         let _ = self.enter(
             host_keyboard,
@@ -203,7 +203,7 @@ impl KeyboardFocusRegistry {
                     .then_some(keyboard)
             })
             .collect::<Vec<_>>();
-        retired_keyboards.sort_unstable_by_key(|keyboard| keyboard.0);
+        retired_keyboards.sort_unstable();
         for keyboard in &retired_keyboards {
             if let Some(retired_focus) = self.keyboards.remove(keyboard) {
                 if *keyboard != host_keyboard {
@@ -232,7 +232,7 @@ impl KeyboardFocusRegistry {
         }
     }
 
-    pub fn leave(&mut self, host_keyboard: HostId, host_surface: u32) -> KeyboardFocusUpdate {
+    pub fn leave(&mut self, host_keyboard: HostId, host_surface: HostId) -> KeyboardFocusUpdate {
         let Some(focus) = self.focus_for_keyboard(host_keyboard) else {
             return if self
                 .retired_guest_enters
@@ -262,7 +262,7 @@ impl KeyboardFocusRegistry {
             .filter(|(_, other)| other.guest_seat == focus.guest_seat)
             .map(|(&keyboard, &other)| (keyboard, other))
             .collect::<Vec<_>>();
-        others.sort_unstable_by_key(|(keyboard, _)| keyboard.0);
+        others.sort_unstable_by_key(|&(keyboard, _)| keyboard);
         for (keyboard, other) in others {
             self.keyboards.remove(&keyboard);
             self.retired_guest_enters
@@ -286,7 +286,7 @@ impl KeyboardFocusRegistry {
         self.remove_keyboard(host_keyboard, focus)
     }
 
-    pub fn destroy_surface(&mut self, guest_surface: u32) -> KeyboardFocusUpdate {
+    pub fn destroy_surface(&mut self, guest_surface: GuestId) -> KeyboardFocusUpdate {
         let mut affected_seats = self
             .keyboards
             .values()
@@ -302,7 +302,7 @@ impl KeyboardFocusRegistry {
                 (focus.guest_surface == guest_surface).then_some(keyboard)
             })
             .collect::<Vec<_>>();
-        retired_keyboards.sort_unstable_by_key(|keyboard| keyboard.0);
+        retired_keyboards.sort_unstable();
         for keyboard in &retired_keyboards {
             self.keyboards.remove(keyboard);
         }

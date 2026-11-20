@@ -141,17 +141,26 @@ always consumed; a configuration problem never stops the proxy) is owned by
   sends itself with a generated encoder, `<interface>::req::<request>` or
   `<interface>::evt::<event>`, which takes the arguments in XML order and
   type, and names protocol values with the generated enum constants.
+  Every ID a message names, the sender's included, is of the one ID
+  space of the peer it goes to: a request built by the proxy names host
+  objects (`HostId`, so a `wire::ToHost`) and an event guest objects
+  (`GuestId`, so a `wire::ToGuest`), and the effect queues and the
+  transport's send queues take only the one for their peer. A guest ID
+  in a request, a host ID in an event, or a message for the wrong peer
+  does not compile.
   `MessageBuilder` is for generated code: `sommelier/clippy.toml` rejects
   `MessageBuilder::new` and `MessageBuilder::with_capacity` everywhere
   else, and its private fields leave no other way to make one. A test module that needs frames no encoder makes,
   such as malformed ones, allows `clippy::disallowed_methods` itself.
   Tests: `encoders_match_hand_built_scalar_messages`,
-  `encoded_messages_decode_to_the_same_arguments`.
+  `encoded_messages_decode_to_the_same_arguments`,
+  `test_generate_typed_encoders`.
 - **Host data is untrusted.** The encoder of a message with a string or an
   array returns a `Result`, because host or guest data can exceed the
   wire's length limit; every other encoder cannot fail. A message the
   proxy builds itself that does not fit is dropped without panicking,
-  usually through `wire::queue_or_drop`, and the session goes on. A
+  usually through `Context::send_host_or_drop` or `send_guest_or_drop`,
+  and the session goes on. A
   forwarded message that does not fit is a `MessageTooLarge` protocol
   error that ends the session instead of truncating the length.
   An encoder takes descriptors as `OwnedFd`s, so a message that cannot be
@@ -307,6 +316,17 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
 
 ## Object lifetimes
 
+- **A guest ID never stands for a host one.** Only the object table
+  (`state::objects`) makes a `GuestId` or a `HostId`: from an ID it
+  allocates, or from a wire value it resolves to an object or to a free
+  ID a message may create one under. A handler gets its sender and its ID
+  arguments as the table resolved them before it ran (`RequestSender`,
+  `EventSender`, `RequestObject`, `EventObject`), and state the proxy
+  keeps for an object is keyed by the type of its side, so code that
+  takes a guest ID for a host one, or the other way round, does not
+  compile.
+  Tests: `test_handlers_get_typed_senders_and_objects`,
+  `requests_resolve_live_objects_of_the_expected_interface`.
 - **Destructors wait for `delete_id`.** A generated destructor request keeps
   its guest/host pairing until the host sends the matching
   `wl_display.delete_id` (`ShadowTable::guest_destroyed`). Meanwhile the

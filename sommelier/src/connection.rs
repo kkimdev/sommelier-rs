@@ -20,6 +20,7 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::VecDeque;
 use std::io::{self, IoSlice};
+use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -75,16 +76,32 @@ pub(crate) const MAX_BYTES_PER_SEND: usize = crate::virtwl_channel::MAX_SEND_SIZ
 /// entry may hold several messages, which a submission then never splits:
 /// the IME glues a surrounding-text report or a `reset` and the
 /// `wl_display.sync` after it into one (`ime::HostOut::Glued`).
-#[derive(Debug, Default)]
-pub(crate) struct OutgoingMessages {
+///
+/// Its messages are all for one peer, whose IDs `I` they carry
+/// ([`Outgoing`]).
+#[derive(Debug)]
+pub(crate) struct OutgoingMessages<I> {
     bytes: Vec<u8>,
     fds: Vec<OwnedFd>,
     /// Where each message ends in `bytes` and in `fds`.
     ends: Vec<(usize, usize)>,
+    ids: PhantomData<I>,
 }
 
-impl OutgoingMessages {
-    pub(crate) fn push(&mut self, (message, fds): Outgoing) {
+impl<I> Default for OutgoingMessages<I> {
+    fn default() -> Self {
+        Self {
+            bytes: Vec::new(),
+            fds: Vec::new(),
+            ends: Vec::new(),
+            ids: PhantomData,
+        }
+    }
+}
+
+impl<I> OutgoingMessages<I> {
+    pub(crate) fn push(&mut self, message: Outgoing<I>) {
+        let (message, fds) = message.into_parts();
         self.bytes.extend_from_slice(&message);
         self.fds.extend(fds);
         self.ends.push((self.bytes.len(), self.fds.len()));
@@ -577,9 +594,9 @@ impl WaylandConnection {
     /// submission carries, which is not sent; the messages before it are.
     /// No Wayland message has that many descriptor arguments. A failed
     /// send drops every message, sent or not.
-    pub(crate) async fn send_messages(
+    pub(crate) async fn send_messages<I>(
         &mut self,
-        messages: &mut OutgoingMessages,
+        messages: &mut OutgoingMessages<I>,
     ) -> io::Result<()> {
         self.send_submissions(messages, LastSubmission::Send).await
     }
@@ -587,9 +604,9 @@ impl WaylandConnection {
     /// Like [`Self::send_messages`], but, for [`LastSubmission::Keep`],
     /// leave the last submission in `messages`, for the messages pushed
     /// later to fill.
-    pub(crate) async fn send_submissions(
+    pub(crate) async fn send_submissions<I>(
         &mut self,
-        messages: &mut OutgoingMessages,
+        messages: &mut OutgoingMessages<I>,
         last: LastSubmission,
     ) -> io::Result<()> {
         let mut sent = (0, 0);
@@ -715,7 +732,7 @@ mod tests {
         WaylandConnection, MAX_BYTES_PER_SEND, MAX_FDS_PER_SEND,
     };
     use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
-    use crate::wire::MessageBuilder;
+    use crate::wire::{MessageBuilder, Outgoing};
     use nix::sys::memfd::{memfd_create, MFdFlags};
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
     use std::ffi::CString;
@@ -748,7 +765,7 @@ mod tests {
                     let mut connection =
                         WaylandConnection::new(socket.into()).expect("register test socket");
                     let mut messages = OutgoingMessages::default();
-                    messages.push((vec![0; 8], Vec::new()));
+                    messages.push(Outgoing::from_parts(vec![0; 8], Vec::new()));
                     connection
                         .send_messages(&mut messages)
                         .await
@@ -782,7 +799,10 @@ mod tests {
             connection.read_buf.clear();
 
             let mut messages = OutgoingMessages::default();
-            messages.push((message.clone(), vec![memfd.try_clone().expect("dup")]));
+            messages.push(Outgoing::from_parts(
+                message.clone(),
+                vec![memfd.try_clone().expect("dup")],
+            ));
             let before = Counts::now();
             connection
                 .send_messages(&mut messages)
@@ -860,7 +880,7 @@ mod tests {
             let fds = (0..fds)
                 .map(|_| memfd.try_clone().expect("dup the memfd"))
                 .collect();
-            messages.push((vec![0; len], fds));
+            messages.push(Outgoing::from_parts(vec![0; len], fds));
         }
         connection
             .send_messages(&mut messages)
@@ -895,7 +915,7 @@ mod tests {
             let fds = (0..fds)
                 .map(|_| memfd.try_clone().expect("dup the memfd"))
                 .collect();
-            (vec![0; len], fds)
+            Outgoing::from_parts(vec![0; len], fds)
         };
 
         // (bytes, descriptors) per message. Each submission starts with a
@@ -955,7 +975,7 @@ mod tests {
             let fds = (0..fds)
                 .map(|_| memfd.try_clone().expect("dup the memfd"))
                 .collect();
-            messages.push((vec![0; len], fds));
+            messages.push(Outgoing::from_parts(vec![0; len], fds));
         }
         connection
             .send_messages(&mut messages)
@@ -994,7 +1014,7 @@ mod tests {
             let fds = (0..fds)
                 .map(|_| memfd.try_clone().expect("dup the memfd"))
                 .collect();
-            messages.push((vec![0; len], fds));
+            messages.push(Outgoing::from_parts(vec![0; len], fds));
         }
         drop(memfd);
         let error = connection

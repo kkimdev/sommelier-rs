@@ -636,7 +636,7 @@ mod tests {
             "AsyncFd receive must wait while the VirtWL context is empty"
         );
 
-        let (sync, _) = wl_display::req::sync(WL_DISPLAY_ID, 2);
+        let (sync, _) = wl_display::req::sync(WL_DISPLAY_ID, 2).into_parts();
         channel
             .send(&sync, &[], &mut transaction)
             .await

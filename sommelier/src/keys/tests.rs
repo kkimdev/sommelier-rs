@@ -19,15 +19,17 @@ limitations under the License.
 use super::*;
 use crate::accelerator::parse_accelerator;
 
-const KEYBOARD: HostId = HostId(100);
-const GUEST_KEYBOARD: u32 = 10;
-const EXTENDED: HostId = HostId(1000);
+const KEYBOARD: HostId = HostId::for_test(100);
+const GUEST_KEYBOARD: GuestId = GuestId::for_test(10);
+/// The guest keyboard of [`OTHER`].
+const OTHER_GUEST_KEYBOARD: GuestId = GuestId::for_test(11);
+const EXTENDED: HostId = HostId::for_test(1000);
 /// Another keyboard of the seat, which focuses no surface.
-const OTHER: HostId = HostId(101);
-const OTHER_EXTENDED: HostId = HostId(1001);
-const SEAT: u32 = 1;
-const SURFACE: u32 = 20;
-const TI: TiId = TiId(40);
+const OTHER: HostId = HostId::for_test(101);
+const OTHER_EXTENDED: HostId = HostId::for_test(1001);
+const SEAT: GuestId = GuestId::for_test(1);
+const SURFACE: GuestId = GuestId::for_test(20);
+const TI: TiId = TiId(GuestId::for_test(40));
 const KEY_Q: u32 = 16;
 const KEY_A: u32 = 30;
 /// Mod1, Alt in the default keymap.
@@ -59,11 +61,11 @@ impl TestEnv {
 }
 
 impl Env for TestEnv {
-    fn seat_focus(&self, seat: u32) -> Option<u32> {
+    fn seat_focus(&self, seat: GuestId) -> Option<GuestId> {
         (seat == SEAT).then_some(SURFACE)
     }
 
-    fn focuses(&self, keyboard: HostId, surface: u32) -> bool {
+    fn focuses(&self, keyboard: HostId, surface: GuestId) -> bool {
         keyboard == KEYBOARD && surface == SURFACE
     }
 
@@ -99,7 +101,7 @@ fn core(accelerators: &str, env: &TestEnv) -> KeyboardCore {
         },
         KeyInput::Created {
             keyboard: OTHER,
-            guest: GUEST_KEYBOARD + 1,
+            guest: OTHER_GUEST_KEYBOARD,
             seat: SEAT,
         },
         KeyInput::ExtendedBound {

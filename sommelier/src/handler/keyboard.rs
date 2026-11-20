@@ -47,10 +47,11 @@ use crate::protocols::AnyEvent;
 use crate::protocols::Iface;
 use crate::state::Singleton;
 use crate::state::{
-    Context, HostId, InternalCallback, KeyboardFocus, KeyboardFocusRegistry, KeyboardModifiers,
+    Context, EventObject, EventSender, GuestId, HostId, InternalCallback, KeyboardFocus,
+    KeyboardFocusRegistry, KeyboardModifiers,
 };
 use crate::warn_once::WarnOnce;
-use crate::wire::{Action, Outgoing};
+use crate::wire::{Action, ToGuest};
 use std::os::fd::BorrowedFd;
 
 /// Whether the proxy warned that the host has no
@@ -96,11 +97,11 @@ impl<'a> CtxEnv<'a> {
 }
 
 impl Env for CtxEnv<'_> {
-    fn seat_focus(&self, seat: u32) -> Option<u32> {
+    fn seat_focus(&self, seat: GuestId) -> Option<GuestId> {
         self.focus.surface_for_seat(seat)
     }
 
-    fn focuses(&self, keyboard: HostId, surface: u32) -> bool {
+    fn focuses(&self, keyboard: HostId, surface: GuestId) -> bool {
         self.focus.keyboard_owns_surface(keyboard, surface)
     }
 
@@ -126,7 +127,7 @@ impl Env for CtxEnv<'_> {
 pub(crate) fn deliver(
     ctx: &mut Context,
     input: KeyInput,
-    resend: impl FnOnce(&Context) -> Option<Outgoing>,
+    resend: impl FnOnce(&Context) -> Option<ToGuest>,
 ) -> Action {
     let mut fx = step(ctx, input);
     let recovered = fx.recovered.is_some();
@@ -136,7 +137,7 @@ pub(crate) fn deliver(
         (false, _) => Action::Drop,
         (true, false) => Action::Forward,
         (true, true) => {
-            ctx.host_to_client_queue.extend(resend(ctx));
+            ctx.send_guest_all(resend(ctx));
             Action::Drop
         }
     };
@@ -179,23 +180,19 @@ fn apply_before(ctx: &mut Context, fx: &mut KeyEffects) {
         queue_internal_sync(ctx, InternalCallback::KeyRecovery);
     }
     if let Some(host_extended_id) = fx.ended {
-        ctx.client_to_host_queue
-            .push(zcr_extended_keyboard_v1::req::destroy(host_extended_id.0));
+        ctx.send_host(zcr_extended_keyboard_v1::req::destroy(host_extended_id));
         // Unregister from the host dispatch table so stale peek_key events
         // (version ≥ 2) sent after destroy cannot be dispatched to a dead
         // object.
-        ctx.retire_destroyed_host_object(host_extended_id.0);
-        log::debug!(
-            "Destroyed extended keyboard: host_extended_id={}",
-            host_extended_id.0
-        );
+        ctx.retire_destroyed_host_object(host_extended_id);
+        log::debug!("Destroyed extended keyboard: host_extended_id={host_extended_id}");
     }
 }
 
 /// What goes after the event's own delivery: guest events, then the IME
 /// core's inputs.
 fn apply_after(ctx: &mut Context, fx: KeyEffects) {
-    ctx.host_to_client_queue.extend(fx.to_guest);
+    ctx.send_guest_all(fx.to_guest);
     for input in fx.ime {
         crate::handler::text_input::ime(ctx, input);
     }
@@ -214,28 +211,28 @@ fn apply_after(ctx: &mut Context, fx: KeyEffects) {
 /// the key may be the very press a waiting recovery waits for.
 pub(crate) fn before_host_event(
     ctx: &mut Context,
-    sender: u32,
-    event: Option<&AnyEvent>,
+    event: Option<(&EventSender, &AnyEvent)>,
     suppressed: bool,
 ) {
     if !ctx.keys.awaits_host_event() {
         return;
     }
     let decoded_by_its_handler = match event {
-        Some(AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. })) if suppressed => {
-            let keyboard = HostId(sender);
+        Some((sender, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }))) if suppressed => {
+            let keyboard = sender.host;
             return keys(ctx, KeyInput::UnhandledKey { keyboard });
         }
-        Some(AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { .. })) if suppressed => {
+        Some((_, AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { .. }))) if suppressed => {
             return keys(ctx, KeyInput::UnhandledModifiers);
         }
-        Some(
+        Some((
+            _,
             AnyEvent::WlKeyboard(
                 wl_keyboard::Event::Key { .. } | wl_keyboard::Event::Modifiers { .. },
             )
             | AnyEvent::ZcrExtendedKeyboardV1(zcr_extended_keyboard_v1::Event::PeekKey { .. })
             | AnyEvent::ZwpTextInputV1(zwp_text_input_v1::Event::Leave {}),
-        ) => !suppressed,
+        )) => !suppressed,
         _ => false,
     };
     if !decoded_by_its_handler {
@@ -269,14 +266,14 @@ fn held_keys(keys: &[u8]) -> Vec<u32> {
 /// `host_keyboard_id`, this function is a no-op.
 ///
 /// This is called from `on_enter` (rather than `wl_seat.get_keyboard`) because
-/// the host keyboard ID (`ctx.last_sender_id` in a host→client event) is only
+/// the host keyboard ID (the sender of a host→client event) is only
 /// known once we process a host event — `get_keyboard` is a client→host request
 /// and at that point we only have the guest keyboard ID. `on_enter` is always
 /// sent by the host before any `wl_keyboard.key` event, so this is safe:
 /// the extended keyboard will be bound before the first key event.
 ///
 /// # Ordering invariant
-/// `get_extended_keyboard` is sent via `client_to_host_queue` and will be
+/// `get_extended_keyboard` is sent with the event's effects and will be
 /// flushed in the same proxy loop iteration as the forwarded `wl_keyboard.enter`
 /// event. Exo enables `SetNeedKeyboardKeyAcks(true)` upon processing
 /// `get_extended_keyboard`. Any key events queued by the compositor *before*
@@ -284,29 +281,23 @@ fn held_keys(keys: &[u8]) -> Vec<u32> {
 /// an active TTL in `pending_key_acks_`; Exo will apply its default policy for
 /// those keys. This mirrors the behavior of the C sommelier reference.
 pub(crate) fn ensure_extended_keyboard_bound(ctx: &mut Context, host_keyboard_id: HostId) {
-    if let Some(extension_host_id) = ctx
-        .singletons
-        .host(Singleton::KeyboardExtension)
-        .map(HostId)
-    {
+    if let Some(extension_host_id) = ctx.singletons.host(Singleton::KeyboardExtension) {
         let bound = ctx
             .keys
             .keyboards()
             .get(host_keyboard_id)
             .map(|k| k.extended.is_some());
         if bound == Some(false) {
-            let Some(extended_version) = ctx.shadow_table.host_object_version(extension_host_id.0)
+            let Some(extended_version) = ctx.shadow_table.host_object_version(extension_host_id)
             else {
                 let _ = ctx.fail(format_args!(
-                    "keyboard extension {} has no version",
-                    extension_host_id.0
+                    "keyboard extension {extension_host_id} has no version"
                 ));
                 return;
             };
-            let host_extended_id = HostId(
-                ctx.shadow_table
-                    .create_host_only(Iface::ZcrExtendedKeyboardV1, extended_version),
-            );
+            let host_extended_id = ctx
+                .shadow_table
+                .create_host_only(Iface::ZcrExtendedKeyboardV1, extended_version);
             let extended = host_extended_id;
             keys(
                 ctx,
@@ -316,16 +307,14 @@ pub(crate) fn ensure_extended_keyboard_bound(ctx: &mut Context, host_keyboard_id
                 },
             );
 
-            ctx.client_to_host_queue
-                .push(zcr_keyboard_extension_v1::req::get_extended_keyboard(
-                    extension_host_id.0,
-                    host_extended_id.0,
-                    host_keyboard_id.0,
-                ));
+            ctx.send_host(zcr_keyboard_extension_v1::req::get_extended_keyboard(
+                extension_host_id,
+                host_extended_id,
+                host_keyboard_id,
+            ));
             log::debug!(
-                "Bound extended keyboard: host_extended_id={} for host_keyboard_id={}",
-                host_extended_id.0,
-                host_keyboard_id.0
+                "Bound extended keyboard: host_extended_id={host_extended_id} for \
+                 host_keyboard_id={host_keyboard_id}"
             );
         }
     }
@@ -356,7 +345,7 @@ fn send_ack_key(ctx: &mut Context, ack: Ack) {
             log::debug!(
                 "ack_key: no extended keyboard bound yet for host_keyboard_id={}; \
                      key event arrived before on_enter? serial={}, handled={}",
-                host_keyboard_id.0,
+                host_keyboard_id,
                 serial,
                 handled
             );
@@ -366,7 +355,7 @@ fn send_ack_key(ctx: &mut Context, ack: Ack) {
                 "ack_key: the host has no zcr_keyboard_extension_v1, so keys go \
                      unacknowledged (host_keyboard_id={}, serial={}, handled={}); \
                      later ones are logged at debug",
-                host_keyboard_id.0,
+                host_keyboard_id,
                 serial,
                 handled
             );
@@ -378,12 +367,11 @@ fn send_ack_key(ctx: &mut Context, ack: Ack) {
     } else {
         zcr_extended_keyboard_v1::HANDLED_STATE_NOT_HANDLED
     };
-    ctx.client_to_host_queue
-        .push(zcr_extended_keyboard_v1::req::ack_key(
-            host_extended_id.0,
-            serial,
-            handled,
-        ));
+    ctx.send_host(zcr_extended_keyboard_v1::req::ack_key(
+        host_extended_id,
+        serial,
+        handled,
+    ));
 }
 
 impl wl_keyboard::WlKeyboardHandler for Handlers {
@@ -399,8 +387,14 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
     /// guest that got their presses, and leave the guest with stuck keys,
     /// and ending a suppression would let the IME hand the accelerator's
     /// key to the guest.
-    fn on_keymap(ctx: &mut Context, format: u32, fd: BorrowedFd<'_>, size: u32) -> Action {
-        let keyboard = HostId::from_event_sender(ctx);
+    fn on_keymap(
+        ctx: &mut Context,
+        sender: EventSender,
+        format: u32,
+        fd: BorrowedFd<'_>,
+        size: u32,
+    ) -> Action {
+        let keyboard = sender.host;
         let keymap = ctx.keys.keymaps().compile(format, fd, size);
         keys(ctx, KeyInput::Keymap { keyboard, keymap });
         Action::Forward
@@ -408,57 +402,38 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
 
     fn on_enter(
         ctx: &mut Context,
+        sender: EventSender,
         serial: u32,
-        surface: u32, // Host ID
+        surface: EventObject,
         keys: &[u8],
     ) -> Action {
-        // on_enter is a host→client event: last_sender_id is the host keyboard ID.
-        let host_keyboard_id = HostId::from_event_sender(ctx);
-        let guest_keyboard_id = ctx
-            .shadow_table
-            .get_guest_id(host_keyboard_id.0)
-            .unwrap_or(0);
-        let guest_surface_id = ctx.shadow_table.get_guest_id(surface).unwrap_or(0);
-
-        // A surface keeps its numeric mapping until the host acknowledges the
-        // forwarded wl_surface.destroy with wl_display.delete_id. A queued
-        // keyboard.enter for that host ID can therefore still be translated,
-        // but it must not resurrect the destroyed surface as IME focus.
-        if guest_surface_id != 0 && ctx.shadow_table.is_pending_destroy_host(surface) {
-            log::debug!(
-                "Ignoring wl_keyboard.enter for pending-destroy surface {}",
-                guest_surface_id
-            );
-            return Action::Drop;
-        }
-        if guest_surface_id == 0 {
-            // Forwarding an enter with an unmapped object argument would turn
-            // a stale host event into a guest protocol error. It must not
-            // mutate the current focus generation or allocate extension
-            // objects for an event that cannot be delivered.
-            log::debug!(
-                "Ignoring wl_keyboard.enter for unknown host surface {}",
-                surface
-            );
-            return Action::Drop;
-        }
+        // The generated dispatcher resolved `surface` to a live guest
+        // surface (`ShadowTable::event_object`): an enter of a surface the
+        // guest destroyed, whose host ID stays mapped until the host's
+        // `delete_id`, never reaches this handler, so it cannot resurrect
+        // the surface as IME focus.
+        let host_keyboard_id = sender.host;
+        let Some(guest_keyboard_id) = sender.guest_id() else {
+            return Action::Forward;
+        };
+        let guest_surface_id = surface.guest;
 
         log::info!(
-            ">>> wl_keyboard.on_enter: host_kb={:?}, guest_kb={}, surface={}, guest_surface={}",
+            ">>> wl_keyboard.on_enter: host_kb={}, guest_kb={}, surface={}, guest_surface={}",
             host_keyboard_id,
             guest_keyboard_id,
-            surface,
+            surface.host,
             guest_surface_id
         );
 
         let Some(guest_seat_id) = ctx.keys.keyboards().seat(host_keyboard_id) else {
-            log::warn!("  -> host keyboard {} has no record", host_keyboard_id.0);
+            log::warn!("  -> host keyboard {host_keyboard_id} has no record");
             return Action::Drop;
         };
         let focus = KeyboardFocus {
             guest_seat: guest_seat_id,
             guest_surface: guest_surface_id,
-            host_surface: surface,
+            host_surface: surface.host,
         };
         if ctx.keyboard_focus.focus_for_keyboard(host_keyboard_id) == Some(focus) {
             // The C reference suppresses an enter when the resource already
@@ -467,7 +442,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
             // the later release unmatched.
             log::debug!(
                 "  -> duplicate enter for keyboard {} surface {}, preserving key state",
-                host_keyboard_id.0,
+                host_keyboard_id,
                 guest_surface_id
             );
             // wl_keyboard.enter is a state notification, not a request that
@@ -530,42 +505,43 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
         Action::Drop
     }
 
-    fn on_leave(ctx: &mut Context, serial: u32, surface: u32) -> Action {
-        // on_leave is a host→client event: last_sender_id is the host keyboard ID.
-        let host_keyboard_id = HostId::from_event_sender(ctx);
-        let guest_keyboard_id = ctx
-            .shadow_table
-            .get_guest_id(host_keyboard_id.0)
-            .unwrap_or(0);
-        let guest_surface_id = ctx.shadow_table.get_guest_id(surface).unwrap_or(0);
-        let surface_can_be_forwarded =
-            guest_surface_id != 0 && !ctx.shadow_table.is_pending_destroy_host(surface);
+    fn on_leave(
+        ctx: &mut Context,
+        sender: EventSender,
+        serial: u32,
+        surface: EventObject,
+    ) -> Action {
+        // The dispatcher resolved `surface` to a live guest surface, as for
+        // `enter`.
+        let host_keyboard_id = sender.host;
+        let Some(guest_keyboard_id) = sender.guest_id() else {
+            return Action::Forward;
+        };
 
         log::info!(
-            ">>> wl_keyboard.on_leave: host_kb={:?}, guest_kb={}, surface={}, guest_surface={}",
+            ">>> wl_keyboard.on_leave: host_kb={}, guest_kb={}, surface={}, guest_surface={}",
             host_keyboard_id,
             guest_keyboard_id,
-            surface,
-            guest_surface_id
+            surface.host,
+            surface.guest
         );
 
-        let focus_update = ctx.keyboard_focus.leave(host_keyboard_id, surface);
+        let focus_update = ctx.keyboard_focus.leave(host_keyboard_id, surface.host);
         if !focus_update.accepted {
             log::debug!(
                 "  -> ignoring stale leave for keyboard {} host surface {}",
-                host_keyboard_id.0,
-                surface
+                host_keyboard_id,
+                surface.host
             );
             return Action::Drop;
         }
         // The IME core sends the leave after the commit of a preedit the
         // focus change ends (F1).
-        let leave = surface_can_be_forwarded
-            .then(|| wl_keyboard::evt::leave(guest_keyboard_id, serial, guest_surface_id));
+        let leave = wl_keyboard::evt::leave(guest_keyboard_id, serial, surface.guest);
         let focus = KeyInput::Focus {
             update: focus_update,
             enter: None,
-            keyboard: leave.into_iter().collect(),
+            keyboard: vec![leave],
         };
         keys(ctx, focus);
         Action::Drop
@@ -573,11 +549,17 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
 
     /// Hand a key to the keyboard core, which decides its `ack_key` and
     /// whether the guest gets it.
-    fn on_key(ctx: &mut Context, serial: u32, time: u32, key: u32, state: u32) -> Action {
-        // on_key is a host→client event: last_sender_id is the host keyboard ID.
-        let keyboard = HostId::from_event_sender(ctx);
+    fn on_key(
+        ctx: &mut Context,
+        sender: EventSender,
+        serial: u32,
+        time: u32,
+        key: u32,
+        state: u32,
+    ) -> Action {
+        let keyboard = sender.host;
         log::trace!(
-            ">>> wl_keyboard.on_key: host_kb={:?}, serial={}, key={}, state={}",
+            ">>> wl_keyboard.on_key: host_kb={}, serial={}, key={}, state={}",
             keyboard,
             serial,
             key,
@@ -589,8 +571,8 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
             key,
             state,
         };
-        let action = deliver(ctx, input, |ctx| {
-            let guest = ctx.shadow_table.get_guest_id(keyboard.0)?;
+        let action = deliver(ctx, input, |_| {
+            let guest = sender.guest_id()?;
             Some(wl_keyboard::evt::key(guest, serial, time, key, state))
         });
         log::debug!("  -> action={:?}", action);
@@ -601,6 +583,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
     /// keysym.
     fn on_modifiers(
         ctx: &mut Context,
+        sender: EventSender,
         serial: u32,
         mods_depressed: u32,
         mods_latched: u32,
@@ -611,7 +594,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
             ">>> wl_keyboard.on_modifiers: serial={}, depressed={:#x}, latched={:#x}, locked={:#x}, group={}",
             serial, mods_depressed, mods_latched, mods_locked, group
         );
-        let keyboard = HostId::from_event_sender(ctx);
+        let keyboard = sender.host;
         let modifiers = KeyboardModifiers {
             depressed: mods_depressed,
             latched: mods_latched,
@@ -622,8 +605,8 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
             keyboard,
             modifiers,
         };
-        deliver(ctx, input, |ctx| {
-            let guest = ctx.shadow_table.get_guest_id(keyboard.0)?;
+        deliver(ctx, input, |_| {
+            let guest = sender.guest_id()?;
             let KeyboardModifiers {
                 depressed,
                 latched,
@@ -639,11 +622,11 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
 
 /// `wl_seat.get_keyboard` of guest seat `seat` created guest keyboard
 /// `keyboard`, whose host keyboard its forward has just mapped: record it.
-pub(crate) fn keyboard_created(ctx: &mut Context, keyboard: u32, seat: u32) {
+pub(crate) fn keyboard_created(ctx: &mut Context, keyboard: GuestId, seat: GuestId) {
     match ctx.shadow_table.get_host_id(keyboard) {
         Some(host) => {
             let created = KeyInput::Created {
-                keyboard: HostId(host),
+                keyboard: host,
                 guest: keyboard,
                 seat,
             };
@@ -678,6 +661,7 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1
 impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler for Handlers {
     fn on_peek_key(
         ctx: &mut Context,
+        sender: EventSender,
         serial: u32,
         time: u32,
         key: u32,
@@ -690,7 +674,7 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             key,
             state
         );
-        let extended = HostId::from_event_sender(ctx);
+        let extended = sender.host;
         let input = KeyInput::Peek {
             extended,
             serial,
@@ -713,7 +697,8 @@ pub(crate) mod for_test {
     /// Record host keyboard `host` of guest keyboard `guest` on guest seat
     /// `seat`, as `wl_seat.get_keyboard` does once its forward paired them.
     pub(crate) fn created(ctx: &mut Context, guest: u32, host: u32, seat: u32) {
-        let keyboard = HostId(host);
+        let keyboard = HostId::for_test(host);
+        let (guest, seat) = (GuestId::for_test(guest), GuestId::for_test(seat));
         keys(
             ctx,
             KeyInput::Created {
@@ -727,14 +712,14 @@ pub(crate) mod for_test {
     /// Bind host keyboard `host`'s extended keyboard `extended`, as its
     /// first enter does.
     pub(crate) fn extended(ctx: &mut Context, host: u32, extended: u32) {
-        let (keyboard, extended) = (HostId(host), HostId(extended));
+        let (keyboard, extended) = (HostId::for_test(host), HostId::for_test(extended));
         keys(ctx, KeyInput::ExtendedBound { keyboard, extended });
     }
 
     /// The `peek_key` of `key` in `state` from extended keyboard
     /// `extended`.
     pub(crate) fn peek(ctx: &mut Context, extended: u32, serial: u32, key: u32, state: u32) {
-        let extended = HostId(extended);
+        let extended = HostId::for_test(extended);
         let time = serial;
         let peek = KeyInput::Peek {
             extended,

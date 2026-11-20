@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use crate::client_kind::WheelClient;
 use crate::protocols::wayland::wl_pointer;
-use crate::state::{Context, HostId};
+use crate::state::{Context, EventObject, EventSender, HostId};
 use crate::wire::Action;
 
 /// The scroll distance of one wheel step, in 24.8 fixed-point surface
@@ -130,8 +130,9 @@ fn restart_steps(ctx: &mut Context, pointer: HostId) {
 impl wl_pointer::WlPointerHandler for Handlers {
     fn on_enter(
         ctx: &mut Context,
+        sender: EventSender,
         _serial: u32,
-        surface: u32,
+        surface: EventObject,
         _surface_x: i32,
         _surface_y: i32,
     ) -> Action {
@@ -139,50 +140,46 @@ impl wl_pointer::WlPointerHandler for Handlers {
         // paired with a live guest surface (`ShadowTable::event_object`):
         // it drops an `enter` or `leave` that names a surface the guest
         // destroyed, whose end already took the pointer off it.
-        if let Some(guest_surface) = ctx.shadow_table.get_guest_id(surface) {
-            ctx.pointer_focus
-                .enter(HostId::from_event_sender(ctx), guest_surface);
-        }
-        restart_steps(ctx, HostId::from_event_sender(ctx));
+        ctx.pointer_focus.enter(sender.host, surface.guest);
+        restart_steps(ctx, sender.host);
         Action::Forward
     }
 
-    fn on_leave(ctx: &mut Context, _serial: u32, surface: u32) -> Action {
+    fn on_leave(
+        ctx: &mut Context,
+        sender: EventSender,
+        _serial: u32,
+        surface: EventObject,
+    ) -> Action {
         // The dispatcher resolved the surface, as for `enter`.
-        if let Some(guest_surface) = ctx.shadow_table.get_guest_id(surface) {
-            ctx.pointer_focus
-                .leave(HostId::from_event_sender(ctx), guest_surface);
-        }
-        restart_steps(ctx, HostId::from_event_sender(ctx));
+        ctx.pointer_focus.leave(sender.host, surface.guest);
+        restart_steps(ctx, sender.host);
         Action::Forward
     }
 
     /// The client's first scroll after its detection answered settles
     /// whether it gets wheel steps ([`WheelClient::settle`]).
-    fn on_axis_source(ctx: &mut Context, axis_source: u32) -> Action {
-        let pointer = HostId::from_event_sender(ctx);
+    fn on_axis_source(ctx: &mut Context, sender: EventSender, axis_source: u32) -> Action {
         let steps = &mut ctx.wheel_steps;
         if steps.client.settle() {
             steps
                 .pointers
-                .entry(pointer)
+                .entry(sender.host)
                 .or_default()
                 .source(axis_source);
         }
         Action::Forward
     }
 
-    fn on_frame(ctx: &mut Context) -> Action {
-        let pointer = HostId::from_event_sender(ctx);
-        if let Some(stepper) = stepper(ctx, pointer) {
+    fn on_frame(ctx: &mut Context, sender: EventSender) -> Action {
+        if let Some(stepper) = stepper(ctx, sender.host) {
             stepper.frame();
         }
         Action::Forward
     }
 
-    fn on_axis_stop(ctx: &mut Context, _time: u32, axis: u32) -> Action {
-        let pointer = HostId::from_event_sender(ctx);
-        if let Some(stepper) = stepper(ctx, pointer) {
+    fn on_axis_stop(ctx: &mut Context, sender: EventSender, _time: u32, axis: u32) -> Action {
+        if let Some(stepper) = stepper(ctx, sender.host) {
             stepper.stop(axis);
         }
         Action::Forward
@@ -192,16 +189,15 @@ impl wl_pointer::WlPointerHandler for Handlers {
     /// a client with [`WheelSteps`] as `axis_discrete`, then the `axis`,
     /// which the protocol says it precedes. A wheel's `axis` comes with
     /// the host's own `axis_discrete`, and passes as it is.
-    fn on_axis(ctx: &mut Context, time: u32, axis: u32, value: i32) -> Action {
-        let pointer = HostId::from_event_sender(ctx);
-        let Some(guest_pointer) = ctx.shadow_table.get_guest_id(pointer.0) else {
+    fn on_axis(ctx: &mut Context, sender: EventSender, time: u32, axis: u32, value: i32) -> Action {
+        let Some(guest_pointer) = sender.guest_id() else {
             return Action::Forward;
         };
-        let Some(steps) = stepper(ctx, pointer).and_then(|stepper| stepper.axis(axis, value))
+        let Some(steps) = stepper(ctx, sender.host).and_then(|stepper| stepper.axis(axis, value))
         else {
             return Action::Forward;
         };
-        ctx.host_to_client_queue.extend([
+        ctx.send_guest_all([
             wl_pointer::evt::axis_discrete(guest_pointer, axis, steps),
             wl_pointer::evt::axis(guest_pointer, time, axis, value),
         ]);
@@ -210,15 +206,20 @@ impl wl_pointer::WlPointerHandler for Handlers {
 
     /// A press on the surface of a composition ends it before the guest
     /// gets the press.
-    fn on_button(ctx: &mut Context, serial: u32, time: u32, button: u32, state: u32) -> Action {
+    fn on_button(
+        ctx: &mut Context,
+        sender: EventSender,
+        serial: u32,
+        time: u32,
+        button: u32,
+        state: u32,
+    ) -> Action {
         if state != wl_pointer::BUTTON_STATE_PRESSED {
             return Action::Forward;
         }
-        let pointer = HostId::from_event_sender(ctx);
-        let (Some(surface), Some(guest_pointer)) = (
-            ctx.pointer_focus.surface(pointer),
-            ctx.shadow_table.get_guest_id(pointer.0),
-        ) else {
+        let (Some(surface), Some(guest_pointer)) =
+            (ctx.pointer_focus.surface(sender.host), sender.guest_id())
+        else {
             return Action::Forward;
         };
         crate::handler::text_input::end_composition_on_press(
@@ -244,7 +245,7 @@ mod tests {
     use crate::protocols::AnyEvent;
     use crate::proxy::harness::{Object, Session};
     use crate::settings::Settings;
-    use crate::state::{ConnectionFacts, Context, HostId};
+    use crate::state::{ConnectionFacts, Context};
     use std::rc::Rc;
 
     /// A pointer's surface is forgotten when the surface ends, and the
@@ -258,8 +259,8 @@ mod tests {
         let pointer = s.pointer_on(seat.id, surface).await;
         // The surface the pointer is on is no state a peer sees.
         assert_eq!(
-            s.ctx().pointer_focus.surface(HostId(pointer.host)),
-            Some(surface.id)
+            s.ctx().pointer_focus.surface(pointer.host_id()),
+            Some(surface.guest_id())
         );
         s.guest([wl_surface::req::destroy(surface.id)]).await;
         let destroy = wl_surface::Request::Destroy {};

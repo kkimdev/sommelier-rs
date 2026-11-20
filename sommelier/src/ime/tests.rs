@@ -36,30 +36,41 @@ use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{self, Event as
 use crate::protocols::wayland::{wl_keyboard, wl_pointer};
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::test_support::decoded;
+use crate::wire::{Outgoing, ToGuest, WireId};
 
-const TI: TiId = TiId(10);
-const TI2: TiId = TiId(11);
-const SEAT: SeatId = SeatId(5);
-const HOST_SEAT: u32 = 105;
-const SURFACE: SurfaceId = SurfaceId(20);
-const HOST_SURFACE: u32 = 120;
-const OTHER: SurfaceId = SurfaceId(21);
-const HOST_OTHER: u32 = 121;
+/// Guest ID `id`.
+const fn g(id: u32) -> GuestId {
+    GuestId::for_test(id)
+}
+
+/// Host ID `id`.
+const fn h(id: u32) -> HostId {
+    HostId::for_test(id)
+}
+
+const TI: TiId = TiId(g(10));
+const TI2: TiId = TiId(g(11));
+const SEAT: SeatId = SeatId(g(5));
+const HOST_SEAT: HostId = h(105);
+const SURFACE: SurfaceId = SurfaceId(g(20));
+const HOST_SURFACE: HostId = h(120);
+const OTHER: SurfaceId = SurfaceId(g(21));
+const HOST_OTHER: HostId = h(121);
 /// The guest pointer whose press [`Ime::press`] re-sends.
-const POINTER: u32 = 40;
+const POINTER: GuestId = g(40);
 /// The guest keyboard of a recovered key.
-const KEYBOARD: u32 = 41;
+const KEYBOARD: GuestId = g(41);
 /// The host `zwp_text_input_manager_v1`; the extension's manager is 3.
-const MANAGER: u32 = 2;
+const MANAGER: HostId = h(2);
 
 /// The host `zwp_text_input_v1` of `ti`.
-fn v1(ti: TiId) -> u32 {
-    200 + ti.0
+fn v1(ti: TiId) -> HostId {
+    h(200 + ti.0.wire())
 }
 
 /// The host `zcr_extended_text_input_v1` of `ti`.
-fn ext_id(ti: TiId) -> u32 {
-    300 + ti.0
+fn ext_id(ti: TiId) -> HostId {
+    h(300 + ti.0.wire())
 }
 
 fn hosts(ti: TiId) -> HostTi {
@@ -67,7 +78,7 @@ fn hosts(ti: TiId) -> HostTi {
         v1: v1(ti),
         ext: HostExt {
             id: ext_id(ti),
-            manager: 3,
+            manager: h(3),
         },
     }
 }
@@ -79,8 +90,8 @@ fn interface(id: u32) -> &'static str {
         3 => "zcr_text_input_extension_v1",
         200..300 => "zwp_text_input_v1",
         300..400 => "zcr_extended_text_input_v1",
-        POINTER => "wl_pointer",
-        KEYBOARD => "wl_keyboard",
+        40 => "wl_pointer",
+        41 => "wl_keyboard",
         _ => "zwp_text_input_v3",
     }
 }
@@ -88,17 +99,17 @@ fn interface(id: u32) -> &'static str {
 /// The facts the core reads, as maps.
 #[derive(Default)]
 struct World {
-    surfaces: BTreeMap<SurfaceId, u32>,
-    seats: BTreeMap<SeatId, u32>,
+    surfaces: BTreeMap<SurfaceId, HostId>,
+    seats: BTreeMap<SeatId, HostId>,
     focus: BTreeMap<SeatId, SurfaceId>,
 }
 
 impl Env for World {
-    fn host_surface(&self, surface: SurfaceId) -> Option<u32> {
+    fn host_surface(&self, surface: SurfaceId) -> Option<HostId> {
         self.surfaces.get(&surface).copied()
     }
 
-    fn host_seat(&self, seat: SeatId) -> Option<u32> {
+    fn host_seat(&self, seat: SeatId) -> Option<HostId> {
         self.seats.get(&seat).copied()
     }
 
@@ -113,7 +124,7 @@ enum Host {
     Req(u32, AnyRequest),
     Barrier(BarrierToken),
     GluedBarrier(BarrierToken),
-    Retire(u32),
+    Retire(HostId),
 }
 
 /// A request to the keyboard concern, decoded.
@@ -160,7 +171,7 @@ impl Out {
     }
 }
 
-fn guest_events(queue: &[Outgoing]) -> Vec<(u32, AnyEvent)> {
+fn guest_events<I>(queue: &[Outgoing<I>]) -> Vec<(u32, AnyEvent)> {
     decoded(queue, |m| AnyEvent::from_wire(interface(m.sender_id), m))
 }
 
@@ -171,7 +182,7 @@ fn decode(fx: Effects) -> Out {
         })
         .try_into()
         .unwrap();
-        Host::Req(id, request)
+        Host::Req(id.wire(), request)
     };
     let host = fx
         .to_host
@@ -355,7 +366,7 @@ impl Ime {
 }
 
 fn v3(ti: TiId, event: V3) -> (u32, AnyEvent) {
-    (ti.0, event.into())
+    (ti.0.wire(), event.into())
 }
 
 fn done(serial: u32) -> (u32, AnyEvent) {
@@ -398,8 +409,8 @@ fn delete(before_length: u32, after_length: u32) -> (u32, AnyEvent) {
     )
 }
 
-fn req(id: u32, request: impl Into<AnyRequest>) -> Host {
-    Host::Req(id, request.into())
+fn req(id: impl WireId, request: impl Into<AnyRequest>) -> Host {
+    Host::Req(id.wire(), request.into())
 }
 
 fn surrounding(ti: TiId, text: &str, cursor: u32) -> Host {
@@ -458,8 +469,8 @@ fn activation(ti: TiId, serial: u32) -> Vec<Host> {
         req(
             v1(ti),
             V1::Activate {
-                seat: HOST_SEAT,
-                surface: HOST_SURFACE,
+                seat: HOST_SEAT.wire(),
+                surface: HOST_SURFACE.wire(),
             },
         ),
         surrounding(ti, "", 0),
@@ -572,8 +583,8 @@ fn count_bumps_only_in_the_commit_arm() {
 
 /// B5 and the core's isolation: one builder of the v3 transaction events
 /// in the crate, and no import from the rest of the proxy but the wire, the
-/// generated protocols, and the size of a host submission, which tells
-/// whether a report and its barrier reach Exo in one read.
+/// generated protocols, the object IDs, and the size of a host submission,
+/// which tells whether a report and its barrier reach Exo in one read.
 #[test]
 fn ime_is_isolated() {
     const BUILDERS: [&str; 4] = [
@@ -604,6 +615,8 @@ fn ime_is_isolated() {
             let path: String = rest[..end].split_whitespace().collect();
             let allowed = path.starts_with("protocols::")
                 || path.starts_with("wire::")
+                || ["state::GuestId", "state::HostId", "state::{GuestId,HostId}"]
+                    .contains(&path.as_str())
                 || path == "connection::MAX_BYTES_PER_SEND";
             assert!(allowed, "{file} uses crate::{path}");
             source = rest;
@@ -669,17 +682,25 @@ fn row_G1_create_makes_the_host_objects_and_enters_the_focus() {
     assert_eq!(
         out.host,
         [
-            req(2, V1Manager::CreateTextInput { id: v1(TI) }),
+            req(2, V1Manager::CreateTextInput { id: v1(TI).wire() }),
             req(
                 3,
                 ExtManager::GetExtendedTextInput {
-                    id: ext_id(TI),
-                    text_input: v1(TI),
+                    id: ext_id(TI).wire(),
+                    text_input: v1(TI).wire(),
                 }
             ),
         ]
     );
-    assert_eq!(out.guest, [v3(TI, V3::Enter { surface: SURFACE.0 })]);
+    assert_eq!(
+        out.guest,
+        [v3(
+            TI,
+            V3::Enter {
+                surface: SURFACE.0.wire()
+            }
+        )]
+    );
 
     // Without a keyboard focus, there is no enter.
     ime.world.focus.clear();
@@ -710,7 +731,12 @@ fn row_G4_a_disable_deactivates_behind_a_barrier() {
     assert_eq!(
         out.host,
         [
-            req(v1(TI), V1::Deactivate { seat: HOST_SEAT }),
+            req(
+                v1(TI),
+                V1::Deactivate {
+                    seat: HOST_SEAT.wire()
+                }
+            ),
             Host::Barrier(barrier),
             surrounding(TI, "", 0),
             cursor_rect(TI, (0, 0, 0, 0)),
@@ -797,7 +823,15 @@ fn row_G9a_an_unfocused_commit_only_counts() {
         surface: Some(SURFACE),
         keyboard: Vec::new(),
     });
-    assert_eq!(out.guest, [v3(TI, V3::Enter { surface: SURFACE.0 })]);
+    assert_eq!(
+        out.guest,
+        [v3(
+            TI,
+            V3::Enter {
+                surface: SURFACE.0.wire()
+            }
+        )]
+    );
     let out = ime.enable(TI);
     assert_eq!(out.host, activation(TI, 3));
     assert_eq!(out.guest, [done(3)]);
@@ -955,7 +989,12 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
         panic!("one drain: {out:?}");
     };
     let mut deactivate = vec![
-        req(v1(TI), V1::Deactivate { seat: HOST_SEAT }),
+        req(
+            v1(TI),
+            V1::Deactivate {
+                seat: HOST_SEAT.wire(),
+            },
+        ),
         Host::Barrier(barrier),
     ];
     deactivate.extend([
@@ -1102,7 +1141,12 @@ fn row_G10_destroy_deactivates_and_destroys_the_extension() {
     assert_eq!(
         out.host,
         [
-            req(v1(TI), V1::Deactivate { seat: HOST_SEAT }),
+            req(
+                v1(TI),
+                V1::Deactivate {
+                    seat: HOST_SEAT.wire()
+                }
+            ),
             Host::Barrier(barrier),
             req(ext_id(TI), Ext::Destroy {}),
             Host::Retire(ext_id(TI)),
@@ -1162,8 +1206,8 @@ fn row_H2_an_exo_detach_commits_the_preedit_and_activates_again() {
     let mut host = vec![req(
         v1(TI),
         V1::Activate {
-            seat: HOST_SEAT,
-            surface: HOST_SURFACE,
+            seat: HOST_SEAT.wire(),
+            surface: HOST_SURFACE.wire(),
         },
     )];
     host.extend(content_type(TI, false));
@@ -1657,7 +1701,7 @@ fn row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery() {
         keep_selection: true,
     });
     let key = |state| wl_keyboard::evt::key(KEYBOARD, 7, 8, 30, state);
-    let recovered = |ime: &mut Ime, pair: Vec<Outgoing>| {
+    let recovered = |ime: &mut Ime, pair: Vec<ToGuest>| {
         let admitted = ime.core.admits_recovery(TI);
         let out = ime.step(Input::HeldKeyRecovered { ti: TI, pair });
         assert!(out.host.is_empty() && out.keys.is_empty());
@@ -1673,7 +1717,7 @@ fn row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery() {
     ime.step(Input::Disable(TI));
     ime.step(Input::Commit(TI));
     assert!(!ime.core.admits_recovery(TI));
-    assert!(!ime.core.admits_recovery(TiId(TI.0 + 1)));
+    assert!(!ime.core.admits_recovery(TiId(g(TI.0.wire() + 1))));
     // The core checks the gate again: a pair behind it reaches no guest.
     let pair = vec![key(1), key(0)];
     let out = ime.step(Input::HeldKeyRecovered { ti: TI, pair });
@@ -1759,8 +1803,8 @@ fn row_W1_a_drained_link_activates_again() {
     let mut host = vec![req(
         v1(TI),
         V1::Activate {
-            seat: HOST_SEAT,
-            surface: HOST_SURFACE,
+            seat: HOST_SEAT.wire(),
+            surface: HOST_SURFACE.wire(),
         },
     )];
     host.extend(content_type(TI, false));
@@ -1807,8 +1851,8 @@ fn row_W1_only_its_own_barrier_ends_a_drain() {
         req(
             v1(TI),
             V1::Activate {
-                seat: HOST_SEAT,
-                surface: HOST_SURFACE,
+                seat: HOST_SEAT.wire(),
+                surface: HOST_SURFACE.wire(),
             },
         )
     );
@@ -1827,8 +1871,18 @@ fn row_F1_a_focus_change_resets_the_field() {
     assert_eq!(
         out.guest,
         [
-            v3(TI, V3::Leave { surface: SURFACE.0 }),
-            v3(TI, V3::Enter { surface: OTHER.0 }),
+            v3(
+                TI,
+                V3::Leave {
+                    surface: SURFACE.0.wire()
+                }
+            ),
+            v3(
+                TI,
+                V3::Enter {
+                    surface: OTHER.0.wire()
+                }
+            ),
         ]
     );
     let [barrier] = out.barriers()[..] else {
@@ -1837,7 +1891,12 @@ fn row_F1_a_focus_change_resets_the_field() {
     assert_eq!(
         out.host,
         [
-            req(v1(TI), V1::Deactivate { seat: HOST_SEAT }),
+            req(
+                v1(TI),
+                V1::Deactivate {
+                    seat: HOST_SEAT.wire()
+                }
+            ),
             Host::Barrier(barrier),
         ]
     );
@@ -1850,9 +1909,17 @@ fn row_F1_a_focus_change_resets_the_field() {
         surface: None,
         keyboard: Vec::new(),
     });
-    assert_eq!(out.guest, [v3(TI, V3::Leave { surface: OTHER.0 })]);
+    assert_eq!(
+        out.guest,
+        [v3(
+            TI,
+            V3::Leave {
+                surface: OTHER.0.wire()
+            }
+        )]
+    );
     let out = ime.step(Input::FocusChanged {
-        seat: SeatId(6),
+        seat: SeatId(g(6)),
         surface: Some(SURFACE),
         keyboard: Vec::new(),
     });
@@ -1878,8 +1945,18 @@ fn row_F1_a_focus_change_commits_the_shown_preedit_before_leave() {
             no_preedit(),
             commit("가"),
             done(1),
-            v3(TI, V3::Leave { surface: SURFACE.0 }),
-            v3(TI, V3::Enter { surface: OTHER.0 }),
+            v3(
+                TI,
+                V3::Leave {
+                    surface: SURFACE.0.wire()
+                }
+            ),
+            v3(
+                TI,
+                V3::Enter {
+                    surface: OTHER.0.wire()
+                }
+            ),
         ]
     );
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
@@ -1897,8 +1974,18 @@ fn row_F1_a_focus_change_commits_the_shown_preedit_before_leave() {
     assert_eq!(
         out.guest,
         [
-            v3(TI, V3::Leave { surface: OTHER.0 }),
-            v3(TI, V3::Enter { surface: SURFACE.0 }),
+            v3(
+                TI,
+                V3::Leave {
+                    surface: OTHER.0.wire()
+                }
+            ),
+            v3(
+                TI,
+                V3::Enter {
+                    surface: SURFACE.0.wire()
+                }
+            ),
         ]
     );
 }
@@ -1912,11 +1999,29 @@ fn row_F2_a_destroyed_surface_is_left_while_it_is_valid() {
     assert_eq!(
         out.guest,
         [
-            v3(TI, V3::Leave { surface: SURFACE.0 }),
-            v3(TI, V3::Enter { surface: OTHER.0 }),
+            v3(
+                TI,
+                V3::Leave {
+                    surface: SURFACE.0.wire()
+                }
+            ),
+            v3(
+                TI,
+                V3::Enter {
+                    surface: OTHER.0.wire()
+                }
+            ),
         ]
     );
-    assert_eq!(out.host[0], req(v1(TI), V1::Deactivate { seat: HOST_SEAT }));
+    assert_eq!(
+        out.host[0],
+        req(
+            v1(TI),
+            V1::Deactivate {
+                seat: HOST_SEAT.wire()
+            }
+        )
+    );
 
     // A preedit the guest shows is not committed into the destroyed
     // surface, unlike at F1.
@@ -1925,7 +2030,15 @@ fn row_F2_a_destroyed_surface_is_left_while_it_is_valid() {
     ime.world.surfaces.remove(&SURFACE);
     ime.world.focus.remove(&SEAT);
     let out = ime.step(Input::SurfaceDestroyed(SURFACE));
-    assert_eq!(out.guest, [v3(TI, V3::Leave { surface: SURFACE.0 })]);
+    assert_eq!(
+        out.guest,
+        [v3(
+            TI,
+            V3::Leave {
+                surface: SURFACE.0.wire()
+            }
+        )]
+    );
     assert_eq!(out.keys, []);
     // The seat's focus change that follows finds the field reset.
     let out = ime.step(Input::FocusChanged {
@@ -1940,7 +2053,15 @@ fn row_F2_a_destroyed_surface_is_left_while_it_is_valid() {
     let mut ime = Ime::enabled();
     let out = ime.step(Input::SurfaceDestroyed(SURFACE));
     assert_eq!(out.guest, []);
-    assert_eq!(out.host[0], req(v1(TI), V1::Deactivate { seat: HOST_SEAT }));
+    assert_eq!(
+        out.host[0],
+        req(
+            v1(TI),
+            V1::Deactivate {
+                seat: HOST_SEAT.wire()
+            }
+        )
+    );
     assert_eq!(ime.step(Input::Commit(TI)).guest, []);
 }
 
@@ -1963,8 +2084,8 @@ fn row_F3_a_bound_seat_carries_the_deferred_activation() {
     let mut host = vec![req(
         v1(TI),
         V1::Activate {
-            seat: HOST_SEAT,
-            surface: HOST_SURFACE,
+            seat: HOST_SEAT.wire(),
+            surface: HOST_SURFACE.wire(),
         },
     )];
     host.extend(content_type(TI, false));
@@ -1989,7 +2110,7 @@ fn row_F4_a_press_commits_the_preedit_then_resends_the_press() {
             no_preedit(),
             commit("가"),
             done(1),
-            (POINTER, button.into())
+            (POINTER.wire(), button.into())
         ]
     );
     let [fence] = out.barriers()[..] else {
@@ -2113,8 +2234,8 @@ fn row_R1_a_dead_seat_abandons_the_link_and_keeps_the_fence() {
     host[0] = req(
         v1(TI),
         V1::Activate {
-            seat: HOST_SEAT,
-            surface: HOST_OTHER,
+            seat: HOST_SEAT.wire(),
+            surface: HOST_OTHER.wire(),
         },
     );
     assert_eq!(ime.enable(TI).host, host);
@@ -2147,7 +2268,7 @@ fn row_R2_an_activation_waits_for_a_live_seat() {
     ime.create(TI);
     ime.enable(TI);
     for _ in 0..2 {
-        let out = ime.step(Input::SeatBound(SeatId(6)));
+        let out = ime.step(Input::SeatBound(SeatId(g(6))));
         assert!(out.host.is_empty());
     }
     assert_eq!(ime.compose("가").guest, []);
