@@ -25,11 +25,11 @@ use crate::protocols::wayland::wl_buffer;
 use crate::settings::{HostTransport, Settings};
 use crate::state::{ConnectionFacts, Context, PostDispatch, SessionEnd};
 use crate::virtwl_channel::VirtWaylandChannel;
+use crate::warn_once::WarnOnce;
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
@@ -210,7 +210,7 @@ enum ParkedFence {
 /// Whether a sync_file has failed to register with the event loop yet.
 /// Only the first failure warns, so a kernel that refuses every one does
 /// not flood the log.
-static FENCE_REGISTRATION_FAILED: AtomicBool = AtomicBool::new(false);
+static FENCE_REGISTRATION_FAILED: WarnOnce = WarnOnce::new();
 
 impl ParkedRequest {
     /// Park a request that waits for the first time.
@@ -232,11 +232,10 @@ impl ParkedRequest {
                 match AsyncFd::with_interest(sync_file, Interest::READABLE) {
                     Ok(sync_file) => ParkedFence::Readable(sync_file),
                     Err(error) => {
-                        if FENCE_REGISTRATION_FAILED.swap(true, Ordering::Relaxed) {
-                            log::debug!("Polling a dma-buf fence that cannot be awaited: {error}");
-                        } else {
-                            log::warn!("Polling a dma-buf fence that cannot be awaited: {error}");
-                        }
+                        log::log!(
+                            FENCE_REGISTRATION_FAILED.level(),
+                            "Polling a dma-buf fence that cannot be awaited: {error}"
+                        );
                         poll_at()
                     }
                 }

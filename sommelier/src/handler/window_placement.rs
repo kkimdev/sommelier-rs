@@ -95,6 +95,7 @@ use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
 use crate::state::{
     Context, GuestId, HostId, InternalCallback, OutputState, Placement, PlacementStep, Point,
 };
+use crate::warn_once::WarnOnce;
 use crate::window_layout::{NormalizedRect, Rect};
 use crate::wire::queue_or_drop;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -119,22 +120,22 @@ const _: () = assert!(
 /// Whether [`warn_if_shell_cannot_place`] has warned. Every client
 /// connection binds the same host shell, so one warning per process says
 /// it all.
-static OLD_SHELL_WARNED: AtomicBool = AtomicBool::new(false);
+static OLD_SHELL: WarnOnce = WarnOnce::new();
 
 /// What this process has seen of Exo's `set_parent` moves. Exo honours
 /// `set_parent` for every window or for none, so one log per process
 /// serves every connection.
 static MOVES: MoveLog = MoveLog::new();
 
-/// Warn, once per `warned` (the process's [`OLD_SHELL_WARNED`], or a
-/// test's own flag), that placement is disabled because the host
-/// `zaura_shell` is older than [`PLACEMENT_SHELL_SINCE`].
+/// Warn, once per `once` (the process's [`OLD_SHELL`], or a test's own),
+/// that placement is disabled because the host `zaura_shell` is older than
+/// [`PLACEMENT_SHELL_SINCE`].
 ///
 /// # Returns
 ///
 /// Whether this call logged the warning.
-fn warn_if_shell_cannot_place(warned: &AtomicBool, shell_version: u32) -> bool {
-    if shell_version >= PLACEMENT_SHELL_SINCE || warned.swap(true, Ordering::Relaxed) {
+fn warn_if_shell_cannot_place(once: &WarnOnce, shell_version: u32) -> bool {
+    if shell_version >= PLACEMENT_SHELL_SINCE || !once.first() {
         return false;
     }
     log::warn!(
@@ -159,14 +160,14 @@ struct MoveLog {
     /// Whether a move has put a window at its target.
     placed: AtomicBool,
     /// Whether an ignored move has been warned about.
-    warned: AtomicBool,
+    warned: WarnOnce,
 }
 
 impl MoveLog {
     const fn new() -> Self {
         Self {
             placed: AtomicBool::new(false),
-            warned: AtomicBool::new(false),
+            warned: WarnOnce::new(),
         }
     }
 
@@ -193,11 +194,7 @@ impl MoveLog {
             );
             return log::Level::Info;
         }
-        let level = if self.warned.swap(true, Ordering::Relaxed) {
-            log::Level::Debug
-        } else {
-            log::Level::Warn
-        };
+        let level = self.warned.level();
         log::log!(
             level,
             "Window placement did not move xdg_toplevel {}: Exo ignored \
@@ -229,7 +226,7 @@ pub(crate) fn shell_bound(ctx: &mut Context, shell_version: u32) {
     for (xdg_toplevel_guest_id, _) in ctx.xdg_roles.toplevels() {
         attach_toplevel(ctx, xdg_toplevel_guest_id);
     }
-    warn_if_shell_cannot_place(&OLD_SHELL_WARNED, shell_version);
+    warn_if_shell_cannot_place(&OLD_SHELL, shell_version);
 }
 
 /// Create the host-only Aura output of a newly bound guest `wl_output`,
@@ -1273,14 +1270,11 @@ mod tests {
     fn an_old_shell_is_reported_once_per_process() {
         // The test's own flag: the process's belongs to the sessions that
         // other tests run in parallel.
-        let warned = AtomicBool::new(false);
-        assert!(!warn_if_shell_cannot_place(&warned, PLACEMENT_SHELL_SINCE));
-        assert!(warn_if_shell_cannot_place(
-            &warned,
-            PLACEMENT_SHELL_SINCE - 1
-        ));
+        let once = WarnOnce::new();
+        assert!(!warn_if_shell_cannot_place(&once, PLACEMENT_SHELL_SINCE));
+        assert!(warn_if_shell_cannot_place(&once, PLACEMENT_SHELL_SINCE - 1));
         assert!(!warn_if_shell_cannot_place(
-            &warned,
+            &once,
             PLACEMENT_SHELL_SINCE - 1
         ));
     }
@@ -1362,7 +1356,7 @@ mod tests {
         let moves = MoveLog::new();
         moves.placed();
         assert_eq!(moves.ignored(1, (5, 0)), Info);
-        assert!(!moves.warned.load(Ordering::Relaxed));
+        assert!(!moves.warned.logged());
     }
 
     // ── The placement on the wire ─────────────────────────────────────────

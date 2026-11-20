@@ -43,10 +43,10 @@ use crate::state::{
     Context, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyAdmission, KeyboardFocus,
     KeyboardModifiers, PeekInput,
 };
+use crate::warn_once::WarnOnce;
 use crate::window_layout::NormalizedRect;
 use crate::wire::Action;
 use std::os::fd::{AsRawFd, BorrowedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use xkbcommon::xkb;
 
 /// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
@@ -62,17 +62,14 @@ const MAX_KEYMAP_SIZE: u32 = 1 << 20;
 /// `zcr_keyboard_extension_v1` to acknowledge keys through. Such a host
 /// sends every key so, to every client, so one warning per process says
 /// it all.
-static NO_KEYBOARD_EXTENSION_WARNED: AtomicBool = AtomicBool::new(false);
+static NO_KEYBOARD_EXTENSION_WARNED: WarnOnce = WarnOnce::new();
 
 /// The level to log a key at that the host's missing
 /// `zcr_keyboard_extension_v1` leaves unacknowledged: a warning the first
-/// time in the process, which this call records, and debug after.
-fn take_no_keyboard_extension_log_level() -> log::Level {
-    if NO_KEYBOARD_EXTENSION_WARNED.swap(true, Ordering::Relaxed) {
-        log::Level::Debug
-    } else {
-        log::Level::Warn
-    }
+/// time for `once` (the process's [`NO_KEYBOARD_EXTENSION_WARNED`], or a
+/// test's own), which this call records, and debug after.
+fn take_no_keyboard_extension_log_level(once: &WarnOnce) -> log::Level {
+    once.level()
 }
 
 /// Who owns a key, decided from its chord (see `KeyboardHandler::classify_key`).
@@ -452,7 +449,7 @@ impl KeyboardHandler {
                 );
             } else {
                 log::log!(
-                    take_no_keyboard_extension_log_level(),
+                    take_no_keyboard_extension_log_level(&NO_KEYBOARD_EXTENSION_WARNED),
                     "ack_key: the host has no zcr_keyboard_extension_v1, so keys go \
                      unacknowledged (host_keyboard_id={}, serial={}, handled={}); \
                      later ones are logged at debug",
@@ -2800,13 +2797,16 @@ mod tests {
                 p.ctx.host_keyboard_extension_id = Some(HostId(500));
                 p.key(KEYBOARD, 1, 1, KEY_A, PRESSED);
                 assert!(p.ctx.client_to_host_queue.is_empty());
-                assert!(!NO_KEYBOARD_EXTENSION_WARNED.load(Ordering::Relaxed));
+                assert!(!NO_KEYBOARD_EXTENSION_WARNED.logged());
 
                 p.ctx.host_keyboard_extension_id = None;
                 p.key(KEYBOARD, 2, 2, KEY_A, RELEASED);
                 assert!(p.ctx.client_to_host_queue.is_empty());
-                assert!(NO_KEYBOARD_EXTENSION_WARNED.load(Ordering::Relaxed));
-                assert_eq!(take_no_keyboard_extension_log_level(), log::Level::Debug);
+                assert!(NO_KEYBOARD_EXTENSION_WARNED.logged());
+                assert_eq!(
+                    take_no_keyboard_extension_log_level(&NO_KEYBOARD_EXTENSION_WARNED),
+                    log::Level::Debug
+                );
             },
         );
     }
