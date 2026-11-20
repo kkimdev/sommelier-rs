@@ -8,9 +8,10 @@ Two kinds of reference are checked, outside third_party/:
   its anchor a heading of the Markdown file it names, as GitHub derives
   heading anchors.
 - A quoted rule title, `INVARIANTS "Title"` or `IME.md "Title"` (with a
-  section name, a comma or a colon allowed between), in any tracked text
-  file, code comments included, must be the start of a rule title (the
-  bold lead of a bullet) or a section heading of that document. A
+  section name, a comma or a colon allowed between; `2.6 "Title"` names
+  an IME.md rule too), in any tracked text file, code comments included,
+  must be a rule title (the bold lead of a bullet) or a section heading
+  of that document. A
   trailing "..." or "…" marks a shortened title. A quote must name the
   rule's owner: an INVARIANTS bullet that only points to an IME rule
   (its body links to IME.md) is not cited, and each such pointer's title
@@ -25,7 +26,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DOCS = {"INVARIANTS": "docs/INVARIANTS.md", "IME.md": "docs/IME.md"}
+DOCS = {"INVARIANTS": "docs/INVARIANTS.md", "IME.md": "docs/IME.md", "2.6": "docs/IME.md"}
 TEXT_FILES = ("*.md", "*.rs", "*.toml", "*.py", "*.nix", "*.yaml", "*.sh")
 FENCE = re.compile(r"^ {0,3}(```|~~~).*?^ {0,3}\1", re.MULTILINE | re.DOTALL)
 CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)+?\1", re.DOTALL)
@@ -35,7 +36,7 @@ RULE = re.compile(r"^[ \t]*- \*\*([^*]+?)\*\*", re.MULTILINE)
 # A document's name, then at most a section name, then the quote of a
 # title, which starts with a capital or a code span.
 QUOTE = re.compile(
-    r"\b(?:docs/)?(INVARIANTS|IME\.md)(?:\.md)?[\w ,:]{0,30}?\\?\"([A-Z`][^\"]*?)\\?\""
+    r"\b(?:docs/)?(INVARIANTS|IME\.md|2\.6)(?:\.md)?[\w ,:]{0,30}?\\?\"([A-Z`][^\"]*?)\\?\""
 )
 # Comment leaders a quote can run across.
 CONTINUATION = re.compile(r"[ \t]*\n[ \t]*(?://[/!]?|#)?[ \t]*")

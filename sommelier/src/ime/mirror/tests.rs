@@ -267,7 +267,7 @@ fn update_with_no_match_resets_and_drops_the_composition() {
     assert_eq!(mirror.health(), Health::Exact);
 }
 
-/// M3's induction: from states that fit, every STT function leaves a
+/// By induction, from states that fit, every STT function leaves a
 /// state that fits the text, on char boundaries, so no range ever
 /// leaves the text and the offset stays 0. The echo checks keep the
 /// wire's ranges in the text.

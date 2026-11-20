@@ -88,7 +88,7 @@ pub(super) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
 }
 
 /// The requests that make `link` equal `target`, and no others: a content
-/// type the host would drop or already has is not sent (INVARIANTS "The
+/// type the host would drop or already has is not sent (IME.md "The
 /// host gets each content type once it can apply it, and only then"). A
 /// draining link waits for its barrier. Pure, and idempotent once its
 /// steps are applied.
@@ -119,7 +119,7 @@ pub(super) fn reconcile(target: &HostTarget, link: &LinkState) -> HostSteps {
 }
 
 /// The host requests that set `content_type` on host extended text input
-/// `ext`, with its surrounding-text support (INVARIANTS "`set_input_type`
+/// `ext`, with its surrounding-text support (IME.md "`set_input_type`
 /// replaces v1 `set_content_type`"). Exo applies the pending support to
 /// the next content type and then resets it, so it goes first.
 pub(super) fn content_type_requests(ext: HostId, content_type: HostContentType) -> [ToHost; 2] {

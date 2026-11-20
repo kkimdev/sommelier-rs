@@ -464,7 +464,7 @@ impl ImeCore {
             .is_some_and(state::TextInput::is_current)
     }
 
-    /// Check the invariants of design 3.1 (I1a to I3) that hold between
+    /// Check the invariants of IME.md 3.1 (I1a to I3) that hold between
     /// steps, and that every pending barrier is one the core numbered,
     /// once. I5 is the adapter's. Test-only, so that a panicking check
     /// cannot be wired into production.

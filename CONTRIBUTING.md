@@ -34,10 +34,11 @@ Tests run in parallel, so a test must not assume which descriptor
 numbers or global state another test leaves alone; see
 [Testing](docs/DESIGN.md#testing).
 
-- Read [docs/INVARIANTS.md](docs/INVARIANTS.md) before changing transport,
-  object lifetimes, SHM or dma-buf, keyboard and IME, or application-ID
-  code. Keep every rule there, or change the rule and its tests in the same
-  pull request. [docs/DESIGN.md](docs/DESIGN.md) explains the structure.
+- Read [docs/INVARIANTS.md](docs/INVARIANTS.md), and section 2 of
+  [docs/IME.md](docs/IME.md#2-behavioural-specification) for IME code,
+  before changing the code they cover. Keep every rule, or change the
+  rule and its tests in the same pull request.
+  [docs/DESIGN.md](docs/DESIGN.md) explains the structure.
 - Every behavior change needs a regression test that fails before the
   change and passes after it.
 - State each documentation fact once and link to it elsewhere: the README
@@ -122,10 +123,13 @@ assert_eq!(
   which are private to it.
 - Use `MessageBuilder` only for frames no encoder builds, such as
   malformed ones.
-- The documentation cites tests by name in "Test:" and "Tests:" clauses.
+- The documentation cites tests by name in "Test:" and "Tests:" clauses,
+  and a rule cites at most three, the ones that fail when it breaks.
   `scripts/check-cited-tests.py` checks, in every tracked Markdown file
   outside `third_party/`, that each names one test, and not a test of a
-  DST model, which pins the model rather than the proxy.
+  DST model, which pins the model rather than the proxy;
+  `scripts/check-doc-links.py` checks the links, their anchors and the
+  quoted rule titles.
 
 ## Randomized tests
 

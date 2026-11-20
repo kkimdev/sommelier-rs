@@ -32,7 +32,7 @@ limitations under the License.
 //! three outcomes for a key in flight:
 //! - before the key's text: the text arrives after the reset, made from the
 //!   composition before it, and goes out with the callback, late (the
-//!   window INVARIANTS "A press ends the composition on its surface"
+//!   window IME.md "A press ends the composition on its surface"
 //!   says the press fence cannot close);
 //! - between the text and the callback: the reset clears the buffer, and
 //!   the key goes out handled, with no text;

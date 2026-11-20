@@ -73,7 +73,7 @@ impl Env for CtxEnv<'_> {
 }
 
 /// Hand `input` to the IME core and apply its effects where the message
-/// is handled (design 3.3): the guest events, the host requests and
+/// is handled (IME.md 3.3): the guest events, the host requests and
 /// barriers, then what it asks of the keyboard concern.
 ///
 /// # Returns
@@ -228,7 +228,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for Handlers {
     }
 
     /// H9. Exo counts `index` from the start of the surrounding text,
-    /// against the v1 XML (docs/INVARIANTS.md, "Exo's deletes are absolute
+    /// against the v1 XML (docs/IME.md, "Exo's deletes are absolute
     /// and stand alone").
     fn on_delete_surrounding_text(
         ctx: &mut Context,

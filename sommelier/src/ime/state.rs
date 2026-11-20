@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The state of one text input (design 3.1). Its fields are private to
+//! The state of one text input (IME.md 3.1). Its fields are private to
 //! this file: every change is a named method, and a host composition event
 //! or a press can change what the guest is shown only through
 //! [`Current`], which only [`TextInput::current`] makes.
@@ -108,7 +108,7 @@ struct FocusedField {
     committed: V3Committed,
 }
 
-/// What the host text input has applied, by Exo's rules (INVARIANTS "The
+/// What the host text input has applied, by Exo's rules (IME.md "The
 /// host gets each content type once it can apply it, and only then").
 /// Only the transitions of [`TextInput`] change it, and only
 /// [`TextInput::leave_attached`] leaves `Attached`.
@@ -486,7 +486,7 @@ impl TextInput {
         drain.into_iter().chain(self.fence)
     }
 
-    /// I1a, I1b and I2 of design 3.1, and that an unfocused text input has
+    /// I1a, I1b and I2 of IME.md 3.1, and that an unfocused text input has
     /// nothing pending. Test-only; see `ImeCore::assert_invariants`.
     #[cfg(test)]
     pub(super) fn assert_invariants(&self, ti: TiId, env: &impl Env) {

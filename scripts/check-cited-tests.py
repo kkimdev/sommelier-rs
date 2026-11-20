@@ -11,6 +11,10 @@ the only test of that name, and not a test of the DST's models or harness
 in sommelier/src/sim/, which pins those rather than the proxy; the DST's
 runs and its regressions may be cited.
 
+A rule cites at most three tests, the ones that fail when it breaks: a
+clause of docs/INVARIANTS.md, or of the rules in section 2.6 of
+docs/IME.md, names at most three.
+
 A "Trace:" or "Traces:" clause cites recorded host traces the same way:
 every backticked name in it must be a tracked file in traces/, which the
 replay test of the corpus replays.
@@ -46,6 +50,12 @@ DST = {
     "every_regression_passes_the_oracle",
 }
 PARAGRAPH_END = re.compile(r"\n\s*(?:\n|- )")
+# Where a clause cites the pins of a rule, which may be at most three.
+RULES = {
+    "docs/INVARIANTS.md": (None, None),
+    "docs/IME.md": ("\n### 2.6 Rules\n", "\n## 3. "),
+}
+MAX_PINS = 3
 
 
 def clause_names(text: str, start: int) -> list[str]:
@@ -85,6 +95,19 @@ def cited_names(doc: pathlib.Path, clause: re.Pattern = CLAUSE) -> list[str]:
     ]
 
 
+def overlong_rule_clauses(doc: pathlib.Path) -> list[list[str]]:
+    """The clauses of a document's rules that name too many tests."""
+    relative = doc.relative_to(ROOT).as_posix()
+    if relative not in RULES:
+        return []
+    text = doc.read_text(encoding="utf-8")
+    start, end = RULES[relative]
+    if start is not None:
+        text = text[text.index(start) : text.index(end, text.index(start))]
+    clauses = (clause_names(text, found.end()) for found in CLAUSE.finditer(text))
+    return [names for names in clauses if len(names) > MAX_PINS]
+
+
 def tracked(*pathspecs: str) -> list[pathlib.Path]:
     files = subprocess.run(
         ["git", "ls-files", "-z", "--", *pathspecs],
@@ -117,6 +140,9 @@ def main() -> int:
             if TRACES + name not in traces or not name.endswith(".trace"):
                 print(f"{relative} cites `{name}`, which is no trace in {TRACES}")
                 failed = True
+        for names in overlong_rule_clauses(doc):
+            print(f"{relative} pins a rule with {len(names)} tests, more than {MAX_PINS}: {names[0]}, ...")
+            failed = True
         for name in cited_names(doc):
             total += 1
             if not NAME.fullmatch(name):
