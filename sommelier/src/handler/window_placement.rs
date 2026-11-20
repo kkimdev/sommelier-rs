@@ -853,6 +853,7 @@ mod fixture {
     use crate::protocols::wayland::{wl_keyboard, wl_output, wl_registry};
     use crate::protocols::xdg_shell::xdg_toplevel;
     use crate::protocols::xdg_shell::xdg_wm_base;
+    use crate::protocols::Iface;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
     use crate::state::OutputState;
@@ -923,9 +924,9 @@ mod fixture {
 
     /// Each message of `queue`, decoded as the interface `interface_of` its
     /// sender has. Panics if a message leaves a descriptor unread.
-    pub(super) fn decode_queue<'a, M>(
+    pub(super) fn decode_queue<M>(
         queue: &[Outgoing],
-        interface_of: impl Fn(u32) -> Option<&'a str>,
+        interface_of: impl Fn(u32) -> Option<Iface>,
         from_wire: fn(&str, &mut crate::wire::WireMessage) -> Result<M, crate::wire::ProtocolError>,
     ) -> Vec<(u32, M)> {
         queue
@@ -936,7 +937,7 @@ mod fixture {
                     .iter()
                     .map(|fd| fd.try_clone().expect("duplicate a queued descriptor"))
                     .collect();
-                let decoded = decode(message, &mut fds, |msg| from_wire(interface, msg))
+                let decoded = decode(message, &mut fds, |msg| from_wire(interface.name(), msg))
                     .expect("a whole message");
                 assert!(
                     fds.is_empty(),
@@ -952,7 +953,7 @@ mod fixture {
         let table = &ctx.shadow_table;
         // The fixtures do not pair the display.
         let interface_of = |id| match id {
-            WL_DISPLAY_ID => Some("wl_display"),
+            WL_DISPLAY_ID => Some(Iface::WlDisplay),
             id => table.get_host_interface(id),
         };
         decode_queue(

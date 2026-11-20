@@ -19,7 +19,8 @@ use crate::handler::compositor::native_wayland_app_id;
 use crate::handler::Handlers;
 use crate::protocols::aura_shell::zaura_surface;
 use crate::protocols::gtk::gtk_shell1::{self, GtkShell1Handler};
-use crate::protocols::gtk::gtk_surface1::{self, GtkSurface1Handler};
+use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
+use crate::protocols::Iface;
 use crate::state::{Context, GtkSurfaceState};
 use crate::wire::{queue_or_drop, Action};
 
@@ -72,7 +73,7 @@ impl GtkShell1Handler for Handlers {
             return ctx.fail(format_args!("gtk_shell1 {shell_id} has no version"));
         };
         ctx.shadow_table
-            .create_local(gtk_surface_id, gtk_surface1::NAME, version);
+            .create_local(gtk_surface_id, Iface::GtkSurface1, version);
         ctx.gtk_surfaces.insert(
             gtk_surface_id,
             GtkSurfaceState {
@@ -171,7 +172,8 @@ mod tests {
 
     /// Give `ctx` the gtk_shell1 [`GTK_SHELL`].
     fn add_gtk_shell(ctx: &mut Context) {
-        ctx.shadow_table.create_local(GTK_SHELL, "gtk_shell1", 1);
+        ctx.shadow_table
+            .create_local(GTK_SHELL, Iface::GtkShell1, 1);
         ctx.gtk_shells.insert(GTK_SHELL, GtkShellState::default());
     }
 

@@ -242,12 +242,15 @@ mod tests {
     use crate::handler::Handlers;
     use crate::protocols::wayland::wl_buffer;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
+    use crate::protocols::Iface;
     use crate::state::{Context, HostId};
     use crate::test_support::{queued_headers, register_test_buffer, BufferKind, BUFFER_KINDS};
     use crate::wire::Action;
 
     fn register_test_server_native(ctx: &mut Context, host_id: u32) -> u32 {
-        let guest_id = ctx.shadow_table.adopt_host_created(host_id, "wl_buffer", 1);
+        let guest_id = ctx
+            .shadow_table
+            .adopt_host_created(host_id, Iface::WlBuffer, 1);
         assert!(ctx.register_native_buffer(host_id, (1, 1), Vec::new()));
         guest_id
     }

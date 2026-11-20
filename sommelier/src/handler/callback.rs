@@ -17,6 +17,7 @@ limitations under the License.
 use crate::handler::Handlers;
 use crate::protocols::wayland::wl_callback::{self, WlCallbackHandler};
 use crate::protocols::wayland::wl_display;
+use crate::protocols::Iface;
 use crate::state::{Context, HostId, InternalCallback};
 use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
 use log::debug;
@@ -39,7 +40,7 @@ pub(crate) fn queue_internal_sync(ctx: &mut Context, waits_for: InternalCallback
 pub(crate) fn internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> (HostId, Outgoing) {
     let callback = HostId(
         ctx.shadow_table
-            .create_host_only(wl_callback::NAME, wl_callback::VERSION),
+            .create_host_only(Iface::WlCallback, wl_callback::VERSION),
     );
     ctx.internal_callbacks.register(callback, waits_for);
     (callback, wl_display::req::sync(WL_DISPLAY_ID, callback.0))
@@ -107,6 +108,7 @@ mod tests {
     use crate::handler::Handlers;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
+    use crate::protocols::Iface;
     use crate::state::{Context, HostId, InternalCallback};
     use crate::wire::Action;
 
@@ -133,7 +135,7 @@ mod tests {
         assert_eq!(ctx.internal_callbacks.get(callback), Some(waits_for));
         assert_eq!(
             ctx.shadow_table.get_host_interface(callback.0),
-            Some("wl_callback")
+            Some(Iface::WlCallback)
         );
     }
 

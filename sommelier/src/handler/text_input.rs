@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::handler::Handlers;
+use crate::protocols::Iface;
 use crate::warn_once::WarnOnce;
 
 use crate::handler::callback::{internal_sync, queue_internal_sync};
@@ -28,7 +29,6 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::protocols::wayland::wl_seat;
 use crate::state::{Context, InternalCallback, KeyboardFocusRegistry, Link, ShadowTable};
 use crate::wire::{Action, IndexedString, Outgoing};
 
@@ -354,7 +354,7 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for Handlers {
             // object: one that has no input method.
             warn_no_input_method(&NO_INPUT_METHOD_WARNED);
             ctx.shadow_table
-                .create_local(id, zwp_text_input_v3::NAME, guest_manager_version);
+                .create_local(id, Iface::ZwpTextInputV3, guest_manager_version);
             return Action::Drop;
         };
         let versions = [host_manager_id, host_ext_manager_id]
@@ -367,14 +367,14 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for Handlers {
         };
         let host_v1_id = ctx.shadow_table.create_bridged(
             id,
-            zwp_text_input_v3::NAME,
+            Iface::ZwpTextInputV3,
             guest_manager_version,
-            zwp_text_input_v1::NAME,
+            Iface::ZwpTextInputV1,
             host_manager_version,
         );
         let host_ext_id = ctx
             .shadow_table
-            .create_host_only(zcr_extended_text_input_v1::NAME, host_ext_version);
+            .create_host_only(Iface::ZcrExtendedTextInputV1, host_ext_version);
         let create = Input::Create {
             ti: TiId(id),
             seat: SeatId(seat),
@@ -454,7 +454,7 @@ fn warn_no_input_method(warned: &WarnOnce) -> bool {
 /// seat awaiting its `delete_id` carries nothing either, and neither does
 /// an ID with no host object (ID 0 is a protocol error).
 fn live_host_seat(table: &ShadowTable, guest_seat: u32) -> Option<u32> {
-    let seat = table.request_object(guest_seat, wl_seat::NAME)?;
+    let seat = table.request_object(guest_seat, Iface::WlSeat)?;
     match seat {
         Link::Host(host_seat) => Some(host_seat),
         // The proxy implements no wl_seat itself.

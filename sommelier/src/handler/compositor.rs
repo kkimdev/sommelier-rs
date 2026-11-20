@@ -1024,6 +1024,7 @@ mod tests {
     use crate::protocols::wayland::wl_surface::{REQ_COMMIT, REQ_DAMAGE};
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::AnyRequest;
+    use crate::protocols::Iface;
     use crate::proxy::harness::Session;
     use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
     use crate::test_support::text_input::{self, Host};
@@ -1038,7 +1039,7 @@ mod tests {
     /// removal) reaches the host with no output, as if the guest named none.
     #[test]
     fn set_fullscreen_on_an_inert_output_is_forwarded_without_an_output() {
-        use crate::protocols::xdg_shell::xdg_toplevel::{dispatch_request, REQ_SET_FULLSCREEN};
+        use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_FULLSCREEN;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let (toplevel_guest, toplevel_host, inert_output) = (400, 500, 10);
         ctx.shadow_table.insert_paired_with_version_for_test(
@@ -1047,13 +1048,14 @@ mod tests {
             "xdg_toplevel",
             3,
         );
-        ctx.shadow_table.create_local(inert_output, "wl_output", 3);
+        ctx.shadow_table
+            .create_local(inert_output, Iface::WlOutput, 3);
 
         ctx.last_sender_id = toplevel_guest;
         let payload = inert_output.to_ne_bytes();
         let mut request =
             crate::wire::WireMessage::new(toplevel_guest, REQ_SET_FULLSCREEN, &payload);
-        let forwarded = dispatch_request::<Handlers>(&mut request, &mut ctx)
+        let forwarded = crate::test_support::dispatch_request(&mut ctx, &mut request)
             .expect("valid request")
             .expect("forwarded");
         assert_eq!(
@@ -1094,7 +1096,7 @@ mod tests {
     /// host's `delete_id`.
     #[test]
     fn surface_events_naming_a_released_output_never_reach_the_handlers() {
-        use crate::protocols::wayland::wl_surface::{dispatch_event, EVT_ENTER, EVT_LEAVE};
+        use crate::protocols::wayland::wl_surface::{EVT_ENTER, EVT_LEAVE};
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let (surface_guest, surface_host, output_guest, output_host) = (100, 200, 10, 20);
         ctx.shadow_table.insert_paired_with_version_for_test(
@@ -1115,7 +1117,7 @@ mod tests {
         let payload = output_host.to_ne_bytes();
         for opcode in [EVT_ENTER, EVT_LEAVE] {
             let mut event = crate::wire::WireMessage::new(surface_host, opcode, &payload);
-            let dispatched = dispatch_event::<Handlers>(&mut event, &mut ctx);
+            let dispatched = crate::test_support::dispatch_event(&mut ctx, &mut event);
             assert!(matches!(dispatched, Ok(None)), "opcode {opcode}");
             assert_eq!(ctx.outputs.entered_for_test(surface_host), None);
         }
@@ -1215,7 +1217,7 @@ mod tests {
                         .unwrap_or_else(|| {
                             panic!("queued request sender {} is no host object", msg.sender_id)
                         });
-                    AnyRequest::from_wire(interface, msg)
+                    AnyRequest::from_wire(interface.name(), msg)
                 })
                 .expect("a queued request decodes")
             })
@@ -1579,9 +1581,9 @@ mod tests {
                 .expect("a whole request");
             let mut request =
                 crate::wire::WireMessage::new(header.sender_id, header.opcode, payload);
-            crate::test_support::raw_dispatch(wl_surface::dispatch_request::<Handlers>(
-                &mut request,
+            crate::test_support::raw_dispatch(crate::test_support::dispatch_request(
                 ctx,
+                &mut request,
             ))
         };
         let mut ctx = Context::new_for_test(false, false, Vec::new());
@@ -1803,7 +1805,7 @@ mod tests {
         register_test_native(&mut ctx, 42, (1, 1));
         assert_eq!(Handlers::on_attach(&mut ctx, 42, 0, 0), Action::Forward);
         assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        ctx.shadow_table.create_local(43, "wl_buffer", 1);
+        ctx.shadow_table.create_local(43, Iface::WlBuffer, 1);
 
         assert_eq!(Handlers::on_attach(&mut ctx, 43, 0, 0), Action::Forward);
         assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
@@ -4171,7 +4173,7 @@ mod tests {
             "legacy aura objects must retire dispatch metadata after surface destroy"
         );
         assert_ne!(
-            ctx.shadow_table.create_host_only("wl_callback", 1),
+            ctx.shadow_table.create_host_only(Iface::WlCallback, 1),
             zaura_surface_host
         );
     }

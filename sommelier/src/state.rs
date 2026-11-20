@@ -49,7 +49,7 @@ pub(crate) use self::input::{
     KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PointerFocus,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
-pub use self::objects::{DeletedHostId, Link, ShadowTable};
+pub use self::objects::{DeletedHostId, EventSender, Link, RequestSender, ShadowTable};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
     is_valid_transform, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
@@ -1117,6 +1117,7 @@ impl ConnectionFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::Iface;
     use std::os::fd::OwnedFd;
 
     fn alt_q() -> crate::accelerator::Accelerator {
@@ -1162,7 +1163,7 @@ mod tests {
     #[test]
     fn retiring_a_destroyed_host_object_requires_a_live_host_only_object() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let host_id = ctx.shadow_table.create_host_only("wl_shm_pool", 1);
+        let host_id = ctx.shadow_table.create_host_only(Iface::WlShmPool, 1);
         ctx.retire_destroyed_host_object(host_id);
         assert!(ctx.shadow_table.is_retired_host(host_id));
         assert!(!ctx.is_fatal());

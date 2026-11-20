@@ -223,7 +223,14 @@ always consumed; a configuration problem never stops the proxy) is owned by
   ended without an error the guest can be given (a failed dma-buf sync
   during a commit, say, a host error naming an object only the proxy
   uses, or a host event the proxy rejects or whose descriptors are
-  ambiguous) gets `implementation` on `wl_display`. The messages before
+  ambiguous) gets `implementation` on `wl_display`. A host event the
+  proxy cannot read (an unknown opcode, an event newer than its object,
+  arguments that do not decode whole) from an object only the proxy uses,
+  such as its own `zaura_shell`, is the exception: it reaches no guest
+  object, so the proxy drops it, warning at the first, and the session
+  goes on; one from an object the guest has still ends it (tests:
+  `an_unreadable_event_of_a_host_only_object_is_dropped`,
+  `an_unreadable_event_of_a_guest_visible_object_ends_the_session`). The messages before
   the one that ended the session in the same batch were valid and are
   sent first. Nothing the ending message produced is sent: not its
   forward, and nothing its handler queued in either direction, before or
@@ -548,7 +555,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   the proxy advertises that one itself, at `GUEST_DMABUF_VERSION` when it
   can synthesize feedback and otherwise at the host's version capped at
   v3. `forwarded_global_version` never exceeds the generated `VERSION`
-  (`protocols::interface_version`), so a host newer than the vendored XML
+  (`protocols::Iface::version`), so a host newer than the vendored XML
   cannot make the guest send requests the proxy cannot decode. A child
   object takes its parent's version, and a request is sent to a host
   object only if that object's version has it: an Aura surface keeps the

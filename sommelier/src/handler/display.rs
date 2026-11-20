@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::handler::Handlers;
 use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
+use crate::protocols::Iface;
 use crate::state::{Context, DeletedHostId, SessionEnd};
 use crate::wire::{Action, MessageHeader, Outgoing, ProtocolError, WL_DISPLAY_ID};
 use log::error;
@@ -76,7 +77,7 @@ impl wl_display::WlDisplayHandler for Handlers {
     fn on_get_registry(ctx: &mut Context, registry: u32) -> Action {
         let host_registry_id = ctx.shadow_table.create_paired(
             registry,
-            wl_registry::NAME,
+            Iface::WlRegistry,
             wl_registry::VERSION,
             wl_registry::VERSION,
         );
@@ -92,7 +93,7 @@ impl wl_display::WlDisplayHandler for Handlers {
     fn on_sync(ctx: &mut Context, callback: u32) -> Action {
         let host_callback_id = ctx.shadow_table.create_paired(
             callback,
-            wl_callback::NAME,
+            Iface::WlCallback,
             wl_callback::VERSION,
             wl_callback::VERSION,
         );
@@ -143,14 +144,6 @@ mod tests {
     use crate::state::{Context, HostId};
     use crate::test_support::{protocol_error, queued_headers, raw_dispatch};
     use crate::wire::{ProtocolError, WireMessage};
-
-    struct ProbeHandler;
-
-    impl WlDisplayHandler for ProbeHandler {
-        fn on_get_registry(ctx: &mut Context, _registry: u32) -> Action {
-            ctx.fail("the probe handler ran")
-        }
-    }
 
     #[test]
     fn delete_id_for_an_untracked_host_id_changes_nothing() {
@@ -221,7 +214,7 @@ mod tests {
         ctx.shadow_table
             .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
         ctx.host_keyboard_extension_id = Some(HostId(EXTENSION));
-        let host = ctx.shadow_table.create_paired(20, "wl_keyboard", 1, 1);
+        let host = ctx.shadow_table.create_paired(20, Iface::WlKeyboard, 1, 1);
         crate::handler::keyboard::for_test::created(&mut ctx, 20, host, SEAT);
         crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
         let extended = ctx
@@ -246,7 +239,7 @@ mod tests {
         // keyboard.
         ctx.client_to_host_queue.clear();
         assert_eq!(
-            ctx.shadow_table.create_paired(21, "wl_keyboard", 1, 1),
+            ctx.shadow_table.create_paired(21, Iface::WlKeyboard, 1, 1),
             host
         );
         crate::handler::keyboard::for_test::created(&mut ctx, 21, host, SEAT);
@@ -271,7 +264,7 @@ mod tests {
         ctx.shadow_table
             .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
         ctx.host_keyboard_extension_id = Some(HostId(EXTENSION));
-        let host = ctx.shadow_table.create_paired(20, "wl_keyboard", 1, 1);
+        let host = ctx.shadow_table.create_paired(20, Iface::WlKeyboard, 1, 1);
         crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
         ctx.guest_destroyed(20);
         ctx.client_to_host_queue.clear();
@@ -292,7 +285,9 @@ mod tests {
         const SURFACE: u32 = 30;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.bind_aura_shell_for_test(100);
-        let host = ctx.shadow_table.create_paired(SURFACE, "wl_surface", 1, 1);
+        let host = ctx
+            .shadow_table
+            .create_paired(SURFACE, Iface::WlSurface, 1, 1);
         ctx.create_surface(SURFACE);
         let aura_surface =
             crate::handler::aura_objects::ensure_host_zaura_surface(&mut ctx, SURFACE)
@@ -361,9 +356,7 @@ mod tests {
         let mut msg = WireMessage::new(999, wl_display::REQ_GET_REGISTRY, &payload);
 
         assert_eq!(
-            raw_dispatch(wl_display::dispatch_request::<ProbeHandler>(
-                &mut msg, &mut ctx
-            )),
+            raw_dispatch(crate::test_support::dispatch_request(&mut ctx, &mut msg)),
             Err(ProtocolError::InvalidSender(999))
         );
         assert!(

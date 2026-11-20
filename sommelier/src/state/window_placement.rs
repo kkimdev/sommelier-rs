@@ -270,16 +270,32 @@ impl PlacementState {
     #[cfg(test)]
     pub(crate) fn assert_no_orphans(
         &self,
-        guest: &dyn Fn(&str, u32, &str),
-        host_only: &dyn Fn(&str, u32, &str),
+        guest: &dyn Fn(&str, u32, crate::protocols::Iface),
+        host_only: &dyn Fn(&str, u32, crate::protocols::Iface),
     ) {
         for (&xdg_toplevel, placed) in &self.toplevels {
-            guest("Aura toplevel", xdg_toplevel.0, "xdg_toplevel");
-            host_only("Aura toplevel", placed.aura_toplevel.0, "zaura_toplevel");
+            guest(
+                "Aura toplevel",
+                xdg_toplevel.0,
+                crate::protocols::Iface::XdgToplevel,
+            );
+            host_only(
+                "Aura toplevel",
+                placed.aura_toplevel.0,
+                crate::protocols::Iface::ZauraToplevel,
+            );
         }
         for (&aura_toplevel, &xdg_toplevel) in &self.xdg_toplevel_by_aura_toplevel {
-            guest("Aura toplevel", xdg_toplevel.0, "xdg_toplevel");
-            host_only("Aura toplevel", aura_toplevel.0, "zaura_toplevel");
+            guest(
+                "Aura toplevel",
+                xdg_toplevel.0,
+                crate::protocols::Iface::XdgToplevel,
+            );
+            host_only(
+                "Aura toplevel",
+                aura_toplevel.0,
+                crate::protocols::Iface::ZauraToplevel,
+            );
         }
     }
 }

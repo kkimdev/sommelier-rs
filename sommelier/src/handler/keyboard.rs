@@ -43,6 +43,8 @@ use crate::protocols::keyboard_extension_unstable_v1::{
 };
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
+use crate::protocols::AnyEvent;
+use crate::protocols::Iface;
 use crate::state::{
     Context, HostId, InternalCallback, KeyboardFocus, KeyboardFocusRegistry, KeyboardModifiers,
 };
@@ -198,46 +200,43 @@ fn apply_after(ctx: &mut Context, fx: KeyEffects) {
     }
 }
 
-/// The host event of `interface` (none for an untracked sender) with
-/// `opcode` is about to be handled: a waiting recovery reads it first
+/// Host event `event` (none for an untracked sender), which `sender`
+/// sent, is about to be handled: a waiting recovery reads it first
 /// ([`KeyInput::HostEvent`]), unless its handler hands the core the event
-/// itself, decoded ([`KeyInput::Key`], [`KeyInput::Modifiers`],
-/// [`KeyInput::Peek`], [`KeyInput::TextInputLeave`]). What the recovery
-/// sends the guest goes before the event.
+/// itself ([`KeyInput::Key`], [`KeyInput::Modifiers`], [`KeyInput::Peek`],
+/// [`KeyInput::TextInputLeave`]). What the recovery sends the guest goes
+/// before the event.
 ///
 /// A key or modifiers event the proxy drops unhandled (`suppressed`), of
-/// a keyboard the guest has released, comes undecoded, from `sender`
-/// ([`KeyInput::UnhandledKey`], [`KeyInput::UnhandledModifiers`]): the key
-/// may be the very press a waiting recovery waits for.
+/// a keyboard the guest has released, reaches no handler, so it comes
+/// here ([`KeyInput::UnhandledKey`], [`KeyInput::UnhandledModifiers`]):
+/// the key may be the very press a waiting recovery waits for.
 pub(crate) fn before_host_event(
     ctx: &mut Context,
     sender: u32,
-    interface: Option<&str>,
-    opcode: u16,
+    event: Option<&AnyEvent>,
     suppressed: bool,
 ) {
     if !ctx.keys.awaits_host_event() {
         return;
     }
-    let keyboard_event = |event| interface == Some(wl_keyboard::NAME) && opcode == event;
-    if suppressed && keyboard_event(wl_keyboard::EVT_KEY) {
-        let keyboard = HostId(sender);
-        return keys(ctx, KeyInput::UnhandledKey { keyboard });
-    }
-    if suppressed && keyboard_event(wl_keyboard::EVT_MODIFIERS) {
-        return keys(ctx, KeyInput::UnhandledModifiers);
-    }
-    let decoded_by_its_handler = !suppressed
-        && matches!(
-            (interface, opcode),
-            (
-                Some(wl_keyboard::NAME),
-                wl_keyboard::EVT_KEY | wl_keyboard::EVT_MODIFIERS
-            ) | (
-                Some(zcr_extended_keyboard_v1::NAME),
-                zcr_extended_keyboard_v1::EVT_PEEK_KEY
-            ) | (Some(zwp_text_input_v1::NAME), zwp_text_input_v1::EVT_LEAVE)
-        );
+    let decoded_by_its_handler = match event {
+        Some(AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. })) if suppressed => {
+            let keyboard = HostId(sender);
+            return keys(ctx, KeyInput::UnhandledKey { keyboard });
+        }
+        Some(AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { .. })) if suppressed => {
+            return keys(ctx, KeyInput::UnhandledModifiers);
+        }
+        Some(
+            AnyEvent::WlKeyboard(
+                wl_keyboard::Event::Key { .. } | wl_keyboard::Event::Modifiers { .. },
+            )
+            | AnyEvent::ZcrExtendedKeyboardV1(zcr_extended_keyboard_v1::Event::PeekKey { .. })
+            | AnyEvent::ZwpTextInputV1(zwp_text_input_v1::Event::Leave {}),
+        ) => !suppressed,
+        _ => false,
+    };
     if !decoded_by_its_handler {
         keys(ctx, KeyInput::HostEvent);
     }
@@ -301,7 +300,7 @@ pub(crate) fn ensure_extended_keyboard_bound(ctx: &mut Context, host_keyboard_id
             };
             let host_extended_id = HostId(
                 ctx.shadow_table
-                    .create_host_only(zcr_extended_keyboard_v1::NAME, extended_version),
+                    .create_host_only(Iface::ZcrExtendedKeyboardV1, extended_version),
             );
             let extended = host_extended_id;
             keys(

@@ -165,13 +165,27 @@ build time (`sommelier/build.rs`). For each protocol it generates:
 - A `NAME` constant, the interface's name. Handlers name an interface
   by it, never by a copied literal.
 
-`generate_routing` derives the interface-to-protocol routing table,
-`interface_version`, each interface's `VERSION` by name, and
-`interface_name`, its `NAME`, from the same list, so the proxy never
-restates which protocol owns an interface or how new it is. The object
-table keeps each object's interface as that `&'static str`, so routing a
-message or creating an object copies no name; a `wl_registry.bind`, whose
-interface is a string on the wire, goes through `interface_name`.
+`generate_routing` derives what spans every protocol from the same list,
+so the proxy never restates which protocol owns an interface or how new
+it is:
+
+- `protocols::Iface`, one variant per vendored interface, with its
+  `name()` (the `NAME`), its `version()` (the `VERSION`) and
+  `from_name`, for the interface names the wire carries (a host global, a
+  `wl_registry.bind`). The object table keeps each object's `Iface`, and
+  a `match` on one is exhaustive, so code that must treat every
+  interface, such as `state::lifecycle::forget_object`, names each.
+- `ProtocolHandlers`, every interface's handler trait, which
+  `handler::Handlers` implements.
+- The one flat dispatch: `dispatch_request`, by the resolved sender's
+  `Iface`, and `dispatch_event`, by the variant of the `AnyEvent` the
+  proxy decoded the host event into. `Client::handle_msgs` decodes a host
+  event whole, once (`AnyEvent::decode`), before anything reads it: the
+  keyboard core's recovery (`handler::keyboard::before_host_event`), the
+  stale-event filter, and then its handler. A host event that does not
+  decode ends the session before any of them sees it, unless only the
+  proxy uses its object (see
+  [Wire messages](INVARIANTS.md#wire-messages)).
 
 Encoders and forwards size their `MessageBuilder` up front, from their
 arguments or the received payload, and it writes the payload after room
@@ -208,9 +222,13 @@ The table's API keeps those entries consistent by construction:
   only in `state`; everything else ends one through its `Context` wrapper
   (see [Object ends](#object-ends)).
 - **Generated dispatch** resolves each sender and object argument once,
-  before the handler runs, which validates and translates it together:
-  `request_sender` and `request_object` return a `Link` (a host ID, or
-  local), and `event_object` returns the guest ID. An event that names a
+  before the handler runs, which validates and translates it together.
+  `resolve_request` and `resolve_event` resolve a message's sender before
+  anything of it is read, into a `RequestSender` or `EventSender`: its
+  `Iface`, version and paired object, which is all dispatch needs of it,
+  so a dispatcher cannot run for a sender that did not resolve.
+  `request_object` returns a `Link` (a host ID, or local), and
+  `event_object` returns the guest ID. An event that names a
   stale object is dropped; one that names an object of another interface
   is dropped too, and the first on a connection warns, since the host
   broke the protocol (test: `an_event_object_of_another_interface_is_warned_of`).

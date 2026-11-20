@@ -21,7 +21,8 @@ use super::dmabuf::{allocate_virtwl_dmabuf, DmabufAllocation};
 use super::dmabuf_layout::DmabufLayout;
 use super::formats::wl_shm_format_to_drm_format;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
-use crate::protocols::wayland::{wl_buffer, wl_shm, wl_shm_pool};
+use crate::protocols::wayland::{wl_shm, wl_shm_pool};
+use crate::protocols::Iface;
 use crate::state::{BufferState, Context, HostMapping, StalePixels};
 use crate::wire::Action;
 use log::{debug, error};
@@ -318,11 +319,11 @@ pub(super) fn create_shared_buffer(
     };
     let host_pool_id = ctx
         .shadow_table
-        .create_host_only(wl_shm_pool::NAME, pool_version);
+        .create_host_only(Iface::WlShmPool, pool_version);
 
     let host_buffer_id = ctx
         .shadow_table
-        .create_paired(request.id, wl_buffer::NAME, 1, 1);
+        .create_paired(request.id, Iface::WlBuffer, 1, 1);
     ctx.client_to_host_queue.extend([
         wl_shm::req::create_pool(host_wl_shm_id, host_pool_id, fd_to_send, buffer_size),
         // The buffer starts the pool, and keeps its SHM (not DRM) format.
@@ -411,7 +412,7 @@ pub(super) fn create_dmabuf_buffer(
     };
     let params_id = ctx
         .shadow_table
-        .create_host_only(zwp_linux_buffer_params_v1::NAME, params_version);
+        .create_host_only(Iface::ZwpLinuxBufferParamsV1, params_version);
     ctx.client_to_host_queue
         .push(zwp_linux_dmabuf_v1::req::create_params(
             host_dmabuf_id,
@@ -444,7 +445,7 @@ pub(super) fn create_dmabuf_buffer(
 
     let host_buffer_id = ctx
         .shadow_table
-        .create_paired(request.id, wl_buffer::NAME, 1, 1);
+        .create_paired(request.id, Iface::WlBuffer, 1, 1);
     ctx.client_to_host_queue
         .push(zwp_linux_buffer_params_v1::req::create_immed(
             params_id,
@@ -498,6 +499,7 @@ mod tests {
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
     use crate::protocols::wayland::{wl_display, wl_registry, wl_shm, wl_shm_pool, wl_surface};
     use crate::protocols::AnyRequest;
+    use crate::protocols::Iface;
     use crate::proxy::harness::Session;
     use crate::state::{BufferState, Context, DamageRegion, ShmPool};
     use crate::test_support::counting::Counts;
@@ -523,7 +525,7 @@ mod tests {
     #[test]
     fn a_shared_host_copy_takes_each_plane_where_the_guest_layout_puts_it() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.host_shm_id = Some(ctx.shadow_table.create_host_only(wl_shm::NAME, 1));
+        ctx.host_shm_id = Some(ctx.shadow_table.create_host_only(Iface::WlShm, 1));
         let host_copy = shm_pool_file(&[0; 12]);
         let request = ShmBufferRequest {
             id: 30,
@@ -564,7 +566,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let host_dmabuf = ctx
             .shadow_table
-            .create_host_only(zwp_linux_dmabuf_v1::NAME, 3);
+            .create_host_only(Iface::ZwpLinuxDmabufV1, 3);
         let (width, height) = (2, 2);
         let layout =
             validate_dmabuf_layout(wl_shm::FORMAT_NV12, width, height, [4, 8, 0], [0, 16, 0])
@@ -782,7 +784,7 @@ mod tests {
                 shm: 10,
             },
         );
-        ctx.shadow_table.create_local(pool_id, "wl_shm_pool", 1);
+        ctx.shadow_table.create_local(pool_id, Iface::WlShmPool, 1);
         ctx.last_sender_id = pool_id;
 
         assert_eq!(

@@ -19,7 +19,8 @@ use crate::handler::Handlers;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
-use crate::protocols::wayland::{wl_buffer, wl_display, wl_shm};
+use crate::protocols::wayland::{wl_display, wl_shm};
+use crate::protocols::Iface;
 use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
 use crate::wire::{Action, MessageHeader, Outgoing, WL_DISPLAY_ID};
 use log::{debug, error};
@@ -258,7 +259,7 @@ fn create_synthetic_feedback(ctx: &mut Context, guest_id: u32) -> Action {
     };
     ctx.shadow_table.create_local(
         guest_id,
-        zwp_linux_dmabuf_feedback_v1::NAME,
+        Iface::ZwpLinuxDmabufFeedbackV1,
         GUEST_DMABUF_VERSION,
     );
     ctx.synthetic_feedback_objects.insert(guest_id, generation);
@@ -854,7 +855,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
         };
         let host_buffer_id = ctx.shadow_table.create_paired(
             buffer_id,
-            wl_buffer::NAME,
+            Iface::WlBuffer,
             buffer_version,
             buffer_version,
         );
@@ -973,8 +974,7 @@ mod tests {
             msg_opcode(&event),
             &event[MessageHeader::LEN..],
         );
-        zwp_linux_buffer_params_v1::dispatch_event::<Handlers>(&mut event, ctx)
-            .expect("the event decodes")
+        crate::test_support::dispatch_event(ctx, &mut event).expect("the event decodes")
     }
 
     /// `forward` is the `created` of guest buffer `buffer`, from `params`.
@@ -1170,7 +1170,7 @@ mod tests {
 
         ctx.last_sender_id = 90;
         let mut destroy = WireMessage::new(90, feedback::REQ_DESTROY, &[]);
-        let dispatched = feedback::dispatch_request::<Handlers>(&mut destroy, &mut ctx);
+        let dispatched = crate::test_support::dispatch_request(&mut ctx, &mut destroy);
         assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert!(ctx.client_to_host_queue.is_empty());
         assert_eq!(
@@ -1537,7 +1537,7 @@ mod tests {
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = first_guest_buffer;
         let mut destroy = WireMessage::new(first_guest_buffer, wl_buffer::REQ_DESTROY, &[]);
-        let dispatched = wl_buffer::dispatch_request::<Handlers>(&mut destroy, &mut ctx);
+        let dispatched = crate::test_support::dispatch_request(&mut ctx, &mut destroy);
         assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert_eq!(ctx.shadow_table.get_host_id(first_guest_buffer), None);
         assert_eq!(ctx.shadow_table.get_guest_id(HOST_BUFFER), None);

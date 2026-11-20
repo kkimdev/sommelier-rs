@@ -27,7 +27,8 @@ use super::storage::{
 };
 use crate::handler::Handlers;
 use crate::protocols;
-use crate::protocols::wayland::{wl_buffer, wl_shm, wl_shm_pool};
+use crate::protocols::wayland::wl_shm;
+use crate::protocols::Iface;
 use crate::state::{Context, ShmPool};
 use crate::wire::Action;
 use log::{debug, error, warn};
@@ -125,7 +126,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
                 ctx.last_sender_id
             );
             // The guest owns the new ID, so the pool exists, inert.
-            ctx.shadow_table.create_local(id, wl_shm_pool::NAME, 1);
+            ctx.shadow_table.create_local(id, Iface::WlShmPool, 1);
             ctx.stale_shm_pools.insert(id);
             return Action::Drop;
         }
@@ -171,7 +172,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
         };
 
         ctx.pools.insert(pool_id, pool);
-        ctx.shadow_table.create_local(pool_id, wl_shm_pool::NAME, 1);
+        ctx.shadow_table.create_local(pool_id, Iface::WlShmPool, 1);
 
         Action::Drop
     }
@@ -230,7 +231,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for Handlers {
             );
             // The guest owns the new ID, so the buffer exists, inert:
             // attaching it detaches (`CompositorHandler::on_attach`).
-            ctx.shadow_table.create_local(id, wl_buffer::NAME, 1);
+            ctx.shadow_table.create_local(id, Iface::WlBuffer, 1);
             return Action::Drop;
         }
         // A live pool that is not stale has state: `wl_shm.create_pool`
@@ -362,6 +363,7 @@ mod tests {
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
     use crate::protocols::wayland::{wl_display, wl_shm, wl_shm_pool};
+    use crate::protocols::Iface;
     use crate::state::Context;
     use crate::test_support::{decoded, queued_headers, raw_dispatch, shm_pool_file};
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
@@ -541,7 +543,7 @@ mod tests {
         let guest_shm = 20;
         let optional_format = 0x3631_4752;
         record_host_shm_wl_format(&mut ctx, optional_format);
-        ctx.shadow_table.create_local(guest_shm, "wl_shm", 2);
+        ctx.shadow_table.create_local(guest_shm, Iface::WlShm, 2);
         register_guest_shm(&mut ctx, guest_shm, 10);
         ctx.host_to_client_queue.clear();
         ctx.stale_shm_guest_objects.insert(guest_shm);
@@ -553,9 +555,10 @@ mod tests {
             &[],
         );
         assert_eq!(
-            raw_dispatch(crate::protocols::wayland::wl_shm::dispatch_request::<
-                Handlers,
-            >(&mut release, &mut ctx)),
+            raw_dispatch(crate::test_support::dispatch_request(
+                &mut ctx,
+                &mut release
+            )),
             Ok(None)
         );
         assert!(!ctx.guest_shms.contains_key(&guest_shm));
@@ -568,7 +571,7 @@ mod tests {
         );
 
         // Reusing the same guest ID must behave like a fresh synthetic object.
-        ctx.shadow_table.create_local(guest_shm, "wl_shm", 2);
+        ctx.shadow_table.create_local(guest_shm, Iface::WlShm, 2);
         register_guest_shm(&mut ctx, guest_shm, 10);
         ctx.host_to_client_queue.clear();
         record_host_shm_wl_format(&mut ctx, optional_format);
@@ -595,7 +598,7 @@ mod tests {
     fn removed_host_shm_creates_only_inert_pools_and_buffers() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_shm = 20;
-        ctx.shadow_table.create_local(guest_shm, "wl_shm", 1);
+        ctx.shadow_table.create_local(guest_shm, Iface::WlShm, 1);
         ctx.last_sender_id = 1;
         ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         assert_eq!(
@@ -623,7 +626,7 @@ mod tests {
         // The guest owns the ID, so the pool exists for it to use and
         // destroy, inert like a pool created before the removal.
         assert!(ctx.shadow_table.is_local(30));
-        assert_eq!(ctx.shadow_table.get_interface(30), Some("wl_shm_pool"));
+        assert_eq!(ctx.shadow_table.get_interface(30), Some(Iface::WlShmPool));
         assert!(ctx.stale_shm_pools.contains(&30));
 
         ctx.last_sender_id = 30;
@@ -632,7 +635,7 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.shadow_table.is_local(31));
-        assert_eq!(ctx.shadow_table.get_interface(31), Some("wl_buffer"));
+        assert_eq!(ctx.shadow_table.get_interface(31), Some(Iface::WlBuffer));
         assert!(!ctx.is_fatal());
 
         assert!(ctx.local_destroyed(30));
@@ -840,7 +843,7 @@ mod tests {
             ctx.shadow_table.get_host_id(31).is_none(),
             "a stale pool must not allocate a host buffer through replacement SHM"
         );
-        assert_eq!(ctx.shadow_table.get_interface(31), Some("wl_buffer"));
+        assert_eq!(ctx.shadow_table.get_interface(31), Some(Iface::WlBuffer));
 
         assert!(ctx.local_destroyed(30));
         assert!(!ctx.pools.contains_key(&30));

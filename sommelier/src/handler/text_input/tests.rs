@@ -32,6 +32,7 @@ use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
 use crate::protocols::wayland::{
     wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_touch,
 };
+use crate::protocols::Iface;
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
 use crate::state::HostId;
@@ -1569,10 +1570,10 @@ fn an_extension_of_unknown_version_gives_no_input_method() {
     let since = zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE;
     let manager = ctx
         .shadow_table
-        .create_host_only(zwp_text_input_manager_v1::NAME, 1);
+        .create_host_only(Iface::ZwpTextInputManagerV1, 1);
     let extension = ctx
         .shadow_table
-        .create_host_only(zcr_text_input_extension_v1::NAME, since);
+        .create_host_only(Iface::ZcrTextInputExtensionV1, since);
     ctx.host_text_input_manager_v1_id = Some(manager);
     ctx.host_text_input_extension_v1_id = Some(extension);
     assert_eq!(host_text_input_managers(&ctx), Some((manager, extension)));
@@ -4166,7 +4167,7 @@ impl Ime {
     pub(in crate::handler) fn confirm(&mut self) {
         self.ctx.last_sender_id = HOST_EXT;
         Handlers::on_confirm_preedit(&mut self.ctx, 0);
-        crate::handler::keyboard::before_host_event(&mut self.ctx, 0, None, 0, false);
+        crate::handler::keyboard::before_host_event(&mut self.ctx, 0, None, false);
     }
 
     pub(in crate::handler) fn peek(&mut self, key: u32, state: u32, serial: u32, time: u32) {
@@ -4228,7 +4229,7 @@ impl Ime {
             .map(|(message, _)| {
                 crate::test_support::decode(message, &mut Default::default(), |msg| {
                     let interface = table.get_interface(msg.sender_id).expect("a sender");
-                    AnyEvent::from_wire(interface, msg)
+                    AnyEvent::from_wire(interface.name(), msg)
                 })
                 .expect("a queued event decodes")
             })
@@ -4335,7 +4336,7 @@ fn child_objects_inherit_their_manager_versions() {
     ctx.shadow_table
         .insert_host_only_for_test(3, "zcr_text_input_extension_v1", 12);
     ctx.shadow_table
-        .create_local(40, "zwp_text_input_manager_v3", 5);
+        .create_local(40, Iface::ZwpTextInputManagerV3, 5);
     ctx.last_sender_id = 40;
 
     assert_eq!(Handlers::on_get_text_input(&mut ctx, 20, 30), Action::Drop);
@@ -4434,7 +4435,7 @@ fn text_input_creation_without_host_manager_does_not_create_broken_state() {
     let manager = 5;
     ctx.shadow_table.create_local(
         manager,
-        zwp_text_input_manager_v3::NAME,
+        Iface::ZwpTextInputManagerV3,
         zwp_text_input_manager_v3::VERSION,
     );
     ctx.last_sender_id = manager;

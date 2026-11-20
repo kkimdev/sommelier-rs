@@ -75,7 +75,7 @@ mod tests {
         assert!(code.contains("pub enum Request"));
         assert!(code.contains("fn from_wire"));
         assert!(
-            compact.contains("adopt_host_created(id,\"wl_data_offer\","),
+            compact.contains("adopt_host_created(id,Iface::WlDataOffer,sender.version,)"),
             "host-generated new_id events must get a guest object"
         );
         assert!(
@@ -97,19 +97,15 @@ mod tests {
         );
         assert!(
             compact.contains(
-                "pubfnconsume_event(interface:&str,msg:&mutWireMessage,)->Result<(),ProtocolError>"
+                "pubfndispatch_request<H:WlDisplayHandler>(sender:RequestSender,msg:&mutWireMessage,ctx:&mutContext,)"
             ),
-            "generated protocols must expose schema-aware event consumption"
+            "a request is dispatched from a sender the table resolved"
         );
         assert!(
             compact.contains(
-                "pubfnconsume_event(msg:&mutWireMessage)->Result<(),ProtocolError>{let_=Event::from_wire(msg)?;Ok(())}"
+                "pubfndispatch_event<H:WlDisplayHandler>(sender:EventSender,evt:Event,payload_len:usize,ctx:&mutContext,)"
             ),
-            "event consumption must decode the complete schema without dispatching a handler"
-        );
-        assert!(
-            compact.contains("_=>Err(ProtocolError::InvalidObjectId(msg.sender_id))"),
-            "event consumption must reject interfaces outside the generated protocol"
+            "an event is dispatched decoded, from a sender the table resolved"
         );
     }
 
@@ -213,12 +209,19 @@ mod tests {
         let code = generator::generate(&protocol);
         let compact = without_whitespace(&code);
 
+        // A request's sender is the guest object, with its negotiated
+        // version, and an event's the host object, with its own.
+        let guard = |message: &str, since: u32| {
+            compact.contains(&format!(
+                "{message}=>{{ifsender.version<{since}u32{{returnErr(ProtocolError::UnsupportedVersion{{object_id:sender.id,required:{since}u32,actual:sender.version,}});}}"
+            ))
+        };
         assert!(
-            compact.contains("guest_object_version(msg.sender_id)"),
+            guard("Request::SetReactive{}", 3),
             "generated requests must check the negotiated guest object version"
         );
         assert!(
-            compact.contains("host_object_version(msg.sender_id)"),
+            guard("Event::ConfigureBounds{width,height}", 4),
             "generated events must check the negotiated host object version"
         );
         assert!(
@@ -464,7 +467,7 @@ mod tests {
 
         assert!(
             compact.contains(
-                "lettranslated_surface=ctx.shadow_table.request_object(surface,\"wl_surface\").ok_or(ProtocolError::InvalidObjectId(surface))?;"
+                "lettranslated_surface=ctx.shadow_table.request_object(surface,Iface::WlSurface).ok_or(ProtocolError::InvalidObjectId(surface))?;"
             ),
             "an object argument must be resolved once, before the handler runs"
         );
@@ -681,15 +684,28 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to parse routing protocol fixtures");
 
-        let code = generator::generate_routing(&protocols);
-        assert!(code.contains("enum ProtocolFamily"));
-        assert!(code.contains("Wayland"));
-        assert!(code.contains("XdgShell"));
-        assert!(code.contains("wl_surface"));
-        assert!(code.contains("fn classify_interface"));
-        assert!(code.contains("fn interface_version"));
-        assert!(code.contains("fn consume_event"));
-        let code = without_whitespace(&code);
+        let code = without_whitespace(&generator::generate_routing(&protocols));
+        assert!(code.contains("pubenumIface{WlDisplay,WlRegistry,"));
+        assert!(
+            code.contains("Self::XdgToplevel=>xdg_shell::xdg_toplevel::NAME,"),
+            "an interface is named by its generated NAME"
+        );
+        assert!(
+            code.contains("\"wl_surface\"=>Some(Self::WlSurface),"),
+            "the wire's name of an interface resolves to it"
+        );
+        assert!(
+            code.contains(
+                "Iface::WlSurface=>wayland::wl_surface::dispatch_request::<H>(sender,msg,ctx),"
+            ),
+            "a request is dispatched by its sender's interface, in one match"
+        );
+        assert!(
+            code.contains(
+                "Iface::WlSurface=>wayland::wl_surface::Event::from_wire(msg).map(Self::WlSurface),"
+            ),
+            "the proxy decodes a host event by its sender's interface"
+        );
         assert!(
             code.contains(
                 "\"wl_surface\"=>wayland::wl_surface::Event::from_wire(msg).map(Self::WlSurface),"

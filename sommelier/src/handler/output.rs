@@ -28,7 +28,7 @@ use crate::handler::Handlers;
 use crate::protocols::aura_shell::zaura_output::{self, ZauraOutputHandler};
 use crate::protocols::wayland::wl_output;
 use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::ZxdgOutputManagerV1Handler;
-use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1;
+use crate::protocols::Iface;
 use crate::state::{is_valid_transform, Context};
 use crate::wire::Action;
 
@@ -203,7 +203,7 @@ impl ZxdgOutputManagerV1Handler for Handlers {
             ));
         };
         ctx.shadow_table
-            .create_local(id, zxdg_output_v1::NAME, version);
+            .create_local(id, Iface::ZxdgOutputV1, version);
         Action::Drop
     }
 }
@@ -847,7 +847,10 @@ mod tests {
             s.guest([get(manager.id, xdg_output, output)]).await;
             // No event can show an inert object's version.
             let table = &s.ctx().shadow_table;
-            assert_eq!(table.get_interface(xdg_output), Some("zxdg_output_v1"));
+            assert_eq!(
+                table.get_interface(xdg_output),
+                Some(crate::protocols::Iface::ZxdgOutputV1)
+            );
             assert_eq!(table.guest_object_version(xdg_output), Some(3));
 
             s.guest([zxdg_output_v1::req::destroy(xdg_output)]).await;

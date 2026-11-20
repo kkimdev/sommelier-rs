@@ -25,6 +25,7 @@ limitations under the License.
 use crate::handler::text_input::CtxEnv;
 use crate::ime::{HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId, V3Pending};
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
+use crate::protocols::Iface;
 use crate::state::{Context, HostId, InternalCallback};
 
 /// A text input the guest committed, enabled unless [`Active::enabled`]
@@ -85,7 +86,7 @@ pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
     let id = active.ext.unwrap_or_else(|| {
         let version = zcr_extended_text_input_v1::VERSION;
         ctx.shadow_table
-            .create_host_only(zcr_extended_text_input_v1::NAME, version)
+            .create_host_only(Iface::ZcrExtendedTextInputV1, version)
     });
     let ext = HostExt {
         id,

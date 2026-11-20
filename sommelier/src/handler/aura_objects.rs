@@ -29,13 +29,14 @@ limitations under the License.
 //! | `zaura_output` | [`crate::state::OutputRegistry`] | placement metadata |
 
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
+use crate::protocols::Iface;
 use crate::state::{Context, HostAuraShell};
 use crate::wire::{queue_or_drop, Outgoing};
 
 /// What the proxy needs to know about one kind of host Aura child.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AuraChild {
-    interface: &'static str,
+    interface: Iface,
     /// The `zaura_shell` request that creates the child, from the shell,
     /// the new child's ID and the object it extends.
     get: fn(u32, u32, u32) -> Outgoing,
@@ -46,19 +47,19 @@ pub(crate) struct AuraChild {
 
 impl AuraChild {
     pub(crate) const SURFACE: Self = Self {
-        interface: zaura_surface::NAME,
+        interface: Iface::ZauraSurface,
         get: zaura_shell::req::get_aura_surface,
         release: zaura_surface::req::release,
         release_since: zaura_surface::REQ_RELEASE_SINCE,
     };
     pub(crate) const TOPLEVEL: Self = Self {
-        interface: zaura_toplevel::NAME,
+        interface: Iface::ZauraToplevel,
         get: zaura_shell::req::get_aura_toplevel_for_xdg_toplevel,
         release: zaura_toplevel::req::release,
         release_since: zaura_toplevel::REQ_RELEASE_SINCE,
     };
     pub(crate) const OUTPUT: Self = Self {
-        interface: zaura_output::NAME,
+        interface: Iface::ZauraOutput,
         get: zaura_shell::req::get_aura_output,
         release: zaura_output::req::release,
         release_since: zaura_output::REQ_RELEASE_SINCE,

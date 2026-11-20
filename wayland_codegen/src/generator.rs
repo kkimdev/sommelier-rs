@@ -147,31 +147,11 @@ pub fn generate(protocol: &Protocol) -> String {
     let protocol = &mark_byte_indexed_strings(protocol);
     let mut parts = Vec::new();
     let mut interface_names = Vec::new();
-    let mut handler_trait_names = Vec::new();
-    let mut dispatch_request_cases = Vec::new();
-    let mut dispatch_event_cases = Vec::new();
-    let mut consume_event_cases = Vec::new();
     let int_enums = int_enums(protocol);
 
     for item in &protocol.items {
         if let ProtocolItem::Interface(interface) = item {
-            let name = &interface.name;
-            let mod_name = format_ident!("{}", name);
-            let handler_trait_name = format_ident!("{}Handler", snake_to_camel(name));
-
-            interface_names.push(name.clone());
-            handler_trait_names.push(quote! { #mod_name::#handler_trait_name });
-
-            dispatch_request_cases.push(quote! {
-                #name => #mod_name::dispatch_request::<H>(msg, ctx),
-            });
-            dispatch_event_cases.push(quote! {
-                #name => #mod_name::dispatch_event::<H>(msg, ctx),
-            });
-            consume_event_cases.push(quote! {
-                #name => #mod_name::consume_event(msg),
-            });
-
+            interface_names.push(interface.name.clone());
             parts.push(generate_interface(interface, &int_enums));
         }
     }
@@ -193,53 +173,14 @@ pub fn generate(protocol: &Protocol) -> String {
 
             use std::os::fd::OwnedFd;
             use crate::wire::{WireMessage, MessageBuilder, Action, Outgoing, ProtocolError};
-            use crate::state::{Context, Link};
+            use crate::state::{Context, EventSender, Link, RequestSender};
+            use crate::protocols::Iface;
 
             pub const ALLOWED_INTERFACES: &[&str] = &[
                 #(#interface_names),*
             ];
 
             #(#parts)*
-
-            pub trait ProtocolHandler:
-                #(#handler_trait_names +)*
-            {}
-
-            impl<T: #(#handler_trait_names +)*> ProtocolHandler for T {}
-
-            pub fn dispatch_request<H: ProtocolHandler>(
-                interface: &str,
-                msg: &mut WireMessage,
-                ctx: &mut Context,
-            ) -> Result<Option<Outgoing>, ProtocolError> {
-                ctx.last_sender_id = msg.sender_id;
-                match interface {
-                    #(#dispatch_request_cases)*
-                    _ => Ok(None),
-                }
-            }
-
-            pub fn dispatch_event<H: ProtocolHandler>(
-                interface: &str,
-                msg: &mut WireMessage,
-                ctx: &mut Context,
-            ) -> Result<Option<Outgoing>, ProtocolError> {
-                ctx.last_sender_id = msg.sender_id;
-                match interface {
-                    #(#dispatch_event_cases)*
-                    _ => Ok(None),
-                }
-            }
-
-            pub fn consume_event(
-                interface: &str,
-                msg: &mut WireMessage,
-            ) -> Result<(), ProtocolError> {
-                match interface {
-                    #(#consume_event_cases)*
-                    _ => Err(ProtocolError::InvalidObjectId(msg.sender_id)),
-                }
-            }
         }
     };
 
@@ -249,163 +190,165 @@ pub fn generate(protocol: &Protocol) -> String {
     expanded.to_string()
 }
 
-/// Generate the cross-protocol routing table used by the proxy.
+/// Generate what spans every protocol: `Iface`, the interface of an
+/// object, which the object table keeps; the one handler bound,
+/// `ProtocolHandlers`; and the flat dispatch of a request or event by its
+/// sender's interface.
 ///
-/// Individual protocol modules own message decoding and handler dispatch, but
-/// the proxy should not need to repeat the interface-to-protocol mapping for
-/// every message direction. The build script passes the complete protocol
-/// list here so that the classifier and both dispatch entry points are derived
-/// from the same source as the protocol modules themselves.
+/// The build script passes every protocol the proxy generates, so the
+/// interfaces, their names and versions, and both dispatch entry points
+/// come from the same XML as the protocol modules, and no interface is
+/// routed by a name the proxy spells itself.
 pub fn generate_routing(protocols: &[Protocol]) -> String {
-    let mut family_variants = Vec::new();
     let mut handler_traits = Vec::new();
-    let mut classify_arms = Vec::new();
-    let mut dispatch_request_arms = Vec::new();
-    let mut dispatch_event_arms = Vec::new();
-    let mut consume_event_arms = Vec::new();
-    let mut version_arms = Vec::new();
-    let mut name_arms = Vec::new();
-    let mut any_variants = Vec::new();
-    // The proxy routes and versions an object by its interface name alone.
+    let mut interfaces = Vec::new();
+    // The proxy routes and versions an object by its interface alone.
     let mut routed_interfaces = HashSet::new();
 
     for protocol in protocols {
         let protocol_name = format_ident!("{}", protocol.name);
-        let family_name = format_ident!("{}", snake_to_camel(&protocol.name));
-
-        family_variants.push(quote! { #family_name });
-        handler_traits.push(quote! { #protocol_name::ProtocolHandler });
-        dispatch_request_arms.push(quote! {
-            ProtocolFamily::#family_name => #protocol_name::dispatch_request::<H>(interface, msg, ctx),
-        });
-        dispatch_event_arms.push(quote! {
-            ProtocolFamily::#family_name => #protocol_name::dispatch_event::<H>(interface, msg, ctx),
-        });
-        consume_event_arms.push(quote! {
-            ProtocolFamily::#family_name => #protocol_name::consume_event(interface, msg),
-        });
-
-        let interface_names: Vec<String> = protocol
-            .items
-            .iter()
-            .filter_map(|item| {
-                if let ProtocolItem::Interface(interface) = item {
-                    Some(interface.name.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if !interface_names.is_empty() {
-            classify_arms.push(quote! {
-                #(#interface_names)|* => Some(ProtocolFamily::#family_name),
-            });
-        }
-        for name in &interface_names {
+        for item in &protocol.items {
+            let ProtocolItem::Interface(interface) = item else {
+                continue;
+            };
+            let name = &interface.name;
             assert!(
                 routed_interfaces.insert(name.clone()),
                 "interface `{name}` is defined by more than one protocol"
             );
-            let interface = format_ident!("{}", name);
-            version_arms.push(quote! {
-                #name => Some(#protocol_name::#interface::VERSION),
-            });
-            name_arms.push(quote! {
-                #name => Some(#protocol_name::#interface::NAME),
-            });
-            any_variants.push((
+            let module = format_ident!("{}", name);
+            let handler_trait = format_ident!("{}Handler", snake_to_camel(name));
+            handler_traits.push(quote! { #protocol_name::#module::#handler_trait });
+            interfaces.push((
                 name.clone(),
                 format_ident!("{}", snake_to_camel(name)),
-                quote! { #protocol_name::#interface },
+                quote! { #protocol_name::#module },
             ));
         }
     }
 
+    let count = interfaces.len();
+    let variants = interfaces.iter().map(|(_, variant, _)| variant);
+    let all = interfaces
+        .iter()
+        .map(|(_, variant, _)| quote! { Self::#variant });
+    let name_arms = interfaces
+        .iter()
+        .map(|(_, variant, module)| quote! { Self::#variant => #module::NAME, });
+    let version_arms = interfaces
+        .iter()
+        .map(|(_, variant, module)| quote! { Self::#variant => #module::VERSION, });
+    let from_name_arms = interfaces
+        .iter()
+        .map(|(name, variant, _)| quote! { #name => Some(Self::#variant), });
+    let dispatch_request_arms = interfaces.iter().map(|(_, variant, module)| {
+        quote! { Iface::#variant => #module::dispatch_request::<H>(sender, msg, ctx), }
+    });
+    let decode_arms = interfaces.iter().map(|(_, variant, module)| {
+        quote! { Iface::#variant => #module::Event::from_wire(msg).map(Self::#variant), }
+    });
+    let dispatch_event_arms = interfaces.iter().map(|(_, variant, module)| {
+        quote! {
+            AnyEvent::#variant(event) => #module::dispatch_event::<H>(sender, event, payload_len, ctx),
+        }
+    });
     let any_request = generate_any_message(
         &format_ident!("AnyRequest"),
         &format_ident!("Request"),
-        &any_variants,
+        &interfaces,
+        true,
     );
     let any_event = generate_any_message(
         &format_ident!("AnyEvent"),
         &format_ident!("Event"),
-        &any_variants,
+        &interfaces,
+        false,
     );
     let expanded = quote! {
-        use crate::state::Context;
+        use crate::state::{Context, EventSender, RequestSender};
         use crate::wire::{Outgoing, ProtocolError, WireMessage};
 
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum ProtocolFamily {
-            #(#family_variants),*
+        /// An interface of the vendored protocols: what the object table
+        /// records of every object, and what a message is dispatched by.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum Iface {
+            #(#variants),*
         }
 
-        pub trait AllProtocolHandlers:
-            #(#handler_traits +)*
-        {}
+        impl Iface {
+            /// Every interface, in the order the protocols define them.
+            #[cfg(test)]
+            pub const ALL: [Self; #count] = [#(#all),*];
 
-        impl<T> AllProtocolHandlers for T
-        where
-            T: #(#handler_traits +)*
-        {}
+            /// The interface's name, as the wire spells it.
+            pub const fn name(self) -> &'static str {
+                match self {
+                    #(#name_arms)*
+                }
+            }
 
-        pub fn classify_interface(interface: &str) -> Option<ProtocolFamily> {
-            match interface {
-                #(#classify_arms)*
-                _ => None,
+            /// The newest version of the interface in the vendored XML,
+            /// the newest the generated code can decode.
+            pub const fn version(self) -> u32 {
+                match self {
+                    #(#version_arms)*
+                }
+            }
+
+            /// The interface the wire names `name`, or `None` for one no
+            /// vendored protocol defines.
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    #(#from_name_arms)*
+                    _ => None,
+                }
             }
         }
 
-        /// `interface` as its generated `NAME`, the `'static` name the
-        /// object table keeps, or `None` for an interface no vendored
-        /// protocol defines.
-        pub fn interface_name(interface: &str) -> Option<&'static str> {
-            match interface {
-                #(#name_arms)*
-                _ => None,
+        impl std::fmt::Display for Iface {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.name())
             }
         }
 
-        /// The newest version of `interface` in the vendored XML, the
-        /// newest the generated code can decode, or `None` for an interface
-        /// no vendored protocol defines.
-        pub fn interface_version(interface: &str) -> Option<u32> {
-            match interface {
-                #(#version_arms)*
-                _ => None,
-            }
-        }
+        /// The handler traits of every interface: what dispatch needs of
+        /// the proxy's handlers.
+        pub trait ProtocolHandlers: #(#handler_traits +)* {}
 
-        pub fn dispatch_request<H: AllProtocolHandlers>(
-            family: ProtocolFamily,
-            interface: &str,
+        impl<T: #(#handler_traits +)*> ProtocolHandlers for T {}
+
+        /// Dispatch a guest request from `sender`, which the object table
+        /// resolved, by its interface.
+        pub fn dispatch_request<H: ProtocolHandlers>(
+            sender: RequestSender,
             msg: &mut WireMessage,
             ctx: &mut Context,
         ) -> Result<Option<Outgoing>, ProtocolError> {
-            match family {
+            match sender.iface {
                 #(#dispatch_request_arms)*
             }
         }
 
-        pub fn dispatch_event<H: AllProtocolHandlers>(
-            family: ProtocolFamily,
-            interface: &str,
-            msg: &mut WireMessage,
-            ctx: &mut Context,
-        ) -> Result<Option<Outgoing>, ProtocolError> {
-            match family {
-                #(#dispatch_event_arms)*
+        impl AnyEvent {
+            /// Decode `msg`, an event from an object of `iface`, whole: its
+            /// payload and descriptors.
+            pub fn decode(iface: Iface, msg: &mut WireMessage) -> Result<Self, ProtocolError> {
+                match iface {
+                    #(#decode_arms)*
+                }
             }
         }
 
-        pub fn consume_event(
-            family: ProtocolFamily,
-            interface: &str,
-            msg: &mut WireMessage,
-        ) -> Result<(), ProtocolError> {
-            match family {
-                #(#consume_event_arms)*
+        /// Dispatch `event`, decoded from `sender`'s message of
+        /// `payload_len` bytes, to its interface's handler.
+        pub fn dispatch_event<H: ProtocolHandlers>(
+            sender: EventSender,
+            event: AnyEvent,
+            payload_len: usize,
+            ctx: &mut Context,
+        ) -> Result<Option<Outgoing>, ProtocolError> {
+            match event {
+                #(#dispatch_event_arms)*
             }
         }
 
@@ -416,14 +359,22 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
     expanded.to_string()
 }
 
-/// Generate `AnyRequest` or `AnyEvent` for tests: a message of any
-/// interface, which a test peer decodes by the interface of its sender, so
-/// that one assertion covers everything the proxy sent that peer, in order.
+/// Generate `AnyRequest` or `AnyEvent`: a message of any interface. A
+/// test peer decodes one by the interface of its sender, so that one
+/// assertion covers everything the proxy sent that peer, in order; the
+/// proxy decodes each host event into an `AnyEvent` once, for everything
+/// that reads it. `test_only` leaves the type out of the proxy.
 fn generate_any_message(
     any_name: &Ident,
     message_type: &Ident,
     interfaces: &[(String, Ident, TokenStream)],
+    test_only: bool,
 ) -> TokenStream {
+    let cfg = if test_only {
+        quote! { #[cfg(test)] }
+    } else {
+        quote! {}
+    };
     let variants = interfaces
         .iter()
         .map(|(_, variant, module)| quote! { #variant(#module::#message_type) });
@@ -451,8 +402,9 @@ fn generate_any_message(
         }
     });
     quote! {
-        #[cfg(test)]
-        #[derive(Debug, PartialEq)]
+        #cfg
+        #[derive(Debug)]
+        #[cfg_attr(test, derive(PartialEq))]
         pub enum #any_name {
             #(#variants),*
         }
@@ -627,7 +579,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 let decodes = generate_reads(&req.items);
                 let field_names = generate_field_names(&req.items);
                 let request_validations = generate_request_validations(&req.items);
-                let request_version_validation = generate_version_validation(req.since, false);
+                let request_version_validation = generate_version_validation(req.since);
                 request_decoders.push(quote! {
                     #req_idx => {
                         #decodes
@@ -716,16 +668,13 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                     // that ends the session. No local is
                                     // bound, so none can shadow a later
                                     // argument.
+                                    let iface = iface_variant(interface_name);
                                     mapping_and_writing.push(quote! {
                                         builder.write_u32(ctx.shadow_table.create_paired(
                                             #name,
-                                            #interface_name,
-                                            ctx.shadow_table
-                                                .guest_object_version(msg.sender_id)
-                                                .ok_or(ProtocolError::InvalidSender(msg.sender_id))?,
-                                            ctx.shadow_table
-                                                .host_object_version(host_sender_id)
-                                                .ok_or(ProtocolError::InvalidSender(msg.sender_id))?,
+                                            #iface,
+                                            sender.version,
+                                            host.version,
                                         ));
                                     });
                                 } else {
@@ -754,7 +703,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             quote! { ctx.guest_destroyed(msg.sender_id); },
                             quote! { ctx.local_destroyed(msg.sender_id); },
                             quote! {
-                                if sender == Link::Local {
+                                if sender.host.is_none() {
                                     ctx.local_destroyed(msg.sender_id);
                                 }
                             },
@@ -782,7 +731,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 // before mapping any new_id: a dropped request
                                 // must not consume or map an ID, since
                                 // libwayland-server refuses a gap in client IDs.
-                                let Link::Host(host_sender_id) = sender else {
+                                let Some(host) = sender.host else {
                                     log::debug!(
                                         "Dropping request from local object {}",
                                         msg.sender_id
@@ -796,7 +745,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 #[allow(unused_mut)]
                                 let mut builder = MessageBuilder::with_capacity(msg.payload.len());
                                 #(#mapping_and_writing)*
-                                let outgoing = builder.try_build(host_sender_id, #req_idx)?;
+                                let outgoing = builder.try_build(host.id, #req_idx)?;
                                 #destructor_cleanup
                                 return Ok(Some(outgoing));
                             }
@@ -825,7 +774,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                     &format!("{}.{}", interface.name, evt.name),
                     &evt.items,
                 );
-                let event_version_validation = generate_version_validation(evt.since, true);
+                let event_version_validation = generate_version_validation(evt.since);
                 event_decoders.push(quote! {
                     #evt_idx => {
                         #decodes
@@ -910,13 +859,12 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 // A child object takes its parent's version,
                                 // bound to no local that could shadow a later
                                 // argument.
+                                let iface = iface_variant(interface_name);
                                 mapping_and_writing.push(quote! {
                                     builder.write_u32(ctx.shadow_table.adopt_host_created(
                                         #name,
-                                        #interface_name,
-                                        ctx.shadow_table
-                                            .host_object_version(msg.sender_id)
-                                            .ok_or(ProtocolError::InvalidSender(msg.sender_id))?,
+                                        #iface,
+                                        sender.version,
                                     ));
                                 });
                             }
@@ -947,7 +895,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         // must still use the ID that addressed the event on
                         // the wire, and destructor cleanup must remove that
                         // same object rather than looking it up again.
-                        let mapped_guest_sender_id = ctx.shadow_table.get_guest_id(msg.sender_id);
+                        let mapped_guest_sender_id = sender.guest.map(|guest| guest.id);
                         if H::#method_name(ctx, #(#handler_call_args),*) == Action::Forward {
                             // Check the sender and every object argument
                             // before mapping any new_id: a dropped event must
@@ -956,13 +904,13 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             let Some(guest_sender_id) = mapped_guest_sender_id else {
                                 log::debug!(
                                     "Dropping event from unmapped sender {}",
-                                    msg.sender_id
+                                    sender.id
                                 );
                                 return Ok(None);
                             };
                             #(#unmapped_object_checks)*
                             #[allow(unused_mut)]
-                            let mut builder = MessageBuilder::with_capacity(msg.payload.len());
+                            let mut builder = MessageBuilder::with_capacity(payload_len);
                             #(#mapping_and_writing)*
                             let outgoing = builder.try_build(guest_sender_id, #evt_idx)?;
                             #destructor_cleanup
@@ -1064,16 +1012,15 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 #(#handler_methods)*
             }
 
+            /// Dispatch a request from `sender`, whose object the table
+            /// resolved before anything of the message was read: as in
+            /// libwayland-server, a request from an object that is gone is
+            /// reported as such, whatever its opcode and arguments.
             pub fn dispatch_request<H: #handler_trait_name>(
+                sender: RequestSender,
                 msg: &mut WireMessage,
                 ctx: &mut Context,
             ) -> Result<Option<Outgoing>, ProtocolError> {
-                // The sender comes first, as in libwayland-server: a request
-                // from an object that is gone is reported as such, whatever
-                // its opcode and arguments.
-                let Some(sender) = ctx.shadow_table.request_sender(msg.sender_id) else {
-                    return Err(ProtocolError::InvalidSender(msg.sender_id));
-                };
                 let req = Request::from_wire(msg)?;
                 match req {
                     #(#dispatch_request_arms)*
@@ -1083,25 +1030,20 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 Ok(None)
             }
 
+            /// Dispatch `evt`, decoded from a message of `payload_len`
+            /// bytes that `sender`, a live host object, sent.
             pub fn dispatch_event<H: #handler_trait_name>(
-                msg: &mut WireMessage,
+                sender: EventSender,
+                evt: Event,
+                payload_len: usize,
                 ctx: &mut Context,
             ) -> Result<Option<Outgoing>, ProtocolError> {
-                // The proxy dispatches an event by its sender's interface
-                // (`ShadowTable::get_host_interface`), so the sender is a
-                // live host object.
-                let evt = Event::from_wire(msg)?;
                 match evt {
                     #(#dispatch_event_arms)*
                     #[allow(unreachable_patterns)]
                     _ => {}
                 }
                 Ok(None)
-            }
-
-            pub fn consume_event(msg: &mut WireMessage) -> Result<(), ProtocolError> {
-                let _ = Event::from_wire(msg)?;
-                Ok(())
             }
         }
     }
@@ -1546,25 +1488,17 @@ fn args(items: &[MessageItem]) -> impl Iterator<Item = &Arg> {
 /// Generate the object-version guard required by Wayland's `since`
 /// attribute. Requests use the guest object's negotiated version, while
 /// events use the host object's version.
-fn generate_version_validation(since: Option<u32>, host_to_guest: bool) -> TokenStream {
+fn generate_version_validation(since: Option<u32>) -> TokenStream {
     let Some(required) = since else {
         return quote! {};
     };
 
-    let lookup = if host_to_guest {
-        quote! { ctx.shadow_table.host_object_version(msg.sender_id) }
-    } else {
-        quote! { ctx.shadow_table.guest_object_version(msg.sender_id) }
-    };
-
     quote! {
-        let object_version = #lookup
-            .ok_or(ProtocolError::InvalidSender(msg.sender_id))?;
-        if object_version < #required {
+        if sender.version < #required {
             return Err(ProtocolError::UnsupportedVersion {
-                object_id: msg.sender_id,
+                object_id: sender.id,
                 required: #required,
-                actual: object_version,
+                actual: sender.version,
             });
         }
     }
@@ -1602,9 +1536,10 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
                     );
                 };
                 let host = translated_object_ident(arg);
+                let iface = iface_variant(interface);
                 let link = quote! {
                     ctx.shadow_table
-                        .request_object(#name, #interface)
+                        .request_object(#name, #iface)
                         .ok_or(ProtocolError::InvalidObjectId(#name))?
                 };
                 validations.push(if arg.allow_null.unwrap_or(false) {
@@ -1658,7 +1593,8 @@ fn generate_event_validations(event: &str, items: &[MessageItem]) -> Vec<TokenSt
                     continue;
                 };
                 let guest = translated_object_ident(arg);
-                let lookup = quote! { ctx.shadow_table.event_object(#name, #interface, #event) };
+                let iface = iface_variant(interface);
+                let lookup = quote! { ctx.shadow_table.event_object(#name, #iface, #event) };
                 validations.push(if arg.allow_null.unwrap_or(false) {
                     quote! {
                         let #guest = if #name == 0 {
@@ -1749,6 +1685,12 @@ fn sanitize_ident(name: &str) -> Ident {
         | "yield" | "try" => format_ident!("r#{}", name),
         _ => format_ident!("{}", name),
     }
+}
+
+/// The `Iface` variant of interface `name`.
+fn iface_variant(name: &str) -> TokenStream {
+    let variant = format_ident!("{}", snake_to_camel(name));
+    quote! { Iface::#variant }
 }
 
 fn snake_to_camel(s: &str) -> String {
