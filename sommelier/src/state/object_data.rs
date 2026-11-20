@@ -98,4 +98,10 @@ object_data! {
     DmabufFactory(crate::handler::linux_dmabuf::DmabufFactory) for ZwpLinuxDmabufV1,
     /// A synthetic guest `zwp_linux_dmabuf_feedback_v1`.
     DmabufFeedback(crate::handler::linux_dmabuf::DmabufFeedback) for ZwpLinuxDmabufFeedbackV1,
+    /// A guest `wp_viewport`.
+    Viewport(crate::handler::compositor::Viewport) for WpViewport,
+    /// A synthetic guest `gtk_shell1`.
+    GtkShell(crate::handler::gtk_shell::GtkShell) for GtkShell1,
+    /// A synthetic guest `gtk_surface1`.
+    GtkSurface(crate::handler::gtk_shell::GtkSurface) for GtkSurface1,
 }

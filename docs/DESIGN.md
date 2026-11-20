@@ -326,12 +326,12 @@ keymaps are compiled in belongs to the keyboard core
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of host globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
-| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`); `shm::ShmFormats`, each `wl_shm` and `wl_shm_pool`'s entry |
+| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`); `shm::ShmFormats`; each `wl_shm`, `wl_shm_pool` and `wp_viewport`'s entry |
 | Dma-buf | `linux_dmabuf.rs` | `linux_dmabuf::Dmabuf` (capabilities), each params, factory and feedback object's entry, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (pointer focus); `sommelier/src/keys` (the keyboard core: the keyboard focus, one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
-| ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
+| ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs`, each GTK shell and surface's entry |
 | Window placement | `window_placement.rs` | `window_placement.rs` |
 
 Two mechanisms let a handler act outside its own message:
@@ -415,16 +415,18 @@ binds no chord of its own. The contract is in
 
 State that only one object owns lives in the object's own table entry
 (`state/object_data.rs`): an `ObjectData` of the object's interface, such
-as a `wl_shm`'s formats, a `wl_shm_pool`'s file, or a dma-buf params
-object's planes and pending create. Only a live entry keeps data, the
+as a `wl_shm`'s formats, a `wl_shm_pool`'s file, a dma-buf params
+object's planes and pending create, or a viewport's or GTK surface's
+link to its `wl_surface`, which that surface's end clears. Only a live entry keeps data, the
 table attaches it only to an object of its interface (`ShadowTable::attach`,
 `create_local_with`; an object the generated code creates gets it after
 its forward, `PostDispatch::Attach`), and the owning module reads it by
 kind (`ShadowTable::data::<T>`). So such state cannot outlive its object,
 be read under a reused ID, or be checked after the fact: the transition
 that ends the object takes it. State that a core owns (the keyboard and
-IME cores), that spans objects (`OutputRegistry`), or that outlives its
-guest object (render buffers) lives with its owner, keyed by the object's
+IME cores), that spans objects (`OutputRegistry`, `XdgRoles`), that every
+frame scans (`SurfaceState`, which buffer references read), or that
+outlives its guest object (render buffers) lives with its owner, keyed by the object's
 guest or host ID. `state/lifecycle.rs` ends both with the object, whichever
 way the object ends: each `Context` wrapper of a table transition that
 ends an object runs one hook. A `wl_surface`'s `SurfaceState` is created

@@ -27,8 +27,8 @@ use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry, wl_shm, wl_su
 use crate::protocols::Iface;
 use crate::settings::Settings;
 use crate::state::{
-    Binding, Context, EventSender, GtkShellState, GuestId, HostGlobal, HostId, InternalCallback,
-    RequestObject, RequestSender, Singleton, INERT_BIND_INTERFACE,
+    Binding, Context, EventSender, GuestId, HostGlobal, HostId, InternalCallback, RequestObject,
+    RequestSender, Singleton, INERT_BIND_INTERFACE,
 };
 use crate::state::{RegistryRecord, Singletons};
 use crate::wire::Action;
@@ -1329,10 +1329,7 @@ impl wl_registry::WlRegistryHandler for Handlers {
                 .create_local(*guest_new_id, interface, *version);
             return;
         } else if interface == Iface::GtkShell1 {
-            ctx.shadow_table
-                .create_local(*guest_new_id, interface, *version);
-            ctx.gtk_shells
-                .insert(*guest_new_id, GtkShellState::default());
+            crate::handler::gtk_shell::create_shell(ctx, *guest_new_id, *version);
             queue_internal_sync(
                 ctx,
                 InternalCallback::GtkShellCapabilities {

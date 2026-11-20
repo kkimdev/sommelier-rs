@@ -230,19 +230,6 @@ impl PumpSlot<'_> {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct GtkShellState {
-    /// Activation token supplied by GTK for windows created through this
-    /// shell binding. ChromeOS validates the token before granting focus.
-    pub startup_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GtkSurfaceState {
-    pub shell_id: GuestId,
-    pub wl_surface_id: GuestId,
-}
-
 /// Work a request handler defers until the proxy has forwarded the request.
 ///
 /// A handler runs before the generated dispatcher maps the request's new
@@ -324,17 +311,10 @@ pub struct Context {
     /// This connection's bound host outputs (see [`OutputRegistry`] for what
     /// it owns).
     pub(crate) outputs: OutputRegistry,
-    /// Synthetic GTK shell bindings and their activation token state.
-    pub gtk_shells: BTreeMap<GuestId, GtkShellState>,
-    /// Synthetic GTK surfaces associated with guest wl_surface objects.
-    pub gtk_surfaces: BTreeMap<GuestId, GtkSurfaceState>,
     /// The host Aura surface of each host wl_surface (see [`AuraSurfaces`]).
     pub(crate) aura_surfaces: AuraSurfaces,
     /// The guest's xdg_surface and xdg_toplevel links to their wl_surface.
     pub(crate) xdg_roles: XdgRoles,
-    /// Tracks wp_viewport objects back to their associated wl_surface so
-    /// destroying a viewport restores the default damage coordinate mapping.
-    pub viewport_to_wl_surface: BTreeMap<GuestId, GuestId>,
     /// The connection's clipboard transfers.
     pub(crate) clipboard_pumps: ClipboardPumps,
 }
@@ -836,11 +816,8 @@ impl Context {
             internal_callbacks: InternalCallbacks::default(),
             window_placement: WindowPlacement::connect(placement),
             outputs: OutputRegistry::default(),
-            gtk_shells: BTreeMap::new(),
-            gtk_surfaces: BTreeMap::new(),
             aura_surfaces: AuraSurfaces::default(),
             xdg_roles: XdgRoles::default(),
-            viewport_to_wl_surface: BTreeMap::new(),
             clipboard_pumps: ClipboardPumps::default(),
         }
     }

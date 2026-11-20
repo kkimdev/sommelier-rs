@@ -439,8 +439,7 @@ pub(crate) fn forget_surface(
 ) {
     release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
     ctx.outputs.surface_destroyed(wl_surface_host_id);
-    ctx.gtk_surfaces
-        .retain(|_, state| state.wl_surface_id != wl_surface_guest_id);
+    crate::handler::gtk_shell::forget_wl_surface(ctx, wl_surface_guest_id);
     // A submitted buffer may have been detached from another surface and
     // still be waiting for wl_buffer.release; only buffers that this host
     // surface actually held may be retired merely because its destructor
@@ -454,8 +453,11 @@ pub(crate) fn forget_surface(
     // Pending-only objects do not receive a host release event. Retire
     // every buffer made eligible by removing this surface in one pass.
     crate::handler::buffer::retire_eligible_buffers(ctx);
-    ctx.viewport_to_wl_surface
-        .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
+    for (_, viewport) in ctx.shadow_table.data_of_mut::<Viewport>() {
+        if viewport.surface == Some(wl_surface_guest_id) {
+            viewport.surface = None;
+        }
+    }
     ctx.pointer_focus.forget_surface(wl_surface_guest_id);
     // Surface destruction can race the host's wl_keyboard.leave event. The
     // keyboard core moves the focus off the surface first, and the IME core
@@ -785,6 +787,37 @@ impl WlRegionHandler for Handlers {}
 impl WlSubcompositorHandler for Handlers {}
 impl WlSubsurfaceHandler for Handlers {}
 
+/// A guest `wp_viewport`; its table entry keeps it.
+#[derive(Debug)]
+pub(crate) struct Viewport {
+    /// The `wl_surface` it scales, until that ends: then its requests
+    /// raise `no_surface`, and a later surface under the ID is not its.
+    surface: Option<GuestId>,
+}
+
+#[cfg(test)]
+impl Viewport {
+    /// The surface it scales, for the orphan check.
+    pub(crate) fn surface_for_test(&self) -> Option<GuestId> {
+        self.surface
+    }
+}
+
+/// The surface of live viewport `viewport`, or the error a request of one
+/// that has none ends the session with.
+fn viewport_surface(ctx: &mut Context, viewport: GuestId) -> Result<GuestId, Action> {
+    let surface = ctx.shadow_table.data::<Viewport>(viewport);
+    surface
+        .and_then(|viewport| viewport.surface)
+        .ok_or_else(|| {
+            ctx.reject(
+                viewport,
+                wp_viewport::ERROR_NO_SURFACE,
+                "wp_viewport has no associated wl_surface",
+            )
+        })
+}
+
 impl wp_viewporter::WpViewporterHandler for Handlers {
     fn on_get_viewport(
         ctx: &mut Context,
@@ -794,9 +827,9 @@ impl wp_viewporter::WpViewporterHandler for Handlers {
     ) -> Action {
         let surface = surface.guest;
         if ctx
-            .viewport_to_wl_surface
-            .values()
-            .any(|&owner| owner == surface)
+            .shadow_table
+            .data_of::<Viewport>()
+            .any(|(_, viewport)| viewport.surface == Some(surface))
         {
             log::warn!("Rejecting duplicate wp_viewport for wl_surface {}", surface);
             return ctx.reject(
@@ -809,7 +842,13 @@ impl wp_viewporter::WpViewporterHandler for Handlers {
             return ctx.missing_surface_state(surface);
         };
         state.pending.viewport = Some(Some(ViewportState::new()));
-        ctx.viewport_to_wl_surface.insert(id, surface);
+        let viewport = Viewport {
+            surface: Some(surface),
+        };
+        ctx.defer_until_forwarded(PostDispatch::Attach {
+            object: id,
+            data: viewport.into(),
+        });
         Action::Forward
     }
 }
@@ -823,12 +862,9 @@ impl wp_viewport::WpViewportHandler for Handlers {
         width: i32,
         height: i32,
     ) -> Action {
-        let Some(&surface_id) = ctx.viewport_to_wl_surface.get(&sender.guest) else {
-            return ctx.reject(
-                sender.guest,
-                wp_viewport::ERROR_NO_SURFACE,
-                "wp_viewport has no associated wl_surface",
-            );
+        let surface_id = match viewport_surface(ctx, sender.guest) {
+            Ok(surface) => surface,
+            Err(action) => return action,
         };
         let unset = (x, y, width, height) == (-256, -256, -256, -256);
         if !unset && (x < 0 || y < 0 || width <= 0 || height <= 0) {
@@ -852,12 +888,9 @@ impl wp_viewport::WpViewportHandler for Handlers {
         width: i32,
         height: i32,
     ) -> Action {
-        let Some(&surface_id) = ctx.viewport_to_wl_surface.get(&sender.guest) else {
-            return ctx.reject(
-                sender.guest,
-                wp_viewport::ERROR_NO_SURFACE,
-                "wp_viewport has no associated wl_surface",
-            );
+        let surface_id = match viewport_surface(ctx, sender.guest) {
+            Ok(surface) => surface,
+            Err(action) => return action,
         };
         let unset = width == -1 && height == -1;
         if !unset && (width <= 0 || height <= 0) {
@@ -880,14 +913,12 @@ impl wp_viewport::WpViewportHandler for Handlers {
     }
 }
 
-/// Forget guest `wp_viewport` `viewport_id`, which ended (see
+/// Forget guest `wp_viewport` `viewport`, which ended (see
 /// `crate::state::lifecycle`): its surface's next commit removes the
 /// viewport.
-pub(crate) fn forget_viewport(ctx: &mut Context, viewport_id: GuestId) {
-    if let Some(surface_id) = ctx.viewport_to_wl_surface.remove(&viewport_id) {
-        if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-            surface.pending.viewport = Some(None);
-        }
+pub(crate) fn forget_viewport(ctx: &mut Context, viewport: Viewport) {
+    if let Some(surface) = viewport.surface.and_then(|id| ctx.surfaces.get_mut(&id)) {
+        surface.pending.viewport = Some(None);
     }
 }
 
@@ -1623,7 +1654,7 @@ mod tests {
         );
         assert_eq!(s.host_received(), []);
         // Reads state no peer can observe once the session has ended.
-        assert!(s.ctx().viewport_to_wl_surface.is_empty());
+        assert!(s.ctx().shadow_table.data_of::<Viewport>().next().is_none());
     }
 
     /// The side of the square ARGB8888 frames of the copy tests.

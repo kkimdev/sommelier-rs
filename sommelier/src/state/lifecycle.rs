@@ -175,7 +175,13 @@ fn forget_object(
     match data {
         ObjectData::DmabufFactory(factory) => linux_dmabuf::forget_factory(ctx, factory),
         ObjectData::DmabufFeedback(feedback) => linux_dmabuf::forget_feedback(ctx, guest, feedback),
-        ObjectData::None | ObjectData::Shm(_) | ObjectData::ShmPool(_) | ObjectData::Params(_) => {}
+        ObjectData::Viewport(viewport) => compositor::forget_viewport(ctx, viewport),
+        ObjectData::None
+        | ObjectData::Shm(_)
+        | ObjectData::ShmPool(_)
+        | ObjectData::Params(_)
+        | ObjectData::GtkShell(_)
+        | ObjectData::GtkSurface(_) => {}
     }
     match (interface, host) {
         (Iface::WlRegistry, Some(host)) => registry::forget_registry(ctx, host),
@@ -192,14 +198,12 @@ fn forget_object(
             | Iface::WlSurface,
             None,
         ) => {}
-        (Iface::WpViewport, _) => compositor::forget_viewport(ctx, guest),
         (Iface::XdgSurface, _) => compositor::forget_xdg_surface(ctx, guest),
         (Iface::XdgToplevel, _) => compositor::forget_xdg_toplevel(ctx, guest),
         (Iface::ZwpTextInputV3, _) => text_input::forget_text_input(ctx, guest, host_deleted),
         // No state of their own outside their entry, or none that ends
-        // here: a GTK surface's ends with its `wl_surface`
-        // (`compositor::forget_surface`), and a GTK shell, which the guest
-        // cannot destroy, lasts the connection.
+        // here: GTK shells and surfaces, which have no destructor, last
+        // the connection.
         (
             Iface::WlDisplay
             | Iface::WlShm
@@ -207,6 +211,7 @@ fn forget_object(
             | Iface::ZwpLinuxDmabufV1
             | Iface::ZwpLinuxDmabufFeedbackV1
             | Iface::ZwpLinuxBufferParamsV1
+            | Iface::WpViewport
             | Iface::WlCallback
             | Iface::WlCompositor
             | Iface::WlBuffer
@@ -297,16 +302,17 @@ impl Context {
         for &surface in self.surfaces.keys() {
             guest("wl_surface state", surface, Iface::WlSurface);
         }
-        for (&viewport, &surface) in &self.viewport_to_wl_surface {
-            guest("viewport link", viewport, Iface::WpViewport);
-            guest("viewport link", surface, Iface::WlSurface);
+        // A viewport's or GTK surface's link to its wl_surface ends with
+        // that surface.
+        for (_, viewport) in table.data_of::<crate::handler::compositor::Viewport>() {
+            if let Some(surface) = viewport.surface_for_test() {
+                guest("viewport link", surface, Iface::WlSurface);
+            }
         }
-        for &gtk_shell in self.gtk_shells.keys() {
-            guest("GTK shell", gtk_shell, Iface::GtkShell1);
-        }
-        for (&gtk_surface, state) in &self.gtk_surfaces {
-            guest("GTK surface", gtk_surface, Iface::GtkSurface1);
-            guest("GTK surface", state.wl_surface_id, Iface::WlSurface);
+        for (_, gtk_surface) in table.data_of::<crate::handler::gtk_shell::GtkSurface>() {
+            if let Some(surface) = gtk_surface.wl_surface_for_test() {
+                guest("GTK surface", surface, Iface::WlSurface);
+            }
         }
         for (xdg_surface, wl_surface, toplevel) in self.xdg_roles.roles_for_test() {
             guest("xdg role", xdg_surface, Iface::XdgSurface);

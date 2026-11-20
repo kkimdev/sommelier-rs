@@ -21,8 +21,51 @@ use crate::protocols::aura_shell::zaura_surface;
 use crate::protocols::gtk::gtk_shell1::{self, GtkShell1Handler};
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
 use crate::protocols::Iface;
-use crate::state::{Context, GtkSurfaceState, GuestId, HostId, RequestObject, RequestSender};
+use crate::state::{Context, GuestId, HostId, RequestObject, RequestSender};
 use crate::wire::Action;
+
+/// A synthetic guest `gtk_shell1`, which lasts the connection; its table
+/// entry keeps it.
+#[derive(Debug, Default)]
+pub(crate) struct GtkShell {
+    /// Activation token supplied by GTK for windows created through this
+    /// shell binding. ChromeOS validates the token before granting focus.
+    startup_id: Option<String>,
+}
+
+/// A synthetic guest `gtk_surface1`, which lasts the connection; its table
+/// entry keeps it.
+#[derive(Debug)]
+pub(crate) struct GtkSurface {
+    shell: GuestId,
+    /// The `wl_surface` it wraps, until that ends ([`forget_wl_surface`]).
+    wl_surface: Option<GuestId>,
+}
+
+#[cfg(test)]
+impl GtkSurface {
+    /// The surface it wraps, for the orphan check.
+    pub(crate) fn wl_surface_for_test(&self) -> Option<GuestId> {
+        self.wl_surface
+    }
+}
+
+/// Create synthetic guest `gtk_shell1` `shell` at `version`, as the guest
+/// binds it.
+pub(crate) fn create_shell(ctx: &mut Context, shell: GuestId, version: u32) {
+    ctx.shadow_table
+        .create_local_with(shell, Iface::GtkShell1, version, GtkShell::default());
+}
+
+/// Guest `wl_surface` `wl_surface` ended: the GTK surfaces that wrapped it
+/// wrap nothing now, so a later surface under its ID is not theirs.
+pub(crate) fn forget_wl_surface(ctx: &mut Context, wl_surface: GuestId) {
+    for (_, gtk_surface) in ctx.shadow_table.data_of_mut::<GtkSurface>() {
+        if gtk_surface.wl_surface == Some(wl_surface) {
+            gtk_surface.wl_surface = None;
+        }
+    }
+}
 
 /// Queue the GTK activation token to an Aura surface. Every Aura surface
 /// supports `set_startup_id`: the registry binds no older `zaura_shell`.
@@ -43,7 +86,7 @@ const GTK_SHELL_CAPABILITIES: u32 = 0;
 /// [`crate::state::InternalCallback::GtkShellCapabilities`]). A shell the
 /// guest has destroyed meanwhile gets nothing.
 pub(crate) fn announce_capabilities(ctx: &mut Context, gtk_shell_id: GuestId) {
-    if !ctx.gtk_shells.contains_key(&gtk_shell_id) || !ctx.shadow_table.is_local(gtk_shell_id) {
+    if ctx.shadow_table.data::<GtkShell>(gtk_shell_id).is_none() {
         return;
     }
     ctx.send_guest(gtk_shell1::evt::capabilities(
@@ -62,8 +105,8 @@ impl GtkShell1Handler for Handlers {
         let shell_id = sender.guest;
         let wl_surface_id = wl_surface.guest;
         let Some(startup_id) = ctx
-            .gtk_shells
-            .get(&shell_id)
+            .shadow_table
+            .data::<GtkShell>(shell_id)
             .map(|shell| shell.startup_id.clone())
         else {
             log::warn!(
@@ -74,14 +117,15 @@ impl GtkShell1Handler for Handlers {
         };
 
         // A new object takes its parent's version.
-        ctx.shadow_table
-            .create_local(gtk_surface_id, Iface::GtkSurface1, sender.version);
-        ctx.gtk_surfaces.insert(
+        let gtk_surface = GtkSurface {
+            shell: shell_id,
+            wl_surface: Some(wl_surface_id),
+        };
+        ctx.shadow_table.create_local_with(
             gtk_surface_id,
-            GtkSurfaceState {
-                shell_id,
-                wl_surface_id,
-            },
+            Iface::GtkSurface1,
+            sender.version,
+            gtk_surface,
         );
         if let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_id) {
             queue_startup_id(ctx, zaura_surface_id, startup_id.as_deref());
@@ -95,7 +139,7 @@ impl GtkShell1Handler for Handlers {
         startup_id: &Option<String>,
     ) -> Action {
         let shell_id = sender.guest;
-        let Some(shell) = ctx.gtk_shells.get_mut(&shell_id) else {
+        let Some(shell) = ctx.shadow_table.data_mut::<GtkShell>(shell_id) else {
             log::warn!(
                 "Ignoring set_startup_id from unknown gtk_shell1 {}",
                 shell_id
@@ -105,10 +149,10 @@ impl GtkShell1Handler for Handlers {
         shell.startup_id.clone_from(startup_id);
         // Two GTK surfaces may wrap one wl_surface; it has one Aura surface.
         let wl_surface_ids = ctx
-            .gtk_surfaces
-            .values()
-            .filter(|surface| surface.shell_id == shell_id)
-            .map(|surface| surface.wl_surface_id)
+            .shadow_table
+            .data_of::<GtkSurface>()
+            .filter(|(_, surface)| surface.shell == shell_id)
+            .filter_map(|(_, surface)| surface.wl_surface)
             .collect::<std::collections::BTreeSet<_>>();
         for wl_surface_id in wl_surface_ids {
             if let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_id) {
@@ -141,11 +185,8 @@ impl GtkSurface1Handler for Handlers {
         let Some(application_id) = application_id.as_deref() else {
             return Action::Drop;
         };
-        let Some(wl_surface_id) = ctx
-            .gtk_surfaces
-            .get(&sender.guest)
-            .map(|surface| surface.wl_surface_id)
-        else {
+        let gtk_surface = ctx.shadow_table.data::<GtkSurface>(sender.guest);
+        let Some(wl_surface_id) = gtk_surface.and_then(|surface| surface.wl_surface) else {
             return Action::Drop;
         };
         let application_id = native_wayland_app_id(&ctx.settings().vm_id, application_id);
