@@ -406,20 +406,8 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
     release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
     window_placement::forget_surface(ctx, wl_surface_guest_id);
     ctx.outputs.surface_destroyed(wl_surface_host_id);
-    let gtk_surface_ids = ctx
-        .gtk_surfaces
-        .iter()
-        .filter_map(|(&gtk_surface_id, state)| {
-            (state.wl_surface_id == wl_surface_guest_id).then_some(gtk_surface_id)
-        })
-        .collect::<Vec<_>>();
-    for gtk_surface_id in gtk_surface_ids {
-        if let Some(state) = ctx.gtk_surfaces.remove(&gtk_surface_id) {
-            if let Some(shell) = ctx.gtk_shells.get_mut(&state.shell_id) {
-                shell.surfaces.remove(&gtk_surface_id);
-            }
-        }
-    }
+    ctx.gtk_surfaces
+        .retain(|_, state| state.wl_surface_id != wl_surface_guest_id);
     // A submitted buffer may have been detached from another surface and
     // still be waiting for wl_buffer.release; only buffers that this host
     // surface actually held may be retired merely because its destructor

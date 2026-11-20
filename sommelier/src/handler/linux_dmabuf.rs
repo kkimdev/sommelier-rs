@@ -421,7 +421,7 @@ impl LinuxDmabufHandler {
         // Send the ADDs, each handing its descriptor to the queue. The caller
         // queues its CREATE right after.
         for param in params {
-            // PASS THE GUEST'S EXACT METADATA. NO MINIGBM OVERRIDES.
+            // The guest's metadata, with `on_add`'s plane-0 fix-up.
             ctx.client_to_host_queue
                 .push(zwp_linux_buffer_params_v1::req::add(
                     host_id,
@@ -549,8 +549,6 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
         if !is_supported_drm_format(format) {
             return Action::Drop;
         }
-        ctx.supported_formats.insert(format);
-
         if let Some(internal_id) = ctx.host_dmabuf_id {
             if ctx.last_sender_id == internal_id {
                 record_host_shm_drm_format(ctx, format);
@@ -611,8 +609,6 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
         }
         // We forward supported modifiers to the guest. The modifier itself is
         // intentionally preserved; LINEAR (0) is a valid modifier.
-        ctx.supported_formats.insert(format);
-
         if let Some(internal_id) = ctx.host_dmabuf_id {
             if ctx.last_sender_id == internal_id {
                 record_host_shm_drm_format(ctx, format);

@@ -239,7 +239,6 @@ fn retire_unseen_global(ctx: &mut Context, name: u32) {
     reset_internal_binding_for_global(ctx, name);
     crate::handler::shm::retire_guest_shms(ctx, name);
     ctx.singleton_candidates.remove(&name);
-    ctx.hidden_host_globals.remove(&name);
     ctx.host_globals.remove(&name);
     if ensure_all_bound(ctx).is_err() {
         // The failed bind ended the session in `ctx`, which is all its
@@ -579,8 +578,8 @@ impl Singleton {
             }
             Self::Shm => {
                 // wl_shm is emulated: on_bind drops the guest request and
-                // sends synthetic format events, so the host never sends
-                // wl_shm events to us. It is nevertheless a live host object.
+                // sends synthetic format events. The host's format events
+                // reach this binding, which records them (`shm::pool`).
                 let host_id = ctx.shadow_table.create_host_only(interface, WL_SHM_VERSION);
                 ctx.host_shm_id = Some(host_id);
                 ctx.host_shm_global_name = Some(name);
@@ -653,8 +652,6 @@ fn ensure_all_bound(ctx: &mut Context) -> Result<(), Action> {
 fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
     ctx.host_dmabuf_global_name == Some(name)
         || ctx.host_shm_global_name == Some(name)
-        || ctx.host_text_input_manager_v1_global_name == Some(name)
-        || ctx.host_text_input_extension_v1_global_name == Some(name)
         || ctx.host_keyboard_extension_global_name == Some(name)
         || ctx
             .host_zaura_shell
@@ -680,7 +677,6 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
             ctx.retire_destroyed_host_object(host_id);
         }
         ctx.host_dmabuf_global_name = None;
-        ctx.supported_formats.clear();
         clear_host_shm_dmabuf_formats(ctx);
         if let Some(generation) = generation {
             crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
@@ -693,19 +689,9 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         ctx.host_shm_global_name = None;
         clear_host_shm_wl_formats(ctx);
     }
-    if ctx.host_text_input_manager_v1_global_name == Some(name) {
-        // The v1 manager has no wire-level destructor.  `global_remove`
-        // invalidates only the advertisement; already-bound synthetic v3
-        // managers still use the host proxy to create text-input children.
-        // Keep its ID and dispatch metadata reserved until connection teardown.
-        ctx.host_text_input_manager_v1_global_name = None;
-    }
-    if ctx.host_text_input_extension_v1_global_name == Some(name) {
-        // As with the v1 manager, this extension manager has no destructor.
-        // Existing text-input resources may request extended children after
-        // the global disappears, so retain the bound host object.
-        ctx.host_text_input_extension_v1_global_name = None;
-    }
+    // The text-input managers have no destructor, and text inputs still
+    // create children from them after their globals go, so they are never
+    // reset or rebound (see `text_input_manager_global`).
     if ctx.host_keyboard_extension_global_name == Some(name) {
         if let Some(host_id) = ctx.host_keyboard_extension_id.take() {
             ctx.shadow_table.retire_host(host_id.0);
@@ -738,7 +724,6 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
     // A remote surface keeps its role through its manager, so the manager
     // is retired without a destructor, as the keyboard extension is.
     crate::handler::window_placement::remote_shell_retired(ctx, name);
-    ctx.hidden_host_globals.remove(&name);
 }
 
 /// Remove advertisement metadata left by the previous generation of a
@@ -754,7 +739,6 @@ fn replace_global_metadata_for_generation(ctx: &mut Context, name: u32) {
     ctx.removed_global_generations.remove(&name);
     ctx.singleton_candidates.remove(&name);
     ctx.host_globals.remove(&name);
-    ctx.hidden_host_globals.remove(&name);
 }
 
 /// Advertise host global `name` to the guest on the sending registry as
@@ -773,8 +757,7 @@ fn advertise_synthetic_global(ctx: &mut Context, name: u32, interface: &str, ver
 
 /// Keep host global `name` of `interface`, which the proxy uses itself,
 /// from the guest.
-fn hide_global(ctx: &mut Context, name: u32, interface: &str) {
-    ctx.hidden_host_globals.insert(name, interface.to_string());
+fn hide_global(ctx: &mut Context, name: u32) {
     record_registry_global_visibility(ctx, name, false);
 }
 
@@ -1028,7 +1011,7 @@ fn dmabuf_global(ctx: &mut Context, name: u32, version: u32) -> Action {
         // be advertised by the synthetic wl_shm global. Keep the
         // linux-dmabuf global hidden from the guest, matching
         // ChromiumOS's separate --enable-linux-dmabuf switch.
-        hide_global(ctx, name, interface);
+        hide_global(ctx, name);
     }
     // The host's own advertisement is uncapped, so it is never forwarded.
     dropped(ensure_bound(ctx, Singleton::Dmabuf))
@@ -1052,7 +1035,6 @@ fn text_input_manager_global(ctx: &mut Context, name: u32, version: u32) -> Acti
     // This object is internal: there is no guest-side pair.
     let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
     ctx.host_text_input_manager_v1_id = Some(host_id);
-    ctx.host_text_input_manager_v1_global_name = Some(name);
     let registry_host_id = ctx.last_sender_id;
     dropped(bind_internally(
         ctx,
@@ -1068,14 +1050,13 @@ fn text_input_manager_global(ctx: &mut Context, name: u32, version: u32) -> Acti
 /// proxy binds the first one for itself.
 fn text_input_extension_global(ctx: &mut Context, name: u32, version: u32) -> Action {
     let interface = zcr_text_input_extension_v1::NAME;
-    hide_global(ctx, name, interface);
+    hide_global(ctx, name);
     if ctx.host_text_input_extension_v1_id.is_some() {
         return Action::Drop;
     }
     let bound_version = version.min(TEXT_INPUT_EXTENSION_VERSION);
     let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
     ctx.host_text_input_extension_v1_id = Some(host_id);
-    ctx.host_text_input_extension_v1_global_name = Some(name);
     let registry_host_id = ctx.last_sender_id;
     dropped(bind_internally(
         ctx,
@@ -1090,7 +1071,7 @@ fn text_input_extension_global(ctx: &mut Context, name: u32, version: u32) -> Ac
 /// A host `zcr_remote_shell_v2` global the remote-shell-v2 placement
 /// backend wants: bound for it, and never advertised to the guest.
 fn remote_shell_global(ctx: &mut Context, name: u32, version: u32) -> Action {
-    hide_global(ctx, name, zcr_remote_shell_v2::NAME);
+    hide_global(ctx, name);
     add_candidate(ctx, Singleton::RemoteShell, name, version);
     dropped(ensure_bound(ctx, Singleton::RemoteShell))
 }
@@ -1098,7 +1079,7 @@ fn remote_shell_global(ctx: &mut Context, name: u32, version: u32) -> Action {
 /// A host `zcr_keyboard_extension_v1` global, hidden from the guest and a
 /// candidate for the proxy's own binding.
 fn keyboard_extension_global(ctx: &mut Context, name: u32, version: u32) -> Action {
-    hide_global(ctx, name, zcr_keyboard_extension_v1::NAME);
+    hide_global(ctx, name);
     add_candidate(ctx, Singleton::KeyboardExtension, name, version);
     dropped(ensure_bound(ctx, Singleton::KeyboardExtension))
 }
@@ -2996,8 +2977,8 @@ mod tests {
             "reused name must not retain the old visible interface metadata"
         );
         assert_eq!(
-            ctx.hidden_host_globals.get(&7).map(String::as_str),
-            Some(keyboard_extension),
+            ctx.host_keyboard_extension_global_name,
+            Some(7),
             "the replacement hidden global must own the numeric name"
         );
 
@@ -3021,10 +3002,6 @@ mod tests {
         // Name 7 is now a normal visible global. A stale hidden marker would
         // make its later global_remove disappear instead of reaching the guest.
         assert_eq!(A.global(&mut ctx, 7, "wl_seat", 5), Action::Forward);
-        assert!(
-            !ctx.hidden_host_globals.contains_key(&7),
-            "reused name must not retain hidden classification"
-        );
         assert_eq!(
             ctx.host_globals.get(&7),
             Some(&HostGlobal {

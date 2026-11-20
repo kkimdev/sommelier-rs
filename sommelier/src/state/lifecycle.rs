@@ -231,11 +231,8 @@ impl Context {
             guest("viewport link", viewport, "wp_viewport");
             guest("viewport link", surface, "wl_surface");
         }
-        for (&gtk_shell, state) in &self.gtk_shells {
+        for &gtk_shell in self.gtk_shells.keys() {
             guest("GTK shell", gtk_shell, "gtk_shell1");
-            for &gtk_surface in &state.surfaces {
-                guest("GTK shell surface", gtk_surface, "gtk_surface1");
-            }
         }
         for (&gtk_surface, state) in &self.gtk_surfaces {
             guest("GTK surface", gtk_surface, "gtk_surface1");
@@ -415,7 +412,7 @@ impl Context {
         }
         // A removal on record is of the global's current generation, and
         // waits for a registry that still lists it; a global the proxy
-        // drops is in neither `host_globals` nor `hidden_host_globals`.
+        // drops is in no registry's record.
         for (&name, &generation) in &self.removed_global_generations {
             assert_eq!(
                 self.global_generations.get(&name),

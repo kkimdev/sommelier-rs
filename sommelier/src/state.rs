@@ -297,8 +297,6 @@ pub struct GtkShellState {
     /// Activation token supplied by GTK for windows created through this
     /// shell binding. ChromeOS validates the token before granting focus.
     pub startup_id: Option<String>,
-    /// Synthetic gtk_surface1 objects created from this shell binding.
-    pub surfaces: BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,18 +406,10 @@ pub struct Context {
     pub host_shm_id: Option<u32>,
     /// Global name that produced the currently bound internal wl_shm object.
     pub host_shm_global_name: Option<u32>,
-    /// Global names that produced the internal singleton bindings. These
-    /// names let registry removal reset exactly the binding that disappeared,
+    /// Global name that produced the internal keyboard extension binding,
+    /// so that registry removal resets exactly the binding that disappeared,
     /// without tearing down a duplicate or a newer global generation.
-    pub host_text_input_manager_v1_global_name: Option<u32>,
-    pub host_text_input_extension_v1_global_name: Option<u32>,
     pub host_keyboard_extension_global_name: Option<u32>,
-    /// Formats observed from the host's SHM or dmabuf capability events that
-    /// the SHM bridge can actually copy. ARGB/XRGB are always available per
-    /// the wl_shm contract; optional formats are added only after the host
-    /// advertises them. Only a VirtWL session offers all of them to the
-    /// guest; without VirtWL only `host_wl_shm_formats` count.
-    pub host_shm_formats: BTreeSet<u32>,
     /// Optional formats learned from the internal host wl_shm binding.
     /// Keeping the source separate lets a dmabuf global disappear without
     /// invalidating a format that the host's real wl_shm object still offers.
@@ -479,17 +469,12 @@ pub struct Context {
     /// ARC bounds policy, and the placement bindings. Shared, never copied:
     /// a reloaded binding generation is visible to the next lookup.
     placement: Arc<PlacementConfig>,
-    pub supported_formats: BTreeSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
     /// the host's interface and version, while a registry lists it; see
     /// `handler::registry::Singleton`.
     pub(crate) singleton_candidates: BTreeMap<u32, HostGlobal>,
-    /// Host globals consumed internally by the proxy and therefore never
-    /// advertised to the guest. Keeping their names lets global_remove clean
-    /// the corresponding host-only object without leaking a removal event.
-    pub hidden_host_globals: BTreeMap<u32, String>,
     /// What each host registry has advertised, by host registry ID (see
     /// [`RegistryRecord`]).
     pub(crate) registries: BTreeMap<u32, RegistryRecord>,
@@ -1045,10 +1030,7 @@ impl Context {
             host_dmabuf_global_name: None,
             host_shm_id: None,
             host_shm_global_name: None,
-            host_text_input_manager_v1_global_name: None,
-            host_text_input_extension_v1_global_name: None,
             host_keyboard_extension_global_name: None,
-            host_shm_formats: BTreeSet::new(),
             host_wl_shm_formats: BTreeSet::new(),
             host_dmabuf_shm_formats: BTreeSet::new(),
             guest_shms: BTreeMap::new(),
@@ -1065,10 +1047,8 @@ impl Context {
             keyboard_xkb_states: BTreeMap::new(),
             keyboard_modifiers: BTreeMap::new(),
             placement,
-            supported_formats: BTreeSet::new(),
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
-            hidden_host_globals: BTreeMap::new(),
             registries: BTreeMap::new(),
             global_generations: BTreeMap::new(),
             next_global_generation: 1,
