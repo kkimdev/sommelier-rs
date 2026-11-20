@@ -41,19 +41,29 @@ use crate::proxy::harness::{Object, Session};
 use crate::state::{GuestKeyOwner, OutputState};
 use crate::test_support::text_input::{self, Host};
 use crate::test_support::{decode, msg_opcode, msg_sender, shm_pool_file};
+use crate::window_layout::NormalizedRect;
 use crate::wire::WL_DISPLAY_ID;
 use std::os::fd::AsFd;
 use xkb::keysyms;
-use GuestKeyOwner::{CompositorShortcut, ImeRecovery, Physical};
+use GuestKeyOwner::{ImeRecovery, Physical, Shortcut};
 
 /// The named preset `name`.
 fn preset(name: &str) -> NormalizedRect {
     NormalizedRect::preset(name).unwrap_or_else(|| panic!("no preset {name:?}"))
 }
 
+/// A key's class, with a shortcut's binding resolved to where it places
+/// the focused window.
+#[derive(Debug, PartialEq)]
+enum Class {
+    Guest,
+    HostAccelerator,
+    Placed(Option<NormalizedRect>),
+}
+
 /// The class of a chord bound to the named preset `name`.
-fn placed(name: &str) -> KeyClass {
-    KeyClass::Placement(preset(name))
+fn placed(name: &str) -> Class {
+    Class::Placed(Some(preset(name)))
 }
 
 // Evdev keycodes and modifier masks of the default keymap, which
@@ -300,8 +310,12 @@ impl Proxy {
             .backspace_repeat_cancelled(HostId(k.host))
     }
 
-    fn classify(&self, k: Mapped, key: u32) -> KeyClass {
-        KeyboardHandler::classify_key(&self.ctx, HostId(k.host), key)
+    fn classify(&self, k: Mapped, key: u32) -> Class {
+        match KeyboardHandler::classify_key(&self.ctx, HostId(k.host), key) {
+            KeyClass::Guest => Class::Guest,
+            KeyClass::HostAccelerator => Class::HostAccelerator,
+            KeyClass::Shortcut(binding) => Class::Placed(self.ctx.placement_rect(binding)),
+        }
     }
 }
 
@@ -784,13 +798,13 @@ fn chord_classification_follows_the_configuration() {
         (&nine, ALT, KEY_X, placed("bottom")),
         (&nine, ALT, KEY_C, placed("bottom-right")),
         // A binding needs exactly its modifiers.
-        (&alt_q, 0, KEY_Q, KeyClass::Guest),
-        (&alt_q, ALT | SHIFT, KEY_Q, KeyClass::Guest),
+        (&alt_q, 0, KEY_Q, Class::Guest),
+        (&alt_q, ALT | SHIFT, KEY_Q, Class::Guest),
         (&control_q, CONTROL, KEY_Q, placed("top-left")),
-        (&off, ALT, KEY_Q, KeyClass::Guest),
-        (&both, CONTROL, KEY_A, KeyClass::HostAccelerator),
+        (&off, ALT, KEY_Q, Class::Guest),
+        (&both, CONTROL, KEY_A, Class::HostAccelerator),
         (&both, CONTROL, KEY_Q, placed("top-left")),
-        (&both, CONTROL, KEY_Z, KeyClass::Guest),
+        (&both, CONTROL, KEY_Z, Class::Guest),
     ];
     for ((host_accelerators, placement), modifiers, key, class) in cases {
         let settings = crate::settings::Settings {
@@ -839,7 +853,7 @@ fn compositor_shortcut_is_handled_and_release_is_suppressed() {
     assert_eq!(press, KeyVerdict::Shortcut);
     assert_eq!(
         ctx.key_generations.guest_owner(keyboard, key),
-        Some(CompositorShortcut)
+        Some(Shortcut)
     );
 
     let release = ctx
@@ -1000,7 +1014,7 @@ fn placement_chord_is_consumed_while_aura_scale_metadata_is_incomplete() {
         Action::Drop,
         "a skipped placement must not leak the chord to the guest"
     );
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(CompositorShortcut));
+    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
     assert_eq!(p.key(PLACING, 2, 101, KEY_Q, RELEASED), Action::Drop);
     assert_eq!(p.owner(PLACING, KEY_Q), None);
     assert_eq!(
@@ -1087,11 +1101,7 @@ fn a_skipped_placement_still_consumes_its_chord() {
             "{skip:?}"
         );
         assert_eq!(queued_bounds(&p.ctx), NOT_PLACED, "{skip:?}");
-        assert_eq!(
-            p.owner(PLACING, KEY_Q),
-            Some(CompositorShortcut),
-            "{skip:?}"
-        );
+        assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut), "{skip:?}");
         assert_eq!(
             p.key(PLACING, 3, 160, KEY_Q, RELEASED),
             Action::Drop,
@@ -1128,7 +1138,7 @@ fn a_bindings_file_edit_takes_effect_on_the_next_press() {
     let mut p = placeable(placement, placeable_output());
     assert_eq!(
         p.classify(PLACING, KEY_Q),
-        KeyClass::Guest,
+        Class::Guest,
         "the file binds nothing"
     );
 
@@ -1138,7 +1148,7 @@ fn a_bindings_file_edit_takes_effect_on_the_next_press() {
     );
     assert_eq!(
         p.classify(PLACING, KEY_Q),
-        KeyClass::Guest,
+        Class::Guest,
         "only a reload adopts an edit"
     );
     // What the watcher does as the file changes.
@@ -1149,7 +1159,7 @@ fn a_bindings_file_edit_takes_effect_on_the_next_press() {
         "the new chord is consumed by the compositor"
     );
     assert_eq!(queued_bounds(&p.ctx), (1, Some([960, 0, 1920, 2160])));
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(CompositorShortcut));
+    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
 
     // Removing the binding while the key is held still suppresses the
     // matching release: ownership, not the binding, owns the release.
@@ -1223,7 +1233,7 @@ fn peeked_placement_chord_is_not_an_ime_recovery_candidate() {
         TOP_LEFT_BOUNDS,
         "the window is placed"
     );
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(CompositorShortcut));
+    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
 
     assert_eq!(p.peek(PLACING, 3, 101, KEY_Q, RELEASED), Action::Drop);
     assert_eq!(p.key(PLACING, 3, 101, KEY_Q, RELEASED), Action::Drop);
@@ -1273,7 +1283,7 @@ fn duplicate_shortcut_press_does_not_queue_another_placement() {
         "a duplicate press must not place the window again"
     );
     assert_eq!(p.ctx.internal_callbacks.count(), barriers);
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(CompositorShortcut));
+    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
 
     assert_eq!(p.key(PLACING, 3, 160, KEY_Q, RELEASED), Action::Drop);
     assert_eq!(p.owner(PLACING, KEY_Q), None);
@@ -1385,7 +1395,7 @@ fn placement_shortcuts_leave_the_focused_ime_generation_untouched() {
 fn focus_leave_during_consumed_shortcut_does_not_swallow_the_next_press() {
     let mut p = placeable_shortcut();
     assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(CompositorShortcut));
+    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
 
     // Focus leaves before the chord's release, which the old surface
     // will never receive. The consumed generation must not survive and

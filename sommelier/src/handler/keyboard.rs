@@ -23,8 +23,9 @@ limitations under the License.
 //! Keys listed in `SOMMELIER_ACCELERATORS` are acked as `NOT_HANDLED` (host
 //! runs the accelerator, key is not forwarded to guest). All other keys are
 //! acked as `HANDLED` (guest receives the key, host skips the accelerator).
-//! A chord bound to a placement action is consumed here and placed by
-//! [`crate::handler::window_placement::place_focused`].
+//! A chord a shortcut binds is consumed here, and its binding goes to the
+//! shortcut's subscriber, window placement
+//! ([`crate::handler::window_placement::shortcut`]).
 //!
 //! Each key's press and release on `wl_keyboard` and on
 //! `zcr_extended_keyboard_v1.peek_key` move its generation in
@@ -33,6 +34,7 @@ limitations under the License.
 //!
 //! See `sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
+use crate::accelerator::BindingId;
 use crate::handler::ime_keys::lease;
 use crate::keymap::{self, Keymap};
 use crate::protocols::keyboard_extension_unstable_v1::{
@@ -44,7 +46,6 @@ use crate::state::{
     LeaseInput, PeekInput, PhysicalKey,
 };
 use crate::warn_once::WarnOnce;
-use crate::window_layout::NormalizedRect;
 use crate::wire::Action;
 use std::os::fd::BorrowedFd;
 use xkbcommon::xkb;
@@ -70,19 +71,19 @@ fn take_no_keyboard_extension_log_level(once: &WarnOnce) -> log::Level {
 enum KeyClass {
     /// Listed in `SOMMELIER_ACCELERATORS`: the host runs the accelerator.
     HostAccelerator,
-    /// Bound to a placement while placement is on: Sommelier owns the
-    /// chord, and places the focused window at the rectangle.
-    Placement(NormalizedRect),
+    /// Bound to a shortcut: Sommelier owns the chord, and its subscriber
+    /// runs the binding.
+    Shortcut(BindingId),
     /// Ordinary guest input.
     Guest,
 }
 
 impl KeyClass {
-    /// The class the key generations know: placement is the keyboard's.
+    /// The class the key generations know, without the binding.
     fn chord(self) -> ChordClass {
         match self {
             Self::HostAccelerator => ChordClass::HostAccelerator,
-            Self::Placement(_) => ChordClass::Shortcut,
+            Self::Shortcut(_) => ChordClass::Shortcut,
             Self::Guest => ChordClass::Guest,
         }
     }
@@ -137,10 +138,10 @@ impl KeyboardHandler {
     /// Decide who owns a key from its chord alone.
     ///
     /// Both key channels (`wl_keyboard.key` and `peek_key`) ask this one
-    /// classification. `Context::placement_rect_for` binds a chord only
-    /// while placement is on, and the validator rejects a chord that is
-    /// both a host accelerator and a binding; if one slipped through, the
-    /// host keeps its accelerator.
+    /// classification. `Context::shortcut_for` binds a chord only while
+    /// its subscriber, placement, is on, and the validator rejects a chord
+    /// that is both a host accelerator and a binding; if one slipped
+    /// through, the host keeps its accelerator.
     fn classify_key(ctx: &Context, host_keyboard_id: HostId, key: u32) -> KeyClass {
         let keymap = ctx
             .keyboards
@@ -152,8 +153,8 @@ impl KeyboardHandler {
         };
         let class = if ctx.is_host_accelerator(&chord) {
             KeyClass::HostAccelerator
-        } else if let Some(action) = ctx.placement_rect_for(&chord) {
-            KeyClass::Placement(action)
+        } else if let Some(binding) = ctx.shortcut_for(&chord) {
+            KeyClass::Shortcut(binding)
         } else {
             KeyClass::Guest
         };
@@ -557,21 +558,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         let verdict = ctx
             .key_generations
             .transition_physical(host_keyboard_id, key, event);
-        if let (KeyVerdict::Shortcut, KeyClass::Placement(action)) = (verdict, class) {
-            // The policy owns every matched chord, so the chord is
-            // consumed whether or not the window can move now; a skip
-            // must not leak the key to the guest.
-            if let Err(reason) =
-                crate::handler::window_placement::place_focused(ctx, host_keyboard_id, action)
-            {
-                log::log!(
-                    reason.log_level(),
-                    "window layout {:?} skipped for keyboard {}: {:?}",
-                    action,
-                    host_keyboard_id.0,
-                    reason
-                );
-            }
+        if let (KeyVerdict::Shortcut, KeyClass::Shortcut(binding)) = (verdict, class) {
+            crate::handler::window_placement::shortcut(ctx, host_keyboard_id, binding);
         }
         if state == KEY_STATE_RELEASED && key == EVDEV_KEY_BACKSPACE {
             lease(ctx, guest_seat, LeaseInput::BackspaceRelease);
@@ -694,7 +682,7 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
         };
         let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
         // Only guest input may be recovered for an empty IME confirmation.
-        // Host accelerators and placement chords belong to the host and to
+        // Host accelerators and shortcut chords belong to the host and to
         // Sommelier: if a recovery claimed one first, the wl_keyboard press
         // that follows would find the guest already owning it.
         let key_class =
@@ -730,12 +718,12 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             }
         }
         if let Some(sequence) = outcome.numbered {
-            if let Some(KeyClass::Placement(action)) = key_class {
+            if let Some(KeyClass::Shortcut(binding)) = key_class {
                 log::debug!(
-                    "peek_key: placement chord {:?} on keyboard {}; it is placed only \
-                     by the matching wl_keyboard.key, so if the host IME consumes it \
-                     the chord is neither placed nor delivered",
-                    action,
+                    "peek_key: shortcut chord {:?} on keyboard {}; it runs only on the \
+                     matching wl_keyboard.key, so if the host IME consumes it the chord \
+                     is neither run nor delivered",
+                    binding,
                     host_keyboard_id.0
                 );
             }

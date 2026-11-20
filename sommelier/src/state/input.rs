@@ -30,7 +30,7 @@ pub struct PeekKeyProvenance {
     pub time: u32,
     pub sequence: u64,
     /// The generation is guest input, which may recover an IME-consumed
-    /// repeat. Host accelerators and placement chords permanently clear
+    /// repeat. Host accelerators and shortcut chords permanently clear
     /// this bit for the lifetime of the generation.
     pub eligible: bool,
 }
@@ -55,10 +55,10 @@ pub enum GuestKeyOwner {
     /// A `wl_keyboard.key` press, or one the enter listed, awaits its
     /// release.
     Physical,
-    /// Sommelier consumed the key as a window-layout shortcut. The
-    /// matching release is acknowledged as handled and never reaches the
-    /// guest client.
-    CompositorShortcut,
+    /// Sommelier consumed the key as a shortcut's chord. The matching
+    /// release is acknowledged as handled and never reaches the guest
+    /// client.
+    Shortcut,
     /// The guest got a balanced pair from an IME recovery. This
     /// tombstone suppresses delayed duplicates on the other channels.
     ImeRecovery,
@@ -71,7 +71,7 @@ pub enum ChordClass {
     Guest,
     /// Listed in `SOMMELIER_ACCELERATORS`: the host runs the accelerator.
     HostAccelerator,
-    /// Bound to a placement action: Sommelier owns the chord.
+    /// Bound to a shortcut: Sommelier owns the chord.
     Shortcut,
 }
 
@@ -172,14 +172,14 @@ impl Delivery {
     /// belongs to the input method's repeat and becomes its tombstone, as
     /// does any press of a recovered generation.
     fn physical(self, key: PhysicalKey) -> (Self, KeyVerdict) {
-        use GuestKeyOwner::{CompositorShortcut, ImeRecovery, Physical};
+        use GuestKeyOwner::{ImeRecovery, Physical, Shortcut};
         let Self {
             owner,
             accelerator_suppressed,
         } = self;
         match (owner, key) {
-            (Some(CompositorShortcut), PhysicalKey::Press { .. }) => (self, KeyVerdict::Consume),
-            (Some(CompositorShortcut), PhysicalKey::Release) => {
+            (Some(Shortcut), PhysicalKey::Press { .. }) => (self, KeyVerdict::Consume),
+            (Some(Shortcut), PhysicalKey::Release) => {
                 let owner = None;
                 (Self { owner, ..self }, KeyVerdict::Consume)
             }
@@ -190,7 +190,7 @@ impl Delivery {
                     ..
                 },
             ) => {
-                let owner = Some(CompositorShortcut);
+                let owner = Some(Shortcut);
                 (Self { owner, ..self }, KeyVerdict::Shortcut)
             }
             (
@@ -248,7 +248,7 @@ impl Delivery {
     /// the chord's key after Sommelier acted on it.
     fn recover(self) -> (Self, bool) {
         match self.owner {
-            Some(GuestKeyOwner::Physical | GuestKeyOwner::CompositorShortcut) => (self, false),
+            Some(GuestKeyOwner::Physical | GuestKeyOwner::Shortcut) => (self, false),
             None | Some(GuestKeyOwner::ImeRecovery) => {
                 let owner = Some(GuestKeyOwner::ImeRecovery);
                 (Self { owner, ..self }, true)
@@ -262,7 +262,7 @@ impl Delivery {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeekInput {
     /// `guest_input`: under its keyboard's current state the key forms
-    /// neither a host accelerator nor a placement chord.
+    /// neither a host accelerator nor a shortcut chord.
     Press {
         serial: u32,
         time: u32,
@@ -1000,8 +1000,8 @@ impl KeyGenerationRegistry {
                 // shortcut, even if a reload has since removed its
                 // binding. Only a still-held generation is the one this
                 // peek describes; a released one is retired by the press.
-                let consumed_by_shortcut = held
-                    && self.guest_owner(keyboard, key) == Some(GuestKeyOwner::CompositorShortcut);
+                let consumed_by_shortcut =
+                    held && self.guest_owner(keyboard, key) == Some(GuestKeyOwner::Shortcut);
                 let eligible = guest_input
                     && !consumed_by_shortcut
                     && !self.host_accelerator_suppressed(keyboard, key);
@@ -1227,8 +1227,7 @@ impl KeyGenerationRegistry {
     ) -> KeyVerdict {
         let verdict = self.deliver(keyboard, key, |delivery| delivery.physical(event));
         if let PhysicalKey::Press { chord, .. } = event {
-            let shortcut =
-                self.guest_owner(keyboard, key) == Some(GuestKeyOwner::CompositorShortcut);
+            let shortcut = self.guest_owner(keyboard, key) == Some(GuestKeyOwner::Shortcut);
             if shortcut || chord == ChordClass::HostAccelerator {
                 self.invalidate_peek(keyboard, key);
             }

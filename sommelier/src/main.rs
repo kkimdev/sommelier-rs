@@ -22,6 +22,7 @@ mod accelerator;
 mod allocator;
 mod client_kind;
 mod connection;
+mod geometry;
 mod handler;
 mod ime;
 mod keymap;

@@ -27,8 +27,8 @@ limitations under the License.
 //! the only statements of the `wl_output.transform` enum rules; surfaces'
 //! buffer transforms use them too.
 
+use crate::geometry::Rect;
 use crate::protocols::wayland::wl_output;
-use crate::window_layout::Rect;
 use std::collections::BTreeMap;
 
 /// Whether `transform` is a `wl_output.transform` enum value.

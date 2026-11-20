@@ -280,6 +280,11 @@ binds no chord of its own. The contract is in
   `reload_follows_a_link_to_files_of_the_same_mtime`,
   `a_connection_takes_placement_from_the_file_when_it_starts`).
 
+- **Shortcuts.** The keyboard knows no placement: it asks for a chord's
+  binding (`accelerator::BindingId`), consumes the chord of one as a
+  shortcut, and hands the binding to its subscriber,
+  `window_placement::shortcut`, which resolves the binding's rectangle and
+  places the focused window.
 - **One module.** `handler/window_placement.rs` is the only placement
   code the protocol handlers call, one entry point per event; the table
   in its module docs is the one list of them. Each does nothing while
@@ -594,7 +599,7 @@ Keys can reach the guest twice: as a `wl_keyboard.key` and as the press
 and release the proxy recovers for an empty IME confirmation; the host's
 text-input keysyms are dropped. `state/input.rs` assigns each physical
 key a generation and an owner (guest keyboard, IME recovery, or a
-compositor shortcut), so a press is released through the path that
+shortcut), so a press is released through the path that
 delivered it, and never twice. Once the key is pressed again, only one
 older generation still waits for its release; see
 [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).

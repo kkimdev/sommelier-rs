@@ -1061,18 +1061,37 @@ impl Context {
         self.settings.host_accelerators.contains(chord)
     }
 
-    /// Where the placement bound to `chord` puts the focused window.
+    /// The shortcut binding of `chord`: window placement's, its one
+    /// subscriber.
     ///
     /// `None` unless placement is on for this connection and the current
     /// bindings bind the chord. A reload of the bindings file replaces them
     /// between two messages, so one message sees one version. Keys already
-    /// captured as compositor shortcuts are tracked by key ownership, not
-    /// by binding, so a dropped binding cannot strand a held key.
+    /// captured as shortcuts are tracked by key ownership, not by binding,
+    /// so a dropped binding cannot strand a held key.
+    pub(crate) fn shortcut_for(
+        &self,
+        chord: &crate::accelerator::Accelerator,
+    ) -> Option<crate::accelerator::BindingId> {
+        self.window_placement.as_ref()?.binding_for(chord)
+    }
+
+    /// Where shortcut binding `binding` places the focused window, while
+    /// placement is on.
+    pub(crate) fn placement_rect(
+        &self,
+        binding: crate::accelerator::BindingId,
+    ) -> Option<crate::window_layout::NormalizedRect> {
+        self.window_placement.as_ref()?.rect(binding)
+    }
+
+    /// Where the placement bound to `chord` puts the focused window.
+    #[cfg(test)]
     pub(crate) fn placement_rect_for(
         &self,
         chord: &crate::accelerator::Accelerator,
     ) -> Option<crate::window_layout::NormalizedRect> {
-        self.window_placement.as_ref()?.rect_for(chord)
+        self.placement_rect(self.shortcut_for(chord)?)
     }
 
     /// This connection's placement state, while placement is on for it.

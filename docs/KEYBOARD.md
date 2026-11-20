@@ -39,7 +39,7 @@ whose variants carry only the data that exists in them:
   a peek press, which makes the generation a candidate for recovery.
 - `delivery: Delivery`, what the guest got of the key:
   - `owner`, who gave the guest the key, if anyone (`GuestKeyOwner`):
-    `Physical`, `CompositorShortcut` (Sommelier placed a window), or
+    `Physical`, `Shortcut` (Sommelier consumed it for a shortcut), or
     `ImeRecovery`, a tombstone for a recovered pair that suppresses late
     duplicates;
   - `accelerator_suppressed`: a `wl_keyboard` press that no channel gave
@@ -88,7 +88,8 @@ or a press of a held key under another serial than its peek announced)
 and moves the phase. `transition_physical` takes the press's chord class
 (`ChordClass`) and returns its `KeyVerdict`: forwarded, consumed or
 declined, which also fixes its `ack_key`, or `Shortcut`, a press that
-claimed its generation for the placement chord the handler then runs.
+claimed its generation for the shortcut whose binding the handler hands
+its subscriber, window placement.
 Its pure core, `Delivery::physical`, is one match of the delivery and
 the event; `Delivery::recover` is the recovery's. `peek_key` retires a stale held generation on a press, owing
 the guest its release, numbers a new peek generation, refreshes the peek

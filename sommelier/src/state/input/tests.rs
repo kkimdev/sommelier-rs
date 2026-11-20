@@ -445,7 +445,7 @@ fn physical_events_of_a_consumed_shortcut_stay_with_the_shortcut() {
     assert_verdicts(&mut registry, key, &[(PRESS, KeyVerdict::Consume)]);
     assert_eq!(
         registry.guest_owner(KEYBOARD_A, key),
-        Some(GuestKeyOwner::CompositorShortcut)
+        Some(GuestKeyOwner::Shortcut)
     );
     assert_verdicts(
         &mut registry,
@@ -465,7 +465,7 @@ fn ime_recovery_does_not_replay_a_compositor_shortcut_key() {
     assert!(!registry.recover(KEYBOARD_A, key));
     assert_eq!(
         registry.guest_owner(KEYBOARD_A, key),
-        Some(GuestKeyOwner::CompositorShortcut)
+        Some(GuestKeyOwner::Shortcut)
     );
     assert_verdicts(
         &mut registry,
@@ -557,7 +557,7 @@ fn guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces() {
                 }
             };
             let verdict = registry.transition_physical(keyboard, key, event);
-            let shortcut = owner_before == Some(GuestKeyOwner::CompositorShortcut);
+            let shortcut = owner_before == Some(GuestKeyOwner::Shortcut);
             let handled = match event {
                 PhysicalKey::Press { chord, .. } => {
                     shortcut
@@ -801,7 +801,7 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
                         };
                     }
                     let consumed_by_shortcut = held.is_some_and(|generation| {
-                        generation.guest_owner == Some(GuestKeyOwner::CompositorShortcut)
+                        generation.guest_owner == Some(GuestKeyOwner::Shortcut)
                     });
                     let suppressed = self
                         .keys
@@ -937,7 +937,7 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
         Operation::TakeAcceleratorSuppression(KEY_B),
         Operation::ClaimOwner(KEY_A, GuestKeyOwner::Physical),
         Operation::ClaimOwner(KEY_A, GuestKeyOwner::ImeRecovery),
-        Operation::ClaimOwner(KEY_A, GuestKeyOwner::CompositorShortcut),
+        Operation::ClaimOwner(KEY_A, GuestKeyOwner::Shortcut),
         Operation::TakePendingPhysicalRelease(KEY_A),
         Operation::TakeOwner(KEY_A),
         Operation::MarkStale,
