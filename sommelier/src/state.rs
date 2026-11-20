@@ -1450,7 +1450,6 @@ mod tests {
                 buffer_damage: vec![BufferRect::new(5, 6, 7, 8)].into(),
                 buffer_scale: Some(2),
                 buffer_transform: Some(3),
-                offset: Some((9, 10)),
                 attach_offset: Some((11, 12)),
                 viewport: Some(Some(ViewportState {
                     source: Some((0, 0, 256, 256)),
@@ -1476,11 +1475,7 @@ mod tests {
             commit.buffer_damage,
             DamageRegion::Rects(vec![BufferRect::new(5, 6, 7, 8)])
         );
-        assert_eq!(
-            commit.buffer_offset,
-            (9, 10),
-            "an explicit offset must win over the legacy attach offset"
-        );
+        assert_eq!(commit.buffer_offset, (11, 12));
         assert_eq!(surface.current_buffer_scale, 2);
         assert_eq!(surface.current_buffer_transform, 3);
         assert_eq!(
@@ -1514,8 +1509,7 @@ mod tests {
                 buffer_damage: vec![BufferRect::new(5, 6, 7, 8)].into(),
                 buffer_scale: Some(2),
                 buffer_transform: Some(3),
-                offset: Some((4, 5)),
-                attach_offset: Some((11, 12)),
+                attach_offset: Some((4, 5)),
                 viewport: Some(None),
             },
             logged_viewport_rule: false,

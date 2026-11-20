@@ -184,9 +184,7 @@ impl ShadowTable {
         Self::GUEST_SERVER_ID_START..Self::GUEST_SERVER_ID_START + WL_MAP_MAX_OBJECTS + 1;
     /// The version of an object created without a negotiated version. In
     /// practice only test fixtures, and children created from them, have
-    /// it. It passes every version check; the permissive `wl_surface.attach`
-    /// rule for it is pinned by `.agent/rules/sommelier-rs-standards.md` and
-    /// INVARIANTS "Surfaces, damage and SHM".
+    /// it. It passes every version check.
     const UNKNOWN_OBJECT_VERSION: u32 = u32::MAX;
 
     pub fn new() -> Self {
@@ -525,12 +523,6 @@ impl ShadowTable {
     pub(crate) fn host_object_version_or_unknown(&self, host_id: u32) -> u32 {
         self.host_object_version(host_id)
             .unwrap_or(Self::UNKNOWN_OBJECT_VERSION)
-    }
-
-    /// Whether `version` is the unknown version: the object was created
-    /// without a negotiated one.
-    pub(crate) fn is_unknown_version(version: u32) -> bool {
-        version == Self::UNKNOWN_OBJECT_VERSION
     }
 
     // Lifecycle. Each transition is named after what happened and changes

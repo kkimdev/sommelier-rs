@@ -623,16 +623,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_mapping_change_stales_the_other_host_copies`,
   `a_buffer_attached_with_a_new_mapping_copies_everything`,
   `destroying_a_surface_stales_the_host_copies_it_showed`.
-- **`attach` offsets at version 5.** For a `wl_surface` at version 5 or
-  newer, `attach(buffer, 0, 0)` MUST NOT create a pending legacy offset, so
-  a committed `wl_surface.offset` survives a later zero-coordinate attach.
-  Non-zero coordinates are a protocol error. Objects with an unknown
-  negotiated version keep the permissive pre-v5 behavior. No guest reaches
-  v5 today (the `wl_compositor` ceiling is v4); this keeps the path correct
-  if the ceiling is raised, which would also need `wl_surface.offset`,
-  forwarded today, to stay local.
-  Tests: `v5_zero_attach_does_not_create_an_attach_offset`,
-  `v5_attach_rejects_nonzero_offsets_but_legacy_attach_tracks_them`.
+- **Surfaces stay below version 5.** The `wl_compositor` ceiling is v4,
+  so `attach` carries a surface's offset, and the generated version check
+  rejects v5's `wl_surface.offset`. The proxy implements no v5 offset
+  semantics, so a compile-time assertion beside `WL_COMPOSITOR_VERSION`
+  keeps the ceiling below v5.
+  Test: `consumed_attach_offset_is_not_reapplied_on_later_commit`.
 - **A non-zero offset forces full damage.** Surface-local damage cannot yet
   be translated through the SHM copy map when the committed offset is
   non-zero, so such a commit MUST send complete host surface damage, even

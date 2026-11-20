@@ -35,7 +35,7 @@ use crate::protocols::text_input_unstable_v3::{
 use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
 use crate::protocols::wayland::{
-    wl_compositor, wl_display, wl_fixes, wl_output, wl_registry, wl_seat, wl_shm,
+    wl_compositor, wl_display, wl_fixes, wl_output, wl_registry, wl_seat, wl_shm, wl_surface,
 };
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_output_unstable_v1::ALLOWED_INTERFACES as XDG_OUTPUT_ALLOWED;
@@ -72,9 +72,11 @@ const TEXT_INPUT_EXTENSION_VERSION: u32 =
 /// Sommelier offers it with `--support-damage-buffer`: v4 adds only
 /// `wl_surface.damage_buffer`, which the proxy records and sends the host
 /// as `wl_surface.damage` at commit. The proxy does not implement the v5
-/// and v6 surface semantics; v5's `wl_surface.offset`, for one, is
-/// forwarded, and would have to stay local too.
+/// and v6 surface semantics: it reads attach's offset, which v5 replaced
+/// with `wl_surface.offset`, and the generated version check rejects the
+/// latter, so raising the ceiling needs that handled first.
 const WL_COMPOSITOR_VERSION: u32 = 4;
+const _: () = assert!(WL_COMPOSITOR_VERSION < wl_surface::REQ_OFFSET_SINCE);
 /// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 /// The `xdg_wm_base` ceiling, ChromiumOS Sommelier's

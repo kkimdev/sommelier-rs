@@ -599,14 +599,10 @@ pub struct SurfacePending {
     pub buffer_damage: DamageRegion<BufferSpace>,
     pub buffer_scale: Option<i32>,
     pub buffer_transform: Option<i32>,
-    /// `wl_surface.offset`. The SHM bridge does not currently transform
-    /// surface damage through a non-zero offset, so the commit path
-    /// conservatively performs a complete copy in that case.
-    pub offset: Option<(i32, i32)>,
-    /// For wl_surface versions before 5, attach(x, y) carries the pending
-    /// buffer offset. Keep it separate from the v5+ offset request so a
-    /// zero-valued attach does not overwrite a real `wl_surface.offset`
-    /// request that appeared earlier in the same state batch.
+    /// The pending buffer offset, which attach(x, y) carries. The SHM
+    /// bridge does not currently transform surface damage through a
+    /// non-zero offset, so the commit path conservatively performs a
+    /// complete copy in that case.
     pub attach_offset: Option<(i32, i32)>,
     /// `Some(None)` represents destruction of the viewport object; `None`
     /// means unchanged.
@@ -628,8 +624,8 @@ pub struct SurfaceCommit {
     pub surface_damage: DamageRegion<SurfaceSpace>,
     pub buffer_damage: DamageRegion<BufferSpace>,
     /// One-shot placement of the pending attachment relative to the previous
-    /// surface contents. wl_surface.offset replaces legacy attach(x, y); it is
-    /// consumed by this commit and is not persistent surface state.
+    /// surface contents, from attach(x, y); it is consumed by this commit
+    /// and is not persistent surface state.
     pub buffer_offset: (i32, i32),
 }
 
@@ -795,7 +791,6 @@ impl SurfaceState {
             buffer_damage,
             buffer_scale,
             buffer_transform,
-            offset,
             attach_offset,
             viewport,
         } = std::mem::take(&mut self.pending);
@@ -822,8 +817,7 @@ impl SurfaceState {
             attachment,
             surface_damage,
             buffer_damage,
-            // An explicit offset wins over a legacy attach offset.
-            buffer_offset: offset.or(attach_offset).unwrap_or((0, 0)),
+            buffer_offset: attach_offset.unwrap_or((0, 0)),
         }
     }
 }
