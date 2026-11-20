@@ -307,11 +307,10 @@ pub(super) fn reconvertible(c: char) -> bool {
 /// deletes a whole character.
 ///
 /// This is the user's intent only for actions the system can follow in
-/// order: each `Click` and `Tap` must have a `Settle` before and after it,
-/// and each `Focus` a `Settle` before it. Otherwise Exo can hand a key to
-/// the engine before the press's reset, and the proxy drops that key's
-/// late result by design (INVARIANTS, "A pointer press ends the
-/// composition on its surface").
+/// order, as a settled case's are ([`super::user::settled`]). Otherwise
+/// Exo can hand a key to the engine before the press's reset, and the
+/// proxy drops that key's late result by design (INVARIANTS, "A pointer
+/// press ends the composition on its surface").
 #[derive(Clone, Debug)]
 pub(super) struct Reference {
     /// One model per field.

@@ -262,7 +262,8 @@ fn keymap(keyboard: u32) -> Outgoing {
 }
 
 /// Whether `request` destroys its sender, for each object a case has that
-/// has a destructor; the proxy destroys none of them in a case so far.
+/// has a destructor: a case destroys a surface as it reopens a window
+/// (F2), and releases the keyboard it bound again.
 fn destructor(request: &AnyRequest) -> bool {
     matches!(
         request,
