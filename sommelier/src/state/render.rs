@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::outputs::transformed_extent;
-use super::HostId;
 use super::HostMapping;
+use super::{GuestId, HostId};
 
 /// A guest `wl_shm_pool`.
 ///
@@ -42,7 +42,7 @@ pub struct ShmPool {
     /// The size the client declared. `wl_shm_pool.resize` only grows it.
     pub size: usize,
     /// The guest `wl_shm` that created it, whose host global it depends on.
-    pub shm: u32,
+    pub shm: GuestId,
 }
 
 pub struct BufferState {
@@ -85,7 +85,7 @@ pub struct BufferState {
 #[derive(Debug)]
 pub struct StalePixels {
     damage: DamageRegion<BufferSpace>,
-    surface: Option<u32>,
+    surface: Option<GuestId>,
 }
 
 impl StalePixels {
@@ -98,7 +98,7 @@ impl StalePixels {
     }
 
     /// The region to copy before the buffer is shown on `surface`.
-    pub fn to_copy_on(&self, surface: u32) -> &DamageRegion<BufferSpace> {
+    pub fn to_copy_on(&self, surface: GuestId) -> &DamageRegion<BufferSpace> {
         static FULL: DamageRegion<BufferSpace> = DamageRegion::Full;
         if self.surface == Some(surface) {
             &self.damage
@@ -108,7 +108,7 @@ impl StalePixels {
     }
 
     /// The host copy now matches the buffer as shown on `surface`.
-    pub fn copied_on(&mut self, surface: u32) {
+    pub fn copied_on(&mut self, surface: GuestId) {
         self.damage = DamageRegion::Empty;
         self.surface = Some(surface);
     }
@@ -121,7 +121,7 @@ impl StalePixels {
     /// A commit on `surface` changed `damage` of the surface's contents, in
     /// this buffer's pixels, or `None` when the contents cannot be related to
     /// this buffer pixel for pixel.
-    fn add_surface_damage(&mut self, surface: u32, damage: Option<&DamageRegion<BufferSpace>>) {
+    fn add_surface_damage(&mut self, surface: GuestId, damage: Option<&DamageRegion<BufferSpace>>) {
         if self.surface != Some(surface) {
             return;
         }
@@ -133,12 +133,12 @@ impl StalePixels {
 
     /// The surface the host copy is relative to, if any.
     #[cfg(test)]
-    fn surface_for_test(&self) -> Option<u32> {
+    fn surface_for_test(&self) -> Option<GuestId> {
         self.surface
     }
 
     /// `surface` was destroyed, and its ID may name a new surface.
-    fn forget_surface(&mut self, surface: u32) {
+    fn forget_surface(&mut self, surface: GuestId) {
         if self.surface == Some(surface) {
             self.invalidate();
         }
@@ -507,19 +507,19 @@ impl<S> From<Vec<Rect<S>>> for DamageRegion<S> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SurfaceContentSnapshot {
-    buffer_id: Option<u32>,
+    buffer_id: Option<GuestId>,
     dimensions: Option<(i32, i32)>,
 }
 
 impl SurfaceContentSnapshot {
-    fn from_buffer(buffer_id: u32) -> Self {
+    fn from_buffer(buffer_id: GuestId) -> Self {
         Self {
             buffer_id: Some(buffer_id),
             dimensions: None,
         }
     }
 
-    fn buffer_id(&self) -> Option<u32> {
+    fn buffer_id(&self) -> Option<GuestId> {
         self.buffer_id
     }
 
@@ -531,7 +531,7 @@ impl SurfaceContentSnapshot {
 /// One double-buffered `wl_surface.attach` transition.
 ///
 /// Wayland distinguishes an omitted attach request from `attach(NULL)`.
-/// Encoding that distinction as `Option<Option<u32>>` makes the most important
+/// Encoding that distinction as `Option<Option<GuestId>>` makes the most important
 /// surface transition easy to invert accidentally, so keep the three protocol
 /// states explicit.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -539,18 +539,21 @@ pub enum SurfaceAttachment {
     #[default]
     Unchanged,
     Detach,
-    Attach(u32),
+    Attach(GuestId),
 }
 
 impl SurfaceAttachment {
-    pub fn buffer_id(self) -> Option<u32> {
+    pub fn buffer_id(self) -> Option<GuestId> {
         match self {
             Self::Attach(buffer_id) => Some(buffer_id),
             Self::Unchanged | Self::Detach => None,
         }
     }
 
-    fn transition_from(self, previous: Option<u32>) -> Option<(Option<u32>, Option<u32>)> {
+    fn transition_from(
+        self,
+        previous: Option<GuestId>,
+    ) -> Option<(Option<GuestId>, Option<GuestId>)> {
         match self {
             Self::Unchanged => None,
             Self::Detach => Some((previous, None)),
@@ -667,11 +670,11 @@ impl SurfaceCommit {
         matches!(self.attachment, SurfaceAttachment::Attach(_))
     }
 
-    pub fn attached_buffer_id(&self) -> Option<u32> {
+    pub fn attached_buffer_id(&self) -> Option<GuestId> {
         self.attachment.buffer_id()
     }
 
-    pub fn attachment_transition(&self) -> Option<(Option<u32>, Option<u32>)> {
+    pub fn attachment_transition(&self) -> Option<(Option<GuestId>, Option<GuestId>)> {
         self.attachment
             .transition_from(self.previous.current_buffer_id())
     }
@@ -749,7 +752,7 @@ impl SurfaceState {
         }
     }
 
-    pub(crate) fn current_buffer_id(&self) -> Option<u32> {
+    pub(crate) fn current_buffer_id(&self) -> Option<GuestId> {
         self.current_content
             .as_ref()
             .and_then(SurfaceContentSnapshot::buffer_id)
@@ -763,7 +766,7 @@ impl SurfaceState {
 
     pub(crate) fn set_current_buffer_dimensions(
         &mut self,
-        buffer_id: u32,
+        buffer_id: GuestId,
         dimensions: Option<(i32, i32)>,
     ) -> bool {
         if let Some(content) = self.current_content.as_mut() {
@@ -778,7 +781,7 @@ impl SurfaceState {
     /// Drop the surface's references to the destroyed `buffer_id`: its
     /// current contents keep only their dimensions, and a pending attach of
     /// it becomes a detach.
-    pub(crate) fn clear_buffer_references(&mut self, buffer_id: u32) {
+    pub(crate) fn clear_buffer_references(&mut self, buffer_id: GuestId) {
         if self.pending.attachment == SurfaceAttachment::Attach(buffer_id) {
             self.pending.attachment = SurfaceAttachment::Detach;
         }
@@ -797,7 +800,7 @@ impl SurfaceState {
     #[cfg(test)]
     pub(crate) fn set_current_buffer_for_test(
         &mut self,
-        buffer_id: Option<u32>,
+        buffer_id: Option<GuestId>,
         dimensions: Option<(i32, i32)>,
     ) {
         self.current_content = buffer_id
@@ -1097,7 +1100,7 @@ impl RenderBufferRegistry {
     /// an attach keeps its pixels when the mapping changes.
     pub(super) fn stale_surface_pixels(
         &mut self,
-        surface: u32,
+        surface: GuestId,
         shown: Option<HostId>,
         damage: &DamageRegion<BufferSpace>,
         mapping_changed: bool,
@@ -1114,7 +1117,7 @@ impl RenderBufferRegistry {
 
     /// `surface` was destroyed, and its ID may name a new surface: no host
     /// copy is relative to it any more.
-    pub(super) fn forget_surface(&mut self, surface: u32) {
+    pub(super) fn forget_surface(&mut self, surface: GuestId) {
         for (_, buffer) in self.local_copies_mut() {
             buffer.stale.forget_surface(surface);
         }
@@ -1190,7 +1193,7 @@ impl RenderBufferRegistry {
 
     /// Every guest wl_surface a host copy is relative to.
     #[cfg(test)]
-    pub(super) fn copy_surfaces_for_test(&self) -> impl Iterator<Item = u32> + '_ {
+    pub(super) fn copy_surfaces_for_test(&self) -> impl Iterator<Item = GuestId> + '_ {
         self.entries
             .values()
             .filter_map(|buffer| match &buffer.active()?.backing {

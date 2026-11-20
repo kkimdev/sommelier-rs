@@ -75,16 +75,6 @@
   surface, Exo's `activate` does nothing and the stale attachment
   stays. Any live host seat would do for the
   `deactivate`; this was never seen on a host.
-- A host that reuses a removed global's numeric name can make a registry
-  created after the removal record the replacement under the old
-  generation, if it sees the replacement before the registry that saw the
-  removal; a bind through it then ends the session. The removal record
-  (`removed_global_generations`), which waits for every registry that
-  lists the removed generation, depends on this being fixed: until then
-  it also waits for such a registry, and destroying that registry while
-  it holds the record retires the replacement and resets its internal
-  binding. libwayland-server never reuses a name, so Exo cannot reach
-  this.
 - Clipboard pumps rely on a VirtWL pipe supporting `poll` and returning
   `EAGAIN` under `O_NONBLOCK`. The ChromiumOS `virtio_wl.c` does both, but
   no transfer has been checked on a device since the pumps stopped

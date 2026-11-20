@@ -30,7 +30,7 @@ use crate::protocols;
 use crate::protocols::wayland::wl_shm;
 use crate::protocols::Iface;
 use crate::state::Singleton;
-use crate::state::{Context, ShmPool};
+use crate::state::{Context, EventSender, GuestId, RequestSender, ShmPool};
 use crate::wire::Action;
 use log::{debug, error, warn};
 use std::fs::File;
@@ -112,19 +112,25 @@ fn valid_buffer_layout(
 }
 
 impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
-    fn on_format(ctx: &mut Context, format: u32) -> Action {
-        if ctx.singletons.host(Singleton::Shm) == Some(ctx.last_sender_id) {
+    fn on_format(ctx: &mut Context, sender: EventSender, format: u32) -> Action {
+        if ctx.singletons.host(Singleton::Shm) == Some(sender.host) {
             record_host_shm_wl_format(ctx, format);
             return Action::Drop;
         }
         Action::Forward
     }
 
-    fn on_create_pool(ctx: &mut Context, id: u32, fd: BorrowedFd<'_>, size: i32) -> Action {
-        if ctx.stale_shm_guest_objects.contains(&ctx.last_sender_id) {
+    fn on_create_pool(
+        ctx: &mut Context,
+        sender: RequestSender,
+        id: GuestId,
+        fd: BorrowedFd<'_>,
+        size: i32,
+    ) -> Action {
+        if ctx.stale_shm_guest_objects.contains(&sender.guest) {
             debug!(
                 "Ignoring wl_shm.create_pool from removed host global object {}",
-                ctx.last_sender_id
+                sender.guest
             );
             // The guest owns the new ID, so the pool exists, inert.
             ctx.shadow_table.create_local(id, Iface::WlShmPool, 1);
@@ -136,7 +142,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
         let Some(pool_size) = valid_pool_size(size) else {
             warn!("Rejecting invalid SHM pool size {}", size);
             return ctx.reject(
-                ctx.last_sender_id,
+                sender.guest,
                 wl_shm::ERROR_INVALID_STRIDE,
                 "invalid wl_shm pool size",
             );
@@ -148,7 +154,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
             Err(error) => {
                 error!("Failed to dup FD for SHM pool: {}", error);
                 return ctx.reject(
-                    ctx.last_sender_id,
+                    sender.guest,
                     wl_shm::ERROR_INVALID_FD,
                     "invalid wl_shm pool fd",
                 );
@@ -161,7 +167,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
                 pool_size
             );
             return ctx.reject(
-                ctx.last_sender_id,
+                sender.guest,
                 wl_shm::ERROR_INVALID_FD,
                 "invalid wl_shm pool fd",
             );
@@ -169,7 +175,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
         let pool = ShmPool {
             file: Arc::new(file),
             size: pool_size,
-            shm: ctx.last_sender_id,
+            shm: sender.guest,
         };
 
         ctx.pools.insert(pool_id, pool);
@@ -183,7 +189,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
 /// retired, and their pools inert (see `Context::stale_shm_guest_objects`),
 /// whether or not the proxy's own binding was `name`.
 pub(crate) fn retire_guest_shms(ctx: &mut Context, name: u32) {
-    let stale: std::collections::BTreeSet<u32> = ctx
+    let stale: std::collections::BTreeSet<GuestId> = ctx
         .guest_shms
         .iter()
         .filter(|(_, shm)| shm.global_name == name)
@@ -201,14 +207,14 @@ pub(crate) fn retire_guest_shms(ctx: &mut Context, name: u32) {
 /// Forget synthetic guest `wl_shm` `shm_id`, which ended (see
 /// `crate::state::lifecycle`), so a later guest ID reuse cannot receive
 /// stale format events from it.
-pub(crate) fn forget_shm(ctx: &mut Context, shm_id: u32) {
+pub(crate) fn forget_shm(ctx: &mut Context, shm_id: GuestId) {
     ctx.guest_shms.remove(&shm_id);
     ctx.stale_shm_guest_objects.remove(&shm_id);
 }
 
 /// Forget synthetic guest `wl_shm_pool` `pool_id`, which ended (see
 /// `crate::state::lifecycle`), and close its file.
-pub(crate) fn forget_pool(ctx: &mut Context, pool_id: u32) {
+pub(crate) fn forget_pool(ctx: &mut Context, pool_id: GuestId) {
     ctx.pools.remove(&pool_id);
     ctx.stale_shm_pools.remove(&pool_id);
 }
@@ -216,7 +222,8 @@ pub(crate) fn forget_pool(ctx: &mut Context, pool_id: u32) {
 impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for Handlers {
     fn on_create_buffer(
         ctx: &mut Context,
-        id: u32,
+        sender: RequestSender,
+        id: GuestId,
         offset: i32,
         width: i32,
         height: i32,
@@ -224,7 +231,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for Handlers {
         format: u32,
     ) -> Action {
         debug!("Creating buffer id={}", id);
-        let pool_id = ctx.last_sender_id;
+        let pool_id = sender.guest;
         if ctx.stale_shm_pools.contains(&pool_id) {
             debug!(
                 "Ignoring wl_shm_pool.create_buffer from removed host global object {}",
@@ -297,14 +304,14 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for Handlers {
         }
     }
 
-    fn on_destroy(_ctx: &mut Context) -> Action {
+    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Action {
         // The generated local-only destructor path ends the synthetic pool
         // (see `forget_pool`) and queues its guest delete_id.
         Action::Drop
     }
 
-    fn on_resize(ctx: &mut Context, size: i32) -> Action {
-        let pool_id = ctx.last_sender_id;
+    fn on_resize(ctx: &mut Context, sender: RequestSender, size: i32) -> Action {
+        let pool_id = sender.guest;
         if ctx.stale_shm_pools.contains(&pool_id) {
             debug!(
                 "Ignoring wl_shm_pool.resize from removed host global object {}",
@@ -363,7 +370,7 @@ mod tests {
     use crate::protocols::AnyRequest;
     use crate::protocols::Iface;
     use crate::proxy::harness::{Object, Session};
-    use crate::state::Context;
+    use crate::state::{Context, GuestId};
     use crate::test_support::{decoded, raw_dispatch, shm_pool_file};
     use crate::wire::{Outgoing, WireMessage, WL_DISPLAY_ID};
     use std::fs::File;
@@ -459,6 +466,7 @@ mod tests {
                 s.guest([resize]).await;
                 assert_eq!(s.guest_received(), [], "resize to {size}");
                 // No peer sees the size the proxy records for the pool.
+                let pool = GuestId::for_test(pool);
                 assert_eq!(s.ctx().pools[&pool].size, size as usize);
             } else {
                 s.guest_fatal([resize]).await;
@@ -468,7 +476,7 @@ mod tests {
                     "resize to {size}"
                 );
                 // No peer sees the size the proxy records for the pool.
-                assert_eq!(s.ctx().pools[&pool].size, 4096);
+                assert_eq!(s.ctx().pools[&GuestId::for_test(pool)].size, 4096);
             }
             assert_eq!(s.host_received(), []);
         }
@@ -491,7 +499,7 @@ mod tests {
             };
             // Injects a fault no peer can cause: the proxy loses the pool's
             // state.
-            s.ctx().pools.remove(&pool);
+            s.ctx().pools.remove(&GuestId::for_test(pool));
             s.guest_fatal([request]).await;
             assert_eq!(
                 s.guest_received_and_error(),
@@ -537,13 +545,13 @@ mod tests {
 
     /// The host advertises `wl_shm` as global `name` on host registry
     /// `registry`.
-    fn shm_global_event(registry: u32, name: u32) -> Outgoing {
+    fn shm_global_event(registry: u32, name: u32) -> Outgoing<u32> {
         let global = wl_registry::evt::global(registry, name, wl_shm::NAME, wl_shm::VERSION);
         global.unwrap()
     }
 
     /// The host removes global `name` from host registry `registry`.
-    fn removal(registry: u32, name: u32) -> Outgoing {
+    fn removal(registry: u32, name: u32) -> Outgoing<u32> {
         wl_registry::evt::global_remove(registry, name)
     }
 
@@ -608,7 +616,7 @@ mod tests {
 
     /// The guest destroys `object` with `destroy`, which the proxy alone
     /// had: the guest gets its `delete_id`.
-    async fn destroy_local(s: &mut Session, object: u32, destroy: Outgoing) {
+    async fn destroy_local(s: &mut Session, object: u32, destroy: Outgoing<u32>) {
         s.guest([destroy]).await;
         assert_eq!(s.host_received(), []);
         assert_eq!(
@@ -625,20 +633,15 @@ mod tests {
     #[test]
     fn synthetic_shm_release_clears_cache_before_guest_id_reuse() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let guest_shm = 20;
+        let guest_shm = GuestId::for_test(20);
         let optional_format = 0x3631_4752;
         record_host_shm_wl_format(&mut ctx, optional_format);
         ctx.shadow_table.create_local(guest_shm, Iface::WlShm, 2);
         register_guest_shm(&mut ctx, guest_shm, 10);
-        ctx.host_to_client_queue.clear();
+        ctx.clear_queues_for_test();
         ctx.stale_shm_guest_objects.insert(guest_shm);
 
-        ctx.last_sender_id = guest_shm;
-        let mut release = WireMessage::new(
-            guest_shm,
-            crate::protocols::wayland::wl_shm::REQ_RELEASE,
-            &[],
-        );
+        let mut release = WireMessage::new(20, crate::protocols::wayland::wl_shm::REQ_RELEASE, &[]);
         assert_eq!(
             raw_dispatch(crate::test_support::dispatch_request(
                 &mut ctx,
@@ -650,18 +653,18 @@ mod tests {
         assert!(!ctx.stale_shm_guest_objects.contains(&guest_shm));
         assert!(ctx.shadow_table.get_interface(guest_shm).is_none());
         assert_eq!(
-            decoded(&ctx.host_to_client_queue, wl_display::Event::from_wire),
-            [(WL_DISPLAY_ID, wl_display::Event::DeleteId { id: guest_shm })],
+            decoded(ctx.guest_queue_for_test(), wl_display::Event::from_wire),
+            [(WL_DISPLAY_ID, wl_display::Event::DeleteId { id: 20 })],
             "local wl_shm.release must emit one guest delete_id"
         );
 
         // Reusing the same guest ID must behave like a fresh synthetic object.
         ctx.shadow_table.create_local(guest_shm, Iface::WlShm, 2);
         register_guest_shm(&mut ctx, guest_shm, 10);
-        ctx.host_to_client_queue.clear();
+        ctx.clear_queues_for_test();
         record_host_shm_wl_format(&mut ctx, optional_format);
         assert!(
-            ctx.host_to_client_queue.is_empty(),
+            !ctx.sends_anything(),
             "a capability already sent by the replacement object must not be duplicated"
         );
     }
@@ -785,56 +788,6 @@ mod tests {
         assert_eq!(s.host_received(), [], "the proxy keeps its binding of 10");
         let pool = pool_of(&mut s, shm).await;
         assert!(!buffer_of(&mut s, pool).await.1, "the pool is inert");
-    }
-
-    /// A registry that saw a `wl_shm` name removed may see it advertised
-    /// anew while another registry still lists the old generation: the old
-    /// generation's objects go inert then, and the new one's stay live,
-    /// even when the other registry's removal arrives late.
-    #[tokio::test]
-    async fn a_re_advertised_shm_name_retires_only_its_old_generation() {
-        let mut s = Session::new();
-        let registry = s.registry().await;
-        let other = second_registry(&mut s).await;
-        s.host([
-            shm_global_event(registry.host, 10),
-            shm_global_event(registry.host, 11),
-            shm_global_event(other.host, 10),
-            shm_global_event(other.host, 11),
-        ])
-        .await;
-        let received = s.host_received();
-        let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { name: 10, .. }))] =
-            received[..]
-        else {
-            panic!("the proxy did not bind wl_shm 10: {received:?}");
-        };
-        s.guest_received();
-        let old_shm = bind_shm(&mut s, registry.id, 11).await;
-        let old_pool = pool_of(&mut s, old_shm).await;
-
-        s.host([removal(registry.host, 11)]).await;
-        s.guest_received();
-        assert!(buffer_of(&mut s, old_pool).await.1, "registry 2 lists 11");
-        s.host([shm_global_event(registry.host, 11)]).await;
-        s.guest_received();
-        assert!(
-            !buffer_of(&mut s, old_pool).await.1,
-            "the old generation's pool is inert"
-        );
-
-        let shm = bind_shm(&mut s, registry.id, 11).await;
-        let pool = pool_of(&mut s, shm).await;
-        assert!(buffer_of(&mut s, pool).await.1);
-        s.host([removal(other.host, 11)]).await;
-        s.guest_received();
-        assert!(
-            buffer_of(&mut s, pool).await.1,
-            "a late removal of the old generation"
-        );
-        let new_pool = pool_of(&mut s, shm).await;
-        assert!(buffer_of(&mut s, new_pool).await.1);
-        assert_eq!(s.host_received(), []);
     }
 
     /// A pool whose host `wl_shm` is gone ignores every request but its

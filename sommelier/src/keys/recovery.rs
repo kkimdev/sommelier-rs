@@ -51,13 +51,13 @@ use super::generations::{LeaseInput, EVDEV_KEY_BACKSPACE};
 use super::{Env, KeyEffects, KeyboardCore, Recovered};
 use crate::ime::{LeaseOutcome, SeatId, TiId};
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::HostId;
-use crate::wire::Outgoing;
+use crate::state::{GuestId, HostId};
+use crate::wire::ToGuest;
 
 /// The held key an empty confirmation may stand for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct HeldRepeatKey {
-    pub(super) guest_keyboard_id: u32,
+    pub(super) guest_keyboard_id: GuestId,
     pub(super) host_keyboard_id: HostId,
     pub(super) key: u32,
     /// The serial of the key's latest `peek_key`.
@@ -142,7 +142,7 @@ enum RecoveryStep {
 impl PendingRecovery {
     /// The guest text input, guest keyboard and host keyboard it names.
     #[cfg(test)]
-    pub(super) fn objects_for_test(&self) -> (u32, u32, HostId) {
+    pub(super) fn objects_for_test(&self) -> (GuestId, GuestId, HostId) {
         let held = self.held;
         (self.ti.0, held.guest_keyboard_id, held.host_keyboard_id)
     }
@@ -211,7 +211,7 @@ impl KeyboardCore {
     /// no `peek_key` (`Keyboard::OnKeyEvent` handles a press only of a key
     /// it does not hold), only the confirmation before it (E13), which no
     /// wire event tells from an autorepeat.
-    fn held_repeat_key(&self, guest_seat: u32, env: &impl Env) -> Option<HeldRepeatKey> {
+    fn held_repeat_key(&self, guest_seat: GuestId, env: &impl Env) -> Option<HeldRepeatKey> {
         let active_surface = env.seat_focus(guest_seat);
         let mut candidates = Vec::new();
         let mut stale_key_held = false;
@@ -415,7 +415,7 @@ impl KeyboardCore {
     /// Both carry the serial and time of the key's latest `peek_key`, which
     /// are those of the `wl_keyboard.key` Exo would have sent; see
     /// INVARIANTS "A recovered key carries the host's serial".
-    fn key_pair(&mut self, held: HeldRepeatKey) -> Vec<Outgoing> {
+    fn key_pair(&mut self, held: HeldRepeatKey) -> Vec<ToGuest> {
         if !self.generations.recover(held.host_keyboard_id, held.key) {
             // The normal wl_keyboard path already delivered this physical
             // generation to the guest. The confirmation still closes a
@@ -424,7 +424,7 @@ impl KeyboardCore {
             log::debug!(
                 "Skipping IME repeat recovery: key {} was already forwarded for host keyboard {}",
                 held.key,
-                held.host_keyboard_id.0
+                held.host_keyboard_id
             );
             return Vec::new();
         }

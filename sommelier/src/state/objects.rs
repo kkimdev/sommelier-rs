@@ -19,12 +19,80 @@ limitations under the License.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::fmt;
 
 use super::id_allocator::{IdAllocator, WL_MAP_MAX_OBJECTS};
-use super::{GuestId, HostId};
 use crate::protocols::Iface;
-use crate::wire::WL_DISPLAY_ID;
+use crate::wire::{EventId, RequestId, WireId, WL_DISPLAY_ID};
 use log::{debug, warn};
+
+/// A Wayland object ID of the **guest**'s, as [`ShadowTable`] keys guest
+/// objects and the events the proxy sends name them.
+///
+/// Only the table makes one: from an ID it allocates, or from a wire value
+/// it resolves to a guest object or to a free ID the guest may create an
+/// object under. So a guest ID cannot stand in for a [`HostId`], an event
+/// cannot name a host object, and a request cannot name a guest one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GuestId(u32);
+
+/// A Wayland object ID on the **host** connection, as [`ShadowTable`] keys
+/// host objects and the requests the proxy sends name them. Like a
+/// [`GuestId`], only the table makes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostId(u32);
+
+impl GuestId {
+    /// `wl_display`, which a connection starts with.
+    pub const DISPLAY: Self = Self(WL_DISPLAY_ID);
+
+    /// Guest ID `id`, for a test that names an object by the ID its guest
+    /// gave it.
+    #[cfg(test)]
+    pub(crate) const fn for_test(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl HostId {
+    /// `wl_display`, which a connection starts with.
+    pub const DISPLAY: Self = Self(WL_DISPLAY_ID);
+
+    /// Host ID `id`, for a test that names an object by the ID its host
+    /// saw.
+    #[cfg(test)]
+    pub(crate) const fn for_test(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl WireId for GuestId {
+    fn wire(self) -> u32 {
+        self.0
+    }
+}
+
+impl EventId for GuestId {}
+
+impl WireId for HostId {
+    fn wire(self) -> u32 {
+        self.0
+    }
+}
+
+impl RequestId for HostId {}
+
+impl fmt::Display for GuestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for HostId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// What a host `wl_display.delete_id` ended
 /// ([`ShadowTable::release_deleted_host_id`]).
@@ -34,11 +102,14 @@ pub enum DeletedHostId {
     /// holds a live object only the proxy uses, which the host never
     /// destroys on its own. Nothing changed.
     Ignored,
-    /// A host-only object; no guest object is owed a `delete_id`.
-    HostOnly,
-    /// An object paired with guest object `guest`, now owed its `delete_id`.
+    /// Host object `host`, which only the proxy used; no guest object is
+    /// owed a `delete_id`.
+    HostOnly { host: HostId },
+    /// Host object `host`, paired with guest object `guest`, which is now
+    /// owed its `delete_id`.
     Paired {
-        guest: u32,
+        host: HostId,
+        guest: GuestId,
         /// Whether the guest object was live: the host destroyed it on its
         /// own, rather than acknowledging the guest's destructor, so this
         /// is the object's first end.
@@ -50,17 +121,27 @@ pub enum DeletedHostId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link {
     /// The host object it is paired with.
-    Host(u32),
+    Host(HostId),
     /// Nothing: the proxy implements the object itself.
     Local,
 }
 
+impl Link {
+    /// The host object, if the guest object has one.
+    pub fn host(self) -> Option<HostId> {
+        match self {
+            Self::Host(host) => Some(host),
+            Self::Local => None,
+        }
+    }
+}
+
 /// The sender of a guest request, resolved once, before anything of the
 /// message is read ([`ShadowTable::resolve_request`]): a live guest object.
+/// Its handler gets it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestSender {
-    /// Its guest ID.
-    pub id: u32,
+    pub guest: GuestId,
     pub iface: Iface,
     /// Its negotiated version.
     pub version: u32,
@@ -69,10 +150,17 @@ pub struct RequestSender {
     pub host: Option<PairedHost>,
 }
 
+impl RequestSender {
+    /// The host object it is paired with, if any.
+    pub fn host_id(&self) -> Option<HostId> {
+        Some(self.host?.id)
+    }
+}
+
 /// The host object a guest object is paired with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairedHost {
-    pub id: u32,
+    pub id: HostId,
     /// The host object's own version, which a bridged object's may not
     /// share with its guest object.
     pub version: u32,
@@ -80,10 +168,10 @@ pub struct PairedHost {
 
 /// The sender of a host event, resolved once, before anything of the
 /// message is read ([`ShadowTable::resolve_event`]): a live host object.
+/// Its handler gets it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventSender {
-    /// Its host ID.
-    pub id: u32,
+    pub host: HostId,
     /// Its own interface, which events from it decode by.
     pub iface: Iface,
     /// Its negotiated version.
@@ -93,13 +181,39 @@ pub struct EventSender {
     pub guest: Option<PairedGuest>,
 }
 
+impl EventSender {
+    /// The guest object it is paired with, if any.
+    pub fn guest_id(&self) -> Option<GuestId> {
+        Some(self.guest?.id)
+    }
+}
+
 /// The guest object a host object is paired with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairedGuest {
-    pub id: u32,
+    pub id: GuestId,
     /// Whether the guest destroyed it, and it awaits the host's
     /// `delete_id` (see [`ShadowTable::guest_destroyed`]).
     pub destroyed: bool,
+}
+
+/// An object argument of a guest request, resolved before its handler runs
+/// ([`ShadowTable::request_object`]): a live guest object of the interface
+/// the argument names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestObject {
+    pub guest: GuestId,
+    /// What it stands for on the host.
+    pub host: Link,
+}
+
+/// An object argument of a host event, resolved before its handler runs
+/// ([`ShadowTable::event_object`]): a host object of the interface the
+/// argument names, paired with a live guest object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventObject {
+    pub host: HostId,
+    pub guest: GuestId,
 }
 
 /// The interface and negotiated version of an object on one side.
@@ -242,7 +356,7 @@ impl ShadowTable {
     /// The ID is free on the host: either never used, or released by the
     /// host's `wl_display.delete_id`. No entry holds it: the allocator hands
     /// out each ID once until it is released, and the host creates objects
-    /// only with server IDs ([`Self::accepts_host_new_id`]).
+    /// only with server IDs ([`Self::host_new_id`]).
     ///
     /// # Panics
     ///
@@ -288,15 +402,10 @@ impl ShadowTable {
     /// ID it has on both sides.
     pub fn create_display(&mut self) {
         let interface = || Interface::new(Iface::WlDisplay, Iface::WlDisplay.version());
-        self.insert_pair(
-            GuestId(WL_DISPLAY_ID),
-            interface(),
-            HostId(WL_DISPLAY_ID),
-            interface(),
-        );
+        self.insert_pair(GuestId::DISPLAY, interface(), HostId::DISPLAY, interface());
     }
 
-    /// Create guest object `guest_id` and a host object for it, paired, each
+    /// Create guest object `guest` and a host object for it, paired, each
     /// with `interface` and its own version.
     ///
     /// # Returns
@@ -304,12 +413,12 @@ impl ShadowTable {
     /// The host object's ID, newly allocated.
     pub fn create_paired(
         &mut self,
-        guest_id: u32,
+        guest: GuestId,
         interface: Iface,
         version: u32,
         host_version: u32,
-    ) -> u32 {
-        self.create_bridged(guest_id, interface, version, interface, host_version)
+    ) -> HostId {
+        self.create_bridged(guest, interface, version, interface, host_version)
     }
 
     /// Like [`Self::create_paired`], for a guest object backed by a host
@@ -317,44 +426,44 @@ impl ShadowTable {
     /// host `zwp_text_input_v1`.
     pub fn create_bridged(
         &mut self,
-        guest_id: u32,
+        guest: GuestId,
         interface: Iface,
         version: u32,
         host_interface: Iface,
         host_version: u32,
-    ) -> u32 {
+    ) -> HostId {
         let host = self.allocate_host_id();
         self.insert_pair(
-            GuestId(guest_id),
+            guest,
             Interface::new(interface, version),
             host,
             Interface::new(host_interface, host_version),
         );
-        host.0
+        host
     }
 
-    /// Create a guest object for host object `host_id`, which a host event
+    /// Create a guest object for host object `host`, which a host event
     /// just created, with a fresh ID from the guest's server range; both
     /// take `interface` and `version`.
     ///
     /// # Returns
     ///
     /// The guest object's ID.
-    pub fn adopt_host_created(&mut self, host_id: u32, interface: Iface, version: u32) -> u32 {
+    pub fn adopt_host_created(&mut self, host: HostId, interface: Iface, version: u32) -> GuestId {
         let guest = self.allocate_guest_server_id();
         let interface = || Interface::new(interface, version);
-        self.insert_pair(guest, interface(), HostId(host_id), interface());
-        guest.0
+        self.insert_pair(guest, interface(), host, interface());
+        guest
     }
 
-    /// Create guest object `guest_id`, which the proxy implements itself:
-    /// it has no host object, and its handlers consume its requests (the
-    /// SHM shim, the v3 text-input manager, or an inert `wl_output` whose
-    /// bind crossed its global's removal).
-    pub fn create_local(&mut self, guest_id: u32, interface: Iface, version: u32) {
+    /// Create guest object `guest`, which the proxy implements itself: it
+    /// has no host object, and its handlers consume its requests (the SHM
+    /// shim, the v3 text-input manager, or an inert `wl_output` whose bind
+    /// crossed its global's removal).
+    pub fn create_local(&mut self, guest: GuestId, interface: Iface, version: u32) {
         let local = GuestObject::Local(Interface::new(interface, version));
-        let previous = self.guests.insert(GuestId(guest_id), local);
-        debug_assert!(previous.is_none(), "guest ID {guest_id} is in use");
+        let previous = self.guests.insert(guest, local);
+        debug_assert!(previous.is_none(), "guest ID {guest} is in use");
     }
 
     /// Create a host object that only the proxy uses.
@@ -362,11 +471,11 @@ impl ShadowTable {
     /// # Returns
     ///
     /// Its ID, newly allocated.
-    pub fn create_host_only(&mut self, interface: Iface, version: u32) -> u32 {
+    pub fn create_host_only(&mut self, interface: Iface, version: u32) -> HostId {
         let host = self.allocate_host_id();
         let object = HostObject::HostOnly(Interface::new(interface, version));
         self.hosts.insert(host, object);
-        host.0
+        host
     }
 
     /// Record a new pairing of two unused IDs.
@@ -393,14 +502,16 @@ impl ShadowTable {
     }
 
     // Generated dispatch. Each message resolves its sender and object
-    // arguments once, which validates and translates them together.
+    // arguments once, which validates, translates and types them together.
+    // These are the only ways a wire value becomes an ID.
 
     /// Resolve the sender of a guest request, a live guest object, with
     /// every fact dispatch needs of it.
     ///
     /// `None` when `guest_id` names no object, or one the guest destroyed.
     pub fn resolve_request(&self, guest_id: u32) -> Option<RequestSender> {
-        let object = self.guests.get(&GuestId(guest_id))?;
+        let guest = GuestId(guest_id);
+        let object = self.guests.get(&guest)?;
         let Interface { iface, version } = *object.interface();
         let host = match object {
             GuestObject::Local(_) => None,
@@ -410,10 +521,7 @@ impl ShadowTable {
                 ..
             } => {
                 let version = self.hosts.get(host)?.interface()?.version;
-                Some(PairedHost {
-                    id: host.0,
-                    version,
-                })
+                Some(PairedHost { id: *host, version })
             }
             GuestObject::Paired {
                 state: GuestState::DestroyPending,
@@ -421,7 +529,7 @@ impl ShadowTable {
             } => return None,
         };
         Some(RequestSender {
-            id: guest_id,
+            guest,
             iface,
             version,
             host,
@@ -433,36 +541,19 @@ impl ShadowTable {
     ///
     /// `None` when `host_id` names no object, or a retired one.
     pub fn resolve_event(&self, host_id: u32) -> Option<EventSender> {
-        let object = self.hosts.get(&HostId(host_id))?;
+        let host = HostId(host_id);
+        let object = self.hosts.get(&host)?;
         let Interface { iface, version } = *object.interface()?;
         let guest = object.guest().map(|guest| PairedGuest {
-            id: guest.0,
-            destroyed: self.is_pending_destroy_guest(guest.0),
+            id: guest,
+            destroyed: self.is_pending_destroy_guest(guest),
         });
         Some(EventSender {
-            id: host_id,
+            host,
             iface,
             version,
             guest,
         })
-    }
-
-    /// Resolve the sender of a guest request: a live guest object.
-    ///
-    /// `None` when `guest_id` names no object, or one the guest destroyed.
-    pub fn request_sender(&self, guest_id: u32) -> Option<Link> {
-        match self.guests.get(&GuestId(guest_id))? {
-            GuestObject::Local(_) => Some(Link::Local),
-            GuestObject::Paired {
-                host,
-                state: GuestState::Live,
-                ..
-            } => Some(Link::Host(host.0)),
-            GuestObject::Paired {
-                state: GuestState::DestroyPending,
-                ..
-            } => None,
-        }
     }
 
     /// Resolve an object argument of a guest request, which must be a live
@@ -471,11 +562,10 @@ impl ShadowTable {
     /// expected would send a type-invalid request to the host.
     ///
     /// `None` when the request may not name `guest_id` there.
-    pub fn request_object(&self, guest_id: u32, interface: Iface) -> Option<Link> {
-        self.request_sender(guest_id).filter(|_| {
-            self.get_interface(guest_id)
-                .is_some_and(|own| own == interface)
-        })
+    pub fn request_object(&self, guest_id: u32, interface: Iface) -> Option<RequestObject> {
+        let guest = GuestId(guest_id);
+        let host = self.live_object(guest, interface)?;
+        Some(RequestObject { guest, host })
     }
 
     /// Resolve an object argument of host event `event` (such as
@@ -488,13 +578,14 @@ impl ShadowTable {
     ///
     /// # Returns
     ///
-    /// The guest object's ID, or `None` when the event may not reach the
-    /// guest naming `host_id` there.
-    pub fn event_object(&self, host_id: u32, interface: Iface, event: &str) -> Option<u32> {
+    /// The object, or `None` when the event may not reach the guest naming
+    /// `host_id` there.
+    pub fn event_object(&self, host_id: u32, interface: Iface, event: &str) -> Option<EventObject> {
+        let host = HostId(host_id);
         let HostObject::Paired {
             guest,
             interface: own,
-        } = self.hosts.get(&HostId(host_id))?
+        } = self.hosts.get(&host)?
         else {
             return None;
         };
@@ -512,75 +603,114 @@ impl ShadowTable {
             }
             return None;
         }
-        (!self.is_pending_destroy_guest(guest.0)).then_some(guest.0)
+        (!self.is_pending_destroy_guest(*guest)).then_some(EventObject {
+            host,
+            guest: *guest,
+        })
     }
 
-    /// Return whether guest object `guest_id` is one the proxy implements
-    /// itself ([`Self::create_local`]).
-    pub fn is_local(&self, guest_id: u32) -> bool {
-        matches!(
-            self.guests.get(&GuestId(guest_id)),
-            Some(GuestObject::Local(_))
-        )
+    /// The guest object paired with the host object that a host event names
+    /// as `host_id` in an argument of no interface, which may name any
+    /// object (`wl_display.error`'s).
+    pub fn guest_named_by_host(&self, host_id: u32) -> Option<GuestId> {
+        self.hosts.get(&HostId(host_id))?.guest()
     }
 
-    /// Return whether a guest request may allocate `guest_id`.
+    /// Resolve the `new_id` of a guest request: an ID the guest may create
+    /// an object under.
     ///
     /// Client-created IDs must be in [`Self::CLIENT_IDS`], as
     /// libwayland-server requires, and must not reuse an existing object.
     /// Keeping this check in the shadow table lets generated protocol
     /// dispatchers validate every `new_id` request before a handler can
     /// mutate state.
-    pub fn is_guest_id_available(&self, guest_id: u32) -> bool {
-        Self::CLIENT_IDS.contains(&guest_id) && !self.guests.contains_key(&GuestId(guest_id))
+    ///
+    /// `None` when the request may not create `guest_id`.
+    pub fn guest_new_id(&self, guest_id: u32) -> Option<GuestId> {
+        let guest = GuestId(guest_id);
+        (Self::CLIENT_IDS.contains(&guest_id) && !self.guests.contains_key(&guest)).then_some(guest)
     }
 
-    /// Return whether a host event may create an object with ID `host_id`:
-    /// an ID from [`Self::SERVER_IDS`], which libwayland-client accepts, that
-    /// no object holds.
+    /// Resolve the `new_id` of a host event: an ID from [`Self::SERVER_IDS`],
+    /// which libwayland-client accepts, that no object holds.
     ///
     /// libwayland-server allocates every object it creates from the server
     /// range. An ID from the client range is one this proxy allocates, so a
     /// host that sent one could later collide with the proxy's own objects.
-    pub fn accepts_host_new_id(&self, host_id: u32) -> bool {
-        Self::SERVER_IDS.contains(&host_id) && !self.hosts.contains_key(&HostId(host_id))
+    ///
+    /// `None` when the event may not create `host_id`.
+    pub fn host_new_id(&self, host_id: u32) -> Option<HostId> {
+        let host = HostId(host_id);
+        (Self::SERVER_IDS.contains(&host_id) && !self.hosts.contains_key(&host)).then_some(host)
+    }
+
+    /// What live guest object `guest` of `interface` stands for on the host.
+    ///
+    /// `None` when `guest` names no live object of `interface`.
+    pub fn live_object(&self, guest: GuestId, interface: Iface) -> Option<Link> {
+        self.link(guest)
+            .filter(|_| self.get_interface(guest) == Some(interface))
+    }
+
+    /// What live guest object `guest` stands for on the host.
+    ///
+    /// `None` when `guest` names no object, or one the guest destroyed.
+    pub fn link(&self, guest: GuestId) -> Option<Link> {
+        match self.guests.get(&guest)? {
+            GuestObject::Local(_) => Some(Link::Local),
+            GuestObject::Paired {
+                host,
+                state: GuestState::Live,
+                ..
+            } => Some(Link::Host(*host)),
+            GuestObject::Paired {
+                state: GuestState::DestroyPending,
+                ..
+            } => None,
+        }
+    }
+
+    /// Return whether guest object `guest` is one the proxy implements
+    /// itself ([`Self::create_local`]).
+    pub fn is_local(&self, guest: GuestId) -> bool {
+        matches!(self.guests.get(&guest), Some(GuestObject::Local(_)))
     }
 
     // Queries.
 
-    /// The host object paired with guest object `guest_id`.
-    pub fn get_host_id(&self, guest_id: u32) -> Option<u32> {
-        Some(self.guests.get(&GuestId(guest_id))?.host()?.0)
+    /// The host object paired with guest object `guest`.
+    pub fn get_host_id(&self, guest: GuestId) -> Option<HostId> {
+        self.guests.get(&guest)?.host()
     }
 
-    /// The guest object paired with host object `host_id`.
-    pub fn get_guest_id(&self, host_id: u32) -> Option<u32> {
-        Some(self.hosts.get(&HostId(host_id))?.guest()?.0)
+    /// The guest object paired with host object `host`.
+    pub fn get_guest_id(&self, host: HostId) -> Option<GuestId> {
+        self.hosts.get(&host)?.guest()
     }
 
     /// The guest object's interface.
-    pub fn get_interface(&self, guest_id: u32) -> Option<Iface> {
-        Some(self.guests.get(&GuestId(guest_id))?.interface().iface)
+    pub fn get_interface(&self, guest: GuestId) -> Option<Iface> {
+        Some(self.guests.get(&guest)?.interface().iface)
     }
 
     /// The interface of a live host object, which events from it are
     /// dispatched by.
-    pub fn get_host_interface(&self, host_id: u32) -> Option<Iface> {
-        Some(self.hosts.get(&HostId(host_id))?.interface()?.iface)
+    pub fn get_host_interface(&self, host: HostId) -> Option<Iface> {
+        Some(self.hosts.get(&host)?.interface()?.iface)
     }
 
-    /// Return whether `guest_id` belongs to the range reserved for objects
+    /// Return whether `guest` belongs to the range reserved for objects
     /// created by the server.
     ///
     /// The client destroys these objects but never receives `delete_id` for
     /// them: the server, not the client, owns their raw ID lifecycle.
-    pub fn is_guest_server_id(&self, guest_id: u32) -> bool {
-        guest_id >= Self::GUEST_SERVER_ID_START
+    pub fn is_guest_server_id(&self, guest: GuestId) -> bool {
+        guest.0 >= Self::GUEST_SERVER_ID_START
     }
 
-    pub fn is_pending_destroy_guest(&self, guest_id: u32) -> bool {
+    pub fn is_pending_destroy_guest(&self, guest: GuestId) -> bool {
         matches!(
-            self.guests.get(&GuestId(guest_id)),
+            self.guests.get(&guest),
             Some(GuestObject::Paired {
                 state: GuestState::DestroyPending,
                 ..
@@ -588,19 +718,14 @@ impl ShadowTable {
         )
     }
 
-    pub fn is_pending_destroy_host(&self, host_id: u32) -> bool {
-        self.get_guest_id(host_id)
-            .is_some_and(|guest_id| self.is_pending_destroy_guest(guest_id))
-    }
-
     /// The guest object's version.
-    pub fn guest_object_version(&self, guest_id: u32) -> Option<u32> {
-        Some(self.guests.get(&GuestId(guest_id))?.interface().version)
+    pub fn guest_object_version(&self, guest: GuestId) -> Option<u32> {
+        Some(self.guests.get(&guest)?.interface().version)
     }
 
     /// The live host object's version.
-    pub fn host_object_version(&self, host_id: u32) -> Option<u32> {
-        Some(self.hosts.get(&HostId(host_id))?.interface()?.version)
+    pub fn host_object_version(&self, host: HostId) -> Option<u32> {
+        Some(self.hosts.get(&host)?.interface()?.version)
     }
 
     // Lifecycle. Each transition is named after what happened and changes
@@ -608,47 +733,46 @@ impl ShadowTable {
     // only in `state`: everything else ends one through its `Context`
     // wrapper (`state::lifecycle`), which forgets the object's state.
 
-    /// The guest destroyed paired guest object `guest_id`, and its
-    /// destructor went to the host object.
+    /// The guest destroyed paired guest object `guest`, and its destructor
+    /// went to the host object.
     ///
     /// An object the guest created stays paired until the host's
     /// `delete_id`, rejecting requests, so late events still resolve and the
     /// `delete_id` reaches the guest. An object the server created gets no
     /// `delete_id`: libwayland frees its ID on both sides as soon as either
     /// side destroys it, so both entries end now.
-    pub(super) fn guest_destroyed(&mut self, guest_id: u32) {
-        if !self.is_guest_server_id(guest_id) {
-            self.guest_destroyed_in_use(guest_id);
+    pub(super) fn guest_destroyed(&mut self, guest: GuestId) {
+        if !self.is_guest_server_id(guest) {
+            self.guest_destroyed_in_use(guest);
             return;
         }
-        let guest = GuestId(guest_id);
         if let Some(host) = self.end_paired_guest(guest) {
             self.remove_paired_host(host, guest);
         }
     }
 
-    /// The guest destroyed paired guest object `guest_id` while its host
-    /// object is still in use, as a buffer the host still shows: the proxy
-    /// destroys the host object later, through [`Self::guest_destroyed`].
+    /// The guest destroyed paired guest object `guest` while its host object
+    /// is still in use, as a buffer the host still shows: the proxy destroys
+    /// the host object later, through [`Self::guest_destroyed`].
     ///
     /// Until then the guest object rejects requests, but stays paired so
     /// the host object's events still reach its handler.
-    pub(super) fn guest_destroyed_in_use(&mut self, guest_id: u32) {
-        if let Some(GuestObject::Paired { state, .. }) = self.guests.get_mut(&GuestId(guest_id)) {
+    pub(super) fn guest_destroyed_in_use(&mut self, guest: GuestId) {
+        if let Some(GuestObject::Paired { state, .. }) = self.guests.get_mut(&guest) {
             *state = GuestState::DestroyPending;
         }
     }
 
-    /// Guest object `guest_id` ended without its destructor reaching its
-    /// host object, which has none (a v3 text input backed by a host v1
-    /// one): the host object stays in use as a host-only object, so its ID
-    /// is not reused while its events are in flight.
+    /// Guest object `guest` ended without its destructor reaching its host
+    /// object, which has none (a v3 text input backed by a host v1 one): the
+    /// host object stays in use as a host-only object, so its ID is not
+    /// reused while its events are in flight.
     ///
     /// # Returns
     ///
-    /// `false`, changing nothing, unless `guest_id` is paired.
-    pub(super) fn guest_ended_host_kept(&mut self, guest_id: u32) -> bool {
-        let Some(host) = self.end_paired_guest(GuestId(guest_id)) else {
+    /// `false`, changing nothing, unless `guest` is paired.
+    pub(super) fn guest_ended_host_kept(&mut self, guest: GuestId) -> bool {
+        let Some(host) = self.end_paired_guest(guest) else {
             return false;
         };
         if let Some(HostObject::Paired { interface, .. }) = self.hosts.remove(&host) {
@@ -657,41 +781,40 @@ impl ShadowTable {
         true
     }
 
-    /// Paired guest object `guest_id` ended, and so did its host object:
-    /// by a terminal event (`wl_callback.done`) or a destructor the proxy
-    /// queued. The host ID stays reserved until the host's `delete_id`,
-    /// which then reaches no guest object.
-    pub(super) fn guest_ended_host_destroyed(&mut self, guest_id: u32) {
-        let host = self.end_paired_guest(GuestId(guest_id));
-        debug_assert!(host.is_some(), "guest {guest_id} is not paired");
+    /// Paired guest object `guest` ended, and so did its host object: by a
+    /// terminal event (`wl_callback.done`) or a destructor the proxy queued.
+    /// The host ID stays reserved until the host's `delete_id`, which then
+    /// reaches no guest object.
+    pub(super) fn guest_ended_host_destroyed(&mut self, guest: GuestId) {
+        let host = self.end_paired_guest(guest);
+        debug_assert!(host.is_some(), "guest {guest} is not paired");
         if let Some(host) = host {
             self.retire_destroyed_host(host);
         }
     }
 
-    /// Local guest object `guest_id` ended: its destructor completed in the
+    /// Local guest object `guest` ended: its destructor completed in the
     /// proxy.
     ///
     /// # Returns
     ///
-    /// `false`, changing nothing, unless `guest_id` is a local object.
-    pub(super) fn local_destroyed(&mut self, guest_id: u32) -> bool {
-        if !self.is_local(guest_id) {
+    /// `false`, changing nothing, unless `guest` is a local object.
+    pub(super) fn local_destroyed(&mut self, guest: GuestId) -> bool {
+        if !self.is_local(guest) {
             return false;
         }
-        self.forget_guest_object(GuestId(guest_id));
+        self.forget_guest_object(guest);
         true
     }
 
-    /// Forget paired guest object `guest_id` and its host object, which
-    /// never reached the host: nothing on either side knows the IDs, so
-    /// both are free at once.
-    pub(super) fn abandon(&mut self, guest_id: u32) {
-        let guest = GuestId(guest_id);
+    /// Forget paired guest object `guest` and its host object, which never
+    /// reached the host: nothing on either side knows the IDs, so both are
+    /// free at once.
+    pub(super) fn abandon(&mut self, guest: GuestId) {
         let host = self
             .forget_guest_object(guest)
             .and_then(|object| object.host());
-        debug_assert!(host.is_some(), "guest {guest_id} is not paired");
+        debug_assert!(host.is_some(), "guest {guest} is not paired");
         if let Some(host) = host {
             self.remove_paired_host(host, guest);
             self.host_ids.release(host.0);
@@ -713,10 +836,8 @@ impl ShadowTable {
     ///
     /// # Returns
     ///
-    /// `false`, changing nothing, unless `host_id` is a live host-only
-    /// object.
-    pub(super) fn host_destroy_queued(&mut self, host_id: u32) -> bool {
-        let host = HostId(host_id);
+    /// `false`, changing nothing, unless `host` is a live host-only object.
+    pub(super) fn host_destroy_queued(&mut self, host: HostId) -> bool {
         if !matches!(self.hosts.get(&host), Some(HostObject::HostOnly(_))) {
             return false;
         }
@@ -724,7 +845,7 @@ impl ShadowTable {
         true
     }
 
-    /// Retire host-only object `host_id`, which has no destructor, once its
+    /// Retire host-only object `host`, which has no destructor, once its
     /// guest object or global is gone: stale events stop reaching it, and
     /// its ID stays reserved for the connection.
     ///
@@ -732,15 +853,14 @@ impl ShadowTable {
     /// binding of the proxy's own, and an ID with no entry has nothing to
     /// keep reserved: reserving it would let it collide with the
     /// allocator's next object. Either is refused with a warning.
-    pub fn retire_host(&mut self, host_id: u32) {
-        match self.hosts.get_mut(&HostId(host_id)) {
+    pub fn retire_host(&mut self, host: HostId) {
+        match self.hosts.get_mut(&host) {
             Some(object @ HostObject::HostOnly(_)) => *object = HostObject::Retired,
             Some(HostObject::Retired) => {}
-            Some(HostObject::Paired { guest, .. }) => warn!(
-                "Not retiring host object {host_id}, which guest object {} uses",
-                guest.0
-            ),
-            None => warn!("Not retiring host object {host_id}, which is untracked"),
+            Some(HostObject::Paired { guest, .. }) => {
+                warn!("Not retiring host object {host}, which guest object {guest} uses")
+            }
+            None => warn!("Not retiring host object {host}, which is untracked"),
         }
     }
 
@@ -775,15 +895,16 @@ impl ShadowTable {
         self.hosts.remove(&host);
         self.host_ids.release(host_id);
         let Some(guest) = guest else {
-            return DeletedHostId::HostOnly;
+            return DeletedHostId::HostOnly { host };
         };
-        let was_live = !self.is_pending_destroy_guest(guest.0);
+        let was_live = !self.is_pending_destroy_guest(guest);
         let paired = self
             .forget_guest_object(guest)
             .and_then(|object| object.host());
         debug_assert_eq!(paired, Some(host), "guest {guest:?} was not paired");
         DeletedHostId::Paired {
-            guest: guest.0,
+            host,
+            guest,
             was_live,
         }
     }
@@ -847,50 +968,25 @@ impl ShadowTable {
     #[cfg(test)]
     pub(crate) fn insert_paired_for_test(
         &mut self,
-        guest_id: u32,
-        host_id: u32,
-        interface: &'static str,
+        guest: GuestId,
+        host: HostId,
+        interface: Iface,
     ) {
-        self.insert_bridged_for_test(guest_id, host_id, interface, interface);
+        self.insert_paired_with_version_for_test(guest, host, interface, interface.version());
     }
 
     /// Like [`Self::insert_paired_for_test`], with `version` on both sides.
     #[cfg(test)]
     pub(crate) fn insert_paired_with_version_for_test(
         &mut self,
-        guest_id: u32,
-        host_id: u32,
-        interface: &'static str,
+        guest: GuestId,
+        host: HostId,
+        interface: Iface,
         version: u32,
     ) {
-        self.reserve_for_test(guest_id, host_id);
-        let iface = iface_for_test(interface);
-        let interface = || Interface::new(iface, version);
-        self.insert_pair(GuestId(guest_id), interface(), HostId(host_id), interface());
-    }
-
-    /// Like [`Self::insert_paired_for_test`], for a guest object of
-    /// `interface` backed by a host object of `host_interface`.
-    #[cfg(test)]
-    pub(crate) fn insert_bridged_for_test(
-        &mut self,
-        guest_id: u32,
-        host_id: u32,
-        interface: &'static str,
-        host_interface: &'static str,
-    ) {
-        self.reserve_for_test(guest_id, host_id);
-        // Each side at the newest version its protocol file defines.
-        let newest = |name: &str| {
-            let iface = iface_for_test(name);
-            Interface::new(iface, iface.version())
-        };
-        self.insert_pair(
-            GuestId(guest_id),
-            newest(interface),
-            HostId(host_id),
-            newest(host_interface),
-        );
+        self.reserve_for_test(guest, host);
+        let interface = || Interface::new(interface, version);
+        self.insert_pair(guest, interface(), host, interface());
     }
 
     /// Create a host-only object under the hard-coded ID of a test fixture,
@@ -902,20 +998,20 @@ impl ShadowTable {
     #[cfg(test)]
     pub(crate) fn insert_host_only_for_test(
         &mut self,
-        host_id: u32,
-        interface: &'static str,
+        host: HostId,
+        interface: Iface,
         version: u32,
     ) {
-        self.reserve_host_id_for_test(host_id);
-        let object = HostObject::HostOnly(Interface::new(iface_for_test(interface), version));
-        self.hosts.insert(HostId(host_id), object);
+        self.reserve_host_id_for_test(host);
+        let object = HostObject::HostOnly(Interface::new(interface, version));
+        self.hosts.insert(host, object);
     }
 
     /// Change the negotiated version of guest object `guest_id`, for a test
     /// of version-dependent behavior on an object a fixture created.
     #[cfg(test)]
-    pub(crate) fn set_guest_version_for_test(&mut self, guest_id: u32, version: u32) {
-        let object = self.guests.get_mut(&GuestId(guest_id));
+    pub(crate) fn set_guest_version_for_test(&mut self, guest: GuestId, version: u32) {
+        let object = self.guests.get_mut(&guest);
         let interface = match object.expect("a guest object") {
             GuestObject::Local(interface) | GuestObject::Paired { interface, .. } => interface,
         };
@@ -923,44 +1019,33 @@ impl ShadowTable {
     }
 
     #[cfg(test)]
-    fn reserve_for_test(&mut self, guest_id: u32, host_id: u32) {
+    fn reserve_for_test(&mut self, guest: GuestId, host: HostId) {
         assert!(
-            !self.guests.contains_key(&GuestId(guest_id))
-                && self.guest_server_ids.reserve(guest_id),
-            "fixture guest ID {guest_id} is in use"
+            !self.guests.contains_key(&guest) && self.guest_server_ids.reserve(guest.0),
+            "fixture guest ID {guest} is in use"
         );
-        self.reserve_host_id_for_test(host_id);
+        self.reserve_host_id_for_test(host);
     }
 
     #[cfg(test)]
-    fn reserve_host_id_for_test(&mut self, host_id: u32) {
+    fn reserve_host_id_for_test(&mut self, host: HostId) {
         assert!(
-            !self.hosts.contains_key(&HostId(host_id)) && self.host_ids.reserve(host_id),
-            "fixture host ID {host_id} is in use"
+            !self.hosts.contains_key(&host) && self.host_ids.reserve(host.0),
+            "fixture host ID {host} is in use"
         );
     }
 
-    /// Return whether no object holds host ID `host_id`.
+    /// Return whether no object holds host ID `host`.
     #[cfg(test)]
-    pub fn is_host_id_available(&self, host_id: u32) -> bool {
-        host_id > 1 && !self.hosts.contains_key(&HostId(host_id))
+    pub fn is_host_id_available(&self, host: HostId) -> bool {
+        host.0 > 1 && !self.hosts.contains_key(&host)
     }
 
-    /// Return whether host ID `host_id` holds a retired object.
+    /// Return whether host ID `host` holds a retired object.
     #[cfg(test)]
-    pub fn is_retired_host(&self, host_id: u32) -> bool {
-        matches!(self.hosts.get(&HostId(host_id)), Some(HostObject::Retired))
+    pub fn is_retired_host(&self, host: HostId) -> bool {
+        matches!(self.hosts.get(&host), Some(HostObject::Retired))
     }
-}
-
-/// The interface a test fixture names `name`.
-///
-/// # Panics
-///
-/// When no vendored protocol defines it.
-#[cfg(test)]
-fn iface_for_test(name: &str) -> Iface {
-    Iface::from_name(name).unwrap_or_else(|| panic!("{name} is a vendored interface"))
 }
 
 impl Default for ShadowTable {
@@ -1009,29 +1094,29 @@ mod tests {
 
         assert!(!table.is_host_id_available(binding));
         assert!(!table.is_host_id_available(retired));
-        let next = table.allocate_host_id().0;
+        let next = table.allocate_host_id();
         assert!(next != binding && next != retired);
     }
 
     #[test]
     fn host_created_objects_get_fresh_guest_server_ids() {
         let mut table = ShadowTable::new();
-        let first = table.adopt_host_created(SERVER + 40, Iface::WlDataOffer, 3);
-        let second = table.adopt_host_created(SERVER + 41, Iface::WlDataOffer, 3);
+        let first = table.adopt_host_created(HostId(SERVER + 40), Iface::WlDataOffer, 3);
+        let second = table.adopt_host_created(HostId(SERVER + 41), Iface::WlDataOffer, 3);
 
-        assert_eq!((first, second), (SERVER, SERVER + 1));
-        assert_eq!(table.get_host_id(second), Some(SERVER + 41));
+        assert_eq!((first, second), (GuestId(SERVER), GuestId(SERVER + 1)));
+        assert_eq!(table.get_host_id(second), Some(HostId(SERVER + 41)));
         assert_eq!(table.guest_object_version(second), Some(3));
-        assert_eq!(table.host_object_version(SERVER + 41), Some(3));
+        assert_eq!(table.host_object_version(HostId(SERVER + 41)), Some(3));
     }
 
     #[test]
     fn guest_server_ids_are_reused_and_stay_below_the_client_map_limit() {
         let mut table = ShadowTable::new();
-        let first = table.adopt_host_created(SERVER + 40, Iface::WlBuffer, 1);
+        let first = table.adopt_host_created(HostId(SERVER + 40), Iface::WlBuffer, 1);
         table.guest_destroyed(first);
         assert_eq!(
-            table.adopt_host_created(SERVER + 40, Iface::WlBuffer, 1),
+            table.adopt_host_created(HostId(SERVER + 40), Iface::WlBuffer, 1),
             first,
             "a destroyed server-created object frees its guest ID"
         );
@@ -1055,76 +1140,76 @@ mod tests {
         let mut table = ShadowTable::new();
 
         // The guest half goes while the host object stays.
-        let guest = table.adopt_host_created(SERVER + 40, Iface::ZwpTextInputV3, 1);
+        let guest = table.adopt_host_created(HostId(SERVER + 40), Iface::ZwpTextInputV3, 1);
         assert!(table.guest_ended_host_kept(guest));
         assert_eq!(
-            table.adopt_host_created(SERVER + 41, Iface::WlBuffer, 1),
+            table.adopt_host_created(HostId(SERVER + 41), Iface::WlBuffer, 1),
             guest
         );
 
         // The guest destroys a buffer the host still uses: it keeps its ID
         // until the proxy destroys the host buffer, and frees it once.
         table.guest_destroyed_in_use(guest);
-        let next = table.adopt_host_created(SERVER + 42, Iface::WlBuffer, 1);
+        let next = table.adopt_host_created(HostId(SERVER + 42), Iface::WlBuffer, 1);
         assert_ne!(next, guest, "a retired object still owns its ID");
         table.guest_destroyed(guest);
         table.guest_destroyed(guest);
         assert_eq!(
-            table.adopt_host_created(SERVER + 43, Iface::WlBuffer, 1),
+            table.adopt_host_created(HostId(SERVER + 43), Iface::WlBuffer, 1),
             guest
         );
         assert_eq!(
-            table.adopt_host_created(SERVER + 44, Iface::WlBuffer, 1),
-            next + 1
+            table.adopt_host_created(HostId(SERVER + 44), Iface::WlBuffer, 1),
+            GuestId(next.0 + 1)
         );
     }
 
     #[test]
     fn guest_id_availability_rejects_reserved_and_reused_ids() {
         let mut table = ShadowTable::new();
-        assert!(!table.is_guest_id_available(0));
-        assert!(!table.is_guest_id_available(1));
-        assert!(table.is_guest_id_available(2));
+        assert!(!table.guest_new_id(0).is_some());
+        assert!(!table.guest_new_id(1).is_some());
+        assert!(table.guest_new_id(2).is_some());
         // libwayland-server refuses a client ID past WL_MAP_MAX_OBJECTS.
-        assert!(table.is_guest_id_available(WL_MAP_MAX_OBJECTS));
-        assert!(!table.is_guest_id_available(WL_MAP_MAX_OBJECTS + 1));
-        assert!(!table.is_guest_id_available(SERVER - 1));
-        assert!(!table.is_guest_id_available(SERVER));
+        assert!(table.guest_new_id(WL_MAP_MAX_OBJECTS).is_some());
+        assert!(!table.guest_new_id(WL_MAP_MAX_OBJECTS + 1).is_some());
+        assert!(!table.guest_new_id(SERVER - 1).is_some());
+        assert!(!table.guest_new_id(SERVER).is_some());
 
-        table.create_paired(2, Iface::WlSurface, 1, 1);
-        assert!(!table.is_guest_id_available(2));
-        table.create_local(3, Iface::WlShm, 1);
-        assert!(!table.is_guest_id_available(3));
+        table.create_paired(GuestId(2), Iface::WlSurface, 1, 1);
+        assert!(!table.guest_new_id(2).is_some());
+        table.create_local(GuestId(3), Iface::WlShm, 1);
+        assert!(!table.guest_new_id(3).is_some());
     }
 
     #[test]
     fn host_new_ids_must_be_fresh_server_ids() {
         let mut table = ShadowTable::new();
-        assert!(table.accepts_host_new_id(SERVER));
-        assert!(!table.accepts_host_new_id(0));
+        assert!(table.host_new_id(SERVER).is_some());
+        assert!(!table.host_new_id(0).is_some());
         assert!(
-            !table.accepts_host_new_id(30),
+            !table.host_new_id(30).is_some(),
             "the client range is the proxy's"
         );
         // libwayland-client refuses a server index past WL_MAP_MAX_OBJECTS.
-        assert!(table.accepts_host_new_id(SERVER + WL_MAP_MAX_OBJECTS));
-        assert!(!table.accepts_host_new_id(SERVER + WL_MAP_MAX_OBJECTS + 1));
-        assert!(!table.accepts_host_new_id(u32::MAX));
+        assert!(table.host_new_id(SERVER + WL_MAP_MAX_OBJECTS).is_some());
+        assert!(!table.host_new_id(SERVER + WL_MAP_MAX_OBJECTS + 1).is_some());
+        assert!(!table.host_new_id(u32::MAX).is_some());
 
-        let guest = table.adopt_host_created(SERVER, Iface::WlDataOffer, 3);
-        assert!(!table.accepts_host_new_id(SERVER));
+        let guest = table.adopt_host_created(HostId(SERVER), Iface::WlDataOffer, 3);
+        assert!(!table.host_new_id(SERVER).is_some());
         table.guest_destroyed(guest);
-        assert!(table.accepts_host_new_id(SERVER));
+        assert!(table.host_new_id(SERVER).is_some());
     }
 
     #[test]
     fn event_sender_is_known_for_paired_and_internal_objects_only() {
         let mut table = ShadowTable::new();
-        assert!(!table.get_host_interface(90).is_some());
+        assert!(!table.get_host_interface(HostId(90)).is_some());
 
-        let paired = table.create_paired(10, Iface::WlSurface, 1, 1);
+        let paired = table.create_paired(GuestId(10), Iface::WlSurface, 1, 1);
         assert!(table.get_host_interface(paired).is_some());
-        assert!(!table.get_host_interface(10).is_some());
+        assert!(!table.get_host_interface(HostId(10)).is_some());
 
         let binding = table.create_host_only(Iface::WlShm, 1);
         assert!(table.get_host_interface(binding).is_some());
@@ -1137,42 +1222,50 @@ mod tests {
     #[test]
     fn requests_resolve_live_objects_of_the_expected_interface() {
         let mut table = ShadowTable::new();
-        table.create_local(20, Iface::WlShm, 1);
-        let host = table.create_paired(21, Iface::WlSurface, 4, 4);
+        table.create_local(GuestId(20), Iface::WlShm, 1);
+        let host = table.create_paired(GuestId(21), Iface::WlSurface, 4, 4);
 
-        assert_eq!(table.request_sender(20), Some(Link::Local));
-        assert_eq!(table.request_sender(21), Some(Link::Host(host)));
-        assert_eq!(table.request_sender(22), None);
-        assert_eq!(
-            table.request_object(21, Iface::WlSurface),
-            Some(Link::Host(host))
-        );
+        assert_eq!(table.link(GuestId(20)), Some(Link::Local));
+        assert_eq!(table.link(GuestId(21)), Some(Link::Host(host)));
+        assert_eq!(table.link(GuestId(22)), None);
+        let surface = RequestObject {
+            guest: GuestId(21),
+            host: Link::Host(host),
+        };
+        assert_eq!(table.request_object(21, Iface::WlSurface), Some(surface));
         assert_eq!(table.request_object(21, Iface::WlSeat), None);
 
-        table.guest_destroyed(21);
-        assert_eq!(table.request_sender(21), None);
+        table.guest_destroyed(GuestId(21));
+        assert_eq!(table.link(GuestId(21)), None);
         assert_eq!(table.request_object(21, Iface::WlSurface), None);
-        assert!(table.local_destroyed(20));
-        assert_eq!(table.request_sender(20), None);
-        assert!(!table.local_destroyed(20), "an object ends once");
+        assert!(table.local_destroyed(GuestId(20)));
+        assert_eq!(table.link(GuestId(20)), None);
+        assert!(!table.local_destroyed(GuestId(20)), "an object ends once");
     }
 
     #[test]
     fn events_name_paired_objects_whose_guest_object_is_live() {
         let mut table = ShadowTable::new();
-        let host = table.create_paired(21, Iface::WlSurface, 4, 4);
+        let host = table.create_paired(GuestId(21), Iface::WlSurface, 4, 4);
         let binding = table.create_host_only(Iface::WlShm, 1);
 
-        assert_eq!(table.event_object(host, Iface::WlSurface, EVENT), Some(21));
-        assert_eq!(table.event_object(host, Iface::WlOutput, EVENT), None);
+        let surface = EventObject {
+            host,
+            guest: GuestId(21),
+        };
         assert_eq!(
-            table.event_object(binding, Iface::WlShm, EVENT),
+            table.event_object(host.0, Iface::WlSurface, EVENT),
+            Some(surface)
+        );
+        assert_eq!(table.event_object(host.0, Iface::WlOutput, EVENT), None);
+        assert_eq!(
+            table.event_object(binding.0, Iface::WlShm, EVENT),
             None,
             "no guest object"
         );
 
-        table.guest_destroyed(21);
-        assert_eq!(table.event_object(host, Iface::WlSurface, EVENT), None);
+        table.guest_destroyed(GuestId(21));
+        assert_eq!(table.event_object(host.0, Iface::WlSurface, EVENT), None);
     }
 
     /// A host event that names an object of another interface breaks the
@@ -1181,66 +1274,72 @@ mod tests {
     #[test]
     fn an_event_object_of_another_interface_is_warned_of() {
         let mut table = ShadowTable::new();
-        let stale = table.create_paired(21, Iface::WlSurface, 4, 4);
-        table.guest_destroyed(21);
-        let host = table.create_paired(22, Iface::WlSurface, 4, 4);
+        let stale = table.create_paired(GuestId(21), Iface::WlSurface, 4, 4);
+        table.guest_destroyed(GuestId(21));
+        let host = table.create_paired(GuestId(22), Iface::WlSurface, 4, 4);
 
-        assert_eq!(table.event_object(stale, Iface::WlSurface, EVENT), None);
+        assert_eq!(table.event_object(stale.0, Iface::WlSurface, EVENT), None);
         assert!(!table.warned_wrong_interface.get());
-        assert_eq!(table.event_object(host, Iface::WlOutput, EVENT), None);
+        assert_eq!(table.event_object(host.0, Iface::WlOutput, EVENT), None);
         assert!(table.warned_wrong_interface.get());
     }
 
     #[test]
     fn object_versions_are_tracked_on_both_sides_of_a_pairing() {
         let mut table = ShadowTable::new();
-        let host = table.create_paired(20, Iface::WlSurface, 4, 3);
+        let host = table.create_paired(GuestId(20), Iface::WlSurface, 4, 3);
 
-        assert_eq!(table.guest_object_version(20), Some(4));
+        assert_eq!(table.guest_object_version(GuestId(20)), Some(4));
         assert_eq!(table.host_object_version(host), Some(3));
-        assert_eq!(table.guest_object_version(99), None);
+        assert_eq!(table.guest_object_version(GuestId(99)), None);
 
-        table.guest_destroyed(20);
-        table.release_deleted_host_id(host);
-        assert_eq!(table.guest_object_version(20), None);
+        table.guest_destroyed(GuestId(20));
+        table.release_deleted_host_id(host.0);
+        assert_eq!(table.guest_object_version(GuestId(20)), None);
         assert_eq!(table.host_object_version(host), None);
     }
 
     #[test]
     fn a_guest_ended_with_its_host_kept_leaves_a_reserved_host_object() {
         let mut table = ShadowTable::new();
-        let host = table.create_paired(20, Iface::WlCallback, 1, 1);
+        let host = table.create_paired(GuestId(20), Iface::WlCallback, 1, 1);
 
-        assert!(table.guest_ended_host_kept(20));
-        assert_eq!(table.get_host_id(20), None);
+        assert!(table.guest_ended_host_kept(GuestId(20)));
+        assert_eq!(table.get_host_id(GuestId(20)), None);
         assert_eq!(table.get_host_interface(host), Some(Iface::WlCallback));
         assert_ne!(
             table.allocate_host_id(),
-            HostId(host),
+            host,
             "a host object without a guest destructor must stay reserved"
         );
-        assert!(!table.guest_ended_host_kept(20), "the guest is gone");
+        assert!(
+            !table.guest_ended_host_kept(GuestId(20)),
+            "the guest is gone"
+        );
     }
 
     #[test]
     fn a_guest_ended_with_its_host_destroyed_awaits_delete_id() {
         let mut table = ShadowTable::new();
-        let host = table.create_paired(20, Iface::WlCallback, 1, 1);
+        let host = table.create_paired(GuestId(20), Iface::WlCallback, 1, 1);
 
-        table.guest_ended_host_destroyed(20);
-        assert!(table.is_guest_id_available(20));
+        table.guest_ended_host_destroyed(GuestId(20));
+        assert!(table.guest_new_id(20).is_some());
         assert!(table.is_retired_host(host));
         assert!(!table.get_host_interface(host).is_some());
-        assert_eq!(table.release_deleted_host_id(host), DeletedHostId::HostOnly);
+        assert_eq!(
+            table.release_deleted_host_id(host.0),
+            DeletedHostId::HostOnly { host }
+        );
         assert!(table.is_host_id_available(host));
     }
 
     #[test]
     fn a_guest_destroyed_in_use_still_routes_host_events() {
         let mut table = ShadowTable::new();
-        let host = table.create_paired(20, Iface::WlBuffer, 1, 1);
+        let host = table.create_paired(GuestId(20), Iface::WlBuffer, 1, 1);
 
-        table.guest_destroyed_in_use(20);
+        table.guest_destroyed_in_use(GuestId(20));
 
         assert_eq!(
             table.get_host_interface(host),
@@ -1249,43 +1348,46 @@ mod tests {
         );
         assert!(table.get_host_interface(host).is_some());
         assert_eq!(table.host_object_version(host), Some(1));
-        assert!(table.is_pending_destroy_guest(20));
-        assert_eq!(table.request_sender(20), None);
+        assert!(table.is_pending_destroy_guest(GuestId(20)));
+        assert_eq!(table.link(GuestId(20)), None);
     }
 
     #[test]
     fn host_only_destructor_reservation_survives_until_delete_id() {
         let mut table = ShadowTable::new();
-        table.insert_host_only_for_test(40, "zcr_extended_keyboard_v1", 2);
+        table.insert_host_only_for_test(HostId(40), Iface::ZcrExtendedKeyboardV1, 2);
 
         // The destroy request has been queued, but the host has not processed
         // it yet. The dispatch metadata is retired immediately while the
         // numeric ID remains unavailable for reuse.
-        assert!(table.host_destroy_queued(40));
-        assert!(table.is_retired_host(40));
-        assert!(!table.get_host_interface(40).is_some());
-        assert!(!table.is_host_id_available(40));
-        assert!(!table.host_destroy_queued(40), "it is retired once");
+        assert!(table.host_destroy_queued(HostId(40)));
+        assert!(table.is_retired_host(HostId(40)));
+        assert!(!table.get_host_interface(HostId(40)).is_some());
+        assert!(!table.is_host_id_available(HostId(40)));
+        assert!(!table.host_destroy_queued(HostId(40)), "it is retired once");
 
         // The host acknowledgement is the only point at which the reservation
         // can be released.
-        assert_eq!(table.release_deleted_host_id(40), DeletedHostId::HostOnly);
-        assert!(!table.is_retired_host(40));
-        assert!(table.is_host_id_available(40));
+        assert_eq!(
+            table.release_deleted_host_id(40),
+            DeletedHostId::HostOnly { host: HostId(40) }
+        );
+        assert!(!table.is_retired_host(HostId(40)));
+        assert!(table.is_host_id_available(HostId(40)));
     }
 
     #[test]
     fn destroyed_host_allocated_object_frees_its_id_at_once() {
         // The host allocates IDs from the server range and sends no
         // delete_id for them; it may reuse one for its next new object.
-        let host_buffer = SERVER + 5;
         let mut table = ShadowTable::new();
-        table.insert_host_only_for_test(host_buffer, "wl_buffer", 1);
+        let host_buffer = HostId(SERVER + 5);
+        table.insert_host_only_for_test(host_buffer, Iface::WlBuffer, 1);
 
         assert!(table.host_destroy_queued(host_buffer));
         assert!(!table.get_host_interface(host_buffer).is_some());
         assert!(
-            table.accepts_host_new_id(host_buffer),
+            table.host_new_id(host_buffer.0).is_some(),
             "the host's next server-created object may reuse the ID"
         );
     }
@@ -1293,32 +1395,33 @@ mod tests {
     #[test]
     fn host_ids_are_reused_only_after_delete_id() {
         let mut table = ShadowTable::new();
-        let first = table.create_paired(10, Iface::WlSurface, 1, 1);
-        table.guest_destroyed(10);
+        let first = table.create_paired(GuestId(10), Iface::WlSurface, 1, 1);
+        table.guest_destroyed(GuestId(10));
 
-        let second = table.create_paired(11, Iface::WlSurface, 1, 1);
+        let second = table.create_paired(GuestId(11), Iface::WlSurface, 1, 1);
         assert_ne!(second, first, "an ID awaiting delete_id must not be reused");
 
         assert_eq!(
-            table.release_deleted_host_id(first),
+            table.release_deleted_host_id(first.0),
             DeletedHostId::Paired {
-                guest: 10,
+                host: first,
+                guest: GuestId(10),
                 was_live: false
             }
         );
-        assert_eq!(table.get_host_id(10), None);
-        assert_eq!(table.get_interface(10), None);
+        assert_eq!(table.get_host_id(GuestId(10)), None);
+        assert_eq!(table.get_interface(GuestId(10)), None);
         assert_eq!(
             table.allocate_host_id(),
-            HostId(first),
+            first,
             "a deleted ID is reused first"
         );
         assert_eq!(
-            table.release_deleted_host_id(first + 100),
+            table.release_deleted_host_id(first.0 + 100),
             DeletedHostId::Ignored,
             "a delete_id for an ID never allocated changes nothing"
         );
-        assert_eq!(table.allocate_host_id(), HostId(second + 1));
+        assert_eq!(table.allocate_host_id(), HostId(second.0 + 1));
     }
 
     /// The host never destroys a binding of the proxy's own, so a
@@ -1332,21 +1435,21 @@ mod tests {
         let binding = table.create_host_only(Iface::WlShm, 1);
 
         assert_eq!(
-            table.release_deleted_host_id(binding),
+            table.release_deleted_host_id(binding.0),
             DeletedHostId::Ignored
         );
         assert!(table.get_host_interface(binding).is_some());
 
         // The binding's global goes, and with it the binding only.
-        let next = table.create_paired(11, Iface::WlSurface, 1, 1);
+        let next = table.create_paired(GuestId(11), Iface::WlSurface, 1, 1);
         assert_ne!(next, binding);
         table.retire_host(binding);
         assert!(!table.get_host_interface(binding).is_some());
-        assert_eq!(table.get_host_id(11), Some(next));
+        assert_eq!(table.get_host_id(GuestId(11)), Some(next));
 
         // Retiring a paired object is refused, not fatal.
         table.retire_host(next);
-        assert_eq!(table.get_host_id(11), Some(next));
+        assert_eq!(table.get_host_id(GuestId(11)), Some(next));
         assert!(table.get_host_interface(next).is_some());
     }
 
@@ -1355,9 +1458,9 @@ mod tests {
     #[test]
     fn retiring_an_untracked_host_id_changes_nothing() {
         let mut table = ShadowTable::new();
-        table.retire_host(2);
-        assert!(table.is_host_id_available(2));
-        assert_eq!(table.create_host_only(Iface::WlShm, 1), 2);
+        table.retire_host(HostId(2));
+        assert!(table.is_host_id_available(HostId(2)));
+        assert_eq!(table.create_host_only(Iface::WlShm, 1), HostId(2));
     }
 
     /// An object whose creation never reached the host frees its host ID
@@ -1365,26 +1468,25 @@ mod tests {
     #[test]
     fn an_abandoned_object_frees_both_ids() {
         let mut table = ShadowTable::new();
-        let host = table.create_paired(10, Iface::WlOutput, 3, 3);
+        let host = table.create_paired(GuestId(10), Iface::WlOutput, 3, 3);
 
-        table.abandon(10);
-        assert!(table.is_guest_id_available(10));
+        table.abandon(GuestId(10));
+        assert!(table.guest_new_id(10).is_some());
         assert!(table.is_host_id_available(host));
-        assert_eq!(
-            table.allocate_host_id(),
-            HostId(host),
-            "the host ID is reused"
-        );
+        assert_eq!(table.allocate_host_id(), host, "the host ID is reused");
     }
 
     #[test]
     fn fixture_ids_are_never_handed_out() {
         let mut table = ShadowTable::new();
         let server_guest = SERVER + 1;
-        table.insert_paired_for_test(10, 3, "wl_surface");
-        table.insert_paired_for_test(server_guest, 4, "wl_data_offer");
-        assert_eq!(table.get_host_id(10), Some(3));
-        assert_eq!(table.get_interface(server_guest), Some(Iface::WlDataOffer));
+        table.insert_paired_for_test(GuestId(10), HostId(3), Iface::WlSurface);
+        table.insert_paired_for_test(GuestId(server_guest), HostId(4), Iface::WlDataOffer);
+        assert_eq!(table.get_host_id(GuestId(10)), Some(HostId(3)));
+        assert_eq!(
+            table.get_interface(GuestId(server_guest)),
+            Some(Iface::WlDataOffer)
+        );
 
         // The allocators skip the fixture IDs themselves.
         assert_eq!(table.host_ids.next_candidate(), Some(2));
@@ -1401,19 +1503,35 @@ mod tests {
     #[test]
     fn a_bridged_host_object_keeps_its_own_interface() {
         let mut table = ShadowTable::new();
-        let host = table.create_bridged(20, Iface::ZwpTextInputV3, 1, Iface::ZwpTextInputV1, 1);
-
-        assert_eq!(table.get_interface(20), Some(Iface::ZwpTextInputV3));
-        assert_eq!(table.get_host_interface(host), Some(Iface::ZwpTextInputV1));
-        assert_eq!(
-            table.event_object(host, Iface::ZwpTextInputV1, EVENT),
-            Some(20)
+        let host = table.create_bridged(
+            GuestId(20),
+            Iface::ZwpTextInputV3,
+            1,
+            Iface::ZwpTextInputV1,
+            1,
         );
-        assert_eq!(table.event_object(host, Iface::ZwpTextInputV3, EVENT), None);
+
+        assert_eq!(
+            table.get_interface(GuestId(20)),
+            Some(Iface::ZwpTextInputV3)
+        );
+        assert_eq!(table.get_host_interface(host), Some(Iface::ZwpTextInputV1));
+        let text_input = EventObject {
+            host,
+            guest: GuestId(20),
+        };
+        assert_eq!(
+            table.event_object(host.0, Iface::ZwpTextInputV1, EVENT),
+            Some(text_input)
+        );
+        assert_eq!(
+            table.event_object(host.0, Iface::ZwpTextInputV3, EVENT),
+            None
+        );
 
         // Once the guest object goes, the host object keeps its own
         // interface, routes its events and stays reserved.
-        assert!(table.guest_ended_host_kept(20));
+        assert!(table.guest_ended_host_kept(GuestId(20)));
         assert_eq!(table.get_host_interface(host), Some(Iface::ZwpTextInputV1));
         assert!(table.get_host_interface(host).is_some());
         assert!(!table.is_host_id_available(host));
@@ -1429,12 +1547,12 @@ mod tests {
         assert!(table.is_retired_host(host_id));
         assert!(!table.get_host_interface(host_id).is_some());
         assert!(!table.is_host_id_available(host_id));
-        assert_ne!(table.allocate_host_id(), HostId(host_id));
+        assert_ne!(table.allocate_host_id(), host_id);
 
         // The host's delete_id still frees it.
         assert_eq!(
-            table.release_deleted_host_id(host_id),
-            DeletedHostId::HostOnly
+            table.release_deleted_host_id(host_id.0),
+            DeletedHostId::HostOnly { host: host_id }
         );
         assert!(table.is_host_id_available(host_id));
     }

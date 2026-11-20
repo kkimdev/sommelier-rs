@@ -24,13 +24,13 @@ fn a_waiting_recovery_is_decided_by_the_hosts_next_event() {
     use RecoveryStep::{Drop, Recover, Wait};
     use RecoveryWait::NextEvent;
     let held = HeldRepeatKey {
-        guest_keyboard_id: 5,
-        host_keyboard_id: HostId(50),
+        guest_keyboard_id: GuestId::for_test(5),
+        host_keyboard_id: HostId::for_test(50),
         key: 14,
         serial: 7,
         time: 70,
     };
-    let (other_keyboard, key, serial) = (HostId(51), 30, 8);
+    let (other_keyboard, key, serial) = (HostId::for_test(51), 30, 8);
     let press = RecoveryWait::Press {
         keyboard: other_keyboard,
         key,
@@ -53,16 +53,34 @@ fn a_waiting_recovery_is_decided_by_the_hosts_next_event() {
         (NextEvent, peek(Some(other_keyboard), false), Recover),
         (NextEvent, peek(None, true), Recover),
         (NextEvent, key_press(other_keyboard, serial), Recover),
-        (NextEvent, TextInputLeave { ti: Some(TiId(9)) }, Drop),
-        (NextEvent, TextInputLeave { ti: Some(TiId(10)) }, Recover),
+        (
+            NextEvent,
+            TextInputLeave {
+                ti: Some(TiId(GuestId::for_test(9))),
+            },
+            Drop,
+        ),
+        (
+            NextEvent,
+            TextInputLeave {
+                ti: Some(TiId(GuestId::for_test(10))),
+            },
+            Recover,
+        ),
         (NextEvent, TextInputLeave { ti: None }, Recover),
         (NextEvent, Other, Recover),
         (press, key_press(other_keyboard, serial), Drop),
         (press, key_press(other_keyboard, serial + 1), Recover),
-        (press, key_press(HostId(50), serial), Recover),
+        (press, key_press(HostId::for_test(50), serial), Recover),
         (press, Modifiers, Recover),
         (press, peek(Some(other_keyboard), true), Recover),
-        (press, TextInputLeave { ti: Some(TiId(9)) }, Drop),
+        (
+            press,
+            TextInputLeave {
+                ti: Some(TiId(GuestId::for_test(9))),
+            },
+            Drop,
+        ),
         (press, Other, Recover),
         (
             NextEvent,
@@ -81,14 +99,14 @@ fn a_waiting_recovery_is_decided_by_the_hosts_next_event() {
         (
             press,
             UnhandledKey {
-                keyboard: HostId(50),
+                keyboard: HostId::for_test(50),
             },
             Recover,
         ),
     ] {
         let pending = PendingRecovery {
-            ti: TiId(9),
-            seat: SeatId(1),
+            ti: TiId(GuestId::for_test(9)),
+            seat: SeatId(GuestId::for_test(1)),
             held,
             wait,
         };

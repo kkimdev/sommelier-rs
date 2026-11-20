@@ -16,20 +16,30 @@ limitations under the License.
 
 use super::*;
 
-const KEYBOARD_A: HostId = HostId(10);
-const KEYBOARD_B: HostId = HostId(11);
+/// Guest ID `id`.
+const fn g(id: u32) -> GuestId {
+    GuestId::for_test(id)
+}
+
+/// Host ID `id`.
+const fn h(id: u32) -> HostId {
+    HostId::for_test(id)
+}
+
+const KEYBOARD_A: HostId = h(10);
+const KEYBOARD_B: HostId = h(11);
 
 /// Seat 1's focus on guest surface 20, host surface 200.
 const ON_20: KeyboardFocus = KeyboardFocus {
-    guest_seat: 1,
-    guest_surface: 20,
-    host_surface: 200,
+    guest_seat: g(1),
+    guest_surface: g(20),
+    host_surface: h(200),
 };
 /// Seat 1's focus on guest surface 21, host surface 201.
 const ON_21: KeyboardFocus = KeyboardFocus {
-    guest_seat: 1,
-    guest_surface: 21,
-    host_surface: 201,
+    guest_seat: g(1),
+    guest_surface: g(21),
+    host_surface: h(201),
 };
 
 fn accepted(
@@ -51,9 +61,9 @@ fn keyboard_focus_registry_balances_replacement_and_delayed_leave() {
         registry.enter(KEYBOARD_A, ON_20),
         accepted(
             vec![SeatFocusChange {
-                guest_seat: 1,
+                guest_seat: g(1),
                 previous_surface: None,
-                current_surface: Some(20),
+                current_surface: Some(g(20)),
             }],
             Vec::new()
         )
@@ -62,14 +72,14 @@ fn keyboard_focus_registry_balances_replacement_and_delayed_leave() {
         registry.enter(KEYBOARD_B, ON_21),
         accepted(
             vec![SeatFocusChange {
-                guest_seat: 1,
-                previous_surface: Some(20),
-                current_surface: Some(21),
+                guest_seat: g(1),
+                previous_surface: Some(g(20)),
+                current_surface: Some(g(21)),
             }],
             vec![KEYBOARD_A]
         )
     );
-    assert_eq!(registry.surface_for_seat(1), Some(21));
+    assert_eq!(registry.surface_for_seat(g(1)), Some(g(21)));
     assert_eq!(
         registry.leave(KEYBOARD_A, ON_20.host_surface),
         accepted(Vec::new(), Vec::new()),
@@ -80,7 +90,7 @@ fn keyboard_focus_registry_balances_replacement_and_delayed_leave() {
         KeyboardFocusUpdate::default(),
         "a duplicate delayed leave must be rejected"
     );
-    assert_eq!(registry.surface_for_seat(1), Some(21));
+    assert_eq!(registry.surface_for_seat(g(1)), Some(g(21)));
 }
 
 /// A delayed leave answers an enter the guest saw. Once that enter is
@@ -134,7 +144,7 @@ fn keyboard_focus_registry_rejects_a_leave_for_a_superseded_or_ended_enter() {
             case.expected_focus_of_a,
             "{what}"
         );
-        assert_eq!(registry.surface_for_seat(1), Some(21), "{what}");
+        assert_eq!(registry.surface_for_seat(g(1)), Some(g(21)), "{what}");
     }
 }
 
@@ -151,19 +161,19 @@ fn keyboard_focus_registry_ends_a_shared_surface_at_its_first_leave() {
         registry.leave(KEYBOARD_A, ON_20.host_surface),
         accepted(
             vec![SeatFocusChange {
-                guest_seat: 1,
-                previous_surface: Some(20),
+                guest_seat: g(1),
+                previous_surface: Some(g(20)),
                 current_surface: None,
             }],
             vec![KEYBOARD_A, KEYBOARD_B]
         )
     );
-    assert_eq!(registry.surface_for_seat(1), None);
+    assert_eq!(registry.surface_for_seat(g(1)), None);
     assert_eq!(
         registry.leave(KEYBOARD_B, ON_20.host_surface),
         accepted(Vec::new(), Vec::new())
     );
-    assert_eq!(registry.surface_for_seat(1), None);
+    assert_eq!(registry.surface_for_seat(g(1)), None);
 }
 
 #[test]
@@ -173,40 +183,40 @@ fn keyboard_focus_registry_destroys_surface_across_seats_without_fallback() {
     registry.enter(
         KEYBOARD_B,
         KeyboardFocus {
-            guest_seat: 2,
+            guest_seat: g(2),
             ..ON_20
         },
     );
     registry.enter(
-        HostId(12),
+        HostId::for_test(12),
         KeyboardFocus {
-            guest_seat: 3,
-            guest_surface: 30,
-            host_surface: 300,
+            guest_seat: g(3),
+            guest_surface: g(30),
+            host_surface: h(300),
         },
     );
 
     assert_eq!(
-        registry.destroy_surface(20),
+        registry.destroy_surface(g(20)),
         accepted(
             vec![
                 SeatFocusChange {
-                    guest_seat: 1,
-                    previous_surface: Some(20),
+                    guest_seat: g(1),
+                    previous_surface: Some(g(20)),
                     current_surface: None,
                 },
                 SeatFocusChange {
-                    guest_seat: 2,
-                    previous_surface: Some(20),
+                    guest_seat: g(2),
+                    previous_surface: Some(g(20)),
                     current_surface: None,
                 },
             ],
             vec![KEYBOARD_A, KEYBOARD_B]
         )
     );
-    assert_eq!(registry.surface_for_seat(1), None);
-    assert_eq!(registry.surface_for_seat(2), None);
-    assert_eq!(registry.surface_for_seat(3), Some(30));
+    assert_eq!(registry.surface_for_seat(g(1)), None);
+    assert_eq!(registry.surface_for_seat(g(2)), None);
+    assert_eq!(registry.surface_for_seat(g(3)), Some(g(30)));
 }
 
 #[test]

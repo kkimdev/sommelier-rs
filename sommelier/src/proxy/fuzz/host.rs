@@ -57,7 +57,7 @@ pub(super) struct Host {
     /// The interface whose live objects it ends on its own.
     destroys: Option<&'static str>,
     /// Answers held back, and whether the last request was a deactivation.
-    held: Vec<Outgoing>,
+    held: Vec<Outgoing<u32>>,
     after_deactivate: bool,
     /// Whether the input method restarted in the answer to the sync of the
     /// last press, after it: it counts once the proxy's `reset` shows that
@@ -117,7 +117,7 @@ impl Host {
         request: &AnyRequest,
         time: u32,
         choices: &mut impl Choose,
-    ) -> Vec<Outgoing> {
+    ) -> Vec<Outgoing<u32>> {
         self.observe(sender, request);
         let sync = matches!(
             request,
@@ -150,7 +150,7 @@ impl Host {
     }
 
     /// The answers it holds back, which it sends now.
-    pub fn release(&mut self) -> Vec<Outgoing> {
+    pub fn release(&mut self) -> Vec<Outgoing<u32>> {
         std::mem::take(&mut self.held)
     }
 
@@ -193,7 +193,12 @@ impl Host {
     /// What the host does as it answers a sync, before its `done`: it may
     /// end live objects of its interface, then composes and presses on the
     /// focused surface, then may restart the input method.
-    fn as_it_syncs(&mut self, time: u32, choices: &mut impl Choose, answer: &mut Vec<Outgoing>) {
+    fn as_it_syncs(
+        &mut self,
+        time: u32,
+        choices: &mut impl Choose,
+        answer: &mut Vec<Outgoing<u32>>,
+    ) {
         if let Some(interface) = self.destroys.filter(|_| choices.pick(2) == 0) {
             let (ended, deletes) = self.display.end(interface, &mut self.exo);
             self.counts.live_objects_host_destroyed += ended as u64;
@@ -221,7 +226,7 @@ impl Host {
         &mut self,
         time: u32,
         choices: &mut impl Choose,
-        answer: &mut Vec<Outgoing>,
+        answer: &mut Vec<Outgoing<u32>>,
     ) -> bool {
         let Some(surface) = self.exo.focus() else {
             return false;
@@ -253,13 +258,13 @@ impl Host {
 
     /// Count what `answer` shows, and end the activations whose seat
     /// ended while they were active.
-    fn after(&mut self, answer: &[Outgoing]) {
+    fn after(&mut self, answer: &[Outgoing<u32>]) {
         let objects = self.display.objects();
-        for (event, _) in answer {
-            let sender = msg_sender(event);
-            let opcode = msg_opcode(event);
+        for event in answer {
+            let sender = msg_sender(event.bytes());
+            let opcode = msg_opcode(event.bytes());
             if (sender, opcode) == (WL_DISPLAY_ID, wl_display::EVT_DELETE_ID) {
-                let id = u32::from_ne_bytes(event[8..12].try_into().expect("an ID"));
+                let id = u32::from_ne_bytes(event.bytes()[8..12].try_into().expect("an ID"));
                 self.deleted.insert(id);
             }
             let text_input = objects.live_interface(sender) == Some(zwp_text_input_v1::NAME);

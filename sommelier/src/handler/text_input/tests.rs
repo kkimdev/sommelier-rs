@@ -15,12 +15,11 @@ limitations under the License.
 */
 
 use super::*;
-use crate::handler::Handlers;
 use crate::ime::map_v3_content_type;
 use crate::keys::GuestKeyOwner;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
-use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
+use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::wayland::wl_display;
 use crate::protocols::wayland::wl_keyboard;
 use crate::protocols::wayland::{
@@ -29,9 +28,10 @@ use crate::protocols::wayland::{
 use crate::protocols::Iface;
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
-use crate::state::HostId;
+use crate::state::{GuestId, HostId};
 use crate::test_support::respell;
 use crate::wire::WL_DISPLAY_ID;
+use crate::wire::{Outgoing, WireId};
 use std::os::fd::OwnedFd;
 use zcr_extended_text_input_v1::{evt as ext, Request as Ext};
 use zcr_keyboard_extension_v1::Request as KeyboardExtension;
@@ -599,7 +599,7 @@ impl Field {
 
     /// The host's `button` event of `pointer`, of the left button in
     /// `state`.
-    fn button(pointer: Object, state: u32) -> Outgoing {
+    fn button(pointer: Object, state: u32) -> Outgoing<u32> {
         wl_pointer::evt::button(pointer.host, 4, 500, BTN_LEFT, state)
     }
 
@@ -616,7 +616,7 @@ impl Field {
 
     /// A host `wl_touch.down` of `touch` on `surface`, of touch point
     /// `id`.
-    fn down(touch: Object, surface: Object, id: i32) -> Outgoing {
+    fn down(touch: Object, surface: Object, id: i32) -> Outgoing<u32> {
         wl_touch::evt::down(touch.host, 6, 600, surface.host, id, 256, 512)
     }
 
@@ -682,41 +682,41 @@ impl Field {
     }
 
     /// The host input method's `preedit_string`.
-    fn preedit(&self, text: &str, commit: &str) -> Outgoing {
+    fn preedit(&self, text: &str, commit: &str) -> Outgoing<u32> {
         v1::preedit_string(self.host, 0, text, commit).unwrap()
     }
 
     /// The host input method's `commit_string`.
-    fn commit(&self, text: &str) -> Outgoing {
+    fn commit(&self, text: &str) -> Outgoing<u32> {
         v1::commit_string(self.host, 0, text).unwrap()
     }
 
     /// The host input method's `delete_surrounding_text` of the bytes
     /// `index..index + length`, as Exo sends it.
-    fn delete_range(&self, index: i32, length: u32) -> Outgoing {
+    fn delete_range(&self, index: i32, length: u32) -> Outgoing<u32> {
         v1::delete_surrounding_text(self.host, index, length)
     }
 
     /// The host input method's `confirm_preedit`.
-    fn confirm(&self) -> Outgoing {
+    fn confirm(&self) -> Outgoing<u32> {
         ext::confirm_preedit(self.host_ext, 1)
     }
 
     /// The extended keyboard's `peek_key` of `k`, which the host
     /// sends before its input method can take the key.
-    fn peek(&self, k: Stroke) -> Outgoing {
+    fn peek(&self, k: Stroke) -> Outgoing<u32> {
         let peek_key = zcr_extended_keyboard_v1::evt::peek_key;
         peek_key(self.extended_keyboard, k.serial, k.time, k.key, k.state)
     }
 
     /// The host keyboard's `key` of `k`.
-    fn key(&self, k: Stroke) -> Outgoing {
+    fn key(&self, k: Stroke) -> Outgoing<u32> {
         wl_keyboard::evt::key(self.keyboard.host, k.serial, k.time, k.key, k.state)
     }
 
     /// The host input method's `keysym` `sym` of `k`, whose serial
     /// and time Exo sends in each other's arguments.
-    fn keysym(&self, sym: u32, k: Stroke) -> Outgoing {
+    fn keysym(&self, sym: u32, k: Stroke) -> Outgoing<u32> {
         v1::keysym(self.host, k.time, k.serial, sym, k.state, 0)
     }
 
@@ -756,22 +756,22 @@ impl Field {
     /// The IME repeat lease of `key` on the host keyboard, which no
     /// peer sees until the key's next confirmation.
     fn repeat_owner(&mut self, key: u32) -> Option<u32> {
-        let keyboard = HostId(self.keyboard.host);
+        let keyboard = HostId::for_test(self.keyboard.host);
         assert_eq!(key, BACKSPACE, "only Backspace is leased");
         let lease = self.s.ctx().keys.backspace_lease(keyboard);
-        lease.map(|ti| ti.0)
+        lease.map(|ti| ti.0.wire())
     }
 
     /// The owner the proxy assigned the guest's press of `key` on the
     /// host keyboard, which no peer sees.
     fn owner(&mut self, key: u32) -> Option<GuestKeyOwner> {
-        let keyboard = HostId(self.keyboard.host);
+        let keyboard = HostId::for_test(self.keyboard.host);
         self.s.ctx().keys.owner(keyboard, key)
     }
 
     /// The proxy's state of the text input, for state no peer sees.
     fn state(&mut self) -> &crate::ime::TextInput {
-        let ti = TiId(self.ti);
+        let ti = TiId(GuestId::for_test(self.ti));
         self.s.ctx().ime.get(ti).expect("the text input")
     }
 
@@ -800,7 +800,7 @@ impl Field {
     /// Whether the proxy holds `key` of the host keyboard, which no peer
     /// sees until the key's next event.
     fn held(&mut self, key: u32) -> bool {
-        let keyboard = HostId(self.keyboard.host);
+        let keyboard = HostId::for_test(self.keyboard.host);
         self.s.ctx().keys.held(keyboard, key)
     }
 }
@@ -1604,7 +1604,9 @@ async fn an_extension_of_unknown_version_gives_no_input_method() {
     // Injects a fault no peer can cause: no peer can make the proxy lose
     // a bound extension's version; retiring its object stands in for
     // that bookkeeping fault.
-    s.ctx().shadow_table.retire_host(extension);
+    s.ctx()
+        .shadow_table
+        .retire_host(HostId::for_test(extension));
     let ti = s.new_id();
     s.guest([
         get_text_input(manager, ti, seat),
@@ -1702,7 +1704,7 @@ impl DoneCountingClient {
     }
 
     /// Its next `commit` of text input `ti`.
-    fn commit(&mut self, ti: u32) -> Outgoing {
+    fn commit(&mut self, ti: u32) -> Outgoing<u32> {
         self.commits += 1;
         v3::commit(ti)
     }
@@ -2431,7 +2433,7 @@ fn delete(before_length: u32, after_length: u32) -> V3 {
 /// commits, whatever serial the host sent.
 #[tokio::test]
 async fn host_ime_events_become_v3_transactions() {
-    type Events = fn(&Field) -> Vec<Outgoing>;
+    type Events = fn(&Field) -> Vec<Outgoing<u32>>;
     let korean: Events = |f| {
         vec![
             f.preedit("ㄱ", "ㄱ"),
@@ -2635,7 +2637,7 @@ async fn host_ime_events_become_v3_transactions() {
 /// (a range its text does not have, a negative index).
 #[tokio::test]
 async fn exo_deletes_become_v3_deletes_around_the_cursor() {
-    type Events = fn(&Field) -> Vec<Outgoing>;
+    type Events = fn(&Field) -> Vec<Outgoing<u32>>;
     /// The guest's surrounding text, cursor and anchor, if it has any.
     type Surrounding = Option<(&'static str, i32, i32)>;
     /// The `done` after the guest's second commit, which stated the
@@ -3643,7 +3645,7 @@ async fn held_keys_repeat_through_confirmations_after_korean_input() {
     f.s.host([f.peek(release)]).await;
     assert!(!f.held(SPACE));
     // No peer sees the peek a later confirmation could recover.
-    let keyboard = HostId(f.keyboard.host);
+    let keyboard = HostId::for_test(f.keyboard.host);
     assert_eq!(f.s.ctx().keys.peek(keyboard, SPACE), None);
 
     // Backspace held over a preedit the input method empties.
@@ -3775,7 +3777,10 @@ async fn a_text_input_destroyed_while_draining_ends_its_barrier_unseen() {
 
     f.drain(callback).await;
     // No peer sees whether the proxy still waits on its own callback.
-    assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
+    assert_eq!(
+        f.s.ctx().internal_callbacks.get(HostId::for_test(callback)),
+        None
+    );
     let ti = f.s.new_id();
     f.create_text_input(ti).await;
     assert!(![f.host, f.host_ext].contains(&callback));
@@ -3834,7 +3839,10 @@ async fn a_focus_change_drops_the_old_composition_and_held_key() {
 
     f.drain(callback).await;
     // No peer sees whether the proxy still waits on its own callback.
-    assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
+    assert_eq!(
+        f.s.ctx().internal_callbacks.get(HostId::for_test(callback)),
+        None
+    );
     let mut expected = vec![f.activate()];
     expected.extend(f.content_type((0, 0), false));
     expected.push(f.commit_state(2));
@@ -3895,7 +3903,10 @@ async fn an_uncommitted_enable_or_disable_dies_with_its_focus() {
     f.drain(callback).await;
     assert_eq!(f.host_received().await, []);
     // No peer sees whether the proxy still waits on its own callback.
-    assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
+    assert_eq!(
+        f.s.ctx().internal_callbacks.get(HostId::for_test(callback)),
+        None
+    );
     f.s.guest([v3::commit(f.ti)]).await;
     assert_eq!(f.host_received().await, [f.commit_state(2)]);
 
@@ -4079,20 +4090,20 @@ async fn a_reports_barrier_is_glued_into_its_entry() {
     // Dispatches the guest's report and commit as their requests would,
     // and reads state no peer can observe: how the host queue holds them
     // before the proxy sends them.
-    let ti = TiId(f.ti);
+    let ti = TiId(GuestId::for_test(f.ti));
     let ctx = f.s.ctx();
     super::ime(
         ctx,
         Input::SurroundingText(ti, IndexedString::from("ab"), 2, 2),
     );
     super::ime(ctx, Input::Commit(ti));
-    let queue = std::mem::take(&mut ctx.client_to_host_queue);
-    ctx.host_to_client_queue.clear();
-    let report = queue.iter().find(|(bytes, _)| {
-        crate::test_support::msg_header(bytes).opcode == zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT
+    let queue: Vec<_> = ctx.take_effects().to_host.collect();
+    let report = queue.iter().find(|message| {
+        crate::test_support::msg_header(message.bytes()).opcode
+            == zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT
     });
-    let (bytes, _) = report.expect("a report");
-    let messages = crate::test_support::glued_messages(bytes);
+    let report = report.expect("a report");
+    let messages = crate::test_support::glued_messages(report.bytes());
     let [_, sync] = messages[..] else {
         panic!("{} messages in the report's entry", messages.len());
     };
@@ -4115,7 +4126,7 @@ async fn a_reports_barrier_is_glued_into_its_entry() {
 async fn oversized_host_text_does_not_partially_advance_state() {
     // Each 0xff becomes the three bytes of U+FFFD.
     let latin1 = "x".repeat(4_000);
-    type Event = fn(&Field, &str) -> Outgoing;
+    type Event = fn(&Field, &str) -> Outgoing<u32>;
     let cases: [(&str, Event); 3] = [
         ("preedit", |f, text| {
             respell(f.preedit(text, ""), text, &[0xff; 4_000])
@@ -4131,7 +4142,7 @@ async fn oversized_host_text_does_not_partially_advance_state() {
         if case == "confirm" {
             // Injects a state no peer can cause: a shown preedit too long
             // to commit.
-            let ti = TiId(f.ti);
+            let ti = TiId(GuestId::for_test(f.ti));
             let state = f.s.ctx().ime.get_mut(ti).expect("the text input");
             state.show_for_test(&"x".repeat(4_084));
         }
@@ -4166,27 +4177,42 @@ fn child_objects_inherit_their_manager_versions() {
     // Built by hand: the proxy binds no version above the generated
     // one, so no session can tell a child's inherited version from it.
     let mut ctx = Context::new_for_test(false, false, vec![]);
-    ctx.host_text_input_manager_v1_id = Some(2);
-    ctx.host_text_input_extension_v1_id = Some(3);
+    let (manager, extension) = (HostId::for_test(2), HostId::for_test(3));
+    ctx.host_text_input_manager_v1_id = Some(manager);
+    ctx.host_text_input_extension_v1_id = Some(extension);
     // Both text-input protocols are v1, so artificial manager versions
     // show where each child's version comes from.
     ctx.shadow_table
-        .insert_host_only_for_test(2, "zwp_text_input_manager_v1", 4);
+        .insert_host_only_for_test(manager, Iface::ZwpTextInputManagerV1, 4);
     ctx.shadow_table
-        .insert_host_only_for_test(3, "zcr_text_input_extension_v1", 12);
+        .insert_host_only_for_test(extension, Iface::ZcrTextInputExtensionV1, 12);
     ctx.shadow_table
-        .create_local(40, Iface::ZwpTextInputManagerV3, 5);
-    ctx.last_sender_id = 40;
+        .create_local(GuestId::for_test(40), Iface::ZwpTextInputManagerV3, 5);
+    let seat = (GuestId::for_test(30), HostId::for_test(31));
+    ctx.shadow_table
+        .insert_paired_for_test(seat.0, seat.1, Iface::WlSeat);
 
-    assert_eq!(Handlers::on_get_text_input(&mut ctx, 20, 30), Action::Drop);
-    let host = ctx.ime.get(TiId(20)).expect("the text input").host();
+    let get_text_input = zwp_text_input_manager_v3::req::get_text_input(40, 20, 30);
+    let (bytes, _) = get_text_input.into_parts();
+    let header = crate::test_support::msg_header(&bytes);
+    let mut fds = std::collections::VecDeque::new();
+    let mut msg = crate::wire::WireMessage::new(
+        header.sender_id,
+        header.opcode,
+        &bytes[crate::wire::MessageHeader::LEN..],
+    )
+    .with_fds(&mut fds);
+    let forward = crate::test_support::dispatch_request(&mut ctx, &mut msg);
+    assert!(matches!(forward, Ok(None)), "the request is consumed");
+    let ti = TiId(GuestId::for_test(20));
+    let host = ctx.ime.get(ti).expect("the text input").host();
     assert_eq!(
         ctx.shadow_table.host_object_version(host.ext.id),
         Some(12),
         "version guards must use the manager's negotiated host version"
     );
     assert_eq!(ctx.shadow_table.host_object_version(host.v1), Some(4));
-    assert_eq!(ctx.shadow_table.guest_object_version(20), Some(5));
+    assert_eq!(ctx.shadow_table.guest_object_version(ti.0), Some(5));
 }
 
 /// A drain barrier completes only the generation it drains: the guest
@@ -4239,7 +4265,7 @@ async fn guest_commit_serial_wraps_and_is_forwarded_unchanged() {
     let mut f = Field::disabled().await;
     // Injects a state no peer can reach in a test's time: 2^32 - 1
     // commits.
-    let ti = TiId(f.ti);
+    let ti = TiId(GuestId::for_test(f.ti));
     let state = f.s.ctx().ime.get_mut(ti).expect("the text input");
     state.set_commits_for_test(u32::MAX);
     f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;

@@ -24,11 +24,13 @@ use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::wayland::{wl_buffer, wl_keyboard};
 use crate::protocols::{AnyEvent, Iface};
 use crate::settings::{HostTransport, Settings};
-use crate::state::{ConnectionFacts, Context, EventSender, PostDispatch, SessionEnd};
+use crate::state::{
+    ConnectionFacts, Context, EventSender, GuestId, HostId, PostDispatch, SessionEnd,
+};
 use crate::trace::{Recorder, Stream, Traces};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::warn_once::WarnOnce;
-use crate::wire::{Framing, MessageHeader, ProtocolError, WireMessage};
+use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, ToGuest, ToHost, WireMessage};
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
@@ -122,7 +124,7 @@ fn pending_host_event_is_stale(ctx: &Context, sender: &EventSender, event: &AnyE
     }
     match event {
         AnyEvent::WlBuffer(wl_buffer::Event::Release {}) => {
-            !ctx.host_buffer_is_guest_destroyed(sender.id)
+            !ctx.host_buffer_is_guest_destroyed(sender.host)
         }
         AnyEvent::ZwpLinuxBufferParamsV1(
             zwp_linux_buffer_params_v1::Event::Created { .. }
@@ -130,6 +132,24 @@ fn pending_host_event_is_stale(ctx: &Context, sender: &EventSender, event: &AnyE
         ) => false,
         _ => true,
     }
+}
+
+/// The forward of a message, to the peer its direction goes to.
+enum Forward {
+    /// A guest request's, for the host.
+    Host(ToHost),
+    /// A host event's, for the guest.
+    Guest(ToGuest),
+}
+
+/// Log forward `message`, which the dispatcher translated.
+fn translated<I>(message: Outgoing<I>) -> Outgoing<I> {
+    log::debug!(
+        "  -> translated ({} bytes, {} fds)",
+        message.bytes().len(),
+        message.fds().len()
+    );
+    message
 }
 
 /// What the proxy read of a host event.
@@ -157,7 +177,7 @@ fn unreadable_internal_event(sender: EventSender, opcode: u16, error: &ProtocolE
         UNREADABLE_INTERNAL_EVENT.level(),
         "Dropping event {opcode} of host {} {}, which only the proxy uses: {error}",
         sender.iface,
-        sender.id
+        sender.host
     );
 }
 
@@ -304,8 +324,8 @@ struct Client {
     parked: Option<ParkedRequest>,
     /// What the batches dispatched so far send each peer and have not sent
     /// yet, in the order they produced it (see [`Self::flush`]).
-    to_host: OutgoingMessages,
-    to_guest: OutgoingMessages,
+    to_host: OutgoingMessages<HostId>,
+    to_guest: OutgoingMessages<GuestId>,
     /// The direction of the batches whose output is pending, and how many
     /// there are; the next batch sends it first if it goes the other way
     /// or would make more than [`MAX_BATCHES_PER_FLUSH`].
@@ -491,13 +511,9 @@ impl Client {
         // an independently addressable byte offset. VirtWL's send path keeps
         // that same order when it chunks a large byte stream. The batch
         // appends to what earlier batches left for each peer.
-        // `reverse_out` is what the messages send back toward their
-        // source: host requests while events are handled (an ack_key, say),
-        // guest events while requests are.
-        let (out, reverse_out) = match direction {
-            Direction::ClientToHost => (&mut self.to_host, &mut self.to_guest),
-            Direction::HostToClient => (&mut self.to_guest, &mut self.to_host),
-        };
+        // A message's forward goes to its direction's peer, and its effects
+        // to the peer whose IDs they carry, so each peer gets its share in
+        // the order the messages produced it.
         let mut end = None;
         let mut offset: usize = 0;
         let mut processed_messages = 0;
@@ -563,14 +579,13 @@ impl Client {
                 Direction::ClientToHost => match self.ctx.shadow_table.resolve_request(sender_id) {
                     Some(sender) => {
                         log::trace!("[{direction:?}] {}:{opcode} (len={len})", sender.iface);
-                        self.ctx.last_sender_id = sender_id;
                         let mut msg = msg(&mut conn.read_fds);
                         let forward = protocols::dispatch_request::<Handlers>(
                             sender,
                             &mut msg,
                             &mut self.ctx,
                         );
-                        whole(&msg, sender.iface, forward)
+                        whole(&msg, sender.iface, forward).map(|forward| forward.map(Forward::Host))
                     }
                     // A guest request is only valid when its sender is a
                     // live object owned by this connection. Unlike a stale
@@ -628,27 +643,22 @@ impl Client {
                             // this event's own forward.
                             crate::handler::keyboard::before_host_event(
                                 &mut self.ctx,
-                                sender_id,
-                                event.map(|(_, event)| event),
+                                event,
                                 stale,
                             );
                             {
                                 let decided = self.ctx.take_effects();
                                 debug_assert!(decided.end.is_none() && decided.wait.is_none());
                                 for message in decided.to_guest {
-                                    out.push(message);
+                                    self.to_guest.push(message);
                                 }
                                 for message in decided.to_host {
-                                    reverse_out.push(message);
+                                    self.to_host.push(message);
                                 }
                             }
                             match read {
-                                HostRead::Event(..) if stale => {
-                                    self.ctx.last_sender_id = sender_id;
-                                    Ok(None)
-                                }
+                                HostRead::Event(..) if stale => Ok(None),
                                 HostRead::Event(sender, event) => {
-                                    self.ctx.last_sender_id = sender_id;
                                     let forward = protocols::dispatch_event::<Handlers>(
                                         sender,
                                         event,
@@ -662,7 +672,9 @@ impl Client {
                                             unreadable_internal_event(sender, opcode, &error);
                                             Ok(None)
                                         }
-                                        forward => forward,
+                                        forward => {
+                                            forward.map(|forward| forward.map(Forward::Guest))
+                                        }
                                     }
                                 }
                                 read => {
@@ -701,14 +713,20 @@ impl Client {
             let forward = match result {
                 Ok(forward) => forward,
                 Err(e) => {
-                    let guest_id_for_log = match direction {
-                        Direction::ClientToHost => Some(sender_id),
-                        Direction::HostToClient => self.ctx.shadow_table.get_guest_id(sender_id),
-                    };
-                    let interface = guest_id_for_log
-                        .and_then(|gid| self.ctx.shadow_table.get_interface(gid))
-                        .map_or("unknown", Iface::name);
-                    log::error!("Protocol error: {} (direction={:?}, id={}, guest_id={:?}, interface={}, opcode={})", e, direction, sender_id, guest_id_for_log, interface, opcode);
+                    let interface = match direction {
+                        Direction::ClientToHost => self
+                            .ctx
+                            .shadow_table
+                            .resolve_request(sender_id)
+                            .map(|sender| sender.iface),
+                        Direction::HostToClient => self
+                            .ctx
+                            .shadow_table
+                            .resolve_event(sender_id)
+                            .map(|sender| sender.iface),
+                    }
+                    .map_or("unknown", Iface::name);
+                    log::error!("Protocol error: {e} (direction={direction:?}, id={sender_id}, interface={interface}, opcode={opcode})");
                     self.ctx.end_session(rejection(direction, &e));
                     None
                 }
@@ -726,14 +744,7 @@ impl Client {
                     (conn.read_fds.len() != queued_fds, "it took descriptors"),
                     (forward.is_some(), "it has a forward"),
                     (!after_forward.is_empty(), "it deferred work"),
-                    (
-                        !self.ctx.client_to_host_queue.is_empty(),
-                        "it queued requests for the host",
-                    ),
-                    (
-                        !self.ctx.host_to_client_queue.is_empty(),
-                        "it queued events for the guest",
-                    ),
+                    (self.ctx.sends_anything(), "it queued output"),
                 ]
                 .into_iter()
                 .find_map(|(broken, why)| broken.then_some(why));
@@ -802,23 +813,16 @@ impl Client {
             // The generated dispatcher encoded the forward under the sender
             // it translated before the handler ran, so a handler that retires
             // the sender's mapping cannot change it.
-            if let Some(message) = forward {
-                log::debug!(
-                    "  -> translated ({} bytes, {} fds)",
-                    message.0.len(),
-                    message.1.len()
-                );
-                out.push(message);
+            match forward {
+                Some(Forward::Host(message)) => self.to_host.push(translated(message)),
+                Some(Forward::Guest(message)) => self.to_guest.push(translated(message)),
+                None => {}
             }
-            let (onward, back) = match direction {
-                Direction::ClientToHost => (effects.to_host, effects.to_guest),
-                Direction::HostToClient => (effects.to_guest, effects.to_host),
-            };
-            for message in onward {
-                out.push(message);
+            for message in effects.to_host {
+                self.to_host.push(message);
             }
-            for message in back {
-                reverse_out.push(message);
+            for message in effects.to_guest {
+                self.to_guest.push(message);
             }
 
             offset = message_end;
@@ -830,19 +834,12 @@ impl Client {
 
         // A session that ends gets its one error after the valid messages.
         if let Some(end) = &end {
-            let to_guest = match direction {
-                Direction::ClientToHost => &mut *reverse_out,
-                Direction::HostToClient => &mut *out,
-            };
-            to_guest.push(crate::handler::display::session_error(end));
+            self.to_guest
+                .push(crate::handler::display::session_error(end));
         }
         if let Some(trace) = &mut self.trace {
-            let (to_host, to_guest) = match direction {
-                Direction::ClientToHost => (&*out, &*reverse_out),
-                Direction::HostToClient => (&*reverse_out, &*out),
-            };
-            trace.record_since(Stream::ToHost, to_host, marks.0);
-            trace.record_since(Stream::ToGuest, to_guest, marks.1);
+            trace.record_since(Stream::ToHost, &self.to_host, marks.0);
+            trace.record_since(Stream::ToGuest, &self.to_guest, marks.1);
             trace.flush();
         }
 
@@ -868,22 +865,30 @@ impl Client {
         } else {
             LastSubmission::Send
         };
-        let mut success = end.is_none();
-        if other_conn.send_submissions(out, last).await.is_err() {
-            success = false;
-        }
-
-        // The reverse output goes back through the source connection, apart
-        // from the forwarded messages, so a forwarded wl_keyboard.key may
-        // reach the guest before or after its ack_key reaches the host.
-        // Either is safe: Exo holds the key in pending_key_acks_ with a
-        // 1000 ms TTL, so the ack always arrives well within the window. The
-        // C sommelier sends the key first.
-        if conn.send_submissions(reverse_out, last).await.is_err() {
-            // success=false signals the caller (handle_msgs) to drop this
-            // client connection.
-            success = false;
-        }
+        // The forwards go out first. The reverse output goes back through
+        // the source connection, apart from them, so a forwarded
+        // wl_keyboard.key may reach the guest before or after its ack_key
+        // reaches the host. Either is safe: Exo holds the key in
+        // pending_key_acks_ with a 1000 ms TTL, so the ack always arrives
+        // well within the window. The C sommelier sends the key first.
+        let sent = match direction {
+            Direction::ClientToHost => {
+                let to_host = other_conn.send_submissions(&mut self.to_host, last).await;
+                (
+                    to_host,
+                    conn.send_submissions(&mut self.to_guest, last).await,
+                )
+            }
+            Direction::HostToClient => {
+                let to_guest = other_conn.send_submissions(&mut self.to_guest, last).await;
+                (
+                    conn.send_submissions(&mut self.to_host, last).await,
+                    to_guest,
+                )
+            }
+        };
+        // A failed send drops this client connection (see `handle_msgs`).
+        let success = end.is_none() && sent.0.is_ok() && sent.1.is_ok();
 
         conn.read_buf.drain(..offset);
         self.ended = !success;
@@ -1200,13 +1205,19 @@ mod tests {
                 // wl_display.sync has opcode 0, so the opcode bytes of its
                 // header read as an invalid zero length when decoded as the
                 // length field.
-                let (sync, _) = wl_display::req::sync(WL_DISPLAY_ID, s.new_id());
+                let (sync, _) = wl_display::req::sync(WL_DISPLAY_ID, s.new_id()).into_parts();
                 let (header, body) = sync.split_at(MessageHeader::LEN);
                 // The body waits in the socket, so the proxy must read again
                 // to complete the message whose header it has already
                 // buffered.
-                s.queue(ClientToHost, [(header.to_vec(), Vec::new())]);
-                s.write(ClientToHost, [(body.to_vec(), Vec::new())]);
+                s.queue(
+                    ClientToHost,
+                    [Outgoing::from_parts(header.to_vec(), Vec::new())],
+                );
+                s.write(
+                    ClientToHost,
+                    [Outgoing::from_parts(body.to_vec(), Vec::new())],
+                );
                 s.run(async |peers| {
                     let forwarded = peers.host_received().await;
                     assert!(
@@ -1267,10 +1278,10 @@ mod tests {
 
     /// A message no encoder builds, such as a malformed one: `words` as
     /// the payload of `opcode` from `sender`.
-    fn raw(sender: u32, opcode: u16, words: &[u32]) -> Outgoing {
+    fn raw(sender: u32, opcode: u16, words: &[u32]) -> Outgoing<u32> {
         let mut message = MessageBuilder::new();
         words.iter().for_each(|&word| message.write_u32(word));
-        (message.build_message(sender, opcode), Vec::new())
+        Outgoing::from_parts(message.build_message(sender, opcode), Vec::new())
     }
 
     /// libwayland-server rejects client object IDs past its map limit, so a
@@ -1496,7 +1507,7 @@ mod tests {
         let mut s = Session::new();
         let region = region(&mut s).await;
         let add = |x| wl_region::req::add(region.id, x, 0, 1, 1);
-        assert!(REQUESTS as usize * add(0).0.len() <= MAX_BYTES_PER_SEND);
+        assert!(REQUESTS as usize * add(0).bytes().len() <= MAX_BYTES_PER_SEND);
 
         s.queue(ClientToHost, (0..REQUESTS).map(add));
         while s.next_direction(false).is_some() {
@@ -1556,7 +1567,7 @@ mod tests {
         let add = |x| wl_region::req::add(region.id, x, 0, 1, 1);
         let sent = (MAX_BATCHES_PER_FLUSH * MAX_MESSAGES_PER_BATCH) as i32;
         // The batches' output fits one submission, so only the count sends it.
-        assert!(sent as usize * add(0).0.len() < MAX_BYTES_PER_SEND);
+        assert!(sent as usize * add(0).bytes().len() < MAX_BYTES_PER_SEND);
 
         s.queue(ClientToHost, (0..requests).map(add));
         for _ in 0..batches {
@@ -1712,7 +1723,7 @@ mod tests {
     /// descriptor. Were its handler to run for a released keyboard, it
     /// would load the keymap for it, state the orphan check after the batch
     /// reports.
-    fn keymap_event(keyboard: u32) -> (Outgoing, TestFdIdentity) {
+    fn keymap_event(keyboard: u32) -> (Outgoing<u32>, TestFdIdentity) {
         use protocols::wayland::wl_keyboard;
         let keymap = default_keymap();
         let file = shm_pool_file(&keymap);
@@ -1725,7 +1736,7 @@ mod tests {
 
     /// The `repeat_info` the host sends a live keyboard after a stale
     /// keymap, as `keyboard` sends it on.
-    fn repeat_info(keyboard: u32) -> Outgoing {
+    fn repeat_info(keyboard: u32) -> Outgoing<u32> {
         protocols::wayland::wl_keyboard::evt::repeat_info(keyboard, 25, 400)
     }
 
@@ -1773,10 +1784,11 @@ mod tests {
         let mut s = Session::new();
         let (released, live) = released_and_live_keyboards(&mut s).await;
         let (keymap, keymap_identity) = keymap_event(released.host);
-        let (live_repeat_info, _) = repeat_info(live.host);
+        let (live_repeat_info, _) = repeat_info(live.host).into_parts();
         let (head, rest) = live_repeat_info.split_at(4);
 
-        s.host([keymap, (head.to_vec(), Vec::new())]).await;
+        s.host([keymap, Outgoing::from_parts(head.to_vec(), Vec::new())])
+            .await;
         assert_eq!(
             s.guest_received(),
             [],
@@ -1788,18 +1800,19 @@ mod tests {
         );
 
         // The completed live follow-up remains decodable.
-        s.host([(rest.to_vec(), Vec::new())]).await;
+        s.host([Outgoing::from_parts(rest.to_vec(), Vec::new())])
+            .await;
         assert_eq!(s.guest_received(), [repeated(live)]);
     }
 
     /// An event of host object 77, which the proxy does not track, with a
     /// descriptor it may or may not own, and that descriptor's identity.
-    fn untracked_event_with_a_descriptor() -> (Outgoing, TestFdIdentity) {
+    fn untracked_event_with_a_descriptor() -> (Outgoing<u32>, TestFdIdentity) {
         // Memfds have identities of their own; pipe ends share one.
         let file = shm_pool_file(&[]);
         let identity = fd_identity(file.as_raw_fd());
         let event = MessageBuilder::new().build_message(77, 0);
-        ((event, vec![file.into()]), identity)
+        (Outgoing::from_parts(event, vec![file.into()]), identity)
     }
 
     /// A seat the guest has bound, and the `name` event the host sends it,
@@ -1807,7 +1820,7 @@ mod tests {
     async fn seat_and_its_name(s: &mut Session) -> (Object, Vec<u8>) {
         use protocols::wayland::wl_seat;
         let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
-        let (name, _) = wl_seat::evt::name(seat.host, "seat0").unwrap();
+        let (name, _) = wl_seat::evt::name(seat.host, "seat0").unwrap().into_parts();
         (seat, name)
     }
 
@@ -1823,8 +1836,11 @@ mod tests {
         // belongs to the stale message or the partial follow-up, so the
         // descriptor must remain queued while the complete stale message is
         // dropped. The connection stays alive for the rest of the follow-up.
-        s.host([stale_event, (follow_up[..4].to_vec(), Vec::new())])
-            .await;
+        s.host([
+            stale_event,
+            Outgoing::from_parts(follow_up[..4].to_vec(), Vec::new()),
+        ])
+        .await;
         assert_eq!(s.guest_received(), []);
         // The proxy's, and the host's own, which it keeps for the messages
         // it has not finished sending.
@@ -1846,12 +1862,16 @@ mod tests {
 
         // Only a partial header of the follow-up message arrives with the
         // first receive, exactly as a stream socket may deliver it.
-        s.host([stale_event, (follow_up[..4].to_vec(), Vec::new())])
-            .await;
+        s.host([
+            stale_event,
+            Outgoing::from_parts(follow_up[..4].to_vec(), Vec::new()),
+        ])
+        .await;
         // The rest of the follow-up arrives in a later receive. The
         // ambiguity marker must survive that boundary and end the session
         // before the pending descriptor can be attached to this message.
-        s.host_fatal([(follow_up[4..].to_vec(), Vec::new())]).await;
+        s.host_fatal([Outgoing::from_parts(follow_up[4..].to_vec(), Vec::new())])
+            .await;
         assert_eq!(
             s.guest_received_and_error(),
             (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)),
@@ -1872,7 +1892,8 @@ mod tests {
         // descriptor arrived on the ordered stream with these bytes and
         // cannot be assigned to either message. The proxy must not guess and
         // accidentally deliver it to the known follow-up.
-        s.host_fatal([stale_event, (follow_up, Vec::new())]).await;
+        s.host_fatal([stale_event, Outgoing::from_parts(follow_up, Vec::new())])
+            .await;
         assert_eq!(
             s.guest_received_and_error(),
             (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)),
@@ -2165,7 +2186,8 @@ mod tests {
         // Injects a fault no peer can cause: the proxy already tracks a
         // buffer under the ID the host creates. (A host that reuses a live
         // ID is caught before the handler runs.)
-        assert!(s.ctx().register_native_buffer(BUFFER, (16, 8), Vec::new()));
+        let buffer = HostId::for_test(BUFFER);
+        assert!(s.ctx().register_native_buffer(buffer, (16, 8), Vec::new()));
         s.host_fatal([params::evt::created(host, BUFFER)]).await;
         assert_eq!(
             s.guest_received_and_error(),
@@ -2240,7 +2262,7 @@ mod tests {
         // Injects a fault no peer can cause: the object table no longer
         // tracks the proxy's shell as a live host-only object, so retiring
         // it fails.
-        s.ctx().shadow_table.retire_host(shell);
+        s.ctx().shadow_table.retire_host(HostId::for_test(shell));
         s.host_fatal([wl_registry::evt::global_remove(registry.host, name)])
             .await;
         assert_eq!(s.host_received(), []);
@@ -2273,11 +2295,13 @@ mod tests {
         // Injects a fault no peer can cause: a create already pending for
         // the params' host ID, which the proxy allocates itself.
         let pending = PendingNativeCreate {
-            guest_params_id: id,
+            guest_params_id: GuestId::for_test(id),
             dimensions: (16, 8),
             sync_fds: Vec::new(),
         };
-        s.ctx().pending_native_creates.insert(HostId(host), pending);
+        s.ctx()
+            .pending_native_creates
+            .insert(HostId::for_test(host), pending);
         s.guest_fatal([params::req::create(id, 16, 8, DRM_FORMAT_ARGB8888, 0)])
             .await;
         assert_eq!(s.host_received(), []);
@@ -2449,7 +2473,7 @@ mod tests {
 
     /// The guest's attach of `buffer` to `surface`, its commit, and a
     /// `wl_display.sync` that creates `callback`.
-    fn commit_and_sync(surface: Object, buffer: Object, callback: u32) -> [Outgoing; 3] {
+    fn commit_and_sync(surface: Object, buffer: Object, callback: u32) -> [Outgoing<u32>; 3] {
         use protocols::wayland::{wl_display, wl_surface};
         [
             wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0),
@@ -2555,17 +2579,17 @@ mod tests {
         type Inject = fn(&mut Context, Object, u32);
         let faults: [(&str, Inject); 3] = [
             ("an event for the guest", |ctx, _, callback| {
-                ctx.host_to_client_queue
-                    .push(wl_callback::evt::done(callback, 0));
+                let callback = GuestId::for_test(callback);
+                ctx.send_guest(wl_callback::evt::done(callback, 0));
             }),
             ("a request for the host", |ctx, surface, _| {
-                ctx.client_to_host_queue
-                    .push(wl_surface::req::commit(surface.host));
+                let surface = HostId::for_test(surface.host);
+                ctx.send_host(wl_surface::req::commit(surface));
             }),
             ("deferred work", |ctx, surface, callback| {
                 ctx.defer_until_forwarded(PostDispatch::XdgToplevelCreated {
-                    xdg_surface: surface.id,
-                    xdg_toplevel: callback,
+                    xdg_surface: GuestId::for_test(surface.id),
+                    xdg_toplevel: GuestId::for_test(callback),
                 });
             }),
         ];
@@ -2647,7 +2671,7 @@ mod tests {
         let planes = (0..SLOW_DEADLINE_PLANES)
             .map(|_| plane.try_clone().expect("share the fence"))
             .collect();
-        assert!(ctx.register_native_buffer(buffer.host, (1, 1), planes));
+        assert!(ctx.register_native_buffer(HostId::for_test(buffer.host), (1, 1), planes));
         let callback = s.new_id();
         let host_callback = s
             .create(wl_display::req::sync(WL_DISPLAY_ID, callback))
@@ -2706,7 +2730,7 @@ mod tests {
             let start = Instant::now();
             let forwarded = loop {
                 let event = MessageBuilder::new().build_message(UNTRACKED_HOST_OBJECT, 0);
-                peers.host([(event, Vec::new())]);
+                peers.host([Outgoing::from_parts(event, Vec::new())]);
                 tokio::select! {
                     forwarded = peers.host_received() => break forwarded,
                     () = tokio::time::advance(Duration::from_micros(500)) => {}
@@ -2980,7 +3004,8 @@ mod tests {
         let mut s = Session::new();
         // A header claiming 6 bytes, less than the header itself.
         let header = [WL_DISPLAY_ID.to_ne_bytes(), (6u32 << 16).to_ne_bytes()].concat();
-        s.guest_fatal([(header, Vec::new())]).await;
+        s.guest_fatal([Outgoing::from_parts(header, Vec::new())])
+            .await;
         assert_eq!(
             s.guest_received_and_error(),
             (
@@ -3027,7 +3052,7 @@ mod tests {
 
         s.guest_fatal([
             wl_data_source::req::offer(source, &mime_type(4096)).unwrap(),
-            (too_long, Vec::new()),
+            Outgoing::from_parts(too_long, Vec::new()),
         ])
         .await;
         assert_eq!(
@@ -3073,7 +3098,7 @@ mod tests {
             .is_some_and(|state| state.toplevel_count() > 0)
             || ctx
                 .xdg_roles
-                .toplevel_of_xdg_surface(xdg_surface.id)
+                .toplevel_of_xdg_surface(GuestId::for_test(xdg_surface.id))
                 .is_some()
     }
 
@@ -3542,7 +3567,9 @@ mod tests {
         assert_eq!(s.host_received(), []);
         // Reads state no peer can observe: the session has ended.
         assert_eq!(
-            s.ctx().shadow_table.get_host_id(subsurface),
+            s.ctx()
+                .shadow_table
+                .get_host_id(GuestId::for_test(subsurface)),
             None,
             "rejected requests must not allocate their new object"
         );
@@ -3551,8 +3578,12 @@ mod tests {
     #[test]
     fn generated_forwarding_rejects_messages_that_exceed_wire_length() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 20, "wl_data_source", 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            GuestId::for_test(10),
+            HostId::for_test(20),
+            Iface::WlDataSource,
+            1,
+        );
 
         let mut builder = MessageBuilder::new();
         builder.write_string(&"x".repeat(4_084));

@@ -23,7 +23,8 @@ use super::state::{ContentType, LinkState, TextInput};
 use super::Env;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as ext;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::wire::Outgoing;
+use crate::state::HostId;
+use crate::wire::ToHost;
 
 /// A content type as the host applies it: the v3 content type, and the
 /// surrounding-text support told with it.
@@ -38,9 +39,9 @@ pub(crate) struct HostContentType {
 pub(super) struct HostTarget {
     /// The host surface of an enabled field, if the host knows it: the
     /// text input wants input there.
-    pub(super) surface: Option<u32>,
+    pub(super) surface: Option<HostId>,
     /// The host seat that can carry an `activate` or `deactivate`.
-    pub(super) seat: Option<u32>,
+    pub(super) seat: Option<HostId>,
     pub(super) content_type: HostContentType,
 }
 
@@ -48,12 +49,12 @@ pub(super) struct HostTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ActivationStep {
     Activate {
-        seat: u32,
-        surface: u32,
+        seat: HostId,
+        surface: HostId,
     },
     /// `deactivate`, behind a drain barrier.
     Deactivate {
-        seat: u32,
+        seat: HostId,
     },
     /// R1: no live seat can carry a `deactivate`, so the link ends
     /// locally. Exo keeps its input method attached until its own focus
@@ -121,7 +122,7 @@ pub(super) fn reconcile(target: &HostTarget, link: &LinkState) -> HostSteps {
 /// `ext`, with its surrounding-text support (INVARIANTS "`set_input_type`
 /// replaces v1 `set_content_type`"). Exo applies the pending support to
 /// the next content type and then resets it, so it goes first.
-pub(super) fn content_type_requests(ext: u32, content_type: HostContentType) -> [Outgoing; 2] {
+pub(super) fn content_type_requests(ext: HostId, content_type: HostContentType) -> [ToHost; 2] {
     let (hint, purpose) = content_type.content_type;
     let (input_type, input_mode, input_flags, learning_mode) = map_v3_content_type(hint, purpose);
     let support = match content_type.surrounding_text_support {

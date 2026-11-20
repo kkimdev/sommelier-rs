@@ -20,7 +20,7 @@ limitations under the License.
 
 use crate::handler::Handlers;
 use crate::protocols::wayland::wl_touch;
-use crate::state::{Context, HostId};
+use crate::state::{Context, EventObject, EventSender};
 use crate::wire::Action;
 
 impl wl_touch::WlTouchHandler for Handlers {
@@ -29,26 +29,21 @@ impl wl_touch::WlTouchHandler for Handlers {
     /// surface, so no focus is tracked.
     fn on_down(
         ctx: &mut Context,
+        sender: EventSender,
         serial: u32,
         time: u32,
-        surface: u32,
+        surface: EventObject,
         id: i32,
         x: i32,
         y: i32,
     ) -> Action {
-        // The generated dispatcher calls this only for a host surface
-        // paired with a live guest surface (`ShadowTable::event_object`).
-        let touch = HostId::from_event_sender(ctx);
-        let (Some(guest_surface), Some(guest_touch)) = (
-            ctx.shadow_table.get_guest_id(surface),
-            ctx.shadow_table.get_guest_id(touch.0),
-        ) else {
+        let Some(touch) = sender.guest_id() else {
             return Action::Forward;
         };
         crate::handler::text_input::end_composition_on_press(
             ctx,
-            guest_surface,
-            wl_touch::evt::down(guest_touch, serial, time, guest_surface, id, x, y),
+            surface.guest,
+            wl_touch::evt::down(touch, serial, time, surface.guest, id, x, y),
         )
     }
 }

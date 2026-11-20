@@ -21,14 +21,13 @@ use crate::protocols::aura_shell::zaura_surface;
 use crate::protocols::gtk::gtk_shell1::{self, GtkShell1Handler};
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
 use crate::protocols::Iface;
-use crate::state::{Context, GtkSurfaceState};
-use crate::wire::{queue_or_drop, Action};
+use crate::state::{Context, GtkSurfaceState, GuestId, HostId, RequestObject, RequestSender};
+use crate::wire::Action;
 
 /// Queue the GTK activation token to an Aura surface. Every Aura surface
 /// supports `set_startup_id`: the registry binds no older `zaura_shell`.
-fn queue_startup_id(ctx: &mut Context, zaura_surface_id: u32, startup_id: Option<&str>) {
-    queue_or_drop(
-        &mut ctx.client_to_host_queue,
+fn queue_startup_id(ctx: &mut Context, zaura_surface_id: HostId, startup_id: Option<&str>) {
+    ctx.send_host_or_drop(
         zaura_surface::req::set_startup_id(zaura_surface_id, startup_id),
         format_args!("GTK startup ID for zaura_surface {zaura_surface_id}"),
     );
@@ -43,19 +42,25 @@ const GTK_SHELL_CAPABILITIES: u32 = 0;
 /// `zaura_shell` bind it relies on has reached the compositor (see
 /// [`crate::state::InternalCallback::GtkShellCapabilities`]). A shell the
 /// guest has destroyed meanwhile gets nothing.
-pub(crate) fn announce_capabilities(ctx: &mut Context, gtk_shell_id: u32) {
+pub(crate) fn announce_capabilities(ctx: &mut Context, gtk_shell_id: GuestId) {
     if !ctx.gtk_shells.contains_key(&gtk_shell_id) || !ctx.shadow_table.is_local(gtk_shell_id) {
         return;
     }
-    ctx.host_to_client_queue.push(gtk_shell1::evt::capabilities(
+    ctx.send_guest(gtk_shell1::evt::capabilities(
         gtk_shell_id,
         GTK_SHELL_CAPABILITIES,
     ));
 }
 
 impl GtkShell1Handler for Handlers {
-    fn on_get_gtk_surface(ctx: &mut Context, gtk_surface_id: u32, wl_surface_id: u32) -> Action {
-        let shell_id = ctx.last_sender_id;
+    fn on_get_gtk_surface(
+        ctx: &mut Context,
+        sender: RequestSender,
+        gtk_surface_id: GuestId,
+        wl_surface: RequestObject,
+    ) -> Action {
+        let shell_id = sender.guest;
+        let wl_surface_id = wl_surface.guest;
         let Some(startup_id) = ctx
             .gtk_shells
             .get(&shell_id)
@@ -69,11 +74,8 @@ impl GtkShell1Handler for Handlers {
         };
 
         // A new object takes its parent's version.
-        let Some(version) = ctx.shadow_table.guest_object_version(shell_id) else {
-            return ctx.fail(format_args!("gtk_shell1 {shell_id} has no version"));
-        };
         ctx.shadow_table
-            .create_local(gtk_surface_id, Iface::GtkSurface1, version);
+            .create_local(gtk_surface_id, Iface::GtkSurface1, sender.version);
         ctx.gtk_surfaces.insert(
             gtk_surface_id,
             GtkSurfaceState {
@@ -87,8 +89,12 @@ impl GtkShell1Handler for Handlers {
         Action::Drop
     }
 
-    fn on_set_startup_id(ctx: &mut Context, startup_id: &Option<String>) -> Action {
-        let shell_id = ctx.last_sender_id;
+    fn on_set_startup_id(
+        ctx: &mut Context,
+        sender: RequestSender,
+        startup_id: &Option<String>,
+    ) -> Action {
+        let shell_id = sender.guest;
         let Some(shell) = ctx.gtk_shells.get_mut(&shell_id) else {
             log::warn!(
                 "Ignoring set_startup_id from unknown gtk_shell1 {}",
@@ -112,7 +118,11 @@ impl GtkShell1Handler for Handlers {
         Action::Drop
     }
 
-    fn on_system_bell(_ctx: &mut Context, _surface: u32) -> Action {
+    fn on_system_bell(
+        _ctx: &mut Context,
+        _sender: RequestSender,
+        _surface: Option<RequestObject>,
+    ) -> Action {
         Action::Drop
     }
 }
@@ -120,6 +130,7 @@ impl GtkShell1Handler for Handlers {
 impl GtkSurface1Handler for Handlers {
     fn on_set_dbus_properties(
         ctx: &mut Context,
+        sender: RequestSender,
         application_id: &Option<String>,
         _app_menu_path: &Option<String>,
         _menubar_path: &Option<String>,
@@ -132,7 +143,7 @@ impl GtkSurface1Handler for Handlers {
         };
         let Some(wl_surface_id) = ctx
             .gtk_surfaces
-            .get(&ctx.last_sender_id)
+            .get(&sender.guest)
             .map(|surface| surface.wl_surface_id)
         else {
             return Action::Drop;
@@ -142,15 +153,15 @@ impl GtkSurface1Handler for Handlers {
         Action::Drop
     }
 
-    fn on_set_modal(_ctx: &mut Context) -> Action {
+    fn on_set_modal(_ctx: &mut Context, _sender: RequestSender) -> Action {
         Action::Drop
     }
 
-    fn on_unset_modal(_ctx: &mut Context) -> Action {
+    fn on_unset_modal(_ctx: &mut Context, _sender: RequestSender) -> Action {
         Action::Drop
     }
 
-    fn on_present(_ctx: &mut Context, _time: u32) -> Action {
+    fn on_present(_ctx: &mut Context, _sender: RequestSender, _time: u32) -> Action {
         Action::Drop
     }
 }
@@ -164,7 +175,7 @@ mod tests {
     use crate::protocols::AnyRequest;
     use crate::proxy::harness::{GtkShell, Object, Session};
     use crate::settings::Settings;
-    use crate::state::Context;
+    use crate::state::{Context, GuestId};
     use crate::wire::Outgoing;
 
     /// The VM the guest runs in, which namespaces its application IDs.
@@ -250,7 +261,7 @@ mod tests {
 
     /// The guest's `gtk_surface1.set_dbus_properties` that names the
     /// application `com.example.Terminal`.
-    fn terminal(gtk_surface: u32) -> Outgoing {
+    fn terminal(gtk_surface: u32) -> Outgoing<u32> {
         let application = Some("com.example.Terminal");
         gtk_surface1::req::set_dbus_properties(
             gtk_surface,
@@ -298,12 +309,14 @@ mod tests {
         let shell_version = 7;
         g.s.ctx()
             .shadow_table
-            .set_guest_version_for_test(g.gtk.id, shell_version);
+            .set_guest_version_for_test(GuestId::for_test(g.gtk.id), shell_version);
         let gtk_surface = g.gtk_surface().await;
         g.aura_surface_and(|_| vec![startup_id(None)]);
         // Reads state no peer can observe, for the same reason.
         assert_eq!(
-            g.s.ctx().shadow_table.guest_object_version(gtk_surface),
+            g.s.ctx()
+                .shadow_table
+                .guest_object_version(GuestId::for_test(gtk_surface)),
             Some(shell_version)
         );
     }
@@ -368,13 +381,7 @@ mod tests {
         g.s.guest([terminal(gtk_surface)]).await;
         assert_eq!(g.s.host_received(), []);
 
-        g.s.global(
-            registry,
-            g.gtk.name,
-            zaura_shell::NAME,
-            zaura_shell::VERSION,
-        )
-        .await;
+        g.s.advertise(zaura_shell::NAME, zaura_shell::VERSION).await;
         g.s.guest_received();
         let host = g.s.host_received();
         let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { ref id, .. }))] = host[..]

@@ -141,17 +141,26 @@ always consumed; a configuration problem never stops the proxy) is owned by
   sends itself with a generated encoder, `<interface>::req::<request>` or
   `<interface>::evt::<event>`, which takes the arguments in XML order and
   type, and names protocol values with the generated enum constants.
+  Every ID a message names, the sender's included, is of the one ID
+  space of the peer it goes to: a request built by the proxy names host
+  objects (`HostId`, so a `wire::ToHost`) and an event guest objects
+  (`GuestId`, so a `wire::ToGuest`), and the effect queues and the
+  transport's send queues take only the one for their peer. A guest ID
+  in a request, a host ID in an event, or a message for the wrong peer
+  does not compile.
   `MessageBuilder` is for generated code: `sommelier/clippy.toml` rejects
   `MessageBuilder::new` and `MessageBuilder::with_capacity` everywhere
   else, and its private fields leave no other way to make one. A test module that needs frames no encoder makes,
   such as malformed ones, allows `clippy::disallowed_methods` itself.
   Tests: `encoders_match_hand_built_scalar_messages`,
-  `encoded_messages_decode_to_the_same_arguments`.
+  `encoded_messages_decode_to_the_same_arguments`,
+  `test_generate_typed_encoders`.
 - **Host data is untrusted.** The encoder of a message with a string or an
   array returns a `Result`, because host or guest data can exceed the
   wire's length limit; every other encoder cannot fail. A message the
   proxy builds itself that does not fit is dropped without panicking,
-  usually through `wire::queue_or_drop`, and the session goes on. A
+  usually through `Context::send_host_or_drop` or `send_guest_or_drop`,
+  and the session goes on. A
   forwarded message that does not fit is a `MessageTooLarge` protocol
   error that ends the session instead of truncating the length.
   An encoder takes descriptors as `OwnedFd`s, so a message that cannot be
@@ -307,6 +316,17 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
 
 ## Object lifetimes
 
+- **A guest ID never stands for a host one.** Only the object table
+  (`state::objects`) makes a `GuestId` or a `HostId`: from an ID it
+  allocates, or from a wire value it resolves to an object or to a free
+  ID a message may create one under. A handler gets its sender and its ID
+  arguments as the table resolved them before it ran (`RequestSender`,
+  `EventSender`, `RequestObject`, `EventObject`), and state the proxy
+  keeps for an object is keyed by the type of its side, so code that
+  takes a guest ID for a host one, or the other way round, does not
+  compile.
+  Tests: `test_handlers_get_typed_senders_and_objects`,
+  `requests_resolve_live_objects_of_the_expected_interface`.
 - **Destructors wait for `delete_id`.** A generated destructor request keeps
   its guest/host pairing until the host sends the matching
   `wl_display.delete_id` (`ShadowTable::guest_destroyed`). Meanwhile the
@@ -440,7 +460,6 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `removed_host_shm_creates_only_inert_pools_and_buffers`,
   `only_objects_bound_from_a_retired_shm_global_go_inert`,
   `a_guest_shm_bound_from_an_unbound_name_goes_inert_when_it_retires`,
-  `a_re_advertised_shm_name_retires_only_its_old_generation`,
   `removed_host_shm_ignores_requests_from_existing_pool_until_destroy`,
   `attaching_an_inert_buffer_detaches_the_surface`.
 - **Releasing a parent does not end its children.** `wl_seat.release`
@@ -502,18 +521,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   still be sent its own; then the metadata goes, and a new bind of the
   name is refused through any registry. A registry destroyed through
   `wl_fixes` before it sees the removal no longer counts, and if it was
-  the last, its destruction retires the global. The removal is on record
-  connection-wide from the first `global_remove` until the global is
-  retired or advertised anew, so this holds even when every registry that
-  saw it was destroyed first.
+  the last, its destruction retires the global. The removal stays on
+  record for the connection from the first `global_remove`, so this holds
+  even when every registry that saw it was destroyed first.
   A registry destroyed while the global is still advertised retires
-  nothing. Only a registry that lists the current advertisement keeps it
-  alive; one that still lists an older advertisement of a re-advertised
-  name neither delays retirement nor receives the proxy's bind of the
-  replacement. A guest bind through such a registry is currently a
-  protocol error; whether it should be is an open question, unpinned
-  because libwayland-server never reuses a name (see the name-reuse item
-  in HANDOVER.md). A guest bind through a registry that has not yet seen
+  nothing. A guest bind through a registry that has not yet seen
   the removal is forwarded. That relies on the host keeping a removed
   global bindable until `wl_global_destroy`, as Exo does: it calls
   `wl_global_remove` and defers `wl_global_destroy`. A host that destroyed
@@ -522,26 +534,23 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `destroying_the_last_registry_to_list_a_removed_global_retires_it`,
   `a_removal_outlives_the_registry_that_saw_it`,
   `an_invalid_bind_is_a_protocol_error`,
-  `the_removal_of_a_dropped_global_waits_for_every_registry`,
   `destroying_a_registry_keeps_a_global_no_registry_saw_removed`,
   `a_singleton_binding_moves_to_the_lowest_live_candidate`.
-- **A re-advertised name replaces its old generation.** When the host
-  re-advertises a global under a previously removed numeric name, the
-  connection-wide metadata for that name MUST be replaced before the new
-  interface is processed, so stale entries cannot route a bind to the old
-  interface or misclassify the replacement's `global_remove`. Live children
-  of the old generation are not invalidated.
-  Tests: `re_advertised_name_replaces_visible_metadata_before_hidden_global`,
-  `re_advertised_hidden_name_replaces_hidden_metadata_before_visible_global`,
-  `stale_remove_cannot_invalidate_a_re_advertised_global_generation`.
+- **A global name is one global for the connection's life.**
+  libwayland-server numbers each global anew, advertises it to each
+  registry once, and never advertises a global it removed, so the proxy
+  identifies a global by its name alone. A `global` event for a name the
+  registry has already advertised, or for a name whose removal any
+  registry has seen, breaks the protocol, and ends the session as an
+  internal failure.
+  Test: `a_name_advertised_again_ends_the_session`.
 - **A singleton binding moves to its replacement.** The proxy binds
   `wl_shm`, `zwp_linux_dmabuf_v1`, `zcr_keyboard_extension_v1` and
   `zaura_shell` once per connection for its own use. A host may advertise
   one under a new name while the old name is bound; when the old one
-  retires, the proxy binds the lowest name (possibly the same name at a
-  new generation) that a registry still lists and that no registry has
-  seen removed, since a compositor may destroy a global as soon as it
-  removes it.
+  retires, the proxy binds the lowest name that a registry still lists
+  and that no registry has seen removed, since a compositor may destroy a
+  global as soon as it removes it.
   Tests: `a_singleton_advertised_anew_is_bound_when_the_old_name_retires`,
   `a_singleton_binding_moves_to_the_lowest_live_candidate`,
   `a_promoted_dmabuf_publishes_its_deferred_guest_global`.
@@ -560,7 +569,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   cannot make the guest send requests the proxy cannot decode. A child
   object takes its parent's version, and a request is sent to a host
   object only if that object's version has it: an Aura surface keeps the
-  version of the shell generation that created it. A version the proxy
+  version of the shell binding that created it. A version the proxy
   cannot find fails closed: no child gets a guessed one, and a feature
   gated on a version is off.
   Tests: `child_objects_inherit_their_manager_versions`,

@@ -26,13 +26,15 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
+use super::GuestId;
+
 /// The role an `xdg_surface` gives its `wl_surface`.
 #[derive(Debug, Clone, Copy)]
 struct XdgSurfaceRole {
-    wl_surface: u32,
+    wl_surface: GuestId,
     /// Set once `get_toplevel` has been forwarded, until the toplevel or
     /// this record is destroyed.
-    toplevel: Option<u32>,
+    toplevel: Option<GuestId>,
 }
 
 /// One connection's guest `xdg_surface` and `xdg_toplevel` links, ordered
@@ -40,12 +42,12 @@ struct XdgSurfaceRole {
 /// toplevels.
 #[derive(Debug, Default)]
 pub(crate) struct XdgRoles {
-    by_xdg_surface: BTreeMap<u32, XdgSurfaceRole>,
+    by_xdg_surface: BTreeMap<GuestId, XdgSurfaceRole>,
 }
 
 impl XdgRoles {
     /// Record `xdg_wm_base.get_xdg_surface`.
-    pub(crate) fn add_xdg_surface(&mut self, xdg_surface: u32, wl_surface: u32) {
+    pub(crate) fn add_xdg_surface(&mut self, xdg_surface: GuestId, wl_surface: GuestId) {
         self.by_xdg_surface.insert(
             xdg_surface,
             XdgSurfaceRole {
@@ -61,7 +63,11 @@ impl XdgRoles {
     ///
     /// The toplevel's wl_surface, or `None`, recording nothing, when the
     /// xdg_surface is unknown.
-    pub(crate) fn add_toplevel(&mut self, xdg_surface: u32, xdg_toplevel: u32) -> Option<u32> {
+    pub(crate) fn add_toplevel(
+        &mut self,
+        xdg_surface: GuestId,
+        xdg_toplevel: GuestId,
+    ) -> Option<GuestId> {
         let role = self.by_xdg_surface.get_mut(&xdg_surface)?;
         // A second get_toplevel is `already_constructed`, which ends the
         // session; the replaced toplevel's own destructor releases it.
@@ -70,12 +76,12 @@ impl XdgRoles {
     }
 
     /// The xdg_toplevel created from an xdg_surface, if any.
-    pub(crate) fn toplevel_of_xdg_surface(&self, xdg_surface: u32) -> Option<u32> {
+    pub(crate) fn toplevel_of_xdg_surface(&self, xdg_surface: GuestId) -> Option<GuestId> {
         self.by_xdg_surface.get(&xdg_surface)?.toplevel
     }
 
     /// The xdg_surface an xdg_toplevel was created from.
-    pub(crate) fn xdg_surface_of_toplevel(&self, xdg_toplevel: u32) -> Option<u32> {
+    pub(crate) fn xdg_surface_of_toplevel(&self, xdg_toplevel: GuestId) -> Option<GuestId> {
         self.by_xdg_surface
             .iter()
             .find(|(_, role)| role.toplevel == Some(xdg_toplevel))
@@ -83,7 +89,7 @@ impl XdgRoles {
     }
 
     /// The wl_surface an xdg_toplevel gives its role to.
-    pub(crate) fn wl_surface_of_toplevel(&self, xdg_toplevel: u32) -> Option<u32> {
+    pub(crate) fn wl_surface_of_toplevel(&self, xdg_toplevel: GuestId) -> Option<GuestId> {
         self.by_xdg_surface
             .values()
             .find(|role| role.toplevel == Some(xdg_toplevel))
@@ -91,7 +97,7 @@ impl XdgRoles {
     }
 
     /// The xdg_toplevel whose role a wl_surface has, if any.
-    pub(crate) fn toplevel_on_wl_surface(&self, wl_surface: u32) -> Option<u32> {
+    pub(crate) fn toplevel_on_wl_surface(&self, wl_surface: GuestId) -> Option<GuestId> {
         self.by_xdg_surface
             .values()
             .filter(|role| role.wl_surface == wl_surface)
@@ -99,7 +105,7 @@ impl XdgRoles {
     }
 
     /// Every recorded toplevel with its wl_surface.
-    pub(crate) fn toplevels(&self) -> Vec<(u32, u32)> {
+    pub(crate) fn toplevels(&self) -> Vec<(GuestId, GuestId)> {
         self.by_xdg_surface
             .values()
             .filter_map(|role| Some((role.toplevel?, role.wl_surface)))
@@ -107,7 +113,7 @@ impl XdgRoles {
     }
 
     /// Forget a destroyed xdg_toplevel. Its xdg_surface stays recorded.
-    pub(crate) fn remove_toplevel(&mut self, xdg_toplevel: u32) {
+    pub(crate) fn remove_toplevel(&mut self, xdg_toplevel: GuestId) {
         for role in self.by_xdg_surface.values_mut() {
             if role.toplevel == Some(xdg_toplevel) {
                 role.toplevel = None;
@@ -122,7 +128,7 @@ impl XdgRoles {
     /// The toplevel whose role ended with it, which the caller must tear
     /// down.
     #[must_use = "the returned toplevel's role has ended"]
-    pub(crate) fn remove_xdg_surface(&mut self, xdg_surface: u32) -> Option<u32> {
+    pub(crate) fn remove_xdg_surface(&mut self, xdg_surface: GuestId) -> Option<GuestId> {
         self.by_xdg_surface.remove(&xdg_surface)?.toplevel
     }
 
@@ -133,7 +139,7 @@ impl XdgRoles {
     ///
     /// The toplevels whose roles ended, which the caller must tear down.
     #[must_use = "the returned toplevels' roles have ended"]
-    pub(crate) fn remove_wl_surface(&mut self, wl_surface: u32) -> Vec<u32> {
+    pub(crate) fn remove_wl_surface(&mut self, wl_surface: GuestId) -> Vec<GuestId> {
         let mut ended = Vec::new();
         self.by_xdg_surface.retain(|_, role| {
             if role.wl_surface != wl_surface {
@@ -149,9 +155,9 @@ impl XdgRoles {
     #[cfg(test)]
     pub(crate) fn add_toplevel_role_for_test(
         &mut self,
-        xdg_surface: u32,
-        wl_surface: u32,
-        xdg_toplevel: u32,
+        xdg_surface: GuestId,
+        wl_surface: GuestId,
+        xdg_toplevel: GuestId,
     ) {
         self.add_xdg_surface(xdg_surface, wl_surface);
         self.add_toplevel(xdg_surface, xdg_toplevel);
@@ -164,7 +170,9 @@ impl XdgRoles {
 
     /// Every recorded xdg_surface with its wl_surface and toplevel.
     #[cfg(test)]
-    pub(super) fn roles_for_test(&self) -> impl Iterator<Item = (u32, u32, Option<u32>)> + '_ {
+    pub(super) fn roles_for_test(
+        &self,
+    ) -> impl Iterator<Item = (GuestId, GuestId, Option<GuestId>)> + '_ {
         self.by_xdg_surface
             .iter()
             .map(|(&xdg_surface, role)| (xdg_surface, role.wl_surface, role.toplevel))
@@ -175,9 +183,9 @@ impl XdgRoles {
 mod tests {
     use super::*;
 
-    const XDG_SURFACE: u32 = 11;
-    const WL_SURFACE: u32 = 12;
-    const XDG_TOPLEVEL: u32 = 13;
+    const XDG_SURFACE: GuestId = GuestId::for_test(11);
+    const WL_SURFACE: GuestId = GuestId::for_test(12);
+    const XDG_TOPLEVEL: GuestId = GuestId::for_test(13);
 
     fn with_toplevel() -> XdgRoles {
         let mut roles = XdgRoles::default();
@@ -215,7 +223,7 @@ mod tests {
         assert_eq!(roles.wl_surface_of_toplevel(XDG_TOPLEVEL), None);
         assert_eq!(roles.toplevel_of_xdg_surface(XDG_SURFACE), None);
         assert_eq!(
-            roles.add_toplevel(XDG_SURFACE, XDG_TOPLEVEL + 1),
+            roles.add_toplevel(XDG_SURFACE, GuestId::for_test(14)),
             Some(WL_SURFACE)
         );
     }
@@ -232,10 +240,13 @@ mod tests {
     #[test]
     fn wl_surface_destroy_ends_only_its_roles() {
         let mut roles = with_toplevel();
-        roles.add_xdg_surface(XDG_SURFACE + 10, WL_SURFACE + 10);
+        roles.add_xdg_surface(GuestId::for_test(21), GuestId::for_test(22));
         assert_eq!(roles.remove_wl_surface(WL_SURFACE), vec![XDG_TOPLEVEL]);
         assert_eq!(roles.toplevel_on_wl_surface(WL_SURFACE), None);
-        assert_eq!(roles.remove_wl_surface(WL_SURFACE + 10), Vec::<u32>::new());
+        assert_eq!(
+            roles.remove_wl_surface(GuestId::for_test(22)),
+            Vec::<GuestId>::new()
+        );
         assert!(roles.is_empty());
     }
 }

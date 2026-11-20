@@ -135,7 +135,7 @@ impl Gtk {
     }
 
     /// `commit`, counted (`commit_state`).
-    fn commit(&mut self) -> Outgoing {
+    fn commit(&mut self) -> Outgoing<u32> {
         self.commits = self.commits.wrapping_add(1);
         req::commit(self.text_input())
     }
@@ -145,7 +145,7 @@ impl Gtk {
     /// which GTK3 states at once if it changed (`set_surrounding`). GTK3
     /// sends `anchor = cursor`, and GTK4 the selection bound, which is the
     /// cursor here (C9).
-    fn notify(&mut self, cause: u32) -> Vec<Outgoing> {
+    fn notify(&mut self, cause: u32) -> Vec<Outgoing<u32>> {
         let Some(field) = self.sender() else {
             return Vec::new();
         };
@@ -174,7 +174,7 @@ impl Gtk {
 
     /// C7: `enable`, the state and a `commit` (`enable`, or GTK4's
     /// `activate_osk_with_event`), for the current context.
-    fn enable(&mut self) -> Vec<Outgoing> {
+    fn enable(&mut self) -> Vec<Outgoing<u32>> {
         let Some(field) = self.current else {
             return Vec::new();
         };
@@ -186,7 +186,7 @@ impl Gtk {
 
     /// `disable` and a `commit`; the current context then clears its
     /// preedit (`disable`).
-    fn disable(&mut self) -> Vec<Outgoing> {
+    fn disable(&mut self) -> Vec<Outgoing<u32>> {
         let mut out = vec![req::disable(self.text_input())];
         let Some(field) = self.current else {
             return out;
@@ -204,7 +204,7 @@ impl Gtk {
     /// The entry of `field` resets its context, which reports with cause
     /// `other` if it is current (`gtk_im_context_wayland_reset`). The
     /// preedit stays.
-    fn reset(&mut self, field: usize) -> Vec<Outgoing> {
+    fn reset(&mut self, field: usize) -> Vec<Outgoing<u32>> {
         self.contexts[field].need_im_reset = false;
         if self.current != Some(field) {
             return Vec::new();
@@ -223,7 +223,7 @@ impl Gtk {
     /// C9: the delete counts characters from the entry's cursor, with the
     /// preedit still shown, clamped to its text
     /// (`gtk_entry_delete_surrounding_cb`, `gtk_editable_delete_text`).
-    fn done(&mut self, serial: u32) -> Vec<Outgoing> {
+    fn done(&mut self, serial: u32) -> Vec<Outgoing<u32>> {
         let Some(field) = self.current else {
             return Vec::new();
         };
@@ -291,7 +291,7 @@ impl Gtk {
 
     /// GTK4 lays out each field: a caret that moved is laid out, and the
     /// current context sends it with a `commit` (`after_layout_cb`).
-    fn layout(&mut self, mut out: Vec<Outgoing>) -> Vec<Outgoing> {
+    fn layout(&mut self, mut out: Vec<Outgoing<u32>>) -> Vec<Outgoing<u32>> {
         if !self.v4 {
             return out;
         }
@@ -327,7 +327,7 @@ impl Client for Gtk {
     /// input is entered, and the one that gains it enables
     /// (`gtk_im_context_wayland_focus_out`, `focus_in`). The entry needs a
     /// reset after either (`gtk_entry_focus_in`, `gtk_entry_focus_out`).
-    fn keyboard_focus(&mut self, _now: Micros, surface: Option<u32>) -> Vec<Outgoing> {
+    fn keyboard_focus(&mut self, _now: Micros, surface: Option<u32>) -> Vec<Outgoing<u32>> {
         let focus = match surface {
             // The keys that follow an enter that crossed the client's
             // destroy of its surface go nowhere.
@@ -365,7 +365,7 @@ impl Client for Gtk {
     /// C7: `enter` enables the current context and `leave` disables it
     /// (`text_input_enter`, `text_input_leave`). Other events wait for
     /// `done`.
-    fn event(&mut self, now: Micros, event: Event) -> Vec<Outgoing> {
+    fn event(&mut self, now: Micros, event: Event) -> Vec<Outgoing<u32>> {
         self.protocol.check(&event, self.commits);
         let out = match event {
             Event::Enter { .. } if self.current.is_some() => self.enable(),
@@ -417,7 +417,7 @@ impl Client for Gtk {
     /// [`TextModel::insert_key`]: crate::sim::editor::TextModel::insert_key
     /// [`TextModel::backspace_to_nfd_prefix`]:
     ///     crate::sim::editor::TextModel::backspace_to_nfd_prefix
-    fn key(&mut self, _now: Micros, key: Key) -> Vec<Outgoing> {
+    fn key(&mut self, _now: Micros, key: Key) -> Vec<Outgoing<u32>> {
         let Some(field) = self.current else {
             assert!(
                 self.protocol.closed,
@@ -456,7 +456,13 @@ impl Client for Gtk {
     /// C8: before the cursor moves, GTK4 always resets
     /// (`gtk_text_click_gesture_pressed`), and GTK3 only if the entry needs
     /// it and the cursor moves (`gtk_entry_real_set_position`).
-    fn press(&mut self, _now: Micros, surface: u32, at: Target, _kind: PressKind) -> Vec<Outgoing> {
+    fn press(
+        &mut self,
+        _now: Micros,
+        surface: u32,
+        at: Target,
+        _kind: PressKind,
+    ) -> Vec<Outgoing<u32>> {
         let Some(field) = self.protocol.field_on(&self.fields, surface) else {
             self.press = None;
             return Vec::new();
@@ -483,7 +489,7 @@ impl Client for Gtk {
     /// enables: on GTK4 always (`gtk_text_click_gesture_released`); on
     /// GTK3 if the text input is entered and the caret did not jump
     /// (`released_cb`).
-    fn release(&mut self, _now: Micros, dragged: bool) -> Vec<Outgoing> {
+    fn release(&mut self, _now: Micros, dragged: bool) -> Vec<Outgoing<u32>> {
         let Some((field, jumped)) = self.press.take() else {
             return Vec::new();
         };
@@ -497,7 +503,7 @@ impl Client for Gtk {
 
     /// The field's context loses the focus if it had it, and the window
     /// opens again with a fresh context, laid out once.
-    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing> {
+    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing<u32>> {
         let focused = self.current == Some(field);
         let out = match focused {
             true => self.keyboard_focus(now, None),

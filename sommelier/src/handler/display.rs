@@ -17,8 +17,10 @@ limitations under the License.
 use crate::handler::Handlers;
 use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
 use crate::protocols::Iface;
-use crate::state::{Context, DeletedHostId, SessionEnd};
-use crate::wire::{Action, MessageHeader, Outgoing, ProtocolError, WL_DISPLAY_ID};
+use crate::state::{
+    Context, DeletedHostId, EventSender, GuestId, HostId, RequestSender, SessionEnd,
+};
+use crate::wire::{Action, MessageHeader, ProtocolError, ToGuest, WL_DISPLAY_ID};
 use log::error;
 
 /// How a guest request the proxy cannot decode or dispatch ends the
@@ -41,7 +43,7 @@ pub(crate) fn request_error(error: &ProtocolError) -> SessionEnd {
 }
 
 /// The one `wl_display.error` that tells the guest its session ended.
-pub(crate) fn session_error(end: &SessionEnd) -> Outgoing {
+pub(crate) fn session_error(end: &SessionEnd) -> ToGuest {
     let (object, code, message) = match end {
         SessionEnd::Protocol {
             object,
@@ -54,7 +56,7 @@ pub(crate) fn session_error(end: &SessionEnd) -> Outgoing {
             "the proxy failed to handle a request",
         ),
     };
-    wl_display::evt::error(WL_DISPLAY_ID, object, code, message)
+    wl_display::evt::error(GuestId::DISPLAY, object, code, message)
         .expect("a bounded diagnostic fits in an error event")
 }
 
@@ -74,37 +76,32 @@ fn bounded(message: &str) -> &str {
 }
 
 impl wl_display::WlDisplayHandler for Handlers {
-    fn on_get_registry(ctx: &mut Context, registry: u32) -> Action {
+    fn on_get_registry(ctx: &mut Context, _sender: RequestSender, registry: GuestId) -> Action {
         let host_registry_id = ctx.shadow_table.create_paired(
             registry,
             Iface::WlRegistry,
             wl_registry::VERSION,
             wl_registry::VERSION,
         );
-
-        ctx.client_to_host_queue.push(wl_display::req::get_registry(
-            WL_DISPLAY_ID,
+        ctx.send_host(wl_display::req::get_registry(
+            HostId::DISPLAY,
             host_registry_id,
         ));
-
         Action::Drop
     }
 
-    fn on_sync(ctx: &mut Context, callback: u32) -> Action {
+    fn on_sync(ctx: &mut Context, _sender: RequestSender, callback: GuestId) -> Action {
         let host_callback_id = ctx.shadow_table.create_paired(
             callback,
             Iface::WlCallback,
             wl_callback::VERSION,
             wl_callback::VERSION,
         );
-
-        ctx.client_to_host_queue
-            .push(wl_display::req::sync(WL_DISPLAY_ID, host_callback_id));
-
+        ctx.send_host(wl_display::req::sync(HostId::DISPLAY, host_callback_id));
         Action::Drop
     }
 
-    fn on_delete_id(ctx: &mut Context, id: u32) -> Action {
+    fn on_delete_id(ctx: &mut Context, _sender: EventSender, id: u32) -> Action {
         // The host has destroyed the object, so no later event can name it,
         // and the ID may go to the next new object: the object's state ends
         // with the ID (see `crate::state::lifecycle`).
@@ -116,10 +113,16 @@ impl wl_display::WlDisplayHandler for Handlers {
         Action::Drop
     }
 
-    fn on_error(ctx: &mut Context, object_id: u32, code: u32, message: &String) -> Action {
+    fn on_error(
+        ctx: &mut Context,
+        _sender: EventSender,
+        object_id: u32,
+        code: u32,
+        message: &String,
+    ) -> Action {
         // The host ends the connection after its error, so the session is
         // over, and its error is the guest's one error.
-        let Some(guest_id) = ctx.shadow_table.get_guest_id(object_id) else {
+        let Some(guest_id) = ctx.shadow_table.guest_named_by_host(object_id) else {
             // wl_display.error.object_id is a non-null object argument. An
             // internal host-only object has no valid guest ID; forwarding 0
             // would make the guest receive an invalid Wayland error event and

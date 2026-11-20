@@ -609,7 +609,7 @@ pub(crate) struct Exo {
     /// The text input of each host `zcr_extended_text_input_v1`.
     extensions: BTreeMap<u32, u32>,
     /// The events Exo sent and no one has taken yet, in order.
-    events: Vec<Outgoing>,
+    events: Vec<Outgoing<u32>>,
     /// What Exo did of each `set_preedit_region` in `events`, by index.
     region_truths: Vec<(usize, RegionTruth)>,
     keyboard: Option<Keyboard>,
@@ -1118,14 +1118,14 @@ impl Exo {
     /// display takes them after each input it hands the model, before it
     /// answers any later `wl_display.sync`, so that the sync's `done`
     /// follows every event of earlier requests (E11).
-    pub(crate) fn take_events(&mut self) -> Vec<Outgoing> {
+    pub(crate) fn take_events(&mut self) -> Vec<Outgoing<u32>> {
         self.region_truths.clear();
         std::mem::take(&mut self.events)
     }
 
     /// [`Exo::take_events`], each `set_preedit_region` with what Exo did
     /// of it.
-    pub(super) fn take_events_with_truths(&mut self) -> Vec<(Outgoing, Option<RegionTruth>)> {
+    pub(super) fn take_events_with_truths(&mut self) -> Vec<(Outgoing<u32>, Option<RegionTruth>)> {
         let mut truths = std::mem::take(&mut self.region_truths)
             .into_iter()
             .peekable();

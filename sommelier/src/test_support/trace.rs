@@ -27,6 +27,7 @@ use super::glued_messages;
 use super::wire_peer::{Peer, Role};
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::trace::{Stream, FACTS, HEADER, KEYMAP};
+use crate::wire::Outgoing;
 
 /// A wire trace, read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,14 +140,20 @@ impl Trace {
                 let decoded = match record.stream {
                     Stream::FromGuest => {
                         let decoded = guest.decode::<AnyRequest>(message, &mut fds);
-                        guest.send(&(message.to_vec(), stand_ins(record.fds).into()));
+                        guest.send(&Outgoing::from_parts(
+                            message.to_vec(),
+                            stand_ins(record.fds).into(),
+                        ));
                         decoded
                             .map(|(sender, request)| format!("{sender} {request:?}"))
                             .map_err(|error| format!("does not decode: {error}"))
                     }
                     Stream::FromHost => {
                         let decoded = host.decode::<AnyEvent>(message, &mut fds);
-                        host.send(&(message.to_vec(), stand_ins(record.fds).into()));
+                        host.send(&Outgoing::from_parts(
+                            message.to_vec(),
+                            stand_ins(record.fds).into(),
+                        ));
                         decoded
                             .map(|(sender, event)| format!("{sender} {event:?}"))
                             .map_err(|error| format!("does not decode: {error}"))

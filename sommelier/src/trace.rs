@@ -319,10 +319,10 @@ impl Recorder {
 
     /// Record what `messages` gained since it held `mark` entries, on
     /// `stream`.
-    pub(crate) fn record_since(
+    pub(crate) fn record_since<I>(
         &mut self,
         stream: Stream,
-        messages: &OutgoingMessages,
+        messages: &OutgoingMessages<I>,
         mark: usize,
     ) {
         for (message, fds) in messages.since(mark) {

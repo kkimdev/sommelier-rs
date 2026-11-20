@@ -170,7 +170,7 @@ impl Display {
         sender: u32,
         request: &AnyRequest,
         exo: &mut Exo,
-    ) -> Vec<Outgoing> {
+    ) -> Vec<Outgoing<u32>> {
         if let AnyRequest::WlRegistry(wl_registry::Request::Bind { name, id }) = request {
             self.check_bind(*name, &id.0, id.1);
         }
@@ -276,7 +276,7 @@ impl Display {
     /// The seat's focus moves to `surface`, as a click on its window does:
     /// Exo moves it ([`Exo::move_focus`]), and the seat's other keyboards,
     /// which Exo does not model, follow it.
-    pub(crate) fn focus(&mut self, surface: u32, exo: &mut Exo) -> Vec<Outgoing> {
+    pub(crate) fn focus(&mut self, surface: u32, exo: &mut Exo) -> Vec<Outgoing<u32>> {
         let lost = exo.focus();
         exo.move_focus(Some(surface));
         let mut events = exo.take_events();
@@ -307,7 +307,13 @@ impl Display {
     /// `pointer` presses and releases the primary button at `x` on
     /// `surface`, entering it first if it is elsewhere, and moving there
     /// if not.
-    pub(crate) fn click(&mut self, pointer: u32, surface: u32, x: i32, time: u32) -> Vec<Outgoing> {
+    pub(crate) fn click(
+        &mut self,
+        pointer: u32,
+        surface: u32,
+        x: i32,
+        time: u32,
+    ) -> Vec<Outgoing<u32>> {
         let mut events = Vec::new();
         if self.pointers.get(&pointer) != Some(&surface) {
             if let Some(left) = self.pointers.insert(pointer, surface) {
@@ -333,7 +339,13 @@ impl Display {
     }
 
     /// A finger of `touch` touches `surface` at `x` and lifts.
-    pub(crate) fn tap(&mut self, touch: u32, surface: u32, x: i32, time: u32) -> Vec<Outgoing> {
+    pub(crate) fn tap(
+        &mut self,
+        touch: u32,
+        surface: u32,
+        x: i32,
+        time: u32,
+    ) -> Vec<Outgoing<u32>> {
         let down = wl_touch::evt::down(touch, self.next_serial(), time, surface, 0, x, 0);
         let up = wl_touch::evt::up(touch, self.next_serial(), time, 0);
         let frame = || wl_touch::evt::frame(touch);
@@ -346,7 +358,7 @@ impl Display {
     /// may on its own: each surface's frame callbacks first, as a
     /// compositor destroys a surface. Returns how many it ended of
     /// `interface`, and their `delete_id`s.
-    pub(crate) fn end(&mut self, interface: &str, exo: &mut Exo) -> (usize, Vec<Outgoing>) {
+    pub(crate) fn end(&mut self, interface: &str, exo: &mut Exo) -> (usize, Vec<Outgoing<u32>>) {
         let ended: Vec<u32> = self
             .objects
             .live(interface)
@@ -375,7 +387,7 @@ impl Display {
     }
 
     /// The display sent `events`.
-    fn sent(&mut self, events: &[Outgoing]) {
+    fn sent(&mut self, events: &[Outgoing<u32>]) {
         for event in events {
             self.objects.send(event);
         }
@@ -388,13 +400,13 @@ impl Display {
 }
 
 /// `wl_display.delete_id` of `id`.
-fn delete_id(id: u32) -> Outgoing {
+fn delete_id(id: u32) -> Outgoing<u32> {
     wl_display::evt::delete_id(WL_DISPLAY_ID, id)
 }
 
 /// `wl_keyboard.keymap` of the default keymap for `keyboard`, compiled
 /// once from the pinned XKB defaults.
-fn keymap(keyboard: u32) -> Outgoing {
+fn keymap(keyboard: u32) -> Outgoing<u32> {
     static KEYMAP: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = KEYMAP.get_or_init(crate::proxy::harness::default_keymap);
     let file = crate::test_support::shm_pool_file(bytes);
@@ -469,10 +481,11 @@ mod tests {
         }
 
         /// The client receives `events` from the display.
-        fn receive(&mut self, events: Vec<Outgoing>) -> Vec<(u32, AnyEvent)> {
+        fn receive(&mut self, events: Vec<Outgoing<u32>>) -> Vec<(u32, AnyEvent)> {
             events
                 .into_iter()
-                .map(|(message, fds)| {
+                .map(|message| {
+                    let (message, fds) = message.into_parts();
                     let event = self.objects.receive(&message, &mut fds.into());
                     event.unwrap_or_else(|violation| panic!("the display sent {violation}"))
                 })

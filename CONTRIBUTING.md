@@ -98,7 +98,10 @@ assert_eq!(
   as a native dma-buf buffer, pairs it with `Session::pair_for_test`,
   which both peers learn.
 - Learn host IDs from what the proxy forwards (`create`, `surface`), not
-  from the object table. `Session::ctx()` reads state no peer can
+  from the object table. The peers name objects by their wire `u32`s; state
+  the proxy keeps for an object is keyed by a `GuestId` or a `HostId`,
+  which a test makes with `Object::guest_id`, `Object::host_id` or
+  `for_test`. `Session::ctx()` reads state no peer can
   observe, or injects a fault no peer can cause; each use says which, in
   a comment. Every batch that keeps the session checks that no state
   outlives its object.

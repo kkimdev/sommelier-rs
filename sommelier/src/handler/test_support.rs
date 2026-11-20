@@ -20,14 +20,28 @@ use crate::placement_config::PlacementConfig;
 use crate::protocols::aura_shell::zaura_shell;
 use crate::protocols::wayland::{wl_registry, wl_shm};
 use crate::protocols::AnyEvent;
+use crate::protocols::Iface;
 use crate::proxy::harness::Session;
-use crate::state::Context;
+use crate::state::{Context, GuestId, HostId};
 
-/// A guest object and the host object it is paired with.
+/// A guest object and the host object it is paired with, by the IDs each
+/// peer sees.
 #[derive(Clone, Copy)]
 pub(crate) struct Paired {
     pub(crate) guest: u32,
     pub(crate) host: u32,
+}
+
+impl Paired {
+    /// The guest object's ID, as the proxy keys it.
+    pub(crate) const fn guest_id(self) -> GuestId {
+        GuestId::for_test(self.guest)
+    }
+
+    /// The host object's ID, as the proxy keys it.
+    pub(crate) const fn host_id(self) -> HostId {
+        HostId::for_test(self.host)
+    }
 }
 
 pub(crate) const SURFACE: Paired = Paired {
@@ -43,32 +57,41 @@ pub(crate) const TOPLEVEL: Paired = Paired {
     host: 220,
 };
 /// The host `zaura_shell`, at the vendored version.
-pub(crate) const SHELL: u32 = 300;
+pub(crate) const SHELL: HostId = HostId::for_test(300);
 
 /// Give `ctx` wl_surface [`SURFACE`], with no role.
 pub(crate) fn add_surface(ctx: &mut Context) {
-    ctx.shadow_table
-        .insert_paired_for_test(SURFACE.guest, SURFACE.host, "wl_surface");
-    ctx.create_surface(SURFACE.guest);
+    ctx.shadow_table.insert_paired_for_test(
+        SURFACE.guest_id(),
+        SURFACE.host_id(),
+        Iface::WlSurface,
+    );
+    ctx.create_surface(SURFACE.guest_id());
 }
 
 /// Give `ctx` wl_surface [`SURFACE`] with the toplevel role:
 /// [`XDG_SURFACE`] and its [`TOPLEVEL`].
 pub(crate) fn add_toplevel(ctx: &mut Context) {
     add_surface(ctx);
-    for (object, interface) in [(XDG_SURFACE, "xdg_surface"), (TOPLEVEL, "xdg_toplevel")] {
+    for (object, interface) in [
+        (XDG_SURFACE, Iface::XdgSurface),
+        (TOPLEVEL, Iface::XdgToplevel),
+    ] {
         ctx.shadow_table
-            .insert_paired_for_test(object.guest, object.host, interface);
+            .insert_paired_for_test(object.guest_id(), object.host_id(), interface);
     }
-    ctx.xdg_roles
-        .add_toplevel_role_for_test(XDG_SURFACE.guest, SURFACE.guest, TOPLEVEL.guest);
+    ctx.xdg_roles.add_toplevel_role_for_test(
+        XDG_SURFACE.guest_id(),
+        SURFACE.guest_id(),
+        TOPLEVEL.guest_id(),
+    );
 }
 
 /// Bind the host [`SHELL`] in `ctx`.
 pub(crate) fn bind_shell(ctx: &mut Context) {
     ctx.bind_aura_shell_for_test(SHELL);
     ctx.shadow_table
-        .insert_host_only_for_test(SHELL, zaura_shell::NAME, zaura_shell::VERSION);
+        .insert_host_only_for_test(SHELL, Iface::ZauraShell, zaura_shell::VERSION);
 }
 
 /// A context under `placement` with [`add_toplevel`] and [`bind_shell`].

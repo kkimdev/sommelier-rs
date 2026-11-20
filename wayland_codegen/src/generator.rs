@@ -170,8 +170,14 @@ pub fn generate(protocol: &Protocol) -> String {
             #![allow(clippy::collapsible_match)]
 
             use std::os::fd::OwnedFd;
-            use crate::wire::{WireMessage, MessageBuilder, Action, Outgoing, ProtocolError};
-            use crate::state::{Context, EventSender, Link, RequestSender};
+            use crate::wire::{
+                Action, EventId, MessageBuilder, Outgoing, ProtocolError, RequestId, ToGuest,
+                ToHost, WireId, WireMessage,
+            };
+            use crate::state::{
+                Context, EventObject, EventSender, GuestId, HostId, Link, RequestObject,
+                RequestSender,
+            };
             use crate::protocols::Iface;
 
             #(#parts)*
@@ -260,7 +266,7 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
     );
     let expanded = quote! {
         use crate::state::{Context, EventSender, RequestSender};
-        use crate::wire::{Outgoing, ProtocolError, WireMessage};
+        use crate::wire::{ProtocolError, ToGuest, ToHost, WireMessage};
 
         /// An interface of the vendored protocols: what the object table
         /// records of every object, and what a message is dispatched by.
@@ -317,7 +323,7 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
             sender: RequestSender,
             msg: &mut WireMessage,
             ctx: &mut Context,
-        ) -> Result<Option<Outgoing>, ProtocolError> {
+        ) -> Result<Option<ToHost>, ProtocolError> {
             match sender.iface {
                 #(#dispatch_request_arms)*
             }
@@ -340,7 +346,7 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
             event: AnyEvent,
             payload_len: usize,
             ctx: &mut Context,
-        ) -> Result<Option<Outgoing>, ProtocolError> {
+        ) -> Result<Option<ToGuest>, ProtocolError> {
             match event {
                 #(#dispatch_event_arms)*
             }
@@ -564,7 +570,12 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 constant_names.claim_opcode(&opcode_name);
                 request_opcodes.push(quote! { pub const #opcode_name: u16 = #req_idx; });
                 request_opcodes.push(generate_since_constant(&opcode_name, req.since));
-                request_encoders.push(generate_encoder(&interface.name, req, &opcode_name));
+                request_encoders.push(generate_encoder(
+                    &interface.name,
+                    req,
+                    &opcode_name,
+                    quote! { RequestId },
+                ));
 
                 let var_name = format_ident!("{}", snake_to_camel(&req.name));
                 let fields = generate_fields(&req.items);
@@ -573,7 +584,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 let decodes = generate_reads(&req.items);
                 let field_names = generate_field_names(&req.items);
                 let request_validations = generate_request_validations(&req.items);
-                let request_version_validation = generate_version_validation(req.since);
+                let request_version_validation =
+                    generate_version_validation(req.since, quote! { sender.guest });
                 request_decoders.push(quote! {
                     #req_idx => {
                         #decodes
@@ -589,15 +601,19 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 // overrides it, or one the handler must write, which
                 // forwards nothing.
                 let method_name = format_ident!("on_{}", req.name);
-                let method_args = generate_handler_args(&req.items);
+                let method_args = generate_handler_args(&req.items, Side::Request);
                 let hand_written = is_hand_written(&interface.name, &req.name);
                 handler_methods.push(if hand_written {
                     quote! {
-                        fn #method_name(ctx: &mut Context, #method_args);
+                        fn #method_name(ctx: &mut Context, sender: RequestSender, #method_args);
                     }
                 } else {
                     quote! {
-                        fn #method_name(_ctx: &mut Context, #method_args) -> Action {
+                        fn #method_name(
+                            _ctx: &mut Context,
+                            _sender: RequestSender,
+                            #method_args
+                        ) -> Action {
                             Action::Forward
                         }
                     }
@@ -627,31 +643,33 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         }
 
                         match arg.typ.as_str() {
-                            // The pre-handler validation translated the
-                            // object (see `generate_request_validations`): a
-                            // nullable one to a host ID, a non-nullable one to
-                            // a `Link`, which must name a host object.
-                            "object" => {
-                                let translated = translated_object_ident(arg);
-                                let host = if arg.allow_null.unwrap_or(false) {
-                                    translated
-                                } else {
-                                    let host = format_ident!("host_{}", arg.name);
-                                    let req_name_str = &req.name;
-                                    local_object_checks.push(quote! {
-                                        let Link::Host(#host) = #translated else {
-                                            log::debug!(
-                                                "Dropping request {} naming a local object as non-nullable argument {}",
-                                                #req_name_str,
-                                                #arg_name_str
-                                            );
-                                            return Ok(None);
-                                        };
-                                    });
-                                    host
-                                };
+                            // The pre-handler validation resolved the object
+                            // (see `generate_request_validations`), which
+                            // must name a host object unless it is null.
+                            "object" if arg.allow_null.unwrap_or(false) => {
                                 mapping_and_writing.push(quote! {
-                                    builder.write_u32(#host);
+                                    builder.write_u32(
+                                        #name
+                                            .and_then(|object| object.host.host())
+                                            .map_or(0, WireId::wire),
+                                    );
+                                });
+                            }
+                            "object" => {
+                                let host = format_ident!("host_{}", arg.name);
+                                let req_name_str = &req.name;
+                                local_object_checks.push(quote! {
+                                    let Link::Host(#host) = #name.host else {
+                                        log::debug!(
+                                            "Dropping request {} naming a local object as non-nullable argument {}",
+                                            #req_name_str,
+                                            #arg_name_str
+                                        );
+                                        return Ok(None);
+                                    };
+                                });
+                                mapping_and_writing.push(quote! {
+                                    builder.write_u32(#host.wire());
                                 });
                             }
                             "new_id" => {
@@ -664,12 +682,16 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                     // argument.
                                     let iface = iface_variant(interface_name);
                                     mapping_and_writing.push(quote! {
-                                        builder.write_u32(ctx.shadow_table.create_paired(
-                                            #name,
-                                            #iface,
-                                            sender.version,
-                                            host.version,
-                                        ));
+                                        builder.write_u32(
+                                            ctx.shadow_table
+                                                .create_paired(
+                                                    #name,
+                                                    #iface,
+                                                    sender.version,
+                                                    host.version,
+                                                )
+                                                .wire(),
+                                        );
                                     });
                                 } else {
                                     // Only its handler knows what it
@@ -694,11 +716,11 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 let (destructor_cleanup, local_destructor_cleanup, dropped_destructor_cleanup) =
                     if req.msg_type.as_deref() == Some("destructor") {
                         (
-                            quote! { ctx.guest_destroyed(msg.sender_id); },
-                            quote! { ctx.local_destroyed(msg.sender_id); },
+                            quote! { ctx.guest_destroyed(sender.guest); },
+                            quote! { ctx.local_destroyed(sender.guest); },
                             quote! {
                                 if sender.host.is_none() {
-                                    ctx.local_destroyed(msg.sender_id);
+                                    ctx.local_destroyed(sender.guest);
                                 }
                             },
                         )
@@ -711,7 +733,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         Request::#var_name { #(#field_names_list),* } => {
                             #request_version_validation
                             #(#request_validations)*
-                            H::#method_name(ctx, #(#handler_call_args),*);
+                            H::#method_name(ctx, sender, #(#handler_call_args),*);
                         }
                     }
                 } else {
@@ -719,7 +741,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         Request::#var_name { #(#field_names_list),* } => {
                             #request_version_validation
                             #(#request_validations)*
-                            let handler_action = H::#method_name(ctx, #(#handler_call_args),*);
+                            let handler_action = H::#method_name(ctx, sender, #(#handler_call_args),*);
                             if handler_action == Action::Forward {
                                 // Check the sender and every object argument
                                 // before mapping any new_id: a dropped request
@@ -728,7 +750,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 let Some(host) = sender.host else {
                                     log::debug!(
                                         "Dropping request from local object {}",
-                                        msg.sender_id
+                                        sender.guest
                                     );
                                     #local_destructor_cleanup
                                     return Ok(None);
@@ -756,7 +778,12 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 constant_names.claim_opcode(&opcode_name);
                 event_opcodes.push(quote! { pub const #opcode_name: u16 = #evt_idx; });
                 event_opcodes.push(generate_since_constant(&opcode_name, evt.since));
-                event_encoders.push(generate_encoder(&interface.name, evt, &opcode_name));
+                event_encoders.push(generate_encoder(
+                    &interface.name,
+                    evt,
+                    &opcode_name,
+                    quote! { EventId },
+                ));
 
                 let var_name = format_ident!("{}", snake_to_camel(&evt.name));
                 let fields = generate_fields(&evt.items);
@@ -768,7 +795,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                     &format!("{}.{}", interface.name, evt.name),
                     &evt.items,
                 );
-                let event_version_validation = generate_version_validation(evt.since);
+                let event_version_validation =
+                    generate_version_validation(evt.since, quote! { sender.host });
                 event_decoders.push(quote! {
                     #evt_idx => {
                         #decodes
@@ -782,9 +810,13 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
 
                 // Handler method for event
                 let method_name = format_ident!("on_{}", evt.name);
-                let method_args = generate_handler_args(&evt.items);
+                let method_args = generate_handler_args(&evt.items, Side::Event);
                 handler_methods.push(quote! {
-                    fn #method_name(_ctx: &mut Context, #method_args) -> Action {
+                    fn #method_name(
+                        _ctx: &mut Context,
+                        _sender: EventSender,
+                        #method_args
+                    ) -> Action {
                         Action::Forward
                     }
                 });
@@ -812,12 +844,17 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         }
 
                         match arg.typ.as_str() {
-                            // The pre-handler validation translated the
+                            // The pre-handler validation resolved the
                             // object (see `generate_event_validations`).
                             "object" if arg.interface.is_some() => {
-                                let guest = translated_object_ident(arg);
-                                mapping_and_writing.push(quote! {
-                                    builder.write_u32(#guest);
+                                mapping_and_writing.push(if arg.allow_null.unwrap_or(false) {
+                                    quote! {
+                                        builder.write_u32(
+                                            #name.map_or(0, |object| object.guest.wire()),
+                                        );
+                                    }
+                                } else {
+                                    quote! { builder.write_u32(#name.guest.wire()); }
                                 });
                             }
                             "object" => {
@@ -828,9 +865,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 );
                                 let evt_name_str = &evt.name;
                                 let arg_name_str = &arg.name;
-                                let guest = translated_object_ident(arg);
+                                let guest = format_ident!("guest_{}", arg.name);
                                 unmapped_object_checks.push(quote! {
-                                    let Some(#guest) = ctx.shadow_table.get_guest_id(#name) else {
+                                    let Some(#guest) = ctx.shadow_table.guest_named_by_host(#name) else {
                                         log::debug!(
                                             "Dropping event {} naming an object with no guest counterpart as argument {}",
                                             #evt_name_str,
@@ -840,7 +877,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                     };
                                 });
                                 mapping_and_writing.push(quote! {
-                                    builder.write_u32(#guest);
+                                    builder.write_u32(#guest.wire());
                                 });
                             }
                             "new_id" => {
@@ -855,11 +892,11 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 // argument.
                                 let iface = iface_variant(interface_name);
                                 mapping_and_writing.push(quote! {
-                                    builder.write_u32(ctx.shadow_table.adopt_host_created(
-                                        #name,
-                                        #iface,
-                                        sender.version,
-                                    ));
+                                    builder.write_u32(
+                                        ctx.shadow_table
+                                            .adopt_host_created(#name, #iface, sender.version)
+                                            .wire(),
+                                    );
                                 });
                             }
                             _ => {
@@ -890,7 +927,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         // the wire, and destructor cleanup must remove that
                         // same object rather than looking it up again.
                         let mapped_guest_sender_id = sender.guest.map(|guest| guest.id);
-                        if H::#method_name(ctx, #(#handler_call_args),*) == Action::Forward {
+                        if H::#method_name(ctx, sender, #(#handler_call_args),*) == Action::Forward {
                             // Check the sender and every object argument
                             // before mapping any new_id: a dropped event must
                             // not consume a guest server ID, since
@@ -898,7 +935,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             let Some(guest_sender_id) = mapped_guest_sender_id else {
                                 log::debug!(
                                     "Dropping event from unmapped sender {}",
-                                    sender.id
+                                    sender.host
                                 );
                                 return Ok(None);
                             };
@@ -1014,7 +1051,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 sender: RequestSender,
                 msg: &mut WireMessage,
                 ctx: &mut Context,
-            ) -> Result<Option<Outgoing>, ProtocolError> {
+            ) -> Result<Option<ToHost>, ProtocolError> {
                 let req = Request::from_wire(msg)?;
                 match req {
                     #(#dispatch_request_arms)*
@@ -1031,7 +1068,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 evt: Event,
                 payload_len: usize,
                 ctx: &mut Context,
-            ) -> Result<Option<Outgoing>, ProtocolError> {
+            ) -> Result<Option<ToGuest>, ProtocolError> {
                 match evt {
                     #(#dispatch_event_arms)*
                     #[allow(unreachable_patterns)]
@@ -1204,13 +1241,24 @@ fn generate_since_constant(opcode_name: &Ident, since: Option<u32>) -> TokenStre
 ///
 /// The encoder takes the sender's ID and then the message's arguments in
 /// XML order, so the compiler checks the opcode, argument order and
-/// argument types of every message the proxy builds itself. A message that
+/// argument types of every message the proxy builds itself. Every ID it
+/// names, the sender's included, is of one ID space `I`: a request's a
+/// `RequestId` (the proxy's are host IDs) and an event's an `EventId` (the
+/// proxy's are guest IDs), so the proxy cannot build a message that names
+/// an object of the wrong side, or send it to the wrong peer. An object of
+/// no interface, which may name any object or none
+/// (`wl_display.error`'s), is a plain `u32`. A message that
 /// carries a string or an array can exceed the wire's 16-bit length and
 /// returns a `Result`; any other cannot and returns the message directly.
 /// The message owns its descriptors, as `OwnedFd`s, so one that cannot be
 /// built or is never sent closes them. A string is a `&str`, even one
 /// other arguments index: what the proxy builds itself is UTF-8.
-fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> TokenStream {
+fn generate_encoder(
+    interface: &str,
+    message: &Message,
+    opcode: &Ident,
+    ids: TokenStream,
+) -> TokenStream {
     let name = sanitize_ident(&message.name);
     let mut params = Vec::new();
     let mut writes = Vec::new();
@@ -1244,9 +1292,12 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
         // chose, so a null required object is a proxy bug. Host data is not
         // checked here: forwarding translates and validates it on its own
         // path, and must not pass it through an encoder unchecked.
-        if matches!(arg.typ.as_str(), "object" | "new_id") && !nullable {
+        if matches!(arg.typ.as_str(), "object" | "new_id")
+            && !nullable
+            && (arg.typ == "new_id" || arg.interface.is_some())
+        {
             let null = format!("{}.{}: {} is null", interface, message.name, arg.name);
-            writes.push(quote! { debug_assert_ne!(#arg_name, 0, #null); });
+            writes.push(quote! { debug_assert_ne!(#arg_name.wire(), 0, #null); });
         }
         match arg.typ.as_str() {
             "int" | "fixed" => {
@@ -1257,24 +1308,33 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
                 params.push(quote! { #arg_name: u32 });
                 writes.push(quote! { builder.write_u32(#arg_name); });
             }
+            "object" if arg.interface.is_none() => {
+                assert!(
+                    !nullable,
+                    "{}.{}: nullable object {} of no interface",
+                    interface, message.name, arg.name
+                );
+                params.push(quote! { #arg_name: u32 });
+                writes.push(quote! { builder.write_u32(#arg_name); });
+            }
             "object" | "new_id" if nullable => {
-                params.push(quote! { #arg_name: Option<u32> });
-                writes.push(quote! { builder.write_u32(#arg_name.unwrap_or(0)); });
+                params.push(quote! { #arg_name: Option<I> });
+                writes.push(quote! { builder.write_u32(#arg_name.map_or(0, WireId::wire)); });
             }
             // `wl_registry.bind` names the interface and version of the
             // object it creates.
             "new_id" if arg.interface.is_none() => {
                 fallible = true;
-                params.push(quote! { interface: &str, version: u32, #arg_name: u32 });
+                params.push(quote! { interface: &str, version: u32, #arg_name: I });
                 writes.push(quote! {
                     builder.write_string(interface);
                     builder.write_u32(version);
-                    builder.write_u32(#arg_name);
+                    builder.write_u32(#arg_name.wire());
                 });
             }
             "object" | "new_id" => {
-                params.push(quote! { #arg_name: u32 });
-                writes.push(quote! { builder.write_u32(#arg_name); });
+                params.push(quote! { #arg_name: I });
+                writes.push(quote! { builder.write_u32(#arg_name.wire()); });
             }
             "string" if nullable => {
                 fallible = true;
@@ -1302,20 +1362,21 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
         }
     }
     let fixed_bytes = 4 * words;
+    // The descriptors go in one exact allocation, as a forward's do.
     let fds = if fds.is_empty() {
-        quote! { Vec::new() }
+        quote! {}
     } else {
-        quote! { vec![#(#fds),*] }
+        quote! { let builder = builder.with_fds(vec![#(#fds),*]); }
     };
     let (output, message) = if fallible {
         (
-            quote! { Result<Outgoing, ProtocolError> },
-            quote! { Ok((builder.try_build_message(sender_id, super::#opcode)?, #fds)) },
+            quote! { Result<Outgoing<I>, ProtocolError> },
+            quote! { builder.try_build(sender_id, super::#opcode) },
         )
     } else {
         (
-            quote! { Outgoing },
-            quote! { (builder.build_message(sender_id, super::#opcode), #fds) },
+            quote! { Outgoing<I> },
+            quote! { builder.build(sender_id, super::#opcode) },
         )
     };
     // A dropped encoder result loses the message without a trace. The
@@ -1323,10 +1384,11 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
     // `Result`.
     quote! {
         #[must_use = "a message that is not queued is never sent"]
-        pub fn #name(sender_id: u32, #(#params),*) -> #output {
+        pub fn #name<I: #ids>(sender_id: I, #(#params),*) -> #output {
             #[allow(unused_mut)]
             let mut builder = MessageBuilder::with_capacity(#fixed_bytes #(+ #variable)*);
             #(#writes)*
+            #fds
             #message
         }
     }
@@ -1482,7 +1544,7 @@ fn args(items: &[MessageItem]) -> impl Iterator<Item = &Arg> {
 /// Generate the object-version guard required by Wayland's `since`
 /// attribute. Requests use the guest object's negotiated version, while
 /// events use the host object's version.
-fn generate_version_validation(since: Option<u32>) -> TokenStream {
+fn generate_version_validation(since: Option<u32>, sender_id: TokenStream) -> TokenStream {
     let Some(required) = since else {
         return quote! {};
     };
@@ -1490,7 +1552,7 @@ fn generate_version_validation(since: Option<u32>) -> TokenStream {
     quote! {
         if sender.version < #required {
             return Err(ProtocolError::UnsupportedVersion {
-                object_id: sender.id,
+                object_id: #sender_id.wire(),
                 required: #required,
                 actual: sender.version,
             });
@@ -1502,24 +1564,28 @@ fn generate_version_validation(since: Option<u32>) -> TokenStream {
 ///
 /// Wayland clients own the IDs in requests. A repeated, null, or
 /// server-reserved ID is a protocol error and must not be allowed to overwrite
-/// an existing shadow-table entry. Each object argument is validated and
-/// translated in one lookup, bound to [`translated_object_ident`]: a nullable
-/// one to the host ID to send, else to its [`Link`].
+/// an existing shadow-table entry. Each ID is validated and typed in one
+/// lookup of the object table, which shadows the wire value: a `new_id` as
+/// the `GuestId` it may create, an object as the `RequestObject` it names,
+/// `None` if it is null and may be.
 fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
     let mut validations = Vec::new();
     for arg in args(items) {
         let name = sanitize_ident(&arg.name);
         match arg.typ.as_str() {
             "new_id" => {
-                let id = if arg.interface.is_none() {
-                    quote! { #name.2 }
+                let (id, typed) = if arg.interface.is_none() {
+                    (quote! { #name.2 }, quote! { (#name.0, #name.1, guest_id) })
                 } else {
-                    quote! { #name }
+                    (quote! { #name }, quote! { guest_id })
                 };
                 validations.push(quote! {
-                    if !ctx.shadow_table.is_guest_id_available(#id) {
-                        return Err(ProtocolError::InvalidObjectId(#id));
-                    }
+                    let #name = {
+                        let Some(guest_id) = ctx.shadow_table.guest_new_id(#id) else {
+                            return Err(ProtocolError::InvalidObjectId(#id));
+                        };
+                        #typed
+                    };
                 });
             }
             "object" => {
@@ -1529,29 +1595,18 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
                         arg.name
                     );
                 };
-                let host = translated_object_ident(arg);
                 let iface = iface_variant(interface);
-                let link = quote! {
+                let object = quote! {
                     ctx.shadow_table
                         .request_object(#name, #iface)
                         .ok_or(ProtocolError::InvalidObjectId(#name))?
                 };
                 validations.push(if arg.allow_null.unwrap_or(false) {
                     quote! {
-                        let #host = if #name == 0 {
-                            0
-                        } else {
-                            match #link {
-                                Link::Host(host_id) => host_id,
-                                // A local object, such as an inert output,
-                                // has no host counterpart: the host gets
-                                // null, as for no object.
-                                Link::Local => 0,
-                            }
-                        };
+                        let #name = if #name == 0 { None } else { Some(#object) };
                     }
                 } else {
-                    quote! { let #host = #link; }
+                    quote! { let #name = #object; }
                 });
             }
             _ => {}
@@ -1561,12 +1616,13 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
 }
 
 /// Generate validation for IDs carried by a host event. A host-generated
-/// object must have a fresh server ID. Each object argument of an interface
-/// must name a live object with a guest counterpart, or the event is
-/// dropped; it is validated and translated to the guest ID in one lookup,
-/// bound to [`translated_object_ident`]. An object of no interface is
-/// resolved only when the event is forwarded. `event` names the event
-/// (`interface.event`) in what the lookup logs.
+/// object must have a fresh server ID, which shadows the wire value as the
+/// `HostId` it creates. Each object argument of an interface must name a
+/// live object with a guest counterpart, or the event is dropped; it is
+/// validated and typed in one lookup, which shadows the wire value as the
+/// `EventObject` it names, `None` if it is null and may be. An object of
+/// no interface is resolved only when the event is forwarded. `event`
+/// names the event (`interface.event`) in what the lookup logs.
 fn generate_event_validations(event: &str, items: &[MessageItem]) -> Vec<TokenStream> {
     let mut validations = Vec::new();
     for arg in args(items) {
@@ -1574,9 +1630,9 @@ fn generate_event_validations(event: &str, items: &[MessageItem]) -> Vec<TokenSt
         match arg.typ.as_str() {
             "new_id" if arg.interface.is_some() => {
                 validations.push(quote! {
-                    if !ctx.shadow_table.accepts_host_new_id(#name) {
+                    let Some(#name) = ctx.shadow_table.host_new_id(#name) else {
                         return Err(ProtocolError::InvalidObjectId(#name));
-                    }
+                    };
                 });
             }
             // An object of no interface (`wl_display.error`'s object) may
@@ -1586,23 +1642,22 @@ fn generate_event_validations(event: &str, items: &[MessageItem]) -> Vec<TokenSt
                 let Some(interface) = &arg.interface else {
                     continue;
                 };
-                let guest = translated_object_ident(arg);
                 let iface = iface_variant(interface);
                 let lookup = quote! { ctx.shadow_table.event_object(#name, #iface, #event) };
                 validations.push(if arg.allow_null.unwrap_or(false) {
                     quote! {
-                        let #guest = if #name == 0 {
-                            0
+                        let #name = if #name == 0 {
+                            None
                         } else {
-                            let Some(guest_id) = #lookup else {
+                            let Some(object) = #lookup else {
                                 return Ok(None);
                             };
-                            guest_id
+                            Some(object)
                         };
                     }
                 } else {
                     quote! {
-                        let Some(#guest) = #lookup else {
+                        let Some(#name) = #lookup else {
                             return Ok(None);
                         };
                     }
@@ -1612,13 +1667,6 @@ fn generate_event_validations(event: &str, items: &[MessageItem]) -> Vec<TokenSt
         }
     }
     validations
-}
-
-/// The binding that holds an object argument translated by its message's
-/// validation (see [`generate_request_validations`] and
-/// [`generate_event_validations`]).
-fn translated_object_ident(arg: &Arg) -> Ident {
-    format_ident!("translated_{}", arg.name)
 }
 
 fn generate_field_names(items: &[MessageItem]) -> TokenStream {
@@ -1643,22 +1691,51 @@ fn generate_fields(items: &[MessageItem]) -> TokenStream {
     quote! { #(#fields),* }
 }
 
-/// The parameters of a handler method.
+/// Which side sends a message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// The guest, whose requests name guest objects.
+    Request,
+    /// The host, whose events name host objects.
+    Event,
+}
+
+/// The parameters of a handler method, after its sender.
 ///
-/// A handler borrows the message's descriptors: the dispatcher owns them,
-/// forwards them or closes them, and a handler that keeps one clones it.
-fn generate_handler_args(items: &[MessageItem]) -> TokenStream {
+/// A handler gets each ID as the object table resolved it before the
+/// handler ran, typed by its side: an object of an interface as the
+/// `RequestObject` or `EventObject` it names (`Option` if it may be null),
+/// a request's `new_id` as the `GuestId` it creates and an event's as the
+/// `HostId`. An object of no interface, which may name anything, stays a
+/// wire `u32`. A handler borrows the message's descriptors: the dispatcher
+/// owns them, forwards them or closes them, and a handler that keeps one
+/// clones it.
+fn generate_handler_args(items: &[MessageItem], side: Side) -> TokenStream {
     let mut args = Vec::new();
     for item in items {
         if let MessageItem::Arg(arg) = item {
             let name = format_ident!("_{}", sanitize_ident(&arg.name));
             let ty = map_type(arg);
+            let nullable = arg.allow_null.unwrap_or(false);
+            let object = match side {
+                Side::Request => quote! { RequestObject },
+                Side::Event => quote! { EventObject },
+            };
             if arg.typ == "string" {
                 args.push(quote! { #name: &#ty });
             } else if arg.typ == "array" {
                 args.push(quote! { #name: &[u8] });
             } else if arg.typ == "new_id" && arg.interface.is_none() {
-                args.push(quote! { #name: &(String, u32, u32) });
+                args.push(quote! { #name: &(String, u32, GuestId) });
+            } else if arg.typ == "new_id" {
+                args.push(match side {
+                    Side::Request => quote! { #name: GuestId },
+                    Side::Event => quote! { #name: HostId },
+                });
+            } else if arg.typ == "object" && arg.interface.is_some() && nullable {
+                args.push(quote! { #name: Option<#object> });
+            } else if arg.typ == "object" && arg.interface.is_some() {
+                args.push(quote! { #name: #object });
             } else if arg.typ == "fd" {
                 args.push(quote! { #name: std::os::fd::BorrowedFd<'_> });
             } else {

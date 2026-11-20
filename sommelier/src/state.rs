@@ -41,7 +41,7 @@ use self::render::RenderBufferRegistry;
 use self::render::MAX_PENDING_DAMAGE_RECTS;
 use crate::allocator::{PendingFence, VirtGpuDevice};
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::{Action, Outgoing};
+use crate::wire::{Action, ProtocolError, ToGuest, ToHost};
 use log::{debug, error, warn};
 
 #[cfg(test)]
@@ -50,11 +50,12 @@ pub(crate) use self::input::{
     KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PointerFocus,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
-pub use self::objects::{DeletedHostId, EventSender, Link, RequestSender, ShadowTable};
-pub use self::outputs::OutputState;
-pub(crate) use self::outputs::{
-    is_valid_transform, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
+pub use self::objects::{
+    DeletedHostId, EventObject, EventSender, GuestId, HostId, Link, RequestObject, RequestSender,
+    ShadowTable,
 };
+pub use self::outputs::OutputState;
+pub(crate) use self::outputs::{is_valid_transform, OutputRegistry, INERT_BIND_INTERFACE};
 pub(crate) use self::registries::RegistryRecord;
 #[cfg(test)]
 pub(crate) use self::render::SurfacePending;
@@ -73,38 +74,21 @@ use crate::placement_config::PlacementConfig;
 use crate::settings::Settings;
 use std::rc::Rc;
 
-/// A Wayland object ID allocated by the **guest** (client) side, as
-/// [`ShadowTable`] keys guest objects.
-///
-/// Within the table, and in state keyed by it, a guest ID cannot stand in
-/// for a [`HostId`]. Handlers and the table's query methods pass raw `u32`
-/// IDs, so at those call sites the direction is a naming convention
-/// (`guest_*`, `host_*`), not a type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GuestId(pub(crate) u32);
-
-/// A Wayland object ID on the **host** connection.
-///
-/// State keyed by host objects (keyboard focus, key generations, render
-/// buffers) uses it, so a guest ID cannot be passed there. Event handlers
-/// receive the raw sender as `ctx.last_sender_id`; [`HostId::from_event_sender`]
-/// wraps it, and [`ShadowTable::get_guest_id`] translates a host ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HostId(pub(crate) u32);
+/// The message that `message` encoded, or `None` after logging why it was
+/// dropped (see [`Context::send_host_or_drop`]).
+fn sent_or_dropped<M>(
+    message: Result<M, ProtocolError>,
+    what: impl std::fmt::Display,
+) -> Option<M> {
+    message
+        .inspect_err(|error| log::warn!("Dropping {what}: {error}"))
+        .ok()
+}
 
 /// Compare Wayland serials across wrapping `u32` space.
 pub(crate) fn serial_is_after(candidate: u32, previous: u32) -> bool {
     let distance = candidate.wrapping_sub(previous);
     distance != 0 && distance < (1 << 31)
-}
-
-impl HostId {
-    /// Wrap the raw sender ID from a **host→client event** handler.
-    /// Only call this in handlers where `ctx.last_sender_id` is a host ID.
-    #[inline]
-    pub(crate) fn from_event_sender(ctx: &Context) -> Self {
-        Self(ctx.last_sender_id)
-    }
 }
 
 /// Why a session ends ([`Context::end_session`]). The guest is told in
@@ -143,8 +127,8 @@ pub(crate) const INTERNAL_END_TARGET: &str = "sommelier::internal_end";
 /// context's queues, which keep their capacity for the next message;
 /// dropping what it has not yielded closes its descriptors.
 pub(crate) struct Effects<'a> {
-    pub(crate) to_host: std::vec::Drain<'a, Outgoing>,
-    pub(crate) to_guest: std::vec::Drain<'a, Outgoing>,
+    pub(crate) to_host: std::vec::Drain<'a, ToHost>,
+    pub(crate) to_guest: std::vec::Drain<'a, ToGuest>,
     pub(crate) end: Option<SessionEnd>,
     /// The fence the message waits for before it can be dispatched again;
     /// see [`Context::wait_for_fence`].
@@ -190,14 +174,12 @@ pub struct HostGlobal {
 /// discovery to complete.
 ///
 /// The host registry object is retained because each guest registry needs its
-/// own `global` event. The generation prevents a delayed capability callback
-/// from publishing a replacement or already-removed global.
+/// own `global` event; the registry's removal of the global drops it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDmabufGlobal {
-    pub registry_host_id: u32,
+    pub registry_host_id: HostId,
     pub name: u32,
     pub version: u32,
-    pub generation: u64,
 }
 
 /// The most clipboard transfers one connection may have in flight.
@@ -278,7 +260,7 @@ pub struct PendingParam {
 /// descriptor together under that host ID prevents a late result from an old
 /// generation from consuming resources owned by its replacement.
 pub struct PendingNativeCreate {
-    pub guest_params_id: u32,
+    pub guest_params_id: GuestId,
     pub dimensions: (i32, i32),
     pub sync_fds: Vec<OwnedFd>,
 }
@@ -303,8 +285,8 @@ pub struct GtkShellState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GtkSurfaceState {
-    pub shell_id: u32,
-    pub wl_surface_id: u32,
+    pub shell_id: GuestId,
+    pub wl_surface_id: GuestId,
 }
 
 /// Work a request handler defers until the proxy has forwarded the request.
@@ -320,10 +302,13 @@ pub struct GtkSurfaceState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PostDispatch {
     /// `xdg_surface.get_toplevel` created `xdg_toplevel` from `xdg_surface`.
-    XdgToplevelCreated { xdg_surface: u32, xdg_toplevel: u32 },
+    XdgToplevelCreated {
+        xdg_surface: GuestId,
+        xdg_toplevel: GuestId,
+    },
     /// `wl_seat.get_keyboard` created guest keyboard `keyboard` of guest
     /// seat `seat`, whose host keyboard its forward mapped.
-    KeyboardCreated { keyboard: u32, seat: u32 },
+    KeyboardCreated { keyboard: GuestId, seat: GuestId },
 }
 
 /// A synthetic guest `wl_shm` object.
@@ -340,11 +325,11 @@ pub struct GuestShm {
 
 pub struct Context {
     pub shadow_table: ShadowTable,
-    pub pools: BTreeMap<u32, ShmPool>,
+    pub pools: BTreeMap<GuestId, ShmPool>,
     render_buffers: RenderBufferRegistry,
     /// Asynchronous linux-dmabuf creates keyed by host params generation.
     pub pending_native_creates: BTreeMap<HostId, PendingNativeCreate>,
-    pub surfaces: BTreeMap<u32, SurfaceState>,
+    pub surfaces: BTreeMap<GuestId, SurfaceState>,
     /// Every guest `zwp_text_input_v3`, ordered by ID: a focus change
     /// reaches them in that order (INVARIANTS "Nothing the proxy sends
     /// depends on hash order").
@@ -357,13 +342,12 @@ pub struct Context {
     /// Wheel steps from touchpad scrolling, which the client gets if
     /// [`crate::client_kind`] chooses it.
     pub(crate) wheel_steps: crate::handler::pointer::WheelSteps,
-    pub last_sender_id: u32,
     /// Requests the message being dispatched sends the host besides its
     /// forward (an ack_key or a bind, say); part of its [`Effects`].
-    pub client_to_host_queue: Vec<Outgoing>,
+    to_host: Vec<ToHost>,
     /// Events the message being dispatched sends the guest besides its
     /// forward (a synthetic wl_shm.format, say); part of its [`Effects`].
-    pub host_to_client_queue: Vec<Outgoing>,
+    to_guest: Vec<ToGuest>,
     /// Why the message being dispatched ends the session, if it does; see
     /// [`Self::end_session`].
     session_end: Option<SessionEnd>,
@@ -400,19 +384,19 @@ pub struct Context {
     pub host_dmabuf_shm_formats: BTreeSet<u32>,
     /// Every synthetic guest wl_shm object, ordered by ID: a host format
     /// reaches them in that order.
-    pub guest_shms: BTreeMap<u32, GuestShm>,
+    pub guest_shms: BTreeMap<GuestId, GuestShm>,
     /// Synthetic guest wl_shm objects whose own global, the name each was
     /// bound from, has retired. Wayland keeps an already-bound global
     /// object valid for teardown, but requests sent to it after its
     /// global's removal are ignored, even while the proxy has bound a
     /// replacement; objects bound from a live name are unaffected.
-    pub stale_shm_guest_objects: BTreeSet<u32>,
+    pub stale_shm_guest_objects: BTreeSet<GuestId>,
     /// Synthetic wl_shm_pool children of a stale guest wl_shm, created before
     /// its global retired or after it. They remain destroyable, but must not
     /// resize or create buffers through a replacement host binding.
-    pub stale_shm_pools: BTreeSet<u32>,
-    pub host_text_input_manager_v1_id: Option<u32>,
-    pub host_text_input_extension_v1_id: Option<u32>,
+    pub stale_shm_pools: BTreeSet<GuestId>,
+    pub host_text_input_manager_v1_id: Option<HostId>,
+    pub host_text_input_extension_v1_id: Option<HostId>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
@@ -421,49 +405,48 @@ pub struct Context {
     pub(crate) singleton_candidates: BTreeMap<u32, HostGlobal>,
     /// What each host registry has advertised, by host registry ID (see
     /// [`RegistryRecord`]).
-    pub(crate) registries: BTreeMap<u32, RegistryRecord>,
-    pub global_generations: BTreeMap<u32, u64>,
-    pub next_global_generation: u64,
-    /// The generation of each global whose current advertisement the host
-    /// removed, from the first registry's `global_remove` until the global
-    /// is retired or advertised anew. It outlives the registries that saw
-    /// the removal, which a guest may destroy before the last registry that
-    /// lists the global sees it.
-    pub removed_global_generations: BTreeMap<u32, u64>,
-    pub pending_params: BTreeMap<u32, Vec<PendingParam>>,
+    pub(crate) registries: BTreeMap<HostId, RegistryRecord>,
+    /// Every global name whose removal a registry has seen. A name is one
+    /// global for the connection's life, so it stays here: a global event
+    /// that names it again breaks the protocol
+    /// (`handler::registry::accept_global`). It outlives the registries
+    /// that saw the removal, which a guest may destroy before the last
+    /// registry that lists the global sees it.
+    pub removed_globals: BTreeSet<u32>,
+    pub pending_params: BTreeMap<GuestId, Vec<PendingParam>>,
     /// Guest linux-dmabuf params objects consumed by create/create_immed.
     ///
     /// The protocol object remains alive after consumption so subsequent
     /// add/create requests can report `already_used` instead of being
     /// confused with an object that was never tracked.
-    pub used_dmabuf_params: BTreeSet<u32>,
+    pub used_dmabuf_params: BTreeSet<GuestId>,
     /// Guest feedback objects synthesized locally from the host's legacy
-    /// linux-dmabuf format/modifier events, keyed by guest feedback ID. The
-    /// generation keeps an object created from an old, still-bound factory
-    /// isolated from a replacement global's capabilities. Ordered, because
-    /// completed capabilities reach the objects in that order.
-    pub synthetic_feedback_objects: BTreeMap<u32, u64>,
+    /// linux-dmabuf format/modifier events, keyed by guest feedback ID,
+    /// with the host global whose capabilities they carry, so an object
+    /// created from an old, still-bound factory stays isolated from a
+    /// replacement global's capabilities. Ordered, because completed
+    /// capabilities reach the objects in that order.
+    pub synthetic_feedback_objects: BTreeMap<GuestId, u32>,
     /// Avoid queuing one complete feedback sequence for every legacy
     /// format/modifier event. A host can advertise hundreds of pairs in a
     /// single roundtrip; sending one memfd per event can overflow the
     /// receiver's SCM_RIGHTS batch and desynchronize the Wayland FD stream.
     /// The proxy clears this set after each dispatch batch.
-    pub synthetic_feedback_refresh_pending: BTreeSet<u32>,
-    /// Capability snapshots for every host dmabuf global generation referenced
-    /// by a live guest object. A completed snapshot is immutable except for a
-    /// defensive refresh if a non-conforming host sends a late unique pair.
-    pub dmabuf_capabilities: BTreeMap<u64, DmabufCapabilityState>,
-    /// Generation collected by the current internal host dmabuf binding.
-    pub host_dmabuf_generation: Option<u64>,
+    pub synthetic_feedback_refresh_pending: BTreeSet<GuestId>,
+    /// Capability snapshots for every host dmabuf global, by name, that
+    /// anything holds (`handler::linux_dmabuf::capabilities_held`). A
+    /// completed snapshot is immutable except for a defensive refresh if a
+    /// non-conforming host sends a late unique pair.
+    pub dmabuf_capabilities: BTreeMap<u32, DmabufCapabilityState>,
     /// Host-only wl_callback barriers the proxy issued for itself, and what
     /// each one waits for.
     pub(crate) internal_callbacks: InternalCallbacks,
     /// Guest-facing v4 globals withheld until the internal v3 binding has
     /// delivered its complete legacy format/modifier capability set.
     pub pending_dmabuf_globals: Vec<PendingDmabufGlobal>,
-    /// Guest dmabuf factory ID to the host-global generation from which it was
-    /// bound. Global removal does not invalidate an already-bound factory.
-    pub dmabuf_guest_generations: BTreeMap<u32, u64>,
+    /// Guest dmabuf factory ID to the name of the host global it was bound
+    /// from. Global removal does not invalidate an already-bound factory.
+    pub dmabuf_factories: BTreeMap<GuestId, u32>,
     /// This connection's window placement, while it is on (see
     /// [`WindowPlacement`] for what it owns); decided as it connects.
     window_placement: Option<WindowPlacement>,
@@ -471,16 +454,16 @@ pub struct Context {
     /// it owns).
     pub(crate) outputs: OutputRegistry,
     /// Synthetic GTK shell bindings and their activation token state.
-    pub gtk_shells: BTreeMap<u32, GtkShellState>,
+    pub gtk_shells: BTreeMap<GuestId, GtkShellState>,
     /// Synthetic GTK surfaces associated with guest wl_surface objects.
-    pub gtk_surfaces: BTreeMap<u32, GtkSurfaceState>,
+    pub gtk_surfaces: BTreeMap<GuestId, GtkSurfaceState>,
     /// The host Aura surface of each host wl_surface (see [`AuraSurfaces`]).
     pub(crate) aura_surfaces: AuraSurfaces,
     /// The guest's xdg_surface and xdg_toplevel links to their wl_surface.
     pub(crate) xdg_roles: XdgRoles,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
-    pub viewport_to_wl_surface: BTreeMap<u32, u32>,
+    pub viewport_to_wl_surface: BTreeMap<GuestId, GuestId>,
     /// The connection's clipboard transfers.
     pub(crate) clipboard_pumps: ClipboardPumps,
 }
@@ -491,6 +474,72 @@ pub(crate) struct LocalBufferCopyResources<'a> {
 }
 
 impl Context {
+    /// Send `request` to the host after the message being dispatched (see
+    /// [`Effects`]).
+    pub(crate) fn send_host(&mut self, request: ToHost) {
+        self.to_host.push(request);
+    }
+
+    /// Send `event` to the guest after the message being dispatched (see
+    /// [`Effects`]).
+    pub(crate) fn send_guest(&mut self, event: ToGuest) {
+        self.to_guest.push(event);
+    }
+
+    /// [`Self::send_host`] each of `requests`, in order.
+    pub(crate) fn send_host_all(&mut self, requests: impl IntoIterator<Item = ToHost>) {
+        self.to_host.extend(requests);
+    }
+
+    /// [`Self::send_guest`] each of `events`, in order.
+    pub(crate) fn send_guest_all(&mut self, events: impl IntoIterator<Item = ToGuest>) {
+        self.to_guest.extend(events);
+    }
+
+    /// [`Self::send_host`] a request that may not have been encoded, or log
+    /// and drop it.
+    ///
+    /// Only the encoder of a message with a string or array fails, when the
+    /// data does not fit [`crate::wire::MessageHeader::MAX_LEN`]. That data
+    /// can come from the host or a guest, so dropping the one message keeps
+    /// the session alive instead of ending it.
+    ///
+    /// # Arguments
+    ///
+    /// * `what` - names the message in the log, such as
+    ///   `format_args!("startup ID for zaura_surface {id}")`.
+    ///
+    /// # Returns
+    ///
+    /// Whether the message was queued.
+    pub(crate) fn send_host_or_drop(
+        &mut self,
+        request: Result<ToHost, ProtocolError>,
+        what: impl std::fmt::Display,
+    ) -> bool {
+        sent_or_dropped(request, what)
+            .map(|request| self.send_host(request))
+            .is_some()
+    }
+
+    /// [`Self::send_guest`] an event that may not have been encoded, or log
+    /// and drop it, as [`Self::send_host_or_drop`] does.
+    pub(crate) fn send_guest_or_drop(
+        &mut self,
+        event: Result<ToGuest, ProtocolError>,
+        what: impl std::fmt::Display,
+    ) -> bool {
+        sent_or_dropped(event, what)
+            .map(|event| self.send_guest(event))
+            .is_some()
+    }
+
+    /// Whether the message being dispatched sends anything besides its
+    /// forward.
+    pub(crate) fn sends_anything(&self) -> bool {
+        !self.to_host.is_empty() || !self.to_guest.is_empty()
+    }
+
     /// Defer `effect` until the message being dispatched is forwarded; it is
     /// discarded if the message is dropped or rejected.
     pub(crate) fn defer_until_forwarded(&mut self, effect: PostDispatch) {
@@ -515,9 +564,14 @@ impl Context {
     /// guest object `object` (see [`Self::end_session`]). A handler returns
     /// the [`Action::Drop`] this returns.
     #[must_use = "a handler returns the Action::Drop"]
-    pub(crate) fn reject(&mut self, object: u32, code: u32, message: impl Into<String>) -> Action {
+    pub(crate) fn reject(
+        &mut self,
+        object: GuestId,
+        code: u32,
+        message: impl Into<String>,
+    ) -> Action {
         self.end_session(SessionEnd::Protocol {
-            object,
+            object: crate::wire::WireId::wire(object),
             code,
             message: message.into(),
         });
@@ -556,8 +610,8 @@ impl Context {
     /// Take what the message just dispatched produced (see [`Effects`]).
     pub(crate) fn take_effects(&mut self) -> Effects<'_> {
         Effects {
-            to_host: self.client_to_host_queue.drain(..),
-            to_guest: self.host_to_client_queue.drain(..),
+            to_host: self.to_host.drain(..),
+            to_guest: self.to_guest.drain(..),
             end: self.session_end.take(),
             wait: self.fence_wait.take(),
         }
@@ -574,10 +628,32 @@ impl Context {
         self.session_end.is_some()
     }
 
+    /// The guest events the message being dispatched sends so far, for a
+    /// test that dispatches through a handler directly.
+    #[cfg(test)]
+    pub(crate) fn guest_queue_for_test(&self) -> &[ToGuest] {
+        &self.to_guest
+    }
+
+    /// The host requests the message being dispatched sends so far, for a
+    /// test that dispatches through a handler directly.
+    #[cfg(test)]
+    pub(crate) fn host_queue_for_test(&self) -> &[ToHost] {
+        &self.to_host
+    }
+
+    /// Forget what the messages dispatched so far send, for a test that
+    /// dispatches through a handler directly.
+    #[cfg(test)]
+    pub(crate) fn clear_queues_for_test(&mut self) {
+        self.to_guest.clear();
+        self.to_host.clear();
+    }
+
     /// Bind host object `id` as the internal `zaura_shell` at the vendored
     /// protocol's version, as the registry would.
     #[cfg(test)]
-    pub(crate) fn bind_aura_shell_for_test(&mut self, id: u32) {
+    pub(crate) fn bind_aura_shell_for_test(&mut self, id: HostId) {
         self.singletons.bind_for_test(Singleton::AuraShell, id);
     }
 
@@ -586,38 +662,36 @@ impl Context {
         std::mem::take(&mut self.post_dispatch)
     }
 
-    pub(crate) fn render_buffer_host_id(&self, guest_buffer_id: u32) -> Option<HostId> {
+    pub(crate) fn render_buffer_host_id(&self, guest_buffer_id: GuestId) -> Option<HostId> {
         self.shadow_table
             .get_host_id(guest_buffer_id)
-            .map(HostId)
             .filter(|host_id| self.render_buffers.contains(*host_id))
     }
 
     pub(crate) fn register_local_buffer(
         &mut self,
-        guest_buffer_id: u32,
-        host_buffer_id: u32,
+        guest_buffer_id: GuestId,
+        host_buffer_id: HostId,
         backing: BufferState,
     ) -> bool {
         debug_assert_eq!(
             self.shadow_table.get_host_id(guest_buffer_id),
             Some(host_buffer_id)
         );
-        self.render_buffers
-            .register_local(HostId(host_buffer_id), backing)
+        self.render_buffers.register_local(host_buffer_id, backing)
     }
 
     pub(crate) fn register_native_buffer(
         &mut self,
-        host_buffer_id: u32,
+        host_buffer_id: HostId,
         size: (i32, i32),
         sync_fds: Vec<OwnedFd>,
     ) -> bool {
         self.render_buffers
-            .register_native(HostId(host_buffer_id), size, sync_fds)
+            .register_native(host_buffer_id, size, sync_fds)
     }
 
-    pub(crate) fn local_buffer(&self, guest_buffer_id: u32) -> Option<&BufferState> {
+    pub(crate) fn local_buffer(&self, guest_buffer_id: GuestId) -> Option<&BufferState> {
         let host_id = self.render_buffer_host_id(guest_buffer_id)?;
         self.render_buffers.local_copy(host_id)
     }
@@ -650,7 +724,7 @@ impl Context {
     /// Create the state of guest `wl_surface` `surface`, as its
     /// `wl_compositor.create_surface` arrives. The state ends with the
     /// surface (see `forget_surface`).
-    pub(crate) fn create_surface(&mut self, surface: u32) {
+    pub(crate) fn create_surface(&mut self, surface: GuestId) {
         let previous = self.surfaces.insert(surface, SurfaceState::default());
         debug_assert!(previous.is_none(), "wl_surface {surface} created twice");
     }
@@ -658,14 +732,14 @@ impl Context {
     /// The state of the live guest `wl_surface` `surface`, or `None` if the
     /// proxy has lost it, which [`Self::missing_surface_state`] ends the
     /// session for.
-    pub(crate) fn surface_mut(&mut self, surface: u32) -> Option<&mut SurfaceState> {
+    pub(crate) fn surface_mut(&mut self, surface: GuestId) -> Option<&mut SurfaceState> {
         self.surfaces.get_mut(&surface)
     }
 
     /// The state of `surface`, created if a test sets it up without a
     /// `create_surface`.
     #[cfg(test)]
-    pub(crate) fn surface_for_test(&mut self, surface: u32) -> &mut SurfaceState {
+    pub(crate) fn surface_for_test(&mut self, surface: GuestId) -> &mut SurfaceState {
         self.surfaces.entry(surface).or_default()
     }
 
@@ -673,7 +747,7 @@ impl Context {
     /// internal divergence: every surface gets its state when it is
     /// created. A handler returns the [`Action::Drop`] this returns.
     #[must_use = "a handler returns the Action::Drop"]
-    pub(crate) fn missing_surface_state(&mut self, surface: u32) -> Action {
+    pub(crate) fn missing_surface_state(&mut self, surface: GuestId) -> Action {
         self.fail(format_args!("wl_surface {surface} has no state"))
     }
 
@@ -682,7 +756,7 @@ impl Context {
     /// See [`StalePixels`].
     pub(crate) fn stale_surface_pixels(
         &mut self,
-        surface: u32,
+        surface: GuestId,
         commit: &SurfaceCommit,
         mapping: &SurfaceMapping,
     ) {
@@ -704,11 +778,11 @@ impl Context {
     }
 
     /// Drop every host copy's relation to the destroyed `surface`.
-    pub(crate) fn forget_surface_buffer_copies(&mut self, surface: u32) {
+    pub(crate) fn forget_surface_buffer_copies(&mut self, surface: GuestId) {
         self.render_buffers.forget_surface(surface);
     }
 
-    pub(crate) fn buffer_dimensions(&self, guest_buffer_id: u32) -> Option<(i32, i32)> {
+    pub(crate) fn buffer_dimensions(&self, guest_buffer_id: GuestId) -> Option<(i32, i32)> {
         let host_id = self.render_buffer_host_id(guest_buffer_id)?;
         self.buffer_dimensions_for_host(host_id)
     }
@@ -717,37 +791,37 @@ impl Context {
         self.render_buffers.dimensions(host_id)
     }
 
-    pub(crate) fn native_buffer_sync_fds(&self, guest_buffer_id: u32) -> Option<&[OwnedFd]> {
+    pub(crate) fn native_buffer_sync_fds(&self, guest_buffer_id: GuestId) -> Option<&[OwnedFd]> {
         let host_id = self.render_buffer_host_id(guest_buffer_id)?;
         self.render_buffers.native_sync_fds(host_id)
     }
 
-    pub(crate) fn native_buffer_uses_implicit_sync(&self, guest_buffer_id: u32) -> bool {
+    pub(crate) fn native_buffer_uses_implicit_sync(&self, guest_buffer_id: GuestId) -> bool {
         self.render_buffer_host_id(guest_buffer_id)
             .is_some_and(|host_id| self.render_buffers.uses_implicit_sync_fallback(host_id))
     }
 
-    pub(crate) fn enable_native_buffer_implicit_sync(&mut self, guest_buffer_id: u32) -> bool {
+    pub(crate) fn enable_native_buffer_implicit_sync(&mut self, guest_buffer_id: GuestId) -> bool {
         let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
             return false;
         };
         self.render_buffers.enable_implicit_sync_fallback(host_id)
     }
 
-    pub(crate) fn host_buffer_use(&self, guest_buffer_id: u32) -> Option<RenderBufferUse> {
+    pub(crate) fn host_buffer_use(&self, guest_buffer_id: GuestId) -> Option<RenderBufferUse> {
         let host_id = self.render_buffer_host_id(guest_buffer_id)?;
         self.render_buffers.lifecycle(host_id)?.use_state().cloned()
     }
 
     #[cfg(test)]
-    pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: u32) -> bool {
+    pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: GuestId) -> bool {
         let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
             return false;
         };
         self.render_buffers.submit(host_id)
     }
 
-    pub(crate) fn mark_buffer_released(&mut self, guest_buffer_id: u32) -> bool {
+    pub(crate) fn mark_buffer_released(&mut self, guest_buffer_id: GuestId) -> bool {
         let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
             return false;
         };
@@ -756,7 +830,7 @@ impl Context {
 
     pub(crate) fn finish_surface_destroy_use(
         &mut self,
-        guest_buffer_id: u32,
+        guest_buffer_id: GuestId,
         has_other_current: bool,
     ) -> bool {
         let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
@@ -768,8 +842,8 @@ impl Context {
 
     pub(crate) fn finalize_surface_attachment(
         &mut self,
-        previous_guest_buffer: Option<u32>,
-        next_guest_buffer: Option<u32>,
+        previous_guest_buffer: Option<GuestId>,
+        next_guest_buffer: Option<GuestId>,
     ) -> bool {
         let resolve = |guest_buffer| match guest_buffer {
             Some(guest_id) => self.render_buffer_host_id(guest_id).map(Some),
@@ -784,7 +858,7 @@ impl Context {
         self.render_buffers.finalize_attachment(previous, next)
     }
 
-    pub(crate) fn mark_buffer_guest_destroyed(&mut self, guest_buffer_id: u32) -> bool {
+    pub(crate) fn mark_buffer_guest_destroyed(&mut self, guest_buffer_id: GuestId) -> bool {
         let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
             return false;
         };
@@ -798,7 +872,7 @@ impl Context {
     /// Every caller tracked the object as host-only and has not retired it,
     /// so a refusal means the proxy's ID bookkeeping diverged, which ends the
     /// session.
-    pub(crate) fn retire_destroyed_host_object(&mut self, host_id: u32) {
+    pub(crate) fn retire_destroyed_host_object(&mut self, host_id: HostId) {
         if !self.shadow_table.host_destroy_queued(host_id) {
             // Deep in object teardown: the session ends, and the loop
             // drops this message's effects whatever its handler returns.
@@ -817,10 +891,10 @@ impl Context {
     /// terminal lifecycle edge and the complete generation is removed now.
     pub(crate) fn complete_queued_buffer_destroy(
         &mut self,
-        guest_buffer_id: u32,
+        guest_buffer_id: GuestId,
         host_buffer_id: HostId,
     ) -> bool {
-        if self.shadow_table.get_host_id(guest_buffer_id) != Some(host_buffer_id.0) {
+        if self.shadow_table.get_host_id(guest_buffer_id) != Some(host_buffer_id) {
             return false;
         }
 
@@ -836,18 +910,18 @@ impl Context {
         render_buffer_ended
     }
 
-    pub(crate) fn buffer_is_submitted(&self, guest_buffer_id: u32) -> bool {
+    pub(crate) fn buffer_is_submitted(&self, guest_buffer_id: GuestId) -> bool {
         self.host_buffer_use(guest_buffer_id)
             .is_some_and(|use_state| use_state.is_awaiting_release())
     }
 
-    pub(crate) fn buffer_is_released(&self, guest_buffer_id: u32) -> bool {
+    pub(crate) fn buffer_is_released(&self, guest_buffer_id: GuestId) -> bool {
         self.host_buffer_use(guest_buffer_id) == Some(RenderBufferUse::Released)
     }
 
-    pub(crate) fn host_buffer_is_guest_destroyed(&self, host_buffer_id: u32) -> bool {
+    pub(crate) fn host_buffer_is_guest_destroyed(&self, host_buffer_id: HostId) -> bool {
         self.render_buffers
-            .lifecycle(HostId(host_buffer_id))
+            .lifecycle(host_buffer_id)
             .is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
     }
 
@@ -878,9 +952,8 @@ impl Context {
             keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),
             wheel_steps: crate::handler::pointer::WheelSteps::new(wheel),
-            last_sender_id: 0,
-            client_to_host_queue: Vec::new(),
-            host_to_client_queue: Vec::new(),
+            to_host: Vec::new(),
+            to_guest: Vec::new(),
             session_end: None,
             post_dispatch: Vec::new(),
             fence_wait: None,
@@ -902,18 +975,15 @@ impl Context {
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
             registries: BTreeMap::new(),
-            global_generations: BTreeMap::new(),
-            next_global_generation: 1,
-            removed_global_generations: BTreeMap::new(),
+            removed_globals: BTreeSet::new(),
             pending_params: BTreeMap::new(),
             used_dmabuf_params: BTreeSet::new(),
             synthetic_feedback_objects: BTreeMap::new(),
             synthetic_feedback_refresh_pending: BTreeSet::new(),
             dmabuf_capabilities: BTreeMap::new(),
-            host_dmabuf_generation: None,
             internal_callbacks: InternalCallbacks::default(),
             pending_dmabuf_globals: Vec::new(),
-            dmabuf_guest_generations: BTreeMap::new(),
+            dmabuf_factories: BTreeMap::new(),
             window_placement: WindowPlacement::connect(placement),
             outputs: OutputRegistry::default(),
             gtk_shells: BTreeMap::new(),
@@ -1049,6 +1119,7 @@ impl ConnectionFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::wayland::{wl_keyboard, wl_shm};
     use crate::protocols::Iface;
     use std::os::fd::OwnedFd;
 
@@ -1171,15 +1242,6 @@ mod tests {
     }
 
     #[test]
-    fn host_id_raw_round_trip() {
-        // Verify the typed constructor round-trips through the same inner u32.
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.last_sender_id = 99;
-        let hid = HostId::from_event_sender(&ctx);
-        assert_eq!(hid.0, 99);
-    }
-
-    #[test]
     fn context_drop_closes_queued_and_pending_fds() {
         use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
         use std::os::fd::AsRawFd;
@@ -1190,11 +1252,13 @@ mod tests {
         let [first, second, third, pending] = files.map(OwnedFd::from);
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.client_to_host_queue.push((Vec::new(), vec![first]));
-        ctx.host_to_client_queue
-            .push((Vec::new(), vec![second, third]));
+        let (guest, host) = (GuestId::for_test(5), HostId::for_test(5));
+        ctx.send_host(wl_shm::req::create_pool(host, host, first, 4));
+        for keymap in [second, third] {
+            ctx.send_guest(wl_keyboard::evt::keymap(guest, 1, keymap, 0));
+        }
         ctx.pending_params.insert(
-            7,
+            GuestId::for_test(7),
             vec![PendingParam {
                 fd: pending,
                 plane_idx: 0,
@@ -1222,7 +1286,7 @@ mod tests {
             current_buffer_transform: 0,
             viewport: None,
             pending: SurfacePending {
-                attachment: SurfaceAttachment::Attach(2),
+                attachment: SurfaceAttachment::Attach(GuestId::for_test(2)),
                 surface_damage: vec![SurfaceRect::new(1, 2, 3, 4)].into(),
                 buffer_damage: vec![BufferRect::new(5, 6, 7, 8)].into(),
                 buffer_scale: Some(2),
@@ -1236,12 +1300,15 @@ mod tests {
             logged_viewport_rule: false,
             new_host_copies: Default::default(),
         };
-        surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
+        surface.set_current_buffer_for_test(Some(GuestId::for_test(1)), Some((10, 20)));
 
         let commit = surface.prepare_commit();
 
-        assert_eq!(commit.attachment, SurfaceAttachment::Attach(2));
-        assert_eq!(commit.attached_buffer_id(), Some(2));
+        assert_eq!(
+            commit.attachment,
+            SurfaceAttachment::Attach(GuestId::for_test(2))
+        );
+        assert_eq!(commit.attached_buffer_id(), Some(GuestId::for_test(2)));
         assert!(commit.has_buffer_attach());
         assert!(commit.moves_buffer());
         assert!(!commit.has_invalid_fractional_viewport());
@@ -1293,7 +1360,7 @@ mod tests {
             logged_viewport_rule: false,
             new_host_copies: Default::default(),
         };
-        surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
+        surface.set_current_buffer_for_test(Some(GuestId::for_test(1)), Some((10, 20)));
         let before = surface.clone();
 
         let commit = surface.prepare_commit();
@@ -1308,7 +1375,7 @@ mod tests {
     fn surface_commit_detach_clears_committed_content_dimensions() {
         let mut surface = SurfaceState::default();
         surface.pending.attachment = SurfaceAttachment::Detach;
-        surface.set_current_buffer_for_test(Some(1), Some((100, 50)));
+        surface.set_current_buffer_for_test(Some(GuestId::for_test(1)), Some((100, 50)));
 
         let commit = surface.prepare_commit();
 
@@ -1320,17 +1387,17 @@ mod tests {
     #[test]
     fn content_snapshot_ignores_mismatched_destroy_generations() {
         let mut surface = SurfaceState::default();
-        surface.set_current_buffer_for_test(Some(7), Some((100, 50)));
+        surface.set_current_buffer_for_test(Some(GuestId::for_test(7)), Some((100, 50)));
 
-        surface.clear_buffer_references(8);
-        assert_eq!(surface.current_buffer_id(), Some(7));
+        surface.clear_buffer_references(GuestId::for_test(8));
+        assert_eq!(surface.current_buffer_id(), Some(GuestId::for_test(7)));
         assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
 
-        surface.clear_buffer_references(7);
+        surface.clear_buffer_references(GuestId::for_test(7));
         assert_eq!(surface.current_buffer_id(), None);
         assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
         assert!(
-            !surface.set_current_buffer_dimensions(7, Some((1, 1))),
+            !surface.set_current_buffer_dimensions(GuestId::for_test(7), Some((1, 1))),
             "a reused numeric ID must not mutate a dimensions-only old snapshot"
         );
         assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
@@ -1452,10 +1519,10 @@ mod tests {
     #[test]
     fn host_buffer_use_is_an_exclusive_phase() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let buffer = 20;
-        let host_buffer = 40;
+        let buffer = GuestId::for_test(20);
+        let host_buffer = HostId::for_test(40);
         ctx.shadow_table
-            .insert_paired_for_test(buffer, host_buffer, "wl_buffer");
+            .insert_paired_for_test(buffer, host_buffer, Iface::WlBuffer);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert_eq!(
@@ -1486,7 +1553,7 @@ mod tests {
         assert!(!ctx.buffer_is_submitted(buffer));
         assert!(!ctx.buffer_is_released(buffer));
         assert_eq!(
-            ctx.render_buffers.lifecycle(HostId(host_buffer)),
+            ctx.render_buffers.lifecycle(host_buffer),
             Some(RenderBufferLifecycle::GuestAlive(
                 RenderBufferUse::ReleaseOwed
             ))
@@ -1501,10 +1568,10 @@ mod tests {
     #[test]
     fn same_buffer_reattach_does_not_create_a_detached_use() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let buffer = 20;
-        let host_buffer = 40;
+        let buffer = GuestId::for_test(20);
+        let host_buffer = HostId::for_test(40);
         ctx.shadow_table
-            .insert_paired_for_test(buffer, host_buffer, "wl_buffer");
+            .insert_paired_for_test(buffer, host_buffer, Iface::WlBuffer);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1515,10 +1582,10 @@ mod tests {
     #[test]
     fn release_clears_the_detached_latch_before_a_new_submit() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let buffer = 20;
-        let host_buffer = 40;
+        let buffer = GuestId::for_test(20);
+        let host_buffer = HostId::for_test(40);
         ctx.shadow_table
-            .insert_paired_for_test(buffer, host_buffer, "wl_buffer");
+            .insert_paired_for_test(buffer, host_buffer, Iface::WlBuffer);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1537,24 +1604,22 @@ mod tests {
     #[test]
     fn failed_attachment_replacement_mutates_neither_buffer_generation() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let old = 20;
-        let old_host = 40;
-        let new = 21;
-        let new_host = 41;
+        let old = GuestId::for_test(20);
+        let old_host = HostId::for_test(40);
+        let new = GuestId::for_test(21);
+        let new_host = HostId::for_test(41);
         for (guest, host) in [(old, old_host), (new, new_host)] {
             ctx.shadow_table
-                .insert_paired_for_test(guest, host, "wl_buffer");
+                .insert_paired_for_test(guest, host, Iface::WlBuffer);
             assert!(ctx.register_native_buffer(host, (1, 1), Vec::new()));
         }
         assert!(ctx.mark_buffer_submitted(old));
-        assert!(ctx
-            .render_buffers
-            .mark_host_destroy_queued(HostId(new_host)));
+        assert!(ctx.render_buffers.mark_host_destroy_queued(new_host));
 
         assert!(!ctx.finalize_surface_attachment(Some(old), Some(new)));
         assert_eq!(ctx.host_buffer_use(old), Some(awaiting_release(false)));
         assert_eq!(
-            ctx.render_buffers.lifecycle(HostId(new_host)),
+            ctx.render_buffers.lifecycle(new_host),
             Some(RenderBufferLifecycle::HostDestroyQueued)
         );
     }
@@ -1579,7 +1644,7 @@ mod tests {
         ];
         let sequence_len = 6;
         let sequence_count = operations.len().pow(sequence_len);
-        let host_buffer = HostId(40);
+        let host_buffer = HostId::for_test(40);
 
         for mut encoded in 0..sequence_count {
             // Exercise the lifecycle reducer directly rather than building a
@@ -1639,7 +1704,7 @@ mod tests {
     /// only when nothing waits.
     #[test]
     fn render_buffer_registry_knows_whether_a_destroyed_buffer_waits() {
-        let (first, second) = (HostId(40), HostId(41));
+        let (first, second) = (HostId::for_test(40), HostId::for_test(41));
         let mut registry = RenderBufferRegistry::default();
         assert!(registry.register_native(first, (1, 1), Vec::new()));
         assert!(registry.register_native(second, (1, 1), Vec::new()));
@@ -1661,7 +1726,7 @@ mod tests {
 
     #[test]
     fn render_buffer_registry_rejects_duplicate_host_generation_without_mutation() {
-        let host_id = HostId(40);
+        let host_id = HostId::for_test(40);
         let mut registry = RenderBufferRegistry::default();
 
         assert!(registry.register_native(host_id, (16, 8), Vec::new()));
@@ -1678,12 +1743,12 @@ mod tests {
 
     #[test]
     fn surface_attachment_requires_both_exact_render_generations() {
-        let previous_guest = 20;
-        let previous_host = 40;
-        let next_guest = 21;
-        let next_host = 41;
-        let unregistered_guest = 22;
-        let unregistered_host = 42;
+        let previous_guest = GuestId::for_test(20);
+        let previous_host = HostId::for_test(40);
+        let next_guest = GuestId::for_test(21);
+        let next_host = HostId::for_test(41);
+        let unregistered_guest = GuestId::for_test(22);
+        let unregistered_host = HostId::for_test(42);
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         for (guest, host) in [
             (previous_guest, previous_host),
@@ -1691,7 +1756,7 @@ mod tests {
             (unregistered_guest, unregistered_host),
         ] {
             ctx.shadow_table
-                .insert_paired_for_test(guest, host, "wl_buffer");
+                .insert_paired_for_test(guest, host, Iface::WlBuffer);
         }
         assert!(ctx.register_native_buffer(previous_host, (1, 1), Vec::new()));
         assert!(ctx.register_native_buffer(next_host, (1, 1), Vec::new()));
@@ -1741,11 +1806,11 @@ mod tests {
         ];
         let sequence_len = 6;
         let sequence_count = operations.len().pow(sequence_len);
-        let host_id = 40;
+        let host_id = HostId::for_test(40);
 
         for mut encoded in 0..sequence_count {
             let mut registry = RenderBufferRegistry::default();
-            assert!(registry.register_native(HostId(host_id), (1, 1), Vec::new()));
+            assert!(registry.register_native(host_id, (1, 1), Vec::new()));
             let mut ownership = ModelOwnership::GuestAlive;
             let mut use_state = RenderBufferUse::NeverSubmitted;
 
@@ -1754,14 +1819,12 @@ mod tests {
                 encoded /= operations.len();
 
                 let actual_changed = match operation {
-                    Operation::Submit => registry.submit(HostId(host_id)),
-                    Operation::Release => registry.release(HostId(host_id)),
-                    Operation::Detach => registry.detach(HostId(host_id)),
-                    Operation::LastSurfaceDestroy => {
-                        registry.end_last_surface_use(HostId(host_id), false)
-                    }
-                    Operation::GuestDestroy => registry.mark_guest_destroyed(HostId(host_id)),
-                    Operation::HostDestroy => registry.mark_host_destroy_queued(HostId(host_id)),
+                    Operation::Submit => registry.submit(host_id),
+                    Operation::Release => registry.release(host_id),
+                    Operation::Detach => registry.detach(host_id),
+                    Operation::LastSurfaceDestroy => registry.end_last_surface_use(host_id, false),
+                    Operation::GuestDestroy => registry.mark_guest_destroyed(host_id),
+                    Operation::HostDestroy => registry.mark_host_destroy_queued(host_id),
                 };
                 let expected_changed = match (ownership, operation) {
                     (ModelOwnership::HostDestroyQueued, _) => false,
@@ -1816,9 +1879,9 @@ mod tests {
                 };
 
                 assert_eq!(actual_changed, expected_changed);
-                assert_eq!(registry.lifecycle(HostId(host_id)), Some(expected));
+                assert_eq!(registry.lifecycle(host_id), Some(expected));
                 assert_eq!(
-                    registry.dimensions(HostId(host_id)).is_some(),
+                    registry.dimensions(host_id).is_some(),
                     ownership != ModelOwnership::HostDestroyQueued
                 );
             }

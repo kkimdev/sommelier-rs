@@ -25,7 +25,8 @@ limitations under the License.
 use std::collections::BTreeMap;
 
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
-use crate::wire::{IndexedString, Outgoing};
+use crate::state::{GuestId, HostId};
+use crate::wire::{IndexedString, ToGuest, ToHost};
 
 mod exo_view;
 mod guest;
@@ -52,15 +53,15 @@ pub(crate) use step::{take_drops_for_test, Drops};
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TiId(pub u32);
+pub struct TiId(pub GuestId);
 
 /// A guest `wl_seat` ID, which may no longer name a live seat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SeatId(pub u32);
+pub struct SeatId(pub GuestId);
 
 /// A guest `wl_surface`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SurfaceId(pub u32);
+pub struct SurfaceId(pub GuestId);
 
 /// A host `wl_display.sync` the core waits for. The core numbers its own
 /// barriers and never reuses a number; the adapter keeps the one map from
@@ -72,7 +73,7 @@ pub struct BarrierToken(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostTi {
     /// The host `zwp_text_input_v1`.
-    pub v1: u32,
+    pub v1: HostId,
     /// The host `zcr_extended_text_input_v1`, at v11 or later: the adapter
     /// creates no text input without one.
     pub ext: HostExt,
@@ -80,9 +81,9 @@ pub struct HostTi {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostExt {
-    pub id: u32,
+    pub id: HostId,
     /// The host `zcr_text_input_extension_v1` it is created from.
-    pub manager: u32,
+    pub manager: HostId,
 }
 
 /// One message the core handles. Every trigger of an IME change is one of
@@ -97,7 +98,7 @@ pub enum Input {
         ti: TiId,
         seat: SeatId,
         host: HostTi,
-        manager: u32,
+        manager: HostId,
     },
     Enable(TiId),
     Disable(TiId),
@@ -116,7 +117,7 @@ pub enum Input {
     HostLeave(TiId),
     V1(TiId, HostIme),
     Ext {
-        ext: u32,
+        ext: HostId,
         event: Edit,
     },
     BarrierDone(BarrierToken),
@@ -131,7 +132,7 @@ pub enum Input {
     FocusChanged {
         seat: SeatId,
         surface: Option<SurfaceId>,
-        keyboard: Vec<Outgoing>,
+        keyboard: Vec<ToGuest>,
     },
     /// F2: the guest destroyed `surface`, before the `FocusChanged`s its
     /// destruction caused, which then find its fields reset.
@@ -143,7 +144,7 @@ pub enum Input {
     /// transaction if the press ends a composition.
     Press {
         surface: SurfaceId,
-        resend: Outgoing,
+        resend: ToGuest,
     },
     /// The keyboard concern forwarded a key press or repeat to the guest on
     /// this seat, which may edit the guest's text where Exo does not see.
@@ -156,7 +157,7 @@ pub enum Input {
     /// the confirmation under the serial of now.
     HeldKeyRecovered {
         ti: TiId,
-        pair: Vec<Outgoing>,
+        pair: Vec<ToGuest>,
     },
 }
 
@@ -261,7 +262,7 @@ pub struct Effects {
     /// Guest events. Every IME transaction ends with its `done`. A press
     /// that ended a composition (F4) is re-sent here, after its
     /// transaction, and so are the keyboard events of a focus change (F1).
-    pub to_guest: Vec<Outgoing>,
+    pub to_guest: Vec<ToGuest>,
     /// Host requests and barriers.
     pub to_host: Vec<HostOut>,
     /// Requests to the keyboard concern, applied after `to_guest` and `to_host`.
@@ -274,7 +275,7 @@ pub struct Effects {
 
 #[derive(Debug)]
 pub enum HostOut {
-    Request(Outgoing),
+    Request(ToHost),
     /// Queue a host `wl_display.sync` here. Its `done` comes back as
     /// [`Input::BarrierDone`].
     Barrier(BarrierToken),
@@ -282,14 +283,14 @@ pub enum HostOut {
     /// submission, which Exo dispatches in one read, so that no event of
     /// Exo's falls between them.
     Glued {
-        request: Outgoing,
+        request: ToHost,
         barrier: BarrierToken,
     },
     /// `request`, the destructor of host object `id`, which is then
     /// retired.
     Destroy {
-        request: Outgoing,
-        id: u32,
+        request: ToHost,
+        id: HostId,
     },
 }
 
@@ -341,10 +342,10 @@ pub enum KeyEffect {
 /// (R1), and an attached link with a dead seat is legal until then (I1b).
 pub trait Env {
     /// The host ID of a live guest surface.
-    fn host_surface(&self, surface: SurfaceId) -> Option<u32>;
+    fn host_surface(&self, surface: SurfaceId) -> Option<HostId>;
     /// The host `wl_seat` this guest ID can carry, while it names a live
     /// `wl_seat`.
-    fn host_seat(&self, seat: SeatId) -> Option<u32>;
+    fn host_seat(&self, seat: SeatId) -> Option<HostId>;
     /// The surface the seat's keyboard focuses now.
     fn keyboard_focus(&self, seat: SeatId) -> Option<SurfaceId>;
 }
@@ -368,7 +369,7 @@ impl ImeCore {
     }
 
     /// The text input whose host extension is `ext`.
-    fn by_ext(&self, ext: u32) -> Option<TiId> {
+    fn by_ext(&self, ext: HostId) -> Option<TiId> {
         let mut inputs = self.inputs.iter();
         inputs.find_map(|(&ti, t)| (t.host().ext.id == ext).then_some(ti))
     }
@@ -415,7 +416,7 @@ impl ImeCore {
     /// or matched by an ambiguous report), fits one or more.
     pub(crate) fn mirror_differs_for_test(
         &self,
-        v1: u32,
+        v1: HostId,
         predicted: &StateForTest,
         history: &[StateForTest],
     ) -> Option<String> {

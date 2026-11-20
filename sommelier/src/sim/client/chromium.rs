@@ -191,7 +191,7 @@ impl Chromium {
     }
 
     /// `commit`, counted (`ZwpTextInputV3Impl::Commit`).
-    fn commit(&mut self) -> Outgoing {
+    fn commit(&mut self) -> Outgoing<u32> {
         self.commits = self.commits.wrapping_add(1);
         req::commit(self.text_input())
     }
@@ -208,7 +208,7 @@ impl Chromium {
     /// C2: `enable` is not gated. It forgets what was sent, held and
     /// applied, then sends the content type, the text and caret it was
     /// last given, if any, and a `commit` (`ZwpTextInputV3Impl::Enable`).
-    fn enable(&mut self, now: Micros, field: usize) -> Vec<Outgoing> {
+    fn enable(&mut self, now: Micros, field: usize) -> Vec<Outgoing<u32>> {
         self.client = Some(field);
         self.reset_text_input(now);
         let ti = self.text_input();
@@ -226,7 +226,7 @@ impl Chromium {
 
     /// C2: `disable` is not gated either; it drops what was held
     /// (`ZwpTextInputV3Impl::Disable`).
-    fn disable(&mut self, now: Micros) -> Vec<Outgoing> {
+    fn disable(&mut self, now: Micros) -> Vec<Outgoing<u32>> {
         self.pending = ImeData::default();
         self.discard(now, DropReason::DiscardedByDisable);
         vec![req::disable(self.text_input()), self.commit()]
@@ -234,7 +234,7 @@ impl Chromium {
 
     /// Enables or disables the text input for each window whose focus or
     /// text-input focus changed (`MaybeUpdateActivated`).
-    fn update_activation(&mut self, now: Micros) -> Vec<Outgoing> {
+    fn update_activation(&mut self, now: Micros) -> Vec<Outgoing<u32>> {
         let mut out = Vec::new();
         for field in 0..self.windows.len() {
             let window = &mut self.windows[field];
@@ -256,7 +256,7 @@ impl Chromium {
     /// C1: sends what is held, then one `commit`, only once a `done` has
     /// named the last commit (`SendPendingImeData`,
     /// `DoneSerialEqualsCommitCount`).
-    fn flush(&mut self) -> Vec<Outgoing> {
+    fn flush(&mut self) -> Vec<Outgoing<u32>> {
         if self.last_done != self.commits {
             return Vec::new();
         }
@@ -277,7 +277,7 @@ impl Chromium {
 
     /// The caret: held unless it is what was sent, then sent if it may be
     /// (`SetCursorRect`).
-    fn set_rect(&mut self, rect: [i32; 4]) -> Vec<Outgoing> {
+    fn set_rect(&mut self, rect: [i32; 4]) -> Vec<Outgoing<u32>> {
         self.latest.rect = Some(rect);
         if self.committed.rect == Some(rect) {
             return Vec::new();
@@ -289,7 +289,7 @@ impl Chromium {
     /// The text: held unless it is what was sent, then sent if it may be
     /// (`SetSurroundingText`). As in Chromium, a text equal to what was
     /// sent leaves an older held one in place.
-    fn set_surrounding(&mut self, model: &TextModel) -> Vec<Outgoing> {
+    fn set_surrounding(&mut self, model: &TextModel) -> Vec<Outgoing<u32>> {
         let surrounding = Some((model.text.clone(), model.cursor));
         self.latest.surrounding.clone_from(&surrounding);
         if self.committed.surrounding == surrounding {
@@ -307,7 +307,7 @@ impl Chromium {
     /// which also resets the prediction to it
     /// (`InputMethodAuraLinux::OnCaretBoundsChanged`,
     /// `SurroundingTextTracker::Update`). Each sends at once if it may.
-    fn report(&mut self, field: usize) -> Vec<Outgoing> {
+    fn report(&mut self, field: usize) -> Vec<Outgoing<u32>> {
         if !self.windows[field].focused {
             return Vec::new();
         }
@@ -344,7 +344,7 @@ impl Chromium {
     /// `UpdateContextFocusState`, `WaylandInputMethodContext::UpdateFocus`).
     /// Blink then finishes the composition, keeping its text
     /// (`WebViewImpl::SetPageFocus`), which the window does not report.
-    fn blur(&mut self, now: Micros, field: usize) -> Vec<Outgoing> {
+    fn blur(&mut self, now: Micros, field: usize) -> Vec<Outgoing<u32>> {
         let composing = !self.fields[field].model.preedit.is_empty();
         self.reset_context(now, field, composing);
         let window = &mut self.windows[field];
@@ -359,7 +359,7 @@ impl Chromium {
     /// `field`'s window gains the keyboard focus: the text input forgets
     /// what it was given and may enable, then the window reports
     /// (`InputMethodAuraLinux::OnDidChangeFocusedClient`).
-    fn focus(&mut self, now: Micros, field: usize) -> Vec<Outgoing> {
+    fn focus(&mut self, now: Micros, field: usize) -> Vec<Outgoing<u32>> {
         let window = &mut self.windows[field];
         window.focused = true;
         window.reported = None;
@@ -374,7 +374,7 @@ impl Chromium {
     /// (`RenderWidgetHostViewEventHandler::FinishImeCompositionSession`,
     /// `InputMethodAuraLinux::CancelComposition`). The cursor then moves
     /// and the window reports. It never enables (C2).
-    fn click(&mut self, now: Micros, field: usize, at: Target) -> Vec<Outgoing> {
+    fn click(&mut self, now: Micros, field: usize, at: Target) -> Vec<Outgoing<u32>> {
         let model = &mut self.fields[field].model;
         let composing = !model.preedit.is_empty();
         confirm(model);
@@ -392,7 +392,7 @@ impl Chromium {
     /// applies what it takes. The text input then reports the predicted
     /// text and sends what it holds (`OnInputEventsApplied`,
     /// `SendPredictedSurroundingText`), and the window reports.
-    fn done(&mut self, now: Micros, serial: u32) -> Vec<Outgoing> {
+    fn done(&mut self, now: Micros, serial: u32) -> Vec<Outgoing<u32>> {
         self.last_done = serial;
         let Some(field) = self.client else {
             return Vec::new();
@@ -502,7 +502,7 @@ impl Client for Chromium {
         &self.drops
     }
 
-    fn keyboard_focus(&mut self, now: Micros, surface: Option<u32>) -> Vec<Outgoing> {
+    fn keyboard_focus(&mut self, now: Micros, surface: Option<u32>) -> Vec<Outgoing<u32>> {
         let focus = match surface {
             // The keys that follow an enter that crossed the client's
             // destroy of its surface go nowhere.
@@ -532,7 +532,7 @@ impl Client for Chromium {
 
     /// C2: `enter` and `leave` change which window may be enabled
     /// (`OnTextInputFocusChanged`). Other events wait for `done`.
-    fn event(&mut self, now: Micros, event: Event) -> Vec<Outgoing> {
+    fn event(&mut self, now: Micros, event: Event) -> Vec<Outgoing<u32>> {
         self.protocol.check(&event, self.commits);
         match event {
             Event::Enter { .. } | Event::Leave { .. } => return self.update_activation(now),
@@ -559,7 +559,7 @@ impl Client for Chromium {
     /// (`InputMethodAuraLinux::DispatchKeyEvent`). A key whose propagation
     /// an accelerator stops resets the input method; no key the simulation
     /// types is one.
-    fn key(&mut self, _now: Micros, key: Key) -> Vec<Outgoing> {
+    fn key(&mut self, _now: Micros, key: Key) -> Vec<Outgoing<u32>> {
         let Some(field) = self.keyboard else {
             assert!(
                 self.protocol.closed,
@@ -578,7 +578,13 @@ impl Client for Chromium {
 
     /// A mouse press clicks at once; a touch clicks when it lifts as a tap
     /// (`kGestureTap`), as the press path skips touch (`EF_FROM_TOUCH`).
-    fn press(&mut self, now: Micros, surface: u32, at: Target, kind: PressKind) -> Vec<Outgoing> {
+    fn press(
+        &mut self,
+        now: Micros,
+        surface: u32,
+        at: Target,
+        kind: PressKind,
+    ) -> Vec<Outgoing<u32>> {
         let Some(field) = self.protocol.field_on(&self.fields, surface) else {
             self.touch = None;
             return Vec::new();
@@ -593,7 +599,7 @@ impl Client for Chromium {
     }
 
     /// A lift that did not drag is a tap.
-    fn release(&mut self, now: Micros, dragged: bool) -> Vec<Outgoing> {
+    fn release(&mut self, now: Micros, dragged: bool) -> Vec<Outgoing<u32>> {
         match self.touch.take() {
             Some((field, at)) if !dragged => self.click(now, field, at),
             _ => Vec::new(),
@@ -602,7 +608,7 @@ impl Client for Chromium {
 
     /// The window blurs if it was focused, and opens again with a fresh
     /// input method context that predicts the field's text.
-    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing> {
+    fn reopen(&mut self, now: Micros, field: usize, surface: u32) -> Vec<Outgoing<u32>> {
         let focused = self.keyboard == Some(field);
         let out = match focused {
             true => self.keyboard_focus(now, None),

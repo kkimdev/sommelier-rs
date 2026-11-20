@@ -16,12 +16,12 @@ limitations under the License.
 
 use crate::handler::Handlers;
 use crate::protocols::wayland::wl_seat;
-use crate::state::{Context, PostDispatch};
+use crate::state::{Context, GuestId, PostDispatch, RequestSender};
 use crate::wire::Action;
 
 impl wl_seat::WlSeatHandler for Handlers {
-    fn on_get_keyboard(ctx: &mut Context, id: u32) -> Action {
-        let seat = ctx.last_sender_id;
+    fn on_get_keyboard(ctx: &mut Context, sender: RequestSender, id: GuestId) -> Action {
+        let seat = sender.guest;
         // The keyboard's record is keyed by its host ID, which the forward
         // maps. Its zcr_extended_keyboard_v1 is bound at its first enter
         // (`keyboard::ensure_extended_keyboard_bound`).
@@ -29,7 +29,7 @@ impl wl_seat::WlSeatHandler for Handlers {
         Action::Forward
     }
 
-    fn on_release(_ctx: &mut Context) -> Action {
+    fn on_release(_ctx: &mut Context, _sender: RequestSender) -> Action {
         // `wl_seat.release` destroys only this parent object. Existing
         // `wl_keyboard`, `wl_pointer`, and `wl_touch` children have their own
         // protocol lifetimes and remain usable until their respective

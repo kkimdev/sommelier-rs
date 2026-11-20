@@ -20,23 +20,22 @@ limitations under the License.
 
 use crate::handler::Handlers;
 use crate::protocols;
-use crate::state::{Context, HostId, SurfaceState};
+use crate::state::{Context, EventSender, GuestId, HostId, RequestSender, SurfaceState};
 use crate::wire::Action;
 use std::collections::BTreeMap;
 
 /// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
-pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) {
-    ctx.client_to_host_queue
-        .push(protocols::wayland::wl_buffer::req::destroy(host_id));
+pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: HostId) {
+    ctx.send_host(protocols::wayland::wl_buffer::req::destroy(host_id));
 }
 
-fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
+fn clear_surface_buffer_references(ctx: &mut Context, guest_id: GuestId) {
     for surface in ctx.surfaces.values_mut() {
         surface.clear_buffer_references(guest_id);
     }
 }
 
-fn record_host_buffer_release(ctx: &mut Context, guest_id: u32) {
+fn record_host_buffer_release(ctx: &mut Context, guest_id: GuestId) {
     if ctx.render_buffer_host_id(guest_id).is_some() && !ctx.mark_buffer_released(guest_id) {
         log::warn!(
             "Ignoring wl_buffer.release that no render use owes for guest {}",
@@ -45,13 +44,13 @@ fn record_host_buffer_release(ctx: &mut Context, guest_id: u32) {
     }
 }
 
-fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: u32, host_id: HostId) {
+fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: GuestId, host_id: HostId) {
     if !ctx.complete_queued_buffer_destroy(guest_id, host_id) {
         // Deep in buffer teardown: the session ends, and the loop drops this
         // message's effects whatever its handler returns.
         let _ = ctx.fail(format_args!(
             "Render buffer generation diverged while destroying guest {} host {}",
-            guest_id, host_id.0
+            guest_id, host_id
         ));
     }
 }
@@ -65,7 +64,7 @@ fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: u32, host_id: Ho
 /// surfaces, which allocates nothing: an attach, commit and release each
 /// ask, every frame.
 struct SurfaceBufferReferences<'a> {
-    surfaces: &'a BTreeMap<u32, SurfaceState>,
+    surfaces: &'a BTreeMap<GuestId, SurfaceState>,
 }
 
 impl<'a> SurfaceBufferReferences<'a> {
@@ -75,17 +74,17 @@ impl<'a> SurfaceBufferReferences<'a> {
         }
     }
 
-    fn contains(&self, guest_id: u32) -> bool {
+    fn contains(&self, guest_id: GuestId) -> bool {
         self.has_current(guest_id) || self.has_pending(guest_id)
     }
 
-    fn has_current(&self, guest_id: u32) -> bool {
+    fn has_current(&self, guest_id: GuestId) -> bool {
         self.surfaces
             .values()
             .any(|surface| surface.current_buffer_id() == Some(guest_id))
     }
 
-    fn has_pending(&self, guest_id: u32) -> bool {
+    fn has_pending(&self, guest_id: GuestId) -> bool {
         self.surfaces
             .values()
             .any(|surface| surface.pending.attachment.buffer_id() == Some(guest_id))
@@ -95,7 +94,7 @@ impl<'a> SurfaceBufferReferences<'a> {
 fn can_retire_deferred_buffer(
     ctx: &Context,
     references: &SurfaceBufferReferences,
-    guest_id: u32,
+    guest_id: GuestId,
 ) -> bool {
     (!references.contains(guest_id)
         || (ctx.buffer_is_released(guest_id) && !references.has_pending(guest_id)))
@@ -114,19 +113,19 @@ pub(crate) fn retire_eligible_buffers(ctx: &mut Context) {
         return;
     }
     let references = SurfaceBufferReferences::of(ctx);
-    let candidates: Vec<(u32, HostId)> = ctx
+    let candidates: Vec<(GuestId, HostId)> = ctx
         .render_buffer_lifecycles()
         .filter_map(|(host_id, lifecycle)| {
             if !lifecycle.is_guest_destroyed() {
                 return None;
             }
-            let guest_id = ctx.shadow_table.get_guest_id(host_id.0)?;
+            let guest_id = ctx.shadow_table.get_guest_id(host_id)?;
             can_retire_deferred_buffer(ctx, &references, guest_id).then_some((guest_id, host_id))
         })
         .collect();
 
     for (guest_id, host_id) in candidates {
-        queue_host_buffer_destroy(ctx, host_id.0);
+        queue_host_buffer_destroy(ctx, host_id);
         // Keep the guest↔host mapping and empty registry generation reserved
         // until wl_display.delete_id acknowledges the host destructor.
         // Server-created generations are removed immediately because neither
@@ -144,7 +143,7 @@ pub(crate) fn retire_eligible_buffers(ctx: &mut Context) {
 /// unresolved use.
 pub(crate) fn clear_buffer_uses_after_surface_destroy(
     ctx: &mut Context,
-    destroyed_surface_buffer: Option<u32>,
+    destroyed_surface_buffer: Option<GuestId>,
 ) {
     let Some(guest_id) = destroyed_surface_buffer else {
         return;
@@ -162,8 +161,8 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
 }
 
 impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
-    fn on_destroy(ctx: &mut Context) -> Action {
-        let guest_id = ctx.last_sender_id;
+    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Action {
+        let guest_id = sender.guest;
         let host_id = ctx.shadow_table.get_host_id(guest_id);
         // wl_surface.attach is forwarded immediately, while the submitted
         // phase starts only when the later wl_surface.commit is handled. A
@@ -192,14 +191,14 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
 
         if let Some(host_id) = host_id {
             queue_host_buffer_destroy(ctx, host_id);
-            retire_destroyed_buffer_mapping(ctx, guest_id, HostId(host_id));
+            retire_destroyed_buffer_mapping(ctx, guest_id, host_id);
         }
         clear_surface_buffer_references(ctx, guest_id);
         Action::Drop
     }
 
-    fn on_release(ctx: &mut Context) -> Action {
-        let host_id = ctx.last_sender_id;
+    fn on_release(ctx: &mut Context, sender: EventSender) -> Action {
+        let host_id = sender.host;
         let Some(guest_id) = ctx.shadow_table.get_guest_id(host_id) else {
             return Action::Drop;
         };
@@ -215,7 +214,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
             }
             record_host_buffer_release(ctx, guest_id);
             queue_host_buffer_destroy(ctx, host_id);
-            retire_destroyed_buffer_mapping(ctx, guest_id, HostId(host_id));
+            retire_destroyed_buffer_mapping(ctx, guest_id, host_id);
             clear_surface_buffer_references(ctx, guest_id);
             return Action::Drop;
         }
@@ -378,7 +377,7 @@ mod tests {
             if shown {
                 // Reads state no peer can observe: what the surface
                 // remembers of the content it shows.
-                let surface = &g.s.ctx().surfaces[&surface.id];
+                let surface = &g.s.ctx().surfaces[&surface.guest_id()];
                 assert_eq!(surface.current_buffer_id(), None, "{case}");
                 assert_eq!(
                     surface.current_buffer_dimensions(),

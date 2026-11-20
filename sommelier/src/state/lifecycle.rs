@@ -37,114 +37,115 @@ limitations under the License.
 //! the object; a `delete_id` runs it after, so a hook gets the object's
 //! interface and IDs and never looks up its own entry.
 
-use super::{Context, DeletedHostId, HostId, Link};
+use super::{Context, DeletedHostId, GuestId, HostId, Link};
 use crate::handler::{
     compositor, keyboard, linux_dmabuf, output, pointer, registry, shm, text_input,
 };
 use crate::protocols::wayland::wl_display;
 use crate::protocols::Iface;
-use crate::wire::WL_DISPLAY_ID;
+use crate::wire::WireId;
 
 impl Context {
-    /// The guest destroyed guest object `guest_id`; see
+    /// The guest destroyed guest object `guest`; see
     /// [`super::ShadowTable::guest_destroyed`].
-    pub(crate) fn guest_destroyed(&mut self, guest_id: u32) {
-        self.forget_live_paired(guest_id);
-        self.shadow_table.guest_destroyed(guest_id);
+    pub(crate) fn guest_destroyed(&mut self, guest: GuestId) {
+        self.forget_live_paired(guest);
+        self.shadow_table.guest_destroyed(guest);
     }
 
-    /// The guest destroyed guest object `guest_id` while the host still uses
+    /// The guest destroyed guest object `guest` while the host still uses
     /// its host object; see [`super::ShadowTable::guest_destroyed_in_use`].
-    pub(crate) fn guest_destroyed_in_use(&mut self, guest_id: u32) {
-        self.forget_live_paired(guest_id);
-        self.shadow_table.guest_destroyed_in_use(guest_id);
+    pub(crate) fn guest_destroyed_in_use(&mut self, guest: GuestId) {
+        self.forget_live_paired(guest);
+        self.shadow_table.guest_destroyed_in_use(guest);
     }
 
-    /// Guest object `guest_id` ended, and its host object stays; see
+    /// Guest object `guest` ended, and its host object stays; see
     /// [`super::ShadowTable::guest_ended_host_kept`].
-    pub(crate) fn guest_ended_host_kept(&mut self, guest_id: u32) -> bool {
-        self.forget_live_paired(guest_id);
-        self.shadow_table.guest_ended_host_kept(guest_id)
+    pub(crate) fn guest_ended_host_kept(&mut self, guest: GuestId) -> bool {
+        self.forget_live_paired(guest);
+        self.shadow_table.guest_ended_host_kept(guest)
     }
 
-    /// Guest object `guest_id` ended with its host object; see
+    /// Guest object `guest` ended with its host object; see
     /// [`super::ShadowTable::guest_ended_host_destroyed`].
-    pub(crate) fn guest_ended_host_destroyed(&mut self, guest_id: u32) {
-        self.forget_live_paired(guest_id);
-        self.shadow_table.guest_ended_host_destroyed(guest_id);
+    pub(crate) fn guest_ended_host_destroyed(&mut self, guest: GuestId) {
+        self.forget_live_paired(guest);
+        self.shadow_table.guest_ended_host_destroyed(guest);
     }
 
-    /// Local guest object `guest_id` ended: its destructor completed in the
+    /// Local guest object `guest` ended: its destructor completed in the
     /// proxy, which queues its `delete_id`, as its host would for a host
     /// object; see [`super::ShadowTable::local_destroyed`].
     ///
     /// # Returns
     ///
-    /// `false`, changing nothing, unless `guest_id` is a live local object.
-    pub(crate) fn local_destroyed(&mut self, guest_id: u32) -> bool {
-        if self.shadow_table.request_sender(guest_id) != Some(Link::Local) {
+    /// `false`, changing nothing, unless `guest` is a live local object.
+    pub(crate) fn local_destroyed(&mut self, guest: GuestId) -> bool {
+        if self.shadow_table.link(guest) != Some(Link::Local) {
             return false;
         }
-        self.forget(guest_id, None);
-        let ended = self.shadow_table.local_destroyed(guest_id);
+        self.forget(guest, None);
+        let ended = self.shadow_table.local_destroyed(guest);
         debug_assert!(ended, "a live local object ends");
-        self.queue_delete_id(guest_id);
+        self.queue_delete_id(guest);
         true
     }
 
-    /// Queue the `wl_display.delete_id` that ends guest object `guest_id`,
-    /// for an object whose host object cannot send it: one the proxy
+    /// Queue the `wl_display.delete_id` that ends guest object `guest`, for
+    /// an object whose host object cannot send it: one the proxy
     /// implements, or one backed by a host object without a destructor.
     /// The caller ends the object in the [`super::ShadowTable`] first.
-    pub(crate) fn queue_delete_id(&mut self, guest_id: u32) {
-        self.host_to_client_queue
-            .push(wl_display::evt::delete_id(WL_DISPLAY_ID, guest_id));
+    pub(crate) fn queue_delete_id(&mut self, guest: GuestId) {
+        // `delete_id` names the ended object as a `uint`, not as an object.
+        self.send_guest(wl_display::evt::delete_id(GuestId::DISPLAY, guest.wire()));
     }
 
-    /// Guest object `guest_id` never reached the host; see
+    /// Guest object `guest` never reached the host; see
     /// [`super::ShadowTable::abandon`].
-    pub(crate) fn abandon(&mut self, guest_id: u32) {
-        self.forget_live_paired(guest_id);
-        self.shadow_table.abandon(guest_id);
+    pub(crate) fn abandon(&mut self, guest: GuestId) {
+        self.forget_live_paired(guest);
+        self.shadow_table.abandon(guest);
     }
 
-    /// Apply the host's `wl_display.delete_id` for `host_id`; see
-    /// [`super::ShadowTable::release_deleted_host_id`].
+    /// Apply the host's `wl_display.delete_id` for `host_id`, a wire value;
+    /// see [`super::ShadowTable::release_deleted_host_id`].
     pub(crate) fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
         let interface = self
             .shadow_table
-            .get_guest_id(host_id)
+            .guest_named_by_host(host_id)
             .and_then(|guest| self.shadow_table.get_interface(guest));
         let deleted = self.shadow_table.release_deleted_host_id(host_id);
-        if let (
+        match deleted {
+            DeletedHostId::Ignored => {}
+            DeletedHostId::HostOnly { host } => forget_host_id(self, host),
             DeletedHostId::Paired {
+                host,
                 guest,
-                was_live: true,
-            },
-            Some(interface),
-        ) = (deleted, interface)
-        {
-            forget_object(self, interface, guest, Some(host_id), true);
-        }
-        if deleted != DeletedHostId::Ignored {
-            forget_host_id(self, HostId(host_id));
+                was_live,
+            } => {
+                if let (true, Some(interface)) = (was_live, interface) {
+                    forget_object(self, interface, guest, Some(host), true);
+                }
+                forget_host_id(self, host);
+            }
         }
         deleted
     }
 
-    /// Forget guest object `guest_id` if it is live and paired, the only
+    /// Forget guest object `guest` if it is live and paired, the only
     /// objects the paired transitions end: a local object keeps its state
     /// until it ends itself.
-    fn forget_live_paired(&mut self, guest_id: u32) {
-        if let Some(Link::Host(host_id)) = self.shadow_table.request_sender(guest_id) {
-            self.forget(guest_id, Some(host_id));
+    fn forget_live_paired(&mut self, guest: GuestId) {
+        if let Some(Link::Host(host)) = self.shadow_table.link(guest) {
+            self.forget(guest, Some(host));
         }
     }
 
-    /// Forget live guest object `guest_id`, paired with `host_id` or local.
-    fn forget(&mut self, guest_id: u32, host_id: Option<u32>) {
-        if let Some(interface) = self.shadow_table.get_interface(guest_id) {
-            forget_object(self, interface, guest_id, host_id, false);
+    /// Forget live guest object `guest`, paired with `host` or local.
+    fn forget(&mut self, guest: GuestId, host: Option<HostId>) {
+        if let Some(interface) = self.shadow_table.get_interface(guest) {
+            forget_object(self, interface, guest, host, false);
         }
     }
 }
@@ -164,15 +165,15 @@ impl Context {
 fn forget_object(
     ctx: &mut Context,
     interface: Iface,
-    guest: u32,
-    host: Option<u32>,
+    guest: GuestId,
+    host: Option<HostId>,
     host_deleted: bool,
 ) {
     match (interface, host) {
         (Iface::WlRegistry, Some(host)) => registry::forget_registry(ctx, host),
         (Iface::WlOutput, Some(host)) => output::forget_output(ctx, host),
-        (Iface::WlKeyboard, Some(host)) => keyboard::forget_keyboard(ctx, HostId(host)),
-        (Iface::WlPointer, Some(host)) => pointer::forget_pointer(ctx, HostId(host)),
+        (Iface::WlKeyboard, Some(host)) => keyboard::forget_keyboard(ctx, host),
+        (Iface::WlPointer, Some(host)) => pointer::forget_pointer(ctx, host),
         (Iface::WlSurface, Some(host)) => compositor::forget_surface(ctx, guest, host),
         // Local objects of these interfaces have no state.
         (
@@ -264,21 +265,21 @@ impl Context {
     /// are checked, against their keyboard's.
     pub(crate) fn assert_no_orphans(&self) {
         let table = &self.shadow_table;
-        let guest = |what: &str, id: u32, interface: Iface| {
+        let guest = |what: &str, id: GuestId, interface: Iface| {
             assert!(
-                table.request_object(id, interface).is_some(),
+                table.live_object(id, interface).is_some(),
                 "{what} outlived guest {interface} {id}"
             );
         };
-        let host = |what: &str, id: u32, interface: Iface| {
+        let host = |what: &str, id: HostId, interface: Iface| {
             assert!(
                 table
                     .get_guest_id(id)
-                    .is_some_and(|paired| table.request_object(paired, interface).is_some()),
+                    .is_some_and(|paired| table.live_object(paired, interface).is_some()),
                 "{what} outlived host {interface} {id}"
             );
         };
-        let host_only = |what: &str, id: u32, interface: Iface| {
+        let host_only = |what: &str, id: HostId, interface: Iface| {
             assert!(
                 table.get_host_interface(id) == Some(interface) && table.get_guest_id(id).is_none(),
                 "{what} outlived host-only {interface} {id}"
@@ -335,23 +336,19 @@ impl Context {
         // its host object and the guest one paired with it are all there is
         // to check; its extended keyboard is host-only.
         for (keyboard, record) in self.keys.keyboards().iter() {
-            host("keyboard record", keyboard.0, Iface::WlKeyboard);
+            host("keyboard record", keyboard, Iface::WlKeyboard);
             assert_eq!(
-                table.get_guest_id(keyboard.0),
+                table.get_guest_id(keyboard),
                 Some(record.guest),
                 "keyboard record {} names another guest keyboard",
-                keyboard.0
+                keyboard
             );
             if let Some(extended) = record.extended {
-                host_only(
-                    "extended keyboard",
-                    extended.0,
-                    Iface::ZcrExtendedKeyboardV1,
-                );
+                host_only("extended keyboard", extended, Iface::ZcrExtendedKeyboardV1);
             }
         }
         for keyboard in self.keys.key_state_keyboards() {
-            host("key generations", keyboard.0, Iface::WlKeyboard);
+            host("key generations", keyboard, Iface::WlKeyboard);
         }
         // A seat reference names the guest wl_seat that its keyboard or
         // text input was created from, and outlives that seat, whose ID the
@@ -361,13 +358,13 @@ impl Context {
         // must name it.
         let keyboard_seat = |keyboard: HostId| self.keys.keyboards().seat(keyboard);
         for (keyboard, focus) in self.keyboard_focus.focuses_for_test() {
-            host("keyboard focus", keyboard.0, Iface::WlKeyboard);
+            host("keyboard focus", keyboard, Iface::WlKeyboard);
             guest("keyboard focus", focus.guest_surface, Iface::WlSurface);
             assert_eq!(
                 keyboard_seat(keyboard),
                 Some(focus.guest_seat),
                 "keyboard focus names a seat other than keyboard {}'s",
-                keyboard.0
+                keyboard
             );
         }
         for (seat, surface, keyboard) in self.keys.peek_watermarks() {
@@ -378,20 +375,20 @@ impl Context {
                 keyboard_seat(keyboard),
                 Some(seat),
                 "peek watermark names a seat other than keyboard {}'s",
-                keyboard.0
+                keyboard
             );
         }
         if let Some((text_input, keyboard, host_keyboard)) = self.keys.recovery_objects() {
             guest("pending recovery", text_input, Iface::ZwpTextInputV3);
             guest("pending recovery", keyboard, Iface::WlKeyboard);
-            host("pending recovery", host_keyboard.0, Iface::WlKeyboard);
+            host("pending recovery", host_keyboard, Iface::WlKeyboard);
         }
         for (pointer, surface) in self.pointer_focus.focuses_for_test() {
-            host("pointer focus", pointer.0, Iface::WlPointer);
+            host("pointer focus", pointer, Iface::WlPointer);
             guest("pointer focus", surface, Iface::WlSurface);
         }
         for pointer in self.wheel_steps.pointers_for_test() {
-            host("wheel steps", pointer.0, Iface::WlPointer);
+            host("wheel steps", pointer, Iface::WlPointer);
         }
         for (text_input, t) in self.ime.iter() {
             guest("text input state", text_input.0, Iface::ZwpTextInputV3);
@@ -422,27 +419,28 @@ impl Context {
         }
         for (buffer, _) in self.render_buffer_lifecycles() {
             assert!(
-                !table.is_host_id_available(buffer.0),
+                !table.is_host_id_available(buffer),
                 "render buffer outlived host ID {}",
-                buffer.0
+                buffer
             );
         }
         for (&params, create) in &self.pending_native_creates {
+            let live_guest_params = table.get_guest_id(params).filter(|&guest| {
+                table
+                    .live_object(guest, Iface::ZwpLinuxBufferParamsV1)
+                    .is_some()
+            });
             assert_eq!(
-                table.event_object(
-                    params.0,
-                    Iface::ZwpLinuxBufferParamsV1,
-                    "zwp_linux_buffer_params_v1.created"
-                ),
+                live_guest_params,
                 Some(create.guest_params_id),
                 "asynchronous dma-buf create outlived host params {}",
-                params.0
+                params
             );
         }
         for &params in self.pending_params.keys().chain(&self.used_dmabuf_params) {
             guest("dma-buf params", params, Iface::ZwpLinuxBufferParamsV1);
         }
-        for &factory in self.dmabuf_guest_generations.keys() {
+        for &factory in self.dmabuf_factories.keys() {
             guest("dma-buf factory", factory, Iface::ZwpLinuxDmabufV1);
         }
         for &feedback in self.synthetic_feedback_objects.keys() {
@@ -452,10 +450,10 @@ impl Context {
                 Iface::ZwpLinuxDmabufFeedbackV1,
             );
         }
-        for &generation in self.dmabuf_capabilities.keys() {
+        for &global in self.dmabuf_capabilities.keys() {
             assert!(
-                linux_dmabuf::capability_generation_held(self, generation),
-                "dma-buf capabilities outlived every hold on generation {generation}"
+                linux_dmabuf::capabilities_held(self, global),
+                "dma-buf capabilities outlived every hold on global {global}"
             );
         }
 
@@ -468,29 +466,19 @@ impl Context {
         for &registry in registries {
             host("registry globals", registry, Iface::WlRegistry);
         }
-        // A singleton candidate is a name a registry still lists.
+        // A singleton candidate is a name a registry still lists, and so
+        // is an advertised global whose removal a registry has seen: it
+        // retires with the last registry that lists it.
         for &name in self.singleton_candidates.keys() {
             assert!(
-                registry::global_still_seen(
-                    self,
-                    name,
-                    self.global_generations.get(&name).copied()
-                ),
+                registry::global_still_seen(self, name),
                 "singleton candidate {name} outlived every registry that lists it"
             );
         }
-        // A removal on record is of the global's current generation, and
-        // waits for a registry that still lists it; a global the proxy
-        // drops is in no registry's record.
-        for (&name, &generation) in &self.removed_global_generations {
-            assert_eq!(
-                self.global_generations.get(&name),
-                Some(&generation),
-                "removal of global {name} outlived its generation {generation}"
-            );
+        for &name in self.host_globals.keys() {
             assert!(
-                registry::global_still_seen(self, name, Some(generation)),
-                "removal of global {name} outlived every registry that lists it"
+                !self.removed_globals.contains(&name) || registry::global_still_seen(self, name),
+                "removed global {name} outlived every registry that lists it"
             );
         }
     }

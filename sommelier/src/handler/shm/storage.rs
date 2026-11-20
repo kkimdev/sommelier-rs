@@ -24,7 +24,7 @@ use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dm
 use crate::protocols::wayland::{wl_shm, wl_shm_pool};
 use crate::protocols::Iface;
 use crate::state::Singleton;
-use crate::state::{BufferState, Context, HostMapping, StalePixels};
+use crate::state::{BufferState, Context, GuestId, HostId, HostMapping, StalePixels};
 use crate::wire::Action;
 use log::{debug, error};
 use std::fs::File;
@@ -41,7 +41,7 @@ pub(super) enum ShmBacking {
     Shared(OwnedFd),
     /// A dma-buf the host imports through the internal `zwp_linux_dmabuf_v1`.
     Dmabuf {
-        host_dmabuf_id: u32,
+        host_dmabuf_id: HostId,
         allocation: DmabufAllocation,
     },
 }
@@ -53,13 +53,12 @@ pub(super) enum ShmBacking {
 /// proxy has no object to service it.  Wayland errors terminate the connection,
 /// which is the only safe outcome once allocation has failed.
 #[must_use = "a handler returns the Action::Drop"]
-fn reject_buffer_creation(ctx: &mut Context, object_id: u32, message: &'static str) -> Action {
+fn reject_buffer_creation(ctx: &mut Context, object_id: GuestId, message: &'static str) -> Action {
     ctx.reject(object_id, wl_shm::ERROR_INVALID_FD, message)
 }
 
-fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
-    ctx.client_to_host_queue
-        .push(zwp_linux_buffer_params_v1::req::destroy(params_id));
+fn queue_host_params_destroy(ctx: &mut Context, params_id: HostId) {
+    ctx.send_host(zwp_linux_buffer_params_v1::req::destroy(params_id));
     // Keep the numeric ID reserved until the host's wl_display.delete_id
     // acknowledgement arrives. The destroy request is ordered after all
     // already-queued params requests.
@@ -68,8 +67,8 @@ fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
 
 /// A `wl_shm_pool.create_buffer` request that passed protocol validation.
 pub(super) struct ShmBufferRequest {
-    pub(super) id: u32,
-    pub(super) pool_id: u32,
+    pub(super) id: GuestId,
+    pub(super) pool_id: GuestId,
     pub(super) pool_file: Arc<File>,
     pub(super) offset: i32,
     pub(super) width: i32,
@@ -328,7 +327,7 @@ pub(super) fn create_shared_buffer(
     let host_buffer_id = ctx
         .shadow_table
         .create_paired(request.id, Iface::WlBuffer, 1, 1);
-    ctx.client_to_host_queue.extend([
+    ctx.send_host_all([
         wl_shm::req::create_pool(host_wl_shm_id, host_pool_id, fd_to_send, buffer_size),
         // The buffer starts the pool, and keeps its SHM (not DRM) format.
         wl_shm_pool::req::create_buffer(
@@ -361,7 +360,7 @@ pub(super) fn create_shared_buffer(
 pub(super) fn create_dmabuf_buffer(
     ctx: &mut Context,
     request: ShmBufferRequest,
-    host_dmabuf_id: u32,
+    host_dmabuf_id: HostId,
     allocation: DmabufAllocation,
 ) -> Action {
     let ShmBufferRequest {
@@ -417,48 +416,44 @@ pub(super) fn create_dmabuf_buffer(
     let params_id = ctx
         .shadow_table
         .create_host_only(Iface::ZwpLinuxBufferParamsV1, params_version);
-    ctx.client_to_host_queue
-        .push(zwp_linux_dmabuf_v1::req::create_params(
-            host_dmabuf_id,
-            params_id,
-        ));
+    ctx.send_host(zwp_linux_dmabuf_v1::req::create_params(
+        host_dmabuf_id,
+        params_id,
+    ));
     let (modifier_hi, modifier_lo) = ((modifier >> 32) as u32, modifier as u32);
     let plane0 = layout.plane0();
-    ctx.client_to_host_queue
-        .push(zwp_linux_buffer_params_v1::req::add(
+    ctx.send_host(zwp_linux_buffer_params_v1::req::add(
+        params_id,
+        fd_to_send,
+        0,
+        plane0.offset,
+        plane0.stride,
+        modifier_hi,
+        modifier_lo,
+    ));
+    if let Some((plane1, plane1_fd)) = plane1_add {
+        ctx.send_host(zwp_linux_buffer_params_v1::req::add(
             params_id,
-            fd_to_send,
-            0,
-            plane0.offset,
-            plane0.stride,
+            plane1_fd,
+            1,
+            plane1.offset,
+            plane1.stride,
             modifier_hi,
             modifier_lo,
         ));
-    if let Some((plane1, plane1_fd)) = plane1_add {
-        ctx.client_to_host_queue
-            .push(zwp_linux_buffer_params_v1::req::add(
-                params_id,
-                plane1_fd,
-                1,
-                plane1.offset,
-                plane1.stride,
-                modifier_hi,
-                modifier_lo,
-            ));
     }
 
     let host_buffer_id = ctx
         .shadow_table
         .create_paired(request.id, Iface::WlBuffer, 1, 1);
-    ctx.client_to_host_queue
-        .push(zwp_linux_buffer_params_v1::req::create_immed(
-            params_id,
-            host_buffer_id,
-            width,
-            height,
-            wl_shm_format_to_drm_format(format),
-            0,
-        ));
+    ctx.send_host(zwp_linux_buffer_params_v1::req::create_immed(
+        params_id,
+        host_buffer_id,
+        width,
+        height,
+        wl_shm_format_to_drm_format(format),
+        0,
+    ));
     // create_immed is processed before this destructor in the ordered
     // host stream. Reserve the params ID until wl_display.delete_id
     // acknowledges its destruction.
@@ -480,7 +475,7 @@ pub(super) fn create_dmabuf_buffer(
 fn register_shm_buffer(
     ctx: &mut Context,
     request: &ShmBufferRequest,
-    host_buffer_id: u32,
+    host_buffer_id: HostId,
     state: BufferState,
 ) -> Action {
     if !ctx.register_local_buffer(request.id, host_buffer_id, state) {
@@ -504,7 +499,7 @@ mod tests {
     use crate::protocols::Iface;
     use crate::proxy::harness::Session;
     use crate::state::Singleton;
-    use crate::state::{BufferState, Context, DamageRegion};
+    use crate::state::{BufferState, Context, DamageRegion, GuestId, HostId};
     use crate::test_support::counting::Counts;
     use crate::test_support::{decode, shm_pool_file};
     use crate::wire::{Action, WL_DISPLAY_ID};
@@ -600,8 +595,8 @@ mod tests {
                 .expect("a valid NV12 layout");
         let host_copy = shm_pool_file(&[0; 24]);
         let request = ShmBufferRequest {
-            id: 30,
-            pool_id: 20,
+            id: GuestId::for_test(30),
+            pool_id: GuestId::for_test(20),
             // The 2x2 Y plane, then the one row of the UV plane.
             pool_file: Arc::new(shm_pool_file(&[1, 2, 3, 4, 5, 6])),
             offset: 0,
@@ -627,12 +622,13 @@ mod tests {
         let senders = std::iter::once(zwp_linux_dmabuf_v1::NAME)
             .chain(std::iter::repeat(zwp_linux_buffer_params_v1::NAME));
         let planes: Vec<_> = ctx
-            .client_to_host_queue
+            .host_queue_for_test()
             .iter()
             .zip(senders)
-            .filter_map(|((message, fds), interface)| {
-                let mut fds = fds.iter().map(|fd| fd.try_clone().unwrap()).collect();
-                match decode(message, &mut fds, |msg| {
+            .filter_map(|(message, interface)| {
+                let fds = message.fds().iter();
+                let mut fds = fds.map(|fd| fd.try_clone().unwrap()).collect();
+                match decode(message.bytes(), &mut fds, |msg| {
                     AnyRequest::from_wire(interface, msg)
                 }) {
                     Ok((
@@ -653,7 +649,10 @@ mod tests {
             .collect();
         assert_eq!(planes, [(0, 0, 4), (1, 16, 8)]);
 
-        copy_every_pixel(ctx.local_buffer(30).expect("the buffer's state"));
+        copy_every_pixel(
+            ctx.local_buffer(GuestId::for_test(30))
+                .expect("the buffer's state"),
+        );
         let mut pixels = [0; 24];
         host_copy.read_exact_at(&mut pixels, 0).unwrap();
         assert_eq!(
@@ -716,7 +715,10 @@ mod tests {
         };
         let (host_buffer, _) = received[1].1.new_object().expect("a host buffer");
         // The proxy's own wl_shm binding has no guest ID to compare with.
-        assert_eq!(Some(*host_shm), s.ctx().singletons.host(Singleton::Shm));
+        assert_eq!(
+            Some(HostId::for_test(*host_shm)),
+            s.ctx().singletons.host(Singleton::Shm)
+        );
         assert_eq!(*size, stride * height);
         let pool_size = nix::sys::stat::fstat(fd).expect("fstat the pool").st_size;
         assert_eq!(pool_size, i64::from(stride * height));
@@ -827,8 +829,11 @@ mod tests {
         // Reads state no peer can observe: the session has ended, and the
         // proxy keeps nothing of the buffer.
         let ctx = s.ctx();
-        assert_eq!(ctx.shadow_table.get_interface(buffer), None);
-        assert!(ctx.shadow_table.is_guest_id_available(buffer));
+        assert_eq!(
+            ctx.shadow_table.get_interface(GuestId::for_test(buffer)),
+            None
+        );
+        assert!(ctx.shadow_table.guest_new_id(buffer).is_some());
         assert_eq!(ctx.render_buffer_count(), 0);
     }
 
@@ -843,7 +848,7 @@ mod tests {
         // Injects a fault no peer can cause: render state already holds the
         // next two host IDs, which the next buffer's temporary pool and the
         // buffer itself take.
-        for host_id in [first.host + 1, first.host + 2] {
+        for host_id in [first.host + 1, first.host + 2].map(HostId::for_test) {
             assert!(s.ctx().register_native_buffer(host_id, (1, 1), Vec::new()));
         }
         let second = s.new_id();

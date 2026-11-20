@@ -86,7 +86,8 @@ pub fn in_own_process_with_env(
 
 /// `message` as a [`RawMessage`], which compares where owned descriptors
 /// do not. The descriptors close, so the returned numbers name nothing.
-pub fn raw_message((message, fds): Outgoing) -> RawMessage {
+pub fn raw_message<I>(message: Outgoing<I>) -> RawMessage {
+    let (message, fds) = message.into_parts();
     (message, fds.iter().map(AsRawFd::as_raw_fd).collect())
 }
 
@@ -95,7 +96,8 @@ pub fn raw_message((message, fds): Outgoing) -> RawMessage {
 /// is not UTF-8 or has a NUL inside. `bytes` is as long as `text`, so the
 /// framing holds. Only the first occurrence of `text` in the payload
 /// changes, so `text` must not be empty or appear earlier in it.
-pub fn respell((mut message, fds): Outgoing, text: &str, bytes: &[u8]) -> Outgoing {
+pub fn respell(message: Outgoing<u32>, text: &str, bytes: &[u8]) -> Outgoing<u32> {
+    let (mut message, fds) = message.into_parts();
     assert!(!text.is_empty(), "an empty text names no bytes to respell");
     assert_eq!(text.len(), bytes.len(), "a respelling keeps the length");
     let payload = &mut message[MessageHeader::LEN..];
@@ -104,12 +106,12 @@ pub fn respell((mut message, fds): Outgoing, text: &str, bytes: &[u8]) -> Outgoi
         .position(|window| window == text.as_bytes())
         .expect("the message carries the text");
     payload[at..at + bytes.len()].copy_from_slice(bytes);
-    (message, fds)
+    Outgoing::from_parts(message, fds)
 }
 
 /// A dispatch result whose message compares; see [`raw_message`].
-pub fn raw_dispatch(
-    result: Result<Option<Outgoing>, ProtocolError>,
+pub fn raw_dispatch<I>(
+    result: Result<Option<Outgoing<I>>, ProtocolError>,
 ) -> Result<Option<RawMessage>, ProtocolError> {
     result.map(|message| message.map(raw_message))
 }
@@ -120,12 +122,11 @@ pub fn raw_dispatch(
 pub fn dispatch_request(
     ctx: &mut crate::state::Context,
     msg: &mut WireMessage,
-) -> Result<Option<Outgoing>, ProtocolError> {
+) -> Result<Option<crate::wire::ToHost>, ProtocolError> {
     let sender = ctx
         .shadow_table
         .resolve_request(msg.sender_id)
         .ok_or(ProtocolError::InvalidSender(msg.sender_id))?;
-    ctx.last_sender_id = msg.sender_id;
     crate::protocols::dispatch_request::<crate::handler::Handlers>(sender, msg, ctx)
 }
 
@@ -145,10 +146,10 @@ pub fn msg_opcode(message: &[u8]) -> u16 {
 }
 
 /// The `(sender, opcode)` of every message in a proxy message queue.
-pub fn queued_headers(queue: &[crate::wire::Outgoing]) -> Vec<(u32, u16)> {
+pub fn queued_headers<I>(queue: &[Outgoing<I>]) -> Vec<(u32, u16)> {
     queue
         .iter()
-        .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
+        .map(|message| (msg_sender(message.bytes()), msg_opcode(message.bytes())))
         .collect()
 }
 
@@ -203,13 +204,14 @@ pub fn decode<M>(
 /// several messages gives each. The decoded descriptors are duplicates, so
 /// the queue keeps its own. Panics if a message does not decode whole, or
 /// leaves a descriptor unread.
-pub fn decoded<M>(
-    queue: &[Outgoing],
+pub fn decoded<I, M>(
+    queue: &[Outgoing<I>],
     decode: fn(&mut WireMessage) -> Result<M, ProtocolError>,
 ) -> Vec<(u32, M)> {
     queue
         .iter()
-        .flat_map(|(bytes, fds)| {
+        .flat_map(|message| {
+            let (bytes, fds) = (message.bytes(), message.fds());
             let mut fds: VecDeque<OwnedFd> = fds
                 .iter()
                 .map(|fd| fd.try_clone().expect("duplicate a queued descriptor"))
@@ -471,7 +473,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(queue[0].1.len(), 1, "the queue keeps its descriptors");
+        assert_eq!(queue[0].fds().len(), 1, "the queue keeps its descriptors");
         let other = shm_pool_file(b"keymap");
         assert_ne!(
             decoded(&queue[..1], wl_keyboard::Event::from_wire),
@@ -494,7 +496,7 @@ mod tests {
     fn decode_takes_one_whole_message_and_reads_all_of_it() {
         let decode_done =
             |message: &[u8]| decode(message, &mut VecDeque::new(), wl_callback::Event::from_wire);
-        let (done, _) = wl_callback::evt::done(3, 9);
+        let (done, _) = wl_callback::evt::done(3, 9).into_parts();
         assert_eq!(
             decode_done(&done),
             Ok((3, wl_callback::Event::Done { callback_data: 9 }))

@@ -22,8 +22,11 @@ use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
 use crate::protocols::wayland::{wl_display, wl_shm};
 use crate::protocols::Iface;
 use crate::state::Singleton;
-use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
-use crate::wire::{Action, MessageHeader, Outgoing, WL_DISPLAY_ID};
+use crate::state::{
+    Context, EventSender, GuestId, HostId, PendingNativeCreate, PendingParam, RequestObject,
+    RequestSender,
+};
+use crate::wire::{Action, MessageHeader, ToGuest};
 use log::{debug, error};
 use nix::sys::memfd::MFdFlags;
 use std::fs::File;
@@ -57,11 +60,13 @@ fn local_device_id(ctx: &Context) -> io::Result<Vec<u8>> {
     Ok(virtgpu.device_number()?.to_ne_bytes().to_vec())
 }
 
-fn feedback_pairs(ctx: &Context, generation: u64) -> Vec<(u32, u64)> {
+/// The format and modifier pairs of host linux-dmabuf global `global`
+/// that synthetic feedback offers.
+fn feedback_pairs(ctx: &Context, global: u32) -> Vec<(u32, u64)> {
     let mut pairs = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
-    if let Some(capabilities) = ctx.dmabuf_capabilities.get(&generation) {
+    if let Some(capabilities) = ctx.dmabuf_capabilities.get(&global) {
         for &(format, modifier) in &capabilities.format_modifiers {
             if is_supported_drm_format(format)
                 && seen.insert((format, modifier))
@@ -75,34 +80,40 @@ fn feedback_pairs(ctx: &Context, generation: u64) -> Vec<(u32, u64)> {
     pairs
 }
 
-pub(crate) fn has_synthetic_feedback_formats(ctx: &Context, generation: u64) -> bool {
-    !feedback_pairs(ctx, generation).is_empty()
+pub(crate) fn has_synthetic_feedback_formats(ctx: &Context, global: u32) -> bool {
+    !feedback_pairs(ctx, global).is_empty()
 }
 
-pub(crate) fn maybe_reclaim_capability_generation(ctx: &mut Context, generation: u64) {
-    if !capability_generation_held(ctx, generation) {
-        ctx.dmabuf_capabilities.remove(&generation);
+/// Drop the capabilities of host linux-dmabuf global `global` once nothing
+/// holds them ([`capabilities_held`]).
+pub(crate) fn maybe_reclaim_capabilities(ctx: &mut Context, global: u32) {
+    if !capabilities_held(ctx, global) {
+        ctx.dmabuf_capabilities.remove(&global);
     }
 }
 
-/// Whether anything still holds capability generation `generation`: the
-/// host's current global, a sync awaiting its formats, a guest factory or
-/// synthetic feedback, or a bind waiting for its formats.
-pub(crate) fn capability_generation_held(ctx: &Context, generation: u64) -> bool {
-    ctx.host_dmabuf_generation == Some(generation)
-        || ctx.internal_callbacks.awaits_dmabuf_generation(generation)
-        || ctx
-            .dmabuf_guest_generations
-            .values()
-            .any(|&value| value == generation)
+/// Whether anything still holds the capabilities of host linux-dmabuf
+/// global `global`: the proxy's binding of it, a sync awaiting its formats,
+/// a guest factory or synthetic feedback, or a guest global waiting for its
+/// formats.
+pub(crate) fn capabilities_held(ctx: &Context, global: u32) -> bool {
+    host_dmabuf_global(ctx) == Some(global)
+        || ctx.internal_callbacks.awaits_dmabuf_capabilities(global)
+        || ctx.dmabuf_factories.values().any(|&name| name == global)
         || ctx
             .synthetic_feedback_objects
             .values()
-            .any(|&value| value == generation)
+            .any(|&name| name == global)
         || ctx
             .pending_dmabuf_globals
             .iter()
-            .any(|pending| pending.generation == generation)
+            .any(|pending| pending.name == global)
+}
+
+/// The name of the host linux-dmabuf global the proxy has bound, whose
+/// capabilities its binding collects.
+fn host_dmabuf_global(ctx: &Context) -> Option<u32> {
+    Some(ctx.singletons.get(Singleton::Dmabuf)?.name)
 }
 
 fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(OwnedFd, u32)> {
@@ -137,10 +148,10 @@ fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(OwnedFd, u3
 }
 
 fn build_synthetic_feedback_messages(
-    guest_id: u32,
+    guest_id: GuestId,
     pairs: &[(u32, u64)],
     device: &[u8],
-) -> io::Result<Vec<Outgoing>> {
+) -> io::Result<Vec<ToGuest>> {
     let (table, table_size) = create_feedback_format_table(pairs)?;
     // Only the array-carrying events can exceed the wire limit. They are
     // built before the table's event takes its descriptor, so a failure
@@ -232,26 +243,27 @@ fn valid_dmabuf_plane(param: &PendingParam, format: u32, width: i32, height: i32
 #[must_use = "a handler returns the Action::Drop"]
 fn reject_unallocatable_feedback(ctx: &mut Context) -> Action {
     ctx.reject(
-        WL_DISPLAY_ID,
+        GuestId::DISPLAY,
         wl_display::ERROR_NO_MEMORY,
         "unable to allocate linux-dmabuf feedback",
     )
 }
 
-fn queue_synthetic_feedback(ctx: &mut Context, guest_id: u32, generation: u64) -> io::Result<()> {
-    let pairs = feedback_pairs(ctx, generation);
+fn queue_synthetic_feedback(ctx: &mut Context, guest_id: GuestId, global: u32) -> io::Result<()> {
+    let pairs = feedback_pairs(ctx, global);
     let device = local_device_id(ctx)?;
     let pending = build_synthetic_feedback_messages(guest_id, &pairs, &device)?;
 
     // Publish a complete sequence atomically. A client must never observe a
     // new format_table without the matching done event.
-    ctx.host_to_client_queue.extend(pending);
+    ctx.send_guest_all(pending);
     Ok(())
 }
 
-fn create_synthetic_feedback(ctx: &mut Context, guest_id: u32) -> Action {
-    let factory_id = ctx.last_sender_id;
-    let Some(generation) = ctx.dmabuf_guest_generations.get(&factory_id).copied() else {
+/// Create guest feedback `guest_id` of guest factory `factory_id`, which
+/// the proxy serves itself.
+fn create_synthetic_feedback(ctx: &mut Context, factory_id: GuestId, guest_id: GuestId) -> Action {
+    let Some(global) = ctx.dmabuf_factories.get(&factory_id).copied() else {
         // The factory interface declares no errors, and the client did
         // nothing wrong: the proxy lost its own bookkeeping.
         return ctx.fail(format_args!(
@@ -263,30 +275,25 @@ fn create_synthetic_feedback(ctx: &mut Context, guest_id: u32) -> Action {
         Iface::ZwpLinuxDmabufFeedbackV1,
         GUEST_DMABUF_VERSION,
     );
-    ctx.synthetic_feedback_objects.insert(guest_id, generation);
+    ctx.synthetic_feedback_objects.insert(guest_id, global);
     let ready = ctx
         .dmabuf_capabilities
-        .get(&generation)
+        .get(&global)
         .is_some_and(|capabilities| capabilities.ready);
     if ready {
-        if let Err(error) = queue_synthetic_feedback(ctx, guest_id, generation) {
-            log::error!(
-                "Failed to create synthetic dmabuf feedback for generation {}: {}",
-                generation,
-                error
-            );
+        if let Err(error) = queue_synthetic_feedback(ctx, guest_id, global) {
+            log::error!("Failed to create synthetic dmabuf feedback of global {global}: {error}");
             return reject_unallocatable_feedback(ctx);
         }
     }
     Action::Drop
 }
 
-pub(crate) fn complete_capability_discovery(ctx: &mut Context, generation: u64) {
-    let Some(capabilities) = ctx.dmabuf_capabilities.get_mut(&generation) else {
-        log::warn!(
-            "Ignoring linux-dmabuf capability callback for unknown generation {}",
-            generation
-        );
+/// Every capability of host linux-dmabuf global `global` has arrived:
+/// publish the guest globals and feedback that wait for them.
+pub(crate) fn complete_capability_discovery(ctx: &mut Context, global: u32) {
+    let Some(capabilities) = ctx.dmabuf_capabilities.get_mut(&global) else {
+        log::warn!("Ignoring linux-dmabuf capability callback for unknown global {global}");
         return;
     };
     if capabilities.ready {
@@ -294,22 +301,11 @@ pub(crate) fn complete_capability_discovery(ctx: &mut Context, generation: u64) 
     }
     capabilities.ready = true;
 
-    crate::handler::registry::publish_pending_dmabuf_globals(ctx, generation);
+    crate::handler::registry::publish_pending_dmabuf_globals(ctx, global);
 
-    let feedback_ids = ctx
-        .synthetic_feedback_objects
-        .iter()
-        .filter_map(|(&guest_id, &object_generation)| {
-            (object_generation == generation).then_some(guest_id)
-        })
-        .collect::<Vec<_>>();
-    for guest_id in feedback_ids {
-        if let Err(error) = queue_synthetic_feedback(ctx, guest_id, generation) {
-            log::error!(
-                "Failed to publish completed dmabuf feedback generation {}: {}",
-                generation,
-                error
-            );
+    for guest_id in feedback_of(ctx, global) {
+        if let Err(error) = queue_synthetic_feedback(ctx, guest_id, global) {
+            log::error!("Failed to publish completed dmabuf feedback of global {global}: {error}");
             // Deep in a wl_callback.done: the session ends, and the
             // loop drops this message's effects whatever its handler
             // returns.
@@ -319,25 +315,48 @@ pub(crate) fn complete_capability_discovery(ctx: &mut Context, generation: u64) 
     }
 }
 
-fn refresh_synthetic_feedbacks(ctx: &mut Context) {
-    let Some(generation) = ctx.host_dmabuf_generation else {
-        return;
+/// Record supported `format` with `modifier` if `sender` is the proxy's
+/// own linux-dmabuf binding, whose events reach no guest.
+///
+/// # Returns
+///
+/// Whether the sender is that binding.
+fn record_host_capability(ctx: &mut Context, sender: HostId, format: u32, modifier: u64) -> bool {
+    let Some(binding) = ctx.singletons.get(Singleton::Dmabuf) else {
+        return false;
     };
+    if sender != binding.host {
+        return false;
+    }
+    record_host_shm_drm_format(ctx, format);
+    let capabilities = ctx.dmabuf_capabilities.entry(binding.name).or_default();
+    if capabilities.format_modifiers.len() < MAX_FEEDBACK_FORMATS
+        && !capabilities.format_modifiers.contains(&(format, modifier))
+    {
+        capabilities.format_modifiers.push((format, modifier));
+        refresh_synthetic_feedbacks(ctx, binding.name);
+    }
+    true
+}
+
+/// The synthetic feedback objects that carry the capabilities of host
+/// linux-dmabuf global `global`, in order.
+fn feedback_of(ctx: &Context, global: u32) -> Vec<GuestId> {
+    ctx.synthetic_feedback_objects
+        .iter()
+        .filter_map(|(&guest_id, &name)| (name == global).then_some(guest_id))
+        .collect()
+}
+
+fn refresh_synthetic_feedbacks(ctx: &mut Context, global: u32) {
     if !ctx
         .dmabuf_capabilities
-        .get(&generation)
+        .get(&global)
         .is_some_and(|capabilities| capabilities.ready)
     {
         return;
     }
-    let feedback_ids = ctx
-        .synthetic_feedback_objects
-        .iter()
-        .filter_map(|(&guest_id, &object_generation)| {
-            (object_generation == generation).then_some(guest_id)
-        })
-        .collect::<Vec<_>>();
-    for guest_id in feedback_ids {
+    for guest_id in feedback_of(ctx, global) {
         // Legacy dmabuf capabilities arrive as one format event followed
         // by many modifier events. Queue at most one replacement per
         // proxy dispatch batch; otherwise every event creates another
@@ -346,12 +365,8 @@ fn refresh_synthetic_feedbacks(ctx: &mut Context) {
         if !ctx.synthetic_feedback_refresh_pending.insert(guest_id) {
             continue;
         }
-        if let Err(error) = queue_synthetic_feedback(ctx, guest_id, generation) {
-            log::error!(
-                "Failed to refresh synthetic dmabuf feedback generation {}: {}",
-                generation,
-                error
-            );
+        if let Err(error) = queue_synthetic_feedback(ctx, guest_id, global) {
+            log::error!("Failed to refresh synthetic dmabuf feedback of global {global}: {error}");
             ctx.synthetic_feedback_refresh_pending.remove(&guest_id);
             // Deep in a capability event: the session ends, and the
             // loop drops this message's effects whatever its handler
@@ -365,7 +380,7 @@ fn refresh_synthetic_feedbacks(ctx: &mut Context) {
 /// Queue the ADDs of params `params_id` and mark it used. Returns its
 /// host ID and the planes' synchronization descriptors, or the action
 /// a handler returns when it cannot.
-fn process_params(ctx: &mut Context, params_id: u32) -> Result<(HostId, Vec<OwnedFd>), Action> {
+fn process_params(ctx: &mut Context, params_id: GuestId) -> Result<(HostId, Vec<OwnedFd>), Action> {
     let params = ctx.pending_params.remove(&params_id).ok_or(Action::Drop)?;
     let Some(host_id) = ctx.shadow_table.get_host_id(params_id) else {
         // The guest request was valid when it entered the proxy, so a
@@ -402,22 +417,21 @@ fn process_params(ctx: &mut Context, params_id: u32) -> Result<(HostId, Vec<Owne
     // queues its CREATE right after.
     for param in params {
         // The guest's metadata, with `on_add`'s plane-0 fix-up.
-        ctx.client_to_host_queue
-            .push(zwp_linux_buffer_params_v1::req::add(
-                host_id,
-                param.fd,
-                param.plane_idx,
-                param.offset,
-                param.stride,
-                param.modifier_hi,
-                param.modifier_lo,
-            ));
+        ctx.send_host(zwp_linux_buffer_params_v1::req::add(
+            host_id,
+            param.fd,
+            param.plane_idx,
+            param.offset,
+            param.stride,
+            param.modifier_hi,
+            param.modifier_lo,
+        ));
     }
     ctx.used_dmabuf_params.insert(params_id);
-    Ok((HostId(host_id), sync_fds))
+    Ok((host_id, sync_fds))
 }
 
-fn valid_params(ctx: &Context, params_id: u32, width: i32, height: i32, format: u32) -> bool {
+fn valid_params(ctx: &Context, params_id: GuestId, width: i32, height: i32, format: u32) -> bool {
     if width <= 0 || height <= 0 || !is_supported_drm_format(format) {
         return false;
     }
@@ -438,7 +452,13 @@ fn valid_params(ctx: &Context, params_id: u32, width: i32, height: i32, format: 
     })
 }
 
-fn params_error_code(ctx: &Context, params_id: u32, width: i32, height: i32, format: u32) -> u32 {
+fn params_error_code(
+    ctx: &Context,
+    params_id: GuestId,
+    width: i32,
+    height: i32,
+    format: u32,
+) -> u32 {
     if width <= 0 || height <= 0 {
         return zwp_linux_buffer_params_v1::ERROR_INVALID_DIMENSIONS;
     }
@@ -468,20 +488,20 @@ fn params_error_code(ctx: &Context, params_id: u32, width: i32, height: i32, for
 }
 
 /// Forget guest `zwp_linux_dmabuf_v1` `factory_id`, which ended (see
-/// `crate::state::lifecycle`), and its hold on a capability generation.
-pub(crate) fn forget_factory(ctx: &mut Context, factory_id: u32) {
-    if let Some(generation) = ctx.dmabuf_guest_generations.remove(&factory_id) {
-        maybe_reclaim_capability_generation(ctx, generation);
+/// `crate::state::lifecycle`), and its hold on its global's capabilities.
+pub(crate) fn forget_factory(ctx: &mut Context, factory_id: GuestId) {
+    if let Some(global) = ctx.dmabuf_factories.remove(&factory_id) {
+        maybe_reclaim_capabilities(ctx, global);
     }
 }
 
 /// Forget synthetic guest `zwp_linux_dmabuf_feedback_v1` `feedback_id`,
-/// which ended (see `crate::state::lifecycle`), and its hold on a
-/// capability generation.
-pub(crate) fn forget_feedback(ctx: &mut Context, feedback_id: u32) {
-    if let Some(generation) = ctx.synthetic_feedback_objects.remove(&feedback_id) {
+/// which ended (see `crate::state::lifecycle`), and its hold on its
+/// global's capabilities.
+pub(crate) fn forget_feedback(ctx: &mut Context, feedback_id: GuestId) {
+    if let Some(global) = ctx.synthetic_feedback_objects.remove(&feedback_id) {
         ctx.synthetic_feedback_refresh_pending.remove(&feedback_id);
-        maybe_reclaim_capability_generation(ctx, generation);
+        maybe_reclaim_capabilities(ctx, global);
     }
 }
 
@@ -493,16 +513,16 @@ pub(crate) fn forget_feedback(ctx: &mut Context, feedback_id: u32) {
 /// the guest's pending destructor. Removing the pending generation of the
 /// host object `host_params_id` closes its synchronization descriptor
 /// immediately.
-pub(crate) fn forget_params(ctx: &mut Context, params_id: u32, host_params_id: Option<u32>) {
+pub(crate) fn forget_params(ctx: &mut Context, params_id: GuestId, host_params_id: Option<HostId>) {
     ctx.used_dmabuf_params.remove(&params_id);
     if let Some(host_params_id) = host_params_id {
-        ctx.pending_native_creates.remove(&HostId(host_params_id));
+        ctx.pending_native_creates.remove(&host_params_id);
     }
     ctx.pending_params.remove(&params_id);
 }
 
 impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
-    fn on_create_params(ctx: &mut Context, params_id: u32) -> Action {
+    fn on_create_params(ctx: &mut Context, _sender: RequestSender, params_id: GuestId) -> Action {
         ctx.used_dmabuf_params.remove(&params_id);
         // Reusing a params ID is a protocol violation; replacing the stale
         // planes closes their descriptors before the compositor reports it.
@@ -510,48 +530,32 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
         Action::Forward
     }
 
-    fn on_get_default_feedback(_ctx: &mut Context, _id: u32) -> Action {
-        create_synthetic_feedback(_ctx, _id)
+    fn on_get_default_feedback(ctx: &mut Context, sender: RequestSender, id: GuestId) -> Action {
+        create_synthetic_feedback(ctx, sender.guest, id)
     }
 
-    fn on_get_surface_feedback(ctx: &mut Context, id: u32, _surface: u32) -> Action {
-        create_synthetic_feedback(ctx, id)
+    fn on_get_surface_feedback(
+        ctx: &mut Context,
+        sender: RequestSender,
+        id: GuestId,
+        _surface: RequestObject,
+    ) -> Action {
+        create_synthetic_feedback(ctx, sender.guest, id)
     }
 
-    fn on_format(ctx: &mut Context, format: u32) -> Action {
+    fn on_format(ctx: &mut Context, sender: EventSender, format: u32) -> Action {
         if !is_supported_drm_format(format) {
             return Action::Drop;
         }
-        if let Some(internal_id) = ctx.singletons.host(Singleton::Dmabuf) {
-            if ctx.last_sender_id == internal_id {
-                record_host_shm_drm_format(ctx, format);
-                let mut changed = false;
-                if let Some(generation) = ctx.host_dmabuf_generation {
-                    let capabilities = ctx.dmabuf_capabilities.entry(generation).or_default();
-                    if capabilities.format_modifiers.len() < MAX_FEEDBACK_FORMATS
-                        && !capabilities
-                            .format_modifiers
-                            .contains(&(format, DRM_FORMAT_MOD_INVALID))
-                    {
-                        capabilities
-                            .format_modifiers
-                            .push((format, DRM_FORMAT_MOD_INVALID));
-                        changed = true;
-                    }
-                }
-                if changed {
-                    refresh_synthetic_feedbacks(ctx);
-                }
-                return Action::Drop;
-            }
+        if record_host_capability(ctx, sender.host, format, DRM_FORMAT_MOD_INVALID) {
+            return Action::Drop;
         }
 
         // A synthetic v4 factory is backed by a v3 host object so create_params
         // remains forwardable. Do not leak the host's deprecated legacy events
         // to a guest that bound the v4 contract.
-        if ctx
-            .shadow_table
-            .get_guest_id(ctx.last_sender_id)
+        if sender
+            .guest_id()
             .and_then(|guest_id| ctx.shadow_table.guest_object_version(guest_id))
             .is_some_and(|version| version >= zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_SINCE)
         {
@@ -565,7 +569,13 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
         Action::Forward
     }
 
-    fn on_modifier(ctx: &mut Context, format: u32, modifier_hi: u32, modifier_lo: u32) -> Action {
+    fn on_modifier(
+        ctx: &mut Context,
+        sender: EventSender,
+        format: u32,
+        modifier_hi: u32,
+        modifier_lo: u32,
+    ) -> Action {
         let modifier = ((modifier_hi as u64) << 32) | (modifier_lo as u64);
         debug!(
             "Host advertises format: {:#010x}, modifier: {:#018x}",
@@ -576,28 +586,11 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
         }
         // We forward supported modifiers to the guest. The modifier itself is
         // intentionally preserved; LINEAR (0) is a valid modifier.
-        if let Some(internal_id) = ctx.singletons.host(Singleton::Dmabuf) {
-            if ctx.last_sender_id == internal_id {
-                record_host_shm_drm_format(ctx, format);
-                let mut changed = false;
-                if let Some(generation) = ctx.host_dmabuf_generation {
-                    let capabilities = ctx.dmabuf_capabilities.entry(generation).or_default();
-                    if capabilities.format_modifiers.len() < MAX_FEEDBACK_FORMATS
-                        && !capabilities.format_modifiers.contains(&(format, modifier))
-                    {
-                        capabilities.format_modifiers.push((format, modifier));
-                        changed = true;
-                    }
-                }
-                if changed {
-                    refresh_synthetic_feedbacks(ctx);
-                }
-                return Action::Drop;
-            }
+        if record_host_capability(ctx, sender.host, format, modifier) {
+            return Action::Drop;
         }
-        if ctx
-            .shadow_table
-            .get_guest_id(ctx.last_sender_id)
+        if sender
+            .guest_id()
             .and_then(|guest_id| ctx.shadow_table.guest_object_version(guest_id))
             .is_some_and(|version| version >= zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_SINCE)
         {
@@ -614,7 +607,7 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
 /// host event of the interface can therefore arrive, and only the guest's
 /// destructor needs handling.
 impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for Handlers {
-    fn on_destroy(_ctx: &mut Context) -> Action {
+    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Action {
         // The generated dispatcher completes the local object's destructor
         // (see `forget_feedback`).
         Action::Drop
@@ -624,6 +617,7 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for Handlers 
 impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
     fn on_add(
         ctx: &mut Context,
+        sender: RequestSender,
         fd: BorrowedFd<'_>,
         plane_idx: u32,
         offset: u32,
@@ -631,7 +625,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
         modifier_hi: u32,
         modifier_lo: u32,
     ) -> Action {
-        let params_id = ctx.last_sender_id;
+        let params_id = sender.guest;
         if ctx.used_dmabuf_params.contains(&params_id) {
             return ctx.reject(
                 params_id,
@@ -705,8 +699,15 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
         Action::Drop
     }
 
-    fn on_create(ctx: &mut Context, width: i32, height: i32, format: u32, flags: u32) -> Action {
-        let params_id = ctx.last_sender_id;
+    fn on_create(
+        ctx: &mut Context,
+        sender: RequestSender,
+        width: i32,
+        height: i32,
+        format: u32,
+        flags: u32,
+    ) -> Action {
+        let params_id = sender.guest;
         if ctx.used_dmabuf_params.contains(&params_id) {
             return ctx.reject(
                 params_id,
@@ -731,14 +732,13 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
             Ok(params) => params,
             Err(action) => return action,
         };
-        ctx.client_to_host_queue
-            .push(zwp_linux_buffer_params_v1::req::create(
-                host_params_id.0,
-                width,
-                height,
-                format,
-                flags,
-            ));
+        ctx.send_host(zwp_linux_buffer_params_v1::req::create(
+            host_params_id,
+            width,
+            height,
+            format,
+            flags,
+        ));
         let pending = PendingNativeCreate {
             guest_params_id: params_id,
             dimensions: (width, height),
@@ -751,14 +751,14 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
             }
             std::collections::btree_map::Entry::Occupied(_) => ctx.fail(format_args!(
                 "Duplicate asynchronous dmabuf params host ID {}",
-                host_params_id.0
+                host_params_id
             )),
         }
     }
 
-    fn on_created(ctx: &mut Context, buffer: u32) -> Action {
-        let host_params_id = ctx.last_sender_id;
-        if let Some(guest_params_id) = ctx.shadow_table.get_guest_id(host_params_id) {
+    fn on_created(ctx: &mut Context, sender: EventSender, buffer: HostId) -> Action {
+        let host_params_id = sender.host;
+        if let Some(guest_params_id) = sender.guest_id() {
             let orphaned = ctx.shadow_table.is_pending_destroy_guest(guest_params_id);
             if orphaned {
                 // params.destroy may have been queued before the compositor
@@ -768,10 +768,10 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
                 // soon as it processes the destructor, so the proxy keeps
                 // nothing for it.
                 crate::handler::buffer::queue_host_buffer_destroy(ctx, buffer);
-                ctx.pending_native_creates.remove(&HostId(host_params_id));
+                ctx.pending_native_creates.remove(&host_params_id);
                 return Action::Drop;
             }
-            if let Some(pending) = ctx.pending_native_creates.remove(&HostId(host_params_id)) {
+            if let Some(pending) = ctx.pending_native_creates.remove(&host_params_id) {
                 if pending.guest_params_id != guest_params_id {
                     return ctx.fail(format_args!(
                         "Async dmabuf params generation diverged: host {} maps to guest {}, pending guest {}",
@@ -790,14 +790,14 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
         Action::Forward
     }
 
-    fn on_failed(ctx: &mut Context) -> Action {
-        let host_params_id = ctx.last_sender_id;
-        if let Some(guest_params_id) = ctx.shadow_table.get_guest_id(host_params_id) {
+    fn on_failed(ctx: &mut Context, sender: EventSender) -> Action {
+        let host_params_id = sender.host;
+        if let Some(guest_params_id) = sender.guest_id() {
             if ctx.shadow_table.is_pending_destroy_guest(guest_params_id) {
-                ctx.pending_native_creates.remove(&HostId(host_params_id));
+                ctx.pending_native_creates.remove(&host_params_id);
                 return Action::Drop;
             }
-            if let Some(pending) = ctx.pending_native_creates.remove(&HostId(host_params_id)) {
+            if let Some(pending) = ctx.pending_native_creates.remove(&host_params_id) {
                 if pending.guest_params_id != guest_params_id {
                     return ctx.fail(format_args!(
                         "Async dmabuf params generation diverged: host {} maps to guest {}, pending guest {}",
@@ -811,13 +811,14 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
 
     fn on_create_immed(
         ctx: &mut Context,
-        buffer_id: u32,
+        sender: RequestSender,
+        buffer_id: GuestId,
         width: i32,
         height: i32,
         format: u32,
         flags: u32,
     ) -> Action {
-        let params_id = ctx.last_sender_id;
+        let params_id = sender.guest;
         if ctx.used_dmabuf_params.contains(&params_id) {
             return ctx.reject(
                 params_id,
@@ -850,25 +851,23 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
             Err(action) => return action,
         };
         // The request is dropped and rebuilt here, so create the buffer the
-        // generated dispatcher would have created for it.
-        let Some(buffer_version) = ctx.shadow_table.guest_object_version(params_id) else {
-            return ctx.fail(format_args!("dma-buf params {params_id} have no version"));
-        };
+        // generated dispatcher would have created for it, which takes its
+        // parent's version.
+        let buffer_version = sender.version;
         let host_buffer_id = ctx.shadow_table.create_paired(
             buffer_id,
             Iface::WlBuffer,
             buffer_version,
             buffer_version,
         );
-        ctx.client_to_host_queue
-            .push(zwp_linux_buffer_params_v1::req::create_immed(
-                host_params_id.0,
-                host_buffer_id,
-                width,
-                height,
-                format,
-                flags,
-            ));
+        ctx.send_host(zwp_linux_buffer_params_v1::req::create_immed(
+            host_params_id,
+            host_buffer_id,
+            width,
+            height,
+            format,
+            flags,
+        ));
         if !ctx.register_native_buffer(host_buffer_id, (width, height), sync_fds) {
             return ctx.fail(format_args!(
                 "Duplicate render buffer host ID {host_buffer_id}"
@@ -892,9 +891,10 @@ mod tests {
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::wl_surface;
     use crate::protocols::wayland::{wl_buffer, wl_callback, wl_display, wl_registry, wl_shm};
+    use crate::protocols::Iface;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{Context, PlaneFenceForTest, SessionEnd};
+    use crate::state::{Context, GuestId, HostId, PlaneFenceForTest, SessionEnd};
     use crate::test_support::wire_peer::SERVER_ID_START;
     use crate::test_support::{any_fd_has_identity, decoded, fd_identity, msg_opcode, msg_sender};
     use crate::wire::{Action, MessageHeader, WL_DISPLAY_ID};
@@ -1101,7 +1101,7 @@ mod tests {
         assert_eq!(s.host_received(), [(dmabuf.internal, destroy.into())]);
     }
 
-    /// A capability snapshot lives while anything holds its generation:
+    /// A capability snapshot lives while anything holds its global:
     /// here a guest factory outlives the host's global, and the snapshot
     /// goes with the factory.
     #[tokio::test]
@@ -1122,7 +1122,7 @@ mod tests {
         // Reads state no peer can observe: the snapshots the proxy keeps.
         assert!(
             s.ctx().dmabuf_capabilities.is_empty(),
-            "an unreferenced removed generation must not accumulate forever"
+            "an unreferenced removed global's capabilities must not accumulate forever"
         );
     }
 
@@ -1130,12 +1130,15 @@ mod tests {
     fn synthetic_feedback_messages_are_atomic_sealed_and_protocol_ordered() {
         let pairs = [(XRGB8888, 0), (0x3432_5241, DRM_FORMAT_MOD_INVALID)];
         let device = 0x1234_5678_u64.to_ne_bytes();
-        let messages =
-            build_synthetic_feedback_messages(77, &pairs, &device).expect("feedback messages");
+        let messages = build_synthetic_feedback_messages(GuestId::for_test(77), &pairs, &device)
+            .expect("feedback messages");
 
         let headers = messages
             .iter()
-            .map(|(message, fds)| (msg_sender(message), msg_opcode(message), fds.len()))
+            .map(|message| {
+                let bytes = message.bytes();
+                (msg_sender(bytes), msg_opcode(bytes), message.fds().len())
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             headers,
@@ -1150,7 +1153,7 @@ mod tests {
             ]
         );
 
-        let table_fd = messages[0].1[0].as_raw_fd();
+        let table_fd = messages[0].fds()[0].as_raw_fd();
         let expected_seals =
             libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
         let seals = unsafe { libc::fcntl(table_fd, libc::F_GET_SEALS) };
@@ -1176,11 +1179,11 @@ mod tests {
         let pairs = (0..MAX_FEEDBACK_FORMATS)
             .map(|index| (XRGB8888, index as u64))
             .collect::<Vec<_>>();
-        let messages = build_synthetic_feedback_messages(77, &pairs, &[0; 8])
+        let messages = build_synthetic_feedback_messages(GuestId::for_test(77), &pairs, &[0; 8])
             .expect("maximum-size feedback should be representable");
         assert!(messages
             .iter()
-            .all(|(message, _)| message.len() <= MessageHeader::MAX_LEN));
+            .all(|message| message.bytes().len() <= MessageHeader::MAX_LEN));
         // The tranche_formats events together list every table index once,
         // in order.
         let indices = decoded(&messages, feedback::Event::from_wire)
@@ -1202,21 +1205,24 @@ mod tests {
 
     /// The guest asks `dmabuf`'s factory for its default feedback; returns
     /// the feedback.
-    fn get_default_feedback(s: &mut Session, dmabuf: &Factory) -> (u32, crate::wire::Outgoing) {
+    fn get_default_feedback(
+        s: &mut Session,
+        dmabuf: &Factory,
+    ) -> (u32, crate::wire::Outgoing<u32>) {
         let id = s.new_id();
         let request = zwp_linux_dmabuf_v1::req::get_default_feedback(dmabuf.factory.id, id);
         (id, request)
     }
 
-    /// A factory without a capability generation is the proxy's own
+    /// A factory without the global it was bound from is the proxy's own
     /// bookkeeping failure. `zwp_linux_dmabuf_v1` declares no errors, so the
     /// display reports it as an implementation error.
     #[tokio::test]
     async fn feedback_from_an_untracked_factory_is_an_implementation_error() {
         let (mut s, dmabuf) = feedback_session().await;
         // Injects a fault no peer can cause: the proxy loses the factory's
-        // capability generation.
-        s.ctx().dmabuf_guest_generations.clear();
+        // global.
+        s.ctx().dmabuf_factories.clear();
         let (_, request) = get_default_feedback(&mut s, &dmabuf);
         s.guest_fatal([request]).await;
         assert_eq!(
@@ -1303,14 +1309,14 @@ mod tests {
     /// only in a feedback's format table, which needs a virtio-gpu device
     /// no test has.
     #[test]
-    fn capability_snapshots_remain_isolated_by_global_generation() {
+    fn capability_snapshots_remain_isolated_by_global() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        for generation in [1, 2] {
+        for global in [1, 2] {
             ctx.dmabuf_capabilities
-                .entry(generation)
+                .entry(global)
                 .or_default()
                 .format_modifiers
-                .push((XRGB8888, generation));
+                .push((XRGB8888, global.into()));
         }
 
         assert_eq!(feedback_pairs(&ctx, 1), vec![(XRGB8888, 1)]);
@@ -1375,7 +1381,7 @@ mod tests {
         let params = params_with(&mut s, dmabuf.id, Vec::new()).await;
         // Injects a fault no peer can cause: the proxy loses the params'
         // planes, which `create_params` records.
-        s.ctx().pending_params.remove(&params.id);
+        s.ctx().pending_params.remove(&params.guest_id());
 
         let buffer = s.new_id();
         s.guest([req::create_immed(params.id, buffer, 16, 16, XRGB8888, 0)])
@@ -1384,6 +1390,7 @@ mod tests {
         assert_eq!(s.guest_received(), []);
         // Reads state no peer can observe: no host object stands for the
         // buffer.
+        let buffer = GuestId::for_test(buffer);
         assert_eq!(s.ctx().shadow_table.get_host_id(buffer), None);
     }
 
@@ -1438,7 +1445,8 @@ mod tests {
         );
         // Reads state no peer can observe: the size the proxy keeps for
         // the buffer.
-        assert_eq!(s.ctx().buffer_dimensions(buffer), Some((16, 8)));
+        let dimensions = s.ctx().buffer_dimensions(GuestId::for_test(buffer));
+        assert_eq!(dimensions, Some((16, 8)));
         let buffer = Object {
             id: buffer,
             host: host_buffer,
@@ -1484,8 +1492,14 @@ mod tests {
 
     fn a_plane_the_proxy_cannot_duplicate() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.pending_params.insert(7, Vec::new());
-        ctx.last_sender_id = 7;
+        let params = GuestId::for_test(7);
+        ctx.shadow_table.insert_paired_for_test(
+            params,
+            HostId::for_test(8),
+            Iface::ZwpLinuxBufferParamsV1,
+        );
+        ctx.pending_params.insert(params, Vec::new());
+        let sender = ctx.shadow_table.resolve_request(7).expect("the params");
         let plane = crate::test_support::shm_pool_file(&[]);
         let mut limit = libc::rlimit {
             rlim_cur: 0,
@@ -1505,12 +1519,12 @@ mod tests {
             unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) },
             0
         );
-        let action = Handlers::on_add(&mut ctx, plane.as_fd(), 0, 0, 64, 0, 0);
+        let action = Handlers::on_add(&mut ctx, sender, plane.as_fd(), 0, 0, 64, 0, 0);
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
 
         assert_eq!(action, Action::Drop);
         assert_eq!(ctx.session_end(), Some(&SessionEnd::Internal));
-        assert!(ctx.pending_params[&7].is_empty());
+        assert!(ctx.pending_params[&params].is_empty());
     }
 
     /// An `add` or `create` the params cannot take ends the session with
@@ -1627,7 +1641,7 @@ mod tests {
         // Reads state no peer can observe: the size the proxy keeps for
         // the buffer.
         assert_eq!(
-            s.ctx().buffer_dimensions(buffer.id),
+            s.ctx().buffer_dimensions(buffer.guest_id()),
             Some((16, 8)),
             "async create must retain dimensions until the host emits created"
         );

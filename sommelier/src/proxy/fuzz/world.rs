@@ -63,10 +63,10 @@ pub(super) struct World<'t> {
     choices: Choices,
     session: Session,
     host: Host,
-    c_to_p: Channel<Outgoing>,
+    c_to_p: Channel<Outgoing<u32>>,
     p_to_c: Channel<Note>,
     p_to_e: Channel<(u32, AnyRequest)>,
-    e_to_p: Channel<Outgoing>,
+    e_to_p: Channel<Outgoing<u32>>,
     /// The guest's submissions it has yet to send, and the roundtrip
     /// whose `done` it waits for before it sends more.
     stream: VecDeque<Submission>,
@@ -178,7 +178,7 @@ impl<'t> World<'t> {
                 0 => {
                     let submission = self.c_to_p.take();
                     if !self.ended {
-                        let (bytes, fds) = (submission.0.len(), submission.1.len());
+                        let (bytes, fds) = (submission.bytes().len(), submission.fds().len());
                         self.log(|| format!("C→P {bytes} bytes, {fds} fds"));
                         let goes_on = self.session.try_guest([submission]).await;
                         self.proxy_sent(goes_on);
@@ -218,7 +218,7 @@ impl<'t> World<'t> {
                 return;
             };
             self.awaiting = submission.then_await;
-            let sent = (submission.bytes, submission.fds);
+            let sent = Outgoing::from_parts(submission.bytes, submission.fds);
             self.c_to_p.send(self.now, sent, &mut self.choices);
         }
     }
@@ -269,7 +269,7 @@ impl<'t> World<'t> {
     }
 
     /// The host sends `events` on E→P.
-    fn host_sends(&mut self, events: Vec<Outgoing>) {
+    fn host_sends(&mut self, events: Vec<Outgoing<u32>>) {
         for event in events {
             self.e_to_p.send(self.now, event, &mut self.choices);
         }

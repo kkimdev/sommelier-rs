@@ -30,7 +30,7 @@ use super::Env;
 use super::{
     BarrierToken, Edit, HostTi, KeyEffect, LeaseOutcome, Piece, SeatId, SurfaceId, TiId, V1Pieces,
 };
-use crate::wire::Outgoing;
+use crate::wire::ToGuest;
 
 /// A text-input-v3 content type: `(hint, purpose)`.
 pub(super) type ContentType = (u32, u32);
@@ -312,7 +312,7 @@ impl TextInput {
     /// G9b and G9c: the answer to a commit, if the field is enabled: a
     /// transaction that repeats the preedit the guest shows. A preedit
     /// that does not fit is forgotten, and a bare `done` goes out.
-    pub(super) fn answer(&mut self, ti: TiId) -> Vec<Outgoing> {
+    pub(super) fn answer(&mut self, ti: TiId) -> Vec<ToGuest> {
         if !self.is_enabled() {
             return Vec::new();
         }
@@ -787,7 +787,7 @@ impl Planned<'_> {
     /// reached the guest. Returns its events and the lease effect; if it
     /// does not fit, nothing changes but that the view learns that nothing
     /// of a host edit reached the guest.
-    pub(super) fn apply(self) -> Result<(Vec<Outgoing>, KeyEffect), TooLong> {
+    pub(super) fn apply(self) -> Result<(Vec<ToGuest>, KeyEffect), TooLong> {
         let Planned {
             cur,
             txn,
