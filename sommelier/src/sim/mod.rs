@@ -58,7 +58,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::test_support::{env_u64, Rng};
 use editor::{Reference, TextModel, Typing, UserAction};
 use engine::Lag;
-use oracle::{Counts, Failure, Tier};
+use oracle::{Check, Counts, Failure, Tier};
 use sched::{Choices, Choose, Line, Setup, World};
 
 /// A client model a case types into.
@@ -191,7 +191,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         let (Some(spec), Some(_), false) = (&world.spec, &world.shadow, world.ended) else {
             outcome.failures.push(Failure {
                 tier: Tier::Exact,
-                check: "session",
+                check: Check::Session,
                 field: None,
                 detail: "the proxy ended the session".to_owned(),
             });
@@ -212,7 +212,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         if !world.mirrors.is_empty() {
             failures.push(Failure {
                 tier: Tier::Exact,
-                check: "mirror",
+                check: Check::Mirror,
                 field: None,
                 detail: world.mirrors.join("\n"),
             });
@@ -239,7 +239,7 @@ fn report(case: &Case, outcome: &Outcome, failures: &[Failure], trace: &[Line]) 
             Tier::Intent => "tier2",
         };
         report += &format!(
-            "  check: {tier} {}, field {:?}\n",
+            "  check: {tier} {:?}, field {:?}\n",
             failure.check, failure.field
         );
         for line in failure.detail.lines() {
@@ -364,7 +364,7 @@ fn run_all(cases: &[Case]) -> Summary {
                     .unwrap_or_default();
                 let failure = Failure {
                     tier: Tier::Exact,
-                    check: "panic",
+                    check: Check::Panic,
                     field: None,
                     detail: message,
                 };
@@ -389,7 +389,7 @@ fn run_all(cases: &[Case]) -> Summary {
                 let detail = format!("the traces first differ at line {first:?}");
                 let failure = Failure {
                     tier: Tier::Exact,
-                    check: "determinism",
+                    check: Check::Determinism,
                     field: None,
                     detail,
                 };
@@ -607,7 +607,7 @@ fn a_report_names_the_seed_the_tier_and_the_field_with_a_trace() {
     let outcome = run(&case, case.choices(), &mut trace);
     let failure = Failure {
         tier: Tier::Intent,
-        check: "text",
+        check: Check::Text,
         field: Some(1),
         detail: "intended: x\nclient:   y".to_owned(),
     };
@@ -615,7 +615,7 @@ fn a_report_names_the_seed_the_tier_and_the_field_with_a_trace() {
     let mut lines = report.lines();
     let heading = lines.next().expect("a heading");
     assert!(heading.starts_with("DST FAILURE seed=7 mode=settled client=chromium"));
-    assert_eq!(lines.next(), Some("  check: tier2 text, field Some(1)"));
+    assert_eq!(lines.next(), Some("  check: tier2 Text, field Some(1)"));
     assert_eq!(lines.next(), Some("    intended: x"));
     assert!(report.contains(&format!("    {}\n", trace[trace.len() - 1])));
     assert!(report.contains(&format!("  choices: {:?}\n", outcome.choices)));

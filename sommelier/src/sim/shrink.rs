@@ -18,10 +18,10 @@ limitations under the License.
 //! fails the same check.
 //!
 //! It tries three reductions, each kept only if a re-run still fails the
-//! check ([`Check`]), and stops at its budget ([`Limits`]). A candidate the
-//! generator could not have made ([`user::valid`]: a click without its
-//! `Settle`, a key released while later keys are pressed held) is skipped
-//! without a re-run:
+//! check ([`FailedCheck`]), and stops at its budget ([`Limits`]). A
+//! candidate the generator could not have made ([`user::valid`]: a click
+//! without its `Settle`, a key released while later keys are pressed held)
+//! is skipped without a re-run:
 //! 1. ddmin over the case's actions, then each `KeyDown` with its `KeyUp`;
 //! 2. zeroing runs of the choices, longest first, from the end: choice 0 is
 //!    the minimum latency or the first variant (`Choose`);
@@ -36,15 +36,15 @@ use std::time::{Duration, Instant};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use super::editor::UserAction;
-use super::oracle::{Failure, Tier};
+use super::oracle::{Check, Failure, Tier};
 use super::regressions::Regression;
 use super::sched::Choices;
 use super::sched::Line;
 use super::user;
 use super::{report, run, Case, Outcome};
 
-/// A check that failed: its tier, name and field.
-pub(super) type Check = (Tier, &'static str, Option<usize>);
+/// A check that failed: its tier, the check and its field.
+pub(super) type FailedCheck = (Tier, Check, Option<usize>);
 
 /// What bounds a shrink.
 #[derive(Clone, Copy, Debug)]
@@ -224,7 +224,7 @@ fn try_run(case: &Case, choices: &[u32], trace: &mut Vec<Line>) -> Option<Outcom
 
 /// Whether `outcome` fails `check`: the one predicate that accepts a
 /// candidate and confirms the result.
-fn fails(outcome: &Outcome, check: Check) -> bool {
+fn fails(outcome: &Outcome, check: FailedCheck) -> bool {
     let same = |f: &Failure| (f.tier, f.check, f.field) == check;
     outcome.failures.iter().any(same)
 }
@@ -232,7 +232,7 @@ fn fails(outcome: &Outcome, check: Check) -> bool {
 /// What a failed case shrinks to, as a report: the shrunk case's own
 /// report, and the snippet that replays it. A note instead if the failure
 /// does not replay from its choices.
-pub(super) fn shrunk_report(case: &Case, choices: &[u32], check: Check) -> String {
+pub(super) fn shrunk_report(case: &Case, choices: &[u32], check: FailedCheck) -> String {
     let mut failing = |case: &Case, choices: &[u32]| {
         let outcome = try_run(case, choices, &mut Vec::new())?;
         fails(&outcome, check).then_some(outcome.choices)
@@ -374,7 +374,7 @@ mod tests {
         let case = Case::new(0, &ClientKind::ALL);
         let mut trace = Vec::new();
         let outcome = try_run(&case, &[], &mut trace).expect("a run");
-        assert!(!fails(&outcome, (Tier::Exact, "no such check", None)));
+        assert!(!fails(&outcome, (Tier::Exact, Check::Session, None)));
         let mut broken = case.clone();
         broken.actions = vec![UserAction::Focus(99)];
         assert!(try_run(&broken, &[], &mut trace).is_none());
