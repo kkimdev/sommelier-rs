@@ -132,7 +132,12 @@ impl Session {
     /// breaks. Closing the guest's end would not do: a process another test
     /// spawns may hold a copy of it.
     pub(crate) fn break_guest_connection(&self) {
-        let socket = self.client.client_conn.as_raw_fd();
+        let socket = self
+            .client
+            .client_conn
+            .unix_socket_for_test()
+            .expect("the guest connection is a Unix socket")
+            .as_raw_fd();
         assert_eq!(unsafe { libc::shutdown(socket, libc::SHUT_WR) }, 0);
     }
 

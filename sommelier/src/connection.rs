@@ -534,13 +534,13 @@ impl WaylandConnection {
             },
         }
     }
-}
 
-impl AsRawFd for WaylandConnection {
-    fn as_raw_fd(&self) -> RawFd {
+    /// The socket of a Unix connection; a VirtWL connection has none.
+    #[cfg(test)]
+    pub(crate) fn unix_socket_for_test(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         match &self.transport {
-            ConnectionTransport::Unix(fd) => fd.as_raw_fd(),
-            ConnectionTransport::VirtWayland(_) => -1,
+            ConnectionTransport::Unix(fd) => Some(std::os::fd::AsFd::as_fd(fd.get_ref())),
+            ConnectionTransport::VirtWayland(_) => None,
         }
     }
 }

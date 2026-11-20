@@ -26,6 +26,7 @@ limitations under the License.
 
 use std::ffi::OsStr;
 use std::path::Path;
+use std::time::Duration;
 
 /// The setting's variable.
 const VARIABLE: &str = "SOMMELIER_WHEEL_FROM_TOUCHPAD";
@@ -35,6 +36,11 @@ const WINE_EXECUTABLES: [&str; 4] = ["wine-preloader", "wine64-preloader", "wine
 
 /// Environment entries only Wine's loader sets in its processes.
 const WINE_ENVIRONMENT_MARKERS: [&[u8]; 2] = [b"WINESERVERSOCKET=", b"WINELOADERNOEXEC="];
+
+/// How long a client waits to learn whether it is Wine before it is
+/// taken not to be; a read of `/proc` takes microseconds unless it hangs.
+/// The wait delays only that client's first message.
+const DETECTION_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// `SOMMELIER_WHEEL_FROM_TOUCHPAD`: which clients get wheel steps.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,11 +85,51 @@ impl WheelFromTouchpad {
 
     /// Return whether the client whose process is `pid` (`None` when the
     /// socket did not say) gets wheel steps.
-    pub(crate) fn applies_to(self, pid: Option<i32>) -> bool {
-        match self {
-            Self::Off => false,
-            Self::All => true,
-            Self::Auto => pid.is_some_and(is_wine_process),
+    ///
+    /// `auto` reads the process's `/proc` entries on a thread of their
+    /// own: reading `environ` takes the process's memory lock, which a
+    /// stalled process can hold, and the proxy's one thread must not wait
+    /// on a client. The thread is detached, not one of Tokio's blocking
+    /// pool, so a read that never ends holds up neither the pool nor the
+    /// proxy's exit. The caller waits for it at most [`DETECTION_TIMEOUT`],
+    /// and then takes the client not to be Wine.
+    pub(crate) async fn applies_to(self, pid: Option<i32>) -> bool {
+        match (self, pid) {
+            (Self::Off, _) | (Self::Auto, None) => false,
+            (Self::All, _) => true,
+            (Self::Auto, Some(pid)) => {
+                let (answer, wine) = tokio::sync::oneshot::channel();
+                let detection = std::thread::Builder::new()
+                    .name("client-kind".to_string())
+                    .spawn(move || {
+                        // The client may have gone; then no one asks.
+                        let _ = answer.send(is_wine_process(pid));
+                    });
+                if let Err(error) = detection {
+                    log::warn!("Cannot tell whether client process {pid} is Wine: {error}");
+                    return false;
+                }
+                await_detection(pid, wine, DETECTION_TIMEOUT).await
+            }
+        }
+    }
+}
+
+/// Wait at most `timeout` for whether process `pid` is `wine`; one that
+/// does not answer in time, or whose detection ended without an answer,
+/// is not.
+async fn await_detection(
+    pid: i32,
+    wine: tokio::sync::oneshot::Receiver<bool>,
+    timeout: Duration,
+) -> bool {
+    match tokio::time::timeout(timeout, wine).await {
+        Ok(answer) => answer.unwrap_or(false),
+        Err(_) => {
+            log::info!(
+                "Reading client process {pid}'s /proc took over {timeout:?}; it is not taken for Wine"
+            );
+            false
         }
     }
 }
@@ -150,8 +196,24 @@ mod tests {
         assert!(!is_wine_process(i32::MAX));
     }
 
-    #[test]
-    fn the_setting_chooses_wine_every_client_or_none() {
+    /// A detection that has not answered by its deadline takes the client
+    /// not to be Wine, so a hung `/proc` read cannot stall it.
+    #[tokio::test(start_paused = true)]
+    async fn a_detection_that_does_not_answer_in_time_is_not_wine() {
+        let (answer, wine) = tokio::sync::oneshot::channel();
+        let asked = tokio::time::Instant::now();
+        assert!(!await_detection(1, wine, DETECTION_TIMEOUT).await);
+        assert_eq!(asked.elapsed(), Duration::from_millis(500));
+        // A late answer changes nothing.
+        assert_eq!(answer.send(true), Err(true));
+
+        let (answer, wine) = tokio::sync::oneshot::channel();
+        answer.send(true).expect("the receiver waits");
+        assert!(await_detection(1, wine, DETECTION_TIMEOUT).await);
+    }
+
+    #[tokio::test]
+    async fn the_setting_chooses_wine_every_client_or_none() {
         let parse = |value: Option<&str>| WheelFromTouchpad::parse(value.map(OsStr::new));
         assert_eq!(parse(None), WheelFromTouchpad::Auto);
         assert_eq!(parse(Some(" ")), WheelFromTouchpad::Auto);
@@ -161,10 +223,34 @@ mod tests {
 
         // This test process is not Wine.
         let me = Some(std::process::id() as i32);
-        assert!(!WheelFromTouchpad::Auto.applies_to(me));
-        assert!(WheelFromTouchpad::All.applies_to(me));
-        assert!(WheelFromTouchpad::All.applies_to(None));
-        assert!(!WheelFromTouchpad::Off.applies_to(me));
-        assert!(!WheelFromTouchpad::Auto.applies_to(None));
+        assert!(!WheelFromTouchpad::Auto.applies_to(me).await);
+        assert!(WheelFromTouchpad::All.applies_to(me).await);
+        assert!(WheelFromTouchpad::All.applies_to(None).await);
+        assert!(!WheelFromTouchpad::Off.applies_to(me).await);
+        assert!(!WheelFromTouchpad::Auto.applies_to(None).await);
+
+        // A process with Wine's loader environment is Wine. It says when it
+        // runs, so its environment is the one `/proc` shows, and then waits
+        // on its stdin without another exec, whose switch `/proc` could see.
+        let mut wine = std::process::Command::new("sh")
+            .args(["-c", "echo running; read _"])
+            .env("WINELOADERNOEXEC", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn a stand-in Wine process");
+        let mut running = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(wine.stdout.as_mut().expect("its stdout")),
+            &mut running,
+        )
+        .expect("read that it runs");
+        let detected = WheelFromTouchpad::Auto
+            .applies_to(Some(wine.id() as i32))
+            .await;
+        wine.kill().expect("kill the stand-in");
+        wine.wait().expect("reap the stand-in");
+        assert_eq!(running, "running\n");
+        assert!(detected);
     }
 }

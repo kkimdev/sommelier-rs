@@ -213,9 +213,12 @@ impl ZxdgOutputManagerV1Handler for OutputHandler {
         // An inert output (its bind crossed its global's removal) has no
         // host object to extend, so its xdg_output is inert too: a
         // local-only object whose destructor completes in the proxy.
-        let version = ctx
-            .shadow_table
-            .guest_object_version_or_unknown(ctx.last_sender_id);
+        let manager = ctx.last_sender_id;
+        let Some(version) = ctx.shadow_table.guest_object_version(manager) else {
+            return ctx.fail(format_args!(
+                "zxdg_output_manager_v1 {manager} has no version"
+            ));
+        };
         ctx.shadow_table
             .create_local(id, zxdg_output_v1::NAME, version);
         Action::Drop

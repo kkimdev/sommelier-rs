@@ -532,8 +532,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   cannot make the guest send requests the proxy cannot decode. A child
   object takes its parent's version, and a request is sent to a host
   object only if that object's version has it: an Aura surface keeps the
-  version of the shell generation that created it.
+  version of the shell generation that created it. A version the proxy
+  cannot find fails closed: no child gets a guessed one, and a feature
+  gated on a version is off.
   Tests: `child_objects_inherit_their_manager_versions`,
+  `an_extension_of_unknown_version_gives_no_input_method`,
   `unset_snap_is_sent_only_to_an_aura_surface_that_has_it`,
   `every_forwarded_global_is_capped_at_its_xml_version`.
 
@@ -623,16 +626,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_mapping_change_stales_the_other_host_copies`,
   `a_buffer_attached_with_a_new_mapping_copies_everything`,
   `destroying_a_surface_stales_the_host_copies_it_showed`.
-- **`attach` offsets at version 5.** For a `wl_surface` at version 5 or
-  newer, `attach(buffer, 0, 0)` MUST NOT create a pending legacy offset, so
-  a committed `wl_surface.offset` survives a later zero-coordinate attach.
-  Non-zero coordinates are a protocol error. Objects with an unknown
-  negotiated version keep the permissive pre-v5 behavior. No guest reaches
-  v5 today (the `wl_compositor` ceiling is v4); this keeps the path correct
-  if the ceiling is raised, which would also need `wl_surface.offset`,
-  forwarded today, to stay local.
-  Tests: `v5_zero_attach_does_not_create_an_attach_offset`,
-  `v5_attach_rejects_nonzero_offsets_but_legacy_attach_tracks_them`.
+- **Surfaces stay below version 5.** The `wl_compositor` ceiling is v4,
+  so `attach` carries a surface's offset, and the generated version check
+  rejects v5's `wl_surface.offset`. The proxy implements no v5 offset
+  semantics, so a compile-time assertion beside `WL_COMPOSITOR_VERSION`
+  keeps the ceiling below v5.
+  Test: `consumed_attach_offset_is_not_reapplied_on_later_commit`.
 - **A non-zero offset forces full damage.** Surface-local damage cannot yet
   be translated through the SHM copy map when the committed offset is
   non-zero, so such a commit MUST send complete host surface damage, even
@@ -1525,12 +1524,15 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `client_kind::WheelFromTouchpad` chooses when it connects
   (`SOMMELIER_WHEEL_FROM_TOUCHPAD`; by default a Wine process, by its
   executable or its loader's environment through `SO_PEERCRED` and
-  `/proc`) gets one `axis_discrete` step, signed like the scroll, per 10
-  units of finger or continuous scrolling on an axis, just before the
-  `axis` that crosses it, as the protocol orders them. 10 is Exo's
-  distance for one wheel notch (`kWaylandScrollUnit`). The rest carries
-  over until that axis's `axis_stop`, the pointer's `enter` or `leave`,
-  or its end. Every other client, and every wheel scroll, which comes
+  `/proc`, read on a detached thread that the client's task waits for,
+  before it handles a message, at most 500 ms (`DETECTION_TIMEOUT`); a
+  client whose read takes longer is not taken for Wine, with an info
+  log, so a hung read stalls no client) gets one `axis_discrete` step, signed like the
+  scroll, per 10 units of finger or continuous scrolling on an axis,
+  just before the `axis` that crosses it, as the protocol orders them.
+  10 is Exo's distance for one wheel notch (`kWaylandScrollUnit`). The
+  rest carries over until that axis's `axis_stop`, the pointer's `enter`
+  or `leave`, or its end. Every other client, and every wheel scroll, which comes
   with Exo's own `axis_discrete`, gets the events as the host sent them.
   A source, and so a step, reaches only a pointer of v5 or later, which
   has `axis_discrete`: the dispatcher rejects a newer event for an older
@@ -1539,6 +1541,7 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `wheel_steps_leave_other_clients_and_wheels_alone`,
   `wine_is_recognised_by_its_executable_or_its_loader_environment`,
   `the_setting_chooses_wine_every_client_or_none`,
+  `a_detection_that_does_not_answer_in_time_is_not_wine`,
   `event_since_guard_rejects_a_newer_event_for_an_old_host_object`.
 
 ## Process

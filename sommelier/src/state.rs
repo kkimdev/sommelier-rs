@@ -38,7 +38,7 @@ pub(crate) use self::host_mapping::HostMapping;
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::MAX_PENDING_DAMAGE_RECTS;
-use crate::allocator::{Allocator, PendingFence};
+use crate::allocator::{PendingFence, VirtGpuDevice};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Outgoing};
 use log::{debug, error, warn};
@@ -297,8 +297,6 @@ pub struct GtkShellState {
     /// Activation token supplied by GTK for windows created through this
     /// shell binding. ChromeOS validates the token before granting focus.
     pub startup_id: Option<String>,
-    /// Synthetic gtk_surface1 objects created from this shell binding.
-    pub surfaces: BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,7 +389,8 @@ pub struct Context {
     /// The fence the message being dispatched waits for, if it does; see
     /// [`Self::wait_for_fence`].
     fence_wait: Option<FenceWait>,
-    pub allocator: Option<Allocator>,
+    /// The process's virtio-gpu render node, shared by every client.
+    pub virtgpu: Option<Arc<VirtGpuDevice>>,
     /// Test-only capability override for exercising synthetic dma-buf
     /// feedback lifecycle without depending on the runner's `/dev/dri`.
     #[cfg(test)]
@@ -408,18 +407,10 @@ pub struct Context {
     pub host_shm_id: Option<u32>,
     /// Global name that produced the currently bound internal wl_shm object.
     pub host_shm_global_name: Option<u32>,
-    /// Global names that produced the internal singleton bindings. These
-    /// names let registry removal reset exactly the binding that disappeared,
+    /// Global name that produced the internal keyboard extension binding,
+    /// so that registry removal resets exactly the binding that disappeared,
     /// without tearing down a duplicate or a newer global generation.
-    pub host_text_input_manager_v1_global_name: Option<u32>,
-    pub host_text_input_extension_v1_global_name: Option<u32>,
     pub host_keyboard_extension_global_name: Option<u32>,
-    /// Formats observed from the host's SHM or dmabuf capability events that
-    /// the SHM bridge can actually copy. ARGB/XRGB are always available per
-    /// the wl_shm contract; optional formats are added only after the host
-    /// advertises them. Only a VirtWL session offers all of them to the
-    /// guest; without VirtWL only `host_wl_shm_formats` count.
-    pub host_shm_formats: BTreeSet<u32>,
     /// Optional formats learned from the internal host wl_shm binding.
     /// Keeping the source separate lets a dmabuf global disappear without
     /// invalidating a format that the host's real wl_shm object still offers.
@@ -479,17 +470,12 @@ pub struct Context {
     /// ARC bounds policy, and the placement bindings. Shared, never copied:
     /// a reloaded binding generation is visible to the next lookup.
     placement: Arc<PlacementConfig>,
-    pub supported_formats: BTreeSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
     /// the host's interface and version, while a registry lists it; see
     /// `handler::registry::Singleton`.
     pub(crate) singleton_candidates: BTreeMap<u32, HostGlobal>,
-    /// Host globals consumed internally by the proxy and therefore never
-    /// advertised to the guest. Keeping their names lets global_remove clean
-    /// the corresponding host-only object without leaking a removal event.
-    pub hidden_host_globals: BTreeMap<u32, String>,
     /// What each host registry has advertised, by host registry ID (see
     /// [`RegistryRecord`]).
     pub(crate) registries: BTreeMap<u32, RegistryRecord>,
@@ -976,45 +962,23 @@ impl Context {
             .take_guest_owner_if(host_keyboard_id, key, expected)
     }
 
-    /// Create the state for one client connection.
+    /// Create the state for one client connection from inputs `main`
+    /// resolved once for the process; reads no environment.
     ///
     /// # Arguments
     ///
     /// * `gpu_accel`, `xdg_decoration` - the command-line feature switches.
-    /// * `vm_identifier` - the VM namespace of application IDs, resolved
-    ///   once in `main` (see [`vm_identifier_from_environment`]).
-    /// * `placement` - the process-wide placement configuration, resolved
-    ///   once in `main`; `Context` never reads placement variables itself.
+    /// * `vm_identifier` - the VM namespace of application IDs (see
+    ///   [`vm_identifier_from_environment`]).
+    /// * `virtgpu` - the process's virtio-gpu render node, if it has one
+    ///   (see [`crate::allocator::VirtGpuNode`]).
+    /// * `placement` - the process-wide placement configuration; `Context`
+    ///   never reads placement variables itself.
     pub fn new(
         gpu_accel: bool,
         xdg_decoration: bool,
         vm_identifier: String,
-        placement: Arc<PlacementConfig>,
-    ) -> Self {
-        // `Allocator::new` reads `SOMMELIER_DRM_DEVICE` and probes the DRM
-        // render nodes; without one, buffers fall back to VirtWL or SHM.
-        let allocator = match Allocator::new() {
-            Ok(alloc) => Some(alloc),
-            Err(e) => {
-                warn!("Failed to initialize GBM allocator: {}", e);
-                None
-            }
-        };
-        Self::from_parts(
-            gpu_accel,
-            xdg_decoration,
-            vm_identifier,
-            allocator,
-            placement,
-        )
-    }
-
-    /// Build the state from resolved inputs; reads no environment.
-    fn from_parts(
-        gpu_accel: bool,
-        xdg_decoration: bool,
-        vm_identifier: String,
-        allocator: Option<Allocator>,
+        virtgpu: Option<Arc<VirtGpuDevice>>,
         placement: Arc<PlacementConfig>,
     ) -> Self {
         let window_placement = WindowPlacementState::new(placement.backend());
@@ -1035,7 +999,7 @@ impl Context {
             session_end: None,
             post_dispatch: Vec::new(),
             fence_wait: None,
-            allocator,
+            virtgpu,
             #[cfg(test)]
             synthetic_feedback_available_for_test: false,
             #[cfg(test)]
@@ -1045,10 +1009,7 @@ impl Context {
             host_dmabuf_global_name: None,
             host_shm_id: None,
             host_shm_global_name: None,
-            host_text_input_manager_v1_global_name: None,
-            host_text_input_extension_v1_global_name: None,
             host_keyboard_extension_global_name: None,
-            host_shm_formats: BTreeSet::new(),
             host_wl_shm_formats: BTreeSet::new(),
             host_dmabuf_shm_formats: BTreeSet::new(),
             guest_shms: BTreeMap::new(),
@@ -1065,10 +1026,8 @@ impl Context {
             keyboard_xkb_states: BTreeMap::new(),
             keyboard_modifiers: BTreeMap::new(),
             placement,
-            supported_formats: BTreeSet::new(),
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
-            hidden_host_globals: BTreeMap::new(),
             registries: BTreeMap::new(),
             global_generations: BTreeMap::new(),
             next_global_generation: 1,
@@ -1102,14 +1061,14 @@ impl Context {
     ///
     /// The ARC bounds policy is off and `accelerators` are the host
     /// accelerators. The VM identifier is the default `termina`, and there
-    /// is no GBM allocator.
+    /// is no virtio-gpu device.
     #[cfg(test)]
     pub fn new_for_test(
         gpu_accel: bool,
         xdg_decoration: bool,
         accelerators: Vec<crate::accelerator::Accelerator>,
     ) -> Self {
-        Self::from_parts(
+        Self::new(
             gpu_accel,
             xdg_decoration,
             resolve_vm_identifier(None),
@@ -1120,10 +1079,10 @@ impl Context {
 
     /// Test-only constructor from an explicit placement configuration, for
     /// example `PlacementConfig::arc_bounds_for_test`. Like `new_for_test`,
-    /// it reads no environment variable and has no GBM allocator.
+    /// it reads no environment variable and has no virtio-gpu device.
     #[cfg(test)]
     pub(crate) fn with_placement_for_test(placement: impl Into<Arc<PlacementConfig>>) -> Self {
-        Self::from_parts(
+        Self::new(
             false,
             false,
             resolve_vm_identifier(None),
@@ -1349,11 +1308,11 @@ mod tests {
         assert_eq!(ctx.placement_action_for(&alt_q()), None);
         assert!(ctx.window_placement.arc().is_none());
         assert_eq!(ctx.vm_identifier, "termina");
-        assert!(ctx.allocator.is_none(), "no DRM device is probed");
+        assert!(ctx.virtgpu.is_none(), "no DRM device is probed");
 
         let ctx = Context::with_placement_for_test(PlacementConfig::for_test(Vec::new()));
         assert_eq!(ctx.vm_identifier, "termina");
-        assert!(ctx.allocator.is_none(), "no DRM device is probed");
+        assert!(ctx.virtgpu.is_none(), "no DRM device is probed");
     }
 
     fn awaiting_release(has_detached_use: bool) -> RenderBufferUse {
@@ -1491,7 +1450,6 @@ mod tests {
                 buffer_damage: vec![BufferRect::new(5, 6, 7, 8)].into(),
                 buffer_scale: Some(2),
                 buffer_transform: Some(3),
-                offset: Some((9, 10)),
                 attach_offset: Some((11, 12)),
                 viewport: Some(Some(ViewportState {
                     source: Some((0, 0, 256, 256)),
@@ -1517,11 +1475,7 @@ mod tests {
             commit.buffer_damage,
             DamageRegion::Rects(vec![BufferRect::new(5, 6, 7, 8)])
         );
-        assert_eq!(
-            commit.buffer_offset,
-            (9, 10),
-            "an explicit offset must win over the legacy attach offset"
-        );
+        assert_eq!(commit.buffer_offset, (11, 12));
         assert_eq!(surface.current_buffer_scale, 2);
         assert_eq!(surface.current_buffer_transform, 3);
         assert_eq!(
@@ -1555,8 +1509,7 @@ mod tests {
                 buffer_damage: vec![BufferRect::new(5, 6, 7, 8)].into(),
                 buffer_scale: Some(2),
                 buffer_transform: Some(3),
-                offset: Some((4, 5)),
-                attach_offset: Some((11, 12)),
+                attach_offset: Some((4, 5)),
                 viewport: Some(None),
             },
             logged_viewport_rule: false,

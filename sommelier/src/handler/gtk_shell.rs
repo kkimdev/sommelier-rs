@@ -75,7 +75,9 @@ impl GtkShell1Handler for GtkShellHandler {
         };
 
         // A new object takes its parent's version.
-        let version = ctx.shadow_table.guest_object_version_or_unknown(shell_id);
+        let Some(version) = ctx.shadow_table.guest_object_version(shell_id) else {
+            return ctx.fail(format_args!("gtk_shell1 {shell_id} has no version"));
+        };
         ctx.shadow_table
             .create_local(gtk_surface_id, gtk_surface1::NAME, version);
         ctx.gtk_surfaces.insert(
@@ -85,9 +87,6 @@ impl GtkShell1Handler for GtkShellHandler {
                 wl_surface_id,
             },
         );
-        if let Some(shell) = ctx.gtk_shells.get_mut(&shell_id) {
-            shell.surfaces.insert(gtk_surface_id);
-        }
         if let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_id) {
             queue_startup_id(ctx, zaura_surface_id, startup_id.as_deref());
         }
@@ -105,10 +104,10 @@ impl GtkShell1Handler for GtkShellHandler {
         };
         shell.startup_id.clone_from(startup_id);
         // Two GTK surfaces may wrap one wl_surface; it has one Aura surface.
-        let wl_surface_ids = shell
-            .surfaces
-            .iter()
-            .filter_map(|surface_id| ctx.gtk_surfaces.get(surface_id))
+        let wl_surface_ids = ctx
+            .gtk_surfaces
+            .values()
+            .filter(|surface| surface.shell_id == shell_id)
             .map(|surface| surface.wl_surface_id)
             .collect::<std::collections::BTreeSet<_>>();
         for wl_surface_id in wl_surface_ids {
@@ -446,13 +445,12 @@ mod tests {
         ctx.last_sender_id = GTK_SHELL;
         let mut handler = GtkShellHandler;
         handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
-        assert!(ctx.gtk_shells[&GTK_SHELL].surfaces.contains(&GTK_SURFACE));
+        assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
 
         ctx.last_sender_id = SURFACE.guest;
         let mut compositor = crate::handler::compositor::CompositorHandler;
         assert_eq!(compositor.on_destroy(&mut ctx), Action::Drop);
         assert!(!ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
-        assert!(!ctx.gtk_shells[&GTK_SHELL].surfaces.contains(&GTK_SURFACE));
         assert!(
             ctx.shadow_table.is_local(GTK_SURFACE),
             "gtk_surface1 has no destroy request, so its client ID stays reserved"

@@ -290,11 +290,10 @@ impl VirtWaylandChannel {
         self.supports_dmabuf
     }
 
-    pub fn allocate(&self, size: u32) -> io::Result<(OwnedFd, u32)> {
+    pub fn allocate(&self, size: u32) -> io::Result<OwnedFd> {
         let mut new_alloc = crate::virtwl::virtwl_ioctl_new::new_alloc(size);
         let ioctl_result = unsafe { virtwl_ioctl_new(self.dev_file.as_raw_fd(), &mut new_alloc) };
-        let fd = take_returned_fd(ioctl_result, new_alloc.fd, "VIRTWL_IOCTL_NEW_ALLOC")?;
-        Ok((fd, size))
+        take_returned_fd(ioctl_result, new_alloc.fd, "VIRTWL_IOCTL_NEW_ALLOC")
     }
 
     /// Allocate a host-backed PRIME dma-buf and return the layout selected by
@@ -343,13 +342,9 @@ impl VirtWaylandChannel {
             .map_err(io::Error::from)
     }
 
-    pub fn create_pipe(&self, read: bool) -> io::Result<OwnedFd> {
-        let mut new_pipe = if read {
-            crate::virtwl::virtwl_ioctl_new::new_pipe_read()
-        } else {
-            crate::virtwl::virtwl_ioctl_new::new_pipe_write()
-        };
-
+    /// A pipe the host writes and the guest reads.
+    pub fn create_read_pipe(&self) -> io::Result<OwnedFd> {
+        let mut new_pipe = crate::virtwl::virtwl_ioctl_new::new_pipe_read();
         let ioctl_result = unsafe { virtwl_ioctl_new(self.dev_file.as_raw_fd(), &mut new_pipe) };
         take_returned_fd(ioctl_result, new_pipe.fd, "VIRTWL_IOCTL_NEW_PIPE")
     }

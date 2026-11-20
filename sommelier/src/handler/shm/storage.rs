@@ -204,7 +204,7 @@ pub(super) fn select_shm_backing(
             buffer_size
         );
         // `valid_buffer_layout` returns a positive size.
-        let (fd, _alloc_size) = match channel.allocate(buffer_size.unsigned_abs()) {
+        let fd = match channel.allocate(buffer_size.unsigned_abs()) {
             Ok(result) => result,
             Err(error) => {
                 error!(
@@ -313,9 +313,9 @@ pub(super) fn create_shared_buffer(
     // destroy request is processed by the compositor, although it has no
     // guest-side object or event callbacks. A new object takes its
     // parent's version.
-    let pool_version = ctx
-        .shadow_table
-        .host_object_version_or_unknown(host_wl_shm_id);
+    let Some(pool_version) = ctx.shadow_table.host_object_version(host_wl_shm_id) else {
+        return ctx.fail(format_args!("host wl_shm {host_wl_shm_id} has no version"));
+    };
     let host_pool_id = ctx
         .shadow_table
         .create_host_only(wl_shm_pool::NAME, pool_version);
@@ -412,9 +412,11 @@ pub(super) fn create_dmabuf_buffer(
     };
 
     // A new object takes its parent's version.
-    let params_version = ctx
-        .shadow_table
-        .host_object_version_or_unknown(host_dmabuf_id);
+    let Some(params_version) = ctx.shadow_table.host_object_version(host_dmabuf_id) else {
+        return ctx.fail(format_args!(
+            "host dma-buf factory {host_dmabuf_id} has no version"
+        ));
+    };
     let params_id = ctx
         .shadow_table
         .create_host_only(zwp_linux_buffer_params_v1::NAME, params_version);

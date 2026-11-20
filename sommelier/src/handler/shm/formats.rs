@@ -54,16 +54,23 @@ pub(crate) fn is_supported_drm_format(format: u32) -> bool {
     shm_format_from_drm(format).is_some()
 }
 
+/// Whether the host reported supported format `format` through its wl_shm
+/// or its linux-dmabuf. ARGB/XRGB are always available per the wl_shm
+/// contract and need no report.
+fn host_reported_shm_format(ctx: &Context, format: u32) -> bool {
+    ctx.host_wl_shm_formats.contains(&format) || ctx.host_dmabuf_shm_formats.contains(&format)
+}
+
 pub(super) fn guest_shm_format_available(ctx: &Context, format: u32) -> bool {
     // Without VirtWL every guest SHM buffer reaches the host's wl_shm (see
     // `select_shm_backing`), so only the formats it lists count. VirtWL also
     // sends some buffers through the host's linux-dmabuf.
-    let host_formats = if ctx.virtwayland_channel.is_some() {
-        &ctx.host_shm_formats
-    } else {
-        &ctx.host_wl_shm_formats
-    };
-    MANDATORY_SHM_FORMATS.contains(&format) || host_formats.contains(&format)
+    MANDATORY_SHM_FORMATS.contains(&format)
+        || if ctx.virtwayland_channel.is_some() {
+            host_reported_shm_format(ctx, format)
+        } else {
+            ctx.host_wl_shm_formats.contains(&format)
+        }
 }
 
 /// Record a format the host reported through its wl_shm or linux-dmabuf and
@@ -75,8 +82,6 @@ fn record_host_shm_format(ctx: &mut Context, format: u32) {
     }
     // A format one source already reported may become available to the
     // guest only now; each guest binding sends a format once.
-    ctx.host_shm_formats.insert(format);
-
     let guest_ids: Vec<u32> = ctx.guest_shms.keys().copied().collect();
     for guest_id in guest_ids {
         if ctx.stale_shm_guest_objects.contains(&guest_id) {
@@ -114,21 +119,11 @@ pub(crate) fn record_host_shm_drm_format(ctx: &mut Context, format: u32) {
 }
 
 pub(crate) fn clear_host_shm_wl_formats(ctx: &mut Context) {
-    let removed = std::mem::take(&mut ctx.host_wl_shm_formats);
-    for format in removed {
-        if !ctx.host_dmabuf_shm_formats.contains(&format) {
-            ctx.host_shm_formats.remove(&format);
-        }
-    }
+    ctx.host_wl_shm_formats.clear();
 }
 
 pub(crate) fn clear_host_shm_dmabuf_formats(ctx: &mut Context) {
-    let removed = std::mem::take(&mut ctx.host_dmabuf_shm_formats);
-    for format in removed {
-        if !ctx.host_wl_shm_formats.contains(&format) {
-            ctx.host_shm_formats.remove(&format);
-        }
-    }
+    ctx.host_dmabuf_shm_formats.clear();
 }
 
 /// Register synthetic guest wl_shm object `guest_id`, bound from host global
@@ -183,9 +178,9 @@ pub(super) fn wl_shm_format_to_drm_format(format: u32) -> u32 {
 mod tests {
     use super::{
         clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, format_bytes_per_pixel,
-        guest_shm_format_available, is_supported_drm_format, record_host_shm_drm_format,
-        record_host_shm_wl_format, register_guest_shm, shm_format_from_drm,
-        wl_shm_format_to_drm_format, SUPPORTED_SHM_FORMATS,
+        guest_shm_format_available, host_reported_shm_format, is_supported_drm_format,
+        record_host_shm_drm_format, record_host_shm_wl_format, register_guest_shm,
+        shm_format_from_drm, wl_shm_format_to_drm_format, SUPPORTED_SHM_FORMATS,
     };
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::{wl_registry, wl_shm};
@@ -281,19 +276,19 @@ mod tests {
         record_host_shm_drm_format(&mut ctx, format);
         assert!(ctx.host_wl_shm_formats.contains(&format));
         assert!(ctx.host_dmabuf_shm_formats.contains(&format));
-        assert!(ctx.host_shm_formats.contains(&format));
+        assert!(host_reported_shm_format(&ctx, format));
         assert_eq!(ctx.host_to_client_queue.len(), 1);
 
         ctx.host_to_client_queue.clear();
         clear_host_shm_dmabuf_formats(&mut ctx);
         assert!(
-            ctx.host_shm_formats.contains(&format),
+            host_reported_shm_format(&ctx, format),
             "wl_shm remains a valid capability source"
         );
         assert!(ctx.host_to_client_queue.is_empty());
 
         clear_host_shm_wl_formats(&mut ctx);
-        assert!(!ctx.host_shm_formats.contains(&format));
+        assert!(!host_reported_shm_format(&ctx, format));
 
         record_host_shm_wl_format(&mut ctx, format);
         assert_eq!(
@@ -315,9 +310,9 @@ mod tests {
         record_host_shm_drm_format(&mut ctx, 0x3432_5241); // DRM ARGB8888
         record_host_shm_drm_format(&mut ctx, 0x3432_5258); // DRM XRGB8888
 
-        assert!(ctx.host_shm_formats.contains(&0));
-        assert!(ctx.host_shm_formats.contains(&1));
-        assert!(!ctx.host_shm_formats.contains(&0xdead_beef));
+        assert!(host_reported_shm_format(&ctx, 0));
+        assert!(host_reported_shm_format(&ctx, 1));
+        assert!(!host_reported_shm_format(&ctx, 0xdead_beef));
     }
 
     /// The host object the proxy binds for itself when the host advertises

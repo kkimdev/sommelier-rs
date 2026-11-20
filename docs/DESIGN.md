@@ -29,18 +29,21 @@ handler intercepts the ones whose meaning changes across the boundary.
 - `main.rs` parses the command line, installs the `SIGHUP` handler and
   raises the open-file soft limit (`prepare_process`), and resolves every
   process-wide setting once, before the first client connects: the VM
-  identifier (`state::vm_identifier_from_environment`), the placement
-  configuration (`PlacementConfig::from_environment`) and which clients
-  get wheel steps for touchpad scrolling
-  (`client_kind::WheelFromTouchpad::from_environment`). Connections
-  receive the results; `client_kind.rs`, the one owner of whether a
-  client is Wine, decides that per client from its process when it
-  connects ([pointer scrolling](INVARIANTS.md#pointer-scrolling)).
-  `Context::from_parts` and the test constructors read no environment
-  (test: `test_contexts_read_no_environment`), with two exceptions below
-  `main`: `Context::new` creates the GBM allocator, which reads
-  `SOMMELIER_DRM_DEVICE` (`allocator.rs`) on every connection, and the ARC
-  task-ID reservation reads `XDG_RUNTIME_DIR` (`arc_task_ids.rs`).
+  identifier (`state::vm_identifier_from_environment`), the virtio-gpu
+  render node (`VirtGpuNode::from_environment`, which reads
+  `SOMMELIER_DRM_DEVICE`; the node opens when a client first needs it,
+  and one that fails to open is tried again for the next client until it
+  opens; test: `a_render_node_that_fails_to_open_is_tried_again_then_kept`),
+  the placement configuration (`PlacementConfig::from_environment`) and
+  which clients get wheel steps for touchpad scrolling
+  (`client_kind::WheelFromTouchpad::from_environment`).
+  Connections receive the results; `client_kind.rs`, the one owner of
+  whether a client is Wine, decides that per client from its process when
+  it connects ([pointer scrolling](INVARIANTS.md#pointer-scrolling)).
+  `Context::new` and the test constructors read no environment
+  (test: `test_contexts_read_no_environment`), with one exception below
+  `main`: the ARC task-ID reservation reads `XDG_RUNTIME_DIR`
+  (`arc_task_ids.rs`).
 - `proxy::run` claims the socket through its lock file, then `serve`
   accepts guest clients and gives each a `Client` with its own guest
   connection, host connection and `Context`. All clients run on one
@@ -337,8 +340,8 @@ or host error wins over an internal failure. After dispatch,
   the session ends as an internal failure, before the deferred work runs
   (test: `a_wait_with_output_ends_the_session`). `proxy::fuzz` counts
   such an end like any other session end, but never reaches a fence
-  wait: its planes are memfds and its contexts have no allocator, so no
-  fence is ever pending. `Client` parks the guest stream
+  wait: its planes are memfds and its contexts have no virtio-gpu
+  device, so no fence is ever pending. `Client` parks the guest stream
   (`ParkedRequest`): it neither reads nor dispatches guest messages, and
   fair dispatch does not offer them, while host events and other clients
   go on. Once the exported sync_file is readable, or, for the virtio-gpu

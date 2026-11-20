@@ -33,22 +33,9 @@ use tokio::io::Interest;
 
 pub struct DataDeviceHandler;
 
-impl wl_data_device_manager::WlDataDeviceManagerHandler for DataDeviceHandler {
-    fn on_create_data_source(&mut self, _ctx: &mut Context, id: u32) -> Action {
-        debug!("Tracking data source id={}", id);
-        Action::Forward
-    }
+impl wl_data_device_manager::WlDataDeviceManagerHandler for DataDeviceHandler {}
 
-    fn on_get_data_device(&mut self, _ctx: &mut Context, _id: u32, _seat: u32) -> Action {
-        Action::Forward
-    }
-}
-
-impl wl_data_device::WlDataDeviceHandler for DataDeviceHandler {
-    fn on_data_offer(&mut self, _ctx: &mut Context, _id: u32) -> Action {
-        Action::Forward
-    }
-}
+impl wl_data_device::WlDataDeviceHandler for DataDeviceHandler {}
 
 impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
     fn on_receive(&mut self, ctx: &mut Context, mime_type: &String, fd: BorrowedFd<'_>) -> Action {
@@ -81,7 +68,7 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
 
             // Create a pipe where we read (so host must write to it)
             // VIRTWL_IOCTL_NEW_PIPE_READ creates a pipe that is readable via the returned FD.
-            let virtwl_pipe = match virtwl.create_pipe(true) {
+            let virtwl_pipe = match virtwl.create_read_pipe() {
                 Ok(p) => p,
                 Err(e) => {
                     error!("Failed to create virtwl pipe: {}", e);

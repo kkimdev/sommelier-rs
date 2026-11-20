@@ -396,9 +396,15 @@ impl KeyboardHandler {
                 .keyboard_to_extended_keyboard
                 .contains_key(&host_keyboard_id)
             {
-                let extended_version = ctx
-                    .shadow_table
-                    .host_object_version_or_unknown(extension_host_id.0);
+                let Some(extended_version) =
+                    ctx.shadow_table.host_object_version(extension_host_id.0)
+                else {
+                    let _ = ctx.fail(format_args!(
+                        "keyboard extension {} has no version",
+                        extension_host_id.0
+                    ));
+                    return;
+                };
                 let host_extended_id = HostId(
                     ctx.shadow_table
                         .create_host_only(zcr_extended_keyboard_v1::NAME, extended_version),

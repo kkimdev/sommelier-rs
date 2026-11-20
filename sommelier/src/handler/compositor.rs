@@ -24,12 +24,12 @@ use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_shm;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
-use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler, REQ_OFFSET_SINCE};
+use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler};
 use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
     is_valid_transform, BufferRect, BufferSpace, BufferState, Context, DamageRegion, FenceWait,
-    HostMapping, PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceMapping,
-    SurfaceRect, SurfaceState, ViewportState,
+    HostMapping, PostDispatch, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect,
+    SurfaceState, ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{queue_or_drop, Action, Outgoing};
@@ -163,7 +163,7 @@ fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> std::io::Result<DmabufFe
             },
         );
     }
-    crate::allocator::dmabuf_fence(plane, ctx.allocator.as_ref())
+    crate::allocator::dmabuf_fence(plane, ctx.virtgpu.as_deref())
 }
 
 impl WlCompositorHandler for CompositorHandler {
@@ -406,20 +406,8 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
     release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
     window_placement::forget_surface(ctx, wl_surface_guest_id);
     ctx.outputs.surface_destroyed(wl_surface_host_id);
-    let gtk_surface_ids = ctx
-        .gtk_surfaces
-        .iter()
-        .filter_map(|(&gtk_surface_id, state)| {
-            (state.wl_surface_id == wl_surface_guest_id).then_some(gtk_surface_id)
-        })
-        .collect::<Vec<_>>();
-    for gtk_surface_id in gtk_surface_ids {
-        if let Some(state) = ctx.gtk_surfaces.remove(&gtk_surface_id) {
-            if let Some(shell) = ctx.gtk_shells.get_mut(&state.shell_id) {
-                shell.surfaces.remove(&gtk_surface_id);
-            }
-        }
-    }
+    ctx.gtk_surfaces
+        .retain(|_, state| state.wl_surface_id != wl_surface_guest_id);
     // A submitted buffer may have been detached from another surface and
     // still be waiting for wl_buffer.release; only buffers that this host
     // surface actually held may be retired merely because its destructor
@@ -497,27 +485,6 @@ impl WlSurfaceHandler for CompositorHandler {
 
     fn on_attach(&mut self, ctx: &mut Context, buffer: u32, x: i32, y: i32) -> Action {
         let surface_id = ctx.last_sender_id;
-        // Objects of unknown version keep the permissive pre-offset rules
-        // (see INVARIANTS); in practice only test fixtures have one.
-        let version = ctx.shadow_table.guest_object_version_or_unknown(surface_id);
-        let has_offset_request =
-            !ShadowTable::is_unknown_version(version) && version >= REQ_OFFSET_SINCE;
-        if has_offset_request && (x != 0 || y != 0) {
-            // wl_surface v5 made non-zero attach offsets a protocol error;
-            // clients must use wl_surface.offset instead. Do not let an
-            // invalid request reach the host compositor.
-            log::warn!(
-                "Rejecting non-zero wl_surface.attach offset ({}, {}) for v5+ surface {}",
-                x,
-                y,
-                surface_id
-            );
-            return ctx.reject(
-                surface_id,
-                wl_surface::ERROR_INVALID_OFFSET,
-                "wl_surface.attach offset is non-zero for version 5+",
-            );
-        }
         // An inert buffer, from a pool whose host wl_shm was removed, has
         // no host object, so it reaches the host as no buffer.
         let attached = buffer != 0 && !ctx.shadow_table.is_local(buffer);
@@ -530,14 +497,9 @@ impl WlSurfaceHandler for CompositorHandler {
         } else {
             SurfaceAttachment::Detach
         };
-        pending.attach_offset = None;
-        // Since wl_surface version 5, attach's x/y arguments are ignored
-        // (and non-zero values were rejected above). Keep them out of the
-        // legacy pending-offset slot so a legal attach(buffer, 0, 0) cannot
-        // reset a previously committed wl_surface.offset.
-        if attached && !has_offset_request {
-            pending.attach_offset = Some((x, y));
-        }
+        // A surface is at most v4 (`WL_COMPOSITOR_VERSION`), where attach
+        // carries the offset.
+        pending.attach_offset = attached.then_some((x, y));
         // A pending native buffer can be destroyed before the commit that
         // attached it. Replacing that pending attach (including attach(NULL))
         // means the compositor will never emit wl_buffer.release for the
@@ -617,15 +579,6 @@ impl WlSurfaceHandler for CompositorHandler {
             return ctx.missing_surface_state(surface_id);
         };
         surface.pending.buffer_transform = Some(transform);
-        Action::Forward
-    }
-
-    fn on_offset(&mut self, ctx: &mut Context, x: i32, y: i32) -> Action {
-        let surface_id = ctx.last_sender_id;
-        let Some(surface) = ctx.surface_mut(surface_id) else {
-            return ctx.missing_surface_state(surface_id);
-        };
-        surface.pending.offset = Some((x, y));
         Action::Forward
     }
 
@@ -1413,14 +1366,13 @@ mod tests {
     #[test]
     fn a_live_surface_without_state_ends_the_session() {
         type Request = fn(&mut CompositorHandler, &mut Context) -> Action;
-        let requests: [(&str, Request); 10] = [
+        let requests: [(&str, Request); 9] = [
             ("attach", |h, ctx| h.on_attach(ctx, 0, 0, 0)),
             ("damage", |h, ctx| h.on_damage(ctx, 0, 0, 1, 1)),
             ("damage_buffer", |h, ctx| {
                 h.on_damage_buffer(ctx, 0, 0, 1, 1)
             }),
             ("set_buffer_scale", |h, ctx| h.on_set_buffer_scale(ctx, 1)),
-            ("offset", |h, ctx| h.on_offset(ctx, 0, 0)),
             ("commit", |h, ctx| h.on_commit(ctx)),
             ("set_buffer_transform", |h, ctx| {
                 h.on_set_buffer_transform(ctx, 0)
@@ -2620,7 +2572,6 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
         register_test_buffer(&mut ctx, BufferKind::Shm, buffer_id, host_buffer_id);
         let pool = test_pool_file(&ctx, buffer_id);
         // This buffer has completed a previous compositor-use interval. A new
@@ -2697,113 +2648,19 @@ mod tests {
     }
 
     #[test]
-    fn v5_attach_rejects_nonzero_offsets_but_legacy_attach_tracks_them() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
-        ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
-
-        assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Drop);
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .map(|surface| surface.pending.attachment)
-                .filter(|attachment| *attachment != SurfaceAttachment::Unchanged),
-            None
-        );
-        assert_eq!(protocol_error_code(&ctx), 3);
-        assert!(ctx.is_fatal());
-
-        ctx.host_to_client_queue.clear();
-        ctx.clear_session_end_for_test();
-        ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
-        assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Forward);
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(|surface| surface.pending.attach_offset),
-            Some((3, 4))
-        );
-    }
-
-    #[test]
-    fn v5_zero_attach_does_not_create_an_attach_offset() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
-        ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
-
-        assert_eq!(handler.on_offset(&mut ctx, 7, 8), Action::Forward);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(|surface| surface.pending.offset),
-            None,
-            "commit must consume the one-shot offset"
-        );
-
-        // Version 5+ ignores attach's zero coordinates, so the new attachment
-        // must not acquire a synthetic legacy offset.
-        assert_eq!(handler.on_attach(&mut ctx, 42, 0, 0), Action::Forward);
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(|surface| surface.pending.attach_offset),
-            None
-        );
-    }
-
-    #[test]
-    fn offset_request_wins_over_legacy_attach_offset_at_commit() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
-        ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
-
-        assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Forward);
-        // Simulate a v5+ offset request in the state path; the commit logic
-        // must prefer it over the legacy attach coordinates.
-        ctx.surfaces
-            .get_mut(&surface_id)
-            .expect("surface state")
-            .pending
-            .offset = Some((8, 9));
-        let commit = ctx
-            .surfaces
-            .get_mut(&surface_id)
-            .expect("surface state")
-            .prepare_commit();
-        assert_eq!(
-            commit.buffer_offset,
-            (8, 9),
-            "an explicit offset must win over legacy attach coordinates"
-        );
-    }
-
-    #[test]
     fn consumed_attach_offset_is_not_reapplied_on_later_commit() {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
-        ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
 
         assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Forward);
-        ctx.surfaces
-            .get_mut(&surface_id)
-            .expect("surface state")
-            .pending
-            .offset = Some((8, 9));
         let surface = ctx.surfaces.get_mut(&surface_id).expect("surface state");
-        assert_eq!(surface.prepare_commit().buffer_offset, (8, 9));
+        assert_eq!(surface.prepare_commit().buffer_offset, (3, 4));
         assert_eq!(
             surface.prepare_commit().buffer_offset,
             (0, 0),
-            "the old explicit and legacy offsets must both be consumed"
+            "the attach offset must be consumed"
         );
     }
 
@@ -2889,7 +2746,6 @@ mod tests {
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
         assert_eq!(handler.on_damage(&mut ctx, 1, 2, 3, 4), Action::Drop);
-        assert_eq!(handler.on_offset(&mut ctx, 5, 6), Action::Forward);
         ctx.release_deleted_host_id(200);
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
@@ -3120,7 +2976,7 @@ mod tests {
     #[test]
     fn damage_buffer_mapping_does_not_include_surface_offset() {
         let mut surface = SurfaceState::default();
-        surface.pending.offset = Some((80, 90));
+        surface.pending.attach_offset = Some((80, 90));
         let commit = surface.prepare_commit();
         assert_eq!(commit.buffer_offset, (80, 90));
 
@@ -3147,7 +3003,7 @@ mod tests {
             mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
-        surface.pending.offset = Some((3, 0));
+        surface.pending.attach_offset = Some((3, 0));
         ctx.surfaces.insert(surface_id, surface);
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), Some((8, 6)));
         ctx.last_sender_id = surface_id;
@@ -3174,7 +3030,7 @@ mod tests {
             mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
-        surface.pending.offset = Some((3, 0));
+        surface.pending.attach_offset = Some((3, 0));
         ctx.surfaces.insert(surface_id, surface);
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), Some((8, 6)));
         ctx.last_sender_id = surface_id;
