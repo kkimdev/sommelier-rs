@@ -42,8 +42,8 @@ gate. It owns:
   peek watermarks (`keys/generations.rs`, below);
 - the recovery of an empty confirmation's held key (`keys/recovery.rs`,
   [below](#the-recovery-decision));
-- the host accelerators (`SOMMELIER_ACCELERATORS`), whose chords the
-  host keeps. A chord is the host's, a shortcut's, or the guest's
+- the host accelerators (`SOMMELIER_ACCELERATORS`, [below](#host-accelerators)),
+  whose chords the host keeps. A chord is the host's, a shortcut's, or the guest's
   (`KeyboardCore::classify`, which both key channels ask). A shortcut is
   generic: the core asks `Env` for a chord's binding
   (`accelerator::BindingId`), consumes its press and release, and hands
@@ -193,6 +193,25 @@ held `stale` across a detach.
 | `Press` | a `wl_keyboard.key` of that keyboard the proxy drops undecoded, as the guest released the keyboard | drop |
 | any | the text input's `leave` (E6) | drop |
 | any | anything else | recover, then handle the event |
+
+## Host accelerators
+
+Exo runs a Chrome accelerator (Ctrl+T opens a tab, Ctrl+W closes one)
+on a key it also sends the client, unless the keyboard has a
+`zcr_extended_keyboard_v1`: then it holds each key's accelerator in
+`pending_key_acks_` until the client's `ack_key`, or for 1000 ms, and
+runs it only for `not_handled` (`Keyboard::AckKeyboardKey` in
+`components/exo/keyboard.cc`; `SetNeedKeyboardKeyAcks` in
+`components/exo/wayland/zcr_keyboard_extension.cc`). The proxy creates an
+extended keyboard for every host keyboard and acknowledges each key: a
+chord in `SOMMELIER_ACCELERATORS` (the chords the host keeps; ChromeOS's
+`cros-sommelier-override.conf` sets `Super_L`, `<Alt>bracketleft`,
+`<Alt>bracketright` and `<Alt>tab`) as `not_handled`, so Exo runs it and
+the guest does not get it, and every other key as `handled`, so the guest
+app gets Ctrl+T. `zwp_keyboard_shortcuts_inhibit_manager_v1` only sets a
+flag on the surface that Exo's accelerator path never reads
+(`components/exo/wayland/zwp_keyboard_shortcuts_inhibit_manager.cc`), so
+the proxy does not use it.
 
 ## Tests
 

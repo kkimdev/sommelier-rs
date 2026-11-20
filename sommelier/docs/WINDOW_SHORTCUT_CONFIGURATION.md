@@ -21,10 +21,8 @@ file, placement is off. There is no other switch. The settings
 `XDG_CONFIG_HOME` (unless it is empty or relative, which the XDG base
 directory specification says to ignore) or else an absolute `HOME`; with
 neither, placement stays off. `SOMMELIER_ACCELERATORS` is read once,
-at startup, too. The earlier `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`,
-`--window-shortcuts-config`, `SOMMELIER_WINDOW_PLACEMENT_BACKEND` and
-`SOMMELIER_WINDOW_BOUNDS_AS_ARC` are gone. `SIGHUP` no longer reloads the
-file: like `SIGTERM`, it ends the proxy.
+at startup, too. `SIGHUP` does not reload the file: like `SIGTERM`, it
+ends the proxy.
 
 ## The file's states
 
@@ -351,10 +349,8 @@ bounds = (X + left, Y + top, right - left, bottom - top)
 - The pixel bias is `1e-6`. It only corrects floating-point error (see
   [Precision](#precision)): it moves an edge by at most the bias, so only an
   edge less than the bias below a pixel boundary lands on the next pixel.
-- For the halves used by the named actions, `floor(0.5 * W)` equals `W / 2`,
-  so their bounds are exactly what the dedicated half-split code produced
-  before (a unit test compares both across small, odd, and extreme sizes).
-  For an odd width the left half gets the smaller share.
+- For the halves used by the named actions, `floor(0.5 * W)` equals
+  `W / 2`, so for an odd width the left half gets the smaller share.
 - The placement is skipped (the chord is still [consumed](#chord-handling))
   when the work area is unavailable, when an edge strictly inside `(0, 1)`
   rounds onto the work-area border (the output is too small to represent the
@@ -517,22 +513,3 @@ correctly, with no warning in the log.
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), sends the shelf application ID, and releases the `zaura_shell` binding. |
 | `sommelier/src/handler/callback.rs` | `queue_internal_sync` issues the placement barrier, and `wl_callback.done` dispatches it to `window_placement::complete_barrier`. |
 | `sommelier/src/proxy.rs` | `Shared` loads and watches the bindings file once and shares the configuration with every connection. |
-
-## Not carried over from the earlier draft
-
-An earlier draft of this feature targeted a different placement architecture.
-These parts were intentionally not reintroduced:
-
-- `--experimental-window-placement`, `--window-host-policy` and
-  `--window-geometry-method`. The bindings file is the only switch.
-- `action = "window.place"`. A binding now names its target directly with
-  `rect` or a named `action`.
-- Rounding each edge to the nearest pixel. Flooring is required to keep the
-  named actions' bounds identical on odd work-area sizes.
-- Failing startup on any configuration error, including a malformed
-  `SOMMELIER_ACCELERATORS`, and rejecting empty list elements in it. The
-  proxy serves every app in the container, so a configuration error only
-  disables what depends on it (see [The file's states](#the-files-states)).
-- A binding list in an environment variable, a path option, `SIGHUP`
-  reloads, and a per-instance control socket. One file at a fixed path,
-  reloaded as it changes, replaces them all.

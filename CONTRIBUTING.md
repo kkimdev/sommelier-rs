@@ -42,8 +42,10 @@ numbers or global state another test leaves alone; see
 - Every behavior change needs a regression test that fails before the
   change and passes after it.
 - State each documentation fact once and link to it elsewhere: the README
-  owns usage and configuration, `docs/` the design and invariants, and
-  `sommelier/docs/` each feature's contract.
+  owns usage and configuration; `docs/` the design, the rules, the IME and
+  the keyboard; `sommelier/docs/` the window placement contract;
+  [HANDOVER.md](HANDOVER.md) the open issues; and the module docs the
+  mechanism, which no document restates.
 - Never commit transient files; `*.local.*` and `_local/` are ignored for
   them.
 
@@ -72,33 +74,12 @@ assert_eq!(
 
 - `guest`, `host` and their `_fatal` forms send messages and say whether
   the session must survive them; `guest_received_and_error` checks that a
-  session ended with one `wl_display.error`, its last event. A guest
-  request that waits for a fence holds the guest's stream until
-  `resume`.
+  session ended with one `wl_display.error`, its last event.
 - Read everything each peer received: a `Session` dropped with output
-  the test never read fails.
-- Each peer receives the proxy's bytes over a real socket, follows its
-  objects as libwayland does, and fails on output the protocol forbids
-  (`test_support::wire_peer`):
-  - a message from, or naming, an object the peer does not have, one of
-    another interface, one the sending side ended, or null where the
-    argument may not be;
-  - a message newer than its object's version;
-  - a new object under an ID outside the sender's range, still in use,
-    or more than one past the highest that range has used;
-  - a `delete_id` of an object no destructor ended, or a second one: the
-    host may end a live guest object on its own only if it is a frame
-    callback of a surface that ended, or the test allows it with
-    `Session::host_may_end`;
-  - a request from, or naming, a host object after the proxy read the
-    host's `delete_id` for it: the proxy reads each host event as the
-    test sends it, so no request can cross one;
-  - a header that cannot be framed, part of a message, or a descriptor
-    no message took, once the proxy has sent all it holds.
-
-  A test that gives the proxy an object no peer can have it create, such
-  as a native dma-buf buffer, pairs it with `Session::pair_for_test`,
-  which both peers learn.
+  the test never read fails. Each peer holds the proxy to the protocol
+  as libwayland would (`test_support::wire_peer` lists the checks). A
+  test that gives the proxy an object no peer can have it create, such as
+  a native dma-buf buffer, pairs it with `Session::pair_for_test`.
 - Learn host IDs from what the proxy forwards (`create`, `surface`), not
   from the object table. The peers name objects by their wire `u32`s; state
   the proxy keeps for an object is keyed by a `GuestId` or a `HostId`,
@@ -134,76 +115,10 @@ assert_eq!(
 ## Randomized tests
 
 `proxy::fuzz` feeds a whole proxy client random, protocol-shaped guest
-request streams built from the vendored XML, some of them damaged, in
-random pieces. Their strings are sometimes not UTF-8, and sometimes
-nearly as long as a message, so that replacing their invalid bytes can
-make a forward too long. Half the cases end like a client typing into
-text fields (`proxy::fuzz::typing`): it moves the focus between its
-surfaces, waits for each move with a roundtrip, and enables, edits and
-disables the field; now and then it releases its seat while the field
-is enabled, reuses the seat's ID for a surface once it is deleted, and
-disables the field, which the proxy can then no longer deactivate. A
-quarter of the cases run with window placement on, so every XDG
-toplevel gets a host-only Aura toplevel; the run reports how many were
-created.
-
-Each case runs on the DST's scheduler (`proxy::fuzz::world`, below): the
-pieces of the guest's stream, what the proxy sends each peer and the
-host's answers each arrive after a latency the seed draws, so a seed
-fixes a case's timing as well as its input, and a replay is exact; two
-cases in 50 run twice and must leave the same trace. The proxy is a
-`proxy::harness::Session`, so its two peers hold everything it sends
-to the protocol (`test_support::wire_peer`, above). The host is the
-display the DST plays too (`sim::display`), with the Exo model behind
-it (`sim::exo`): it advertises every global, and one more output that
-it removes at once, so a bind of it crosses the removal; answers each
-sync and destructor; creates objects of its own (a data offer for each
-data device, a buffer for each asynchronous dma-buf create), as weston
-does; destroys a destroyed surface's pending frame callbacks without
-`done`; and gives each new keyboard the keymap and each keyboard the
-seat's focus. Exo drops a content type while no input method is
-attached, spends a pending surrounding-text support on the next content
-type, keeps surrounding text and the cursor rectangle regardless, and
-sends `enter` and `leave` as an input method attaches and detaches. The
-seed picks the host's `zcr_text_input_extension_v1` version: the
-newest, or in a quarter of the cases one too old for the proxy to give
-a text input an input method. Around the display, the host gives the
-seat's focus to each surface the proxy commits; as it answers a sync,
-composes on the focused field, clicks and taps there, and now and then
-takes its input method away, as when its process restarts, so that the
-proxy must activate the field again; holds its answer to a text input's
-drain barrier until it answers anything else, so a transaction the guest
-sends meanwhile reaches the proxy first and the proxy defers the
-field's activation, unless the guest waited with a second roundtrip;
-and in a quarter of the cases ends the live objects of one interface on
-its own as it answers some syncs.
-
-Each case must end without a panic, close every descriptor, and send at
-most one `wl_display.error`, as its last event. A case whose framing is
-intact must also either answer the stream's closing `wl_display.sync`
-or send that error. After every batch that keeps the session, the proxy
-must hold no state for an object that has ended
-(`Context::assert_no_orphans`). The guest takes a `delete_id` of an
-object it did not destroy only for a frame callback the host cancelled
-with its surface, or an object of the interface the host ends on its
-own; when its requests are whole and undamaged, every cancelled
-callback must get one before the closing sync is answered. What
-Exo holds of a field at the end is the DST's to check (`sim`, below).
-The run reports how many input methods restarted, how many host
-activations had their seat end while active, and how many deactivates
-named a seat the host had ended.
-
-A case that goes on for 100,000 deliveries hangs, and fails. One case
-in 30 also runs through `Client::run` over real sockets (test:
-`client_run_serves_guest_streams_over_sockets`), behind the same host,
-where the kernel decides the timing: its event loop must serve both
-sides until the guest leaves, keep the protocol with both, which the
-guest of an undamaged case checks as the session's guest does, and close
-every descriptor. A scheduled case has the proxy receive its bytes in
-pieces of a size its seed draws.
-
-The suite runs 6000 cases from seed 0; run more, from another seed,
-after changing how the proxy reads guest requests or tracks objects:
+streams on the DST's scheduler; its module docs say what a case does and
+must keep. The suite runs 6000 cases from seed 0; run more, from another
+seed, after changing how the proxy reads guest requests or tracks
+objects:
 
 ```bash
 SOMMELIER_FUZZ_CASES=200000 SOMMELIER_FUZZ_SEED=1000000 \
@@ -218,31 +133,15 @@ prints with the failure.
 
 ## Simulation test
 
-`sim` is a deterministic simulation test (DST) of the IME bridge. It
-types into models of Chromium's and GTK's text-input-v3 clients through
-a whole proxy client (`proxy::harness::Session`), with a model of Exo
-and its Korean input method behind it. Every message travels a FIFO
-channel with a drawn latency on one virtual clock, so a seed fixes the
-whole case, timing included; [docs/IME.md](docs/IME.md#4-the-dst-harness)
-describes it, and its [section 4.7](docs/IME.md#47-the-oracles) the
-checks. One test holds what the guest gets to what the simulation did,
-whatever the timing (test: `ime_reaches_the_specified_text`). The other
-also holds the client to the user's intent, in cases that settle around
-every click, tap, focus move and restart of the input method, and after
-a key the input method passes while it takes the engine to compose, whose
-confirmation then resets the engine (test:
-`ime_reaches_the_intended_text`). Each test runs in a
-process of its own, with the XKB defaults pinned.
-
-The suite runs 600 seeds from seed 0, an even seed free and an odd one
-settled, in about 5 s; two cases in 50 run twice and must leave the same
-trace, and a run fails if it never met a variant a case draws or a path
-the mode is there to reach, such as Exo's own detach (H2). Run more
-after changing the IME code or a model:
+`sim` is a deterministic simulation test (DST) of the IME bridge;
+[docs/IME.md section 4](docs/IME.md#4-the-dst-harness) describes it, and
+the `sim` module docs its settings. The suite runs 600 seeds from seed 0
+in about 5 s. Run more after changing the IME code or a model, in
+release mode, which is several times faster:
 
 ```bash
 SOMMELIER_DST_CASES=100000 SOMMELIER_DST_SEED=1000000 \
-  cargo test -p sommelier --bins sim::
+  cargo test --release -p sommelier --bins sim::
 ```
 
 A failure prints its seed, each failed check with its tier and field, the
@@ -253,25 +152,18 @@ SOMMELIER_DST_CASES=1`, which replays it exactly;
 `SOMMELIER_DST_MODE=free|settled` narrow a run.
 
 The first failed case of a run is shrunk (`sim/shrink.rs`) after its
-report: ddmin over its actions, zeroing runs of its choices (0 is the
-minimum latency or the first variant), then dropping the trailing zeros,
-within 2,000 re-runs or 60 s, keeping a step only if the same check still
-fails. The report ends with `SHRUNK from ...`, the shrunk case's own
+report, and the report ends with `SHRUNK from ...`, the shrunk case's own
 report, and a `Regression { ... }` snippet that replays it. To add a
 regression, fix the bug, then paste the snippet into `CASES` in
 `sim/regressions.rs`, give it a name that says what it caught and a
 `reaches` check of the counts that show the state the bug needs, and run
 `cargo test -p sommelier --bins sim::regressions`; it must fail on the old
-code and pass on the fix. A regression also fails, with what went wrong,
-once its replay draws other choices than it stores: a draw the models
-added or re-ranged, or a message the proxy added or dropped, makes it
-replay another schedule. If the proxy changed, rule out a regression,
-then shrink it again, or, once the code before its fix is gone, find a
-schedule of its actions that reaches the state again. And it fails once
-its own schedule no longer reaches that state, which a change to what the
-proxy or the models do there causes: find out why before shrinking it
-again, as a regression of the proxy shows here. A failure that does not
-replay from its choices, or a panic, is not shrunk.
+code and pass on the fix. A regression fails, with what went wrong, once
+its replay draws other choices than it stores (a draw the models added or
+re-ranged, or a message the proxy added or dropped), or once its schedule
+no longer reaches its state: rule out a regression of the proxy, then
+shrink it again, or find a schedule of its actions that reaches the state
+again.
 
 ## Recorded host traces
 
@@ -293,17 +185,12 @@ x86_64 and sets `SOMMELIER_E2E_REQUIRED=1` so a missing one fails.
 
 ## Live VirtWL test
 
-Unit tests reach the VirtWL channel only through the functions that
-handle what an ioctl returned; the ioctls themselves need a real
-`virtio_wl` device. A test of `virtwl_channel` drives one (test:
-`live_try_recv_eagain_then_async_recv_wakes`): it opens a
-VirtWL context, checks that a receive on the empty context returns at
-once and that an asynchronous receive waits, then sends a
-`wl_display.sync` and waits up to five seconds for the host compositor's
-`wl_callback.done`. It is ignored by default, because CI has no such
-device. Run it in a Crostini container, or another guest whose
-`/dev/wl0` you can read and write and whose host compositor answers;
-set `SOMMELIER_TEST_VIRTWL` to use another device path:
+The VirtWL ioctls need a real `virtio_wl` device, so the test of
+`virtwl_channel` that drives one (test:
+`live_try_recv_eagain_then_async_recv_wakes`) is ignored by default. Run
+it in a Crostini container, or another guest whose `/dev/wl0` you can
+read and write and whose host compositor answers; set
+`SOMMELIER_TEST_VIRTWL` to use another device path:
 
 ```bash
 cargo test -p sommelier --bins live_try_recv -- --ignored

@@ -204,7 +204,7 @@ text input before the gate, as each one changed Exo's text.
 | F4 | Press: a `wl_pointer.button` press from a pointer whose `enter` named `s`, or a `wl_touch.down` on `s` (`pointer.rs` and `touch.rs`, through `text_input::end_composition_on_press`) | The enabled text input is focused on `s`; gate; `shown = Some(p)` | `zwp_text_input_v1.reset`, then a barrier (the fence) | `Txn{commit: p, preedit: none}`, then the press or down itself, re-sent by the core | `shown := none`; `fence := Some(f)`; the lease ends. A press whose commit does not fit changes nothing and is forwarded. A press leaves the pieces to their edit (B3). A release, another surface (subsurfaces included), no composition, or an open fence changes nothing, and the press is forwarded. | 2.6 "A press ends the composition on its surface" |
 | F5 | Key activity: a key press the keyboard concern forwards to the guest (`Input::GuestKey`, from the keyboard core) | The text inputs of that seat | none | none | The guest may have edited its text where Exo does not see, so the mirror stops measuring until the guest states its text (2.6 "Exo's deletes and regions are measured in the Exo mirror, or dropped"). Leases are keyboard state: the keyboard ends them on a non-Backspace press and on a Backspace release. | INVARIANTS "IME state is scoped to its keyboard or seat"; row test: `row_H9_after_a_forwarded_key_drops` |
 | F6 | Host `delete_id` of the v1 object while the guest object is live (`forget_object`, as `Input::Destroy` with `host_deleted`) | any | Nothing to v1; the extension is destroyed | `delete_id`, as in G10 | Link → `Detached` with no requests. | test: `a_host_destroyed_text_input_sends_nothing_to_its_host_object` |
-| R1 | **Abandon** (reconcile outcome): the target is inactive, the link is `Attached`, and `Env::host_seat` is `None` | none | none | none | Link → `Detached` locally; the composition is cleared; **the fence stays**. Exo keeps its input method attached until its own focus moves; HANDOVER covers the cost. | `ActivationStep::Abandon`; HANDOVER "A text input whose guest `wl_seat` goes away…" |
+| R1 | **Abandon** (reconcile outcome): the target is inactive, the link is `Attached`, and `Env::host_seat` is `None` | none | none | none | Link → `Detached` locally; the composition is cleared; **the fence stays**. Exo keeps its input method attached until its own focus moves ([5.4](#54-known-gaps)). | `ActivationStep::Abandon` |
 | R2 | **Deferred activation** (reconcile outcome): the target is active, and the link is `Draining`, or `Detached` with no live seat | none | none | none | No change. The deferral is logged when it starts or changes its reason (`Deferral::Draining` or `NoSeat`), not at every step that finds it waiting. A missing seat warns once per text input. | `ime/host.rs`; `Warned` |
 
 A seat that ends is **not** an input. The core notices it at the
@@ -954,7 +954,7 @@ for user actions (U→E), and the mojo pipe between Exo and the engine
   which the DST and the fuzzer share. The DST's display leaves out the
   `delete_id` of a destroyed `zcr_extended_keyboard_v1`, as its model
   always has, so that the shrunk regressions replay their schedules
-  (HANDOVER, "Known issues and debt"). The display takes the model's events
+  ([HANDOVER](../HANDOVER.md#open-issues-and-debt)). The display takes the model's events
   after each input and before it answers any later sync, so that a
   sync's `done` follows every event of earlier requests (E11). It reads
   a surrounding text or a `reset` and the sync glued to it in one go, as
@@ -1224,19 +1224,16 @@ so that the fact it settles cites the trace and its replay keeps it.
 | U1 | Does Exo ever send `zwp_text_input_v1.keysym`? | The proxy logs the first keysym it drops at info level, the default: log a week of Korean and English typing. | H10: a keysym that arrives would have to reach the guest as a press and a release |
 | U4 | Does the Korean engine commit a confirmable composition with `commit_string` or with `confirm_preedit`? E15's Space commits "가 " with `commit_string`, but that text is not the composition. | Type "가", then Enter, or click elsewhere. | E9 |
 | U5 | Should the composition be kept on blur? Native Chrome keeps it. F1 commits it instead, as mutter and ibus do; keeping it would need Exo to keep its composition across the detach, which E6 rules out. | Type "가" in a native Chrome field, Alt-Tab, and compare with the guest. | F1 |
-| U6 | How often does an engine commit for a key pressed just before a click arrive after the fence (P3), and what are real engine latencies? | HANDOVER's "Press Space and click at the same instant", counted, with timestamps. | Q1; the lag profiles |
+| U6 | How often does an engine commit for a key pressed just before a click arrive after the fence (P3), and what are real engine latencies? | Press Space and click in the field at the same instant, many times, with timestamps; count the syllables that appear twice. | Q1; the lag profiles |
 | U7 | Does Exo send `wl_touch` to Crostini clients, and in what order relative to text-input events? | Tablet mode. | F4 for touch |
-| U8 | Does the `done` that answers each commit move the candidate window with the caret? | HANDOVER's check. | G9c |
+| U8 | Does the `done` that answers each commit move the candidate window with the caret? | In Chrome or VS Code started with `--enable-wayland-ime --wayland-text-input-version=3`, type Korean: the candidate window follows the caret after a click or an arrow key, before the next keystroke, and a composition survives the caret-rectangle updates it causes, with no syllable dropped or doubled. | G9c |
 | U10 | In GTK3, does `GtkEntry` update its cursor location before the click's release? This decides whether C7's release-time enable happens. | `WAYLAND_DEBUG` on gedit while clicking. | The GTK3 model's C7 |
 | U12 | Does the ChromeOS Korean engine combine two lone consonants (ㄱ + ㅅ → ㄳ), as libhangul's default and the DST's `Composer` do? | Type ㄱ then ㅅ with no vowel. | The `Composer`'s lone-consonant rule |
 | U13 | Does Chromium's blur follow the keyboard focus or the xdg `activated` state? If it follows `activated`, which can come before the keyboard's `leave`, Chromium blurs before F1's commit reaches it and drops that commit (C11), so it keeps the syllable only if its blur confirms it (U14). | `WAYLAND_DEBUG` on a Chromium guest while Alt-Tabbing, and while focusing another guest window. | C11; F1 |
 | U14 | Does Chromium's blur call `ResetContext`, and so confirm a composition locally? F1's commit reaches it before the blur, so a local confirmation finds nothing composed; a double commit would mean the commit came after it. | Type "가" in a Chromium guest, Alt-Tab, and come back. | C11; F1 |
 | U15 | Does a Chromium tap-down finish the composition, or only the tap's lift? | Tablet mode: type "가", then touch the field and hold. | C4 for touch |
-
-U9 (whether the ARC placement backend bypassed the IME) is closed: Chrome
-sends an ARC window's keys past the IME, so placement no longer makes windows
-ARC (see
-[How a window is moved](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#how-a-window-is-moved)).
+| U16 | Does a press end the composition on a host as F4 expects? | In Chrome or VS Code started as for U8, and in gedit, type a syllable and click elsewhere in the field while it composes, then tap on a touchscreen: the syllable stays where it was, committed once, and the next jamo starts a new syllable at the click or tap, without the old one showing up there. | F4 |
+| U17 | Does the Exo mirror follow a real Exo? | With `RUST_LOG=sommelier::ime=debug`, in gedit, a GTK4 app, and Chrome or VS Code started as for U8: type Korean with Shift, hold Backspace, reconvert with the hanja key inside a word and after it, then press Esc and Backspace, click and move the focus while composing, and accept a suggestion if one is offered. No "Exo mirror ... diverged" warning shows, and every "Dropping Exo's" debug line has a cause the case explains. | 2.6 mirror rule; 5.4 |
 
 ### 5.3 Open design questions
 
@@ -1252,10 +1249,68 @@ ARC (see
   composition does not reset Exo. GTK's reset is a commit with
   `cause=other`, and GTK4 sends one on every press, which F4 already
   covers. Decide on DST evidence whether a host `reset` behind a fence
-  is needed (HANDOVER lists it).
+  is needed.
 - **Q4. Subsurface presses.** mutter matches the surface and KWin the
   window. Chromium and Firefox subsurfaces have an empty input region.
   Leave as is. The DST does not model subsurfaces.
 - **Q5. A rejected enable** still applies the rest of its commit (G9c).
   Tightening it would be a one-line change in the Commit arm, if
   wanted.
+
+### 5.4 Known gaps
+
+What the proxy is known to get wrong, worst first. None has been seen on
+a host.
+
+1. **A drop doubles text once.** A delete or a region the mirror cannot
+   measure is dropped (2.6 "Exo's deletes and regions are measured in
+   the Exo mirror, or dropped"), and the input method's next commit
+   doubles text until the guest's next report. The gaps that cause
+   drops:
+   - GTK3 reports a click's new cursor only with its next edit, so a
+     region right after the click is measured at Exo's old cursor. The
+     DST's tier 1 holds the proxy to Exo's text, not the guest's, so it
+     misses this; tier 2 sees it only in free cases, which it does not
+     judge.
+   - A guest commit that states no surrounding text reads as
+     "unchanged" (Chromium reports its text only when it changed, C1),
+     so a client that commits a changed text without stating it, as
+     GTK3 might with a commit of only a cursor rectangle after a click,
+     leaves the guest wrongly in step.
+   - A region that does not cover the composition Exo holds is dropped:
+     the guest keeps the old preedit while Exo composes the new range
+     and keeps the rest of the old one as text. The exact answer commits
+     that rest after the region's delete.
+   - Chromium applies a transaction's delete before its preedit clear
+     and drops a delete while it shows a composition (C3), so a region
+     over a shown preedit that deletes bytes beyond it leaves them in
+     Chromium's text as well as in the new preedit, and the next region
+     is dropped until the guest reports (test:
+     `a_region_over_a_region_drops`). A `done` of its own for the clear
+     would serve Chromium, but Chromium's report in answer lacks the
+     preedit, so Exo would drop its composition (E4).
+   - The mirror assumes Exo reads a report and its glued sync in one
+     read; an IME event between them would leave it exact but wrong.
+2. **An engine commit after a press's fence doubles a syllable** (P3;
+   Q1, U6).
+3. **A withheld report hides a guest edit** that happens to equal Exo's
+   state without the shown composition, as from a client that drops its
+   preedit without a word (C4): Exo keeps composing until the
+   composition ends and the next report goes out. Exo's own clients
+   share that hazard whenever a report matches.
+4. **IMA keeps composing after a composition empties** (ㄱ then
+   Backspace), so an earlier key's text can be lost. This is host
+   behaviour, not mitigated.
+5. **A replace-selection delete is lost**, since deletes are dropped
+   while the guest has a selection (2.6 "Exo's deletes are absolute and
+   stand alone").
+6. **A focus-loss commit too long for one message loses the preedit**:
+   Exo's own confirmation is dropped while the link drains.
+7. **A seat that goes away leaves Exo attached** (R1). A text input
+   whose guest `wl_seat` ends while it is active ends its host
+   activation without a `deactivate`, since none can name a live seat,
+   at the end of the core's next step. Exo keeps its input method
+   attached until its own focus moves, and if the guest binds a new
+   seat under the seat's ID on that surface, Exo's `activate` does
+   nothing and the stale attachment stays. Any live host seat would do
+   for the `deactivate`.

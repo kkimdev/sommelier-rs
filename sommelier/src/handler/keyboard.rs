@@ -29,9 +29,8 @@ limitations under the License.
 //! host skips the accelerator). A chord a shortcut binds is consumed, and
 //! its binding goes to the shortcut's subscriber, window placement
 //! ([`crate::handler::window_placement::shortcut`]). `docs/KEYBOARD.md`
-//! describes the core.
-//!
-//! See `sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
+//! describes the core, and its "Host accelerators" what Exo does with an
+//! acknowledgment.
 
 use crate::accelerator::{Accelerator, BindingId};
 use crate::handler::callback::queue_internal_sync;
