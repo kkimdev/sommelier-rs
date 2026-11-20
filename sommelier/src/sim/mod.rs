@@ -199,6 +199,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         };
         outcome.counts = spec.counts;
         outcome.counts.drops = drops;
+        outcome.counts.exo = world.exo.reached;
         let (engine, resets) = (world.engine_composition(), world.engine_resets());
         let (exo, steps) = (&world.exo, &world.steps);
         let mut failures = oracle::exact(steps, spec, exo, &engine, resets);

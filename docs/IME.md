@@ -851,10 +851,12 @@ There are two generator modes, half of the cases each:
      committed.
 - **Counters** (in the summary): late results applied after a fence
   (P3), text a fence dropped, raw keys, deletes and regions and the
-  proxy's drops by cause, reports that crossed an edit (P4), autorepeats
-  and what each empty confirmation became (X2'), Backspace leases,
-  surfaces destroyed (F2), client drops by reason, and one counter per
-  draw. A counter `check` (`sim/mod.rs`) lists that stays at zero over a
+  proxy's drops by cause, reports that crossed an edit (P4), regions
+  that crossed a report and reports withheld (G9c), reconversions Exo
+  refused, autorepeats and what each empty confirmation became (X2'),
+  Backspace leases, surfaces destroyed (F2) and keys Exo sent to one,
+  the states of the Exo model the regressions check (`exo::Reached`),
+  client drops by reason, and one counter per draw. A counter `check` (`sim/mod.rs`) lists that stays at zero over a
   full run fails the run; the summary prints the rest.
 
 **Tier 2: the user-intent oracle. Settled cases only.**

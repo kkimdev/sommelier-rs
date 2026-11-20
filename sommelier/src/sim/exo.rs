@@ -93,7 +93,7 @@ use crate::protocols::text_input_unstable_v1::{zwp_text_input_manager_v1, zwp_te
 use crate::protocols::wayland::{wl_keyboard, wl_registry, wl_seat};
 use crate::protocols::AnyRequest;
 use crate::wire::{IndexedString, Outgoing};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 
 /// What one Exo `TextInput` holds for its field.
@@ -564,6 +564,35 @@ struct PendingKey {
     dropped: bool,
 }
 
+/// States of the model that a case reached, which a stored regression
+/// checks its replay still reaches ([`super::regressions`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Reached {
+    /// `set_preedit_region`s Exo sent while it held a composition.
+    pub regions_over_compositions: u64,
+    /// Regions IMA held for a key in flight, which its confirmation before
+    /// that key, unhandled, composed.
+    pub held_regions_confirmed: u64,
+    /// Unhandled presses, while another key was held, of a key whose
+    /// release died with the input method, which the keyboard still held,
+    /// so that only the confirmation before them went out (E13); and those
+    /// of a key whose earlier press the keyboard had forwarded.
+    pub stale_presses: u64,
+    pub stale_presses_forwarded: u64,
+    /// Keyboard enters that forgot such a key.
+    pub stale_keys_forgotten: u64,
+}
+
+impl std::ops::AddAssign for Reached {
+    fn add_assign(&mut self, other: Self) {
+        self.regions_over_compositions += other.regions_over_compositions;
+        self.held_regions_confirmed += other.held_regions_confirmed;
+        self.stale_presses += other.stale_presses;
+        self.stale_presses_forwarded += other.stale_presses_forwarded;
+        self.stale_keys_forgotten += other.stale_keys_forgotten;
+    }
+}
+
 /// Exo's seat and its text inputs, as far as the model goes.
 #[derive(Default)]
 pub(crate) struct Exo {
@@ -586,6 +615,8 @@ pub(crate) struct Exo {
     /// each press (`Keyboard::pressed_keys_`): its release goes the same
     /// way.
     pressed: BTreeMap<u32, bool>,
+    /// The keys of `pressed` whose release died with the input method.
+    stale: BTreeSet<u32>,
     /// The last serial an event took.
     serial: u32,
     /// The serial `MaybeNextKeySerial` keeps for keys: a `peek_key` takes
@@ -611,6 +642,8 @@ pub(crate) struct Exo {
     /// `wl_display.sync`, with the sync's callback, in order
     /// ([`Exo::snapshot_trackers`]).
     pub(super) synced: Vec<(u32, BTreeMap<u32, Tracker>)>,
+    /// What the case reached.
+    pub(super) reached: Reached,
 }
 
 impl Exo {
@@ -794,10 +827,16 @@ impl Exo {
                     }
                     self.flush()
                 } else {
+                    let region = self.ima.region.is_some();
                     let shown = self
                         .ima
                         .client
                         .is_some_and(|client| self.confirm_composition(client));
+                    self.reached.held_regions_confirmed += u64::from(region && shown);
+                    let stale = held && self.stale.contains(&code) && self.pressed.len() > 1;
+                    let forwarded = stale && self.pressed.get(&code) == Some(&false);
+                    self.reached.stale_presses += u64::from(stale);
+                    self.reached.stale_presses_forwarded += u64::from(forwarded);
                     let sent = self.flush() || shown;
                     if !held {
                         self.key_events(k, time, pressed, false);
@@ -1014,6 +1053,9 @@ impl Exo {
         self.ima = Ima::default();
         for pending in &mut self.in_engine {
             pending.orphaned = true;
+            if let Some((key, false)) = pending.key {
+                self.stale.insert(keymap::keycode(key).0);
+            }
         }
         let mut detached = false;
         for id in self.ids() {
@@ -1534,6 +1576,7 @@ impl Exo {
             return false;
         }
         let truth = RegionTruth::of(text);
+        let over = !text.predicted.composition().is_empty();
         let hidden = self.extension_of(id).is_none();
         let composed = self
             .text_input(id)
@@ -1543,6 +1586,7 @@ impl Exo {
             let index = -i32::try_from(cursor - range.start).expect("a short region");
             let length = u32::try_from(range.len()).expect("a short region");
             let event = extended::evt::set_preedit_region(extension, index, length);
+            self.reached.regions_over_compositions += u64::from(over);
             self.region_truths.push((self.events.len(), truth));
             self.events.push(event);
         }
@@ -1624,7 +1668,9 @@ impl Exo {
     /// or `None` if Exo tracked no such press, whose release
     /// `Keyboard::OnKeyEvent` ignores.
     fn release(&mut self, key: Key) -> Option<bool> {
-        self.pressed.remove(&keymap::keycode(key).0)
+        let code = keymap::keycode(key).0;
+        self.stale.remove(&code);
+        self.pressed.remove(&code)
     }
 
     /// `wl_keyboard.modifiers` with `depressed`, if they changed.
@@ -1646,6 +1692,8 @@ impl Exo {
     /// method ([`Exo::destroy_input_method`]) is no longer held, and its
     /// next press gets its `peek_key` again.
     fn keyboard_enter(&mut self, keyboard: u32, surface: u32) {
+        self.reached.stale_keys_forgotten += u64::from(!self.stale.is_empty());
+        self.stale.clear();
         self.pressed.clear();
         let serial = self.next_serial();
         let modifiers = self.modifiers;

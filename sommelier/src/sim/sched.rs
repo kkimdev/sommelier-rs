@@ -59,6 +59,7 @@ use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
 use super::surfaces::Surfaces;
 use super::ClientKind;
+use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{
     wl_callback, wl_compositor, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat,
@@ -295,8 +296,12 @@ pub(super) struct World<'t> {
     p_to_e: Channel<Vec<(u32, AnyRequest)>>,
     /// Each host event, what engine text it carries, and how many of the
     /// proxy's surrounding texts Exo had got when it sent the event.
-    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>)>,
+    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>, u64)>,
     to_engine: Channel<EngineIn>,
+    /// The guest's surrounding texts the proxy sent the host, and those
+    /// that reached Exo.
+    reports_sent: u64,
+    reports_got: u64,
     /// The guest's view of what the client models do not take: the
     /// globals, Shift and where its pointer is, as the proxy tells it.
     globals: BTreeMap<String, (u32, u32)>,
@@ -367,6 +372,8 @@ impl<'t> World<'t> {
             shift: false,
             pointer: None,
             keyboard_gone: false,
+            reports_sent: 0,
+            reports_got: 0,
             resets: 0,
             repeat: None,
             edits: Edits::default(),
@@ -505,13 +512,14 @@ impl<'t> World<'t> {
                 }
                 2 => {
                     for (sender, request) in self.p_to_e.take() {
+                        self.reports_got += u64::from(is_report(&request));
                         let events = self.display.request(sender, &request, &mut self.exo);
                         self.host_sends(events, false);
                     }
                 }
                 3 => {
-                    let (event, origin, truth) = self.e_to_p.take();
-                    self.deliver_host_event(event, origin, truth).await;
+                    let (event, origin, truth, reports) = self.e_to_p.take();
+                    self.deliver_host_event(event, origin, truth, reports).await;
                 }
                 4 => {
                     let input = self.to_engine.take();
@@ -650,14 +658,14 @@ impl<'t> World<'t> {
             resets: self.resets,
             press,
         };
+        let reports = self.reports_got;
         for (event, truth) in self.exo.take_events_with_truths() {
-            self.e_to_p
-                .send(self.now, (event, origin, truth), &mut self.choices);
+            let sent = (event, origin, truth, reports);
+            self.e_to_p.send(self.now, sent, &mut self.choices);
         }
         for event in events {
-            let origin = Origin::default();
-            self.e_to_p
-                .send(self.now, (event, origin, None), &mut self.choices);
+            let sent = (event, Origin::default(), None, reports);
+            self.e_to_p.send(self.now, sent, &mut self.choices);
         }
         for input in self.exo.take_engine() {
             self.resets += u64::from(input == EngineIn::Reset);
@@ -672,12 +680,15 @@ impl<'t> World<'t> {
         self.log(Place::Engine, format!("{answer:?}"));
         let press = self.exo.press_of(&answer);
         let verdict = self.exo.answer(&answer);
-        match self.exo.take_region_outcome() {
+        let outcome = self.exo.take_region_outcome();
+        let refused = outcome == Some(RegionOutcome::Refused);
+        match outcome {
             Some(RegionOutcome::Composed(text)) => self.engine.learn_region(text),
             Some(RegionOutcome::Refused) => self.engine.refused_region(),
             None => {}
         }
         if let Some(spec) = &mut self.spec {
+            spec.counts.regions_refused += u64::from(refused);
             spec.counts.late += u64::from(verdict == Answer::Late);
             spec.counts.dropped += u64::from(verdict == Answer::Dropped);
         }
@@ -740,14 +751,24 @@ impl<'t> World<'t> {
         self.send_proxy_output(goes_on);
     }
 
-    /// A host event reaches the proxy.
+    /// A host event, which Exo sent once it had got `reports` of the
+    /// proxy's surrounding texts, reaches the proxy. A region that a later
+    /// report the proxy has sent did not reach in time crossed it.
     async fn deliver_host_event(
         &mut self,
         event: Outgoing,
         origin: Origin,
         truth: Option<RegionTruth>,
+        reports: u64,
     ) {
         let (sender, decoded) = self.display.decode(&event);
+        let region = matches!(
+            decoded,
+            AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion { .. })
+        );
+        if let Some(spec) = self.spec.as_mut().filter(|_| region) {
+            spec.counts.regions_crossing_reports += u64::from(self.reports_sent > reports);
+        }
         // The proxy drops a pointer enter that names a surface the guest
         // destroyed, so the guest's pointer is on none of its surfaces.
         if let AnyEvent::WlPointer(wl_pointer::Event::Enter { surface, .. }) = decoded {
@@ -819,6 +840,7 @@ impl<'t> World<'t> {
         let mut batch: Vec<(u32, AnyRequest)> = Vec::new();
         for (sender, request) in self.session.host_received() {
             self.log(Place::PToE, format!("{sender} {request:?}"));
+            self.reports_sent += u64::from(is_report(&request));
             self.see(Seen::ToHost(&request));
             let glued = matches!(
                 request,
@@ -897,6 +919,10 @@ impl<'t> World<'t> {
     fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>, gone: bool) {
         let now = self.now;
         self.edits.got.follow(&event);
+        let key = matches!(event, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }));
+        if let Some(spec) = self.spec.as_mut().filter(|_| key && gone) {
+            spec.counts.keys_to_no_window += 1;
+        }
         if let AnyEvent::WlRegistry(wl_registry::Event::Global {
             name,
             interface,

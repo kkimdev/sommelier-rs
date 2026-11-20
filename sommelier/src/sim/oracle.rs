@@ -306,6 +306,20 @@ pub(super) struct Counts {
     pub drops_truth_in_step: u64,
     /// Guest reports that crossed an edit on its way to the guest (P4).
     pub crossed_reports: u64,
+    /// Exo's regions that reached the proxy after it had sent a report Exo
+    /// made them before.
+    pub regions_crossing_reports: u64,
+    /// Guest reports the proxy withheld while the guest showed a preedit
+    /// (G9c).
+    pub reports_withheld: u64,
+    /// Reconversions Exo refused, as their range lay past its text.
+    pub regions_refused: u64,
+    /// Keys Exo sent to a surface the guest destroyed, which reach no
+    /// window.
+    pub keys_to_no_window: u64,
+    /// The states the Exo model reached; the world reads them at the end
+    /// of the case.
+    pub exo: exo::Reached,
 
     /// Focus moves that the text input heard of before the keyboard, bound
     /// after its activate, so that Exo detached while attached (H2).
@@ -352,6 +366,11 @@ impl std::ops::AddAssign for Counts {
         self.drops += other.drops;
         self.drops_truth_in_step += other.drops_truth_in_step;
         self.crossed_reports += other.crossed_reports;
+        self.regions_crossing_reports += other.regions_crossing_reports;
+        self.reports_withheld += other.reports_withheld;
+        self.regions_refused += other.regions_refused;
+        self.keys_to_no_window += other.keys_to_no_window;
+        self.exo += other.exo;
         self.detaches_before_keyboard += other.detaches_before_keyboard;
         self.recovered_keys += other.recovered_keys;
         self.recoveries_skipped += other.recoveries_skipped;
@@ -1405,6 +1424,7 @@ impl SpecText {
             self.report_withheld = withheld.as_ref().map(|(_, shown)| shown.clone());
         }
         if withheld.is_some() {
+            self.counts.reports_withheld += 1;
             self.withheld = withheld;
         } else if reported != expected {
             wrong.push(format!(

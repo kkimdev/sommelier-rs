@@ -216,10 +216,19 @@ within 2,000 re-runs or 60 s, keeping a step only if the same check still
 fails. The report ends with `SHRUNK from ...`, the shrunk case's own
 report, and a `Regression { ... }` snippet that replays it. To add a
 regression, fix the bug, then paste the snippet into `CASES` in
-`sim/regressions.rs`, give it a name that says what it caught, and run
+`sim/regressions.rs`, give it a name that says what it caught and a
+`reaches` check of the counts that show the state the bug needs, and run
 `cargo test -p sommelier --bins sim::regressions`; it must fail on the old
-code and pass on the fix. A failure that does not replay from its choices,
-or a panic, is not shrunk.
+code and pass on the fix. A regression also fails, with what went wrong,
+once its replay draws other choices than it stores: a draw the models
+added or re-ranged, or a message the proxy added or dropped, makes it
+replay another schedule. If the proxy changed, rule out a regression,
+then shrink it again, or, once the code before its fix is gone, find a
+schedule of its actions that reaches the state again. And it fails once
+its own schedule no longer reaches that state, which a change to what the
+proxy or the models do there causes: find out why before shrinking it
+again, as a regression of the proxy shows here. A failure that does not
+replay from its choices, or a panic, is not shrunk.
 
 ## End-to-end test
 
