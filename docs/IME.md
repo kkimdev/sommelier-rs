@@ -668,7 +668,7 @@ user actions.
 | `user.rs` | The user action generator, free and settled |
 | `display.rs` | The host display, which the fuzzer drives too: globals, syncs, `delete_id`, keymaps, the focus of the keyboards Exo does not play, pointers and touches, and the objects a compositor creates of its own |
 | `surfaces.rs` | Each field's surfaces, a generation each (F2), and the host windows that take them (`Windows`) |
-| `oracle.rs` | The exact oracle (`SpecText`, `Shadow`) and the user-intent oracle |
+| `oracle.rs` | Tier 1 (`Judge`, which holds `Shadow` to what the simulation did) and the user-intent oracle |
 | `shrink.rs` | Minimizing a failing case |
 | `regressions.rs` | Shrunk cases kept as regressions |
 
@@ -837,8 +837,8 @@ to the user and to a client that lags behind.
 
 There are two generator modes, half of the cases each:
 
-- **Free.** Any timing. The exact oracle judges it, which is valid for
-  every timing.
+- **Free.** Any timing. Tier 1 judges it, which is valid for every
+  timing.
 - **Settled.** Both oracles judge it. A `Settle` comes before and after
   every click, tap, focus move, restart, suggestion and reconversion.
   Otherwise Exo could hand the engine a key after a press but before its
@@ -856,37 +856,72 @@ There are two generator modes, half of the cases each:
   `ImeCore::assert_invariants`;
 - no `wl_display.error`.
 
-**Tier 1: the exact oracle, at the Exo boundary. All cases.**
+**Tier 1: what the guest gets against what the simulation did. All
+cases.**
 
-- **Reference.** `oracle::SpecText` reads every message delivered to the
-  proxy, in order, and applies the text semantics of section 2 to an
-  ideal client per field. From the inputs alone it decides what the
-  proxy must ask of the host: an `activate` or a `deactivate` and its
-  barrier where the field's wish and the link differ, and a `reset` and
-  its fence for a press that ends a composition. Each step's decisions
-  must be the proxy's own. It applies H7 to X2 by their rows, F4 at each
-  press on the composing surface, forwarded keys (raw ones included),
-  and F1, F2 and H2 at focus changes, surface ends and Exo's own detach.
-- **Shadow.** `oracle::Shadow` is the same ideal client fed what the
-  proxy actually sent the guest. It has no client drops.
-- **Checks at quiescence:**
-  1. **Text.** For each field, `Shadow` equals `SpecText` in text,
-     cursor, preedit and preedit cursor. This is exact for every timing,
-     because both sides are ideal clients.
-  2. **Composition.** For the focused field's attached text input,
-     Exo's composition equals `SpecText`'s preedit.
+The judge (`oracle::Judge`) models none of the proxy's decisions: the
+reconcile, the fence, the lease and the recovery decision are the cores'
+own, and their row tests pin them. It holds what the guest gets to what
+the simulated Exo, engine and user actually did, which the scheduler
+labels each of Exo's events with (`oracle::Origin`): the key whose press
+or autorepeat it answers, whether the engine made it before a reset that
+reached it after the key (late, P3), and how many of the proxy's
+`activate`, `deactivate` and `reset` requests Exo had handled when it sent
+it. `oracle::Shadow` is an ideal client fed what the proxy sent the guest:
+what the guest shows, holds and committed of its field.
+
+- **After every step:**
+  1. **Exo's edits.** A preedit, commit or confirmation that Exo sent
+     after it had handled every such request the proxy sent reaches the
+     guest as section 2 translates it (H5, H7, H8, X2). One that crossed
+     such a request does not: its text is for a composition the proxy has
+     already ended or left. Deletes and regions reach it as 4.8 says.
+  2. **The composition.** Nothing else changes what the guest shows,
+     except that the guest commits the preedit it shows where the
+     composition ends: at a press (F4), a focus change (F1) or Exo's own
+     detach (H2), after which it shows none. No press lands in, and no
+     `leave` drops, the preedit of an enabled field, but for a surface the
+     guest destroyed (F2); and the proxy sends `reset` exactly when a
+     press ends the composition the guest shows, so that Exo ends it too.
+  3. **Keys.** Each press the guest gets is Exo's `wl_keyboard.key` press
+     of that key, in the same step, or one for an autorepeat of a held key
+     that the input method passed (E13), at most once each, and never of a
+     key the guest holds. Every such press reaches it, and the
+     autorepeat's before Exo's next confirmation (X2'), unless the guest
+     holds the key, which repeats it itself; Exo's keyboard holds a key
+     whose release died with the input method, whose press would send the
+     same confirmation; or the proxy changed what Exo's text input serves
+     first.
+  4. **Reports.** The proxy reports the surrounding text and content
+     type the guest committed in the step, or withholds a report while
+     the guest shows a preedit, if Exo's tracker holds the report with
+     that preedit as its composition.
+- **At quiescence:**
+  1. **Keys.** No autorepeat's press is still owed, and the guest holds
+     no key that Exo's keyboard released.
+  2. **Composition.** For the focused field's attached text input, Exo's
+     composition, or its engine's, equals the guest's preedit, unless the
+     engine reset since the guest's preedit was made, Exo composes a
+     region the guest never got, or it composes a region its client
+     cannot see.
   3. **Field state.** Exo's attached field has the content type,
-     support, surrounding text and cursor rectangle that the client last
+     support, surrounding text and cursor rectangle that the guest last
      committed.
-- **Counters** (in the summary): late results applied after a fence
-  (P3), text a fence dropped, raw keys, deletes and regions and the
-  proxy's drops by cause, reports that crossed an edit (P4), regions
-  that crossed a report and reports withheld (G9c), reconversions Exo
-  refused, autorepeats and what each empty confirmation became (X2'),
-  Backspace leases, surfaces destroyed (F2) and keys Exo sent to one,
-  the states of the Exo model the regressions check (`exo::Reached`),
-  client drops by reason, and one counter per draw. A counter `check` (`sim/mod.rs`) lists that stays at zero over a
-  full run fails the run; the summary prints the rest.
+- **Counters** (in the summary): late results applied after a reset
+  (P3), Exo's edits that crossed a `reset` (the fence), raw presses (E7),
+  deletes and regions and the proxy's drops by cause, reports that
+  crossed an edit (P4), regions that crossed a report and reports
+  withheld (G9c), reconversions Exo refused, autorepeats and what became
+  of each one the input method passed (X2'), Exo's empty confirmations
+  before a press and at a detach while a key was held, surfaces destroyed
+  (F2) and keys Exo sent to one, the states of the Exo model the
+  regressions check (`exo::Reached`), client drops by reason, and one
+  counter per draw. A counter `check` (`sim/mod.rs`) lists that stays at
+  zero over a full run fails the run; the summary prints the rest.
+
+**Tier 1, settled cases: no loss.** At each `Settle` and at the end, each
+of the client model's fields shows every character the user intends
+there, in order, preedit included at the cursor (`oracle::lost`).
 
 **Tier 2: the user-intent oracle. Settled cases only.**
 
@@ -906,10 +941,12 @@ There are two generator modes, half of the cases each:
 
 The DST also holds the proxy to Exo's real text:
 
-- `SpecText` measures each delete and region in what the simulated Exo
+- The judge measures each delete and region in what the simulated Exo
   really held before it (`RegionTruth`). The guest must get exactly that
-  transaction or none.
-- The proxy counts its drops by cause (`Counts::drops`). `SpecText`
+  transaction or none; an empty region over a preedit the guest shows
+  that the proxy drops must commit that preedit, as Exo ends its
+  composition as text all the same.
+- The proxy counts its drops by cause (`Counts::drops`). The judge
   counts those where the guest held Exo's text (`drops_truth_in_step`).
   Those are the drops a sharper mirror could avoid. A settled case may
   make no drop.
@@ -933,7 +970,7 @@ The DST also holds the proxy to Exo's real text:
 | Risk | Mitigation |
 |---|---|
 | **The models are wrong** (Exo, the engine or the clients), so the DST passes on traces real hosts never produce, or fails on impossible ones. | Every model rule cites a source (2.4, 2.5) or is marked [U] and **drawn** (E9), so both branches stay covered. The host checks in 5.2 settle the rest. A DST failure is checked against the citations before any proxy fix. A recorded host trace ([traces/](../traces/README.md)) holds the proxy's Exo mirror to a real Exo when it replays. It does not yet hold the Exo model (4.3) to one: the model takes, besides the proxy's requests, the seat's focus moves, the user's keys and the engine's answers, which a trace shows only as Exo's events, mixed with its replies to the requests, so a check needs those events turned back into the model's inputs, by IMA's rules (E5 to E13), which the model would share. |
-| **`SpecText` and the core share a misreading of section 2.** | Tier 2 checks the outcome against user intent, independently of section 2. |
+| **The judge and the core share a misreading of section 2.** | The judge models none of the core's decisions; it translates Exo's edits as section 2 says and holds outcomes to what the simulation did. Tier 2 checks the outcome against user intent, independently of section 2. |
 | **The DST covers only some clients.** It models Chromium, GTK3 and GTK4, without selections, highlights, Qt, Firefox, terminals or several text inputs. | Row tests and Session tests pin the rest. Adding `anchor` to `TextModel` for selections is a local change in `sim/`. |
 | **The clock is unrealistic.** | Latencies come from three lag profiles with a spike. The host check U6, with timestamps, calibrates them. |
 | **User text in logs.** | The trace log is at `trace` only, which is off by default. Scrub a log before sharing it. |

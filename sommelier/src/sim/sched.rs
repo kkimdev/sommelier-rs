@@ -56,7 +56,7 @@ use super::engine::{Engine, EngineIn, Lag, Request};
 use super::exo::{Answer, Exo, Predicted, RegionOutcome, RegionTruth};
 use super::hangul::Key;
 use super::keymap;
-use super::oracle::{self, Origin, Seen, Shadow, SpecText};
+use super::oracle::{self, Judge, Origin, Seen};
 use super::surfaces::{Surfaces, Windows};
 use super::ClientKind;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
@@ -367,14 +367,14 @@ pub(super) struct World<'t> {
     /// The guest's text input and compositor.
     text_input: u32,
     compositor: u32,
-    /// Which field each surface is, shared with the windows, the
-    /// specification and the shadow.
+    /// Which field each surface is, shared with the windows and the
+    /// judge.
     surfaces: Surfaces,
-    /// The oracle's two readers, from the end of the setup.
-    pub spec: Option<SpecText>,
-    pub shadow: Option<Shadow>,
-    /// The first steps whose output tier 1 failed ([`oracle::step`]).
-    pub steps: Vec<String>,
+    /// Tier 1, from the end of the setup.
+    pub judge: Option<Judge>,
+    /// The proxy's requests that change what Exo's text input serves
+    /// that Exo has handled ([`Origin::requests`]).
+    requests: u64,
     /// The first answered syncs at which an exact Exo mirror of the proxy's
     /// differed from Exo's tracker ([`World::check_mirrors`]).
     pub mirrors: Vec<String>,
@@ -424,9 +424,8 @@ impl<'t> World<'t> {
             text_input: 0,
             compositor: 0,
             surfaces,
-            spec: None,
-            shadow: None,
-            steps: Vec::new(),
+            judge: None,
+            requests: 0,
             mirrors: Vec::new(),
             ended: false,
             settles: Vec::new(),
@@ -481,9 +480,7 @@ impl<'t> World<'t> {
             ClientKind::Gtk3 => Box::new(Gtk::new(false, text_input, fields)),
             ClientKind::Gtk4 => Box::new(Gtk::new(true, text_input, fields)),
         });
-        let spec = SpecText::new(world.surfaces.clone(), setup.texts);
-        world.spec = Some(spec);
-        world.shadow = Some(Shadow::new(world.surfaces.clone(), setup.texts));
+        world.judge = Some(Judge::new(world.surfaces.clone(), setup.texts));
         world.act(UserAction::Focus(0));
         world.run(&[]).await;
         if setup.late_keyboard && !world.ended {
@@ -556,6 +553,9 @@ impl<'t> World<'t> {
                         self.windows.request(sender, &request, &mut self.exo);
                         let events = self.display.request(sender, &request, &mut self.exo);
                         self.host_sends(events, false);
+                        // What Exo sent as it handled the request is of the
+                        // state before it.
+                        self.requests += u64::from(oracle::changes_service(&request));
                     }
                 }
                 Source::HostEvents => {
@@ -572,8 +572,8 @@ impl<'t> World<'t> {
                     self.repeat = Some((key, at + REPEAT_INTERVAL));
                     self.log(Place::User, format!("repeat {key:?}"));
                     let handed = self.exo.autorepeat(self.now, key);
-                    if let Some(spec) = &mut self.spec {
-                        spec.counts.repeats += u64::from(handed);
+                    if let Some(judge) = &mut self.judge {
+                        judge.counts.repeats += u64::from(handed);
                     }
                     self.host_sends(Vec::new(), false);
                 }
@@ -675,8 +675,8 @@ impl<'t> World<'t> {
         };
         if self.exo.focus() != Some(surface) {
             let before_keyboard = self.exo.text_inputs_hear_first();
-            if let Some(spec) = self.spec.as_mut().filter(|_| before_keyboard) {
-                spec.counts.detaches_before_keyboard += 1;
+            if let Some(judge) = self.judge.as_mut().filter(|_| before_keyboard) {
+                judge.counts.detaches_before_keyboard += 1;
             }
             self.exo.move_focus(Some(surface));
         }
@@ -718,15 +718,24 @@ impl<'t> World<'t> {
     /// a late answer if `late`, made before the resets this input hands the
     /// engine.
     fn host_sends(&mut self, events: Vec<Outgoing>, late: bool) {
-        self.host_sends_of(events, late, None);
+        self.host_sends_of(events, late, (None, None));
     }
 
-    /// [`World::host_sends`], of Exo's answer to a press of `press`.
-    fn host_sends_of(&mut self, events: Vec<Outgoing>, late: bool, press: Option<Key>) {
+    /// [`World::host_sends`], of Exo's answer to a press of `press` or an
+    /// autorepeat of `repeat`.
+    fn host_sends_of(
+        &mut self,
+        events: Vec<Outgoing>,
+        late: bool,
+        (press, repeat): (Option<Key>, Option<Key>),
+    ) {
         let origin = Origin {
             late,
             resets: self.resets,
             press,
+            repeat,
+            requests: self.requests,
+            stale_held: self.exo.holds_stale_key(),
         };
         let reports = self.reports_got;
         for (event, truth) in self.exo.take_events_with_truths() {
@@ -748,7 +757,7 @@ impl<'t> World<'t> {
     fn engine_answers(&mut self) {
         let answer = self.engine.take(&mut self.choices);
         self.log(Place::Engine, format!("{answer:?}"));
-        let press = self.exo.press_of(&answer);
+        let keys = (self.exo.press_of(&answer), self.exo.repeat_of(&answer));
         let verdict = self.exo.answer(&answer);
         let outcome = self.exo.take_region_outcome();
         let refused = outcome == Some(RegionOutcome::Refused);
@@ -757,12 +766,12 @@ impl<'t> World<'t> {
             Some(RegionOutcome::Refused) => self.engine.refused_region(),
             None => {}
         }
-        if let Some(spec) = &mut self.spec {
-            spec.counts.regions_refused += u64::from(refused);
-            spec.counts.late += u64::from(verdict == Answer::Late);
-            spec.counts.dropped += u64::from(verdict == Answer::Dropped);
+        if let Some(judge) = &mut self.judge {
+            judge.counts.regions_refused += u64::from(refused);
+            judge.counts.late += u64::from(verdict == Answer::Late);
+            judge.counts.dropped += u64::from(verdict == Answer::Dropped);
         }
-        self.host_sends_of(Vec::new(), verdict == Answer::Late, press);
+        self.host_sends_of(Vec::new(), verdict == Answer::Late, keys);
     }
 
     /// The guest sends `requests` at once, on C→P.
@@ -792,9 +801,9 @@ impl<'t> World<'t> {
                     request,
                     zwp_text_input_v3::Request::SetSurroundingText { .. }
                 );
-                if let Some(spec) = self.spec.as_mut().filter(|_| report) {
+                if let Some(judge) = self.judge.as_mut().filter(|_| report) {
                     let crossed = edits < self.edits.sent.0;
-                    spec.counts.crossed_reports += u64::from(crossed);
+                    judge.counts.crossed_reports += u64::from(crossed);
                 }
                 self.see(Seen::Guest(request));
             }
@@ -836,8 +845,8 @@ impl<'t> World<'t> {
             decoded,
             AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion { .. })
         );
-        if let Some(spec) = self.spec.as_mut().filter(|_| region) {
-            spec.counts.regions_crossing_reports += u64::from(self.reports_sent > reports);
+        if let Some(judge) = self.judge.as_mut().filter(|_| region) {
+            judge.counts.regions_crossing_reports += u64::from(self.reports_sent > reports);
         }
         // The proxy drops a pointer enter that names a surface the guest
         // destroyed, so the guest's pointer is on none of its surfaces.
@@ -990,8 +999,8 @@ impl<'t> World<'t> {
         let now = self.now;
         self.edits.got.follow(&event);
         let key = matches!(event, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }));
-        if let Some(spec) = self.spec.as_mut().filter(|_| key && gone) {
-            spec.counts.keys_to_no_window += 1;
+        if let Some(judge) = self.judge.as_mut().filter(|_| key && gone) {
+            judge.counts.keys_to_no_window += 1;
         }
         if let AnyEvent::WlRegistry(wl_registry::Event::Global {
             name,
@@ -1051,23 +1060,10 @@ impl<'t> World<'t> {
         self.guest(requests);
     }
 
-    /// The oracle's readers follow `seen`, and check each step's output.
+    /// The judge follows `seen`, and checks each step's output.
     fn see(&mut self, seen: Seen<'_>) {
-        let (Some(spec), Some(shadow)) = (&mut self.spec, &mut self.shadow) else {
-            return;
-        };
-        spec.see(seen);
-        shadow.see(seen);
-        if !matches!(seen, Seen::StepEnd) {
-            return;
-        }
-        let exo = &self.exo;
-        spec.take_withheld(|report, shown| exo.holds_with_composition(report, shown));
-        if let Some(failed) = oracle::step(spec, shadow) {
-            if self.steps.len() < 3 {
-                let at = self.now.0 as f64 / 1_000.0;
-                self.steps.push(format!("{at:.3} ms {failed}"));
-            }
+        if let Some(judge) = &mut self.judge {
+            judge.see(seen, self.now, &self.exo);
         }
     }
 

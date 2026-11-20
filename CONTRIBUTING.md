@@ -216,21 +216,14 @@ a whole proxy client (`proxy::harness::Session`), with a model of Exo
 and its Korean input method behind it. Every message travels a FIFO
 channel with a drawn latency on one virtual clock, so a seed fixes the
 whole case, timing included; [docs/IME.md](docs/IME.md#4-the-dst-harness)
-describes it. One test holds the proxy to the specification (section 2
-of that document), whatever the timing: after every message the proxy
-handles, the transactions the guest gets and what it then shows, the
-preedit's cursor included, and the activations and resets the proxy asks
-of the host (test: `ime_reaches_the_specified_text`). The other also
-holds the client to the user's intent, in cases that settle around every
-click, tap, focus move and restart of the input method, and after a key
-the input method passes while it takes the engine to compose, whose
+describes it, and its [section 4.7](docs/IME.md#47-the-oracles) the
+checks. One test holds what the guest gets to what the simulation did,
+whatever the timing (test: `ime_reaches_the_specified_text`). The other
+also holds the client to the user's intent, in cases that settle around
+every click, tap, focus move and restart of the input method, and after
+a key the input method passes while it takes the engine to compose, whose
 confirmation then resets the engine (test:
-`ime_reaches_the_intended_text`). Exo's deletes and preedit regions must reach the
-guest as the specification measures them in the simulated Exo's text,
-or not at all; the summary counts the proxy's drops by cause
-(`Counts::drops`) and those of a guest that held Exo's text
-(`drops_truth_in_step`), and a settled case with a drop the Exo mirror
-could have measured fails. Each test runs in a
+`ime_reaches_the_intended_text`). Each test runs in a
 process of its own, with the XKB defaults pinned.
 
 The suite runs 600 seeds from seed 0, an even seed free and an odd one

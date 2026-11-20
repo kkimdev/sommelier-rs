@@ -581,6 +581,9 @@ pub(super) struct Reached {
     pub stale_presses_forwarded: u64,
     /// Keyboard enters that forgot such a key.
     pub stale_keys_forgotten: u64,
+    /// Presses Exo sent past a Korean input method that served no text
+    /// input, as during a drain or before the first `activate` (E7).
+    pub raw_presses: u64,
 }
 
 impl std::ops::AddAssign for Reached {
@@ -590,6 +593,7 @@ impl std::ops::AddAssign for Reached {
         self.stale_presses += other.stale_presses;
         self.stale_presses_forwarded += other.stale_presses_forwarded;
         self.stale_keys_forgotten += other.stale_keys_forgotten;
+        self.raw_presses += other.raw_presses;
     }
 }
 
@@ -715,6 +719,7 @@ impl Exo {
                     return;
                 }
                 self.pressed.insert(code, false);
+                self.reached.raw_presses += u64::from(!self.latin);
                 false
             } else {
                 let Some(consumed) = self.release(key) else {
@@ -869,6 +874,30 @@ impl Exo {
             Some((key, true)) if pending.id == id && !pending.repeat => Some(key),
             _ => None,
         }
+    }
+
+    /// The held key whose autorepeat `out` answers, if it does.
+    pub(super) fn repeat_of(&self, out: &EngineOut) -> Option<Key> {
+        let pending = self.in_engine.front()?;
+        let id = match *out {
+            EngineOut::Text { id, .. } | EngineOut::Done { id, .. } => id,
+        };
+        match pending.key {
+            Some((key, true)) if pending.id == id && pending.repeat => Some(key),
+            _ => None,
+        }
+    }
+
+    /// Whether the keyboard holds a key whose release died with the input
+    /// method ([`Exo::destroy_input_method`]), so that a press of it sends
+    /// only the input method's confirmation (E13).
+    pub(super) fn holds_stale_key(&self) -> bool {
+        self.stale.iter().any(|key| self.pressed.contains_key(key))
+    }
+
+    /// The keys the keyboard holds, by keycode.
+    pub(super) fn held_keys(&self) -> BTreeSet<u32> {
+        self.pressed.keys().copied().collect()
     }
 
     /// The engine repeats held `key` at `now` (D7). IMA hands it the

@@ -232,8 +232,7 @@
   Backspace), so an earlier key's text can be lost; host behaviour, not
   mitigated.
 - The DST models only Chromium, GTK3 and GTK4 (no selection, one text
-  input), and nothing checks independently that a real autorepeat is
-  never dropped (`SpecText::decide_recovery`).
+  input).
 - The `zxdg_output_manager_v1` passthrough has not been checked on a host.
   That Exo advertises the global is inferred from ChromiumOS Sommelier,
   whose direct-scale mode binds it and assumes it is present.
