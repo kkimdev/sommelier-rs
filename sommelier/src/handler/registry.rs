@@ -28,7 +28,7 @@ use crate::protocols::Iface;
 use crate::settings::Settings;
 use crate::state::{
     Binding, Context, EventSender, GtkShellState, GuestId, HostGlobal, HostId, InternalCallback,
-    PendingDmabufGlobal, RequestObject, RequestSender, Singleton, INERT_BIND_INTERFACE,
+    RequestObject, RequestSender, Singleton, INERT_BIND_INTERFACE,
 };
 use crate::state::{RegistryRecord, Singletons};
 use crate::wire::Action;
@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// proxy synthesizes the guest's feedback object from. `create_immed` is
 /// available since v2 and explicit modifier events since v3, so bind at v3
 /// when the host supports it.
-const LINUX_DMABUF_CAPABILITY_VERSION: u32 = zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
+pub(crate) const LINUX_DMABUF_CAPABILITY_VERSION: u32 = zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
 // The host binding has no feedback requests, so no host feedback object
 // exists (see `ZwpLinuxDmabufFeedbackV1Handler for LinuxDmabufHandler`).
 const _: () =
@@ -182,6 +182,22 @@ pub(crate) struct Globals {
     text_input_manager: Option<HostId>,
     /// The proxy's `zcr_text_input_extension_v1` ([`Internal::TextInputExtension`]).
     text_input_extension: Option<HostId>,
+    /// Guest-facing v4 linux-dmabuf globals withheld until the internal v3
+    /// binding has delivered its complete legacy format/modifier
+    /// capability set.
+    pending_dmabuf: Vec<PendingDmabufGlobal>,
+}
+
+/// A synthetic linux-dmabuf v4 global waiting for legacy host capability
+/// discovery to complete.
+///
+/// The host registry object is retained because each guest registry needs its
+/// own `global` event; the registry's removal of the global drops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingDmabufGlobal {
+    registry_host_id: HostId,
+    name: u32,
+    version: u32,
 }
 
 impl Globals {
@@ -193,6 +209,14 @@ impl Globals {
     /// The proxy's text-input manager and extension, once it has bound both.
     pub(crate) fn text_input_factories(&self) -> Option<(HostId, HostId)> {
         Some((self.text_input_manager?, self.text_input_extension?))
+    }
+
+    /// Whether a guest global waits for the capabilities of host
+    /// linux-dmabuf global `global`.
+    pub(crate) fn awaits_dmabuf_capabilities(&self, global: u32) -> bool {
+        self.pending_dmabuf
+            .iter()
+            .any(|pending| pending.name == global)
     }
 
     /// Whether a registry still lists global `name`: it has not seen its
@@ -239,7 +263,11 @@ impl Globals {
     /// candidate outlived every registry that lists it.
     #[cfg(test)]
     pub(crate) fn assert_no_orphans(&self, table: &crate::state::ShadowTable) {
-        for &registry in self.registries.keys() {
+        let pending = self
+            .pending_dmabuf
+            .iter()
+            .map(|pending| &pending.registry_host_id);
+        for &registry in self.registries.keys().chain(pending) {
             assert!(
                 table
                     .get_guest_id(registry)
@@ -451,8 +479,8 @@ fn defer_synthetic_dmabuf_global(
         name,
         version,
     };
-    if !ctx.pending_dmabuf_globals.contains(&pending) {
-        ctx.pending_dmabuf_globals.push(pending);
+    if !ctx.globals.pending_dmabuf.contains(&pending) {
+        ctx.globals.pending_dmabuf.push(pending);
     }
     set_registry_global_visibility(ctx, registry_host_id, name, false);
 }
@@ -462,7 +490,7 @@ fn defer_synthetic_dmabuf_global(
 pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, name: u32) {
     let can_publish = crate::handler::linux_dmabuf::has_synthetic_feedback_formats(ctx, name);
     let mut matching = Vec::new();
-    ctx.pending_dmabuf_globals.retain(|pending| {
+    ctx.globals.pending_dmabuf.retain(|pending| {
         if pending.name == name {
             matching.push(pending.clone());
             false
@@ -569,7 +597,7 @@ impl Singleton {
                 ctx.globals
                     .singletons
                     .bind(self, binding(host_id, name, bound_version));
-                ctx.dmabuf_capabilities.entry(name).or_default();
+                crate::handler::linux_dmabuf::start_capability_discovery(ctx, name);
                 bind_internally(
                     ctx,
                     registry_host_id,
@@ -578,7 +606,7 @@ impl Singleton {
                     bound_version,
                     host_id,
                 )?;
-                if can_synthesize_dmabuf_feedback(ctx, version) {
+                if crate::handler::linux_dmabuf::can_synthesize_feedback(ctx, version) {
                     queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { global: name });
                 }
             }
@@ -812,23 +840,6 @@ fn set_registry_global_visibility(
     }
 }
 
-fn can_synthesize_dmabuf_feedback(ctx: &Context, version: u32) -> bool {
-    if version < LINUX_DMABUF_CAPABILITY_VERSION {
-        return false;
-    }
-    if ctx.virtgpu().is_some() {
-        return true;
-    }
-    #[cfg(test)]
-    {
-        ctx.synthetic_feedback_available_for_test
-    }
-    #[cfg(not(test))]
-    {
-        false
-    }
-}
-
 /// How the proxy serves an admitted guest bind.
 #[derive(Debug, PartialEq, Eq)]
 enum BindAdmission {
@@ -960,7 +971,8 @@ fn dmabuf_global(ctx: &mut Context, registry: HostId, name: u32, version: u32) -
     // A v3 host still has enough legacy format/modifier information
     // for our synthetic v4 feedback object. Advertise v4 to the
     // guest while clamping only the internal host bind to v3.
-    let can_synthesize_feedback = can_synthesize_dmabuf_feedback(ctx, version);
+    let can_synthesize_feedback =
+        crate::handler::linux_dmabuf::can_synthesize_feedback(ctx, version);
     let client_version = if can_synthesize_feedback {
         GUEST_DMABUF_VERSION
     } else {
@@ -977,10 +989,7 @@ fn dmabuf_global(ctx: &mut Context, registry: HostId, name: u32, version: u32) -
         // One host dmabuf object is shared for capability discovery,
         // and a guest global for it waits until the binding of its
         // own name has the capabilities.
-        let capability_ready = ctx
-            .dmabuf_capabilities
-            .get(&name)
-            .is_some_and(|capabilities| capabilities.ready);
+        let capability_ready = crate::handler::linux_dmabuf::capabilities_ready(ctx, name);
         if can_synthesize_feedback && !capability_ready {
             defer_synthetic_dmabuf_global(ctx, registry, name, client_version);
         } else if !can_synthesize_feedback
@@ -1197,7 +1206,8 @@ impl wl_registry::WlRegistryHandler for Handlers {
         let was_visible = record
             .visibility(name)
             .unwrap_or_else(|| ctx.globals.host_globals.contains_key(&name));
-        ctx.pending_dmabuf_globals
+        ctx.globals
+            .pending_dmabuf
             .retain(|pending| !(pending.registry_host_id == registry_id && pending.name == name));
         // A bound wl_output remains a valid Wayland object after its global
         // advertisement disappears, but it must stop feeding
@@ -1298,15 +1308,12 @@ impl wl_registry::WlRegistryHandler for Handlers {
         };
 
         if interface == Iface::WlShm {
-            // Do NOT forward wl_shm to host. We emulate it.
-            ctx.shadow_table
-                .create_local(*guest_new_id, interface, *version);
-
-            // Advertise mandatory formats immediately and optional formats
-            // only after the host wl_shm/dmabuf capability event has arrived.
-            // This mirrors ChromiumOS Sommelier and prevents a guest from
+            // Do NOT forward wl_shm to host. We emulate it. Advertise
+            // mandatory formats immediately and optional formats only after
+            // the host wl_shm/dmabuf capability event has arrived. This
+            // mirrors ChromiumOS Sommelier and prevents a guest from
             // selecting a format that the host cannot import.
-            register_guest_shm(ctx, *guest_new_id, name);
+            register_guest_shm(ctx, *guest_new_id, *version, name);
 
             // The host-side wl_shm object was bound when the host global was
             // observed. Binding the synthetic guest global must not issue a
@@ -1379,7 +1386,7 @@ impl wl_registry::WlRegistryHandler for Handlers {
             crate::handler::window_placement::output_bound(ctx, host_new_id);
         }
         if interface == Iface::ZwpLinuxDmabufV1 {
-            ctx.dmabuf_factories.insert(*guest_new_id, name);
+            crate::handler::linux_dmabuf::factory_bound(ctx, *guest_new_id, name);
         }
         if interface == Iface::WlSeat {
             // A text input whose seat had no host object can activate now.
@@ -1402,7 +1409,8 @@ pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: HostId) {
         .registries
         .remove(&registry_host_id)
         .unwrap_or_default();
-    ctx.pending_dmabuf_globals
+    ctx.globals
+        .pending_dmabuf
         .retain(|pending| pending.registry_host_id != registry_host_id);
     for name in record.listed() {
         if global_removal_seen(ctx, name) && !ctx.globals.still_seen(name) {
@@ -1517,7 +1525,7 @@ mod tests {
             let mut ctx = Context::new_for_test(true, false, vec![]);
             // Stands in for a virtio-gpu render node, which the proxy
             // synthesizes feedback for and a test cannot have.
-            ctx.synthetic_feedback_available_for_test = feedback;
+            ctx.dmabuf.set_feedback_available_for_test(feedback);
             Self::with_context(ctx).await
         }
 
@@ -2581,7 +2589,7 @@ mod tests {
             );
             // Reads state no peer can observe: the guest global that waited
             // for the binding's capabilities, which no registry lists now.
-            assert!(r.s.ctx().pending_dmabuf_globals.is_empty(), "{interface}");
+            assert!(r.s.ctx().globals.pending_dmabuf.is_empty(), "{interface}");
 
             r.global(A, 11, interface, version).await;
             let new = binding(11, r.s.host_received());

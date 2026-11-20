@@ -405,11 +405,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   what the guest's destructor would but sends nothing to the deleted
   object. The `delete_id` that acknowledges a destructor forgets nothing
   again, and a render buffer, which outlives its guest object while the
-  host shows it, ends when the host releases its ID. An asynchronous
-  dma-buf create ends with its params; releasing the host ID drops it
-  too, as a backstop. A new map of per-object
-  state gets its arm in `state::lifecycle::forget_object` and its check in
-  `Context::assert_no_orphans`. Ending an object sends its teardown in the
+  host shows it, ends when the host releases its ID. State only the
+  object owns is kept in its table entry (`ObjectData`), which only a
+  live object keeps, so it ends with the object by construction; an
+  asynchronous dma-buf create is its params'. Per-object state kept
+  outside the table gets its arm in `state::lifecycle::forget_object` and
+  its check in `Context::assert_no_orphans`. Ending an object sends its teardown in the
   current message's effects, in the wire order its destructor handler
   had: the Aura objects of a surface or toplevel are released before its
   destructor, and a surface's text-input leave and buffer retirement

@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use super::id_allocator::{IdAllocator, WL_MAP_MAX_OBJECTS};
+use super::object_data::{Data, ObjectData};
 use crate::protocols::Iface;
 use crate::wire::{EventId, RequestId, WireId, WL_DISPLAY_ID};
 use log::{debug, warn};
@@ -233,8 +234,8 @@ impl Interface {
 #[derive(Debug)]
 enum GuestObject {
     /// An object with no host counterpart, which the proxy implements
-    /// ([`ShadowTable::create_local`]).
-    Local(Interface),
+    /// ([`ShadowTable::create_local`]), and its data.
+    Local(Interface, ObjectData),
     /// An object paired with a host object, which records the pairing too.
     Paired {
         host: HostId,
@@ -243,9 +244,10 @@ enum GuestObject {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum GuestState {
-    Live,
+    /// The object is live, and keeps its data.
+    Live(ObjectData),
     /// The guest destroyed the object. It rejects requests, but stays paired
     /// until the host's `delete_id` (or the event that ends it), so late
     /// events still resolve.
@@ -255,13 +257,43 @@ enum GuestState {
 impl GuestObject {
     fn interface(&self) -> &Interface {
         match self {
-            Self::Local(interface) | Self::Paired { interface, .. } => interface,
+            Self::Local(interface, _) | Self::Paired { interface, .. } => interface,
+        }
+    }
+
+    /// The data of a live object.
+    fn data(&self) -> Option<&ObjectData> {
+        match self {
+            Self::Local(_, data)
+            | Self::Paired {
+                state: GuestState::Live(data),
+                ..
+            } => Some(data),
+            Self::Paired {
+                state: GuestState::DestroyPending,
+                ..
+            } => None,
+        }
+    }
+
+    /// [`Self::data`], mutably.
+    fn data_mut(&mut self) -> Option<&mut ObjectData> {
+        match self {
+            Self::Local(_, data)
+            | Self::Paired {
+                state: GuestState::Live(data),
+                ..
+            } => Some(data),
+            Self::Paired {
+                state: GuestState::DestroyPending,
+                ..
+            } => None,
         }
     }
 
     fn host(&self) -> Option<HostId> {
         match self {
-            Self::Local(_) => None,
+            Self::Local(..) => None,
             Self::Paired { host, .. } => Some(*host),
         }
     }
@@ -461,7 +493,22 @@ impl ShadowTable {
     /// shim, the v3 text-input manager, or an inert `wl_output` whose bind
     /// crossed its global's removal).
     pub fn create_local(&mut self, guest: GuestId, interface: Iface, version: u32) {
-        let local = GuestObject::Local(Interface::new(interface, version));
+        let local = GuestObject::Local(Interface::new(interface, version), ObjectData::None);
+        let previous = self.guests.insert(guest, local);
+        debug_assert!(previous.is_none(), "guest ID {guest} is in use");
+    }
+
+    /// [`Self::create_local`], with the data the object keeps until it
+    /// ends, of its interface.
+    pub(crate) fn create_local_with<T: Data>(
+        &mut self,
+        guest: GuestId,
+        interface: Iface,
+        version: u32,
+        data: T,
+    ) {
+        debug_assert_eq!(interface, T::IFACE, "guest {guest} keeps another's data");
+        let local = GuestObject::Local(Interface::new(interface, version), data.into());
         let previous = self.guests.insert(guest, local);
         debug_assert!(previous.is_none(), "guest ID {guest} is in use");
     }
@@ -487,7 +534,7 @@ impl ShadowTable {
         let guest_object = GuestObject::Paired {
             host,
             interface,
-            state: GuestState::Live,
+            state: GuestState::Live(ObjectData::None),
         };
         let previous = (
             self.hosts.insert(host, host_object),
@@ -514,10 +561,10 @@ impl ShadowTable {
         let object = self.guests.get(&guest)?;
         let Interface { iface, version } = *object.interface();
         let host = match object {
-            GuestObject::Local(_) => None,
+            GuestObject::Local(..) => None,
             GuestObject::Paired {
                 host,
-                state: GuestState::Live,
+                state: GuestState::Live(_),
                 ..
             } => {
                 let version = self.hosts.get(host)?.interface()?.version;
@@ -657,10 +704,10 @@ impl ShadowTable {
     /// `None` when `guest` names no object, or one the guest destroyed.
     pub fn link(&self, guest: GuestId) -> Option<Link> {
         match self.guests.get(&guest)? {
-            GuestObject::Local(_) => Some(Link::Local),
+            GuestObject::Local(..) => Some(Link::Local),
             GuestObject::Paired {
                 host,
-                state: GuestState::Live,
+                state: GuestState::Live(_),
                 ..
             } => Some(Link::Host(*host)),
             GuestObject::Paired {
@@ -673,7 +720,82 @@ impl ShadowTable {
     /// Return whether guest object `guest` is one the proxy implements
     /// itself ([`Self::create_local`]).
     pub fn is_local(&self, guest: GuestId) -> bool {
-        matches!(self.guests.get(&guest), Some(GuestObject::Local(_)))
+        matches!(self.guests.get(&guest), Some(GuestObject::Local(..)))
+    }
+
+    // Per-object data (`state::object_data`).
+
+    /// The data of kind `T` of live guest object `guest`, if it keeps it.
+    pub(crate) fn data<T: Data>(&self, guest: GuestId) -> Option<&T> {
+        T::of(self.guests.get(&guest)?.data()?)
+    }
+
+    /// [`Self::data`], mutably.
+    pub(crate) fn data_mut<T: Data>(&mut self, guest: GuestId) -> Option<&mut T> {
+        T::of_mut(self.guests.get_mut(&guest)?.data_mut()?)
+    }
+
+    /// Every live guest object that keeps data of kind `T`, in ID order.
+    pub(crate) fn data_of<T: Data + 'static>(&self) -> impl Iterator<Item = (GuestId, &T)> {
+        self.guests
+            .iter()
+            .filter_map(|(&guest, object)| Some((guest, T::of(object.data()?)?)))
+    }
+
+    /// [`Self::data_of`], mutably.
+    pub(crate) fn data_of_mut<T: Data + 'static>(
+        &mut self,
+    ) -> impl Iterator<Item = (GuestId, &mut T)> {
+        self.guests
+            .iter_mut()
+            .filter_map(|(&guest, object)| Some((guest, T::of_mut(object.data_mut()?)?)))
+    }
+
+    /// Give live guest object `guest`, of `T`'s interface, its data, which
+    /// it keeps until it ends.
+    ///
+    /// # Returns
+    ///
+    /// `false`, changing nothing, unless `guest` is a live object of `T`'s
+    /// interface that keeps no data yet.
+    #[must_use = "a refused attach means the proxy's bookkeeping diverged"]
+    pub(crate) fn attach<T: Data>(&mut self, guest: GuestId, data: T) -> bool {
+        self.attach_data(guest, data.into())
+    }
+
+    /// Drop the data of guest object `guest`, for a test that injects a
+    /// fault no peer can cause: the proxy loses an object's state.
+    #[cfg(test)]
+    pub(crate) fn drop_data_for_test(&mut self, guest: GuestId) {
+        self.take_data(guest);
+    }
+
+    /// [`Self::attach`] data of any kind, which must be of `guest`'s
+    /// interface.
+    pub(crate) fn attach_data(&mut self, guest: GuestId, data: ObjectData) -> bool {
+        let Some(object) = self.guests.get_mut(&guest) else {
+            return false;
+        };
+        if data.iface() != Some(object.interface().iface) {
+            return false;
+        }
+        match object.data_mut() {
+            Some(slot @ ObjectData::None) => {
+                *slot = data;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Take the data of guest object `guest`, which is ending, for its
+    /// owner to forget (`state::lifecycle`).
+    pub(super) fn take_data(&mut self, guest: GuestId) -> ObjectData {
+        self.guests
+            .get_mut(&guest)
+            .and_then(GuestObject::data_mut)
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     // Queries.
@@ -759,6 +881,13 @@ impl ShadowTable {
     /// the host object's events still reach its handler.
     pub(super) fn guest_destroyed_in_use(&mut self, guest: GuestId) {
         if let Some(GuestObject::Paired { state, .. }) = self.guests.get_mut(&guest) {
+            debug_assert!(
+                matches!(
+                    state,
+                    GuestState::DestroyPending | GuestState::Live(ObjectData::None)
+                ),
+                "guest {guest} ends before its data is forgotten"
+            );
             *state = GuestState::DestroyPending;
         }
     }
@@ -1013,7 +1142,7 @@ impl ShadowTable {
     pub(crate) fn set_guest_version_for_test(&mut self, guest: GuestId, version: u32) {
         let object = self.guests.get_mut(&guest);
         let interface = match object.expect("a guest object") {
-            GuestObject::Local(interface) | GuestObject::Paired { interface, .. } => interface,
+            GuestObject::Local(interface, _) | GuestObject::Paired { interface, .. } => interface,
         };
         interface.version = version;
     }

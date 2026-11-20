@@ -28,19 +28,15 @@ limitations under the License.
 //!   object was live. A later `delete_id` acknowledging the destructor
 //!   forgets nothing again.
 //! - [`forget_host_id`] runs when the host ID is released, for state that
-//!   outlives the guest object: a render buffer the host still shows. It
-//!   also drops an asynchronous dma-buf create, as a backstop: forgetting
-//!   its params at their end already did.
+//!   outlives the guest object: a render buffer the host still shows.
 //!
 //! What a hook sends joins the current message's effects. A guest
 //! destructor runs it before the transition, while the table still knows
 //! the object; a `delete_id` runs it after, so a hook gets the object's
 //! interface and IDs and never looks up its own entry.
 
-use super::{Context, DeletedHostId, GuestId, HostId, Link};
-use crate::handler::{
-    compositor, keyboard, linux_dmabuf, output, pointer, registry, shm, text_input,
-};
+use super::{Context, DeletedHostId, GuestId, HostId, Link, ObjectData};
+use crate::handler::{compositor, keyboard, linux_dmabuf, output, pointer, registry, text_input};
 use crate::protocols::wayland::wl_display;
 use crate::protocols::Iface;
 use crate::wire::WireId;
@@ -111,10 +107,11 @@ impl Context {
     /// Apply the host's `wl_display.delete_id` for `host_id`, a wire value;
     /// see [`super::ShadowTable::release_deleted_host_id`].
     pub(crate) fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
-        let interface = self
-            .shadow_table
-            .guest_named_by_host(host_id)
-            .and_then(|guest| self.shadow_table.get_interface(guest));
+        let guest = self.shadow_table.guest_named_by_host(host_id);
+        let interface = guest.and_then(|guest| self.shadow_table.get_interface(guest));
+        let data = guest.map_or_else(ObjectData::default, |guest| {
+            self.shadow_table.take_data(guest)
+        });
         let deleted = self.shadow_table.release_deleted_host_id(host_id);
         match deleted {
             DeletedHostId::Ignored => {}
@@ -125,7 +122,7 @@ impl Context {
                 was_live,
             } => {
                 if let (true, Some(interface)) = (was_live, interface) {
-                    forget_object(self, interface, guest, Some(host), true);
+                    forget_object(self, interface, guest, Some(host), true, data);
                 }
                 forget_host_id(self, host);
             }
@@ -145,7 +142,8 @@ impl Context {
     /// Forget live guest object `guest`, paired with `host` or local.
     fn forget(&mut self, guest: GuestId, host: Option<HostId>) {
         if let Some(interface) = self.shadow_table.get_interface(guest) {
-            forget_object(self, interface, guest, host, false);
+            let data = self.shadow_table.take_data(guest);
+            forget_object(self, interface, guest, host, false, data);
         }
     }
 }
@@ -158,17 +156,27 @@ impl Context {
 /// `deactivate`); the other arms send only to other objects, such as Aura
 /// children or an extended keyboard, which the host's delete leaves live.
 ///
-/// The match names every interface, so a new one must say whether its
-/// objects have state of their own. A `wl_buffer`'s state is its render
-/// buffer, keyed by host ID ([`forget_host_id`]); an inert `wl_output`, a
-/// local one, has none.
+/// `data` is what the object's table entry kept
+/// ([`super::object_data`]), which ends here: dropped, or handed to its
+/// owner. The match names every interface, so a new one must say whether
+/// its objects have state of their own outside their entry. A
+/// `wl_buffer`'s state is its render buffer, keyed by host ID
+/// ([`forget_host_id`]); an inert `wl_output`, a local one, has none.
 fn forget_object(
     ctx: &mut Context,
     interface: Iface,
     guest: GuestId,
     host: Option<HostId>,
     host_deleted: bool,
+    data: ObjectData,
 ) {
+    // The data whose end does more than drop it, and the data that ends
+    // with its entry.
+    match data {
+        ObjectData::DmabufFactory(factory) => linux_dmabuf::forget_factory(ctx, factory),
+        ObjectData::DmabufFeedback(feedback) => linux_dmabuf::forget_feedback(ctx, guest, feedback),
+        ObjectData::None | ObjectData::Shm(_) | ObjectData::ShmPool(_) | ObjectData::Params(_) => {}
+    }
     match (interface, host) {
         (Iface::WlRegistry, Some(host)) => registry::forget_registry(ctx, host),
         (Iface::WlOutput, Some(host)) => output::forget_output(ctx, host),
@@ -187,17 +195,18 @@ fn forget_object(
         (Iface::WpViewport, _) => compositor::forget_viewport(ctx, guest),
         (Iface::XdgSurface, _) => compositor::forget_xdg_surface(ctx, guest),
         (Iface::XdgToplevel, _) => compositor::forget_xdg_toplevel(ctx, guest),
-        (Iface::WlShm, _) => shm::forget_shm(ctx, guest),
-        (Iface::WlShmPool, _) => shm::forget_pool(ctx, guest),
-        (Iface::ZwpLinuxDmabufV1, _) => linux_dmabuf::forget_factory(ctx, guest),
-        (Iface::ZwpLinuxDmabufFeedbackV1, _) => linux_dmabuf::forget_feedback(ctx, guest),
-        (Iface::ZwpLinuxBufferParamsV1, _) => linux_dmabuf::forget_params(ctx, guest, host),
         (Iface::ZwpTextInputV3, _) => text_input::forget_text_input(ctx, guest, host_deleted),
-        // No state of their own, or none that ends here: a GTK surface's
-        // ends with its `wl_surface` (`compositor::forget_surface`), and a
-        // GTK shell, which the guest cannot destroy, lasts the connection.
+        // No state of their own outside their entry, or none that ends
+        // here: a GTK surface's ends with its `wl_surface`
+        // (`compositor::forget_surface`), and a GTK shell, which the guest
+        // cannot destroy, lasts the connection.
         (
             Iface::WlDisplay
+            | Iface::WlShm
+            | Iface::WlShmPool
+            | Iface::ZwpLinuxDmabufV1
+            | Iface::ZwpLinuxDmabufFeedbackV1
+            | Iface::ZwpLinuxBufferParamsV1
             | Iface::WlCallback
             | Iface::WlCompositor
             | Iface::WlBuffer
@@ -243,11 +252,9 @@ fn forget_object(
 }
 
 /// Forget the state of host ID `host`, which the host released: what
-/// outlived its guest object, and an asynchronous dma-buf create, which
-/// `forget_params` should have dropped already.
+/// outlived its guest object.
 fn forget_host_id(ctx: &mut Context, host: HostId) {
     ctx.render_buffers.remove(host);
-    ctx.pending_native_creates.remove(&host);
 }
 
 #[cfg(test)]
@@ -411,12 +418,6 @@ impl Context {
             .assert_invariants(&crate::handler::text_input::CtxEnv::of(self));
 
         // SHM and dma-buf.
-        for &pool in self.pools.keys().chain(&self.stale_shm_pools) {
-            guest("SHM pool", pool, Iface::WlShmPool);
-        }
-        for &shm in self.guest_shms.keys().chain(&self.stale_shm_guest_objects) {
-            guest("wl_shm state", shm, Iface::WlShm);
-        }
         for (buffer, _) in self.render_buffer_lifecycles() {
             assert!(
                 !table.is_host_id_available(buffer),
@@ -424,47 +425,9 @@ impl Context {
                 buffer
             );
         }
-        for (&params, create) in &self.pending_native_creates {
-            let live_guest_params = table.get_guest_id(params).filter(|&guest| {
-                table
-                    .live_object(guest, Iface::ZwpLinuxBufferParamsV1)
-                    .is_some()
-            });
-            assert_eq!(
-                live_guest_params,
-                Some(create.guest_params_id),
-                "asynchronous dma-buf create outlived host params {}",
-                params
-            );
-        }
-        for &params in self.pending_params.keys().chain(&self.used_dmabuf_params) {
-            guest("dma-buf params", params, Iface::ZwpLinuxBufferParamsV1);
-        }
-        for &factory in self.dmabuf_factories.keys() {
-            guest("dma-buf factory", factory, Iface::ZwpLinuxDmabufV1);
-        }
-        for &feedback in self.synthetic_feedback_objects.keys() {
-            guest(
-                "dma-buf feedback",
-                feedback,
-                Iface::ZwpLinuxDmabufFeedbackV1,
-            );
-        }
-        for &global in self.dmabuf_capabilities.keys() {
-            assert!(
-                linux_dmabuf::capabilities_held(self, global),
-                "dma-buf capabilities outlived every hold on global {global}"
-            );
-        }
+        linux_dmabuf::assert_no_orphans(self);
 
         // Registries.
-        for pending in &self.pending_dmabuf_globals {
-            host(
-                "registry globals",
-                pending.registry_host_id,
-                Iface::WlRegistry,
-            );
-        }
         self.globals.assert_no_orphans(table);
     }
 }

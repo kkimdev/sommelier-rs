@@ -219,6 +219,11 @@ fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
             xdg_surface,
             xdg_toplevel,
         } => crate::handler::compositor::record_xdg_toplevel(ctx, xdg_surface, xdg_toplevel),
+        PostDispatch::Attach { object, data } => {
+            if !ctx.shadow_table.attach_data(object, data) {
+                let _ = ctx.fail(format_args!("Guest object {object} cannot keep its state"));
+            }
+        }
         PostDispatch::KeyboardCreated { keyboard, seat } => {
             crate::handler::keyboard::keyboard_created(ctx, keyboard, seat)
         }
@@ -847,7 +852,7 @@ impl Client {
         // then a long modifier stream. The dmabuf handler coalesces feedback
         // refreshes within this dispatch batch; allow the next batch to
         // publish a newer table after more capabilities have arrived.
-        self.ctx.synthetic_feedback_refresh_pending.clear();
+        self.ctx.dmabuf.end_batch();
         // A session that ends rolls nothing back, so in tests every batch
         // that keeps it must leave no state behind an ended object.
         #[cfg(test)]
@@ -2273,11 +2278,11 @@ mod tests {
     }
 
     /// A message that ends the session discards what its handler queued
-    /// before the failure: a dma-buf `create` whose host params generation
-    /// is already pending must not send its plane and create to the host.
+    /// before the failure: a dma-buf `create_immed` whose host buffer the
+    /// proxy cannot record must not send its plane and create to the host.
     #[tokio::test]
     async fn a_handler_error_discards_its_earlier_output() {
-        use crate::state::{HostId, PendingNativeCreate};
+        use crate::state::HostId;
         use protocols::linux_dmabuf_v1::{
             zwp_linux_buffer_params_v1 as params, zwp_linux_dmabuf_v1,
         };
@@ -2292,18 +2297,20 @@ mod tests {
         s.guest([params::req::add(id, plane, 0, 0, 64, 0, 0)]).await;
         assert_eq!(s.host_received(), [], "the plane waits for the create");
 
-        // Injects a fault no peer can cause: a create already pending for
-        // the params' host ID, which the proxy allocates itself.
-        let pending = PendingNativeCreate {
-            guest_params_id: GuestId::for_test(id),
-            dimensions: (16, 8),
-            sync_fds: Vec::new(),
-        };
-        s.ctx()
-            .pending_native_creates
-            .insert(HostId::for_test(host), pending);
-        s.guest_fatal([params::req::create(id, 16, 8, DRM_FORMAT_ARGB8888, 0)])
-            .await;
+        // Injects a fault no peer can cause: a render buffer already under
+        // the host ID the proxy allocates next, for the buffer.
+        let next = HostId::for_test(host + 1);
+        assert!(s.ctx().register_native_buffer(next, (16, 8), Vec::new()));
+        let buffer = s.new_id();
+        s.guest_fatal([params::req::create_immed(
+            id,
+            buffer,
+            16,
+            8,
+            DRM_FORMAT_ARGB8888,
+            0,
+        )])
+        .await;
         assert_eq!(s.host_received(), []);
         assert_eq!(
             s.guest_received_and_error(),

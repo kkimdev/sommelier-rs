@@ -221,7 +221,10 @@ one list it cannot check:
      of its own in its place. A forwarded global needs nothing more. An
      interface that is no global is hidden.
    - `state::lifecycle::forget_object`: whether its objects have state of
-     their own to forget when they end.
+     their own outside their table entry to forget when they end. State
+     only the object owns goes in its entry instead (an `ObjectData`
+     variant; see [Object ends](#object-ends)), whose `match` in
+     `forget_object` says whether ending it does more than drop it.
    - `ProtocolHandlers`: `handler::Handlers` implements its handler
      trait, either in the module that owns the interface or, if every
      message forwards as it is, in the list in `handler/mod.rs`.
@@ -323,8 +326,8 @@ keymaps are compiled in belongs to the keyboard core
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of host globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
-| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
-| Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
+| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`); `shm::ShmFormats`, each `wl_shm` and `wl_shm_pool`'s entry |
+| Dma-buf | `linux_dmabuf.rs` | `linux_dmabuf::Dmabuf` (capabilities), each params, factory and feedback object's entry, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (pointer focus); `sommelier/src/keys` (the keyboard core: the keyboard focus, one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
@@ -410,9 +413,19 @@ binds no chord of its own. The contract is in
 
 ### Object ends
 
-Per-object state lives with the module that owns it (`surfaces`,
-`OutputRegistry`, the keyboard maps, and so on), keyed by the object's
-guest or host ID. `state/lifecycle.rs` ends it with the object, whichever
+State that only one object owns lives in the object's own table entry
+(`state/object_data.rs`): an `ObjectData` of the object's interface, such
+as a `wl_shm`'s formats, a `wl_shm_pool`'s file, or a dma-buf params
+object's planes and pending create. Only a live entry keeps data, the
+table attaches it only to an object of its interface (`ShadowTable::attach`,
+`create_local_with`; an object the generated code creates gets it after
+its forward, `PostDispatch::Attach`), and the owning module reads it by
+kind (`ShadowTable::data::<T>`). So such state cannot outlive its object,
+be read under a reused ID, or be checked after the fact: the transition
+that ends the object takes it. State that a core owns (the keyboard and
+IME cores), that spans objects (`OutputRegistry`), or that outlives its
+guest object (render buffers) lives with its owner, keyed by the object's
+guest or host ID. `state/lifecycle.rs` ends both with the object, whichever
 way the object ends: each `Context` wrapper of a table transition that
 ends an object runs one hook. A `wl_surface`'s `SurfaceState` is created
 with the surface, by `wl_compositor.create_surface`; a live surface without
@@ -421,23 +434,24 @@ its state is an internal divergence that ends the session.
 - `forget_object` runs once per object, at its first end: a guest
   destructor, a terminal event, a local destructor, a bind that never
   reached the host, or a host `delete_id` while the guest object was live
-  (`DeletedHostId::Paired` reports `was_live`). Its one `match` on the
-  interface is the inventory of per-object state: each arm calls the
-  owner's `forget_*` function (`forget_surface`, `forget_keyboard`,
+  (`DeletedHostId::Paired` reports `was_live`). It gets the data the
+  entry kept, whose `match` says what ending each kind does beyond
+  dropping it (a dma-buf factory's or feedback's hold on its global's
+  capabilities), and its `match` on the interface is the inventory of
+  per-object state kept elsewhere: each arm calls the owner's `forget_*`
+  function (`forget_surface`, `forget_keyboard`,
   `forget_output`, `forget_registry`, ...). It is the one place `state`
   calls into handlers, because ending an object can send requests, such
   as an Aura release or an extended keyboard's destructor.
 - `forget_host_id` runs when the host releases the ID, for state that
-  outlives the guest object: a render buffer the host still shows. It
-  drops an asynchronous dma-buf create too, as a backstop, though
-  `forget_params` already did at the params' end.
+  outlives the guest object: a render buffer the host still shows.
 
 What a hook sends joins the current message's effects, so the wire order
 is the handler's: a destructor handler that must order its own destructor
 against that output queues the part that goes first before it calls the
 wrapper (`wl_surface.destroy` releases the surface's Aura objects first).
-In tests, `Context::assert_no_orphans` checks every per-object key, and
-every object such state names, against the table; a test's `Client`,
+In tests, `Context::assert_no_orphans` checks every per-object key kept
+outside the table, and every object such state names, against the table; a test's `Client`,
 the fuzzer's included, runs it after every batch that keeps the session.
 A seat reference is the exception: it outlives its seat
 ([Object lifetimes](INVARIANTS.md#object-lifetimes)), so only its copies
