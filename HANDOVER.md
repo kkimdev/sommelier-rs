@@ -199,16 +199,15 @@
 - A focus-loss commit too long for one message loses the preedit (Exo's
   confirmation is dropped while the link drains).
 - Key generations: an `Announced` peek accepts an older release, and a
-  stale held Backspace can still be leased (`arm_ime_repeat` ignores
-  `stale`).
+  stale held Backspace can still be leased (`KeyGenerationRegistry::lease`
+  ignores `stale`).
 - `on_peek_key`'s owed release of a stale press can reach the guest
   before a waiting recovery's pair.
 - Each empty confirmation while a taken key is held sends the host a
   `wl_display.sync` (about 30 a second).
 - The mirror assumes Exo reads a report and its glued sync in one read;
   an IME event between them would leave it exact but wrong (never seen).
-- The mirror keeps a highlight across `set_preedit_region`, and
-  `is_modifier` reads only layout 0, level 0.
+- `Keymap::is_modifier` reads only layout 0, level 0.
 - Chromium's IMA keeps composing after a composition empties (ㄱ then
   Backspace), so an earlier key's text can be lost; host behaviour, not
   mitigated.

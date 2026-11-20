@@ -3819,10 +3819,9 @@ mod tests {
             )
             .numbered
             .expect("a new press is numbered");
-        ctx.key_generations
-            .cancel_backspace_repeat(host_keyboard_id, 14);
-        ctx.keyboard_repeatable_keys
-            .insert(host_keyboard_id, [14].into_iter().collect());
+        ctx.key_generations.cancel_lease_for_test(host_keyboard_id);
+        ctx.keyboards.add_for_test(700, host_keyboard_id.0, 1);
+        ctx.keyboards.load_default_keymap_for_test(host_keyboard_id);
         ctx.key_generations.record_latest_peek(
             1,
             Some(wl_surface_guest_id),
@@ -3865,7 +3864,7 @@ mod tests {
             !ctx.key_generations.physically_held(host_keyboard_id, 14)
                 && !ctx
                     .key_generations
-                    .backspace_repeat_cancelled(host_keyboard_id, 14)
+                    .backspace_repeat_cancelled(host_keyboard_id)
                 && ctx.key_generations.peek(host_keyboard_id, 14).is_none()
                 && ctx
                     .key_generations
@@ -3879,7 +3878,7 @@ mod tests {
             "surface destruction must discard retired guest releases"
         );
         assert!(
-            ctx.keyboard_repeatable_keys.contains_key(&host_keyboard_id),
+            ctx.keyboards.keymap_for_test(host_keyboard_id).is_some(),
             "surface focus teardown must preserve keymap-derived capabilities"
         );
         assert!(
@@ -3981,7 +3980,8 @@ mod tests {
         for ((guest_keyboard, host_keyboard), (guest_seat, _)) in keyboards.into_iter().zip(seats) {
             ctx.shadow_table
                 .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-            ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
+            ctx.keyboards
+                .add_for_test(guest_keyboard, host_keyboard, guest_seat);
         }
         // Only the first is enabled: one text input on a connection can be.
         for (

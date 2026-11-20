@@ -24,6 +24,7 @@ mod client_kind;
 mod connection;
 mod handler;
 mod ime;
+mod keymap;
 mod placement_config;
 mod proxy;
 mod settings;

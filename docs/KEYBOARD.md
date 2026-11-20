@@ -20,10 +20,9 @@ channels and its delivery on up to two.
 `KeyGenerationRegistry` (`sommelier/src/state/input.rs`) holds one
 `KeyGeneration` per host keyboard and key, its current generation: the
 key's life from one press to the next. A key with no entry is idle. A
-generation has three independent parts: its phase, with the peek record
-inside it, its guest owner and its accelerator suppression. The phase,
-the peek record and the guest owner are enums whose variants carry only
-the data that exists in them:
+generation has two independent parts: its phase, with the peek record
+inside it, and its delivery. The phase and the peek record are enums
+whose variants carry only the data that exists in them:
 
 - `phase: KeyPhase`, what the host has shown of the key:
   - `Unseen`: a claim or a suppression came before any physical event,
@@ -38,12 +37,14 @@ the data that exists in them:
   serial }` (a generation whose keyboard has since held no key) or
   `Live(PeekKeyProvenance)`, the serial, time, sequence and eligibility of
   a peek press, which makes the generation a candidate for recovery.
-- `guest: GuestPress`, who gave the guest the key: `None`, `Physical`,
-  `Shortcut` (Sommelier placed a window), or `Recovered`, a tombstone for
-  a recovered pair that suppresses late duplicates.
-- `host_accelerator_suppressed`, a flag: a `wl_keyboard` press that no
-  channel gave the guest was a host accelerator. It is independent of the
-  rest: its release is dropped whatever the phase.
+- `delivery: Delivery`, what the guest got of the key:
+  - `owner`, who gave the guest the key, if anyone (`GuestKeyOwner`):
+    `Physical`, `CompositorShortcut` (Sommelier placed a window), or
+    `ImeRecovery`, a tombstone for a recovered pair that suppresses late
+    duplicates;
+  - `accelerator_suppressed`: a `wl_keyboard` press that no channel gave
+    the guest was a host accelerator. Its release is dropped whatever the
+    phase.
 
 When a key is pressed again before `wl_keyboard` released the guest's
 previous press of it, the retired generation's release waits beside the
@@ -61,7 +62,7 @@ within each part, their illegal combinations cannot be written:
 | `physical_release_serial` | `Released { release_serial }` only |
 | `backspace_repeat_cancelled`, `ime_repeat_owner` | `RepeatLease`, inside `Held` only: never both, and a release ends it |
 | `stale` | `Held { stale }` only: a release ends it |
-| `guest_owner` | `GuestPress` |
+| `guest_owner`, `host_accelerator_suppressed` | `Delivery` |
 
 ## Transitions
 
@@ -72,24 +73,37 @@ keyboard's XKB state, focus), and applies the effects on the guest:
 | Input | Transition | Handler |
 | --- | --- | --- |
 | `peek_key` press, release | `peek_key(PeekInput)` → `PeekOutcome` | `on_peek_key` |
-| `wl_keyboard.key` | `admit_key` (physical), then `transition_guest_key` (delivery) | `on_key` |
-| recovered pair | `transition_guest_key(RecoverIme)` | `ime_keys::recover_pending` |
+| `wl_keyboard.key` | `admit_key` (physical), then `transition_physical` (delivery) | `on_key` |
+| recovered pair | `recover` | `ime_keys::recover_pending` |
 | `wl_keyboard.enter` | `install_enter_snapshot`: every listed key `Held`, `Physical` | `on_enter` |
 | leave, keyboard end | `clear_keyboard` of each keyboard that lost its focus or ended | `on_leave`, `forget_keyboard` |
 | H2 detach | `mark_held_keys_stale` | `ime_keys::forget_held_keys_for_seat` |
-| Backspace lease | `arm_ime_repeat`, `cancel_backspace_repeat(_for_owner)` | `ime_keys`, `text_input::apply_lease` |
+| Backspace lease | `lease(LeaseInput)` | `ime_keys::lease`, from `on_key`, `on_peek_key`, the IME core's `KeyEffect::Lease`, a recovery and a focus change |
 
-`wl_keyboard.key` has two steps because placing a window, which a
-placement chord does before the key's delivery is decided, needs the
-whole `Context`. `admit_key` settles the events that belong to another
-generation (a late release of a retired generation, a release under
-another serial than the key's peek release, or a press of a held key
-under another serial than its peek announced) and moves the phase;
-`transition_guest_key` decides the delivery and the `ack_key` from the
-guest owner. `peek_key` retires a stale held generation on a press, owing
+`wl_keyboard.key` has two steps, because only a press of the current
+generation needs its chord classified. `admit_key` settles the events
+that belong to another generation (a late release of a retired
+generation, a release under another serial than the key's peek release,
+or a press of a held key under another serial than its peek announced)
+and moves the phase. `transition_physical` takes the press's chord class
+(`ChordClass`) and returns its `KeyVerdict`: forwarded, consumed or
+declined, which also fixes its `ack_key`, or `Shortcut`, a press that
+claimed its generation for the placement chord the handler then runs.
+Its pure core, `Delivery::physical`, is one match of the delivery and
+the event; `Delivery::recover` is the recovery's. `peek_key` retires a stale held generation on a press, owing
 the guest its release, numbers a new peek generation, refreshes the peek
 of a held one, or closes it on a release, unless the release is older
 than the peek.
+
+The lease has one transition, `lease`, for the seat's keyboards and a
+`LeaseInput`: the IME core's outcome for a text input (arm the seat's
+first held Backspace whose lease is not cancelled, or end that text
+input's lease), another key's press (which cancels its keyboard's held
+Backspace for the rest of the hold), a Backspace release or a focus
+change (which end the seat's leases), and a recovery (which arms the
+recovered Backspace whose pair went, and ends the lease after another
+recovered pair, or a Backspace whose pair was skipped). A lease names
+its text input by `TiId`.
 
 The phase moves:
 
@@ -135,5 +149,5 @@ confirmation alone (`held_repeat_key_for_seat`).
   `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`.
 - The recovery's transition table. Test:
   `a_waiting_recovery_is_decided_by_the_hosts_next_event`.
-- The handler tests in `keyboard.rs`, `ime_keys.rs` and `text_input.rs`
-  and the DST pin the wire behaviour.
+- The handler tests of `keyboard.rs`, `ime_keys.rs` and `text_input.rs`
+  (each in its `tests.rs`) and the DST pin the wire behaviour.

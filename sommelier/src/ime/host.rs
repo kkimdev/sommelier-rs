@@ -91,7 +91,7 @@ pub(super) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
 /// host gets each content type once it can apply it, and only then"). A
 /// draining link waits for its barrier. Pure, and idempotent once its
 /// steps are applied.
-pub(super) fn reconcile(target: &HostTarget, link: LinkState) -> HostSteps {
+pub(super) fn reconcile(target: &HostTarget, link: &LinkState) -> HostSteps {
     let activation = match (target.surface, link) {
         (Some(surface), LinkState::Detached) => target
             .seat
@@ -106,7 +106,7 @@ pub(super) fn reconcile(target: &HostTarget, link: LinkState) -> HostSteps {
     // input method is attached to apply a content type.
     let attached = match (activation, link) {
         (Some(ActivationStep::Activate { .. }), _) => Some(None),
-        (None, LinkState::Attached { content_type }) => Some(content_type),
+        (None, LinkState::Attached { content_type, .. }) => Some(*content_type),
         _ => None,
     };
     HostSteps {

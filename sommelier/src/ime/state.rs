@@ -19,7 +19,7 @@ limitations under the License.
 //! or a press can change what the guest is shown only through
 //! [`Current`], which only [`TextInput::current`] makes.
 
-use super::exo_view::{Edit, ExoView, Frame, Unmeasured};
+use super::exo_view::{ExoView, Observation, Reached, Unmeasured, Withheld};
 use super::guest::{resolve_preedit_cursor, GuestTxn, Preedit, TooLong};
 #[cfg(test)]
 use super::host;
@@ -27,7 +27,9 @@ use super::host::HostContentType;
 use super::serial::{CommitCount, Serial};
 #[cfg(test)]
 use super::Env;
-use super::{BarrierToken, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
+use super::{
+    BarrierToken, Edit, HostTi, KeyEffect, LeaseOutcome, Piece, SeatId, SurfaceId, TiId, V1Pieces,
+};
 use crate::wire::Outgoing;
 
 /// A text-input-v3 content type: `(hint, purpose)`.
@@ -87,7 +89,8 @@ pub(crate) struct TextInput {
     /// Exo's text, which the host text input keeps for its whole life, so
     /// it lives beside the link too.
     exo: ExoView,
-    composition: Composition,
+    /// The pieces of Exo's next edit, which arrive whatever the link.
+    pieces: V1Pieces,
     warned: Warned,
 }
 
@@ -109,7 +112,7 @@ struct FocusedField {
 /// host gets each content type once it can apply it, and only then").
 /// Only the transitions of [`TextInput`] change it, and only
 /// [`TextInput::leave_attached`] leaves `Attached`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LinkState {
     /// No input method is attached, and none is about to be.
     Detached,
@@ -117,26 +120,30 @@ pub(crate) enum LinkState {
     Attached {
         /// The content type the input method applied, `None` until sent.
         content_type: Option<HostContentType>,
+        /// What the guest shows of the input method's composition, which
+        /// exists only while it is attached (I2).
+        composition: Composition,
     },
     /// `deactivate` was sent, and `barrier` drains Exo's events from
     /// before it.
     Draining { barrier: BarrierToken },
 }
 
-/// What the guest shows, and the v1 pieces of the next host event. What
-/// Exo holds is the Exo mirror's ([`ExoView`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Composition {
-    shown: Option<Preedit>,
-    assembly: Assembly,
+impl LinkState {
+    /// The preedit the guest shows, which only an attached link has.
+    fn shown(&self) -> Option<&Preedit> {
+        match self {
+            Self::Attached { composition, .. } => composition.shown.as_ref(),
+            Self::Detached | Self::Draining { .. } => None,
+        }
+    }
 }
 
-/// The v1 `preedit_cursor` and `preedit_styling` selection that the next
-/// preedit or preedit region applies.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Assembly {
-    pub(crate) cursor: Option<i32>,
-    pub(crate) selection: Option<(u32, u32)>,
+/// What the guest shows. What Exo holds is the Exo mirror's
+/// ([`ExoView`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Composition {
+    shown: Option<Preedit>,
 }
 
 /// What the proxy warned of, so that it warns once per text input. The
@@ -168,7 +175,7 @@ impl TextInput {
             link: LinkState::Detached,
             fence: None,
             exo: ExoView::new(),
-            composition: Composition::default(),
+            pieces: V1Pieces::default(),
             warned: Warned::default(),
         }
     }
@@ -185,8 +192,21 @@ impl TextInput {
         self.commits.serial()
     }
 
-    pub(crate) fn link(&self) -> LinkState {
-        self.link
+    pub(crate) fn link(&self) -> &LinkState {
+        &self.link
+    }
+
+    /// The preedit the guest shows, which only an attached link has.
+    fn shown(&self) -> Option<&Preedit> {
+        self.link.shown()
+    }
+
+    /// The composition, while the link is attached.
+    fn composition_mut(&mut self) -> Option<&mut Composition> {
+        match &mut self.link {
+            LinkState::Attached { composition, .. } => Some(composition),
+            LinkState::Detached | LinkState::Draining { .. } => None,
+        }
     }
 
     pub(crate) fn is_attached(&self) -> bool {
@@ -220,6 +240,7 @@ impl TextInput {
         self.commits.bump();
     }
 
+    #[cfg(test)]
     pub(super) fn exo(&self) -> &ExoView {
         &self.exo
     }
@@ -228,21 +249,21 @@ impl TextInput {
         &mut self.exo
     }
 
-    /// The preedit the guest shows.
-    pub(super) fn shown(&self) -> Option<&Preedit> {
-        self.composition.shown.as_ref()
-    }
-
     /// Whether the core withholds the guest's report `report`
-    /// (`ExoView::withholds`).
-    pub(super) fn withholds_report(&mut self, report: &(String, u32, u32)) -> bool {
-        self.exo.withholds(report, self.composition.shown.as_ref())
+    /// (`ExoView::withholding`).
+    pub(super) fn withholding(&self, report: &(String, u32, u32)) -> Option<Withheld> {
+        self.exo.withholding(report, self.shown())
     }
 
-    /// After a tracker-changing host event, with `frame` the one made
-    /// before it and `edit` what reached the guest (`ExoView::after`).
-    pub(super) fn exo_after(&mut self, frame: Option<&Frame>, edit: Option<Edit>) {
-        self.exo.after(frame, edit, self.composition.shown.as_ref());
+    /// The mirror takes host edit `edit`, with its `pieces`, before the
+    /// gate (`ExoView::observe`).
+    pub(super) fn observe(&mut self, ti: TiId, edit: &Edit, pieces: &V1Pieces) -> Observation {
+        self.exo.observe(ti, edit, pieces, self.link.shown())
+    }
+
+    /// An edit the gate kept from the guest.
+    pub(super) fn stale(&mut self, observation: Observation) {
+        self.exo.finish(observation, None, self.link.shown());
     }
 
     /// The pending state a commit consumes, or `None` while unfocused
@@ -297,7 +318,7 @@ impl TextInput {
         }
         let serial = self.serial();
         let txn = GuestTxn {
-            preedit: self.composition.shown.clone(),
+            preedit: self.shown().cloned(),
             ..GuestTxn::default()
         };
         txn.encode(ti, false, serial).unwrap_or_else(|TooLong| {
@@ -305,7 +326,9 @@ impl TextInput {
                 "Forgetting the preedit of text input {}: it no longer fits",
                 ti.0
             );
-            self.composition.shown = None;
+            if let Some(composition) = self.composition_mut() {
+                composition.shown = None;
+            }
             let done = GuestTxn::default().encode(ti, false, serial);
             done.expect("a bare done has no string")
         })
@@ -316,8 +339,9 @@ impl TextInput {
     /// answer that forgets one (G9c).
     #[cfg(test)]
     pub(super) fn replace_shown(&mut self, preedit: Preedit) {
-        assert!(self.composition.shown.is_some(), "a preedit shows");
-        self.composition.shown = Some(preedit);
+        let composition = self.composition_mut().expect("attached");
+        assert!(composition.shown.is_some(), "a preedit shows");
+        composition.shown = Some(preedit);
     }
 
     /// F1, F2 and G10: the field ends, and a new one starts on `surface`,
@@ -332,46 +356,61 @@ impl TextInput {
         old
     }
 
-    /// H4 and H5 record into the assembly only while attached.
-    pub(super) fn assembly_mut(&mut self) -> Option<&mut Assembly> {
-        self.is_attached().then_some(&mut self.composition.assembly)
+    /// H4 to H6: record a piece of Exo's next edit.
+    pub(super) fn record_piece(&mut self, piece: Piece) {
+        self.pieces.record(piece);
     }
 
-    /// B3: take the assembly, which a host composition event or a press
-    /// used up (design H9).
-    pub(super) fn take_assembly(&mut self) -> Assembly {
-        std::mem::take(&mut self.composition.assembly)
+    /// B3: an edit takes the pieces Exo sent before it, whatever becomes of
+    /// the edit.
+    pub(super) fn take_pieces(&mut self) -> V1Pieces {
+        std::mem::take(&mut self.pieces)
     }
 
-    /// The gate of every host composition event and press: the link is
-    /// attached, no fence is pending, and the field is focused. The only
-    /// constructor of [`Current`].
+    /// Whether the text input passes the gate of every host composition
+    /// event and press: the link is attached, no fence is pending, and the
+    /// field is focused.
+    pub(super) fn is_current(&self) -> bool {
+        self.is_attached() && self.fence.is_none() && matches!(self.field, Field::Focused(_))
+    }
+
+    /// The gate ([`Self::is_current`]); the only constructor of
+    /// [`Current`].
     pub(super) fn current(&mut self, ti: TiId) -> Option<Current<'_>> {
-        if !self.is_attached() || self.fence.is_some() {
+        if !self.is_current() {
             return None;
         }
-        if matches!(self.field, Field::Unfocused) {
+        // The composition, which only an attached link has.
+        let LinkState::Attached { composition, .. } = &mut self.link else {
             return None;
-        }
+        };
         Some(Current {
             ti,
             seat: self.seat,
             serial: self.commits.serial(),
-            composition: &mut self.composition,
+            composition,
             fence: &mut self.fence,
+            exo: &mut self.exo,
         })
     }
 
     pub(super) fn activate_sent(&mut self) {
         debug_assert_eq!(self.link, LinkState::Detached);
-        self.link = LinkState::Attached { content_type: None };
+        self.link = LinkState::Attached {
+            content_type: None,
+            composition: Composition::default(),
+        };
     }
 
     pub(super) fn content_type_sent(&mut self, applied: HostContentType) {
-        debug_assert!(self.is_attached());
-        self.link = LinkState::Attached {
-            content_type: Some(applied),
-        };
+        if let LinkState::Attached { content_type, .. } = &mut self.link {
+            *content_type = Some(applied);
+        } else {
+            debug_assert!(
+                false,
+                "only an attached input method applies a content type"
+            );
+        }
     }
 
     /// The one way out of `Attached`, into `next`. It ends the composition
@@ -383,8 +422,10 @@ impl TextInput {
         if !self.is_attached() {
             return None;
         }
-        self.link = next;
-        Some(std::mem::take(&mut self.composition))
+        match std::mem::replace(&mut self.link, next) {
+            LinkState::Attached { composition, .. } => Some(composition),
+            LinkState::Detached | LinkState::Draining { .. } => None,
+        }
     }
 
     pub(super) fn deactivate_sent(&mut self, barrier: BarrierToken) {
@@ -456,13 +497,13 @@ impl TextInput {
         // activation waits for a live seat (R2), or while it is attached
         // with a dead seat.
         let target = host::target(self, env);
-        match (target.surface, self.link) {
+        match (target.surface, &self.link) {
             (_, LinkState::Draining { .. }) | (None, LinkState::Detached) => {}
             (Some(_), LinkState::Detached) => {
                 assert_eq!(target.seat, None, "I1b: {ti:?} can activate: {self:?}")
             }
-            (Some(_), LinkState::Attached { content_type }) => assert_eq!(
-                content_type,
+            (Some(_), LinkState::Attached { content_type, .. }) => assert_eq!(
+                *content_type,
                 Some(target.content_type),
                 "I1b: {ti:?} lacks its content type"
             ),
@@ -470,11 +511,7 @@ impl TextInput {
                 panic!("I1b: {ti:?} is attached with no target: {self:?}")
             }
         }
-        let Composition { shown, assembly } = &self.composition;
-        if shown.is_some() || *assembly != Assembly::default() {
-            assert!(attached, "I2: {ti:?} composes while not attached");
-        }
-        if shown.is_some() {
+        if self.shown().is_some() {
             assert!(
                 self.fence.is_none(),
                 "I2: {ti:?} shows a preedit behind a fence"
@@ -513,32 +550,38 @@ impl TextInput {
     /// for, as the reconcile of the guest commit that set its state would.
     pub(crate) fn attach_for_test(&mut self, env: &impl Env) {
         let content_type = Some(host::target(self, env).content_type);
-        self.link = LinkState::Attached { content_type };
+        self.link = LinkState::Attached {
+            content_type,
+            composition: Composition::default(),
+        };
     }
 
     /// Show `text` with the cursor at its end, or show nothing for empty
     /// `text`.
     pub(crate) fn show_for_test(&mut self, text: &str) {
         let end = text.len() as i32;
-        self.composition.shown = Preedit::new(text.to_string(), (end, end));
+        let composition = self
+            .composition_mut()
+            .expect("only an attached link composes");
+        composition.shown = Preedit::new(text.to_string(), (end, end));
     }
 
     /// The text of the preedit the guest shows.
     pub(crate) fn shown_for_test(&self) -> Option<&str> {
-        self.composition.shown.as_ref().map(Preedit::text)
+        self.shown().map(Preedit::text)
     }
 
     pub(crate) fn pending_for_test(&self) -> &V3Pending {
         &self.pending
     }
 
-    pub(crate) fn assembly_for_test(&self) -> Assembly {
-        self.composition.assembly
+    pub(crate) fn pieces_for_test(&self) -> &V1Pieces {
+        &self.pieces
     }
 
-    /// Record `assembly`, whatever the link.
-    pub(crate) fn set_assembly_for_test(&mut self, assembly: Assembly) {
-        self.composition.assembly = assembly;
+    /// Record `pieces` for Exo's next edit.
+    pub(crate) fn set_pieces_for_test(&mut self, pieces: V1Pieces) {
+        self.pieces = pieces;
     }
 
     /// Take `other`'s view of Exo's text.
@@ -567,13 +610,16 @@ impl Field {
 /// Proof that a text input's composition is current (the gate of
 /// [`TextInput::current`]). Its fields are private to this file, so no
 /// other module can make one. Each method plans the transaction of one
-/// row.
+/// row; one that answers a host edit takes the edit's [`Observation`],
+/// which the plan's [`Planned::apply`] finishes with what reached the
+/// guest, or the method itself if nothing is planned.
 pub(super) struct Current<'a> {
     ti: TiId,
     seat: SeatId,
     serial: Serial,
     composition: &'a mut Composition,
     fence: &'a mut Option<BarrierToken>,
+    exo: &'a mut ExoView,
 }
 
 /// Why a host delete (H9) is dropped.
@@ -602,80 +648,141 @@ pub(super) enum Confirm<'a> {
     RecoverHeldKey(KeyEffect),
 }
 
+/// What a plan's transaction stands for, which says what the Exo view
+/// learns once it applies.
+enum Origin {
+    /// A host edit (H7 to X2), whose observation it finishes, applied or
+    /// not.
+    Edit(Observation),
+    /// The guest commits the preedit it shows with no event of Exo's (F1,
+    /// H2), after which Exo may not hold the text.
+    Shown,
+    /// A press commits the preedit, and resets Exo behind the fence (F4).
+    Press(BarrierToken),
+}
+
 impl<'a> Current<'a> {
     pub(super) fn shown(&self) -> Option<&Preedit> {
         self.composition.shown.as_ref()
     }
 
-    /// Plan `txn`, with what becomes of the Backspace lease, `lease`. H9
-    /// and X1 plan the transaction a `exo_view::Frame` measured in Exo's
-    /// text.
-    pub(super) fn plan(self, txn: GuestTxn, lease: LeaseOutcome) -> Planned<'a> {
+    /// What becomes of the Backspace lease after an edit that does not
+    /// reach the guest.
+    pub(super) fn lease(&self, outcome: LeaseOutcome) -> KeyEffect {
+        KeyEffect::Lease {
+            ti: self.ti,
+            seat: self.seat,
+            outcome,
+        }
+    }
+
+    fn planned(self, txn: GuestTxn, lease: LeaseOutcome, origin: Origin) -> Planned<'a> {
         Planned {
             cur: self,
             txn,
             lease,
-            fence: None,
+            origin,
         }
     }
 
+    /// Plan `txn`, the answer to the host edit of `observation`, with what
+    /// becomes of the Backspace lease, `lease`. H9 and X1 plan the
+    /// transaction a `exo_view::Frame` measured in Exo's text.
+    pub(super) fn plan(
+        self,
+        txn: GuestTxn,
+        lease: LeaseOutcome,
+        observation: Observation,
+    ) -> Planned<'a> {
+        self.planned(txn, lease, Origin::Edit(observation))
+    }
+
+    /// The host edit of `observation` reaches the guest as nothing, which
+    /// is then out of step with Exo.
+    pub(super) fn drop_edit(self, observation: Observation) {
+        self.exo
+            .finish(observation, None, self.composition.shown.as_ref());
+    }
+
+    /// The host edit of `observation` edits nothing, so the guest stays as
+    /// Exo is.
+    pub(super) fn edits_nothing(self, observation: Observation) {
+        let shown = self.composition.shown.as_ref();
+        self.exo
+            .finish(observation, Some(Reached::default()), shown);
+    }
+
     /// H7. Exo's commit text is always the preedit's, so it is not read.
-    pub(super) fn preedit(self, text: String, assembly: Assembly) -> Planned<'a> {
+    pub(super) fn preedit(
+        self,
+        text: String,
+        pieces: &V1Pieces,
+        observation: Observation,
+    ) -> Planned<'a> {
         let lease = match text.is_empty() && self.shown().is_some() {
             true => LeaseOutcome::ArmIfBackspaceHeld,
             false => LeaseOutcome::End,
         };
-        let cursor = resolve_preedit_cursor(&text, assembly.selection, assembly.cursor);
+        let cursor = resolve_preedit_cursor(&text, pieces.selection(), pieces.cursor);
         let txn = GuestTxn {
             preedit: Preedit::new(text, cursor),
             ..GuestTxn::default()
         };
-        self.plan(txn, lease)
+        self.plan(txn, lease, observation)
     }
 
     /// H8.
-    pub(super) fn host_commit(self, text: String) -> Planned<'a> {
+    pub(super) fn host_commit(self, text: String, observation: Observation) -> Planned<'a> {
         let txn = GuestTxn {
             commit: Some(text),
             ..GuestTxn::default()
         };
-        self.plan(txn, LeaseOutcome::End)
+        self.plan(txn, LeaseOutcome::End, observation)
     }
 
     /// X2 commits the shown preedit; X2', with none shown, recovers the
-    /// key the input method took.
-    pub(super) fn confirm(self) -> Confirm<'a> {
+    /// key the input method took, and edits nothing.
+    pub(super) fn confirm(self, observation: Observation) -> Confirm<'a> {
         if self.shown().is_none() {
-            return Confirm::RecoverHeldKey(KeyEffect::RecoverHeldKey {
+            let recover = KeyEffect::RecoverHeldKey {
                 ti: self.ti,
                 seat: self.seat,
-            });
+            };
+            self.edits_nothing(observation);
+            return Confirm::RecoverHeldKey(recover);
         }
-        Confirm::Commit(self.commit_shown())
+        Confirm::Commit(self.commit_composition(observation))
     }
 
-    /// The assembly, which a preedit and a region apply (B3).
-    pub(super) fn take_assembly(&mut self) -> Assembly {
-        std::mem::take(&mut self.composition.assembly)
+    /// X1 and X2: the host edit of `observation` commits the shown
+    /// preedit.
+    pub(super) fn commit_composition(self, observation: Observation) -> Planned<'a> {
+        let txn = self.commit_txn();
+        self.plan(txn, LeaseOutcome::End, observation)
     }
 
     /// F4: a press commits the shown preedit, and fences the host's
     /// `reset` with `fence`.
     pub(super) fn press_commit(self, fence: BarrierToken) -> Planned<'a> {
         debug_assert!(self.shown().is_some(), "a press commits a shown preedit");
-        let mut planned = self.commit_shown();
-        planned.fence = Some(fence);
-        planned
+        let txn = self.commit_txn();
+        self.planned(txn, LeaseOutcome::End, Origin::Press(fence))
     }
 
-    /// The commit of the shown preedit (X1, X2, F1, F4, H2).
+    /// F1 and H2: the guest commits the shown preedit, with no event of
+    /// Exo's.
     pub(super) fn commit_shown(self) -> Planned<'a> {
+        let txn = self.commit_txn();
+        self.planned(txn, LeaseOutcome::End, Origin::Shown)
+    }
+
+    /// The commit of the shown preedit.
+    fn commit_txn(&self) -> GuestTxn {
         let text = self.shown().map(|shown| shown.text().to_string());
-        let txn = GuestTxn {
+        GuestTxn {
             commit: text,
             ..GuestTxn::default()
-        };
-        self.plan(txn, LeaseOutcome::End)
+        }
     }
 }
 
@@ -686,38 +793,50 @@ pub(super) struct Planned<'a> {
     cur: Current<'a>,
     txn: GuestTxn,
     lease: LeaseOutcome,
-    /// The press's reset fence (F4).
-    fence: Option<BarrierToken>,
+    origin: Origin,
 }
 
 impl Planned<'_> {
-    /// What reaches the guest of the transaction, if it applies.
-    pub(super) fn edit(&self) -> Edit {
-        let txn = &self.txn;
-        let (deleted_before, deleted_after) = txn.delete.unwrap_or_default();
-        Edit {
-            deleted_before,
-            deleted: (deleted_before, deleted_after) != (0, 0),
-            committed: txn.commit.as_ref().map_or(0, String::len),
-            shown_before: self.cur.composition.shown.is_some(),
-        }
-    }
-
     /// Encode the transaction and, if it fits, make its change: the guest
-    /// then shows the transaction's preedit. Returns its events and the
-    /// lease effect; if it does not fit, nothing changes.
+    /// then shows the transaction's preedit, and the Exo view learns what
+    /// reached the guest. Returns its events and the lease effect; if it
+    /// does not fit, nothing changes but that the view learns that nothing
+    /// of a host edit reached the guest.
     pub(super) fn apply(self) -> Result<(Vec<Outgoing>, KeyEffect), TooLong> {
         let Planned {
             cur,
             txn,
             lease,
-            fence,
+            origin,
         } = self;
-        let events = txn.encode(cur.ti, cur.composition.shown.is_some(), cur.serial)?;
+        let shown_before = cur.composition.shown.is_some();
+        let events = match txn.encode(cur.ti, shown_before, cur.serial) {
+            Ok(events) => events,
+            Err(TooLong) => {
+                if let Origin::Edit(observation) = origin {
+                    cur.drop_edit(observation);
+                }
+                return Err(TooLong);
+            }
+        };
+        let (deleted_before, deleted_after) = txn.delete.unwrap_or_default();
+        let reached = Reached {
+            deleted_before,
+            deleted: (deleted_before, deleted_after) != (0, 0),
+            committed: txn.commit.as_ref().map_or(0, String::len),
+            shown_before,
+        };
         cur.composition.shown = txn.preedit;
-        if fence.is_some() {
-            // The gate admitted the press, so no fence was pending.
-            *cur.fence = fence;
+        let shown = cur.composition.shown.as_ref();
+        match origin {
+            Origin::Edit(observation) => cur.exo.finish(observation, Some(reached), shown),
+            // An edit with no event of Exo's, which may not hold the text.
+            Origin::Shown => cur.exo.step_lost(),
+            Origin::Press(fence) => {
+                // The gate admitted the press, so no fence was pending.
+                *cur.fence = Some(fence);
+                cur.exo.cancel_sent(fence);
+            }
         }
         let lease = KeyEffect::Lease {
             ti: cur.ti,

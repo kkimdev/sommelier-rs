@@ -24,6 +24,7 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
+use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::wire::{IndexedString, Outgoing};
 
 mod exo_view;
@@ -42,7 +43,7 @@ mod tests;
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
 #[cfg(test)]
-pub(crate) use state::{Assembly, LinkState, TextInput, V3Committed, V3Pending};
+pub(crate) use state::{LinkState, TextInput, V3Committed, V3Pending};
 #[cfg(test)]
 pub(crate) use step::{take_drops_for_test, Drops};
 
@@ -113,11 +114,11 @@ pub enum Input {
     V1(TiId, HostIme),
     Ext {
         ext: u32,
-        event: HostIme,
+        event: Edit,
     },
     BarrierDone(BarrierToken),
 
-    // Cross-concern messages (F1 to F4).
+    // Cross-concern messages (F1 to F5, and X2's recovery).
     /// F1: the seat's keyboard focus moved to `surface`, or to none. The
     /// keyboard concern sends one per seat whose focused surface changed.
     /// `keyboard` is the guest's copy of the keyboard events that moved it,
@@ -144,22 +145,41 @@ pub enum Input {
     /// The keyboard concern forwarded a key press or repeat to the guest on
     /// this seat, which may edit the guest's text where Exo does not see.
     GuestKey(SeatId),
+    /// X2': the keyboard concern recovered the held key of `ti`'s empty
+    /// confirmation ([`KeyEffect::RecoverHeldKey`]), once
+    /// [`ImeCore::admits_recovery`] admitted it. `pair` is the key's press
+    /// and release, empty if another channel already delivered the key;
+    /// the guest gets it, then G9c's answer, the transaction that closes
+    /// the confirmation under the serial of now.
+    HeldKeyRecovered {
+        ti: TiId,
+        pair: Vec<Outgoing>,
+    },
 }
 
 /// A host input-method event of a text input, from its v1 object or its
 /// extension.
 #[derive(Debug)]
 pub enum HostIme {
-    PreeditStyling {
-        index: u32,
-        length: u32,
-        style: u32,
-    },
-    PreeditCursor(i32),
-    CursorPosition {
-        index: i32,
-        anchor: i32,
-    },
+    Piece(Piece),
+    Edit(Edit),
+}
+
+/// A v1 event that describes the edit Exo sends right after it (H4 to
+/// H6), which takes it ([`V1Pieces`]).
+#[derive(Debug)]
+pub enum Piece {
+    /// H4 `preedit_styling`.
+    Styling { index: u32, length: u32, style: u32 },
+    /// H5 `preedit_cursor`.
+    Cursor(i32),
+    /// H6 `cursor_position`.
+    CursorPosition { index: i32, anchor: i32 },
+}
+
+/// An event that changes Exo's text (H7 to H9, X1 and X2).
+#[derive(Debug)]
+pub enum Edit {
     Preedit {
         serial: u32,
         text: IndexedString,
@@ -181,6 +201,55 @@ pub enum HostIme {
         /// `confirm_preedit`'s selection behavior is `unchanged`.
         keep_selection: bool,
     },
+}
+
+impl From<Piece> for HostIme {
+    fn from(piece: Piece) -> Self {
+        Self::Piece(piece)
+    }
+}
+
+impl From<Edit> for HostIme {
+    fn from(edit: Edit) -> Self {
+        Self::Edit(edit)
+    }
+}
+
+/// The v1 pieces Exo sent since its last edit, which the next edit takes,
+/// whatever becomes of it: Exo sends each piece only right before the edit
+/// it describes. The mirror reads them all; the guest's preedit takes the
+/// cursor and the selection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct V1Pieces {
+    /// H5's index.
+    pub(crate) cursor: Option<i32>,
+    /// H4's spans, in order: index, length and style.
+    pub(crate) styling: Vec<(u32, u32, u32)>,
+    /// H6's index and anchor.
+    pub(crate) cursor_position: Option<(i32, i32)>,
+}
+
+impl V1Pieces {
+    /// Record `piece`.
+    fn record(&mut self, piece: Piece) {
+        match piece {
+            Piece::Styling {
+                index,
+                length,
+                style,
+            } => self.styling.push((index, length, style)),
+            Piece::Cursor(index) => self.cursor = Some(index),
+            Piece::CursorPosition { index, anchor } => self.cursor_position = Some((index, anchor)),
+        }
+    }
+
+    /// The last selection span, which v3 can show only as the preedit's
+    /// cursor.
+    fn selection(&self) -> Option<(u32, u32)> {
+        let selection = zwp_text_input_v1::PREEDIT_STYLE_SELECTION;
+        let mut spans = self.styling.iter().rev();
+        spans.find_map(|&(index, length, style)| (style == selection).then_some((index, length)))
+    }
 }
 
 /// What one step asks the adapter to send and do, each in order.
@@ -241,9 +310,11 @@ pub enum KeyEffect {
     /// method took, if the confirmation turns out to be its autorepeat and
     /// not Exo's confirmation before a new press (E13). The keyboard
     /// concern decides at the host's next event; if it recovers the key,
-    /// it sends its press and release unless another channel already
-    /// delivered it, then the transaction of [`ImeCore::recovery_done`],
-    /// whether or not the pair went. The lease:
+    /// and the text input still passes the gate
+    /// ([`ImeCore::admits_recovery`]), it hands the core the key's press
+    /// and release, unless another channel already delivered it, as
+    /// [`Input::HeldKeyRecovered`], whose transaction follows them whether
+    /// or not the pair went. The lease:
     /// - a held Backspace whose pair is sent arms it;
     /// - a held Backspace whose pair is skipped ends it;
     /// - another held key whose pair is sent ends it;
@@ -251,6 +322,10 @@ pub enum KeyEffect {
     /// - with no held key, or a new press's confirmation, it ends, and
     ///   nothing is sent.
     RecoverHeldKey { ti: TiId, seat: SeatId },
+    /// H2: Exo detached the input method of a text input of `seat` on its
+    /// own, and the key events in flight died with it: no key the seat
+    /// holds now is recovered again.
+    InputMethodDetached { seat: SeatId },
 }
 
 /// Read-only facts the core needs and does not own. The adapter answers
@@ -375,26 +450,14 @@ impl ImeCore {
 pub(crate) type StateForTest = (String, (usize, usize), std::ops::Range<usize>);
 
 impl ImeCore {
-    /// The seat of text input `ti` while Exo's input method is attached
-    /// to it, whatever its fence.
-    pub fn attached_seat(&self, ti: TiId) -> Option<SeatId> {
+    /// X2': whether text input `ti` still passes the gate, so that the held
+    /// key its empty confirmation stood for may be recovered
+    /// ([`Input::HeldKeyRecovered`]). The keyboard concern asks before it
+    /// recovers the key, as nothing is sent otherwise.
+    pub fn admits_recovery(&self, ti: TiId) -> bool {
         self.inputs
             .get(&ti)
-            .filter(|t| t.is_attached())
-            .map(|t| t.seat())
-    }
-
-    /// X2': the transaction that closes text input `ti`'s empty
-    /// confirmation once the keyboard concern has recovered the held key
-    /// it stood for ([`KeyEffect::RecoverHeldKey`]): G9c's answer, what the
-    /// guest shows under the current serial. `None` if the text input no
-    /// longer passes the gate, in which case nothing is recovered.
-    pub fn recovery_done(&mut self, ti: TiId) -> Option<Vec<Outgoing>> {
-        let input = self.inputs.get_mut(&ti)?;
-        input.current(ti)?;
-        // The key may edit the guest's text.
-        input.exo_mut().guest_edited();
-        Some(input.answer(ti))
+            .is_some_and(state::TextInput::is_current)
     }
 
     /// Check the invariants of design 3.1 (I1a to I3) that hold between

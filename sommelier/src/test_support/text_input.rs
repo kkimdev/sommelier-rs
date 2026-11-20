@@ -23,9 +23,7 @@ limitations under the License.
 //! what the peers receive uses `proxy::harness::Session` instead.
 
 use crate::handler::text_input::CtxEnv;
-use crate::ime::{
-    Assembly, HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId, V3Pending,
-};
+use crate::ime::{HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId, V3Pending};
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::state::{Context, HostId, InternalCallback};
 
@@ -54,9 +52,8 @@ pub(crate) struct Active<'a> {
     pub(crate) preedit: Option<&'a str>,
     /// The commits the guest has made.
     pub(crate) commits: u32,
-    /// Whether state waits for its commit or for its host event: the
-    /// guest's next enable, surrounding text and cursor rectangle, and, if
-    /// the host is active, its preedit cursor and preedit styling.
+    /// Whether state waits for its commit: the guest's next enable,
+    /// surrounding text and cursor rectangle.
     pub(crate) pending: bool,
 }
 
@@ -130,13 +127,6 @@ pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
                 cursor_rect: Some((1, 2, 3, 4)),
             };
         }
-        // The host's events reach the field only while it is active.
-        if active.enabled {
-            t.set_assembly_for_test(Assembly {
-                cursor: Some(1),
-                selection: Some((0, 1)),
-            });
-        }
     }
     ctx.ime
         .assert_invariants(&CtxEnv::new(&ctx.shadow_table, &ctx.keyboard_focus));
@@ -168,8 +158,8 @@ pub(crate) struct View {
     pub(crate) preedit: Option<String>,
     /// The commits the guest has made.
     pub(crate) commits: u32,
-    /// Whether any state waits for its commit or its host event, as
-    /// [`Active::pending`] lists.
+    /// Whether any state waits for its commit, as [`Active::pending`]
+    /// lists.
     pub(crate) pending: bool,
 }
 
@@ -187,14 +177,13 @@ pub(crate) fn view(ctx: &Context, guest: u32) -> View {
             LinkState::Attached { .. } => Host::Active,
             LinkState::Draining { barrier } => Host::Draining(
                 ctx.internal_callbacks
-                    .awaits(InternalCallback::TextInput { token: barrier })
+                    .awaits(InternalCallback::TextInput { token: *barrier })
                     .expect("a drain waits for its callback"),
             ),
         },
         preedit: t.shown_for_test().map(str::to_string),
         commits: t.serial().get(),
-        pending: *t.pending_for_test() != V3Pending::default()
-            || t.assembly_for_test() != Assembly::default(),
+        pending: *t.pending_for_test() != V3Pending::default(),
     }
 }
 

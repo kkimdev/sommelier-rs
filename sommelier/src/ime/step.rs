@@ -18,13 +18,13 @@ limitations under the License.
 //! reconcile of every text input, then removals. Each arm decides, which
 //! includes encoding, before it changes anything (design 3.5).
 
-use super::exo_view::{Edit, Frame, Unmeasured};
+use super::exo_view::{Frame, Observation, Unmeasured};
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
 use super::state::{Confirm, Deferral, DeleteDrop, LinkState, RegionDrop, TextInput, V3Pending};
 use super::{
-    BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, Input, KeyEffect, LeaseOutcome,
-    SeatId, SurfaceId, TiId,
+    BarrierToken, Edit, Effects, Env, HostIme, HostOut, HostTi, ImeCore, Input, KeyEffect,
+    LeaseOutcome, SeatId, SurfaceId, TiId, V1Pieces,
 };
 use crate::connection::MAX_BYTES_PER_SEND;
 use crate::protocols::text_input_extension_unstable_v1::{
@@ -41,18 +41,6 @@ const TRACE: &str = "sommelier::ime";
 
 /// The length of a `wl_display.sync`: a header and its `new_id`.
 const SYNC_LEN: usize = crate::wire::MessageHeader::LEN + 4;
-
-/// When a planned host composition event takes the assembly, as the old
-/// handlers did (B3, design H9).
-enum Takes {
-    /// It took it before it was planned: a preedit and a region, which
-    /// apply it.
-    Before,
-    /// Once it reaches the guest: a commit and a delete.
-    IfApplied,
-    /// Whether or not it fits a message: a confirmation of a preedit.
-    Planned,
-}
 
 /// A report the core forwards: the text, cursor and anchor, and whether
 /// the guest stated them, or the empty stand-in for a field that states
@@ -103,7 +91,7 @@ impl ImeCore {
             Input::HostLeave(ti) => self.host_leave(ti, &mut fx),
             Input::V1(ti, event) => self.host_event(ti, event, &mut fx),
             Input::Ext { ext, event } => match self.by_ext(ext) {
-                Some(ti) => self.host_event(ti, event, &mut fx),
+                Some(ti) => self.host_event(ti, HostIme::Edit(event), &mut fx),
                 None => log::debug!("Ignoring an event of retired extension {ext}"),
             },
             // W1 and W2: a token is one text input's drain or fence, or a
@@ -127,6 +115,7 @@ impl ImeCore {
                 .values_mut()
                 .filter(|t| t.seat() == seat)
                 .for_each(|t| t.exo_mut().guest_edited()),
+            Input::HeldKeyRecovered { ti, pair } => self.held_key_recovered(ti, pair, &mut fx),
         }
         self.reconcile_all(commit, env, &mut fx);
         if let Some(t) = handled.and_then(|ti| self.inputs.get_mut(&ti)) {
@@ -306,6 +295,8 @@ impl ImeCore {
             return;
         };
         log::info!("Exo detached the input method of text input {}", ti.0);
+        fx.keys
+            .push(KeyEffect::InputMethodDetached { seat: t.seat() });
         // Only a preedit whose commit does not fit a message is left.
         if shown {
             let clear = GuestTxn::default().encode(ti, true, t.serial());
@@ -314,52 +305,35 @@ impl ImeCore {
         }
     }
 
-    /// H4 to H9, X1 and X2. The Exo mirror takes every event first, before
-    /// the gate, as each changed Exo's text; then
-    /// the guest is in step with Exo after a tracker-changing event only if
-    /// its transaction reached the guest and left the two alike (3.2).
+    /// H4 to H9, X1 and X2. A piece waits for its edit, which takes it. The
+    /// Exo mirror takes every edit first, before the gate, as each changed
+    /// Exo's text; then the guest is in step with Exo after it only if its
+    /// transaction reached the guest and left the two alike (3.2).
     fn host_event(&mut self, ti: TiId, event: HostIme, fx: &mut Effects) {
         let Some(t) = self.inputs.get_mut(&ti) else {
             return;
         };
-        let frame = t.exo().frame(t.shown(), &event);
-        t.exo_mut().observe(ti, &event);
-        match event {
-            HostIme::PreeditStyling {
-                index,
-                length,
-                style,
-            } => {
-                // v3 can show only the selection style, as the cursor.
-                if let Some(assembly) = t
-                    .assembly_mut()
-                    .filter(|_| style == zwp_text_input_v1::PREEDIT_STYLE_SELECTION)
-                {
-                    assembly.selection = Some((index, length));
-                }
-                return;
-            }
-            HostIme::PreeditCursor(index) => {
-                if let Some(assembly) = t.assembly_mut() {
-                    assembly.cursor = Some(index);
-                }
-                return;
-            }
-            HostIme::CursorPosition { index, anchor } => {
-                // Exo sends it only before a commit_string.
-                // H6: v3 has no cursor position apart from the preedit's.
-                log::debug!("Cannot represent v1 cursor_position({index}, {anchor}) in v3");
-                return;
-            }
-            HostIme::Preedit { .. }
-            | HostIme::Commit { .. }
-            | HostIme::Delete { .. }
-            | HostIme::PreeditRegion { .. }
-            | HostIme::Confirm { .. } => {}
-        }
-        let measuring = t.exo().measuring(&frame);
-        let edit = composition_event(ti, t, event, measuring, fx);
-        t.exo_after(frame.as_ref().ok(), edit);
+        let edit = match event {
+            HostIme::Piece(piece) => return t.record_piece(piece),
+            HostIme::Edit(edit) => edit,
+        };
+        let pieces = t.take_pieces();
+        let observation = t.observe(ti, &edit, &pieces);
+        composition_event(ti, t, edit, &pieces, observation, fx);
+    }
+
+    /// X2': the guest gets the recovered key's `pair`, then G9c's answer,
+    /// if the text input still passes the gate, which the keyboard concern
+    /// checked before it recovered the key.
+    fn held_key_recovered(&mut self, ti: TiId, pair: Vec<Outgoing>, fx: &mut Effects) {
+        let Some(t) = self.inputs.get_mut(&ti).filter(|t| t.is_current()) else {
+            log::debug!("Text input {} no longer admits its recovered key", ti.0);
+            return;
+        };
+        // The key may edit the guest's text.
+        t.exo_mut().guest_edited();
+        fx.to_guest.extend(pair);
+        fx.to_guest.extend(t.answer(ti));
     }
 
     /// F1, per text input of the seat, in `TiId` order. The field the
@@ -411,9 +385,6 @@ impl ImeCore {
             let fence = BarrierToken(self.next_barrier);
             match cur.press_commit(fence).apply() {
                 Ok((events, lease)) => {
-                    // It takes the assembly once its commit reaches the
-                    // guest, as a host commit does (B3).
-                    t.take_assembly();
                     self.next_barrier += 1;
                     log::debug!("A press ended the composition of text input {}", ti.0);
                     fx.to_guest.extend(events);
@@ -423,7 +394,6 @@ impl ImeCore {
                         request: zwp_text_input_v1::req::reset(t.host().v1),
                         barrier: fence,
                     });
-                    t.exo_mut().cancel_sent(fence);
                     fx.keys.push(lease);
                 }
                 Err(TooLong) => {
@@ -504,26 +474,27 @@ impl ImeCore {
                     None => (false, None, None),
                 };
             // A report applies at the barrier glued to it, which places it
-            // among Exo's events for the mirror. One
-            // the guest stated that Exo could only drop its composition for is
-            // withheld (5); the rest of the commit still goes out.
-            let surrounding_text = surrounding_text.filter(|(_, (report, stated))| {
-                let withheld = *stated && t.withholds_report(report);
-                if withheld {
-                    log::debug!(
-                        "Withholding the surrounding text of text input {}: Exo holds it \
-                         with the composition the guest shows",
-                        ti.0
-                    );
-                }
-                !withheld
-            });
+            // among Exo's events for the mirror. One the guest stated that
+            // Exo could only drop its composition for is withheld (5); the
+            // rest of the commit still goes out.
             if let Some((request, (report, stated))) = surrounding_text {
-                let barrier = BarrierToken(self.next_barrier);
-                self.next_barrier += 1;
-                let one_read = request.0.len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
-                fx.to_host.push(HostOut::Glued { request, barrier });
-                t.exo_mut().report_sent(barrier, report, one_read, stated);
+                match stated.then(|| t.withholding(&report)).flatten() {
+                    Some(withheld) => {
+                        log::debug!(
+                            "Withholding the surrounding text of text input {}: Exo holds it \
+                             with the composition the guest shows",
+                            ti.0
+                        );
+                        t.exo_mut().withhold(withheld);
+                    }
+                    None => {
+                        let barrier = BarrierToken(self.next_barrier);
+                        self.next_barrier += 1;
+                        let one_read = request.0.len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
+                        fx.to_host.push(HostOut::Glued { request, barrier });
+                        t.exo_mut().report_sent(barrier, report, one_read, stated);
+                    }
+                }
             }
             if let Some(content_type) = steps.content_type {
                 let requests = host::content_type_requests(host.ext.id, content_type);
@@ -547,50 +518,44 @@ impl ImeCore {
     }
 }
 
-/// H7 to H9, X1 and X2 through the gate: plan the event's transaction and
-/// send it. A delete and a region are measured in the frame `measuring`
-/// holds, Exo's text before the event, or dropped. Returns what reached
-/// the guest, if the event did.
+/// H7 to H9, X1 and X2 through the gate: plan the edit's transaction, with
+/// the pieces Exo sent before it, and send it. A delete and a region are
+/// measured in the frame of `observation`, Exo's text before the edit, or
+/// dropped. Every path finishes the observation with what reached the
+/// guest.
 fn composition_event(
     ti: TiId,
     t: &mut TextInput,
-    event: HostIme,
-    measuring: Result<&Frame, Unmeasured>,
+    edit: Edit,
+    pieces: &V1Pieces,
+    observation: Observation,
     fx: &mut Effects,
-) -> Option<Edit> {
+) {
     let count = t.serial().get();
-    let Some(mut cur) = t.current(ti) else {
-        // B3: a preedit and a region take the assembly they apply
-        // whatever becomes of them, a stale one included.
-        if matches!(
-            event,
-            HostIme::Preedit { .. } | HostIme::PreeditRegion { .. }
-        ) {
-            t.take_assembly();
-        }
+    let Some(cur) = t.current(ti) else {
         log::debug!("Ignoring a stale composition event of text input {}", ti.0);
-        return None;
+        return t.stale(observation);
     };
     // A region dropped, whose empty range commits the shown preedit.
     let mut dropped = None;
-    let (planned, takes) = match event {
-        HostIme::Preedit { serial, text, .. } => {
+    let planned = match edit {
+        Edit::Preedit { serial, text, .. } => {
             log_host_serial(serial, count);
-            let assembly = cur.take_assembly();
-            // The assembly's offsets index the text, which replacing
-            // an invalid sequence would move.
+            // The pieces' offsets index the text, which replacing an
+            // invalid sequence would move.
             let IndexedString::Utf8(text) = text else {
                 log::debug!("Ignoring a host preedit that is not UTF-8");
-                return None;
+                return cur.drop_edit(observation);
             };
-            (cur.preedit(text, assembly), Takes::Before)
+            cur.preedit(text, pieces, observation)
         }
-        HostIme::Commit { serial, text } => {
+        Edit::Commit { serial, text } => {
             log_host_serial(serial, count);
-            (cur.host_commit(text), Takes::IfApplied)
+            cur.host_commit(text, observation)
         }
-        HostIme::Delete { index, length } => {
-            let lengths = measuring
+        Edit::Delete { index, length } => {
+            let lengths = observation
+                .measuring()
                 .map_err(DeleteDrop::Unmeasured)
                 .and_then(Frame::delete);
             match lengths {
@@ -599,81 +564,60 @@ fn composition_event(
                         delete: Some(lengths),
                         ..GuestTxn::default()
                     };
-                    (cur.plan(txn, LeaseOutcome::End), Takes::IfApplied)
+                    cur.plan(txn, LeaseOutcome::End, observation)
                 }
-                // An empty delete edits nothing, so the guest stays as
-                // Exo is.
-                Err(DeleteDrop::Empty) => return Some(Edit::default()),
+                Err(DeleteDrop::Empty) => return cur.edits_nothing(observation),
                 Err(drop) => {
                     log_delete_drop(ti, index, length, drop);
                     // Exo edited its text, unless the range was empty.
                     if length > 0 {
-                        fx.keys.push(lease(ti, t, LeaseOutcome::End));
+                        fx.keys.push(cur.lease(LeaseOutcome::End));
                     }
-                    return None;
+                    return cur.drop_edit(observation);
                 }
             }
         }
-        HostIme::PreeditRegion { index, length } => {
-            let assembly = cur.take_assembly();
-            let txn = measuring
+        Edit::PreeditRegion { index, length } => {
+            let txn = observation
+                .measuring()
                 .map_err(RegionDrop::Unmeasured)
-                .and_then(|frame| frame.region(assembly));
+                .and_then(|frame| frame.region(pieces));
             match txn {
-                Ok(txn) => (cur.plan(txn, LeaseOutcome::End), Takes::Before),
+                Ok(txn) => cur.plan(txn, LeaseOutcome::End, observation),
                 // Exo ends its composition at an empty region, measured or
                 // not, and leaves it as text: the guest commits what it
                 // shows, which at worst doubles text the next preedit
                 // would otherwise replace.
                 Err(drop) if length == 0 && cur.shown().is_some() => {
                     dropped = Some((index, length, drop));
-                    (cur.commit_shown(), Takes::Before)
+                    cur.commit_composition(observation)
                 }
                 Err(drop) => {
                     log_region_drop(ti, index, length, drop);
                     // Exo edited its composition all the same.
-                    fx.keys.push(lease(ti, t, LeaseOutcome::End));
-                    return None;
+                    fx.keys.push(cur.lease(LeaseOutcome::End));
+                    return cur.drop_edit(observation);
                 }
             }
         }
-        HostIme::Confirm { .. } => match cur.confirm() {
-            Confirm::Commit(planned) => (planned, Takes::Planned),
-            Confirm::RecoverHeldKey(recover) => {
-                fx.keys.push(recover);
-                return Some(Edit::default());
-            }
+        Edit::Confirm { .. } => match cur.confirm(observation) {
+            Confirm::Commit(planned) => planned,
+            Confirm::RecoverHeldKey(recover) => return fx.keys.push(recover),
         },
-        HostIme::PreeditStyling { .. }
-        | HostIme::PreeditCursor(_)
-        | HostIme::CursorPosition { .. } => unreachable!("handled by the caller"),
     };
-    let edit = planned.edit();
     let applied = planned.apply();
     if let Some((index, length, drop)) = dropped {
         log_region_drop(ti, index, length, drop);
-    }
-    let take = match takes {
-        Takes::Before => false,
-        Takes::IfApplied => applied.is_ok(),
-        Takes::Planned => true,
-    };
-    if take {
-        t.take_assembly();
     }
     match applied {
         Ok((events, lease)) => {
             fx.to_guest.extend(events);
             fx.keys.push(lease);
-            Some(edit)
         }
-        Err(TooLong) => {
-            log::warn!(
-                "Dropping a host event of text input {}: its text does not fit a message",
-                ti.0
-            );
-            None
-        }
+        Err(TooLong) => log::warn!(
+            "Dropping a host event of text input {}: its text does not fit a message",
+            ti.0
+        ),
     }
 }
 
@@ -758,8 +702,6 @@ fn commit_shown(ti: TiId, t: &mut TextInput, fx: &mut Effects) {
         Ok((events, lease)) => {
             fx.to_guest.extend(events);
             fx.keys.push(lease);
-            // An edit with no event of Exo's, which may not hold the text.
-            t.exo_mut().step_lost();
         }
         Err(TooLong) => log::warn!(
             "Dropping the commit of text input {}'s preedit: too long",

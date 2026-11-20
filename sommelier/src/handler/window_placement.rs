@@ -283,8 +283,7 @@ struct FocusedToplevel {
 
 /// Resolve the xdg_toplevel that `host_keyboard_id` focuses, if any.
 fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedToplevel> {
-    let guest_keyboard_id = ctx.shadow_table.get_guest_id(host_keyboard_id.0)?;
-    let guest_seat_id = *ctx.keyboard_to_seat.get(&guest_keyboard_id)?;
+    let guest_seat_id = ctx.keyboards.seat(host_keyboard_id)?;
     let wl_surface_guest_id = ctx.keyboard_focus.surface_for_seat(guest_seat_id)?;
     if !ctx
         .keyboard_focus
@@ -847,7 +846,8 @@ mod fixture {
         let seat = 11;
         ctx.shadow_table
             .insert_paired_for_test(KEYBOARD.guest, KEYBOARD.host, "wl_keyboard");
-        ctx.keyboard_to_seat.insert(KEYBOARD.guest, seat);
+        ctx.keyboards
+            .add_for_test(KEYBOARD.guest, KEYBOARD.host, seat);
         ctx.keyboard_focus
             .set_for_test(HostId(KEYBOARD.host), seat, SURFACE.guest, SURFACE.host);
     }

@@ -33,7 +33,7 @@ use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1::Request as V1Manager;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::{self, Request as V1};
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{self, Event as V3};
-use crate::protocols::wayland::wl_pointer;
+use crate::protocols::wayland::{wl_keyboard, wl_pointer};
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::test_support::decoded;
 
@@ -47,6 +47,8 @@ const OTHER: SurfaceId = SurfaceId(21);
 const HOST_OTHER: u32 = 121;
 /// The guest pointer whose press [`Ime::press`] re-sends.
 const POINTER: u32 = 40;
+/// The guest keyboard of a recovered key.
+const KEYBOARD: u32 = 41;
 /// The host `zwp_text_input_manager_v1`; the extension's manager is 3.
 const MANAGER: u32 = 2;
 
@@ -78,6 +80,7 @@ fn interface(id: u32) -> &'static str {
         200..300 => "zwp_text_input_v1",
         300..400 => "zcr_extended_text_input_v1",
         POINTER => "wl_pointer",
+        KEYBOARD => "wl_keyboard",
         _ => "zwp_text_input_v3",
     }
 }
@@ -118,6 +121,8 @@ enum Host {
 enum Key {
     Lease(TiId, LeaseOutcome),
     Recover(TiId),
+    /// H2 on the seat of every test.
+    Detached,
 }
 
 /// The effects of one step, decoded.
@@ -189,6 +194,10 @@ fn decode(fx: Effects) -> Out {
             KeyEffect::RecoverHeldKey { ti, seat } => {
                 assert_eq!(seat, SEAT);
                 Key::Recover(ti)
+            }
+            KeyEffect::InputMethodDetached { seat } => {
+                assert_eq!(seat, SEAT);
+                Key::Detached
             }
         })
         .collect();
@@ -263,11 +272,28 @@ impl Ime {
         ime
     }
 
-    fn v1(&mut self, event: HostIme) -> Out {
-        self.step(Input::V1(TI, event))
+    fn v1(&mut self, event: impl Into<HostIme>) -> Out {
+        self.step(Input::V1(TI, event.into()))
     }
 
-    fn ext(&mut self, event: HostIme) -> Out {
+    /// Exo's pieces of a preedit that selects its first 3 bytes and puts
+    /// its cursor at 0.
+    fn select_and_place(&mut self) {
+        let style = zwp_text_input_v1::PREEDIT_STYLE_SELECTION;
+        for piece in [
+            Piece::Styling {
+                index: 0,
+                length: 3,
+                style,
+            },
+            Piece::Cursor(0),
+        ] {
+            let out = self.v1(piece);
+            assert!(out.guest.is_empty() && out.host.is_empty() && out.keys.is_empty());
+        }
+    }
+
+    fn ext(&mut self, event: Edit) -> Out {
         self.step(Input::Ext {
             ext: ext_id(TI),
             event,
@@ -276,7 +302,7 @@ impl Ime {
 
     /// Exo composes `text`, which it also sends as the commit text.
     fn compose(&mut self, text: &str) -> Out {
-        self.v1(HostIme::Preedit {
+        self.v1(Edit::Preedit {
             serial: 0,
             text: text.into(),
             commit: text.to_string(),
@@ -303,15 +329,15 @@ impl Ime {
     /// Exo commits `text`.
     fn host_commit(&mut self, text: &str) -> Out {
         let text = text.to_owned();
-        self.v1(HostIme::Commit { serial: 0, text })
+        self.v1(Edit::Commit { serial: 0, text })
     }
 
     fn region(&mut self, index: i32, length: u32) -> Out {
-        self.ext(HostIme::PreeditRegion { index, length })
+        self.ext(Edit::PreeditRegion { index, length })
     }
 
     fn delete(&mut self, index: i32, length: u32) -> Out {
-        self.v1(HostIme::Delete { index, length })
+        self.v1(Edit::Delete { index, length })
     }
 
     /// Whether [`TI`]'s next delete or region is measured in the mirror.
@@ -823,7 +849,7 @@ fn the_commit_after_an_oversized_one_does_not_retry_it() {
 #[test]
 fn row_G9c_a_commit_of_an_enabled_field_repeats_the_shown_preedit() {
     let mut ime = Ime::enabled();
-    ime.v1(HostIme::PreeditCursor(0));
+    ime.v1(Piece::Cursor(0));
     ime.compose("가");
     let out = ime.step(Input::Commit(TI));
     assert_eq!(out.host, [commit_state(TI, 2)]);
@@ -839,7 +865,7 @@ fn row_G9c_a_commit_of_an_enabled_field_repeats_the_shown_preedit() {
 fn an_answer_that_cannot_repeat_the_preedit_forgets_it() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 4);
-    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let region = |index, length| Edit::PreeditRegion { index, length };
     ime.ext(region(-1, 1));
     let long = Preedit::new("x".repeat(4_084), (1, 1)).unwrap();
     ime.core.inputs.get_mut(&TI).unwrap().replace_shown(long);
@@ -899,15 +925,7 @@ fn row_G9c_an_enable_while_another_is_enabled_applies_the_rest() {
 fn only_an_enable_that_changes_the_field_closes_its_composition() {
     let mut ime = Ime::enabled();
     ime.compose("가");
-    let select = |ime: &mut Ime| {
-        ime.v1(HostIme::PreeditStyling {
-            index: 0,
-            length: 3,
-            style: zwp_text_input_v1::PREEDIT_STYLE_SELECTION,
-        });
-        ime.v1(HostIme::PreeditCursor(0));
-    };
-    select(&mut ime);
+    ime.select_and_place();
     let out = ime.enable(TI);
     let kept = [
         surrounding(TI, "", 0),
@@ -917,11 +935,14 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
     assert_eq!(out.host, kept);
     assert_eq!(out.guest, [preedit("가"), done(2)]);
     assert_eq!(out.keys, []);
-    // The preedit cursor and styling the host sent before it survive too.
+    // The pieces Exo sent before it wait for their edit, as at any guest
+    // request.
     let out = ime.compose("나");
     assert_eq!(out.guest, [preedit_at("나", 0, 3), done(2)]);
 
-    select(&mut ime);
+    // The pieces belong to Exo's next edit, not to the field (B3), so a
+    // new field leaves them to that edit, which Exo sends right after them.
+    ime.select_and_place();
     ime.step(Input::Disable(TI));
     let out = ime.step(Input::Commit(TI));
     let [barrier] = out.barriers()[..] else {
@@ -944,7 +965,8 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
     let out = ime.enable(TI);
     assert_eq!(out.host, activation(TI, 4));
     assert_eq!(out.guest, [done(4)]);
-    assert_eq!(ime.compose("다").guest, [preedit("다"), done(4)]);
+    // The composition did not survive; the pieces did.
+    assert_eq!(ime.compose("다").guest, [preedit_at("다", 0, 3), done(4)]);
 }
 
 /// INVARIANTS "The host gets each content type once it can apply it, and
@@ -955,7 +977,7 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
 #[test]
 fn reconcile_reaches_every_target_with_only_needed_requests() {
     use super::host::HostContentType;
-    use super::state::LinkState;
+    use super::state::{Composition, LinkState};
     use host::{ActivationStep, HostSteps, HostTarget};
     let content_types: Vec<_> = [(1, 2), (3, 4)]
         .into_iter()
@@ -975,35 +997,39 @@ fn reconcile_reaches_every_target_with_only_needed_requests() {
             [None]
                 .into_iter()
                 .chain(content_types.iter().copied().map(Some))
-                .map(|content_type| LinkState::Attached { content_type }),
+                .map(|content_type| LinkState::Attached {
+                    content_type,
+                    composition: Composition::default(),
+                }),
         )
         .collect();
     // Apply `steps` to `link` as the host does.
-    let apply = |link: LinkState, steps: HostSteps| {
+    let attached = |content_type| LinkState::Attached {
+        content_type,
+        composition: Composition::default(),
+    };
+    let apply = |link: &LinkState, steps: HostSteps| {
         let mut next = match (steps.activation, link) {
-            (Some(ActivationStep::Activate { .. }), LinkState::Detached) => {
-                LinkState::Attached { content_type: None }
-            }
+            (Some(ActivationStep::Activate { .. }), LinkState::Detached) => attached(None),
             (Some(ActivationStep::Deactivate { .. }), LinkState::Attached { .. }) => {
                 LinkState::Draining {
                     barrier: BarrierToken(101),
                 }
             }
             (Some(ActivationStep::Abandon), LinkState::Attached { .. }) => LinkState::Detached,
-            (None, link) => link,
+            (None, link) => link.clone(),
             (step, link) => panic!("{step:?} is no transition from {link:?}"),
         };
         if let Some(content_type) = steps.content_type {
             let LinkState::Attached {
                 content_type: applied,
+                ..
             } = next
             else {
                 panic!("{steps:?} sends a content type no input method applies");
             };
             assert_ne!(applied, Some(content_type), "{steps:?} resends {applied:?}");
-            next = LinkState::Attached {
-                content_type: Some(content_type),
-            };
+            next = attached(Some(content_type));
         }
         next
     };
@@ -1015,14 +1041,12 @@ fn reconcile_reaches_every_target_with_only_needed_requests() {
                     seat,
                     content_type,
                 };
-                for &link in &links {
+                for link in &links {
                     let reached = apply(link, host::reconcile(&target, link));
-                    let attached = LinkState::Attached {
-                        content_type: Some(content_type),
-                    };
+                    let attached = attached(Some(content_type));
                     let expected = match (link, surface, seat) {
                         // The barrier's completion reconciles again.
-                        (LinkState::Draining { .. }, ..) => link,
+                        (LinkState::Draining { .. }, ..) => link.clone(),
                         (_, Some(_), Some(_)) => attached,
                         (LinkState::Attached { .. }, None, Some(_)) => LinkState::Draining {
                             barrier: BarrierToken(101),
@@ -1031,12 +1055,12 @@ fn reconcile_reaches_every_target_with_only_needed_requests() {
                         // A seat that cannot carry an activate keeps the
                         // link as it is, with the content type it can still
                         // take.
-                        (LinkState::Detached, Some(_), None) => link,
+                        (LinkState::Detached, Some(_), None) => link.clone(),
                         (LinkState::Attached { .. }, Some(_), None) => attached,
                     };
                     assert_eq!(reached, expected, "{target:?} from {link:?}");
                     assert_eq!(
-                        host::reconcile(&target, reached),
+                        host::reconcile(&target, &reached),
                         HostSteps::default(),
                         "{target:?} is reached from {link:?} in one reconcile"
                     );
@@ -1083,7 +1107,7 @@ fn row_G10_destroy_deactivates_and_destroys_the_extension() {
     // Its barrier's done, and its extension's events, find nothing.
     let out = ime.step(Input::BarrierDone(barrier));
     assert!(out.host.is_empty() && out.guest.is_empty());
-    let out = ime.ext(HostIme::Confirm {
+    let out = ime.ext(Edit::Confirm {
         keep_selection: true,
     });
     assert!(out.guest.is_empty() && out.keys.is_empty());
@@ -1128,7 +1152,7 @@ fn row_H2_an_exo_detach_commits_the_preedit_and_activates_again() {
     ime.compose("가");
     let out = ime.step(Input::HostLeave(TI));
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
-    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End), Key::Detached]);
     let mut host = vec![req(
         v1(TI),
         V1::Activate {
@@ -1148,21 +1172,36 @@ fn row_H2_an_exo_detach_commits_the_preedit_and_activates_again() {
 fn row_H2_a_confirmed_composition_is_committed_once() {
     let mut ime = Ime::enabled();
     ime.compose("가");
-    let out = ime.ext(HostIme::Confirm {
+    let out = ime.ext(Edit::Confirm {
         keep_selection: true,
     });
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
     let out = ime.step(Input::HostLeave(TI));
-    assert!(out.guest.is_empty() && out.keys.is_empty());
+    assert!(out.guest.is_empty());
+    assert_eq!(out.keys, [Key::Detached]);
     // So does a commit of the composition.
     let mut ime = Ime::enabled();
     ime.compose("가");
-    ime.v1(HostIme::Commit {
+    ime.v1(Edit::Commit {
         serial: 0,
         text: "가".into(),
     });
     let out = ime.step(Input::HostLeave(TI));
-    assert!(out.guest.is_empty() && out.keys.is_empty());
+    assert!(out.guest.is_empty());
+    assert_eq!(out.keys, [Key::Detached]);
+}
+
+/// Exo's own detach ends the recovery of the seat's held keys whatever
+/// the fence: a press's reset fence closes the gate, not the link.
+#[test]
+fn row_H2_an_exo_detach_behind_a_press_fence_forgets_the_held_keys() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let fence = ime.press(SURFACE).barriers();
+    assert_eq!(fence.len(), 1);
+    let out = ime.step(Input::HostLeave(TI));
+    assert!(out.guest.is_empty());
+    assert_eq!(out.keys, [Key::Detached]);
 }
 
 #[test]
@@ -1170,18 +1209,18 @@ fn row_H2prime_a_leave_that_answers_a_deactivate_is_ignored() {
     let mut ime = Ime::new();
     ime.create(TI);
     let out = ime.step(Input::HostLeave(TI));
-    assert!(out.host.is_empty() && out.guest.is_empty());
+    assert!(out.host.is_empty() && out.guest.is_empty() && out.keys.is_empty());
     ime.enable(TI);
     ime.step(Input::Disable(TI));
     ime.step(Input::Commit(TI));
     let out = ime.step(Input::HostLeave(TI));
-    assert!(out.host.is_empty() && out.guest.is_empty());
+    assert!(out.host.is_empty() && out.guest.is_empty() && out.keys.is_empty());
 }
 
 #[test]
 fn row_H4_a_selection_style_becomes_the_preedit_cursor() {
     let mut ime = Ime::enabled();
-    let style = |style| HostIme::PreeditStyling {
+    let style = |style| Piece::Styling {
         index: 3,
         length: 3,
         style,
@@ -1193,21 +1232,24 @@ fn row_H4_a_selection_style_becomes_the_preedit_cursor() {
         ime.compose("가나").guest,
         [preedit_at("가나", 3, 6), done(1)]
     );
-
-    // Only an attached text input records one.
-    ime.step(Input::Disable(TI));
-    let barrier = ime.step(Input::Commit(TI)).barriers()[0];
+    // The last selection counts.
     ime.v1(style(zwp_text_input_v1::PREEDIT_STYLE_SELECTION));
-    ime.step(Input::BarrierDone(barrier));
-    ime.enable(TI);
-    assert_eq!(ime.compose("가나").guest, [preedit("가나"), done(3)]);
+    ime.v1(Piece::Styling {
+        index: 0,
+        length: 3,
+        style: zwp_text_input_v1::PREEDIT_STYLE_SELECTION,
+    });
+    assert_eq!(
+        ime.compose("가나").guest,
+        [preedit_at("가나", 0, 3), done(1)]
+    );
 }
 
 #[test]
 fn row_H5_a_preedit_cursor_places_the_cursor() {
     let mut ime = Ime::enabled();
     for (cursor, expected) in [(3, (3, 3)), (1, (6, 6)), (-1, (-1, -1))] {
-        ime.v1(HostIme::PreeditCursor(cursor));
+        ime.v1(Piece::Cursor(cursor));
         let out = ime.compose("가나");
         assert_eq!(
             out.guest,
@@ -1219,12 +1261,12 @@ fn row_H5_a_preedit_cursor_places_the_cursor() {
 #[test]
 fn row_H6_a_cursor_position_is_only_logged() {
     let mut ime = Ime::enabled();
-    let out = ime.v1(HostIme::CursorPosition {
+    let out = ime.v1(Piece::CursorPosition {
         index: 0,
         anchor: 0,
     });
     assert!(out.guest.is_empty() && out.host.is_empty() && out.keys.is_empty());
-    let out = ime.v1(HostIme::Commit {
+    let out = ime.v1(Edit::Commit {
         serial: 0,
         text: "a".into(),
     });
@@ -1250,7 +1292,7 @@ fn row_H7_a_preedit_shows_and_its_clear_arms_the_lease() {
 fn row_H7_a_preedit_that_does_not_fit_is_dropped() {
     let mut ime = Ime::enabled();
     ime.compose("가");
-    ime.v1(HostIme::PreeditCursor(0));
+    ime.v1(Piece::Cursor(0));
     let out = ime.compose(&"x".repeat(4_084));
     assert!(out.guest.is_empty() && out.keys.is_empty());
     // The guest still shows its preedit, and the next one is placed by
@@ -1263,8 +1305,8 @@ fn row_H7_a_preedit_that_does_not_fit_is_dropped() {
 #[test]
 fn row_H7prime_a_preedit_that_is_not_utf8_is_dropped() {
     let mut ime = Ime::enabled();
-    ime.v1(HostIme::PreeditCursor(0));
-    let out = ime.v1(HostIme::Preedit {
+    ime.v1(Piece::Cursor(0));
+    let out = ime.v1(Edit::Preedit {
         serial: 0,
         text: IndexedString::NotUtf8(vec![0xff]),
         commit: String::new(),
@@ -1278,7 +1320,7 @@ fn row_H8_a_commit_ends_the_preedit() {
     let mut ime = Ime::enabled();
     ime.compose("가");
     // The host's serial is only logged.
-    let out = ime.v1(HostIme::Commit {
+    let out = ime.v1(Edit::Commit {
         serial: 2945,
         text: "각".into(),
     });
@@ -1286,7 +1328,7 @@ fn row_H8_a_commit_ends_the_preedit() {
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
     // One that does not fit is dropped.
     ime.compose("가");
-    let out = ime.v1(HostIme::Commit {
+    let out = ime.v1(Edit::Commit {
         serial: 0,
         text: "x".repeat(4_090),
     });
@@ -1300,12 +1342,12 @@ fn row_H8_a_commit_ends_the_preedit() {
 fn row_H8_an_empty_commit_is_no_edit() {
     let mut ime = Ime::enabled();
     ime.report("ab", 2);
-    let out = ime.v1(HostIme::Commit {
+    let out = ime.v1(Edit::Commit {
         serial: 0,
         text: String::new(),
     });
     assert_eq!(out.guest, [done(2)]);
-    let out = ime.v1(HostIme::Delete {
+    let out = ime.v1(Edit::Delete {
         index: 0,
         length: 2,
     });
@@ -1320,11 +1362,11 @@ fn row_H8_an_empty_commit_over_a_preedit_is_no_edit() {
     let mut ime = Ime::enabled();
     ime.report("ab", 2);
     ime.compose("가");
-    ime.v1(HostIme::Commit {
+    ime.v1(Edit::Commit {
         serial: 0,
         text: String::new(),
     });
-    let out = ime.v1(HostIme::Delete {
+    let out = ime.v1(Edit::Delete {
         index: 0,
         length: 2,
     });
@@ -1339,20 +1381,20 @@ fn row_H8_an_empty_commit_over_a_preedit_is_no_edit() {
 fn row_H9_an_absolute_delete_becomes_lengths_around_the_cursor() {
     let mut ime = Ime::enabled();
     ime.report("abcd", 2);
-    let out = ime.v1(HostIme::Delete {
+    let out = ime.v1(Edit::Delete {
         index: 1,
         length: 2,
     });
     assert_eq!(out.guest, [delete(1, 1), done(2)]);
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
     // Exo's "a|d", which the guest has yet to report.
-    let absolute = HostIme::Delete {
+    let absolute = Edit::Delete {
         index: 0,
         length: 1,
     };
     assert_eq!(ime.v1(absolute).guest, [delete(1, 0), done(2)]);
     ime.report("d", 0);
-    let relative = HostIme::Delete {
+    let relative = Edit::Delete {
         index: -1,
         length: 1,
     };
@@ -1375,7 +1417,7 @@ fn row_H9_a_delete_that_cannot_be_measured_is_dropped() {
             ime.step(Input::SurroundingText(TI, text.into(), cursor, anchor));
             ime.step(Input::Commit(TI));
         }
-        let out = ime.v1(HostIme::Delete { index, length });
+        let out = ime.v1(Edit::Delete { index, length });
         assert_eq!(out.guest, [], "{case}");
         // Exo edited its text, unless the range was empty.
         let ended = (length > 0).then_some(lease(LeaseOutcome::End));
@@ -1384,32 +1426,17 @@ fn row_H9_a_delete_that_cannot_be_measured_is_dropped() {
 }
 
 #[test]
-fn an_attached_input_has_its_seat_whatever_its_fence() {
-    let mut ime = Ime::new();
-    ime.create(TI);
-    assert_eq!(ime.core.attached_seat(TI), None);
-    ime.enable(TI);
-    assert_eq!(ime.core.attached_seat(TI), Some(SEAT));
-    ime.compose("가");
-    ime.press(SURFACE);
-    assert_eq!(ime.core.attached_seat(TI), Some(SEAT));
-    ime.step(Input::Disable(TI));
-    ime.step(Input::Commit(TI));
-    assert_eq!(ime.core.attached_seat(TI), None);
-}
-
-#[test]
 fn row_X1_a_preedit_region_turns_text_into_the_preedit() {
     let mut ime = Ime::enabled();
     ime.report("a가b", 4);
-    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let region = |index, length| Edit::PreeditRegion { index, length };
     let out = ime.ext(region(-3, 3));
     assert_eq!(out.guest, [delete(3, 0), preedit_at("가", 3, 3), done(2)]);
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
-    // The assembly places its cursor, and the edit the guest has yet to
+    // The pieces place its cursor, and the edit the guest has yet to
     // report does not stop it. The guest no longer has the "가" the first
     // region took.
-    ime.v1(HostIme::PreeditCursor(0));
+    ime.v1(Piece::Cursor(0));
     let out = ime.ext(region(-3, 4));
     assert_eq!(
         out.guest,
@@ -1417,20 +1444,20 @@ fn row_X1_a_preedit_region_turns_text_into_the_preedit() {
     );
 }
 
-/// With no assembly, the preedit cursor stays where the text cursor was,
+/// With no pieces, the preedit cursor stays where the text cursor was,
 /// inside the region; and an empty region edits nothing.
 #[test]
 fn row_X1_a_region_keeps_the_cursor_and_an_empty_one_edits_nothing() {
     let mut ime = Ime::enabled();
     ime.report("ab", 1);
-    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let region = |index, length| Edit::PreeditRegion { index, length };
     let out = ime.ext(region(-1, 2));
     assert_eq!(out.guest, [delete(1, 1), preedit_at("ab", 1, 1), done(2)]);
 
     let mut ime = Ime::enabled();
     ime.report("ab", 2);
     assert_eq!(ime.ext(region(0, 0)).guest, [done(2)]);
-    let out = ime.v1(HostIme::Delete {
+    let out = ime.v1(Edit::Delete {
         index: 0,
         length: 2,
     });
@@ -1444,7 +1471,7 @@ fn row_X1_a_region_keeps_the_cursor_and_an_empty_one_edits_nothing() {
 fn a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 4);
-    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let region = |index, length| Edit::PreeditRegion { index, length };
     let out = ime.ext(region(-1, 1));
     assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
 
@@ -1464,11 +1491,11 @@ fn a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
 fn a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
     let mut ime = Ime::enabled();
     ime.report("a1b", 3);
-    ime.v1(HostIme::PreeditCursor(1));
+    ime.v1(Piece::Cursor(1));
     let out = ime.compose("b");
     assert_eq!(out.guest, [preedit_at("b", 1, 1), done(2)]);
 
-    let out = ime.ext(HostIme::PreeditRegion {
+    let out = ime.ext(Edit::PreeditRegion {
         index: -2,
         length: 2,
     });
@@ -1482,12 +1509,12 @@ fn a_region_over_a_host_preedit_is_measured_from_exos_cursor() {
 /// each.
 #[test]
 fn a_region_that_does_not_cover_a_host_preedit_is_dropped() {
-    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let region = |index, length| Edit::PreeditRegion { index, length };
     // Exo holds "ax|bc".
     let composing = || {
         let mut ime = Ime::enabled();
         ime.report("abc", 1);
-        ime.v1(HostIme::PreeditCursor(1));
+        ime.v1(Piece::Cursor(1));
         let out = ime.compose("x");
         assert_eq!(out.guest, [preedit_at("x", 1, 1), done(2)]);
         ime
@@ -1514,7 +1541,7 @@ fn a_region_that_does_not_cover_a_host_preedit_is_dropped() {
 fn an_empty_region_over_a_held_preedit_commits_it() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 4);
-    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let region = |index, length| Edit::PreeditRegion { index, length };
     assert_eq!(ime.compose("x").guest, [preedit("x"), done(2)]);
     let out = ime.ext(region(0, 0));
     assert_eq!(out.guest, [no_preedit(), commit("x"), done(2)]);
@@ -1533,7 +1560,7 @@ fn an_empty_region_over_a_held_preedit_commits_it() {
 fn a_region_equal_to_the_shown_one_sends_only_the_preedit() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 4);
-    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let region = |index, length| Edit::PreeditRegion { index, length };
     let out = ime.ext(region(-1, 1));
     assert_eq!(out.guest, [delete(1, 0), preedit_at("d", 1, 1), done(2)]);
 
@@ -1546,7 +1573,7 @@ fn a_region_equal_to_the_shown_one_sends_only_the_preedit() {
 /// bytes on either side.
 #[test]
 fn a_region_that_does_not_cover_the_shown_one_is_dropped() {
-    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let region = |index, length| Edit::PreeditRegion { index, length };
     for (index, length) in [(-2, 2), (0, 2), (-1, 1)] {
         let mut ime = Ime::enabled();
         ime.report("abcdef", 3);
@@ -1565,7 +1592,7 @@ fn a_region_that_does_not_cover_the_shown_one_is_dropped() {
 fn a_region_over_a_region_deletes_the_rest_on_both_sides() {
     let mut ime = Ime::enabled();
     ime.report("abcdef", 3);
-    let region = |index, length| HostIme::PreeditRegion { index, length };
+    let region = |index, length| Edit::PreeditRegion { index, length };
     let out = ime.ext(region(-1, 2));
     assert_eq!(out.guest, [delete(1, 1), preedit_at("cd", 1, 1), done(2)]);
 
@@ -1582,8 +1609,8 @@ fn a_region_over_a_region_deletes_the_rest_on_both_sides() {
 #[test]
 fn row_X1prime_a_region_the_text_cannot_hold_is_dropped() {
     let mut ime = Ime::enabled();
-    let region = |index, length| HostIme::PreeditRegion { index, length };
-    ime.v1(HostIme::PreeditCursor(0));
+    let region = |index, length| Edit::PreeditRegion { index, length };
+    ime.v1(Piece::Cursor(0));
     let out = ime.ext(region(-1, 1));
     assert_eq!(out.guest, []);
     assert_eq!(ime.compose("나").guest, [preedit("나"), done(1)]);
@@ -1595,7 +1622,7 @@ fn row_X1prime_a_region_the_text_cannot_hold_is_dropped() {
 fn row_X2_a_confirmation_commits_the_shown_preedit() {
     let mut ime = Ime::enabled();
     ime.compose("가");
-    let out = ime.ext(HostIme::Confirm {
+    let out = ime.ext(Edit::Confirm {
         keep_selection: true,
     });
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
@@ -1605,7 +1632,7 @@ fn row_X2_a_confirmation_commits_the_shown_preedit() {
 #[test]
 fn row_X2prime_an_empty_confirmation_recovers_the_held_key() {
     let mut ime = Ime::enabled();
-    let out = ime.ext(HostIme::Confirm {
+    let out = ime.ext(Edit::Confirm {
         keep_selection: true,
     });
     assert_eq!(out.guest, []);
@@ -1614,93 +1641,96 @@ fn row_X2prime_an_empty_confirmation_recovers_the_held_key() {
 
 /// X2': the keyboard concern recovers the held key at the host's next
 /// event, after guest requests the core has handled since the
-/// confirmation. The transaction that follows the key is the guest's state
-/// under the serial of then; with the gate closed there is none.
+/// confirmation. The key's pair, then the guest's state under the serial
+/// of then, follow; with the gate closed, which the core admits no
+/// recovery behind, nothing does.
 #[test]
 fn row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery() {
     let mut ime = Ime::enabled();
-    ime.ext(HostIme::Confirm {
+    ime.ext(Edit::Confirm {
         keep_selection: true,
     });
-    let done_now = |ime: &mut Ime| {
-        let done = ime.core.recovery_done(TI);
-        done.map(|done| guest_events(&done))
+    let key = |state| wl_keyboard::evt::key(KEYBOARD, 7, 8, 30, state);
+    let recovered = |ime: &mut Ime, pair: Vec<Outgoing>| {
+        let admitted = ime.core.admits_recovery(TI);
+        let out = ime.step(Input::HeldKeyRecovered { ti: TI, pair });
+        assert!(out.host.is_empty() && out.keys.is_empty());
+        admitted.then_some(out.guest)
     };
-    assert_eq!(done_now(&mut ime), Some(vec![done(1)]));
+    let pair = vec![key(1), key(0)];
+    let mut expected = guest_events(&pair);
+    expected.push(done(1));
+    assert_eq!(recovered(&mut ime, pair), Some(expected));
     ime.report("ab", 1);
-    assert_eq!(done_now(&mut ime), Some(vec![done(2)]));
+    assert_eq!(recovered(&mut ime, Vec::new()), Some(vec![done(2)]));
+    // The guest states the key's effect in its next report.
     ime.step(Input::Disable(TI));
     ime.step(Input::Commit(TI));
-    assert_eq!(done_now(&mut ime), None);
-    assert!(ime.core.recovery_done(TiId(TI.0 + 1)).is_none());
+    assert!(!ime.core.admits_recovery(TI));
+    assert!(!ime.core.admits_recovery(TiId(TI.0 + 1)));
+    // The core checks the gate again: a pair behind it reaches no guest.
+    let pair = vec![key(1), key(0)];
+    let out = ime.step(Input::HeldKeyRecovered { ti: TI, pair });
+    assert!(out.guest.is_empty() && out.host.is_empty() && out.keys.is_empty());
 }
 
-/// B3, as the old handlers did it: a commit or a delete that reaches no
-/// guest, and an empty confirmation, leave the preedit cursor and styling
-/// to the next preedit; a confirmation of a preedit takes them.
+/// B3: a region takes the highlight Exo sent before it, so the next
+/// preedit, whose cursor is at that highlight's end, does not read it as
+/// a composition selection the mirror cannot know: the mirror stays
+/// exact.
 #[test]
-fn row_H8_H9_X2_only_an_edit_that_reaches_the_guest_takes_the_assembly() {
-    type Case = (&'static str, bool, fn() -> HostIme, bool);
-    let cases: [Case; 4] = [
-        (
-            "a commit that does not fit",
-            false,
-            || HostIme::Commit {
-                serial: 0,
-                text: "x".repeat(4_090),
-            },
-            false,
-        ),
-        (
-            "a delete with no surrounding text",
-            false,
-            || HostIme::Delete {
-                index: -1,
-                length: 1,
-            },
-            false,
-        ),
-        (
-            "an empty confirmation",
-            false,
-            || HostIme::Confirm {
-                keep_selection: true,
-            },
-            false,
-        ),
-        (
-            "a confirmation",
-            true,
-            || HostIme::Confirm {
-                keep_selection: true,
-            },
-            true,
-        ),
-    ];
-    for (case, composing, event, takes) in cases {
-        let mut ime = Ime::enabled();
-        if composing {
-            ime.compose("가");
+fn row_B3_a_region_takes_the_highlight_the_mirror_reads() {
+    let mut ime = Ime::enabled();
+    ime.host_commit("가나다");
+    assert_eq!(ime.mirror().health(), mirror::Health::Exact);
+    ime.v1(Piece::Styling {
+        index: 0,
+        length: 3,
+        style: zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT,
+    });
+    // An empty region at Exo's cursor, which leaves its text alone.
+    ime.ext(Edit::PreeditRegion {
+        index: 0,
+        length: 0,
+    });
+    assert_eq!(ime.mirror().health(), mirror::Health::Exact);
+    ime.v1(Piece::Cursor(3));
+    ime.compose("라");
+    assert_eq!(ime.mirror().health(), mirror::Health::Exact);
+}
+
+/// B3: every edit takes the pieces Exo sent before it, whatever becomes
+/// of the edit, so that none applies to a later one; a piece alone waits
+/// for its edit, whatever the link.
+#[test]
+fn row_B3_every_edit_takes_the_pieces_whatever_becomes_of_it() {
+    for composing in [false, true] {
+        for edit in every_edit() {
+            let name = format!("{edit:?}, composing {composing}");
+            let mut ime = Ime::enabled();
+            if composing {
+                ime.compose("가");
+            }
+            ime.select_and_place();
+            match edit {
+                edit @ (Edit::PreeditRegion { .. } | Edit::Confirm { .. }) => ime.ext(edit),
+                edit => ime.v1(edit),
+            };
+            assert_eq!(
+                ime.core.inputs[&TI].pieces_for_test(),
+                &V1Pieces::default(),
+                "{name}"
+            );
+            let out = ime.compose("나");
+            assert_eq!(out.guest.first(), Some(&preedit("나")), "{name}");
         }
-        ime.v1(HostIme::PreeditStyling {
-            index: 0,
-            length: 3,
-            style: zwp_text_input_v1::PREEDIT_STYLE_SELECTION,
-        });
-        ime.v1(HostIme::PreeditCursor(0));
-        let out = match event() {
-            HostIme::Confirm { .. } => ime.ext(HostIme::Confirm {
-                keep_selection: true,
-            }),
-            event => ime.v1(event),
-        };
-        assert_eq!(out.guest.is_empty(), !takes, "{case}");
-        let next = match takes {
-            true => preedit("나"),
-            false => preedit_at("나", 0, 3),
-        };
-        assert_eq!(ime.compose("나").guest, [next, done(1)], "{case}");
     }
+    // A piece while no input method is attached waits for its edit too.
+    let mut ime = Ime::new();
+    ime.create(TI);
+    ime.select_and_place();
+    ime.enable(TI);
+    assert_eq!(ime.compose("나").guest, [preedit_at("나", 0, 3), done(1)]);
 }
 
 #[test]
@@ -1847,7 +1877,7 @@ fn row_F1_a_focus_change_commits_the_shown_preedit_before_leave() {
         ]
     );
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
-    let confirm = ime.ext(HostIme::Confirm {
+    let confirm = ime.ext(Edit::Confirm {
         keep_selection: true,
     });
     assert!(confirm.guest.is_empty() && confirm.keys.is_empty());
@@ -1940,7 +1970,6 @@ fn row_F3_a_bound_seat_carries_the_deferred_activation() {
 fn row_F4_a_press_commits_the_preedit_then_resends_the_press() {
     let mut ime = Ime::enabled();
     ime.compose("가");
-    ime.v1(HostIme::PreeditCursor(0));
     let out = ime.press(SURFACE);
     let button = wl_pointer::Event::Button {
         serial: 7,
@@ -1966,27 +1995,20 @@ fn row_F4_a_press_commits_the_preedit_then_resends_the_press() {
     );
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
     assert!(!out.forward);
-    // The press took the assembly.
+    // The fence's done opens the gate again.
     ime.step(Input::BarrierDone(fence));
     assert_eq!(ime.compose("나").guest, [preedit("나"), done(1)]);
 }
 
-/// A press whose commit does not fit is forwarded, and leaves the preedit
-/// cursor and styling to the next preedit, as the old code's
-/// `end_composition_on_press` did: it took them only once the commit
-/// reached the guest.
+/// A press whose commit does not fit is forwarded and changes nothing: the
+/// pieces Exo sent wait for their edit, as at any press.
 #[test]
-fn row_F4_a_press_whose_commit_does_not_fit_keeps_the_assembly() {
+fn row_F4_a_press_whose_commit_does_not_fit_changes_nothing() {
     let mut ime = Ime::enabled();
     ime.compose("가");
     let long = Preedit::new("x".repeat(4_090), (0, 0)).unwrap();
     ime.core.inputs.get_mut(&TI).unwrap().replace_shown(long);
-    ime.v1(HostIme::PreeditStyling {
-        index: 0,
-        length: 3,
-        style: zwp_text_input_v1::PREEDIT_STYLE_SELECTION,
-    });
-    ime.v1(HostIme::PreeditCursor(0));
+    ime.select_and_place();
     let out = ime.press(SURFACE);
     assert!(out.forward && out.guest.is_empty() && out.host.is_empty());
     assert_eq!(out.keys, []);
@@ -2003,76 +2025,53 @@ fn row_F4_a_press_elsewhere_or_without_a_composition_is_forwarded() {
     assert!(out.forward && out.guest.is_empty() && out.host.is_empty());
 }
 
-/// Events in flight at a press are dropped. A preedit and a region take
-/// the preedit cursor and styling before them; a commit, a delete and a
-/// confirmation leave them, as the old handlers did (B3).
+/// Events in flight at a press are dropped, and each takes the pieces Exo
+/// sent before it (B3).
 #[test]
 fn row_F4_events_in_flight_at_a_press_are_dropped() {
-    type Event = (&'static str, fn() -> Input);
-    let events: [Event; 5] = [
-        ("preedit", || {
-            Input::V1(
-                TI,
-                HostIme::Preedit {
-                    serial: 0,
-                    text: "각".into(),
-                    commit: "각".into(),
-                },
-            )
-        }),
-        ("commit", || {
-            Input::V1(
-                TI,
-                HostIme::Commit {
-                    serial: 0,
-                    text: "가".into(),
-                },
-            )
-        }),
-        ("delete", || {
-            Input::V1(
-                TI,
-                HostIme::Delete {
-                    index: -1,
-                    length: 1,
-                },
-            )
-        }),
-        ("region", || Input::Ext {
-            ext: ext_id(TI),
-            event: HostIme::PreeditRegion {
-                index: -1,
-                length: 1,
-            },
-        }),
-        ("confirm", || Input::Ext {
-            ext: ext_id(TI),
-            event: HostIme::Confirm {
-                keep_selection: true,
-            },
-        }),
-    ];
-    for (event, input) in events {
-        let mut ime = Ime::enabled();
-        ime.report("ab", 2);
-        ime.compose("가");
-        let fence = ime.press(SURFACE).barriers()[0];
-        let selection = zwp_text_input_v1::PREEDIT_STYLE_SELECTION;
-        ime.v1(HostIme::PreeditStyling {
-            index: 0,
-            length: 3,
-            style: selection,
-        });
-        ime.v1(HostIme::PreeditCursor(0));
-        let out = ime.step(input());
-        assert!(out.guest.is_empty() && out.keys.is_empty(), "{event}");
-        ime.step(Input::BarrierDone(fence));
-        let next = match event {
-            "preedit" | "region" => preedit("나"),
-            _ => preedit_at("나", 0, 3),
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.compose("가");
+    let fence = ime.press(SURFACE).barriers()[0];
+    for edit in every_edit() {
+        let name = format!("{edit:?}");
+        ime.select_and_place();
+        let out = match edit {
+            edit @ (Edit::PreeditRegion { .. } | Edit::Confirm { .. }) => ime.ext(edit),
+            edit => ime.v1(edit),
         };
-        assert_eq!(ime.compose("나").guest, [next, done(2)], "{event}");
+        assert!(out.guest.is_empty() && out.keys.is_empty(), "{name}");
+        assert_eq!(ime.core.inputs[&TI].pieces_for_test(), &V1Pieces::default());
     }
+    ime.step(Input::BarrierDone(fence));
+    assert_eq!(ime.compose("나").guest, [preedit("나"), done(2)]);
+}
+
+/// One edit of each kind, none of which reaches a guest that shows no
+/// preedit and is not in step with Exo.
+fn every_edit() -> [Edit; 5] {
+    [
+        Edit::Preedit {
+            serial: 0,
+            text: "각".into(),
+            commit: "각".into(),
+        },
+        Edit::Commit {
+            serial: 0,
+            text: "x".repeat(4_090),
+        },
+        Edit::Delete {
+            index: -1,
+            length: 1,
+        },
+        Edit::PreeditRegion {
+            index: -1,
+            length: 1,
+        },
+        Edit::Confirm {
+            keep_selection: true,
+        },
+    ]
 }
 
 #[test]
@@ -2384,9 +2383,9 @@ fn row_X1_a_mirror_that_is_not_exact_drops() {
 fn row_X1_after_a_confirm_inside_the_composition_drops() {
     drops(|ime| {
         ime.report("ab", 2);
-        ime.v1(HostIme::PreeditCursor(3));
+        ime.v1(Piece::Cursor(3));
         ime.compose("가나");
-        let confirmed = ime.ext(HostIme::Confirm {
+        let confirmed = ime.ext(Edit::Confirm {
             keep_selection: true,
         });
         assert_eq!(confirmed.guest, [no_preedit(), commit("가나"), done(2)]);
@@ -2401,7 +2400,7 @@ fn row_H9_after_set_editable_selection_range_drops() {
     drops(|ime| {
         ime.report("ab", 2);
         ime.compose("가");
-        ime.v1(HostIme::CursorPosition {
+        ime.v1(Piece::CursorPosition {
             index: 0,
             anchor: 0,
         });
@@ -2417,7 +2416,7 @@ fn row_H9_after_set_editable_selection_range_drops() {
 fn row_H9_after_an_empty_region_with_exos_cursor_inside_drops() {
     drops(|ime| {
         ime.report("ab", 2);
-        ime.v1(HostIme::PreeditCursor(3));
+        ime.v1(Piece::Cursor(3));
         ime.compose("가나");
         let out = ime.region(0, 0);
         assert_eq!(out.guest, [no_preedit(), commit("가나"), done(2)]);
@@ -2433,7 +2432,7 @@ fn row_H9_after_a_dropped_region_drops() {
         ime.report("abc", 3);
         ime.compose("가");
         assert_eq!(ime.region(-4, 1).guest, []);
-        ime.ext(HostIme::Confirm {
+        ime.ext(Edit::Confirm {
             keep_selection: true,
         });
         ime.delete(3, 3)
@@ -2526,14 +2525,14 @@ fn row_H9_X1_a_dropped_delete_or_region_ends_the_lease() {
 fn row_H9_a_delete_that_heals_an_unsure_mirror_drops_as_unsure() {
     let mut ime = Ime::enabled();
     ime.report("가나다", 9);
-    ime.v1(HostIme::PreeditStyling {
+    ime.v1(Piece::Styling {
         index: 0,
         length: 3,
         style: zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT,
     });
-    ime.v1(HostIme::PreeditCursor(3));
+    ime.v1(Piece::Cursor(3));
     ime.compose("漢字");
-    ime.ext(HostIme::Confirm {
+    ime.ext(Edit::Confirm {
         keep_selection: true,
     });
     assert_eq!(ime.mirror().health(), mirror::Health::Vague);
@@ -2583,23 +2582,28 @@ fn korean_typing(syllables: u64) -> Vec<HostIme> {
         for jamo in ["ㅎ", "하", "한"] {
             let length = jamo.len() as u32;
             events.extend([
-                HostIme::PreeditStyling {
+                Piece::Styling {
                     index: 0,
                     length,
                     style: zwp_text_input_v1::PREEDIT_STYLE_UNDERLINE,
-                },
-                HostIme::PreeditCursor(length as i32),
-                HostIme::Preedit {
+                }
+                .into(),
+                Piece::Cursor(length as i32).into(),
+                Edit::Preedit {
                     serial: 0,
                     text: jamo.into(),
                     commit: jamo.to_owned(),
-                },
+                }
+                .into(),
             ]);
         }
-        events.push(HostIme::Commit {
-            serial: 0,
-            text: "한".to_owned(),
-        });
+        events.push(
+            Edit::Commit {
+                serial: 0,
+                text: "한".to_owned(),
+            }
+            .into(),
+        );
     }
     events
 }
@@ -2627,10 +2631,7 @@ fn typing_cost(len: usize) -> (crate::test_support::counting::Counts, std::time:
     let mut cost = Counts::default();
     let mut time = std::time::Duration::ZERO;
     for event in events {
-        let reaches_guest = !matches!(
-            event,
-            HostIme::PreeditStyling { .. } | HostIme::PreeditCursor(_)
-        );
+        let reaches_guest = !matches!(event, HostIme::Piece(_));
         let input = Input::V1(TI, event);
         let started = std::time::Instant::now();
         let (step, fx) = Counts::of(|| ime.core.step(input, &ime.world));

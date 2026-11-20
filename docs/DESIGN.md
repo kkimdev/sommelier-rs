@@ -236,7 +236,7 @@ encode wire bytes ad hoc.
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs`, `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `ime_keys.rs` (held-key recovery, Backspace leases), `seat.rs` | `input.rs` (focus, key generations); the IME core, `sommelier/src/ime` (text inputs) |
+| Keyboard and IME | `keyboard.rs`, `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `ime_keys.rs` (held-key recovery, Backspace leases), `seat.rs` | `keyboards.rs` (`Keyboard`, one record per host keyboard: its guest object and seat, keymap, modifiers and extended keyboard), `input.rs` (focus, key generations); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
@@ -544,8 +544,9 @@ end, the events of the host's `zwp_text_input_v1` and its extension, the
 `done` of the core's drain barriers and reset fences, each seat's
 keyboard focus change (`keyboard.rs`), a surface's end (`compositor.rs`),
 a `wl_seat` bind (`registry.rs`) and a pointer press or touch-down
-(`pointer.rs`, `touch.rs`), and each key press the keyboard concern
-forwards to the guest (`keyboard.rs`, `ime_keys.rs`). Nothing outside
+(`pointer.rs`, `touch.rs`), each key press the keyboard concern
+forwards to the guest (`keyboard.rs`), and the held key it recovers for
+an empty confirmation (`ime_keys.rs`). Nothing outside
 `ime` changes a text input, and only `ime/guest.rs` builds the v3
 transaction events.
 
@@ -599,7 +600,8 @@ older generation still waits for its release; see
 [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 [KEYBOARD.md](KEYBOARD.md) describes each key's states and the one
 transition each input makes. Keymaps are compiled locally with
-xkbcommon to classify chords; chords listed in
+xkbcommon (`keymap.rs`) to classify chords, which `Accelerator::of_key`
+computes; chords listed in
 `SOMMELIER_ACCELERATORS` are acknowledged as not handled through
 `zcr_extended_keyboard_v1.ack_key`, so Exo keeps them as accelerators.
 
