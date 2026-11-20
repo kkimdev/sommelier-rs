@@ -694,17 +694,14 @@ pub(crate) fn forget_feedback(ctx: &mut Context, feedback_id: GuestId, feedback:
 }
 
 /// Whether `event` of params the guest destroyed still reaches its handler
-/// (`handler::outlives_destroy`): an asynchronous create's `created` or
-/// `failed`, which may legally follow `destroy`. The host still owns a
-/// newly created `wl_buffer` then, which `on_created` destroys; dropping
-/// the event would leak it, since the generated `new_id` mapping only runs
-/// when the event is forwarded.
+/// (`handler::outlives_destroy`): an asynchronous create's `created`, which
+/// may legally follow `destroy`. The host still owns a newly created
+/// `wl_buffer` then, which `on_created` destroys; dropping the event would
+/// leak it, since the generated `new_id` mapping only runs when the event
+/// is forwarded. A `failed` needs nothing: it discards what the create
+/// kept, and the params' destructor discards that too.
 pub(crate) fn outlives_destroy(event: &zwp_linux_buffer_params_v1::Event) -> bool {
-    matches!(
-        event,
-        zwp_linux_buffer_params_v1::Event::Created { .. }
-            | zwp_linux_buffer_params_v1::Event::Failed {}
-    )
+    matches!(event, zwp_linux_buffer_params_v1::Event::Created { .. })
 }
 
 impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
@@ -956,9 +953,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
 
     fn on_failed(ctx: &mut Context, sender: EventSender) -> Action {
         if let Some(guest_params_id) = sender.guest_id() {
-            if ctx.shadow_table.is_pending_destroy_guest(guest_params_id) {
-                return Action::Drop;
-            }
             // Closes the planes' synchronization descriptors.
             take_native_create(ctx, guest_params_id);
         }
