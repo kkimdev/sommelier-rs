@@ -157,11 +157,13 @@ impl RuntimeDir {
         &self.0
     }
 
-    /// `program` in this runtime directory, with no display of the caller's.
+    /// `program` in this runtime directory, with no display or
+    /// configuration of the caller's.
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
         command
             .env("XDG_RUNTIME_DIR", &self.0)
+            .env("XDG_CONFIG_HOME", &self.0)
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("DISPLAY");
         command

@@ -37,6 +37,11 @@ fn run_proxy(runtime_dir: Option<&Path>, args: &[&str]) -> Output {
         .args(["--virtio-wl", "/dev/null"])
         .args(args)
         .env("RUST_LOG", "error")
+        // No configuration of the caller's; nothing is created there.
+        .env(
+            "XDG_CONFIG_HOME",
+            std::env::temp_dir().join("sommelier-startup-no-config"),
+        )
         .env_remove("XDG_RUNTIME_DIR")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

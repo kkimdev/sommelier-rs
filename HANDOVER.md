@@ -222,11 +222,16 @@
   [Output and work area](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#output-and-work-area);
   popups on a toplevel repaired through a late `zaura_shell` bind were also
   never checked on a host.
-- Neither placement backend has been checked on a host since they were
-  separated, and the remote-shell-v2 backend never has: stock Crostini
-  does not advertise `zcr_remote_shell_v2`. The
+- Placement moves windows with `zaura_surface.set_parent(self, dx, dy)`,
+  a Chromium behaviour that is not an API. The host check passed on
+  2026-11-20: gedit, all nine named actions placed correctly (23
+  `set_parent` moves, each followed by the expected configure, no
+  warnings). The
   [manual test plan](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#manual-test-plan)
-  lists what to check for each.
+  lists what to check, and
+  [How a window is moved](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#how-a-window-is-moved)
+  its known limits. The ARC and remote-shell-v2 backends it replaced are
+  at tag `placement-arc-remote-shell-final`.
 
 - Wheel steps for touchpad scrolling in Wine apps
   ([pointer scrolling](docs/INVARIANTS.md#pointer-scrolling)) have not

@@ -40,7 +40,6 @@ limitations under the License.
 use super::{Context, DeletedHostId, HostId, Link};
 use crate::handler::{
     compositor, keyboard, linux_dmabuf, output, pointer, registry, shm, text_input,
-    window_placement,
 };
 use crate::protocols::linux_dmabuf_v1::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
@@ -50,7 +49,7 @@ use crate::protocols::viewporter::wp_viewport;
 use crate::protocols::wayland::{
     wl_keyboard, wl_output, wl_pointer, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
-use crate::protocols::xdg_shell::{xdg_popup, xdg_surface, xdg_toplevel};
+use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
 
 impl Context {
     /// The guest destroyed guest object `guest_id`; see
@@ -168,7 +167,6 @@ fn forget_object(
         (wp_viewport::NAME, _) => compositor::forget_viewport(ctx, guest),
         (xdg_surface::NAME, _) => compositor::forget_xdg_surface(ctx, guest),
         (xdg_toplevel::NAME, _) => compositor::forget_xdg_toplevel(ctx, guest),
-        (xdg_popup::NAME, _) => window_placement::forget_xdg_popup(ctx, guest),
         (wl_shm::NAME, _) => shm::forget_shm(ctx, guest),
         (wl_shm_pool::NAME, _) => shm::forget_pool(ctx, guest),
         (zwp_linux_dmabuf_v1::NAME, _) => linux_dmabuf::forget_factory(ctx, guest),

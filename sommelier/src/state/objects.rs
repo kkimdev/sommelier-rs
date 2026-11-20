@@ -181,10 +181,6 @@ impl ShadowTable {
     /// [`Self::GUEST_SERVER_ID_START`]) up to `WL_MAP_MAX_OBJECTS` inclusive.
     const SERVER_IDS: std::ops::Range<u32> =
         Self::GUEST_SERVER_ID_START..Self::GUEST_SERVER_ID_START + WL_MAP_MAX_OBJECTS + 1;
-    /// What [`Self::guest_object_version_or_unknown`] gives for an object
-    /// the table does not know: below every message's `since`, so a child
-    /// created from it fails every version check.
-    const UNKNOWN_OBJECT_VERSION: u32 = 0;
 
     pub fn new() -> Self {
         Self {
@@ -513,16 +509,6 @@ impl ShadowTable {
     /// The live host object's version.
     pub fn host_object_version(&self, host_id: u32) -> Option<u32> {
         Some(self.hosts.get(&HostId(host_id))?.interface()?.version)
-    }
-
-    /// The guest object's version, or the unknown version, which fails
-    /// closed, when none is recorded. A child object created from it takes
-    /// this version. Only the window-placement code still uses it, for
-    /// senders that always have a version; elsewhere a missing version is
-    /// a bookkeeping fault that ends the session.
-    pub(crate) fn guest_object_version_or_unknown(&self, guest_id: u32) -> u32 {
-        self.guest_object_version(guest_id)
-            .unwrap_or(Self::UNKNOWN_OBJECT_VERSION)
     }
 
     // Lifecycle. Each transition is named after what happened and changes

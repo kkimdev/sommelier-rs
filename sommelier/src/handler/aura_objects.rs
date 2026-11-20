@@ -30,7 +30,7 @@ limitations under the License.
 
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
 use crate::state::{Context, HostAuraShell};
-use crate::wire::Outgoing;
+use crate::wire::{queue_or_drop, Outgoing};
 
 /// What the proxy needs to know about one kind of host Aura child.
 #[derive(Clone, Copy, Debug)]
@@ -82,13 +82,6 @@ fn live_child_version(ctx: &Context, child: AuraChild, child_host_id: u32) -> Op
         child.interface
     );
     version
-}
-
-/// The version of `child_host_id` as a live Aura child of kind `child`
-/// (see [`live_child_version`]). An ID that is not one gets version 0,
-/// which sends it no request that needs a version.
-pub(crate) fn aura_object_version(ctx: &Context, child: AuraChild, child_host_id: u32) -> u32 {
-    live_child_version(ctx, child, child_host_id).unwrap_or(0)
 }
 
 /// Create a host Aura child that extends `parent_host_id`.
@@ -196,6 +189,39 @@ pub(crate) fn ensure_host_zaura_surface(
     Some(zaura_surface_host_id)
 }
 
+/// Send the application ID the guest set (through XDG or GTK) to the
+/// surface's host Aura surface, creating that surface if needed. Nothing is
+/// sent while no `zaura_shell` is bound.
+///
+/// The Aura surface needs no version check: the registry binds no
+/// `zaura_shell` older than `set_application_id`.
+///
+/// # Arguments
+///
+/// * `native_application_id` - the guest's ID in the Guest OS namespace
+///   (`compositor::native_wayland_app_id`). An ID too long for one message
+///   is dropped with a warning.
+pub(crate) fn set_application_id(
+    ctx: &mut Context,
+    wl_surface_guest_id: u32,
+    native_application_id: &str,
+) {
+    let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id) else {
+        return;
+    };
+    if queue_or_drop(
+        &mut ctx.client_to_host_queue,
+        zaura_surface::req::set_application_id(zaura_surface_host_id, Some(native_application_id)),
+        format_args!("the application ID of zaura_surface {zaura_surface_host_id}"),
+    ) {
+        log::debug!(
+            "Set application ID to {} on zaura_surface (host_id={})",
+            native_application_id,
+            zaura_surface_host_id
+        );
+    }
+}
+
 /// Release the Aura surface of a host wl_surface that is being destroyed,
 /// if it has one.
 pub(crate) fn release_host_zaura_surface(ctx: &mut Context, wl_surface_host_id: u32) {
@@ -277,7 +303,7 @@ mod tests {
                 ctx.shadow_table.get_host_interface(id),
                 Some(child.interface)
             );
-            assert_eq!(aura_object_version(&ctx, child, id), version);
+            assert_eq!(live_child_version(&ctx, child, id), Some(version));
         }
     }
 

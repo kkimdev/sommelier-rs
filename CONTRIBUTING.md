@@ -106,10 +106,8 @@ for each move with a roundtrip, and enables, edits and disables the
 field; now and then it releases its seat while the field is enabled,
 reuses the seat's ID for a surface once it is deleted, and disables the
 field, which the proxy can then no longer deactivate. A quarter of the
-cases run with the remote-shell-v2 placement backend, so the proxy binds
-the compositor's `zcr_remote_shell_v2` and implements the guest's XDG
-objects itself; the run reports how many facade windows got a remote
-surface. Each case must end
+cases run with window placement on, so every XDG toplevel gets a
+host-only Aura toplevel; the run reports how many were created. Each case must end
 without a panic or hang, close every descriptor, and send at most one
 `wl_display.error`, as its last event. A case whose framing is intact
 must also either answer the stream's closing `wl_display.sync` or send

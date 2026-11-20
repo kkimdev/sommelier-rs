@@ -45,9 +45,10 @@ pub(crate) enum InternalCallback {
     /// ([`crate::handler::ime_keys::PendingRecovery`]). The `done` decides
     /// it, as any host event that comes before it would.
     KeyRecovery,
-    /// Exo has processed the `set_window_bounds` that placement sent to this
-    /// host `zaura_toplevel`.
-    WindowBoundsBarrier { zaura_toplevel: u32 },
+    /// Exo has handled a placement step of the toplevel of this host
+    /// `zaura_toplevel` (`crate::handler::window_placement`), and sent the
+    /// configures it causes.
+    PlacementBarrier { zaura_toplevel: u32 },
 }
 
 /// One connection's pending internal callbacks, keyed by host callback ID.

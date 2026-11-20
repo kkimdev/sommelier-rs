@@ -14,62 +14,51 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Window placement configuration, resolved once per process.
+//! Window placement configuration, shared by the whole process.
 //!
 //! [`PlacementConfig`] is the single owner of every placement setting:
 //!
-//! * the placement backend: `SOMMELIER_WINDOW_PLACEMENT_BACKEND`, or the
-//!   legacy `SOMMELIER_WINDOW_BOUNDS_AS_ARC` gate, chooses one, and the ARC
-//!   backend is active only once the process's ARC task-ID block is
-//!   reserved;
-//! * the host accelerators from `SOMMELIER_ACCELERATORS`;
-//! * the placement bindings, from exactly one source:
-//!   `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` (`CHORD=ACTION,...`, never
-//!   reloads) or `--window-shortcuts-config PATH` (a versioned TOML file,
-//!   reloaded on `SIGHUP`).
+//! * the host accelerators from `SOMMELIER_ACCELERATORS`, read once;
+//! * the placement bindings, from one file,
+//!   `$XDG_CONFIG_HOME/sommelier-rs/window-placement.toml`: where it is
+//!   ([`config_path`], resolved once), when it changed
+//!   ([`PlacementConfig::refresh`]), and what it binds (parse and
+//!   validation).
 //!
-//! `main` resolves it once with [`PlacementConfig::from_environment`] and
+//! `main` builds it once with [`PlacementConfig::from_environment`] and
 //! every connection's `Context` shares it, so no other code reads these
-//! variables and every warning is logged once per process. Both binding
-//! sources produce the same raw entries, which pass through one validator
-//! (chord syntax, duplicates after parsing, host-accelerator conflicts,
-//! actions, rectangles, size bound).
+//! settings and every warning is logged once per process. There are no
+//! built-in bindings: placement is on exactly while the file holds a valid
+//! configuration.
 //!
-//! The configuration contract (sources, precedence, failure policy, reload,
+//! The configuration contract (location, failure policy, reload,
 //! precision) is specified once, in
 //! `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::accelerator::{parse_accelerator, parse_accelerators, Accelerator, ParseError};
-use crate::arc_task_ids::ArcIdAllocator;
 use crate::window_layout::{NormalizedRect, RectError, WindowLayoutAction};
 
-/// The placement backend setting.
-const BACKEND_VARIABLE: &str = "SOMMELIER_WINDOW_PLACEMENT_BACKEND";
-/// The legacy ARC backend gate.
-const ARC_BOUNDS_VARIABLE: &str = "SOMMELIER_WINDOW_BOUNDS_AS_ARC";
 /// Keys the host compositor handles.
 const HOST_ACCELERATORS_VARIABLE: &str = "SOMMELIER_ACCELERATORS";
-/// The environment binding source.
-const SHORTCUTS_VARIABLE: &str = "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS";
-/// The file binding source's command-line option.
-const SHORTCUTS_OPTION: &str = "--window-shortcuts-config";
+/// The bindings file, relative to the XDG configuration directory.
+const CONFIG_FILE: &str = "sommelier-rs/window-placement.toml";
 
 /// The only schema version this build understands.
 const CONFIG_VERSION: i64 = 1;
 /// Upper bound on the file size read from disk. Real configurations are a few
-/// kilobytes; the bound keeps a mistaken path from stalling the proxy.
+/// kilobytes; the bound keeps a mistaken file from stalling the proxy.
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
-/// Upper bound on the number of bindings from either source.
+/// Upper bound on the number of bindings.
 const MAX_BINDINGS: usize = 256;
 
 /// One validated placement binding: a chord the compositor consumes and the
@@ -80,52 +69,25 @@ struct PlacementBinding {
     action: WindowLayoutAction,
 }
 
-impl PlacementBinding {
-    /// Return the chord, normalized like every parsed [`Accelerator`].
-    #[cfg(test)]
-    const fn chord(&self) -> Accelerator {
-        self.chord
-    }
-
-    /// Return the placement action.
-    const fn action(&self) -> WindowLayoutAction {
-        self.action
-    }
-}
-
-/// One immutable, validated generation of bindings.
-type Bindings = Arc<[PlacementBinding]>;
-
-/// Why a binding source was rejected. Indices count bindings from zero; in
-/// the environment list, empty entries are not counted.
+/// Why the bindings file was rejected. Indices count bindings from zero.
 #[derive(Debug, Error)]
 pub(crate) enum BindingsError {
-    #[error("cannot open {}: {source}", path.display())]
-    Open {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("{} is not a regular file", path.display())]
-    NotRegularFile { path: PathBuf },
-    #[error("cannot read {}: {source}", path.display())]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("{} exceeds the {limit}-byte size limit", path.display())]
-    TooLarge { path: PathBuf, limit: u64 },
-    #[error("{} is not valid UTF-8", path.display())]
-    NotUtf8 { path: PathBuf },
+    #[error("cannot open it: {0}")]
+    Open(#[source] io::Error),
+    #[error("it is not a regular file")]
+    NotRegularFile,
+    #[error("cannot read it: {0}")]
+    Read(#[source] io::Error),
+    #[error("it exceeds the {MAX_CONFIG_BYTES}-byte size limit")]
+    TooLarge,
+    #[error("it is not valid UTF-8")]
+    NotUtf8,
     #[error("malformed TOML: {0}")]
     Toml(#[from] toml::de::Error),
     #[error("unsupported version {found}; this build understands version {CONFIG_VERSION}")]
     UnsupportedVersion { found: i64 },
-    #[error("bindings[{index}]: {entry:?} must use CHORD=ACTION syntax")]
-    MissingAction { index: usize, entry: String },
-    #[error("{count} bindings exceed the limit of {limit}")]
-    TooManyBindings { count: usize, limit: usize },
+    #[error("{count} bindings exceed the limit of {MAX_BINDINGS}")]
+    TooManyBindings { count: usize },
     #[error("bindings[{index}]: invalid chord {chord:?}: {source}")]
     InvalidChord {
         index: usize,
@@ -154,250 +116,101 @@ pub(crate) enum BindingsError {
     },
 }
 
-/// Why a requested binding source cannot be used at startup.
+/// Where the bindings file is: `$XDG_CONFIG_HOME/sommelier-rs/window-placement.toml`,
+/// or under `$HOME/.config` when `XDG_CONFIG_HOME` is unset.
 ///
-/// Never fatal: the resolver logs it once and starts with placement
-/// shortcuts disabled, because the proxy serves every app in the container.
-#[derive(Debug, Error)]
-enum PlacementConfigError {
-    #[error(
-        "{SHORTCUTS_OPTION} and {SHORTCUTS_VARIABLE} are mutually exclusive; configure \
-         placement shortcuts in one place"
-    )]
-    ConflictingSources,
-    #[error("{variable} is not valid UTF-8")]
-    NotUnicode { variable: &'static str },
-    #[error("unknown {BACKEND_VARIABLE} {value:?}; expected `arc`, `remote-shell-v2` or `off`")]
-    UnknownBackend { value: String },
-    #[error("{BACKEND_VARIABLE}={value} contradicts {ARC_BOUNDS_VARIABLE}")]
-    ConflictingBackends { value: String },
-    #[error(
-        "cannot check placement bindings: invalid {HOST_ACCELERATORS_VARIABLE} {value:?}: {source}"
-    )]
-    InvalidHostAccelerators {
-        value: String,
-        #[source]
-        source: ParseError,
-    },
-    #[error("cannot resolve {SHORTCUTS_OPTION} {}: {source}", path.display())]
-    Path {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("invalid {SHORTCUTS_OPTION}: {0}")]
-    File(#[source] BindingsError),
-    #[error("invalid {SHORTCUTS_VARIABLE}: {0}")]
-    Environment(#[source] BindingsError),
+/// As the XDG base directory specification asks, an empty or relative
+/// `XDG_CONFIG_HOME` counts as unset. A relative `HOME` is not used either,
+/// because the path would then depend on the startup directory.
+///
+/// # Returns
+///
+/// `None` when neither variable names an absolute directory.
+fn config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    fn absolute(value: Option<&OsStr>) -> Option<&Path> {
+        value.map(Path::new).filter(|path| path.is_absolute())
+    }
+    let config_home = match absolute(xdg_config_home) {
+        Some(config_home) => config_home.to_path_buf(),
+        None => absolute(home)?.join(".config"),
+    };
+    Some(config_home.join(CONFIG_FILE))
 }
 
-/// The process environment that configures placement, captured once.
-#[derive(Debug, Default)]
-struct PlacementEnvironment {
-    backend: Option<OsString>,
-    arc_bounds: Option<OsString>,
-    host_accelerators: Option<OsString>,
-    shortcuts: Option<OsString>,
+/// Parse `SOMMELIER_ACCELERATORS`; unset or blank is an empty list.
+///
+/// A malformed list must not stop the proxy: it degrades to no filtering,
+/// logged once, and so binds no chord out of reach of a binding either.
+fn host_accelerators(value: Option<&OsStr>) -> Vec<Accelerator> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    value
+        .to_str()
+        .ok_or_else(|| "it is not UTF-8".to_string())
+        .and_then(|text| parse_accelerators(text).map_err(|error| format!("{text:?}: {error}")))
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "Invalid {HOST_ACCELERATORS_VARIABLE}, {error}. Accelerator filtering is disabled."
+            );
+            Vec::new()
+        })
 }
 
-impl PlacementEnvironment {
-    fn read() -> Self {
-        Self {
-            backend: std::env::var_os(BACKEND_VARIABLE),
-            arc_bounds: std::env::var_os(ARC_BOUNDS_VARIABLE),
-            host_accelerators: std::env::var_os(HOST_ACCELERATORS_VARIABLE),
-            shortcuts: std::env::var_os(SHORTCUTS_VARIABLE),
-        }
-    }
+/// What identifies one version of the bindings file, as `stat` sees it
+/// through any symbolic links.
+///
+/// Home Manager installs the file as a link into `/nix/store`, where every
+/// file's mtime is 1: an activation points the link at another store file
+/// with the same mtime, so the device and inode must count too. An editor
+/// that rewrites the file in place keeps its inode and changes its times or
+/// size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    size: u64,
+}
 
-    /// Return whether the gate requests the ARC bounds policy.
-    ///
-    /// Mere presence is not enough: `VAR=0`, `VAR=false`, an exported empty
-    /// value, and a non-UTF-8 value leave the policy off; the conventional
-    /// explicit true spellings turn it on.
-    fn arc_bounds_requested(&self) -> bool {
-        self.arc_bounds
-            .as_deref()
-            .and_then(OsStr::to_str)
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-    }
-
-    /// Return what the deployment asked for.
-    ///
-    /// `SOMMELIER_WINDOW_PLACEMENT_BACKEND` chooses, case-insensitively and
-    /// ignoring surrounding whitespace; `off` wins over the legacy gate.
-    /// Unset or blank, the gate chooses the ARC backend or nothing.
-    ///
-    /// # Errors
-    ///
-    /// The setting is not UTF-8, names no backend, or names a backend other
-    /// than the one the gate, which is on, chooses. Placement is then off:
-    /// guessing which backend was meant could change every window's host
-    /// behaviour.
-    fn requested_backend(&self) -> Result<BackendChoice, PlacementConfigError> {
-        let gate = self.arc_bounds_requested();
-        let Some(value) = configured_text(self.backend.as_deref(), BACKEND_VARIABLE)? else {
-            return Ok(if gate {
-                BackendChoice::Backend(BackendRequest::Arc)
-            } else {
-                BackendChoice::Unchosen
-            });
-        };
-        let value = value.trim().to_ascii_lowercase();
-        match value.as_str() {
-            "arc" => Ok(BackendChoice::Backend(BackendRequest::Arc)),
-            "off" => Ok(BackendChoice::Off),
-            "remote-shell-v2" if gate => Err(PlacementConfigError::ConflictingBackends { value }),
-            "remote-shell-v2" => Ok(BackendChoice::Backend(BackendRequest::RemoteShellV2)),
-            _ => Err(PlacementConfigError::UnknownBackend { value }),
-        }
-    }
-
-    /// Parse the host accelerators; a blank or unset variable is an empty
-    /// list.
-    fn host_accelerators(&self) -> Result<Vec<Accelerator>, PlacementConfigError> {
-        let Some(value) = configured_text(
-            self.host_accelerators.as_deref(),
-            HOST_ACCELERATORS_VARIABLE,
-        )?
-        else {
-            return Ok(Vec::new());
-        };
-        parse_accelerators(value).map_err(|source| PlacementConfigError::InvalidHostAccelerators {
-            value: value.to_string(),
-            source,
+impl FileIdentity {
+    /// `stat` the file `path` names, following symbolic links.
+    fn of(path: &Path) -> io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            size: metadata.size(),
         })
     }
 }
 
-/// The one "configured text" rule for placement variables.
-///
-/// # Returns
-///
-/// `None` when the variable is unset or blank: a blank value means "not
-/// configured". Otherwise the text.
-///
-/// # Errors
-///
-/// A non-UTF-8 value is a (malformed) attempt to configure, never "unset".
-fn configured_text<'a>(
-    value: Option<&'a OsStr>,
-    variable: &'static str,
-) -> Result<Option<&'a str>, PlacementConfigError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let text = value
-        .to_str()
-        .ok_or(PlacementConfigError::NotUnicode { variable })?;
-    Ok((!text.trim().is_empty()).then_some(text))
+/// What the process knows of the bindings file.
+#[derive(Debug, Default)]
+struct LoadedFile {
+    /// What the last check saw: `None` before the first check, `Some(None)`
+    /// while the file cannot be found.
+    seen: Option<Option<FileIdentity>>,
+    /// The last good bindings; `None` while placement is off.
+    bindings: Option<Vec<PlacementBinding>>,
 }
 
-/// The binding source a deployment asked for.
-enum BindingSource<'a> {
-    /// The environment list, or why it cannot be read as text.
-    Environment(Result<&'a str, PlacementConfigError>),
-    File(&'a Path),
-    /// Both sources at once, which is a configuration error.
-    Both(&'a Path),
-}
-
-impl BindingSource<'_> {
-    /// Name the source as the user spelled it, for diagnostics.
-    fn describe(&self) -> String {
-        match self {
-            Self::Environment(_) => SHORTCUTS_VARIABLE.to_string(),
-            Self::File(path) => format!("{SHORTCUTS_OPTION} {}", path.display()),
-            Self::Both(path) => {
-                format!(
-                    "{SHORTCUTS_OPTION} {} and {SHORTCUTS_VARIABLE}",
-                    path.display()
-                )
-            }
-        }
-    }
-
-    /// Read and validate the source.
-    ///
-    /// # Returns
-    ///
-    /// The file that `SIGHUP` re-reads, whenever the source is a file whose
-    /// path resolved (even if its content is invalid, so that a later valid
-    /// reload can activate it), and the bindings.
-    ///
-    /// # Errors
-    ///
-    /// The bindings are an error when both sources are given, when the
-    /// environment list is not UTF-8 or invalid, or when the file path cannot
-    /// be resolved or the file cannot be read or is invalid.
-    fn load(
-        self,
-        host_accelerators: &[Accelerator],
-    ) -> (
-        Option<PathBuf>,
-        Result<Vec<PlacementBinding>, PlacementConfigError>,
-    ) {
-        match self {
-            Self::Both(_) => (None, Err(PlacementConfigError::ConflictingSources)),
-            Self::Environment(text) => (
-                None,
-                text.and_then(|text| {
-                    parse_environment_bindings(text, host_accelerators)
-                        .map_err(PlacementConfigError::Environment)
-                }),
-            ),
-            // Resolve against the startup directory once, so every reload
-            // reads the same file. Symbolic links are deliberately not
-            // resolved.
-            Self::File(path) => match std::path::absolute(path) {
-                Ok(path) => {
-                    let bindings = load_shortcut_config(&path, host_accelerators)
-                        .map_err(PlacementConfigError::File);
-                    (Some(path), bindings)
-                }
-                Err(source) => (
-                    None,
-                    Err(PlacementConfigError::Path {
-                        path: path.to_path_buf(),
-                        source,
-                    }),
-                ),
-            },
-        }
-    }
-}
-
-/// What the backend settings ask for.
+/// What one [`PlacementConfig::refresh`] did. Every outcome but
+/// `Unchanged` is logged once, as it happens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BackendChoice {
-    /// Neither setting chooses a backend.
-    Unchosen,
-    /// `SOMMELIER_WINDOW_PLACEMENT_BACKEND=off`.
-    Off,
-    Backend(BackendRequest),
-}
-
-/// A placement backend a deployment asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BackendRequest {
-    Arc,
-    RemoteShellV2,
-}
-
-/// The placement backend every connection of the process uses.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PlacementBackend {
-    /// `zaura_toplevel.set_window_bounds` under an ARC policy identity
-    /// from the process's reserved ARC task-ID block.
-    Arc(&'static ArcIdAllocator),
-    /// Host `zcr_remote_surface_v2` roles placed with
-    /// `set_bounds_in_output`.
-    RemoteShellV2,
+pub(crate) enum Refresh {
+    /// The file is as the last check saw it, or no path resolved.
+    Unchanged,
+    /// The file cannot be found or examined; there are no bindings.
+    Absent,
+    /// The file changed and its bindings replaced the last ones.
+    Loaded,
+    /// The file changed but cannot be used; the last good bindings, if
+    /// any, stay.
+    Rejected,
 }
 
 /// Process-wide window placement configuration.
@@ -405,149 +218,119 @@ pub(crate) enum PlacementBackend {
 pub(crate) struct PlacementConfig {
     /// Parsed `SOMMELIER_ACCELERATORS`: chords the host keeps.
     host_accelerators: Vec<Accelerator>,
-    /// `None` while placement is off. Bindings live inside it, so
-    /// placement being off and a chord being consumed cannot coexist.
-    active: Option<ActivePlacement>,
-}
-
-/// The active placement backend and its bindings.
-#[derive(Debug)]
-struct ActivePlacement {
-    backend: PlacementBackend,
-    /// The current generation. A reload replaces the whole `Arc`, so every
-    /// lookup sees one complete generation.
-    bindings: RwLock<Bindings>,
-    /// The file that `SIGHUP` re-reads; `None` for the environment source,
-    /// which never reloads.
-    reload_path: Option<PathBuf>,
+    /// The bindings file; `None` when no path resolved, which leaves
+    /// placement off for good.
+    path: Option<PathBuf>,
+    file: Mutex<LoadedFile>,
 }
 
 impl PlacementConfig {
-    /// Resolve the configuration from the process environment.
+    /// Resolve the configuration from the process environment and load the
+    /// bindings file.
     ///
-    /// Reads `SOMMELIER_WINDOW_PLACEMENT_BACKEND`,
-    /// `SOMMELIER_WINDOW_BOUNDS_AS_ARC`, `SOMMELIER_ACCELERATORS` and
-    /// `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`, reserves the process's ARC
-    /// task-ID block when the ARC backend is chosen, and loads the bindings.
-    ///
-    /// This never fails. Every problem is logged here, once, and leaves
-    /// placement shortcuts disabled; the rules are specified in
+    /// Reads `SOMMELIER_ACCELERATORS`, `XDG_CONFIG_HOME` and `HOME`, once.
+    /// This never fails: every problem is logged and leaves placement off
+    /// or key filtering disabled, because the proxy serves every app in the
+    /// container. The rules are specified in
     /// `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`.
-    ///
-    /// # Arguments
-    ///
-    /// * `shortcuts_file` - the `--window-shortcuts-config` value, if given.
-    pub(crate) fn from_environment(shortcuts_file: Option<&Path>) -> Self {
-        Self::resolve(
-            &PlacementEnvironment::read(),
-            shortcuts_file,
-            crate::arc_task_ids::process_allocator,
-        )
-    }
-
-    /// Apply the resolution rules to captured inputs.
-    ///
-    /// `reserve_arc_ids` is called only when the ARC backend is chosen.
-    fn resolve(
-        environment: &PlacementEnvironment,
-        shortcuts_file: Option<&Path>,
-        reserve_arc_ids: impl FnOnce() -> Option<&'static ArcIdAllocator>,
-    ) -> Self {
-        let environment_shortcuts =
-            configured_text(environment.shortcuts.as_deref(), SHORTCUTS_VARIABLE).transpose();
-        let source = match (shortcuts_file, environment_shortcuts) {
-            (Some(path), Some(_)) => Some(BindingSource::Both(path)),
-            (Some(path), None) => Some(BindingSource::File(path)),
-            (None, Some(text)) => Some(BindingSource::Environment(text)),
-            (None, None) => None,
-        };
-        let host_accelerators = environment.host_accelerators();
-
-        let (backend, off_reason) = match environment.requested_backend() {
-            Err(error) => {
-                log::error!("{error}. Window placement is off.");
-                (None, "its backend setting is unusable")
-            }
-            Ok(BackendChoice::Unchosen) => (
-                None,
-                "neither SOMMELIER_WINDOW_PLACEMENT_BACKEND nor \
-                 SOMMELIER_WINDOW_BOUNDS_AS_ARC chooses a backend",
-            ),
-            Ok(BackendChoice::Off) => (None, "SOMMELIER_WINDOW_PLACEMENT_BACKEND is off"),
-            // The allocator logs why it could not reserve a block.
-            Ok(BackendChoice::Backend(BackendRequest::Arc)) => (
-                reserve_arc_ids().map(PlacementBackend::Arc),
-                "no ARC task-ID block could be reserved",
-            ),
-            Ok(BackendChoice::Backend(BackendRequest::RemoteShellV2)) => {
-                (Some(PlacementBackend::RemoteShellV2), "")
-            }
-        };
-        let Some(backend) = backend else {
-            if let Some(source) = &source {
-                log::warn!(
-                    "Window placement shortcuts from {} are ignored and not read: placement \
-                     is off because {off_reason}",
-                    source.describe()
-                );
-            }
-            return Self {
-                host_accelerators: host_accelerators_or_unfiltered(host_accelerators),
-                active: None,
-            };
-        };
-
-        let Some(source) = source else {
-            return Self::with_backend(
-                host_accelerators_or_unfiltered(host_accelerators),
-                backend,
-                Vec::new(),
-                None,
+    pub(crate) fn from_environment() -> Self {
+        let host_accelerators =
+            host_accelerators(std::env::var_os(HOST_ACCELERATORS_VARIABLE).as_deref());
+        let path = config_path(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        );
+        if path.is_none() {
+            log::debug!(
+                "Neither XDG_CONFIG_HOME nor HOME names an absolute directory, so there is no \
+                 window placement configuration"
             );
-        };
-        let host_accelerators = match host_accelerators {
-            Ok(host_accelerators) => host_accelerators,
-            Err(error) => {
-                // No binding can be checked against the host list, now or on
-                // a reload, so the source is not read at all.
-                log::error!(
-                    "{error}. Window placement shortcuts and accelerator filtering are disabled."
-                );
-                return Self::with_backend(Vec::new(), backend, Vec::new(), None);
-            }
-        };
-        let (reload_path, bindings) = source.load(&host_accelerators);
-        match bindings {
-            Ok(bindings) => {
-                let config = Self::with_backend(host_accelerators, backend, bindings, reload_path);
-                config.log_loaded("Loaded");
-                config
-            }
-            Err(error) => {
-                let until = if reload_path.is_some() {
-                    " until a valid SIGHUP reload"
-                } else {
-                    ""
-                };
-                log::error!("{error}. Window placement shortcuts are disabled{until}.");
-                Self::with_backend(host_accelerators, backend, Vec::new(), reload_path)
-            }
         }
+        Self::with_file(host_accelerators, path)
     }
 
-    fn with_backend(
-        host_accelerators: Vec<Accelerator>,
-        backend: PlacementBackend,
-        bindings: Vec<PlacementBinding>,
-        reload_path: Option<PathBuf>,
-    ) -> Self {
-        Self {
+    /// The configuration of `host_accelerators` and the bindings file at
+    /// `path`, if any, loaded once.
+    fn with_file(host_accelerators: Vec<Accelerator>, path: Option<PathBuf>) -> Self {
+        let config = Self {
             host_accelerators,
-            active: Some(ActivePlacement {
-                backend,
-                bindings: RwLock::new(Bindings::from(bindings)),
-                reload_path,
-            }),
+            path,
+            file: Mutex::default(),
+        };
+        config.refresh();
+        config
+    }
+
+    fn file(&self) -> MutexGuard<'_, LoadedFile> {
+        // Every update leaves `LoadedFile` whole, so a poisoned lock holds a
+        // usable state.
+        self.file.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Load the bindings file again if its [`FileIdentity`] changed since
+    /// the last check.
+    ///
+    /// Costs one `stat` when the file did not change. A file that cannot be
+    /// found clears the bindings; one that cannot be used keeps the last
+    /// good bindings. Either is logged once per change of the file, never
+    /// per call.
+    pub(crate) fn refresh(&self) -> Refresh {
+        let Some(path) = &self.path else {
+            return Refresh::Unchanged;
+        };
+        let identity = FileIdentity::of(path);
+        let mut file = self.file();
+        let first = file.seen.is_none();
+        let seen = identity.as_ref().ok().copied();
+        if file.seen.replace(seen) == Some(seen) {
+            return Refresh::Unchanged;
+        }
+        let had_bindings = file.bindings.is_some();
+        if let Err(error) = identity {
+            file.bindings = None;
+            if error.kind() != io::ErrorKind::NotFound {
+                log::warn!(
+                    "Cannot examine {}: {error}. Window placement is off.",
+                    path.display()
+                );
+            } else if had_bindings {
+                log::info!("{} was removed; window placement is off", path.display());
+            } else {
+                log::debug!(
+                    "No window placement configuration at {}; placement is off",
+                    path.display()
+                );
+            }
+            return Refresh::Absent;
+        }
+        match load_shortcut_config(path, &self.host_accelerators) {
+            Ok(bindings) => {
+                log::info!(
+                    "Loaded {} window placement binding(s) from {}{}",
+                    bindings.len(),
+                    path.display(),
+                    if had_bindings || first {
+                        ""
+                    } else {
+                        "; apps that connected while placement was off are placed once \
+                         they reconnect"
+                    }
+                );
+                file.bindings = Some(bindings);
+                Refresh::Loaded
+            }
+            Err(error) => {
+                log::warn!(
+                    "Ignoring {}: {error}. {}",
+                    path.display(),
+                    if had_bindings {
+                        "Keeping the last good window placement bindings."
+                    } else {
+                        "Window placement is off."
+                    }
+                );
+                Refresh::Rejected
+            }
         }
     }
 
@@ -556,101 +339,25 @@ impl PlacementConfig {
         self.host_accelerators.contains(chord)
     }
 
-    /// Return the action bound to a chord in the current generation.
-    ///
-    /// Always `None` while placement is off. A generation
-    /// published by a reload is visible to the next lookup.
+    /// Return the action bound to a chord, as of the last
+    /// [`refresh`](Self::refresh); always `None` while placement is off.
     pub(crate) fn action_for(&self, chord: &Accelerator) -> Option<WindowLayoutAction> {
-        self.bindings()?
+        self.file()
+            .bindings
+            .as_ref()?
             .iter()
             .find(|binding| binding.chord == *chord)
-            .map(PlacementBinding::action)
+            .map(|binding| binding.action)
     }
 
-    /// Return the placement backend, or `None` while placement is off.
-    pub(crate) fn backend(&self) -> Option<PlacementBackend> {
-        self.active.as_ref().map(|active| active.backend)
-    }
-
-    /// Return the current bindings, or `None` while placement is off.
-    fn bindings(&self) -> Option<Bindings> {
-        let policy = self.active.as_ref()?;
-        // A writer only swaps in a complete `Arc`, so a poisoned lock still
-        // holds a whole generation.
-        Some(Arc::clone(
-            &policy
-                .bindings
-                .read()
-                .unwrap_or_else(PoisonError::into_inner),
-        ))
-    }
-
-    /// Re-read the configuration file and publish it only if it is valid.
-    ///
-    /// # Returns
-    ///
-    /// `None` when no file is in use; there is nothing to reload. That is
-    /// the case without `--window-shortcuts-config`, while placement is off,
-    /// and when startup could not use the file at all (see
-    /// [`BindingSource::load`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns the load error and leaves the published bindings untouched.
-    pub(crate) fn reload(&self) -> Option<Result<(), BindingsError>> {
-        let policy = self.active.as_ref()?;
-        let path = policy.reload_path.as_deref()?;
-        Some(
-            load_shortcut_config(path, &self.host_accelerators).map(|bindings| {
-                *policy
-                    .bindings
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner) = Bindings::from(bindings);
-            }),
-        )
-    }
-
-    /// Handle a reload request (`SIGHUP`) and log its outcome.
-    pub(crate) fn reload_and_log(&self) {
-        match self.reload() {
-            None => log::info!("SIGHUP ignored: no window shortcut configuration file is in use"),
-            Some(Ok(())) => self.log_loaded("Reloaded"),
-            Some(Err(error)) => log::error!(
-                "Keeping the last known-good window placement shortcuts; reload failed: {error}"
-            ),
-        }
-    }
-
-    fn log_loaded(&self, verb: &str) {
-        let Some(policy) = &self.active else {
-            return;
-        };
-        let count = self.bindings().map_or(0, |bindings| bindings.len());
-        match &policy.reload_path {
-            Some(path) => log::info!(
-                "{verb} {count} window placement shortcut binding(s) from {}; send SIGHUP to reload",
-                path.display()
-            ),
-            None => log::info!("{verb} {count} window placement shortcut binding(s) from {SHORTCUTS_VARIABLE}"),
-        }
+    /// Return whether placement is on: the bindings file was valid when
+    /// last loaded and has not gone since. Its bindings may be none.
+    pub(crate) fn is_active(&self) -> bool {
+        self.file().bindings.is_some()
     }
 }
 
-/// Use the host accelerators when no binding source depends on them.
-///
-/// A malformed `SOMMELIER_ACCELERATORS` must not stop the proxy when it only
-/// filters keys: that would break every app in the container. It degrades to
-/// no filtering, logged once.
-fn host_accelerators_or_unfiltered(
-    host_accelerators: Result<Vec<Accelerator>, PlacementConfigError>,
-) -> Vec<Accelerator> {
-    host_accelerators.unwrap_or_else(|error| {
-        log::warn!("{error}. Accelerator filtering disabled.");
-        Vec::new()
-    })
-}
-
-/// One binding as written in either source, before validation.
+/// One binding as written in the file, before validation.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBinding {
@@ -659,11 +366,11 @@ struct RawBinding {
     rect: Option<[f64; 4]>,
 }
 
-/// Validate bindings from either source. This is the only validator.
+/// Validate the file's bindings.
 ///
 /// # Arguments
 ///
-/// * `raw` - the bindings in source order.
+/// * `raw` - the bindings in document order.
 /// * `host_accelerators` - a binding for one of these chords is rejected.
 ///
 /// # Errors
@@ -677,10 +384,7 @@ fn validate_bindings(
     host_accelerators: &[Accelerator],
 ) -> Result<Vec<PlacementBinding>, BindingsError> {
     if raw.len() > MAX_BINDINGS {
-        return Err(BindingsError::TooManyBindings {
-            count: raw.len(),
-            limit: MAX_BINDINGS,
-        });
+        return Err(BindingsError::TooManyBindings { count: raw.len() });
     }
     let mut bindings: Vec<PlacementBinding> = Vec::with_capacity(raw.len());
     for (index, binding) in raw.into_iter().enumerate() {
@@ -728,43 +432,6 @@ fn validate_bindings(
     Ok(bindings)
 }
 
-/// Parse and validate the `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` syntax.
-///
-/// The value is a comma-separated list of `CHORD=ACTION` pairs, for example
-/// `<Alt>q=top-left,<Alt>w=top`. Empty entries are ignored for consistency
-/// with `SOMMELIER_ACCELERATORS`.
-///
-/// # Errors
-///
-/// Returns [`BindingsError::MissingAction`] for an entry without `=`, and
-/// otherwise the [`validate_bindings`] error.
-fn parse_environment_bindings(
-    value: &str,
-    host_accelerators: &[Accelerator],
-) -> Result<Vec<PlacementBinding>, BindingsError> {
-    let raw = value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .enumerate()
-        .map(|(index, entry)| {
-            let (chord, action) =
-                entry
-                    .split_once('=')
-                    .ok_or_else(|| BindingsError::MissingAction {
-                        index,
-                        entry: entry.to_string(),
-                    })?;
-            Ok(RawBinding {
-                chord: chord.trim().to_string(),
-                action: Some(action.trim().to_string()),
-                rect: None,
-            })
-        })
-        .collect::<Result<Vec<_>, BindingsError>>()?;
-    validate_bindings(raw, host_accelerators)
-}
-
 /// Version probe parsed before the strict schema, so a document written for
 /// a newer version reports the version instead of its first unknown field.
 #[derive(Deserialize)]
@@ -791,7 +458,7 @@ struct RawConfig {
 /// # Returns
 ///
 /// The bindings in document order. An empty `bindings` list is valid and
-/// disables every placement shortcut.
+/// binds no chord.
 ///
 /// # Errors
 ///
@@ -820,37 +487,21 @@ fn read_config_text(path: &Path) -> Result<String, BindingsError> {
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
-        .map_err(|source| BindingsError::Open {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let metadata = file.metadata().map_err(|source| BindingsError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+        .map_err(BindingsError::Open)?;
+    let metadata = file.metadata().map_err(BindingsError::Read)?;
     if !metadata.file_type().is_file() {
-        return Err(BindingsError::NotRegularFile {
-            path: path.to_path_buf(),
-        });
+        return Err(BindingsError::NotRegularFile);
     }
     // Bound the read itself instead of trusting the size reported by stat;
     // the extra byte distinguishes an at-limit file from an oversized one.
     let mut bytes = Vec::new();
     file.take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|source| BindingsError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        .map_err(BindingsError::Read)?;
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(BindingsError::TooLarge {
-            path: path.to_path_buf(),
-            limit: MAX_CONFIG_BYTES,
-        });
+        return Err(BindingsError::TooLarge);
     }
-    String::from_utf8(bytes).map_err(|_| BindingsError::NotUtf8 {
-        path: path.to_path_buf(),
-    })
+    String::from_utf8(bytes).map_err(|_| BindingsError::NotUtf8)
 }
 
 /// Read and validate a configuration file.
@@ -880,74 +531,39 @@ fn load_shortcut_config(
 impl PlacementConfig {
     /// Placement off, with the given host accelerators.
     pub(crate) fn for_test(host_accelerators: Vec<Accelerator>) -> Self {
-        Self {
-            host_accelerators,
-            active: None,
-        }
+        Self::with_file(host_accelerators, None)
     }
 
-    /// The process's ARC task-ID block while the ARC backend is active.
-    pub(crate) fn arc_id_allocator(&self) -> Option<&'static ArcIdAllocator> {
-        match self.backend()? {
-            PlacementBackend::Arc(arc_ids) => Some(arc_ids),
-            PlacementBackend::RemoteShellV2 => None,
-        }
+    /// Placement on, with `bindings` (chord, named action), which may be
+    /// none, and no file.
+    pub(crate) fn active_for_test(bindings: &[(&str, &str)]) -> Self {
+        Self::loaded_for_test(Vec::new(), bindings)
     }
 
-    /// Resolve named test variables with the production rules.
-    ///
-    /// `arc_ids` stands in for the process block, so a test never reserves
-    /// a real one.
-    pub(crate) fn resolve_for_test(
-        variables: &[(&str, &str)],
-        shortcuts_file: Option<&Path>,
-        arc_ids: &'static ArcIdAllocator,
+    /// [`active_for_test`](Self::active_for_test) with host accelerators.
+    pub(crate) fn loaded_for_test(
+        host_accelerators: Vec<Accelerator>,
+        bindings: &[(&str, &str)],
     ) -> Self {
-        let mut environment = PlacementEnvironment::default();
-        for &(name, value) in variables {
-            let slot = match name {
-                BACKEND_VARIABLE => &mut environment.backend,
-                ARC_BOUNDS_VARIABLE => &mut environment.arc_bounds,
-                HOST_ACCELERATORS_VARIABLE => &mut environment.host_accelerators,
-                SHORTCUTS_VARIABLE => &mut environment.shortcuts,
-                other => panic!("{other} does not configure placement"),
-            };
-            *slot = Some(OsString::from(value));
-        }
-        Self::resolve(&environment, shortcuts_file, || Some(arc_ids))
-    }
-
-    /// The remote-shell-v2 backend with
-    /// `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`-syntax bindings.
-    pub(crate) fn remote_shell_for_test(shortcuts: &str) -> Self {
-        let config = Self::resolve_for_test(
-            &[
-                (BACKEND_VARIABLE, "remote-shell-v2"),
-                (SHORTCUTS_VARIABLE, shortcuts),
-            ],
-            None,
-            ArcIdAllocator::block_for_test(),
-        );
-        assert!(matches!(
-            config.backend(),
-            Some(PlacementBackend::RemoteShellV2)
-        ));
+        let raw = bindings
+            .iter()
+            .map(|&(chord, action)| RawBinding {
+                chord: chord.to_string(),
+                action: Some(action.to_string()),
+                rect: None,
+            })
+            .collect();
+        let bindings = validate_bindings(raw, &host_accelerators)
+            .unwrap_or_else(|error| panic!("invalid test bindings {bindings:?}: {error}"));
+        let config = Self::for_test(host_accelerators);
+        config.file().bindings = Some(bindings);
         config
     }
 
-    /// The ARC bounds policy on, with a fresh test block and
-    /// `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`-syntax bindings.
-    pub(crate) fn arc_bounds_for_test(shortcuts: &str) -> Self {
-        let config = Self::resolve_for_test(
-            &[(ARC_BOUNDS_VARIABLE, "1"), (SHORTCUTS_VARIABLE, shortcuts)],
-            None,
-            ArcIdAllocator::block_for_test(),
-        );
-        assert!(
-            shortcuts.trim().is_empty() || !config.bindings().unwrap_or_default().is_empty(),
-            "invalid test bindings {shortcuts:?} would leave shortcuts disabled"
-        );
-        config
+    /// The configuration of the bindings file at `path`, loaded once, as
+    /// `main` builds it.
+    pub(crate) fn file_for_test(path: &Path) -> Self {
+        Self::with_file(Vec::new(), Some(path.to_path_buf()))
     }
 }
 
@@ -956,7 +572,7 @@ mod tests {
     use super::*;
     use crate::accelerator::ALT_MASK;
     use crate::test_support::TempDir;
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::OsStrExt;
     use xkbcommon::xkb;
 
     const VALID: &str = r#"
@@ -986,120 +602,39 @@ action = "fullscreen"
         }
     }
 
-    fn environment(
-        arc_bounds: Option<&str>,
-        host_accelerators: Option<&str>,
-        shortcuts: Option<&str>,
-    ) -> PlacementEnvironment {
-        PlacementEnvironment {
-            backend: None,
-            arc_bounds: arc_bounds.map(OsString::from),
-            host_accelerators: host_accelerators.map(OsString::from),
-            shortcuts: shortcuts.map(OsString::from),
-        }
+    fn alt_q(config: &PlacementConfig) -> Option<WindowLayoutAction> {
+        config.action_for(&alt(xkb::keysyms::KEY_q))
     }
 
-    /// Resolve with a test block, recording whether one was requested.
-    fn resolve(
-        environment: &PlacementEnvironment,
-        file: Option<&Path>,
-        arc_ids: Option<&'static ArcIdAllocator>,
-    ) -> (PlacementConfig, bool) {
-        let mut reserved = false;
-        let config = PlacementConfig::resolve(environment, file, || {
-            reserved = true;
-            arc_ids
-        });
-        (config, reserved)
+    /// Replace `name` in `dir` as an editor or dotfile tool does: write a
+    /// new file and rename it over the old one.
+    fn replace(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
+        let staged = dir.write(".staged", contents.as_bytes());
+        let path = dir.path().join(name);
+        std::fs::rename(staged, &path).expect("rename the staged file");
+        path
     }
 
-    fn block() -> Option<&'static ArcIdAllocator> {
-        Some(ArcIdAllocator::block_for_test())
-    }
-
-    fn current(config: &PlacementConfig) -> Bindings {
-        config.bindings().expect("ARC bounds policy is active")
-    }
-
-    fn reload_path(config: &PlacementConfig) -> Option<&Path> {
-        config.active.as_ref()?.reload_path.as_deref()
-    }
-
-    /// The failure policy: the ARC policy stays active, but no chord is
-    /// bound, so none is consumed.
-    fn assert_shortcuts_disabled(config: &PlacementConfig) {
-        assert!(
-            config.arc_id_allocator().is_some(),
-            "the ARC policy stays on"
-        );
-        assert!(current(config).is_empty(), "no binding is active");
-        assert_eq!(config.action_for(&alt(xkb::keysyms::KEY_q)), None);
-    }
-
-    // ── One validator for both sources ────────────────────────────────
+    // ── Validation ────────────────────────────────────────────────────
 
     #[test]
     fn parses_rect_and_named_bindings_in_document_order() {
         let bindings = parse(VALID).unwrap();
         assert_eq!(bindings.len(), 2);
-        assert_eq!(bindings[0].chord(), alt(xkb::keysyms::KEY_q));
+        assert_eq!(bindings[0].chord, alt(xkb::keysyms::KEY_q));
         assert_eq!(
-            bindings[0].action(),
+            bindings[0].action,
             WindowLayoutAction::Rect(NormalizedRect::new(0.0, 0.0, 0.5, 0.5).unwrap())
         );
-        assert_eq!(bindings[1].action(), WindowLayoutAction::Fullscreen);
+        assert_eq!(bindings[1].action, WindowLayoutAction::Fullscreen);
     }
 
     #[test]
-    fn environment_bindings_parse_in_order() {
-        let bindings =
-            parse_environment_bindings("<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen", &[])
-                .unwrap();
-        assert_eq!(bindings.len(), 3);
-        assert_eq!(bindings[0].chord(), alt(xkb::keysyms::KEY_q));
-        assert_eq!(bindings[0].action(), WindowLayoutAction::TopLeft);
-        assert_eq!(bindings[2].action(), WindowLayoutAction::Fullscreen);
-        assert_eq!(
-            parse_environment_bindings(" , <Alt>q = left ,, ", &[]).unwrap()[0].action(),
-            WindowLayoutAction::Left,
-            "empty entries and padding are ignored"
-        );
-    }
-
-    #[test]
-    fn environment_bindings_reject_bad_syntax_duplicates_and_actions() {
-        assert!(matches!(
-            parse_environment_bindings(",<Alt>q", &[]),
-            Err(BindingsError::MissingAction { index: 0, .. })
-        ));
-        assert!(matches!(
-            parse_environment_bindings("<Alt>q=tile", &[]),
-            Err(BindingsError::UnknownAction { index: 0, .. })
-        ));
-        assert!(matches!(
-            parse_environment_bindings("<Alt>q=top,<Meta>Q=left", &[]),
-            Err(BindingsError::DuplicateChord {
-                index: 1,
-                first: 0,
-                ..
-            })
-        ));
-        assert!(matches!(
-            parse_environment_bindings("<Hyper>q=top", &[]),
-            Err(BindingsError::InvalidChord { index: 0, .. })
-        ));
-    }
-
-    #[test]
-    fn both_sources_reject_host_accelerator_conflicts() {
+    fn rejects_host_accelerator_conflicts() {
         let host = vec![parse_accelerator("<Alt>q").unwrap()];
         assert!(matches!(
             parse_shortcut_config(&one_binding("action = \"left\""), &host),
             Err(BindingsError::HostAcceleratorConflict { index: 0, .. })
-        ));
-        assert!(matches!(
-            parse_environment_bindings("<Alt>w=right,<Alt>q=left", &host),
-            Err(BindingsError::HostAcceleratorConflict { index: 1, .. })
         ));
     }
 
@@ -1107,7 +642,7 @@ action = "fullscreen"
     fn accepts_integer_rect_components_and_empty_binding_list() {
         let bindings = parse(&one_binding("rect = [0, 0, 1, 1]")).unwrap();
         assert_eq!(
-            bindings[0].action(),
+            bindings[0].action,
             WindowLayoutAction::Rect(NormalizedRect::new(0.0, 0.0, 1.0, 1.0).unwrap())
         );
         assert!(parse("version = 1\n").unwrap().is_empty());
@@ -1197,19 +732,14 @@ action = "fullscreen"
     }
 
     #[test]
-    fn rejects_too_many_bindings_from_either_source() {
+    fn rejects_too_many_bindings() {
         let mut text = String::from("version = 1\n");
         for _ in 0..=MAX_BINDINGS {
             text.push_str("[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n");
         }
         assert!(matches!(
             parse(&text),
-            Err(BindingsError::TooManyBindings { count, .. }) if count == MAX_BINDINGS + 1
-        ));
-        let list = vec!["<Alt>q=left"; MAX_BINDINGS + 1].join(",");
-        assert!(matches!(
-            parse_environment_bindings(&list, &[]),
-            Err(BindingsError::TooManyBindings { count, .. }) if count == MAX_BINDINGS + 1
+            Err(BindingsError::TooManyBindings { count }) if count == MAX_BINDINGS + 1
         ));
     }
 
@@ -1219,7 +749,7 @@ action = "fullscreen"
         let oversized = dir.write("big.toml", &vec![b'#'; MAX_CONFIG_BYTES as usize + 1]);
         assert!(matches!(
             load_shortcut_config(&oversized, &[]),
-            Err(BindingsError::TooLarge { .. })
+            Err(BindingsError::TooLarge)
         ));
         let mut at_limit = b"version = 1\n".to_vec();
         at_limit.resize(MAX_CONFIG_BYTES as usize, b' ');
@@ -1228,15 +758,15 @@ action = "fullscreen"
         let binary = dir.write("binary.toml", b"version = 1\n# \xff\n");
         assert!(matches!(
             load_shortcut_config(&binary, &[]),
-            Err(BindingsError::NotUtf8 { .. })
+            Err(BindingsError::NotUtf8)
         ));
         assert!(matches!(
             load_shortcut_config(&dir.path().join("missing.toml"), &[]),
-            Err(BindingsError::Open { .. })
+            Err(BindingsError::Open(_))
         ));
         assert!(matches!(
             load_shortcut_config(dir.path(), &[]),
-            Err(BindingsError::NotRegularFile { .. })
+            Err(BindingsError::NotRegularFile)
         ));
         let fifo = dir.path().join("fifo.toml");
         nix::unistd::mkfifo(
@@ -1247,493 +777,243 @@ action = "fullscreen"
         assert!(
             matches!(
                 load_shortcut_config(&fifo, &[]),
-                Err(BindingsError::NotRegularFile { .. })
+                Err(BindingsError::NotRegularFile)
             ),
             "a FIFO must be rejected without blocking on a writer"
         );
     }
 
-    #[test]
-    fn load_follows_symbolic_links() {
-        let dir = TempDir::new("shortcut-symlink");
-        let target = dir.write("target.toml", VALID.as_bytes());
-        let link = dir.path().join("link.toml");
-        std::os::unix::fs::symlink(&target, &link).expect("create test symlink");
-        assert_eq!(load_shortcut_config(&link, &[]).unwrap().len(), 2);
-    }
+    // ── Location ──────────────────────────────────────────────────────
 
-    // ── Environment rules ─────────────────────────────────────────────
-
-    /// `SOMMELIER_WINDOW_PLACEMENT_BACKEND` chooses the backend, ignoring
-    /// case and surrounding whitespace, and `off` wins over the legacy
-    /// gate; unset or blank, the gate still chooses the ARC backend.
     #[test]
-    fn the_backend_setting_chooses_the_backend() {
-        const BACKEND: &str = "SOMMELIER_WINDOW_PLACEMENT_BACKEND";
-        const GATE: &str = "SOMMELIER_WINDOW_BOUNDS_AS_ARC";
-        for (variables, arc) in [
-            (&[(BACKEND, "arc")][..], true),
-            (&[(BACKEND, " ARC ")], true),
-            (&[(BACKEND, "arc"), (GATE, "1")], true),
-            (&[(GATE, "1")], true),
-            (&[(BACKEND, " "), (GATE, "1")], true),
-            (&[(BACKEND, " ")], false),
-            (&[(BACKEND, "off")], false),
-            (&[(BACKEND, "Off"), (GATE, "0")], false),
-            (&[(BACKEND, "off"), (GATE, "1")], false),
+    fn the_file_is_under_xdg_config_home_or_home() {
+        let os = |text: &'static str| Some(OsStr::from_bytes(text.as_bytes()));
+        let file = |dir: &str| Some(Path::new(dir).join("sommelier-rs/window-placement.toml"));
+        for (xdg_config_home, home, path) in [
+            (os("/xdg"), os("/home/u"), file("/xdg")),
+            (None, os("/home/u"), file("/home/u/.config")),
+            // Empty or relative counts as unset.
+            (os(""), os("/home/u"), file("/home/u/.config")),
+            (os("xdg"), os("/home/u"), file("/home/u/.config")),
+            (os("/xdg"), None, file("/xdg")),
+            (None, None, None),
+            (None, os(""), None),
+            (os("xdg"), os("home"), None),
         ] {
-            let mut variables = variables.to_vec();
-            variables.push(("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left"));
-            let config = PlacementConfig::resolve_for_test(
-                &variables,
-                None,
-                ArcIdAllocator::block_for_test(),
-            );
-            assert_eq!(config.arc_id_allocator().is_some(), arc, "{variables:?}");
             assert_eq!(
-                config.action_for(&alt(xkb::keysyms::KEY_q)).is_some(),
-                arc,
-                "{variables:?}"
+                config_path(xdg_config_home, home),
+                path,
+                "{xdg_config_home:?} {home:?}"
             );
         }
     }
 
-    /// The remote-shell-v2 backend needs no ARC block, and its bindings
-    /// are active.
     #[test]
-    fn the_remote_shell_backend_needs_no_arc_block() {
-        let environment = PlacementEnvironment {
-            backend: Some(" Remote-Shell-V2 ".into()),
-            shortcuts: Some("<Alt>q=left".into()),
-            ..PlacementEnvironment::default()
-        };
-        let (config, reserved) = resolve(&environment, None, block());
-        assert!(!reserved);
-        assert!(matches!(
-            config.backend(),
-            Some(PlacementBackend::RemoteShellV2)
-        ));
+    fn host_accelerators_are_unset_valid_or_ignored() {
+        let os = |text: &'static str| Some(OsStr::from_bytes(text.as_bytes()));
+        assert_eq!(host_accelerators(None), Vec::new());
+        assert_eq!(host_accelerators(os("  ")), Vec::new());
         assert_eq!(
-            config.action_for(&alt(xkb::keysyms::KEY_q)),
-            Some(WindowLayoutAction::Left)
-        );
-    }
-
-    /// A blank backend setting is unset, not a request, and `off` is a
-    /// choice, not a conflict with the gate.
-    #[test]
-    fn a_blank_backend_setting_is_unset_and_off_is_a_choice() {
-        let choice = |backend: &str, gate: Option<&str>| {
-            PlacementEnvironment {
-                backend: Some(backend.into()),
-                arc_bounds: gate.map(OsString::from),
-                ..PlacementEnvironment::default()
-            }
-            .requested_backend()
-            .ok()
-        };
-        assert_eq!(choice(" ", None), Some(BackendChoice::Unchosen));
-        assert_eq!(
-            choice("", Some("1")),
-            Some(BackendChoice::Backend(BackendRequest::Arc))
-        );
-        assert_eq!(choice("off", Some("1")), Some(BackendChoice::Off));
-        assert_eq!(choice(" OFF ", None), Some(BackendChoice::Off));
-    }
-
-    /// A backend setting that is not UTF-8, names no backend, or
-    /// contradicts the legacy gate is a configuration problem: placement is
-    /// off, no ARC block is reserved, and no binding source is read.
-    #[test]
-    fn an_unusable_backend_setting_turns_placement_off() {
-        let shortcuts = Some(OsString::from("<Alt>q=left"));
-        for environment in [
-            PlacementEnvironment {
-                backend: Some("tile".into()),
-                ..PlacementEnvironment::default()
-            },
-            PlacementEnvironment {
-                backend: Some(OsString::from_vec(vec![b'a', b'r', b'c', 0xff])),
-                ..PlacementEnvironment::default()
-            },
-            PlacementEnvironment {
-                backend: Some("remote-shell-v2".into()),
-                arc_bounds: Some("yes".into()),
-                ..PlacementEnvironment::default()
-            },
-        ] {
-            let environment = PlacementEnvironment {
-                shortcuts: shortcuts.clone(),
-                ..environment
-            };
-            let (config, reserved) = resolve(&environment, None, block());
-            assert!(!reserved, "{environment:?}");
-            assert!(config.backend().is_none(), "{environment:?}");
-            assert_eq!(config.action_for(&alt(xkb::keysyms::KEY_q)), None);
-        }
-    }
-
-    #[test]
-    fn arc_bounds_gate_requires_an_explicit_true_spelling() {
-        for on in ["1", "true", " YES ", "on"] {
-            assert!(environment(Some(on), None, None).arc_bounds_requested());
-        }
-        for off in ["", "0", "false", "1please"] {
-            assert!(!environment(Some(off), None, None).arc_bounds_requested());
-        }
-        assert!(!environment(None, None, None).arc_bounds_requested());
-        let not_unicode = PlacementEnvironment {
-            arc_bounds: Some(OsString::from_vec(vec![b'1', 0xff])),
-            ..PlacementEnvironment::default()
-        };
-        assert!(!not_unicode.arc_bounds_requested());
-    }
-
-    #[test]
-    fn blank_means_unset_and_non_utf8_means_malformed() {
-        assert_eq!(configured_text(None, "V").unwrap(), None);
-        assert_eq!(configured_text(Some(OsStr::new("")), "V").unwrap(), None);
-        assert_eq!(configured_text(Some(OsStr::new(" \t")), "V").unwrap(), None);
-        assert_eq!(
-            configured_text(Some(OsStr::new("<Alt>q=left")), "V").unwrap(),
-            Some("<Alt>q=left")
-        );
-        let not_unicode = OsString::from_vec(vec![0xff]);
-        assert!(matches!(
-            configured_text(Some(&not_unicode), "V"),
-            Err(PlacementConfigError::NotUnicode { variable: "V" })
-        ));
-    }
-
-    #[test]
-    fn host_accelerators_are_unset_valid_or_invalid() {
-        assert_eq!(
-            environment(None, None, None).host_accelerators().unwrap(),
-            Vec::new()
-        );
-        assert_eq!(
-            environment(None, Some("  "), None)
-                .host_accelerators()
-                .unwrap(),
-            Vec::new()
-        );
-        assert_eq!(
-            environment(None, Some("<Alt>a"), None)
-                .host_accelerators()
-                .unwrap(),
+            host_accelerators(os("<Alt>a")),
             vec![parse_accelerator("<Alt>a").unwrap()]
         );
-        assert!(matches!(
-            environment(None, Some("<Hyper>a"), None).host_accelerators(),
-            Err(PlacementConfigError::InvalidHostAccelerators { .. })
-        ));
-    }
-
-    // ── Resolution and failure policy ─────────────────────────────────
-
-    #[test]
-    fn gate_off_ignores_both_sources_without_reading_or_reserving() {
-        let dir = TempDir::new("placement-gate-off");
-        for (env, file) in [
-            (
-                environment(None, None, Some("<Alt>q=bogus")),
-                None::<PathBuf>,
-            ),
-            (
-                environment(Some("0"), None, None),
-                Some(dir.path().join("missing.toml")),
-            ),
-        ] {
-            let (config, reserved) = resolve(&env, file.as_deref(), block());
-            assert!(!reserved, "the gate decides whether a block is reserved");
-            assert!(config.arc_id_allocator().is_none());
-            assert_eq!(config.action_for(&alt(xkb::keysyms::KEY_q)), None);
-            assert!(config.reload().is_none());
-        }
-    }
-
-    #[test]
-    fn no_arc_block_ignores_both_sources_without_reading() {
-        let dir = TempDir::new("placement-no-block");
-        let missing = dir.path().join("missing.toml");
-        for (env, file) in [
-            (environment(Some("1"), None, Some("<Alt>q=bogus")), None),
-            (environment(Some("1"), None, None), Some(missing.as_path())),
-        ] {
-            let (config, reserved) = resolve(&env, file, None);
-            assert!(reserved);
-            assert!(config.arc_id_allocator().is_none());
-            assert!(config.reload().is_none());
-        }
-    }
-
-    /// Both sources at once used to stop startup with exit status 2; now
-    /// the conflict is logged and shortcuts start disabled.
-    #[test]
-    fn both_sources_at_once_disable_shortcuts() {
-        let dir = TempDir::new("placement-both");
-        let path = dir.write("shortcuts.toml", VALID.as_bytes());
-        let (config, _) = resolve(
-            &environment(Some("1"), None, Some("<Alt>q=left")),
-            Some(&path),
-            block(),
-        );
-        assert_shortcuts_disabled(&config);
-        assert!(config.reload().is_none(), "neither source is followed");
-        assert!(matches!(
-            BindingSource::Both(&path).load(&[]),
-            (None, Err(PlacementConfigError::ConflictingSources))
-        ));
-        // With the gate off, both are ignored like any source.
-        let (config, _) = resolve(
-            &environment(None, None, Some("<Alt>q=left")),
-            Some(&path),
-            block(),
-        );
-        assert!(config.arc_id_allocator().is_none());
-        // A blank environment list is not a second source.
-        let (config, _) = resolve(
-            &environment(Some("1"), None, Some(" ")),
-            Some(&path),
-            block(),
-        );
-        assert_eq!(current(&config).len(), 2);
-    }
-
-    /// An invalid environment list used to log a warning on every
-    /// connection. Now it is logged once per process and shortcuts start
-    /// disabled, exactly like an unusable file.
-    #[test]
-    fn invalid_environment_bindings_disable_shortcuts() {
-        for (host, shortcuts) in [
-            (None, "<Alt>q=tile"),
-            (None, "<Alt>q"),
-            (None, "<Alt>q=top,<Meta>Q=left"),
-            (Some("<Alt>q"), "<Alt>q=left"),
-        ] {
-            let (config, _) = resolve(
-                &environment(Some("1"), host, Some(shortcuts)),
-                None,
-                block(),
-            );
-            assert_shortcuts_disabled(&config);
-            assert!(config.reload().is_none(), "the list never reloads");
-            let host = host.map_or_else(Vec::new, |host| parse_accelerators(host).unwrap());
-            assert!(
-                matches!(
-                    BindingSource::Environment(Ok(shortcuts)).load(&host),
-                    (None, Err(PlacementConfigError::Environment(_)))
-                ),
-                "{shortcuts:?}"
-            );
-        }
-        let not_unicode = PlacementEnvironment {
-            arc_bounds: Some("1".into()),
-            shortcuts: Some(OsString::from_vec(vec![0xff])),
-            ..PlacementEnvironment::default()
-        };
-        assert_shortcuts_disabled(&resolve(&not_unicode, None, block()).0);
-        assert!(matches!(
-            configured_text(not_unicode.shortcuts.as_deref(), SHORTCUTS_VARIABLE),
-            Err(PlacementConfigError::NotUnicode {
-                variable: SHORTCUTS_VARIABLE
-            })
-        ));
-    }
-
-    #[test]
-    fn invalid_host_accelerators_disable_a_requested_source_and_filtering() {
-        let dir = TempDir::new("placement-host");
-        let path = dir.write("shortcuts.toml", VALID.as_bytes());
-        let alt_a = parse_accelerator("<Alt>a").unwrap();
-        for (shortcuts, file) in [(Some("<Alt>q=left"), None), (None, Some(path.as_path()))] {
-            let (config, _) = resolve(
-                &environment(Some("1"), Some("<Hyper>a"), shortcuts),
-                file,
-                block(),
-            );
-            assert_shortcuts_disabled(&config);
-            assert!(!config.is_host_accelerator(&alt_a));
-            assert!(
-                config.reload().is_none(),
-                "a reload could not be checked against the host list either"
-            );
-        }
-        // Without a binding source the list only filters keys, so it
-        // degrades to no filtering.
-        for gate in [None, Some("1")] {
-            let (config, _) = resolve(&environment(gate, Some("<Hyper>a"), None), None, block());
-            assert!(!config.is_host_accelerator(&alt_a));
-        }
-    }
-
-    #[test]
-    fn environment_source_resolves_bindings_and_never_reloads() {
-        let (config, reserved) = resolve(
-            &environment(Some("1"), Some("<Alt>a"), Some("<Alt>q=left")),
-            None,
-            block(),
-        );
-        assert!(reserved);
-        assert!(config.arc_id_allocator().is_some());
-        assert!(config.is_host_accelerator(&alt(xkb::keysyms::KEY_a)));
+        assert_eq!(host_accelerators(os("<Hyper>a")), Vec::new());
         assert_eq!(
-            config.action_for(&alt(xkb::keysyms::KEY_q)),
-            Some(WindowLayoutAction::Left)
+            host_accelerators(Some(OsStr::from_bytes(b"\xff"))),
+            Vec::new()
         );
-        assert_eq!(config.action_for(&alt(xkb::keysyms::KEY_w)), None);
-        assert!(config.reload().is_none());
-        config.reload_and_log();
     }
 
+    // ── Loading and reloading ─────────────────────────────────────────
+
+    /// No file, or no path at all, is placement off, and costs no warning.
     #[test]
-    fn active_policy_without_a_source_consumes_no_chord() {
-        let (config, _) = resolve(&environment(Some("1"), None, None), None, block());
-        assert!(config.arc_id_allocator().is_some());
-        assert!(current(&config).is_empty());
+    fn a_missing_file_leaves_placement_off() {
+        let dir = TempDir::new("placement-missing");
+        let config = PlacementConfig::file_for_test(&dir.path().join("window-placement.toml"));
+        assert!(!config.is_active());
+        assert_eq!(alt_q(&config), None);
+        assert_eq!(config.refresh(), Refresh::Unchanged);
+
+        let config = PlacementConfig::with_file(Vec::new(), None);
+        assert!(!config.is_active());
+        assert_eq!(config.refresh(), Refresh::Unchanged);
     }
 
+    /// A file that cannot be used at startup leaves placement off, and its
+    /// warning is logged once: a later check of the same file is
+    /// `Unchanged`.
     #[test]
-    fn file_source_loads_strictly() {
-        let dir = TempDir::new("placement-file");
-        let path = dir.write("shortcuts.toml", VALID.as_bytes());
-        let gate = environment(Some("1"), None, None);
-        let config = resolve(&gate, Some(&path), block()).0;
-        assert_eq!(current(&config).len(), 2);
-        assert_eq!(reload_path(&config), Some(path.as_path()));
-
-        let (config, _) = resolve(
-            &environment(Some("1"), Some("<Alt>s"), None),
-            Some(&path),
-            block(),
+    fn an_invalid_file_at_startup_leaves_placement_off() {
+        let dir = TempDir::new("placement-invalid");
+        for invalid in [
+            "not toml",
+            "version = 1\n[[bindings]]\nchord = \"<Alt>q\"\n",
+            "version = 2\n",
+        ] {
+            let path = replace(&dir, "window-placement.toml", invalid);
+            let config = PlacementConfig::file_for_test(&path);
+            assert!(!config.is_active(), "{invalid}");
+            assert_eq!(alt_q(&config), None);
+            assert_eq!(config.refresh(), Refresh::Unchanged);
+        }
+        let path = replace(
+            &dir,
+            "window-placement.toml",
+            &one_binding("action = \"left\""),
         );
-        assert_shortcuts_disabled(&config);
-        assert!(matches!(
-            BindingSource::File(&path).load(&[parse_accelerator("<Alt>s").unwrap()]),
-            (
-                Some(_),
-                Err(PlacementConfigError::File(
-                    BindingsError::HostAcceleratorConflict { index: 1, .. }
-                ))
-            )
-        ));
+        let host = vec![parse_accelerator("<Alt>q").unwrap()];
+        let config = PlacementConfig::with_file(host, Some(path));
+        assert!(!config.is_active(), "a host accelerator cannot be bound");
     }
 
-    /// A missing, unreadable or invalid file used to stop startup with exit
-    /// status 2. Now shortcuts start disabled, and because the path is
-    /// known, a later valid reload activates the file.
     #[test]
-    fn unusable_file_disables_shortcuts_until_a_valid_reload() {
-        let dir = TempDir::new("placement-file-invalid");
-        let path = dir.path().join("shortcuts.toml");
-        let (config, _) = resolve(&environment(Some("1"), None, None), Some(&path), block());
-        assert_shortcuts_disabled(&config);
-        assert_eq!(reload_path(&config), Some(path.as_path()));
-        assert!(matches!(
-            config.reload(),
-            Some(Err(BindingsError::Open { .. }))
-        ));
-
-        dir.write("shortcuts.toml", b"not toml");
-        let (config, _) = resolve(&environment(Some("1"), None, None), Some(&path), block());
-        assert_shortcuts_disabled(&config);
-
-        dir.write("shortcuts.toml", VALID.as_bytes());
-        config.reload().unwrap().unwrap();
-        assert_eq!(current(&config).len(), 2);
+    fn a_valid_file_turns_placement_on() {
+        let dir = TempDir::new("placement-valid");
+        let path = replace(&dir, "window-placement.toml", VALID);
+        let config = PlacementConfig::file_for_test(&path);
+        assert!(config.is_active());
         assert_eq!(
             config.action_for(&alt(xkb::keysyms::KEY_s)),
             Some(WindowLayoutAction::Fullscreen)
         );
+        assert_eq!(config.action_for(&alt(xkb::keysyms::KEY_w)), None);
+
+        let path = replace(&dir, "empty.toml", "version = 1\n");
+        let config = PlacementConfig::file_for_test(&path);
+        assert!(config.is_active(), "a valid file with no bindings");
+        assert_eq!(alt_q(&config), None);
     }
 
+    /// A changed file replaces the bindings on the next check; a bad edit
+    /// keeps the last good ones and is reported once, however often the
+    /// file is checked; removing the file clears them; and a file that
+    /// appears later is loaded.
     #[test]
-    fn file_source_resolves_relative_paths_against_the_startup_directory() {
-        let relative = Path::new("sommelier-shortcuts-that-do-not-exist.toml");
-        let absolute = std::env::current_dir().unwrap().join(relative);
-        match BindingSource::File(relative).load(&[]) {
-            (
-                Some(reload_path),
-                Err(PlacementConfigError::File(BindingsError::Open { path, .. })),
-            ) => {
-                assert_eq!(path, absolute);
-                assert_eq!(reload_path, absolute);
-            }
-            other => panic!("expected absolute open failure, got {other:?}"),
-        }
-    }
+    fn refresh_follows_the_file() {
+        let dir = TempDir::new("placement-refresh");
+        let bind_alt_q = |action: &str| {
+            replace(
+                &dir,
+                "window-placement.toml",
+                &one_binding(&format!("action = \"{action}\"")),
+            )
+        };
+        let path = bind_alt_q("left");
+        let config = PlacementConfig::file_for_test(&path);
+        assert_eq!(alt_q(&config), Some(WindowLayoutAction::Left));
+        assert_eq!(config.refresh(), Refresh::Unchanged);
 
-    // ── Reload ────────────────────────────────────────────────────────
-
-    #[test]
-    fn reload_swaps_valid_generation_and_keeps_last_good_on_error() {
-        let dir = TempDir::new("shortcut-reload");
-        let path = dir.write("shortcuts.toml", VALID.as_bytes());
-        let config = PlacementConfig::resolve_for_test(
-            &[(ARC_BOUNDS_VARIABLE, "1")],
-            Some(&path),
-            ArcIdAllocator::block_for_test(),
-        );
-        assert_eq!(current(&config).len(), 2);
-
-        dir.write(
-            "shortcuts.toml",
-            one_binding("action = \"left\"").as_bytes(),
-        );
-        config.reload().unwrap().unwrap();
-        assert_eq!(current(&config).len(), 1);
+        bind_alt_q("right");
         assert_eq!(
-            config.action_for(&alt(xkb::keysyms::KEY_q)),
+            alt_q(&config),
             Some(WindowLayoutAction::Left),
-            "the next lookup sees the new generation"
+            "only a check adopts a change"
         );
-        assert_eq!(config.action_for(&alt(xkb::keysyms::KEY_s)), None);
+        assert_eq!(config.refresh(), Refresh::Loaded);
+        assert_eq!(alt_q(&config), Some(WindowLayoutAction::Right));
 
-        let last_good = current(&config);
-        for invalid in [
-            one_binding("rect = [0.8, 0.0, 0.5, 0.5]"),
-            "version = 1\n[[bindings]]\nchord = \"<Alt>q\"\n".to_string(),
-            "not toml".to_string(),
-        ] {
-            dir.write("shortcuts.toml", invalid.as_bytes());
-            assert!(config.reload().unwrap().is_err());
-            config.reload_and_log();
-            assert!(Arc::ptr_eq(&last_good, &current(&config)));
+        for invalid in ["not toml", "version = 1\nbindings = 3\n"] {
+            replace(&dir, "window-placement.toml", invalid);
+            assert_eq!(config.refresh(), Refresh::Rejected, "{invalid}");
+            assert_eq!(config.refresh(), Refresh::Unchanged, "warned once");
+            assert_eq!(
+                alt_q(&config),
+                Some(WindowLayoutAction::Right),
+                "the last good bindings stay"
+            );
         }
 
         std::fs::remove_file(&path).unwrap();
-        assert!(matches!(
-            config.reload(),
-            Some(Err(BindingsError::Open { .. }))
-        ));
-        assert!(Arc::ptr_eq(&last_good, &current(&config)));
+        assert_eq!(config.refresh(), Refresh::Absent);
+        assert!(!config.is_active());
+        assert_eq!(alt_q(&config), None);
+        assert_eq!(config.refresh(), Refresh::Unchanged);
 
-        dir.write("shortcuts.toml", b"version = 1\n");
-        config.reload().unwrap().unwrap();
-        config.reload_and_log();
-        assert!(current(&config).is_empty());
+        bind_alt_q("top");
+        assert_eq!(config.refresh(), Refresh::Loaded);
+        assert_eq!(alt_q(&config), Some(WindowLayoutAction::Top));
     }
 
+    /// A file that cannot be examined for another reason than that it is
+    /// missing, here because a directory on its path became a file, clears
+    /// the bindings like a removed one and is warned about once.
     #[test]
-    fn reload_keeps_rejecting_startup_host_accelerators() {
-        let dir = TempDir::new("shortcut-reload-host");
-        let path = dir.write("shortcuts.toml", b"version = 1\n");
-        let config = PlacementConfig::resolve_for_test(
-            &[
-                (ARC_BOUNDS_VARIABLE, "1"),
-                (HOST_ACCELERATORS_VARIABLE, "<Alt>q"),
-            ],
-            Some(&path),
-            ArcIdAllocator::block_for_test(),
+    fn a_file_that_cannot_be_examined_clears_the_bindings() {
+        let dir = TempDir::new("placement-unexaminable");
+        let parent = dir.path().join("sommelier-rs");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("window-placement.toml");
+        std::fs::write(&path, one_binding("action = \"left\"")).unwrap();
+        let config = PlacementConfig::file_for_test(&path);
+        assert_eq!(alt_q(&config), Some(WindowLayoutAction::Left));
+
+        std::fs::remove_dir_all(&parent).unwrap();
+        std::fs::write(&parent, "").unwrap();
+        assert_eq!(
+            FileIdentity::of(&path).map_err(|error| error.kind()),
+            Err(io::ErrorKind::NotADirectory),
+            "not a missing file"
         );
-        dir.write(
-            "shortcuts.toml",
+        assert_eq!(config.refresh(), Refresh::Absent);
+        assert!(!config.is_active());
+        assert_eq!(alt_q(&config), None);
+        assert_eq!(config.refresh(), Refresh::Unchanged, "warned once");
+    }
+
+    /// An edit in place, which keeps the inode, is seen too.
+    #[test]
+    fn refresh_sees_an_edit_in_place() {
+        let dir = TempDir::new("placement-in-place");
+        let path = dir.write(
+            "window-placement.toml",
             one_binding("action = \"left\"").as_bytes(),
         );
-        assert!(matches!(
-            config.reload(),
-            Some(Err(BindingsError::HostAcceleratorConflict { .. }))
-        ));
-        assert!(current(&config).is_empty());
+        let config = PlacementConfig::file_for_test(&path);
+        dir.write(
+            "window-placement.toml",
+            one_binding("action = \"bottom\"").as_bytes(),
+        );
+        assert_eq!(config.refresh(), Refresh::Loaded);
+        assert_eq!(alt_q(&config), Some(WindowLayoutAction::Bottom));
+    }
+
+    /// Home Manager links the file into `/nix/store`, where every file's
+    /// mtime is 1, and an activation points the link at another store file:
+    /// same mtime, here the same size too, but another inode.
+    #[test]
+    fn refresh_follows_a_link_to_files_of_the_same_mtime() {
+        let dir = TempDir::new("placement-link");
+        let store_file = |name: &str, x: &str| {
+            let path = dir.write(
+                name,
+                one_binding(&format!("rect = [{x}, 0.0, 0.5, 1.0]")).as_bytes(),
+            );
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| {
+                    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+                })
+                .expect("set the store file's mtime");
+            path
+        };
+        let left = store_file("left.toml", "0.0");
+        let right = store_file("right.toml", "0.5");
+        let link = dir.path().join("window-placement.toml");
+        std::os::unix::fs::symlink(&left, &link).unwrap();
+        let config = PlacementConfig::file_for_test(&link);
+        let half = |x| {
+            Some(WindowLayoutAction::Rect(
+                NormalizedRect::new(x, 0.0, 0.5, 1.0).unwrap(),
+            ))
+        };
+        assert_eq!(alt_q(&config), half(0.0));
+
+        let staged = dir.path().join(".staged-link");
+        std::os::unix::fs::symlink(&right, &staged).unwrap();
+        std::fs::rename(&staged, &link).unwrap();
+        assert_eq!(config.refresh(), Refresh::Loaded);
+        assert_eq!(alt_q(&config), half(0.5));
     }
 }

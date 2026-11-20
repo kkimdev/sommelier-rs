@@ -91,7 +91,6 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
 
     fn on_done(&mut self, ctx: &mut Context) -> Action {
         ctx.outputs.commit(ctx.last_sender_id);
-        crate::handler::window_placement::output_committed(ctx);
         Action::Forward
     }
 
@@ -276,7 +275,7 @@ pub(crate) mod fixture {
     /// a `zaura_output`.
     pub(crate) fn context() -> Context {
         let mut ctx = Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
+            crate::placement_config::PlacementConfig::active_for_test(&[]),
         );
         for registry in [1, 2] {
             ctx.shadow_table

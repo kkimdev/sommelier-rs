@@ -930,8 +930,10 @@ client.
 | U14 | Does Chromium's blur call `ResetContext`, and so confirm a composition locally? F1's commit reaches it before the blur, so a local confirmation finds nothing composed; a double commit would mean the commit came after it. | Type "가" in a Chromium guest, Alt-Tab, and come back. | C11; F1 |
 | U15 | Does a Chromium tap-down finish the composition, or only the tap's lift? | Tablet mode: type "가", then touch the field and hold. | C4 for touch |
 
-Whether the ARC placement backend bypasses the IME (U9) is covered under
-[The ARC backend and the IME](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#the-arc-backend-and-the-ime).
+U9 (whether the ARC placement backend bypassed the IME) is closed: Chrome
+sends an ARC window's keys past the IME, so placement no longer makes windows
+ARC (see
+[How a window is moved](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#how-a-window-is-moved)).
 
 ### 5.3 Open design questions
 

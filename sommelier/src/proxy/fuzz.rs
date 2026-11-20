@@ -165,11 +165,11 @@ fn guest_streams_cannot_crash_hang_or_leak() {
         let dead_seat_deactivates = DEACTIVATES_OF_DESTROYED_SEATS.load(Ordering::Relaxed);
         let presses = COMPOSITIONS_ENDED_BY_PRESSES.load(Ordering::Relaxed);
         let press_restarts = RESTARTS_AFTER_PRESSES.load(Ordering::Relaxed);
-        let remote_surfaces = REMOTE_SURFACES.load(Ordering::Relaxed);
+        let aura_toplevels = AURA_TOPLEVELS.load(Ordering::Relaxed);
         if cases >= COVERAGE_CASES {
             assert!(
-                remote_surfaces > 0,
-                "no case created a remote surface, so the remote-shell backend's facades went untested"
+                aura_toplevels > 0,
+                "no case created an Aura toplevel, so placement's went untested"
             );
             assert!(
                 presses > 0,
@@ -211,7 +211,7 @@ fn guest_streams_cannot_crash_hang_or_leak() {
              {seatless} activations outlived their seat, \
              {dead_seat_deactivates} deactivates named a destroyed seat, \
              {presses} compositions ended by a press, {press_restarts} restarts after a press, \
-             {remote_surfaces} facade windows got a remote surface"
+             {aura_toplevels} Aura toplevels created"
         );
     });
 }
@@ -295,10 +295,9 @@ struct Config {
     xdg_decoration: bool,
     /// The version of the host's `zcr_text_input_extension_v1`.
     text_input_extension: u32,
-    /// Whether placement uses the remote-shell-v2 backend, which binds the
-    /// compositor's `zcr_remote_shell_v2` and implements the guest's XDG
-    /// objects itself.
-    remote_shell: bool,
+    /// Whether window placement is on, so every XDG toplevel gets a
+    /// host-only Aura toplevel in screen coordinates.
+    placement: bool,
 }
 
 impl Config {
@@ -308,17 +307,17 @@ impl Config {
             xdg_decoration: seed & 2 != 0,
             text_input_extension: TEXT_INPUT_EXTENSION_VERSIONS[(seed >> 2) as usize % 4],
             // A quarter of the cases, independent of the bits above.
-            remote_shell: (seed >> 4) & 3 == 0,
+            placement: (seed >> 4) & 3 == 0,
         }
     }
 
     /// The proxy's context for a case.
     fn context(self) -> Context {
-        if !self.remote_shell {
+        if !self.placement {
             return Context::new_for_test(self.gpu_accel, self.xdg_decoration, Vec::new());
         }
         let mut context = Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::remote_shell_for_test(""),
+            crate::placement_config::PlacementConfig::active_for_test(&[]),
         );
         context.gpu_accel = self.gpu_accel;
         context.xdg_decoration = self.xdg_decoration;
@@ -1453,9 +1452,9 @@ fn read_until_closed(
 /// across all cases.
 static FRAME_CALLBACKS_CANCELLED: AtomicU64 = AtomicU64::new(0);
 
-/// `zcr_remote_surface_v2` objects the proxy created, one per facade window
-/// of the remote-shell-v2 backend, across all cases.
-static REMOTE_SURFACES: AtomicU64 = AtomicU64::new(0);
+/// `zaura_toplevel` objects the proxy created, one per XDG toplevel of a
+/// case with placement on, across all cases.
+static AURA_TOPLEVELS: AtomicU64 = AtomicU64::new(0);
 
 /// Host object IDs the fake compositor saw created again after their
 /// `delete_id`, across all cases: evidence that the proxy's ID reuse runs.
@@ -1595,8 +1594,8 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                 if deleted.remove(&id) {
                     HOST_IDS_REUSED.fetch_add(1, Ordering::Relaxed);
                 }
-                if interface == "zcr_remote_surface_v2" {
-                    REMOTE_SURFACES.fetch_add(1, Ordering::Relaxed);
+                if interface == "zaura_toplevel" {
+                    AURA_TOPLEVELS.fetch_add(1, Ordering::Relaxed);
                 }
                 zombies.remove(&id);
                 let previous = objects.insert(id, interface);

@@ -194,13 +194,13 @@ pub(crate) fn record_xdg_toplevel(
             .is_some(),
         "a forwarded get_toplevel has mapped its new ID"
     );
-    let Some(wl_surface_guest_id) = ctx
+    if ctx
         .xdg_roles
         .add_toplevel(xdg_surface_guest_id, xdg_toplevel_guest_id)
-    else {
-        return;
-    };
-    window_placement::attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
+        .is_some()
+    {
+        window_placement::attach_toplevel(ctx, xdg_toplevel_guest_id);
+    }
 }
 
 /// The size of the buffer `state` shows, which outlives a destroyed
@@ -428,13 +428,12 @@ fn release_surface_aura_objects(
 
 /// Forget guest wl_surface `wl_surface_guest_id` and its host object
 /// `wl_surface_host_id`, which ended (see `crate::state::lifecycle`): its
-/// roles and Aura objects, its ARC identity, outputs, GTK surfaces,
+/// roles and Aura objects, outputs, GTK surfaces,
 /// viewports and pixel state, the buffer uses it held, and its keyboard
 /// focus, which ends with a text-input leave while the guest surface ID is
 /// still valid.
 pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_surface_host_id: u32) {
     release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
-    window_placement::forget_surface(ctx, wl_surface_guest_id);
     ctx.outputs.surface_destroyed(wl_surface_host_id);
     ctx.gtk_surfaces
         .retain(|_, state| state.wl_surface_id != wl_surface_guest_id);
@@ -767,12 +766,6 @@ impl WlSurfaceHandler for CompositorHandler {
         if let Some(problem) = viewport_problem {
             log_unenforced_viewport_rule(ctx, surface_id, problem, &mapping);
         }
-        if shown_buffer.is_some() {
-            // What placement sends for a shown window applies with this
-            // commit, so it goes first.
-            let size = mapping.surface_rect();
-            window_placement::surface_shown(ctx, surface_id, (size.width, size.height));
-        }
         // Damage and commit were built as one batch before local state was
         // finalized. Append them together, in order, only once every check
         // has passed, so the host never sees a partial transaction.
@@ -895,10 +888,6 @@ pub(crate) fn forget_viewport(ctx: &mut Context, viewport_id: u32) {
 impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHandler {
     fn on_get_xdg_surface(&mut self, ctx: &mut Context, id: u32, surface: u32) -> Action {
         ctx.xdg_roles.add_xdg_surface(id, surface);
-        // A placement backend may implement the xdg_surface itself.
-        if let Some(action) = window_placement::claim_xdg_surface(ctx, id, surface) {
-            return action;
-        }
         Action::Forward
     }
 }
@@ -930,9 +919,7 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
         let Some(guest_xdg_surface_id) = ctx.shadow_table.get_guest_id(host_xdg_surface_id) else {
             return Action::Drop;
         };
-        if window_placement::hold_surface_configure(ctx, guest_xdg_surface_id, serial) {
-            return Action::Drop;
-        }
+        window_placement::surface_configured(ctx, guest_xdg_surface_id, serial);
         Action::Forward
     }
 
@@ -973,10 +960,8 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
             );
             return Action::Drop;
         };
-        // Keep the host XDG role in the Guest OS namespace.  ARC is only a
-        // permission hint on the Aura surface; applying it to the role makes
-        // ChromeOS classify every guest window as the same generic ARC app and
-        // loses the client's shelf/icon identity.
+        // The host XDG role and the Aura surface both get the ID in the Guest
+        // OS namespace.
         let native_app_id = native_wayland_app_id(&ctx.vm_identifier, app_id);
 
         // The host xdg_toplevel carries the app ID used by ordinary Exo
@@ -994,7 +979,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
 
         // Resolve xdg_toplevel → wl_surface (guest) → wl_surface (host).
         if let Some(wl_surface_guest_id) = ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id) {
-            window_placement::set_aura_application_id(ctx, wl_surface_guest_id, &native_app_id);
+            aura_objects::set_application_id(ctx, wl_surface_guest_id, &native_app_id);
         }
         Action::Drop
     }
@@ -1002,22 +987,11 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
     fn on_configure(
         &mut self,
         ctx: &mut Context,
-        width: i32,
-        height: i32,
-        states: &[u8],
+        _width: i32,
+        _height: i32,
+        _states: &[u8],
     ) -> Action {
-        let host_xdg_toplevel_id = ctx.last_sender_id;
-        let Some(guest_xdg_toplevel_id) = ctx.shadow_table.get_guest_id(host_xdg_toplevel_id)
-        else {
-            return Action::Drop;
-        };
-        if window_placement::hold_toplevel_configure(
-            ctx,
-            guest_xdg_toplevel_id,
-            width,
-            height,
-            states,
-        ) {
+        if ctx.shadow_table.get_guest_id(ctx.last_sender_id).is_none() {
             return Action::Drop;
         }
         Action::Forward
@@ -1048,16 +1022,9 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
     }
 
     fn on_origin_change(&mut self, ctx: &mut Context, x: i32, y: i32) -> Action {
-        log::debug!(
-            "zaura_toplevel.origin_change host={} origin=({}, {})",
-            ctx.last_sender_id,
-            x,
-            y
-        );
-        // xdg_toplevel has no origin-change event and the proxy keeps no
-        // window origin, so the event is always dropped, whether or not a
-        // placement barrier is active. A subsequent Aura configure carries
-        // the authoritative size and state.
+        // xdg_toplevel has no origin-change event: placement keeps the
+        // origin, and the guest gets nothing.
+        window_placement::origin_changed(ctx, ctx.last_sender_id, x, y);
         Action::Drop
     }
 }
@@ -1744,21 +1711,13 @@ mod tests {
     }
 
     #[test]
-    fn set_app_id_uses_arc_namespace_when_bounds_policy_is_enabled() {
-        let mut ctx =
-            toplevel_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
+    fn set_app_id_keeps_the_guest_os_namespace_with_placement_on() {
+        let mut ctx = toplevel_ctx_with(crate::placement_config::PlacementConfig::active_for_test(
+            &[],
+        ));
         let requests = set_test_app_id(&mut ctx, TOPLEVEL.guest, "com.example.Terminal");
         let zaura_surface_host = ctx.aura_surfaces.get(SURFACE.host).unwrap();
-        // The Aura surface gets the first ID of the test policy's ARC task
-        // block; the role keeps the guest's.
-        let arc_app_id = "org.chromium.arc.2000000000";
-        assert_eq!(
-            ctx.window_placement
-                .arc_mut()
-                .and_then(|arc| arc.arc_application_id(TEST_SURFACE))
-                .as_deref(),
-            Some(arc_app_id)
-        );
+        let app_id = "org.chromium.guest_os.termina.wayland.com.example.Terminal";
         assert_eq!(
             requests,
             [
@@ -1780,7 +1739,7 @@ mod tests {
                 (
                     zaura_surface_host,
                     zaura_surface::Request::SetApplicationId {
-                        application_id: Some(arc_app_id.into())
+                        application_id: Some(app_id.into())
                     }
                     .into()
                 ),

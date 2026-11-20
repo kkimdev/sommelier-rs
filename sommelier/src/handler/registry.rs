@@ -26,7 +26,6 @@ use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
 use crate::protocols::linux_dmabuf_v1::{
     zwp_linux_dmabuf_v1, ALLOWED_INTERFACES as DMABUF_ALLOWED,
 };
-use crate::protocols::remote_shell_unstable_v2::zcr_remote_shell_v2;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
 use crate::protocols::text_input_unstable_v3::{
@@ -442,18 +441,14 @@ enum Singleton {
     KeyboardExtension,
     AuraShell,
     Shm,
-    /// The remote-shell-v2 placement backend's manager; a candidate only
-    /// while that backend is active (`window_placement::wants_remote_shell`).
-    RemoteShell,
 }
 
 impl Singleton {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 4] = [
         Self::Dmabuf,
         Self::KeyboardExtension,
         Self::AuraShell,
         Self::Shm,
-        Self::RemoteShell,
     ];
 
     fn interface(self) -> &'static str {
@@ -462,7 +457,6 @@ impl Singleton {
             Self::KeyboardExtension => zcr_keyboard_extension_v1::NAME,
             Self::AuraShell => zaura_shell::NAME,
             Self::Shm => wl_shm::NAME,
-            Self::RemoteShell => zcr_remote_shell_v2::NAME,
         }
     }
 
@@ -473,7 +467,6 @@ impl Singleton {
             Self::KeyboardExtension => ctx.host_keyboard_extension_global_name,
             Self::AuraShell => ctx.host_zaura_shell.map(|shell| shell.global_name),
             Self::Shm => ctx.host_shm_global_name,
-            Self::RemoteShell => crate::handler::window_placement::remote_shell_name(ctx),
         }
     }
 
@@ -564,21 +557,6 @@ impl Singleton {
                 crate::handler::window_placement::shell_bound(ctx, bound_version);
                 log::debug!("Bound {interface} internally (host_id={host_id})");
             }
-            Self::RemoteShell => {
-                let Some(manager) =
-                    crate::handler::window_placement::remote_shell_bound(ctx, name, version)
-                else {
-                    return Ok(());
-                };
-                bind_internally(
-                    ctx,
-                    registry_host_id,
-                    name,
-                    interface,
-                    manager.version,
-                    manager.host_id,
-                )?;
-            }
             Self::Shm => {
                 // wl_shm is emulated: on_bind drops the guest request and
                 // sends synthetic format events. The host's format events
@@ -659,7 +637,6 @@ fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
         || ctx
             .host_zaura_shell
             .is_some_and(|shell| shell.global_name == name)
-        || crate::handler::window_placement::remote_shell_name(ctx) == Some(name)
 }
 
 /// Drop proxy state associated with one host global generation.
@@ -724,9 +701,6 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // shell global is advertised and rebound.
         crate::handler::aura_objects::release_shell(ctx, shell);
     }
-    // A remote surface keeps its role through its manager, so the manager
-    // is retired without a destructor, as the keyboard extension is.
-    crate::handler::window_placement::remote_shell_retired(ctx, name);
 }
 
 /// Remove advertisement metadata left by the previous generation of a
@@ -1071,14 +1045,6 @@ fn text_input_extension_global(ctx: &mut Context, name: u32, version: u32) -> Ac
     ))
 }
 
-/// A host `zcr_remote_shell_v2` global the remote-shell-v2 placement
-/// backend wants: bound for it, and never advertised to the guest.
-fn remote_shell_global(ctx: &mut Context, name: u32, version: u32) -> Action {
-    hide_global(ctx, name);
-    add_candidate(ctx, Singleton::RemoteShell, name, version);
-    dropped(ensure_bound(ctx, Singleton::RemoteShell))
-}
-
 /// A host `zcr_keyboard_extension_v1` global, hidden from the guest and a
 /// candidate for the proxy's own binding.
 fn keyboard_extension_global(ctx: &mut Context, name: u32, version: u32) -> Action {
@@ -1167,13 +1133,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             zwp_linux_dmabuf_v1::NAME => dmabuf_global(ctx, name, version),
             zwp_text_input_manager_v1::NAME => text_input_manager_global(ctx, name, version),
             zcr_text_input_extension_v1::NAME => text_input_extension_global(ctx, name, version),
-            // Without the remote-shell-v2 placement backend, it is dropped
-            // like any global the proxy does not know.
-            zcr_remote_shell_v2::NAME
-                if crate::handler::window_placement::wants_remote_shell(ctx, version) =>
-            {
-                remote_shell_global(ctx, name, version)
-            }
             zcr_keyboard_extension_v1::NAME => keyboard_extension_global(ctx, name, version),
             zaura_shell::NAME => aura_shell_global(ctx, name, version),
             wl_shm::NAME => shm_global(ctx, name, version),
@@ -1545,7 +1504,7 @@ mod tests {
     /// A context whose window placement uses Aura, for output and toplevel
     /// tests.
     fn aura_placement_context() -> Context {
-        let placement = PlacementConfig::arc_bounds_for_test("");
+        let placement = PlacementConfig::active_for_test(&[]);
         with_registries(Context::with_placement_for_test(placement), &[A])
     }
 
@@ -1602,11 +1561,6 @@ mod tests {
             Singleton::KeyboardExtension => ctx.host_keyboard_extension_id.map(|id| id.0),
             Singleton::AuraShell => ctx.host_zaura_shell.map(|shell| shell.id),
             Singleton::Shm => ctx.host_shm_id,
-            Singleton::RemoteShell => ctx
-                .window_placement
-                .remote_shell()
-                .and_then(|state| state.manager())
-                .map(|manager| manager.host_id),
         }
     }
 
@@ -2083,20 +2037,11 @@ mod tests {
         );
     }
 
-    /// Bind zaura_shell after one XDG toplevel (guest 13 on wl_surface 12)
-    /// already exists, and return whether the retry attached its Aura
-    /// toplevel.
-    fn late_zaura_shell_attaches_existing_toplevel(arc_identity_available: bool) -> bool {
-        let arc_ids = if arc_identity_available {
-            crate::arc_task_ids::ArcIdAllocator::block_for_test()
-        } else {
-            crate::arc_task_ids::ArcIdAllocator::exhausted_for_test()
-        };
-        let placement = PlacementConfig::resolve_for_test(
-            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
-            None,
-            arc_ids,
-        );
+    /// A toplevel created before zaura_shell is bound gets its Aura
+    /// toplevel when the shell is bound.
+    #[test]
+    fn late_zaura_shell_binding_attaches_existing_toplevels() {
+        let placement = PlacementConfig::active_for_test(&[]);
         let mut ctx = with_registries(Context::with_placement_for_test(placement), &[A]);
         ctx.shadow_table
             .insert_paired_for_test(12, 22, "wl_surface");
@@ -2105,33 +2050,12 @@ mod tests {
         ctx.xdg_roles.add_toplevel_role_for_test(13 + 1000, 12, 13);
 
         assert_eq!(A.global(&mut ctx, 11, "zaura_shell", 38), Action::Drop);
-        let attached = ctx
-            .window_placement
-            .arc()
-            .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(13))
-            .is_some();
-        if attached {
-            assert!(
-                ctx.window_placement
-                    .arc_mut()
-                    .and_then(|arc| arc.arc_application_id(12))
-                    .is_some(),
-                "an attached toplevel's surface carries an ARC identity"
-            );
-        }
-        attached
-    }
-
-    #[test]
-    fn late_zaura_shell_binding_attaches_toplevels_only_with_an_arc_identity() {
         assert!(
-            late_zaura_shell_attaches_existing_toplevel(true),
+            ctx.window_placement
+                .active()
+                .and_then(|state| state.aura_toplevel(13))
+                .is_some(),
             "late shell binding must attach every recorded toplevel"
-        );
-        assert!(
-            !late_zaura_shell_attaches_existing_toplevel(false),
-            "a toplevel without an ARC identity can never be placed, so it \
-             must not get an Aura toplevel"
         );
     }
 

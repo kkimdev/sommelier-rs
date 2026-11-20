@@ -213,37 +213,28 @@ test uses `/dev/wl0`.
 
 ## Configuration
 
-| Variable/option | Purpose |
+| Setting | Purpose |
 | --- | --- |
-| `XDG_RUNTIME_DIR` | Directory where the proxy creates its Wayland socket; required. With the ARC policy it also holds the [task-ID block locks](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator), and must then be private to the user. |
+| `XDG_RUNTIME_DIR` | Directory where the proxy creates its Wayland socket; required. |
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated chords, such as `Super_L` or `<Alt>tab`, that the host compositor keeps. See [keyboard shortcut inhibition](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md#the-sommelier_accelerators-environment-variable). |
-| `SOMMELIER_WINDOW_PLACEMENT_BACKEND` | The experimental window placement backend, `arc`, `remote-shell-v2` or `off`; off by default. `arc` is expected to bypass the ChromeOS IME, so Korean composition would not work in any window (unverified on a host); `remote-shell-v2` needs a host that offers remote shell, which Crostini does not. See [the backends](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#backends). |
-| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Legacy switch for the `arc` placement backend, used while `SOMMELIER_WINDOW_PLACEMENT_BACKEND` is unset; it has the same expected IME bypass. See [the settings](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#settings). |
-| `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional `CHORD=ACTION,...` placement bindings. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 | `SOMMELIER_WHEEL_FROM_TOUCHPAD` | Which clients get mouse-wheel steps (`wl_pointer.axis_discrete`) for touchpad scrolling, which Wine apps such as KakaoTalk need to scroll: `auto` (the default) Wine clients, `all` every client, `off` none. With `all`, a client that scrolls on both the steps and the smooth `axis`, as GTK, Qt and Firefox may, can scroll twice as far. See [the rule](docs/INVARIANTS.md#pointer-scrolling). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
-| `--window-shortcuts-config PATH` | Optional TOML file of placement bindings (named actions or work-area rects), reloaded on `SIGHUP`. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
+| `$XDG_CONFIG_HOME/sommelier-rs/window-placement.toml` | Optional TOML file of placement bindings (named actions or work-area rects); `~/.config/sommelier-rs/window-placement.toml` when `XDG_CONFIG_HOME` is unset. A valid file turns window placement on for apps that connect from then on. In an app that connected while placement was on, an edit takes effect on the next key press; an app that connected before the file existed is placed once it reconnects. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 
-Compositor-owned window placement is opt-in, and no placement shortcut is
-active by default. With a placement backend and placement bindings
-configured, Sommelier consumes the bound chords and moves the focused XDG
-toplevel to a region of its output's work area. For example:
-
-```text
-SOMMELIER_WINDOW_PLACEMENT_BACKEND=arc
-SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen"
-```
+Window placement is opt-in and experimental. Sommelier binds no chord of
+its own: without the file, placement is off. With bindings in the file,
+Sommelier consumes the bound chords and moves the focused XDG toplevel to
+a region of its output's work area, keeping the ChromeOS IME.
 
 [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md)
-owns the placement contract, and
-[`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md)
-explains the ARC application-ID workaround it relies on.
+owns the placement contract, including how it moves windows and its
+limits.
 
 ## CI and release workflow
 
