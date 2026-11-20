@@ -102,13 +102,45 @@ pub(super) enum Tier {
     Intent,
 }
 
+/// What a check holds a case to. The shrinker keeps a candidate only if it
+/// fails the same check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Check {
+    /// The proxy keeps the session.
+    Session,
+    /// The proxy's Exo mirror agrees with the Exo model.
+    Mirror,
+    /// The case does not panic.
+    Panic,
+    /// A case run twice leaves the same trace.
+    Determinism,
+    /// Tier 1 after every step ([`step`]): the guest's fields.
+    Step,
+    /// Tier 1: what the proxy asks of the host, as far as the IME
+    /// decides it.
+    Decision,
+    /// Tier 1: the reports the proxy sends the host.
+    Report,
+    /// Tier 1: no held key is recovered for Exo's confirmation before
+    /// another key's press.
+    Recovery,
+    /// Tier 1: the guest's preedit against Exo's composition.
+    Composition,
+    /// Tier 1: Exo's fields against what the guest committed.
+    FieldState,
+    /// Tier 1, settled cases: no field loses a character the user means.
+    NoLoss,
+    /// Tier 2: a field's text, cursor and preedit.
+    Text,
+    /// Tier 2: the focused field.
+    Focus,
+}
+
 /// A failed check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Failure {
     pub tier: Tier,
-    /// What was checked: `"text"`, `"decision"`, `"composition"`,
-    /// `"field state"` or `"focus"`.
-    pub check: &'static str,
+    pub check: Check,
     /// The field it failed on, if the check is of one.
     pub field: Option<usize>,
     /// What was expected and what was found.
@@ -306,6 +338,20 @@ pub(super) struct Counts {
     pub drops_truth_in_step: u64,
     /// Guest reports that crossed an edit on its way to the guest (P4).
     pub crossed_reports: u64,
+    /// Exo's regions that reached the proxy after it had sent a report Exo
+    /// made them before.
+    pub regions_crossing_reports: u64,
+    /// Guest reports the proxy withheld while the guest showed a preedit
+    /// (G9c).
+    pub reports_withheld: u64,
+    /// Reconversions Exo refused, as their range lay past its text.
+    pub regions_refused: u64,
+    /// Keys Exo sent to a surface the guest destroyed, which reach no
+    /// window.
+    pub keys_to_no_window: u64,
+    /// The states the Exo model reached; the world reads them at the end
+    /// of the case.
+    pub exo: exo::Reached,
 
     /// Focus moves that the text input heard of before the keyboard, bound
     /// after its activate, so that Exo detached while attached (H2).
@@ -352,6 +398,11 @@ impl std::ops::AddAssign for Counts {
         self.drops += other.drops;
         self.drops_truth_in_step += other.drops_truth_in_step;
         self.crossed_reports += other.crossed_reports;
+        self.regions_crossing_reports += other.regions_crossing_reports;
+        self.reports_withheld += other.reports_withheld;
+        self.regions_refused += other.regions_refused;
+        self.keys_to_no_window += other.keys_to_no_window;
+        self.exo += other.exo;
         self.detaches_before_keyboard += other.detaches_before_keyboard;
         self.recovered_keys += other.recovered_keys;
         self.recoveries_skipped += other.recoveries_skipped;
@@ -403,8 +454,16 @@ struct Measured {
     origin: Origin,
     /// The preedit the guest shows after it.
     shown: Option<Shown>,
-    /// A delete or a region.
-    kind: &'static str,
+    kind: MeasuredKind,
+}
+
+/// What a [`Measured`] transaction is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeasuredKind {
+    /// Exo's delete (H9).
+    Delete,
+    /// Exo's preedit region (X1).
+    Region,
 }
 
 /// The step's delete or region (H9, X1), which the guest gets as Exo's
@@ -1186,7 +1245,7 @@ impl SpecText {
                     commit,
                     ..Txn::default()
                 };
-                return Some((txn, (0, 0), None, "region"));
+                return Some((txn, (0, 0), None));
             }
             if held.start < start || end < held.end {
                 return None;
@@ -1203,15 +1262,15 @@ impl SpecText {
                 preedit: text.to_owned(),
                 ..Txn::default()
             };
-            Some((txn, cursor, Some(shown), "region"))
+            Some((txn, cursor, Some(shown)))
         })();
-        let (txn, cursor, shown, kind) = measured?;
+        let (txn, cursor, shown) = measured?;
         Some(Measured {
             txn,
             cursor,
             origin,
             shown,
-            kind,
+            kind: MeasuredKind::Region,
         })
     }
 
@@ -1239,7 +1298,7 @@ impl SpecText {
             cursor: (0, 0),
             origin,
             shown: None,
-            kind: "delete",
+            kind: MeasuredKind::Delete,
         })
     }
 
@@ -1256,12 +1315,12 @@ impl SpecText {
         self.end_lease();
         let over = std::mem::replace(&mut self.shown, shown).is_some();
         match kind {
-            "delete" => self.counts.deletes += 1,
-            _ if !txn.preedit.is_empty() => {
+            MeasuredKind::Delete => self.counts.deletes += 1,
+            MeasuredKind::Region if !txn.preedit.is_empty() => {
                 self.counts.regions += 1;
                 self.counts.regions_over_preedits += u64::from(over);
             }
-            _ => {}
+            MeasuredKind::Region => {}
         }
         self.counts.late_shown += u64::from(origin.late);
         self.apply(&txn, cursor);
@@ -1405,6 +1464,7 @@ impl SpecText {
             self.report_withheld = withheld.as_ref().map(|(_, shown)| shown.clone());
         }
         if withheld.is_some() {
+            self.counts.reports_withheld += 1;
             self.withheld = withheld;
         } else if reported != expected {
             wrong.push(format!(
@@ -1707,20 +1767,24 @@ pub(super) fn exact(
     };
     // `step` compared the fields after every step.
     if !steps.is_empty() {
-        failures.push(failure("step", None, steps.join("\n")));
+        failures.push(failure(Check::Step, None, steps.join("\n")));
     }
     if !spec.wrong_decisions.is_empty() {
-        failures.push(failure("decision", None, spec.wrong_decisions.join("\n")));
+        failures.push(failure(
+            Check::Decision,
+            None,
+            spec.wrong_decisions.join("\n"),
+        ));
     }
     if !spec.wrong_reports.is_empty() {
-        failures.push(failure("report", None, spec.wrong_reports.join("\n")));
+        failures.push(failure(Check::Report, None, spec.wrong_reports.join("\n")));
     }
     let recoveries = spec.counts.recoveries_before_a_press;
     if recoveries > 0 {
         let detail = format!(
             "{recoveries} held keys recovered for Exo's confirmation before another key's press"
         );
-        failures.push(failure("recovery", spec.focus, detail));
+        failures.push(failure(Check::Recovery, spec.focus, detail));
     }
     let composing = exo.composition().filter(|_| !spec.region_dropped);
     if let (Some(field), Some(tracked)) = (spec.focus, composing) {
@@ -1736,7 +1800,7 @@ pub(super) fn exact(
             let detail = format!(
                 "the guest shows {preedit:?}; Exo tracks {tracked:?}, its engine composes {engine:?}"
             );
-            failures.push(failure("composition", Some(field), detail));
+            failures.push(failure(Check::Composition, Some(field), detail));
         }
     }
     let mut expected: Vec<exo::Field> = spec.committed.iter().map(V3Field::on_host).collect();
@@ -1753,7 +1817,7 @@ pub(super) fn exact(
     }
     if held != expected {
         let detail = format!("committed: {expected:?}\nExo holds: {held:?}");
-        failures.push(failure("field state", spec.focus, detail));
+        failures.push(failure(Check::FieldState, spec.focus, detail));
     }
     failures
 }
@@ -1776,7 +1840,7 @@ pub(super) fn intended(reference: &Reference, client: &dyn Client) -> Vec<Failur
                 show_model(got),
                 client.drops()
             );
-            failures.push(failure("text", Some(i), detail));
+            failures.push(failure(Check::Text, Some(i), detail));
         }
     }
     if client.focused_field() != Some(reference.focus()) {
@@ -1785,7 +1849,7 @@ pub(super) fn intended(reference: &Reference, client: &dyn Client) -> Vec<Failur
             reference.focus(),
             client.focused_field()
         );
-        failures.push(failure("focus", None, detail));
+        failures.push(failure(Check::Focus, None, detail));
     }
     failures
 }
@@ -1815,7 +1879,7 @@ pub(super) fn lost(
             .filter(|(_, (intended, got))| !is_subsequence(&shown(intended), &shown(got)))
             .map(|(i, (intended, got))| Failure {
                 tier: Tier::Exact,
-                check: "no loss",
+                check: Check::NoLoss,
                 field: Some(i),
                 detail: format!(
                     "{at}: intended: {}\nclient:   {}",
@@ -2735,23 +2799,23 @@ mod tests {
         exo.set_text_input_focus(Some(HOST[0]));
         exo.request(3, &manager::Request::CreateTextInput { id: 10 }.into());
         exo.request(10, &activate(0));
-        let checks = |spec: &SpecText, engine: &str, resets| -> Vec<&'static str> {
+        let checks = |spec: &SpecText, engine: &str, resets| -> Vec<Check> {
             let failures = exact(&[], spec, &exo, engine, resets);
             let checks = failures.iter().map(|failure| failure.check);
-            checks.filter(|&check| check != "field state").collect()
+            checks.filter(|&check| check != Check::FieldState).collect()
         };
         let mut spec = attached(&["0"]);
         // The guest shows nothing, which Exo tracks.
-        assert_eq!(checks(&spec, "가", 0), Vec::<&str>::new());
+        assert_eq!(checks(&spec, "가", 0), Vec::<Check>::new());
         // The guest shows what the engine composes.
         preedit(&mut spec, "가");
-        assert_eq!(checks(&spec, "가", 0), Vec::<&str>::new());
+        assert_eq!(checks(&spec, "가", 0), Vec::<Check>::new());
         // Nothing composes it.
-        assert_eq!(checks(&spec, "", 0), ["composition"]);
+        assert_eq!(checks(&spec, "", 0), [Check::Composition]);
         // Unless the engine reset since it made it, without Exo's client
         // hearing of it.
-        assert_eq!(checks(&spec, "", 1), Vec::<&str>::new());
-        assert_eq!(checks(&spec, "각", 1), ["composition"]);
+        assert_eq!(checks(&spec, "", 1), Vec::<Check>::new());
+        assert_eq!(checks(&spec, "각", 1), [Check::Composition]);
         // Or the guest got it late.
         let late = v1::Event::PreeditString {
             serial: 0,
@@ -2768,7 +2832,7 @@ mod tests {
             origin,
             region: None,
         });
-        assert_eq!(checks(&spec, "", 0), Vec::<&str>::new());
+        assert_eq!(checks(&spec, "", 0), Vec::<Check>::new());
         assert_eq!(spec.counts.late_shown, 1);
     }
 
@@ -2799,12 +2863,14 @@ mod tests {
             handled: true,
         });
         let spec = attached(&["0a"]);
-        let checks = |exo: &Exo, engine: &str| -> Vec<&'static str> {
+        let checks = |exo: &Exo, engine: &str| -> Vec<Check> {
             let failures = exact(&[], &spec, exo, engine, 0);
             let checks = failures.iter().map(|failure| failure.check);
-            checks.filter(|&check| check == "composition").collect()
+            checks
+                .filter(|&check| check == Check::Composition)
+                .collect()
         };
-        assert_eq!(checks(&exo, ""), Vec::<&str>::new());
+        assert_eq!(checks(&exo, ""), Vec::<Check>::new());
         // Once a key composes over it, the guest must show that.
         exo.key(Micros(0), Key::Char('r'), wl_keyboard::KEY_STATE_PRESSED);
         exo.take_engine();
@@ -2816,7 +2882,7 @@ mod tests {
             id: 1,
             handled: true,
         });
-        assert_eq!(checks(&exo, "ㄱ"), ["composition"]);
+        assert_eq!(checks(&exo, "ㄱ"), [Check::Composition]);
     }
 
     /// GTK4 showing `texts`, the keyboard on field `focus`.
@@ -2867,6 +2933,6 @@ mod tests {
         reference.apply(UserAction::Focus(0));
         let failures = intended(&reference, &gtk);
         let checks: Vec<_> = failures.iter().map(|f| (f.check, f.field)).collect();
-        assert_eq!(checks, [("text", Some(1)), ("focus", None)]);
+        assert_eq!(checks, [(Check::Text, Some(1)), (Check::Focus, None)]);
     }
 }

@@ -125,15 +125,15 @@ confirmation alone (`held_repeat_key_for_seat`).
 
 ## Tests
 
-- `key_generation_registry_matches_the_model_for_all_short_transition_sequences`
-  checks every sequence of four registry operations, `peek_key`,
-  `admit_key`, the enter's snapshot, the detach and the retirement of a
-  stale generation included, against a model of the flat fields the
-  states replaced.
-- `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`
-  checks that the delivery reducer never opens two guest presses, nor
-  forwards a release without one.
-- `a_waiting_recovery_is_decided_by_the_hosts_next_event` pins the
-  recovery's transition table.
+- Every sequence of four registry operations, `peek_key`, `admit_key`,
+  the enter's snapshot, the detach and the retirement of a stale
+  generation included, leaves the registry as a model of the flat fields
+  the states replaced. Test:
+  `key_generation_registry_matches_the_model_for_all_short_transition_sequences`.
+- The delivery reducer never opens two guest presses, nor forwards a
+  release without one. Test:
+  `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`.
+- The recovery's transition table. Test:
+  `a_waiting_recovery_is_decided_by_the_hosts_next_event`.
 - The handler tests in `keyboard.rs`, `ime_keys.rs` and `text_input.rs`
   and the DST pin the wire behaviour.

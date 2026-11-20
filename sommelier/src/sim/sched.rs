@@ -59,6 +59,7 @@ use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
 use super::surfaces::Surfaces;
 use super::ClientKind;
+use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{
     wl_callback, wl_compositor, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat,
@@ -272,6 +273,42 @@ enum Pointer {
     Gone,
 }
 
+/// What can happen next in a [`World`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// C→P delivers.
+    GuestRequests,
+    /// P→C delivers.
+    GuestEvents,
+    /// P→E delivers.
+    HostRequests,
+    /// E→P delivers.
+    HostEvents,
+    /// E→Eng delivers.
+    EngineInput,
+    /// The engine answers.
+    EngineAnswers,
+    /// A held key repeats.
+    Repeat,
+    /// The user acts.
+    User,
+}
+
+impl Source {
+    /// Every source, in the order whose position a tie's choice picks
+    /// ([`earliest`]): reordering it changes every recorded schedule.
+    const ORDER: [Self; 8] = [
+        Self::GuestRequests,
+        Self::GuestEvents,
+        Self::HostRequests,
+        Self::HostEvents,
+        Self::EngineInput,
+        Self::EngineAnswers,
+        Self::Repeat,
+        Self::User,
+    ];
+}
+
 /// One case's client, proxy, Exo, engine and display, joined by channels.
 pub(super) struct World<'t> {
     now: Micros,
@@ -295,8 +332,12 @@ pub(super) struct World<'t> {
     p_to_e: Channel<Vec<(u32, AnyRequest)>>,
     /// Each host event, what engine text it carries, and how many of the
     /// proxy's surrounding texts Exo had got when it sent the event.
-    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>)>,
+    e_to_p: Channel<(Outgoing, Origin, Option<RegionTruth>, u64)>,
     to_engine: Channel<EngineIn>,
+    /// The guest's surrounding texts the proxy sent the host, and those
+    /// that reached Exo.
+    reports_sent: u64,
+    reports_got: u64,
     /// The guest's view of what the client models do not take: the
     /// globals, Shift and where its pointer is, as the proxy tells it.
     globals: BTreeMap<String, (u32, u32)>,
@@ -367,6 +408,8 @@ impl<'t> World<'t> {
             shift: false,
             pointer: None,
             keyboard_gone: false,
+            reports_sent: 0,
+            reports_got: 0,
             resets: 0,
             repeat: None,
             edits: Edits::default(),
@@ -469,16 +512,8 @@ impl<'t> World<'t> {
         let mut actions = actions.iter().copied().peekable();
         let mut next = self.now;
         while !self.ended {
-            let idle = [
-                self.c_to_p.ready_at(),
-                self.p_to_c.ready_at(),
-                self.p_to_e.ready_at(),
-                self.e_to_p.ready_at(),
-                self.to_engine.ready_at(),
-                self.engine.ready_at(),
-            ];
             let user = match actions.peek() {
-                Some(UserAction::Settle) if idle.iter().any(Option::is_some) => None,
+                Some(UserAction::Settle) if self.busy() => None,
                 Some(_) => Some(next.max(self.now)),
                 None => None,
             };
@@ -487,38 +522,40 @@ impl<'t> World<'t> {
             if actions.peek().is_none() {
                 self.repeat = None;
             }
-            let mut sources = idle.to_vec();
-            sources.push(self.repeat.map(|(_, at)| at));
-            sources.push(user);
-            let Some(source) = earliest(&sources, &mut self.choices) else {
+            let ready = Source::ORDER.map(|source| match source {
+                Source::User => user,
+                source => self.ready_at(source),
+            });
+            let Some(source) = earliest(&ready, &mut self.choices) else {
                 return;
             };
-            self.now = self.now.max(sources[source].expect("a ready source"));
-            match source {
-                0 => {
+            self.now = self.now.max(ready[source].expect("a ready source"));
+            match Source::ORDER[source] {
+                Source::GuestRequests => {
                     let (request, edits) = self.c_to_p.take();
                     self.deliver_guest_request(request, edits).await;
                 }
-                1 => {
+                Source::GuestEvents => {
                     let (sender, event, press, gone) = self.p_to_c.take();
                     self.deliver_to_guest(sender, event, press, gone);
                 }
-                2 => {
+                Source::HostRequests => {
                     for (sender, request) in self.p_to_e.take() {
+                        self.reports_got += u64::from(is_report(&request));
                         let events = self.display.request(sender, &request, &mut self.exo);
                         self.host_sends(events, false);
                     }
                 }
-                3 => {
-                    let (event, origin, truth) = self.e_to_p.take();
-                    self.deliver_host_event(event, origin, truth).await;
+                Source::HostEvents => {
+                    let (event, origin, truth, reports) = self.e_to_p.take();
+                    self.deliver_host_event(event, origin, truth, reports).await;
                 }
-                4 => {
+                Source::EngineInput => {
                     let input = self.to_engine.take();
                     self.engine.send(self.now, input, &mut self.choices);
                 }
-                5 => self.engine_answers(),
-                6 => {
+                Source::EngineAnswers => self.engine_answers(),
+                Source::Repeat => {
                     let (key, at) = self.repeat.expect("a held key");
                     self.repeat = Some((key, at + REPEAT_INTERVAL));
                     self.log(Place::User, format!("repeat {key:?}"));
@@ -528,7 +565,7 @@ impl<'t> World<'t> {
                     }
                     self.host_sends(Vec::new(), false);
                 }
-                _ => {
+                Source::User => {
                     let action = actions.next().expect("an action");
                     self.act(action);
                     next = self.now
@@ -545,6 +582,28 @@ impl<'t> World<'t> {
                 }
             }
         }
+    }
+
+    /// When `source` is next ready, `None` while it is idle; the user's
+    /// next action is [`World::run`]'s to time, and is `None` here.
+    fn ready_at(&self, source: Source) -> Option<Micros> {
+        match source {
+            Source::GuestRequests => self.c_to_p.ready_at(),
+            Source::GuestEvents => self.p_to_c.ready_at(),
+            Source::HostRequests => self.p_to_e.ready_at(),
+            Source::HostEvents => self.e_to_p.ready_at(),
+            Source::EngineInput => self.to_engine.ready_at(),
+            Source::EngineAnswers => self.engine.ready_at(),
+            Source::Repeat => self.repeat.map(|(_, at)| at),
+            Source::User => None,
+        }
+    }
+
+    /// Whether a channel or the engine has something to do, which a
+    /// `Settle` waits for; a held key's repeats it does not.
+    fn busy(&self) -> bool {
+        let busy = |&source: &Source| source != Source::Repeat && self.ready_at(source).is_some();
+        Source::ORDER.iter().any(busy)
     }
 
     /// The user acts: Exo takes a key's press and release; a click or a
@@ -650,14 +709,14 @@ impl<'t> World<'t> {
             resets: self.resets,
             press,
         };
+        let reports = self.reports_got;
         for (event, truth) in self.exo.take_events_with_truths() {
-            self.e_to_p
-                .send(self.now, (event, origin, truth), &mut self.choices);
+            let sent = (event, origin, truth, reports);
+            self.e_to_p.send(self.now, sent, &mut self.choices);
         }
         for event in events {
-            let origin = Origin::default();
-            self.e_to_p
-                .send(self.now, (event, origin, None), &mut self.choices);
+            let sent = (event, Origin::default(), None, reports);
+            self.e_to_p.send(self.now, sent, &mut self.choices);
         }
         for input in self.exo.take_engine() {
             self.resets += u64::from(input == EngineIn::Reset);
@@ -672,12 +731,15 @@ impl<'t> World<'t> {
         self.log(Place::Engine, format!("{answer:?}"));
         let press = self.exo.press_of(&answer);
         let verdict = self.exo.answer(&answer);
-        match self.exo.take_region_outcome() {
+        let outcome = self.exo.take_region_outcome();
+        let refused = outcome == Some(RegionOutcome::Refused);
+        match outcome {
             Some(RegionOutcome::Composed(text)) => self.engine.learn_region(text),
             Some(RegionOutcome::Refused) => self.engine.refused_region(),
             None => {}
         }
         if let Some(spec) = &mut self.spec {
+            spec.counts.regions_refused += u64::from(refused);
             spec.counts.late += u64::from(verdict == Answer::Late);
             spec.counts.dropped += u64::from(verdict == Answer::Dropped);
         }
@@ -740,14 +802,24 @@ impl<'t> World<'t> {
         self.send_proxy_output(goes_on);
     }
 
-    /// A host event reaches the proxy.
+    /// A host event, which Exo sent once it had got `reports` of the
+    /// proxy's surrounding texts, reaches the proxy. A region that a later
+    /// report the proxy has sent did not reach in time crossed it.
     async fn deliver_host_event(
         &mut self,
         event: Outgoing,
         origin: Origin,
         truth: Option<RegionTruth>,
+        reports: u64,
     ) {
         let (sender, decoded) = self.display.decode(&event);
+        let region = matches!(
+            decoded,
+            AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion { .. })
+        );
+        if let Some(spec) = self.spec.as_mut().filter(|_| region) {
+            spec.counts.regions_crossing_reports += u64::from(self.reports_sent > reports);
+        }
         // The proxy drops a pointer enter that names a surface the guest
         // destroyed, so the guest's pointer is on none of its surfaces.
         if let AnyEvent::WlPointer(wl_pointer::Event::Enter { surface, .. }) = decoded {
@@ -819,6 +891,7 @@ impl<'t> World<'t> {
         let mut batch: Vec<(u32, AnyRequest)> = Vec::new();
         for (sender, request) in self.session.host_received() {
             self.log(Place::PToE, format!("{sender} {request:?}"));
+            self.reports_sent += u64::from(is_report(&request));
             self.see(Seen::ToHost(&request));
             let glued = matches!(
                 request,
@@ -897,6 +970,10 @@ impl<'t> World<'t> {
     fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>, gone: bool) {
         let now = self.now;
         self.edits.got.follow(&event);
+        let key = matches!(event, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }));
+        if let Some(spec) = self.spec.as_mut().filter(|_| key && gone) {
+            spec.counts.keys_to_no_window += 1;
+        }
         if let AnyEvent::WlRegistry(wl_registry::Event::Global {
             name,
             interface,
