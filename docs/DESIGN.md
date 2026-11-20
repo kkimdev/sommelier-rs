@@ -327,6 +327,17 @@ so a handler acts only on the `Context` it is given; the XKB context the
 keymaps are compiled in belongs to the keyboard core
 (`keymap::Compiler`), next to the keymaps compiled from it.
 
+`Context` holds sub-states, not loose collections: each is a type whose
+fields are private to the module that owns its concern, so a write from
+any other module does not compile, and others read it through narrow
+methods. The registry owns the host's globals and the proxy's bindings
+(`registry::Globals`), the keyboard core its keyboards, keys and focus
+(`keys::KeyboardCore`), `handler::shm` the host's SHM formats
+(`ShmFormats`), `handler::linux_dmabuf` the dma-buf capabilities
+(`Dmabuf`), and so on for the IME core, outputs, internal callbacks,
+placement and clipboard pumps. State that one object owns is in that
+object's table entry instead ([Object ends](#object-ends)).
+
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of host globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
