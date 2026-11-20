@@ -71,13 +71,22 @@ preferred side so bytes still in the kernel queue are not starved. A
 client that streams render requests would otherwise hold keyboard and IME
 events behind several frames on the single thread. A parked guest stream
 (see [Message effects](#message-effects)) is never offered.
-32 messages still amortize a send while bounding the wait to about one
-frame. Translated messages of one batch are sent in as few transport
+32 messages bound the wait to about one frame.
+
+A batch costs no send of its own. `Client` keeps what the batches
+produce for each peer (`to_host`, `to_guest`), appended in the order a
+send per batch would have sent it, and sends it in as few transport
 submissions as the 28-descriptor and VirtWL transaction-size limits
-allow, usually one, each ending at a message boundary; per-message
-VirtWL ioctls would add latency without changing the byte and descriptor
-order (see
+allow, each ending at a message boundary: a submission once a later
+message no longer fits it, the rest (`Client::flush`) once everything
+received is dispatched, before `run` waits, and when the session ends.
+Each submission is a synchronous VirtWL round trip, so a burst costs
+about one per 3,980 bytes rather than one per batch; per-message VirtWL
+ioctls would add latency without changing the byte and descriptor order
+(see
 [transport invariants](INVARIANTS.md#transport-and-file-descriptors)).
+Output therefore waits at most until the proxy has dispatched what it has
+already received.
 
 ### Descriptors
 
@@ -323,9 +332,10 @@ or host error wins over an internal failure. After dispatch,
 `Client::handle_msgs` takes the message's `state::Effects` once
 (`Context::take_effects`):
 
-- If the message did not end the session, it sends the forward, then the
-  output in the same direction, and, once the batch ends, the output back
-  toward the message's source.
+- If the message did not end the session, it queues the forward, then the
+  output in the same direction, and the output back toward the message's
+  source, each for its peer ([Fair dispatch](#fair-dispatch) says when it
+  is sent).
 - If it did, it drops the forward and every effect, which closes their
   descriptors, and ends the batch. After the batch's earlier, valid
   messages, `handler::display::session_error` encodes the session's one

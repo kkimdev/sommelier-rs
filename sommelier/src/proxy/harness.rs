@@ -374,17 +374,20 @@ impl Session {
             connection.read_buf.extend(bytes);
             connection.read_fds.extend(fds);
         }
-        loop {
-            let before = Counts::now();
+        let before = Counts::now();
+        let goes_on = loop {
             let goes_on = self.client.handle_msgs(direction).await;
-            self.proxy_cost += Counts::now() - before;
-            self.guest.receive();
-            self.host.receive();
             let parked = direction == Direction::ClientToHost && self.client.parked.is_some();
             if !goes_on || parked || !self.client.connection(direction).has_complete_message() {
-                return goes_on;
+                break goes_on;
             }
-        }
+        };
+        // Nothing more is buffered, so the proxy sends what it holds.
+        let goes_on = self.client.flush().await && goes_on;
+        self.proxy_cost += Counts::now() - before;
+        self.guest.receive();
+        self.host.receive();
+        goes_on
     }
 }
 

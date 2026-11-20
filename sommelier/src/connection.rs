@@ -66,8 +66,10 @@ pub(crate) const MAX_BYTES_PER_SEND: usize = crate::virtwl_channel::MAX_SEND_SIZ
 ///
 /// Sent by [`WaylandConnection::send_messages`], which coalesces messages
 /// into as few submissions as [`MAX_FDS_PER_SEND`] and
-/// [`MAX_BYTES_PER_SEND`] allow. It owns the descriptors: a send passes
-/// copies to the peer, and dropping the run closes them, sent or not.
+/// [`MAX_BYTES_PER_SEND`] allow, or, while more may follow, only its full
+/// submissions ([`LastSubmission::Keep`]). It owns the descriptors: a
+/// send passes copies to the peer and then closes them, and dropping the
+/// run closes the rest, sent or not.
 ///
 /// A submission ends only at an entry of `ends`, one per pushed entry. An
 /// entry may hold several messages, which a submission then never splits:
@@ -88,9 +90,82 @@ impl OutgoingMessages {
         self.ends.push((self.bytes.len(), self.fds.len()));
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.ends.is_empty()
     }
+
+    /// Where each submission of these messages ends in `bytes` and in
+    /// `fds`, in order: each takes as many whole entries as fit in
+    /// [`MAX_BYTES_PER_SEND`] and [`MAX_FDS_PER_SEND`], or one entry that
+    /// is longer on its own. An entry with more descriptors than a
+    /// submission carries is an `InvalidInput` error, after which there is
+    /// nothing more.
+    fn submission_ends(&self) -> impl Iterator<Item = io::Result<(usize, usize)>> + '_ {
+        let mut entries = self.ends.iter().copied().peekable();
+        let mut start = (0, 0);
+        std::iter::from_fn(move || {
+            let mut end = start;
+            while let Some(&entry) = entries.peek() {
+                let fits = entry.0 - start.0 <= MAX_BYTES_PER_SEND
+                    && entry.1 - start.1 <= MAX_FDS_PER_SEND;
+                if !fits && end != start {
+                    // This entry starts the next submission.
+                    break;
+                }
+                let entry_fds = entry.1 - end.1;
+                if entry_fds > MAX_FDS_PER_SEND {
+                    entries.by_ref().for_each(drop);
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("a message carries {entry_fds} descriptors"),
+                    )));
+                }
+                entries.next();
+                end = entry;
+                if !fits {
+                    // A message longer than a submission goes alone.
+                    break;
+                }
+            }
+            (end != start).then(|| {
+                start = end;
+                Ok(end)
+            })
+        })
+    }
+
+    /// Forget the messages that end at `sent` in `bytes` and `fds`, which
+    /// closes their descriptors, and keep the capacity for the next ones.
+    fn forget_sent(&mut self, sent: (usize, usize)) {
+        self.bytes.drain(..sent.0);
+        self.fds.drain(..sent.1);
+        let sent_entries = self.ends.partition_point(|&(bytes, _)| bytes <= sent.0);
+        self.ends.drain(..sent_entries);
+        for end in &mut self.ends {
+            end.0 -= sent.0;
+            end.1 -= sent.1;
+        }
+    }
+
+    /// Forget every message, which closes their descriptors, and keep the
+    /// capacity for the next ones.
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.fds.clear();
+        self.ends.clear();
+    }
+}
+
+/// Whether [`WaylandConnection::send_submissions`] sends the last
+/// submission, which later messages could still fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LastSubmission {
+    /// Send it: no message follows soon.
+    Send,
+    /// Keep it for the messages that may follow: send only the full
+    /// submissions.
+    Keep,
 }
 
 pub struct WaylandConnection {
@@ -429,7 +504,7 @@ impl WaylandConnection {
     }
 
     /// Send `messages` in order, in as few submissions as
-    /// [`MAX_FDS_PER_SEND`] and [`MAX_BYTES_PER_SEND`] allow.
+    /// [`MAX_FDS_PER_SEND`] and [`MAX_BYTES_PER_SEND`] allow, and empty it.
     ///
     /// A submission ends only between messages, so every message's
     /// descriptors travel with its bytes: a receiver must never meet a
@@ -441,38 +516,48 @@ impl WaylandConnection {
     ///
     /// `InvalidInput` for a message with more descriptors than one
     /// submission carries, which is not sent; the messages before it are.
-    /// No Wayland message has that many descriptor arguments.
-    pub(crate) async fn send_messages(&mut self, messages: &OutgoingMessages) -> io::Result<()> {
-        let mut start = (0, 0);
-        let mut end = start;
-        for &message_end in &messages.ends {
-            if message_end.0 - start.0 > MAX_BYTES_PER_SEND
-                || message_end.1 - start.1 > MAX_FDS_PER_SEND
-            {
-                // This message starts the next submission.
-                if start != end {
-                    self.send(
-                        &messages.bytes[start.0..end.0],
-                        &messages.fds[start.1..end.1],
-                    )
-                    .await?;
-                }
-                start = end;
-                let message_fds = message_end.1 - start.1;
-                if message_fds > MAX_FDS_PER_SEND {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("a message carries {message_fds} descriptors"),
-                    ));
-                }
+    /// No Wayland message has that many descriptor arguments. A failed
+    /// send drops every message, sent or not.
+    pub(crate) async fn send_messages(
+        &mut self,
+        messages: &mut OutgoingMessages,
+    ) -> io::Result<()> {
+        self.send_submissions(messages, LastSubmission::Send).await
+    }
+
+    /// Like [`Self::send_messages`], but, for [`LastSubmission::Keep`],
+    /// leave the last submission in `messages`, for the messages pushed
+    /// later to fill.
+    pub(crate) async fn send_submissions(
+        &mut self,
+        messages: &mut OutgoingMessages,
+        last: LastSubmission,
+    ) -> io::Result<()> {
+        let mut sent = (0, 0);
+        let mut ends = messages.submission_ends().peekable();
+        let result = loop {
+            let end = match ends.next() {
+                None => break Ok(()),
+                Some(Err(error)) => break Err(error),
+                Some(Ok(end)) => end,
+            };
+            if last == LastSubmission::Keep && ends.peek().is_none() {
+                break Ok(());
             }
-            end = message_end;
+            if let Err(error) = self
+                .send(&messages.bytes[sent.0..end.0], &messages.fds[sent.1..end.1])
+                .await
+            {
+                break Err(error);
+            }
+            sent = end;
+        };
+        drop(ends);
+        match result {
+            Ok(()) => messages.forget_sent(sent),
+            Err(_) => messages.clear(),
         }
-        self.send(
-            &messages.bytes[start.0..end.0],
-            &messages.fds[start.1..end.1],
-        )
-        .await
+        result
     }
 
     pub async fn recv(&mut self) -> io::Result<usize> {
@@ -549,8 +634,8 @@ impl WaylandConnection {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        decode_unix_control_fds, recv_unix_message, OutgoingMessages, WaylandConnection,
-        MAX_BYTES_PER_SEND, MAX_FDS_PER_SEND,
+        decode_unix_control_fds, recv_unix_message, LastSubmission, OutgoingMessages,
+        WaylandConnection, MAX_BYTES_PER_SEND, MAX_FDS_PER_SEND,
     };
     use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
     use crate::wire::MessageBuilder;
@@ -588,7 +673,7 @@ mod tests {
                     let mut messages = OutgoingMessages::default();
                     messages.push((vec![0; 8], Vec::new()));
                     connection
-                        .send_messages(&messages)
+                        .send_messages(&mut messages)
                         .await
                         .expect_err("the peer has gone")
                 });
@@ -657,7 +742,7 @@ mod tests {
             messages.push((vec![0; len], fds));
         }
         connection
-            .send_messages(&messages)
+            .send_messages(&mut messages)
             .await
             .expect("send the batch");
         drop(connection);
@@ -674,6 +759,56 @@ mod tests {
             submissions.push((bytes, fds.len()));
         }
         assert_eq!(submissions, vec![(8, 20), (48, 15)]);
+    }
+
+    /// While more messages may follow, only the full submissions go out:
+    /// the last one waits for the messages that could still fill it, and
+    /// goes out with them.
+    #[tokio::test]
+    async fn kept_submissions_wait_for_the_messages_that_fill_them() {
+        let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
+        let name = CString::new("sommelier-full-submissions").unwrap();
+        let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let message = |len: usize, fds: usize| {
+            let fds = (0..fds)
+                .map(|_| memfd.try_clone().expect("dup the memfd"))
+                .collect();
+            (vec![0; len], fds)
+        };
+
+        // (bytes, descriptors) per message. Each submission starts with a
+        // descriptor, so the receiver reads each one on its own.
+        let limit = MAX_BYTES_PER_SEND;
+        let mut messages = OutgoingMessages::default();
+        messages.push(message(limit - 8, 1));
+        messages.push(message(12, 1));
+        for _ in 0..2 {
+            connection
+                .send_submissions(&mut messages, LastSubmission::Keep)
+                .await
+                .expect("send the full submission");
+        }
+        messages.push(message(8, 0));
+        connection
+            .send_messages(&mut messages)
+            .await
+            .expect("send the rest");
+        assert!(messages.is_empty());
+        drop(connection);
+
+        let mut submissions = Vec::new();
+        loop {
+            let mut data = [0u8; 4096];
+            let mut control = vec![0u8; 4096];
+            let (bytes, fds) =
+                recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
+            if bytes == 0 {
+                break;
+            }
+            submissions.push((bytes, fds.len()));
+        }
+        assert_eq!(submissions, vec![(limit - 8, 1), (20, 1)]);
     }
 
     /// A VirtWL transaction holds at most `MAX_BYTES_PER_SEND` bytes, and
@@ -702,7 +837,7 @@ mod tests {
             messages.push((vec![0; len], fds));
         }
         connection
-            .send_messages(&messages)
+            .send_messages(&mut messages)
             .await
             .expect("send the batch");
         drop(connection);
@@ -742,7 +877,7 @@ mod tests {
         }
         drop(memfd);
         let error = connection
-            .send_messages(&messages)
+            .send_messages(&mut messages)
             .await
             .expect_err("the second message cannot be sent");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);

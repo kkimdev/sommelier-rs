@@ -135,7 +135,7 @@ async fn a_partial_width_shm_frame_costs_one_read() {
     let cost = shm_frame_cost("SHM, partial-width damage", PARTIAL_WIDTH).await;
     assert_eq!(cost.pool_reads, 1);
     assert_eq!(cost.host_maps, 0);
-    assert!(cost.allocations <= 28, "{cost:?}");
+    assert!(cost.allocations <= 22, "{cost:?}");
 }
 
 /// A frame that damages the whole of a buffer laid out like its host copy
@@ -145,7 +145,7 @@ async fn a_full_shm_frame_costs_one_read() {
     let cost = shm_frame_cost("SHM, full damage", FULL).await;
     assert_eq!(cost.pool_reads, 1);
     assert_eq!(cost.host_maps, 0);
-    assert!(cost.allocations <= 28, "{cost:?}");
+    assert!(cost.allocations <= 22, "{cost:?}");
 }
 
 /// A host copy whose rows are longer than the guest's, as a VirtWL dma-buf
@@ -246,7 +246,7 @@ async fn a_native_frame_reads_no_pixels() {
     println!("frame cost, native dma-buf: {cost:?}");
     assert_eq!(cost.pool_reads, 0);
     assert_eq!(cost.host_maps, 0);
-    assert!(cost.allocations <= 24, "{cost:?}");
+    assert!(cost.allocations <= 18, "{cost:?}");
 }
 
 /// The motions the message test measures, after the warm-up ones that
@@ -288,5 +288,5 @@ async fn a_forwarded_pointer_motion_costs_at_most_its_budget() {
         cpu / MOTIONS as u32
     );
     let cost = total.per(MOTIONS);
-    assert!(cost.allocations <= 6, "{cost:?}");
+    assert!(cost.allocations <= 4, "{cost:?}");
 }

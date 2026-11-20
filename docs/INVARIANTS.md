@@ -20,8 +20,9 @@ always consumed; a configuration problem never stops the proxy) is owned by
   connection's queue (`WaylandConnection::read_fds`), then the decoded
   message (`WireMessage::read_fd` takes the next one), then the outgoing
   message (`wire::Outgoing`, `OutgoingMessages`). A message that is
-  dropped, suppressed or rejected therefore closes its descriptors, and a
-  batch closes the ones it sent once the send returns. Handlers get a
+  dropped, suppressed or rejected therefore closes its descriptors, and
+  the output pending for a peer closes the ones it sent once their send
+  returns. Handlers get a
   `BorrowedFd` and duplicate a descriptor to keep it. Only the kernel and
   device boundaries (the `recvmsg` decoder, `virtwl_channel.rs` and the
   allocator's fence export) take over or close a raw descriptor; elsewhere
@@ -66,7 +67,19 @@ always consumed; a configuration problem never stops the proxy) is owned by
   to per-message sends just to make ownership look explicit: extra VirtWL
   ioctls add latency and regress input throughput. Introduce
   message-granular sends only for a transport constraint that a regression
-  test or device contract demonstrates.
+  test or device contract demonstrates. The output of consecutive
+  batches is coalesced too: a fairness batch costs no send of its own.
+  The proxy keeps what the batches produce for each peer, in the order a
+  send per batch would have sent it, and sends a submission once a later
+  message no longer fits it, and the rest before it waits for input and
+  when the session ends ([Fair dispatch](DESIGN.md#fair-dispatch)). So
+  each peer gets the same bytes and descriptors in the same order, and
+  output waits at most until what the proxy has received is dispatched.
+  A send fails only when its peer is gone, which ends the session as a
+  lost transport (see [Wire messages](#wire-messages)); by then the proxy
+  may have dispatched batches after the one whose output failed.
+  Tests: `a_burst_of_batches_reaches_the_host_in_one_submission`,
+  `kept_submissions_wait_for_the_messages_that_fill_them`.
 - **A submission carries at most 28 descriptors and ends at a message
   boundary.** 28 is the VirtWL transaction limit
   (`VIRTWL_SEND_MAX_ALLOCS`) and libwayland's `MAX_FDS_OUT`, and

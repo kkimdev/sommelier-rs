@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::allocator::{PendingFence, VirtGpuNode};
 use crate::client_kind::WheelFromTouchpad;
-use crate::connection::{OutgoingMessages, WaylandConnection};
+use crate::connection::{LastSubmission, OutgoingMessages, WaylandConnection};
 use crate::placement_config::PlacementConfig;
 use crate::protocols;
 use crate::protocols::aura_shell::{zaura_output, zaura_toplevel};
@@ -51,8 +51,9 @@ type DispatchResult = Result<Option<Outgoing>, ProtocolError>;
 // wait behind the entire render burst on the current-thread runtime.
 // Keep the fairness quantum short enough that a render burst cannot hold a
 // keyboard or text-input event behind several frames.  Ghostty can emit a
-// dozen small requests per frame at 4K; 32 messages still amortizes a send
-// while bounding the opposite direction to roughly one frame of work.
+// dozen small requests per frame at 4K; 32 messages bound the opposite
+// direction to roughly one frame of work. A batch's output waits for the
+// next ones' (see `Client::flush`), so the quantum costs no send.
 const MAX_MESSAGES_PER_BATCH: usize = 32;
 
 /// How long the accept loop waits after a failed accept.
@@ -275,6 +276,10 @@ struct Client {
     ended: bool,
     /// The guest request waiting for a fence, if one is.
     parked: Option<ParkedRequest>,
+    /// What the batches dispatched so far send each peer and have not sent
+    /// yet, in the order they produced it (see [`Self::flush`]).
+    to_host: OutgoingMessages,
+    to_guest: OutgoingMessages,
 }
 
 impl Client {
@@ -287,6 +292,8 @@ impl Client {
             handler: SommelierHandler::new(),
             ended: false,
             parked: None,
+            to_host: OutgoingMessages::default(),
+            to_guest: OutgoingMessages::default(),
         }
     }
 
@@ -311,6 +318,11 @@ impl Client {
                 continue;
             }
 
+            // Everything received is dispatched: send what it produced
+            // before waiting for more.
+            if !self.flush().await {
+                break;
+            }
             tokio::select! {
                 res = self.client_conn.recv(), if self.parked.is_none() => {
                     match res {
@@ -338,6 +350,10 @@ impl Client {
                 }
             }
         }
+
+        // A session that goes on until a peer closes may still hold output
+        // for the other one.
+        self.flush().await;
 
         // Clipboard receive pumps are tied to this client connection. Stop
         // them before dropping the connection so an unfinished VirtWL transfer
@@ -499,12 +515,15 @@ impl Client {
         // messages. A single transport submission may contain several
         // messages; Wayland associates received descriptors by order, not by
         // an independently addressable byte offset. VirtWL's send path keeps
-        // that same order when it chunks a large byte stream.
-        let mut out = OutgoingMessages::default();
-        // What the messages send back toward their source: host requests
-        // while events are handled (an ack_key, say), guest events while
-        // requests are.
-        let mut reverse_out = OutgoingMessages::default();
+        // that same order when it chunks a large byte stream. The batch
+        // appends to what earlier batches left for each peer.
+        // `reverse_out` is what the messages send back toward their
+        // source: host requests while events are handled (an ack_key, say),
+        // guest events while requests are.
+        let (out, reverse_out) = match direction {
+            Direction::ClientToHost => (&mut self.to_host, &mut self.to_guest),
+            Direction::HostToClient => (&mut self.to_guest, &mut self.to_host),
+        };
         let mut end = None;
         let mut offset: usize = 0;
         let mut processed_messages = 0;
@@ -784,8 +803,8 @@ impl Client {
         // A session that ends gets its one error after the valid messages.
         if let Some(end) = &end {
             let to_guest = match direction {
-                Direction::ClientToHost => &mut reverse_out,
-                Direction::HostToClient => &mut out,
+                Direction::ClientToHost => &mut *reverse_out,
+                Direction::HostToClient => &mut *out,
             };
             to_guest.push(crate::handler::display::session_error(end));
         }
@@ -802,21 +821,28 @@ impl Client {
             crate::test_support::counting::uncounted(|| self.ctx.assert_no_orphans());
         }
 
-        // A send passes the peer copies of the descriptors. `out` and
-        // `reverse_out` still own them and close them when the batch ends,
-        // whether or not their send succeeded, as on any early return.
+        // A send passes the peer copies of the descriptors, which the
+        // pending output then closes; a failed send drops it all. Only full
+        // submissions go out while the session goes on: later batches may
+        // fill the last one, which `flush` sends before the proxy waits. A
+        // session that ends sends everything, its error last.
+        let last = if end.is_none() {
+            LastSubmission::Keep
+        } else {
+            LastSubmission::Send
+        };
         let mut success = end.is_none();
-        if !out.is_empty() && other_conn.send_messages(&out).await.is_err() {
+        if other_conn.send_submissions(out, last).await.is_err() {
             success = false;
         }
 
-        // The reverse output goes back through the source connection after
-        // the forwarded messages. A forwarded wl_keyboard.key therefore
-        // reaches the guest *before* its ack_key reaches the host. This is
-        // intentional and safe: Exo holds the key in pending_key_acks_ with a
+        // The reverse output goes back through the source connection, apart
+        // from the forwarded messages, so a forwarded wl_keyboard.key may
+        // reach the guest before or after its ack_key reaches the host.
+        // Either is safe: Exo holds the key in pending_key_acks_ with a
         // 1000 ms TTL, so the ack always arrives well within the window. The
-        // C sommelier exhibits the same ordering.
-        if !reverse_out.is_empty() && conn.send_messages(&reverse_out).await.is_err() {
+        // C sommelier sends the key first.
+        if conn.send_submissions(reverse_out, last).await.is_err() {
             // success=false signals the caller (handle_msgs) to drop this
             // client connection.
             success = false;
@@ -825,6 +851,19 @@ impl Client {
         conn.read_buf.drain(..offset);
         self.ended = !success;
         success
+    }
+
+    /// Send all the output the batches dispatched so far left for either
+    /// peer, as `run` does before it waits and when the session ends; the
+    /// peers' streams are independent, so only each one's order matters.
+    /// Returns whether the session goes on: a failed send ends it.
+    async fn flush(&mut self) -> bool {
+        let to_host = self.host_conn.send_messages(&mut self.to_host).await;
+        let to_guest = self.client_conn.send_messages(&mut self.to_guest).await;
+        if to_host.is_err() || to_guest.is_err() {
+            self.ended = true;
+        }
+        !self.ended
     }
 }
 
@@ -844,6 +883,16 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+    impl Client {
+        /// Dispatch one batch and send what it produced, as `run` does
+        /// once nothing more is buffered; returns whether the session goes
+        /// on.
+        async fn handle_msgs_and_flush(&mut self, direction: Direction) -> bool {
+            let goes_on = self.handle_msgs(direction).await;
+            self.flush().await && goes_on
+        }
+    }
 
     #[test]
     fn generated_classifier_routes_each_protocol_family() {
@@ -992,7 +1041,7 @@ mod tests {
         for event in events {
             client.host_conn.read_buf.extend_from_slice(event);
         }
-        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
         assert!(client.host_conn.read_buf.is_empty());
     }
 
@@ -1134,7 +1183,7 @@ mod tests {
 
         let (destroy, _) = wl_buffer::req::destroy(GUEST);
         client.client_conn.read_buf.extend_from_slice(&destroy);
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
         assert_eq!(client.ctx.shadow_table.request_sender(GUEST), None);
         assert!(client.ctx.shadow_table.is_pending_destroy_guest(GUEST));
 
@@ -1365,6 +1414,69 @@ mod tests {
             .await;
     }
 
+    /// A burst of requests longer than one fairness batch reaches the host
+    /// in as few submissions as fit it, not one per batch: each submission
+    /// is a synchronous VirtWL round trip.
+    #[tokio::test]
+    async fn a_burst_of_batches_reaches_the_host_in_one_submission() {
+        use crate::protocols::wayland::wl_region;
+        use std::os::fd::AsRawFd;
+
+        const GUEST_REGION: u32 = 30;
+        const HOST_REGION: u32 = 31;
+        const REQUESTS: usize = 100;
+        const { assert!(REQUESTS > 3 * MAX_MESSAGES_PER_BATCH) };
+        let (guest_peer, client_socket) =
+            std::os::unix::net::UnixStream::pair().expect("a guest socket pair");
+        // A sequenced-packet host keeps each submission apart.
+        let (host_peer, host_socket) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::SeqPacket,
+            None,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        )
+        .expect("a host socket pair");
+        let mut client = Client::new(
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket).expect("register test socket"),
+            Context::new_for_test(false, false, Vec::new()),
+        );
+        client
+            .ctx
+            .shadow_table
+            .insert_paired_for_test(GUEST_REGION, HOST_REGION, "wl_region");
+
+        // The guest writes the burst at once and goes away, which ends the
+        // proxy once it has dispatched the burst.
+        let requests: Vec<u8> = (0..REQUESTS as i32)
+            .flat_map(|x| wl_region::req::add(GUEST_REGION, x, 0, 1, 1).0)
+            .collect();
+        (&guest_peer).write_all(&requests).expect("send the burst");
+        drop(guest_peer);
+        client.run().await;
+
+        let mut submissions = Vec::new();
+        loop {
+            let mut data = [0u8; 4096];
+            let received = nix::sys::socket::recv(
+                host_peer.as_raw_fd(),
+                &mut data,
+                nix::sys::socket::MsgFlags::empty(),
+            )
+            .expect("receive from the proxy");
+            if received == 0 {
+                break;
+            }
+            submissions.push(data[..received].to_vec());
+        }
+        let forwarded: Vec<u8> = (0..REQUESTS as i32)
+            .flat_map(|x| wl_region::req::add(HOST_REGION, x, 0, 1, 1).0)
+            .collect();
+        let sizes: Vec<usize> = submissions.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [forwarded.len()], "bytes per submission");
+        assert_eq!(submissions.concat(), forwarded);
+    }
+
     /// A VirtWL transaction carries at most 28 descriptors, so a batch that
     /// forwards more must be split, between messages.
     #[tokio::test]
@@ -1408,7 +1520,7 @@ mod tests {
                 .expect("receive the requests"),
             requests.len()
         );
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
         drop(client);
 
         // Read the host side one submission at a time.
@@ -1495,7 +1607,7 @@ mod tests {
         for _ in 0..=MAX_MESSAGES_PER_BATCH {
             client.host_conn.read_buf.extend_from_slice(&message);
         }
-        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
         assert!(
             client.host_conn.has_complete_message(),
             "a bounded batch must leave complete frames for the next loop turn"
@@ -1506,7 +1618,7 @@ mod tests {
             "exactly one frame should remain after the first bounded batch"
         );
 
-        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
         assert!(client.host_conn.read_buf.is_empty());
     }
 
@@ -1631,7 +1743,7 @@ mod tests {
         client.host_conn.read_fds.push_back(keymap_fd);
 
         assert!(
-            client.handle_msgs(Direction::HostToClient).await,
+            client.handle_msgs_and_flush(Direction::HostToClient).await,
             "a known stale event with an FD must not terminate the connection"
         );
         assert!(client.host_conn.read_buf.is_empty());
@@ -1670,7 +1782,7 @@ mod tests {
             .extend_from_slice(&live_repeat_info[..4]);
         client.host_conn.read_fds.push_back(keymap_fd);
 
-        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
         assert_eq!(
             client.host_conn.read_buf,
             live_repeat_info[..4],
@@ -1693,7 +1805,7 @@ mod tests {
             .read_buf
             .extend_from_slice(&live_repeat_info[4..]);
         assert!(
-            client.handle_msgs(Direction::HostToClient).await,
+            client.handle_msgs_and_flush(Direction::HostToClient).await,
             "the completed live follow-up must remain decodable"
         );
         assert!(client.host_conn.read_buf.is_empty());
@@ -1735,7 +1847,7 @@ mod tests {
             .push_back(unsafe { OwnedFd::from_raw_fd(pending_fd) });
 
         assert!(
-            client.handle_msgs(Direction::HostToClient).await,
+            client.handle_msgs_and_flush(Direction::HostToClient).await,
             "a pending FD after an untracked complete message must not terminate the connection"
         );
         assert!(
@@ -1790,7 +1902,7 @@ mod tests {
             .host_conn
             .read_fds
             .push_back(unsafe { OwnedFd::from_raw_fd(pending_fd) });
-        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
         assert_eq!(client.host_conn.read_buf.len(), 4);
 
         // The rest of the follow-up arrives in a later recv/handle_msgs call.
@@ -1805,7 +1917,7 @@ mod tests {
             .shadow_table
             .insert_host_only_for_test(88, "wl_display", 1);
         assert!(
-            !client.handle_msgs(Direction::HostToClient).await,
+            !client.handle_msgs_and_flush(Direction::HostToClient).await,
             "descriptor ambiguity must remain fatal across receive calls"
         );
         drop(client);
@@ -1851,7 +1963,7 @@ mod tests {
             .insert_host_only_for_test(88, "wl_display", 1);
 
         assert!(
-            !client.handle_msgs(Direction::HostToClient).await,
+            !client.handle_msgs_and_flush(Direction::HostToClient).await,
             "complete untracked message plus a complete follow-up is fatal FD ambiguity"
         );
         drop(client);
@@ -1886,7 +1998,7 @@ mod tests {
         }
         client.host_conn.read_fds.push_back(pending.into());
 
-        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        assert!(!client.handle_msgs_and_flush(Direction::HostToClient).await);
         drop(client);
         let mut events = Vec::new();
         std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
@@ -2129,7 +2241,7 @@ mod tests {
             .read_buf
             .extend(created.build_message(HOST_PARAMS, zwp_linux_buffer_params_v1::EVT_CREATED));
 
-        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        assert!(!client.handle_msgs_and_flush(Direction::HostToClient).await);
         drop(client);
         let mut events = Vec::new();
         std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
@@ -2218,7 +2330,7 @@ mod tests {
             .read_buf
             .extend(remove.build_message(HOST_REGISTRY, wl_registry::EVT_GLOBAL_REMOVE));
 
-        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        assert!(!client.handle_msgs_and_flush(Direction::HostToClient).await);
         drop(client);
         assert_eq!(sent_messages(&mut host_peer), Vec::new());
         assert_eq!(
@@ -2271,7 +2383,7 @@ mod tests {
             .read_buf
             .extend(create.build_message(PARAMS, zwp_linux_buffer_params_v1::REQ_CREATE));
 
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        assert!(!client.handle_msgs_and_flush(Direction::ClientToHost).await);
         drop(client);
         assert_eq!(sent_messages(&mut host_peer), Vec::new());
         assert_eq!(
@@ -2595,7 +2707,7 @@ mod tests {
         let (mut client, mut guest_peer, mut host_peer, _signal) =
             client_committing_a_fenced_buffer(PlaneFenceForTest::SyncFile, 1);
 
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
         assert!(client.parked.is_some());
         assert_eq!(
             client.ctx.shadow_table.get_host_id(SYNC_CALLBACK),
@@ -2608,7 +2720,7 @@ mod tests {
             "fair dispatch must not offer a parked stream"
         );
         let deadline = client.parked.as_ref().map(|parked| parked.deadline);
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
         assert_eq!(
             client.parked.as_ref().map(|parked| parked.deadline),
             deadline,
@@ -2624,7 +2736,7 @@ mod tests {
             Some(Direction::HostToClient),
             "a parked client still serves the host"
         );
-        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
         assert!(client.parked.is_some());
         drop(client);
         assert_eq!(
@@ -2858,14 +2970,14 @@ mod tests {
         let fence = fd_identity(signal.as_raw_fd());
 
         let start = Instant::now();
-        let mut alive = client.handle_msgs(Direction::ClientToHost).await;
+        let mut alive = client.handle_msgs_and_flush(Direction::ClientToHost).await;
         while alive {
             assert!(
                 start.elapsed() < crate::allocator::VIRTGPU_WAIT_TIMEOUT * 4,
                 "the session outlives its deadline"
             );
             ParkedRequest::due(client.parked.as_ref()).await;
-            alive = client.handle_msgs(Direction::ClientToHost).await;
+            alive = client.handle_msgs_and_flush(Direction::ClientToHost).await;
         }
         let lasted = start.elapsed();
 
@@ -2925,7 +3037,7 @@ mod tests {
     async fn a_slow_fallback_fence_outlasts_the_sync_file_bound() {
         let (mut client, _guest_peer, mut host_peer, signal) =
             client_committing_a_fenced_buffer(PlaneFenceForTest::Busy, 1);
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
         let start = Instant::now();
         let gpu_time = crate::allocator::SYNC_FILE_TIMEOUT * 5;
         assert!(gpu_time < crate::allocator::VIRTGPU_WAIT_TIMEOUT);
@@ -2935,7 +3047,7 @@ mod tests {
             }
             ParkedRequest::due(client.parked.as_ref()).await;
             assert!(
-                client.handle_msgs(Direction::ClientToHost).await,
+                client.handle_msgs_and_flush(Direction::ClientToHost).await,
                 "a slow fallback fence must not end the session"
             );
         }
@@ -3167,7 +3279,7 @@ mod tests {
         client.client_conn.read_buf.extend_from_slice(&request);
 
         assert!(
-            !client.handle_msgs(Direction::ClientToHost).await,
+            !client.handle_msgs_and_flush(Direction::ClientToHost).await,
             "a request from a pending xdg_surface must terminate the session"
         );
         assert!(
@@ -3199,7 +3311,7 @@ mod tests {
         let (mut client, _guest_peer, mut host_peer) = client_with_xdg_surface();
         let request = get_toplevel_request(&[]);
         client.client_conn.read_buf.extend_from_slice(&request);
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
         assert_eq!(
             client.ctx.xdg_roles.wl_surface_of_toplevel(XDG_TOPLEVEL),
             Some(WL_SURFACE)
@@ -3240,7 +3352,7 @@ mod tests {
         let request = get_toplevel_request(&[0]);
         client.client_conn.read_buf.extend_from_slice(&request);
 
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        assert!(!client.handle_msgs_and_flush(Direction::ClientToHost).await);
         assert_eq!(
             client.ctx.xdg_roles.toplevel_of_xdg_surface(XDG_SURFACE),
             None
@@ -3265,7 +3377,7 @@ mod tests {
         let request = get_toplevel_request(&[]);
         client.client_conn.read_buf.extend_from_slice(&request);
 
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        assert!(!client.handle_msgs_and_flush(Direction::ClientToHost).await);
         assert_eq!(
             client.ctx.xdg_roles.toplevel_of_xdg_surface(XDG_SURFACE),
             None
@@ -3495,7 +3607,7 @@ mod tests {
         client.host_conn.read_fds.push_back(pending.into());
 
         assert!(
-            !client.handle_msgs(Direction::HostToClient).await,
+            !client.handle_msgs_and_flush(Direction::HostToClient).await,
             "trailing bytes in a host event end the session"
         );
         assert!(
