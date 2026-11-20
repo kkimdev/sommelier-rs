@@ -651,11 +651,6 @@ impl Context {
     }
 
     #[cfg(test)]
-    pub(crate) fn has_render_buffer_host(&self, host_id: HostId) -> bool {
-        self.render_buffers.contains(host_id)
-    }
-
-    #[cfg(test)]
     pub(crate) fn render_buffer_count(&self) -> usize {
         self.render_buffers.len()
     }

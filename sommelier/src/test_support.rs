@@ -165,20 +165,6 @@ pub fn msg_opcode(message: &[u8]) -> u16 {
     msg_header(message).opcode
 }
 
-/// The object and code of the `wl_display.error` that ends the session
-/// with the message `ctx` is dispatching.
-pub fn protocol_error(ctx: &crate::state::Context) -> (u32, u32) {
-    let end = ctx.session_end().expect("the message ends the session");
-    let (message, _) = crate::handler::display::session_error(end);
-    assert_eq!(msg_sender(&message), 1);
-    assert_eq!(
-        msg_opcode(&message),
-        crate::protocols::wayland::wl_display::EVT_ERROR
-    );
-    let word = |at: usize| u32::from_ne_bytes(message[at..at + 4].try_into().unwrap());
-    (word(8), word(12))
-}
-
 /// The `(sender, opcode)` of every message in a proxy message queue.
 pub fn queued_headers(queue: &[crate::wire::Outgoing]) -> Vec<(u32, u16)> {
     queue

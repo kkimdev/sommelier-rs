@@ -140,176 +140,248 @@ impl wl_display::WlDisplayHandler for Handlers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
-    use crate::state::Singleton;
-    use crate::state::{Context, HostId};
-    use crate::test_support::{protocol_error, queued_headers, raw_dispatch};
-    use crate::wire::{ProtocolError, WireMessage};
+    use crate::placement_config::PlacementConfig;
+    use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface};
+    use crate::protocols::gtk::gtk_shell1;
+    use crate::protocols::keyboard_extension_unstable_v1::{
+        zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
+    };
+    use crate::protocols::wayland::{wl_keyboard, wl_output, wl_surface};
+    use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::proxy::harness::{Object, Session};
 
-    #[test]
-    fn delete_id_for_an_untracked_host_id_changes_nothing() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+    /// The guest's `delete_id` of `id`.
+    fn deleted(id: u32) -> (u32, AnyEvent) {
+        (WL_DISPLAY_ID, wl_display::Event::DeleteId { id }.into())
+    }
+
+    /// A `delete_id` for a host ID the proxy does not track changes
+    /// nothing: the guest gets nothing, and the ID is not freed, so the
+    /// next host object the proxy creates gets the next ID, as the host
+    /// checks.
+    #[tokio::test]
+    async fn delete_id_for_an_untracked_host_id_changes_nothing() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
         const UNTRACKED: u32 = 40;
-        assert!(ctx.register_native_buffer(UNTRACKED, (1, 1), Vec::new()));
+        assert!(surface.host < UNTRACKED);
 
-        assert_eq!(Handlers::on_delete_id(&mut ctx, UNTRACKED), Action::Drop);
-        assert!(
-            ctx.has_render_buffer_host(HostId(UNTRACKED)),
-            "a delete_id the table does not track must not end other state"
-        );
-        assert!(ctx.host_to_client_queue.is_empty());
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, UNTRACKED)])
+            .await;
+        assert_eq!(s.guest_received(), []);
+        assert_eq!(s.surface().await.host, surface.host + 1);
+    }
+
+    /// The guest binds output global `name` from `registry` at v3, which
+    /// the proxy gives an Aura output from host `shell`; returns the output
+    /// and its Aura output.
+    async fn bind_output(
+        s: &mut Session,
+        registry: Object,
+        name: u32,
+        shell: u32,
+    ) -> (Object, u32) {
+        let id = s.new_id();
+        s.guest([wl_registry::req::bind(registry.id, name, "wl_output", 3, id).unwrap()])
+            .await;
+        let host = s.host_received();
+        let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id: bound, .. })), (
+            sender,
+            AnyRequest::ZauraShell(zaura_shell::Request::GetAuraOutput {
+                id: aura_output,
+                output,
+            }),
+        )] = &host[..]
+        else {
+            panic!("the output got no Aura output: {host:?}");
+        };
+        assert_eq!((*sender, *output), (shell, bound.2));
+        (Object { id, host: bound.2 }, *aura_output)
     }
 
     /// A host may destroy a guest's object on its own (INVARIANTS "Object
     /// lifetimes"). Its `delete_id` must forget the object's state, as the
     /// guest's destructor would, so the host ID the allocator hands out next
-    /// starts clean.
-    #[test]
-    fn a_host_destroyed_output_is_forgotten() {
-        use crate::handler::Handlers;
-        use crate::protocols::aura_shell::zaura_output;
-        use crate::protocols::wayland::wl_registry::WlRegistryHandler;
-        let mut ctx = Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::active_for_test(&[]),
-        );
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let output = "wl_output".to_string();
-        Handlers::on_global(&mut ctx, 11, &"zaura_shell".to_string(), 38);
-        Handlers::on_global(&mut ctx, 10, &output, 3);
-        Handlers::on_bind(&mut ctx, 10, &(output.clone(), 3, 20));
-        let host = ctx.shadow_table.get_host_id(20).expect("a bound output");
-        let aura_output = ctx.outputs.aura_output(host).expect("an Aura output");
-        ctx.client_to_host_queue.clear();
-        ctx.host_to_client_queue.clear();
+    /// starts clean: the next output gets it, and an Aura output of its
+    /// own.
+    #[tokio::test]
+    async fn a_host_destroyed_output_is_forgotten() {
+        let placement = PlacementConfig::active_for_test(&[]);
+        let mut s = Session::with_context(Context::with_placement_for_test(placement));
+        let registry = s.registry().await;
+        let shell = s.aura_shell().await;
+        let name = s.advertise("wl_output", 3).await;
+        s.guest_received();
+        let (output, aura_output) = bind_output(&mut s, registry, name, shell).await;
 
-        Handlers::on_delete_id(&mut ctx, host);
-
+        s.host_may_end(|_, interface| interface == wl_output::NAME);
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, output.host)])
+            .await;
         assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(aura_output, zaura_output::REQ_RELEASE)]
+            s.host_received(),
+            [(aura_output, zaura_output::Request::Release {}.into())]
         );
-        assert!(ctx.outputs.is_empty_for_test());
-        assert_eq!(
-            queued_headers(&ctx.host_to_client_queue),
-            [(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)]
-        );
-        ctx.assert_no_orphans();
+        assert_eq!(s.guest_received(), [deleted(output.id)]);
 
-        // The next output gets the freed host ID.
-        Handlers::on_bind(&mut ctx, 10, &(output, 3, 21));
-        assert_eq!(ctx.shadow_table.get_host_id(21), Some(host));
-        assert_eq!(ctx.outputs.live_outputs(), [host]);
+        let (next, _) = bind_output(&mut s, registry, name, shell).await;
+        assert_eq!(next.host, output.host);
     }
 
-    #[test]
-    fn a_host_destroyed_keyboard_is_forgotten() {
-        use crate::handler::Handlers;
-        use crate::protocols::keyboard_extension_unstable_v1::{
-            zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
-        };
-        const SEAT: u32 = 10;
-        const EXTENSION: u32 = 100;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_for_test(SEAT, 11, "wl_seat");
-        ctx.shadow_table
-            .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
-        ctx.singletons
-            .bind_for_test(Singleton::KeyboardExtension, EXTENSION);
-        let host = ctx.shadow_table.create_paired(20, Iface::WlKeyboard, 1, 1);
-        crate::handler::keyboard::for_test::created(&mut ctx, 20, host, SEAT);
-        crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
-        let extended = ctx
-            .keys
-            .keyboards()
-            .extended_for_test(HostId(host))
-            .unwrap();
-        ctx.client_to_host_queue.clear();
+    /// A keyboard whose first enter has bound its `zcr_extended_keyboard_v1`
+    /// from the proxy's keyboard extension.
+    struct Extended {
+        s: Session,
+        seat: u32,
+        surface: Object,
+        /// The host `zcr_keyboard_extension_v1`.
+        extension: u32,
+        keyboard: Object,
+        /// The host `zcr_extended_keyboard_v1` of `keyboard`.
+        extended: u32,
+    }
 
-        Handlers::on_delete_id(&mut ctx, host);
+    impl Extended {
+        async fn new() -> Self {
+            let mut s = Session::new();
+            s.advertise(zcr_keyboard_extension_v1::NAME, 2).await;
+            let host = s.host_received();
+            let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))] = &host[..]
+            else {
+                panic!("the proxy did not bind the keyboard extension: {host:?}");
+            };
+            let extension = id.2;
+            let (seat, keyboard) = s.keyboard().await;
+            let surface = s.surface().await;
+            let extended = Self::enter(&mut s, extension, keyboard, surface, 1).await;
+            Self {
+                s,
+                seat,
+                surface,
+                extension,
+                keyboard,
+                extended,
+            }
+        }
 
+        /// The host's keyboard focus enters `surface` on `keyboard` with
+        /// `serial`, its first enter, which binds its extended keyboard
+        /// from `extension`; returns it.
+        async fn enter(
+            s: &mut Session,
+            extension: u32,
+            keyboard: Object,
+            surface: Object,
+            serial: u32,
+        ) -> u32 {
+            s.host([wl_keyboard::evt::enter(keyboard.host, serial, surface.host, &[]).unwrap()])
+                .await;
+            assert_eq!(s.guest_received().len(), 2, "the enter and its modifiers");
+            let host = s.host_received();
+            let [(
+                sender,
+                AnyRequest::ZcrKeyboardExtensionV1(
+                    zcr_keyboard_extension_v1::Request::GetExtendedKeyboard { id, keyboard: of },
+                ),
+            )] = host[..]
+            else {
+                panic!("the keyboard got no extended keyboard: {host:?}");
+            };
+            assert_eq!((sender, of), (extension, keyboard.host));
+            id
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_destroyed_keyboard_is_forgotten() {
+        let Extended {
+            mut s,
+            seat,
+            surface,
+            extension,
+            keyboard,
+            extended,
+        } = Extended::new().await;
+
+        s.host_may_end(|_, interface| interface == wl_keyboard::NAME);
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, keyboard.host)])
+            .await;
         assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(extended.0, zcr_extended_keyboard_v1::REQ_DESTROY)]
+            s.host_received(),
+            [(
+                extended,
+                zcr_extended_keyboard_v1::Request::Destroy {}.into()
+            )]
         );
-        assert!(ctx.shadow_table.is_retired_host(extended.0));
-        assert!(ctx.keys.keyboards().is_empty());
-        assert!(!ctx.is_fatal());
-        ctx.assert_no_orphans();
+        assert_eq!(s.guest_received(), [deleted(keyboard.id)]);
 
         // The next keyboard gets the freed host ID, and its own extended
         // keyboard.
-        ctx.client_to_host_queue.clear();
-        assert_eq!(
-            ctx.shadow_table.create_paired(21, Iface::WlKeyboard, 1, 1),
-            host
-        );
-        crate::handler::keyboard::for_test::created(&mut ctx, 21, host, SEAT);
-        crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(
-                EXTENSION,
-                zcr_keyboard_extension_v1::REQ_GET_EXTENDED_KEYBOARD
-            )]
-        );
+        let next = s.keyboard_of(seat).await;
+        assert_eq!(next.host, keyboard.host);
+        Extended::enter(&mut s, extension, next, surface, 2).await;
     }
 
     /// An object is forgotten once, at its first end: the `delete_id` that
     /// acknowledges the guest's destructor forgets nothing again, so the
     /// extended keyboard is destroyed and retired once.
-    #[test]
-    fn a_delete_id_after_the_destructor_forgets_nothing_again() {
-        use crate::handler::Handlers;
-        const EXTENSION: u32 = 100;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
-        ctx.singletons
-            .bind_for_test(Singleton::KeyboardExtension, EXTENSION);
-        let host = ctx.shadow_table.create_paired(20, Iface::WlKeyboard, 1, 1);
-        crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
-        ctx.guest_destroyed(20);
-        ctx.client_to_host_queue.clear();
-
-        Handlers::on_delete_id(&mut ctx, host);
-
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert!(!ctx.is_fatal(), "the extended keyboard is retired once");
+    #[tokio::test]
+    async fn a_delete_id_after_the_destructor_forgets_nothing_again() {
+        let Extended {
+            mut s,
+            keyboard,
+            extended,
+            ..
+        } = Extended::new().await;
+        s.guest([wl_keyboard::req::release(keyboard.id)]).await;
         assert_eq!(
-            queued_headers(&ctx.host_to_client_queue),
-            [(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)]
+            s.host_received(),
+            [
+                (keyboard.host, wl_keyboard::Request::Release {}.into()),
+                (
+                    extended,
+                    zcr_extended_keyboard_v1::Request::Destroy {}.into()
+                ),
+            ]
         );
+
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, keyboard.host)])
+            .await;
+        assert_eq!(
+            s.host_received(),
+            [],
+            "the extended keyboard is retired once"
+        );
+        assert_eq!(s.guest_received(), [deleted(keyboard.id)]);
     }
 
-    #[test]
-    fn a_host_destroyed_surface_is_forgotten() {
-        use crate::protocols::aura_shell::zaura_surface;
-        const SURFACE: u32 = 30;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.bind_aura_shell_for_test(100);
-        let host = ctx
-            .shadow_table
-            .create_paired(SURFACE, Iface::WlSurface, 1, 1);
-        ctx.create_surface(SURFACE);
-        let aura_surface =
-            crate::handler::aura_objects::ensure_host_zaura_surface(&mut ctx, SURFACE)
-                .expect("an Aura surface");
-        ctx.client_to_host_queue.clear();
+    #[tokio::test]
+    async fn a_host_destroyed_surface_is_forgotten() {
+        let mut s = Session::new();
+        let gtk = s.gtk_shell(zaura_shell::VERSION).await;
+        let surface = s.surface().await;
+        let gtk_surface = s.new_id();
+        s.guest([gtk_shell1::req::get_gtk_surface(
+            gtk.id,
+            gtk_surface,
+            surface.id,
+        )])
+        .await;
+        let host = s.host_received();
+        let [(_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { id, .. })), ..] =
+            host[..]
+        else {
+            panic!("the surface got no Aura surface: {host:?}");
+        };
+        let aura_surface = id;
 
-        Handlers::on_delete_id(&mut ctx, host);
-
+        s.host_may_end(|_, interface| interface == wl_surface::NAME);
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, surface.host)])
+            .await;
         assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(aura_surface, zaura_surface::REQ_RELEASE)]
+            s.host_received(),
+            [(aura_surface, zaura_surface::Request::Release {}.into())]
         );
-        assert_eq!(ctx.aura_surfaces.count(), 0);
-        assert!(ctx.surfaces.is_empty());
-        assert_eq!(
-            queued_headers(&ctx.host_to_client_queue),
-            [(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)]
-        );
-        ctx.assert_no_orphans();
+        assert_eq!(s.guest_received(), [deleted(surface.id)]);
     }
 
     /// The host object of an active text input is gone with its
@@ -319,8 +391,6 @@ mod tests {
     async fn a_host_destroyed_text_input_sends_nothing_to_its_host_object() {
         use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
         use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-        use crate::protocols::wayland::wl_keyboard;
-        use crate::proxy::harness::Session;
 
         let mut s = Session::new();
         let (seat, keyboard) = s.keyboard().await;
@@ -352,65 +422,45 @@ mod tests {
         assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
     }
 
-    #[test]
-    fn unmapped_request_is_rejected_before_handler_state_mutation() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let payload = 20u32.to_ne_bytes();
-        let mut msg = WireMessage::new(999, wl_display::REQ_GET_REGISTRY, &payload);
-
-        assert_eq!(
-            raw_dispatch(crate::test_support::dispatch_request(&mut ctx, &mut msg)),
-            Err(ProtocolError::InvalidSender(999))
-        );
-        assert!(
-            !ctx.is_fatal(),
-            "an invalid sender must not reach a mutating handler"
-        );
-    }
-
-    #[test]
-    fn unmapped_host_error_is_not_encoded_with_invalid_object_zero() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-
-        assert_eq!(
-            Handlers::on_error(&mut ctx, 77, 3, &"internal error".to_string()),
-            Action::Drop
-        );
-        assert_eq!(
-            ctx.session_end(),
-            Some(&SessionEnd::Internal),
-            "an unmapped host-only object must not name the guest's object 0"
-        );
-    }
-
     /// The host's error reaches the guest on its object and with its code,
     /// its diagnostic bounded like the proxy's own.
-    #[test]
-    fn a_host_error_is_forwarded_with_a_bounded_diagnostic() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
+    #[tokio::test]
+    async fn a_host_error_is_forwarded_with_a_bounded_diagnostic() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
 
-        Handlers::on_error(&mut ctx, 77, 3, &"x".repeat(2_000));
+        let diagnostic = "x".repeat(2_000);
+        s.host_fatal([
+            wl_display::evt::error(WL_DISPLAY_ID, surface.host, 3, &diagnostic).unwrap(),
+        ])
+        .await;
 
-        assert_eq!(protocol_error(&ctx), (7, 3));
-        let (error, _) = session_error(ctx.session_end().expect("the session ends"));
+        let (events, error, message) = s.guest_received_and_diagnosed_error();
+        assert_eq!((events, error), (vec![], (surface.id, 3)));
         assert_eq!(
-            u32::from_ne_bytes(error[16..20].try_into().unwrap()),
-            1025,
-            "the diagnostic keeps 1024 bytes and its terminator"
+            message,
+            diagnostic[..1024],
+            "the diagnostic keeps 1024 bytes"
         );
     }
 
-    #[test]
-    fn fatal_protocol_error_keeps_a_bounded_diagnostic() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        assert_eq!(ctx.reject(7, 3, "x".repeat(4_084)), Action::Drop);
+    /// A diagnostic the proxy writes itself is bounded too, so that its
+    /// error fits a message: here one that names the interface of a bind,
+    /// which the guest made nearly as long as a message.
+    #[tokio::test]
+    async fn fatal_protocol_error_keeps_a_bounded_diagnostic() {
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        let interface = "x".repeat(4_000);
+        let id = s.new_id();
+        s.guest_fatal([wl_registry::req::bind(registry.id, 7, &interface, 1, id).unwrap()])
+            .await;
 
-        let (error, _) = session_error(ctx.session_end().expect("the session ends"));
-        assert!(
-            error.len() <= crate::wire::MessageHeader::MAX_LEN,
-            "the bounded diagnostic must fit Wayland's message length field"
+        let (events, error, message) = s.guest_received_and_diagnosed_error();
+        assert_eq!(
+            (events, error),
+            (vec![], (registry.id, wl_display::ERROR_INVALID_OBJECT))
         );
-        assert_eq!(protocol_error(&ctx), (7, 3));
+        assert!(message.len() <= 1024, "{} bytes", message.len());
     }
 }

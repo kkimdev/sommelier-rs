@@ -105,93 +105,158 @@ impl WlCallbackHandler for Handlers {
 
 #[cfg(test)]
 mod tests {
-    use crate::handler::Handlers;
-    use crate::protocols::wayland::wl_callback::WlCallbackHandler;
-    use crate::protocols::wayland::wl_display::WlDisplayHandler;
-    use crate::protocols::Iface;
-    use crate::state::{Context, HostId, InternalCallback};
-    use crate::wire::Action;
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
+    use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
+    use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::proxy::harness::Session;
+    use crate::state::Context;
+    use crate::wire::WL_DISPLAY_ID;
 
-    #[test]
-    fn internal_sync_is_a_tracked_host_callback() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let waits_for = InternalCallback::DmabufCapabilities { generation: 9 };
-        let callback = super::queue_internal_sync(&mut ctx, waits_for);
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        let message = &ctx.client_to_host_queue[0].0;
-        assert_eq!(
-            crate::test_support::msg_sender(message),
-            1,
-            "wl_display must own the sync request"
-        );
-        assert_eq!(
-            crate::test_support::msg_opcode(message),
-            crate::protocols::wayland::wl_display::REQ_SYNC
-        );
-        assert_eq!(
-            u32::from_ne_bytes(message[8..12].try_into().unwrap()),
-            callback.0
-        );
-        assert_eq!(ctx.internal_callbacks.get(callback), Some(waits_for));
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(callback.0),
-            Some(Iface::WlCallback)
-        );
+    /// The callback of a `wl_display.sync` the host got from the proxy.
+    fn synced(request: &(u32, AnyRequest)) -> u32 {
+        match request {
+            (WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback })) => {
+                *callback
+            }
+            _ => panic!("{request:?} is no sync"),
+        }
     }
 
-    #[test]
-    fn internal_dmabuf_callback_completes_exact_generation() {
-        let callback_id = 40;
-        let generation = 7;
+    /// The proxy's own sync, here the one that asks for a `gtk_shell1`'s
+    /// capabilities, is a host callback the proxy tracks: its `done` and
+    /// `delete_id` reach the proxy alone, and its ID stays reserved until
+    /// the `delete_id`, which frees it for the next host object.
+    #[tokio::test]
+    async fn internal_sync_is_a_tracked_host_callback() {
+        use crate::protocols::aura_shell::zaura_shell;
+        use crate::protocols::gtk::gtk_shell1;
+        let mut s = Session::new();
+        // Binds the compositor, so that each later surface takes one host
+        // ID.
+        s.surface().await;
+        let registry = s.registry().await;
+        let name = s.advertise(zaura_shell::NAME, zaura_shell::VERSION).await;
+        s.host_received();
+        s.guest_received();
+        let gtk_shell = s.new_id();
+        s.guest([
+            wl_registry::req::bind(registry.id, name, gtk_shell1::NAME, 1, gtk_shell).unwrap(),
+        ])
+        .await;
+        let host = s.host_received();
+        let [ref sync] = host[..] else {
+            panic!("the host got {host:?}, not one sync");
+        };
+        let callback = synced(sync);
+
+        s.host([wl_callback::evt::done(callback, 0)]).await;
+        let capabilities = gtk_shell1::Event::Capabilities { capabilities: 0 };
+        assert_eq!(s.guest_received(), [(gtk_shell, capabilities.into())]);
+        let surface = s.surface().await;
+        assert_ne!(surface.host, callback, "reserved until its delete_id");
+
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, callback)])
+            .await;
+        assert_eq!(s.guest_received(), []);
+        assert_eq!(s.surface().await.host, callback, "freed by its delete_id");
+    }
+
+    /// The `done` of a linux-dmabuf capability sync completes the
+    /// generation the sync was for: the `done` of a retired binding's sync
+    /// does not complete its replacement's, whose guest global waits for
+    /// its own.
+    #[tokio::test]
+    async fn internal_dmabuf_callback_completes_exact_generation() {
+        let dmabuf = zwp_linux_dmabuf_v1::NAME;
         let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.shadow_table
-            .insert_host_only_for_test(callback_id, "wl_callback", 1);
-        ctx.dmabuf_capabilities.entry(generation).or_default();
-        ctx.host_dmabuf_generation = Some(generation);
-        ctx.internal_callbacks.register(
-            HostId(callback_id),
-            InternalCallback::DmabufCapabilities { generation },
-        );
-        ctx.last_sender_id = callback_id;
+        // Stands in for a virtio-gpu render node, which the proxy
+        // synthesizes feedback for and a test cannot have.
+        ctx.synthetic_feedback_available_for_test = true;
+        let mut s = Session::with_context(ctx);
+        let registry = s.registry().await;
+        let old = s.advertise(dmabuf, 4).await;
+        let host = s.host_received();
+        let [_, ref sync] = host[..] else {
+            panic!("the host got {host:?}, not a bind and a sync");
+        };
+        let old_callback = synced(sync);
+        let replacement = s.advertise(dmabuf, 4).await;
+        assert_eq!(s.host_received(), []);
+        assert_eq!(s.guest_received(), []);
 
-        assert_eq!(Handlers::on_done(&mut ctx, 0), Action::Drop);
-        assert!(ctx.dmabuf_capabilities[&generation].ready);
-        assert_eq!(ctx.internal_callbacks.get(HostId(callback_id)), None);
-        assert!(ctx.shadow_table.is_retired_host(callback_id));
+        s.host([wl_registry::evt::global_remove(registry.host, old)])
+            .await;
+        let host = s.host_received();
+        let [_, (_, AnyRequest::WlRegistry(wl_registry::Request::Bind { ref id, .. })), ref sync] =
+            host[..]
+        else {
+            panic!("the host got {host:?}, not a destroy, a bind and a sync");
+        };
+        let (binding, callback) = (id.2, synced(sync));
+
+        s.host([
+            wl_callback::evt::done(old_callback, 0),
+            wl_display::evt::delete_id(WL_DISPLAY_ID, old_callback),
+        ])
+        .await;
+        assert_eq!(s.guest_received(), [], "the old generation completes");
+
+        let xrgb8888 = 0x3432_5258;
+        s.host([
+            zwp_linux_dmabuf_v1::evt::modifier(binding, xrgb8888, 0, 0),
+            wl_callback::evt::done(callback, 0),
+            wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+        ])
+        .await;
+        let global = wl_registry::Event::Global {
+            name: replacement,
+            interface: dmabuf.to_string(),
+            version: 4,
+        };
+        assert_eq!(s.guest_received(), [(registry.id, global.into())]);
     }
 
-    #[test]
-    fn guest_callback_reserves_host_id_until_real_delete_id() {
-        let guest_id = 20;
-        let host_id = 40;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(guest_id, host_id, "wl_callback", 1);
-        ctx.last_sender_id = host_id;
+    /// A guest callback ends at its `done`, which the guest gets with its
+    /// `delete_id`, but its host ID stays reserved until the host's own
+    /// `delete_id`, which the guest does not get again.
+    #[tokio::test]
+    async fn guest_callback_reserves_host_id_until_real_delete_id() {
+        let mut s = Session::new();
+        // Binds the compositor, so that each later surface takes one host
+        // ID.
+        s.surface().await;
+        let callback = s.new_id();
+        let host = s
+            .create(wl_display::req::sync(WL_DISPLAY_ID, callback))
+            .await;
 
-        assert_eq!(Handlers::on_done(&mut ctx, 7), Action::Drop);
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-        assert_eq!(ctx.shadow_table.get_host_id(guest_id), None);
-        assert_eq!(ctx.shadow_table.get_guest_id(host_id), None);
-        assert!(ctx.shadow_table.is_retired_host(host_id));
-        assert!(!ctx.shadow_table.is_host_id_available(host_id));
-
-        ctx.last_sender_id = 1;
-        assert_eq!(Handlers::on_delete_id(&mut ctx, host_id), Action::Drop);
+        s.host([wl_callback::evt::done(host, 7)]).await;
+        let done: AnyEvent = wl_callback::Event::Done { callback_data: 7 }.into();
+        let deleted = wl_display::Event::DeleteId { id: callback };
         assert_eq!(
-            ctx.host_to_client_queue.len(),
-            2,
+            s.guest_received(),
+            [(callback, done), (WL_DISPLAY_ID, deleted.into())]
+        );
+        let surface = s.surface().await;
+        assert_ne!(surface.host, host, "reserved until the host's delete_id");
+
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, host)])
+            .await;
+        assert_eq!(
+            s.guest_received(),
+            [],
             "the guest already received its callback delete_id"
         );
-        assert!(!ctx.shadow_table.is_retired_host(host_id));
-        assert!(ctx.shadow_table.is_host_id_available(host_id));
+        assert_eq!(s.surface().await.host, host, "freed by its delete_id");
     }
 
-    /// A placement barrier retires at its `done`, even for a toplevel
-    /// placement no longer knows, and its ID stays reserved until the
-    /// host's `delete_id`.
     #[test]
     fn placement_barrier_completes_and_reserves_callback_until_delete_id() {
+        use crate::handler::Handlers;
+        use crate::protocols::wayland::wl_callback::WlCallbackHandler;
+        use crate::protocols::wayland::wl_display::WlDisplayHandler;
+        use crate::state::{HostId, InternalCallback};
+        use crate::wire::Action;
         let callback_id = 40;
         let mut ctx = Context::with_placement_for_test(
             crate::placement_config::PlacementConfig::active_for_test(&[]),

@@ -866,6 +866,102 @@ impl Session {
     }
 }
 
+/// The guest's `gtk_shell1`, which the proxy serves itself in place of the
+/// host's `zaura_shell` ([`Session::gtk_shell`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GtkShell {
+    pub(crate) id: u32,
+    /// The global the guest bound it from: the host's `zaura_shell`, on
+    /// [`Session::registry`].
+    pub(crate) name: u32,
+    /// The host `zaura_shell` the proxy bound for itself.
+    pub(crate) shell: u32,
+}
+
+/// Registries and their globals: the globals the host advertises, removes
+/// and reuses on each of several registries, and the `gtk_shell1` the proxy
+/// serves for the host's `zaura_shell`.
+impl Session {
+    /// The host advertises `zaura_shell` at `version`, which the proxy binds
+    /// for itself, and the guest binds the `gtk_shell1` the proxy
+    /// advertises in its place, which gets its capabilities once the host
+    /// has answered the proxy's sync. Neither peer's messages are kept.
+    pub(crate) async fn gtk_shell(&mut self, version: u32) -> GtkShell {
+        use crate::protocols::aura_shell::zaura_shell;
+        use crate::protocols::gtk::gtk_shell1;
+        use crate::protocols::wayland::wl_callback;
+        let registry = self.registry().await;
+        let name = self.advertise(zaura_shell::NAME, version).await;
+        let host = self.host_received();
+        let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id: shell, .. }))] = &host[..]
+        else {
+            panic!("the proxy did not bind zaura_shell: {host:?}");
+        };
+        let shell = shell.2;
+        let advertised = wl_registry::Event::Global {
+            name,
+            interface: gtk_shell1::NAME.to_string(),
+            version: gtk_shell1::VERSION,
+        };
+        assert_eq!(self.guest_received(), [(registry.id, advertised.into())]);
+        let id = self.new_id();
+        self.guest([wl_registry::req::bind(
+            registry.id,
+            name,
+            gtk_shell1::NAME,
+            gtk_shell1::VERSION,
+            id,
+        )
+        .unwrap()])
+            .await;
+        let host = self.host_received();
+        let [(WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            host[..]
+        else {
+            panic!("the proxy did not ask for gtk_shell1's capabilities: {host:?}");
+        };
+        self.host([
+            wl_callback::evt::done(callback, 0),
+            wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+        ])
+        .await;
+        let capabilities = gtk_shell1::Event::Capabilities { capabilities: 0 };
+        assert_eq!(self.guest_received(), [(id, capabilities.into())]);
+        GtkShell { id, name, shell }
+    }
+
+    /// A new `wl_registry` the guest creates, besides [`Self::registry`].
+    pub(crate) async fn new_registry(&mut self) -> Object {
+        let id = self.new_id();
+        let host = self
+            .create(wl_display::req::get_registry(WL_DISPLAY_ID, id))
+            .await;
+        Object { id, host }
+    }
+
+    /// The host advertises global `name` of `interface` at `version` on
+    /// `registry`; [`Self::advertise`] never picks `name` after. What the
+    /// proxy sends either peer is kept.
+    pub(crate) async fn global(
+        &mut self,
+        registry: Object,
+        name: u32,
+        interface: &str,
+        version: u32,
+    ) {
+        self.next_global_name = self.next_global_name.max(name + 1);
+        self.host([wl_registry::evt::global(registry.host, name, interface, version).unwrap()])
+            .await;
+    }
+
+    /// The host removes global `name` from `registry`. What the proxy sends
+    /// either peer is kept.
+    pub(crate) async fn global_remove(&mut self, registry: Object, name: u32) {
+        self.host([wl_registry::evt::global_remove(registry.host, name)])
+            .await;
+    }
+}
+
 impl Drop for Session {
     /// A test reads all the proxy sent, so that nothing it did not expect
     /// goes unnoticed.
