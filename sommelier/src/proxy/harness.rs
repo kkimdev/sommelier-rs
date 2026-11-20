@@ -505,7 +505,7 @@ impl Session {
     /// the session goes on. It dispatches one direction and then sends
     /// everything, so it never interleaves directions, and cannot show when
     /// a batch's output leaves relative to the other peer's batches; the
-    /// tests of that drive `Client::handle_msgs` directly.
+    /// tests of that dispatch a batch at a time ([`Self::batch`]).
     async fn send(
         &mut self,
         direction: Direction,
@@ -549,31 +549,14 @@ impl Session {
     /// `Client::run` does, so that it reads them through its own
     /// transport. Returns `false` if the proxy refuses what it receives.
     fn transmit(&mut self, direction: Direction, (bytes, fds): Outgoing) -> bool {
-        use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
-        use std::io::IoSlice;
-        // A stream socket carries descriptors only with a byte: with none,
-        // the kernel sends nothing, and they are lost.
-        let peer = match direction {
-            Direction::ClientToHost => &self.guest.connection,
-            Direction::HostToClient => &self.host.connection,
-        };
-        let socket = peer
-            .unix_socket_for_test()
-            .expect("a peer's connection is a Unix socket")
-            .as_raw_fd();
-        let raw: Vec<_> = fds.iter().map(AsRawFd::as_raw_fd).collect();
         let mut sent = 0;
         while sent < bytes.len() {
-            let rights = [ControlMessage::ScmRights(&raw)];
-            let cmsgs: &[ControlMessage] = if sent == 0 && !raw.is_empty() {
-                &rights
-            } else {
-                &[]
-            };
             let end = bytes.len().min(sent + self.piece);
-            let iov = [IoSlice::new(&bytes[sent..end])];
-            sent += sendmsg::<()>(socket, &iov, cmsgs, MsgFlags::MSG_NOSIGNAL, None)
-                .expect("send to the proxy");
+            let fds: &[OwnedFd] = if sent == 0 { &fds } else { &[] };
+            sent += match direction {
+                Direction::ClientToHost => self.guest.write(&bytes[sent..end], fds),
+                Direction::HostToClient => self.host.write(&bytes[sent..end], fds),
+            };
             let connection = self.client.connection_mut(direction);
             loop {
                 match connection.try_recv() {
@@ -962,6 +945,139 @@ impl Session {
     }
 }
 
+/// Dispatch a batch at a time, and the proxy's own event loop: for the
+/// proxy's tests of fair dispatch, of when output leaves, and of the loop
+/// itself, which [`Self::send`] cannot show, as it dispatches one
+/// direction and then sends everything. What either peer receives is
+/// decoded and checked as always.
+impl Session {
+    /// The peer that sends in `direction` sends `messages`, which the proxy
+    /// receives, as `Client::run` does, but does not dispatch yet.
+    pub(super) fn queue(
+        &mut self,
+        direction: Direction,
+        messages: impl IntoIterator<Item = Outgoing>,
+    ) {
+        for message in messages {
+            match direction {
+                Direction::ClientToHost => self.guest.wire.send(&message),
+                Direction::HostToClient => self.host.wire.send(&message),
+            }
+            assert!(
+                self.transmit(direction, message),
+                "the proxy refuses what it receives"
+            );
+        }
+    }
+
+    /// The peer that sends in `direction` sends `messages`, which wait in
+    /// its socket: the proxy has not received them yet.
+    pub(super) fn write(
+        &mut self,
+        direction: Direction,
+        messages: impl IntoIterator<Item = Outgoing>,
+    ) {
+        for message in messages {
+            match direction {
+                Direction::ClientToHost => self.guest.send(message),
+                Direction::HostToClient => self.host.send(message),
+            }
+        }
+    }
+
+    /// The direction `Client::run` dispatches next when it prefers the
+    /// host's (`prefer_host`) or the guest's, as it chooses it: it may
+    /// receive from the preferred peer. `None` if neither has a whole
+    /// message buffered.
+    pub(super) fn next_direction(&mut self, prefer_host: bool) -> Option<Direction> {
+        self.client
+            .next_buffered_direction(prefer_host)
+            .expect("both peers are open")
+    }
+
+    /// Dispatch one batch of what the proxy has received in `direction`, as
+    /// `Client::run` does; returns whether the session goes on. It sends
+    /// what a batch sends: what earlier batches left, before a batch in the
+    /// other direction or after a few in the same one, and its own full
+    /// submissions, but not the rest ([`Self::flush`]).
+    pub(super) async fn batch(&mut self, direction: Direction) -> bool {
+        let goes_on = self.client.handle_msgs(direction).await;
+        self.guest.receive();
+        self.host.receive();
+        goes_on
+    }
+
+    /// Send all the batches left for either peer, as `Client::run` does
+    /// before it waits; returns whether the session goes on.
+    pub(super) async fn flush(&mut self) -> bool {
+        let goes_on = self.client.flush().await;
+        self.guest.receive();
+        self.host.receive();
+        goes_on
+    }
+
+    /// Wait until the parked guest request is due, as `Client::run` does,
+    /// without dispatching it.
+    pub(super) async fn fence_due(&self) {
+        assert!(self.parked(), "no guest request waits for a fence");
+        ParkedRequest::due(self.client.parked.as_ref()).await;
+    }
+
+    /// Run the proxy's own event loop, `Client::run`, beside `peers`, which
+    /// plays the guest and the host through [`Running`]. Once `peers`
+    /// returns, both close their connections, which ends the loop, and the
+    /// session with it: an ended stand-in takes the proxy's place. What
+    /// the proxy sent that `peers` did not take is kept.
+    pub(super) async fn run(&mut self, peers: impl AsyncFnOnce(&mut Running<'_>)) {
+        let (_, guest_socket) = UnixStream::pair().expect("a guest socket pair");
+        let (_, host_socket) = UnixStream::pair().expect("a host socket pair");
+        let connection =
+            |socket: UnixStream| WaylandConnection::new(socket.into()).expect("register a socket");
+        let ctx = Context::new_for_test(false, false, Vec::new());
+        let stand_in = Client::new(connection(guest_socket), connection(host_socket), ctx);
+        let client = std::mem::replace(&mut self.client, stand_in);
+        self.client.ended = true;
+        let mut running = Running {
+            guest: &mut self.guest,
+            host: &mut self.host,
+        };
+        let peers = async {
+            peers(&mut running).await;
+            running.guest.close();
+            running.host.close();
+        };
+        tokio::join!(client.run(), peers);
+        self.guest.receive_last();
+        self.host.receive_last();
+    }
+}
+
+/// Both peers of a session whose proxy runs its own event loop
+/// ([`Session::run`]).
+pub(super) struct Running<'a> {
+    guest: &'a mut Peer<AnyEvent>,
+    host: &'a mut Peer<AnyRequest>,
+}
+
+impl Running<'_> {
+    /// The host sends `events`.
+    pub(super) fn host(&mut self, events: impl IntoIterator<Item = Outgoing>) {
+        events.into_iter().for_each(|event| self.host.send(event));
+    }
+
+    /// Wait until the proxy has sent the guest an event; returns what the
+    /// guest has received.
+    pub(super) async fn guest_received(&mut self) -> Vec<(u32, AnyEvent)> {
+        self.guest.next().await
+    }
+
+    /// Wait until the proxy has sent the host a request; returns what the
+    /// host has received.
+    pub(super) async fn host_received(&mut self) -> Vec<(u32, AnyRequest)> {
+        self.host.next().await
+    }
+}
+
 impl Drop for Session {
     /// A test reads all the proxy sent, so that nothing it did not expect
     /// goes unnoticed.
@@ -1006,6 +1122,60 @@ impl<M: Message> Peer<M> {
         }
     }
 
+    /// Write `bytes`, and `fds` with them, to the proxy in one send;
+    /// returns how many bytes it took. A stream socket carries descriptors
+    /// only with a byte: with none, the kernel sends nothing, and they are
+    /// lost.
+    fn write(&self, bytes: &[u8], fds: &[OwnedFd]) -> usize {
+        use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+        use std::io::IoSlice;
+        let socket = self
+            .connection
+            .unix_socket_for_test()
+            .expect("a peer's connection is a Unix socket")
+            .as_raw_fd();
+        let raw: Vec<_> = fds.iter().map(AsRawFd::as_raw_fd).collect();
+        let rights = [ControlMessage::ScmRights(&raw)];
+        let cmsgs: &[ControlMessage] = if raw.is_empty() { &[] } else { &rights };
+        let iov = [IoSlice::new(bytes)];
+        sendmsg::<()>(socket, &iov, cmsgs, MsgFlags::MSG_NOSIGNAL, None).expect("send to the proxy")
+    }
+
+    /// Send `message` whole, and learn from it.
+    fn send(&mut self, message: Outgoing) {
+        self.wire.send(&message);
+        let (bytes, fds) = message;
+        let mut sent = self.write(&bytes, &fds);
+        while sent < bytes.len() {
+            sent += self.write(&bytes[sent..], &[]);
+        }
+    }
+
+    /// Wait until the proxy has sent this peer a message, and take all
+    /// it has received.
+    async fn next(&mut self) -> Vec<(u32, M)> {
+        while self.received.is_empty() {
+            let bytes = self
+                .connection
+                .recv()
+                .await
+                .expect("receive from the proxy");
+            assert_ne!(bytes, 0, "the proxy closed the connection");
+            self.receive();
+        }
+        std::mem::take(&mut self.received)
+    }
+
+    /// Close this peer's sending side, as a peer that goes away does.
+    fn close(&self) {
+        let socket = self
+            .connection
+            .unix_socket_for_test()
+            .expect("a peer's connection is a Unix socket")
+            .as_raw_fd();
+        assert_eq!(unsafe { libc::shutdown(socket, libc::SHUT_WR) }, 0);
+    }
+
     /// Decode every whole message the proxy has sent. Each must decode, and
     /// keep the protocol ([`wire_peer`]).
     ///
@@ -1021,6 +1191,25 @@ impl<M: Message> Peer<M> {
             .expect("receive from the proxy")
             .is_some_and(|bytes| bytes > 0)
         {}
+        self.decode_received();
+    }
+
+    /// [`Self::receive`] once the proxy has closed its end, which resets
+    /// the connection if the proxy left something this peer sent unread.
+    fn receive_last(&mut self) {
+        loop {
+            match self.connection.try_recv() {
+                Ok(Some(bytes)) if bytes > 0 => {}
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(error) => panic!("receive from the proxy: {error}"),
+            }
+        }
+        self.decode_received();
+    }
+
+    /// Decode every whole message received: see [`Self::receive`].
+    fn decode_received(&mut self) {
         let peer = match self.wire.role() {
             Role::Client => "guest",
             Role::Server => "host",

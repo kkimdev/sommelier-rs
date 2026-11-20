@@ -643,14 +643,6 @@ impl Context {
     }
 
     #[cfg(test)]
-    pub(crate) fn render_buffer_lifecycle_for_host(
-        &self,
-        host_id: HostId,
-    ) -> Option<RenderBufferLifecycle> {
-        self.render_buffers.lifecycle(host_id)
-    }
-
-    #[cfg(test)]
     pub(crate) fn render_buffer_count(&self) -> usize {
         self.render_buffers.len()
     }
