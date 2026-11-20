@@ -3446,11 +3446,14 @@ async fn a_seats_peek_watermarks_end_with_its_focus() {
 /// The guest releases a keyboard between Exo's `peek_key` of a new press
 /// on it and the press, which the proxy then drops undecoded: it is still
 /// that press, so the empty confirmation before them was the press's, and
-/// the held Backspace is not recovered.
+/// the held Backspace is not recovered. A modifiers event the proxy drops
+/// from a released keyboard waits the same way: it keeps the recovery
+/// waiting for the host's next event, rather than deciding it.
 #[tokio::test]
 async fn a_press_dropped_with_its_released_keyboard_is_still_the_confirmations() {
     let mut kb = Kb::new().await;
     let other = kb.another_keyboard().await;
+    let gone = kb.another_keyboard().await;
     let ime = kb.text_input().await;
     // The input method takes Backspace.
     kb.peek(2, 2, BACKSPACE, PRESSED).await;
@@ -3460,6 +3463,13 @@ async fn a_press_dropped_with_its_released_keyboard_is_still_the_confirmations()
     let [(_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] = host[..] else {
         panic!("the recovery waits with no sync: {host:?}");
     };
+    // The guest releases `gone`, whose modifiers the proxy then drops:
+    // dropped, it reaches the core as `UnhandledModifiers`, which leaves a
+    // waiting recovery waiting.
+    kb.s.guest([wl_keyboard::req::release(gone.id)]).await;
+    assert_eq!(kb.s.host_received(), released(gone));
+    kb.s.host([wl_keyboard::evt::modifiers(gone.host, 4, ALT, 0, 0, 0)])
+        .await;
     kb.peek_on(other, 3, 3, KEY_A, PRESSED).await;
     kb.s.guest([wl_keyboard::req::release(other.id)]).await;
     assert_eq!(kb.s.host_received(), released(other));
