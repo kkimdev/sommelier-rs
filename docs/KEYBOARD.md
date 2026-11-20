@@ -20,8 +20,10 @@ channels and its delivery on up to two.
 `KeyGenerationRegistry` (`sommelier/src/state/input.rs`) holds one
 `KeyGeneration` per host keyboard and key, its current generation: the
 key's life from one press to the next. A key with no entry is idle. A
-generation is three independent parts, each an enum whose variants carry
-only the data that exists in them:
+generation has three independent parts: its phase, with the peek record
+inside it, its guest owner and its accelerator suppression. The phase,
+the peek record and the guest owner are enums whose variants carry only
+the data that exists in them:
 
 - `phase: KeyPhase`, what the host has shown of the key:
   - `Unseen`: a claim or a suppression came before any physical event,
@@ -31,16 +33,17 @@ only the data that exists in them:
     for the rest of the hold); `stale` marks a key held across the input
     method's own detach (H2);
   - `Released { peek, release_serial }`.
-- `peek: PeekRecord`, inside `Held` and `Released`: `None`, `Announced {
+
+  The `peek: PeekRecord` of `Held` and `Released` is `None`, `Announced {
   serial }` (a generation whose keyboard has since held no key) or
   `Live(PeekKeyProvenance)`, the serial, time, sequence and eligibility of
   a peek press, which makes the generation a candidate for recovery.
 - `guest: GuestPress`, who gave the guest the key: `None`, `Physical`,
   `Shortcut` (Sommelier placed a window), or `Recovered`, a tombstone for
   a recovered pair that suppresses late duplicates.
-- `host_accelerator_suppressed`: a `wl_keyboard` press that no channel
-  gave the guest was a host accelerator. It is independent of the rest:
-  its release is dropped whatever the phase.
+- `host_accelerator_suppressed`, a flag: a `wl_keyboard` press that no
+  channel gave the guest was a host accelerator. It is independent of the
+  rest: its release is dropped whatever the phase.
 
 When a key is pressed again before `wl_keyboard` released the guest's
 previous press of it, the retired generation's release waits beside the

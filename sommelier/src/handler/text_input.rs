@@ -1431,7 +1431,7 @@ pub(super) mod tests {
         /// host keyboard, which no peer sees.
         fn owner(&mut self, key: u32) -> Option<GuestKeyOwner> {
             let keyboard = HostId(self.keyboard.host);
-            self.s.ctx().guest_key_owner(keyboard, key)
+            self.s.ctx().key_generations.guest_owner(keyboard, key)
         }
 
         /// The proxy's state of the text input, for state no peer sees.

@@ -239,8 +239,11 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
 /// are those of the `wl_keyboard.key` Exo would have sent; see
 /// INVARIANTS "A recovered key carries the host's serial".
 pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> bool {
-    let decision =
-        ctx.transition_guest_key(held.host_keyboard_id, held.key, GuestKeyEvent::RecoverIme);
+    let decision = ctx.key_generations.transition_guest_key(
+        held.host_keyboard_id,
+        held.key,
+        GuestKeyEvent::RecoverIme,
+    );
     if decision.delivery != GuestKeyDelivery::EmitBalancedPair {
         // The normal wl_keyboard path already delivered this physical
         // generation to the guest. The confirmation still closes a

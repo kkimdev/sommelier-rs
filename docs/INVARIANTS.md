@@ -740,9 +740,9 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `a_rejected_keymap_keeps_held_keys`,
   `an_unusable_keymap_clears_the_loaded_one_and_is_forwarded`,
   `an_accelerator_held_across_a_keymap_is_not_recovered`.
-- **IME state is scoped to its keyboard or seat.** Pressed-key sets, repeat
-  flags and focus markers used to bridge ChromeOS IME events belong to the
-  originating keyboard or seat, never to the process. Synthetic
+- **IME state is scoped to its keyboard or seat.** Key generations,
+  Backspace leases and focus markers used to bridge ChromeOS IME events
+  belong to the originating keyboard or seat, never to the process. Synthetic
   `wl_keyboard` events use the compositor's monotonic millisecond time
   domain of the real keyboard events, never wall-clock time.
   Tests: `ime_repeat_state_is_scoped_to_the_originating_keyboard`,

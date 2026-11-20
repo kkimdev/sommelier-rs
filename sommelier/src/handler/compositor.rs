@@ -4014,7 +4014,10 @@ mod tests {
                     .key_generations
                     .backspace_repeat_cancelled(host_keyboard_id, 14)
                 && ctx.key_generations.peek(host_keyboard_id, 14).is_none()
-                && ctx.guest_key_owner(host_keyboard_id, 14).is_none(),
+                && ctx
+                    .key_generations
+                    .guest_owner(host_keyboard_id, 14)
+                    .is_none(),
             "destroying a surface must retire all per-keyboard input state"
         );
         assert!(

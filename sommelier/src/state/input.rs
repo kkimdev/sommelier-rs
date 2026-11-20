@@ -2004,7 +2004,7 @@ mod tests {
                         }
                     }
                 }
-                assert_eq!(ctx.guest_key_owner(keyboard, key), model);
+                assert_eq!(ctx.key_generations.guest_owner(keyboard, key), model);
             }
         }
     }
@@ -2989,9 +2989,9 @@ mod tests {
 
         ctx.key_generations.clear_keyboard(HostId(10));
 
-        assert!(ctx.guest_key_owner(HostId(10), 57).is_none());
+        assert!(ctx.key_generations.guest_owner(HostId(10), 57).is_none());
         assert_eq!(
-            ctx.guest_key_owner(HostId(11), 57),
+            ctx.key_generations.guest_owner(HostId(11), 57),
             Some(GuestKeyOwner::Physical)
         );
         assert!(

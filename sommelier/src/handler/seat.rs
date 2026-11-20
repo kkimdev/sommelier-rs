@@ -264,7 +264,7 @@ mod tests {
             Action::Forward
         );
         assert_eq!(
-            ctx.guest_key_owner(HostId(host_keyboard), key),
+            ctx.key_generations.guest_owner(HostId(host_keyboard), key),
             Some(GuestKeyOwner::Physical)
         );
 

@@ -26,6 +26,11 @@ limitations under the License.
 //! A chord bound to a placement action is consumed here and placed by
 //! [`crate::handler::window_placement::place_focused`].
 //!
+//! Each key's press and release on `wl_keyboard` and on
+//! `zcr_extended_keyboard_v1.peek_key` move its generation in
+//! [`crate::state::KeyGenerationRegistry`], which decides whether the guest
+//! gets the event; `docs/KEYBOARD.md` describes the states.
+//!
 //! See `sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
 use crate::protocols::keyboard_extension_unstable_v1::{
@@ -190,19 +195,6 @@ impl KeyboardHandler {
         ctx.keyboard_to_seat.get(&guest_keyboard_id).copied()
     }
 
-    fn clear_host_keyboard_state(ctx: &mut Context, host_keyboard_id: HostId) {
-        ctx.key_generations.clear_keyboard(host_keyboard_id);
-    }
-
-    fn invalidate_peek_key_press(ctx: &mut Context, host_keyboard_id: HostId, key: u32) {
-        ctx.key_generations.invalidate_peek(host_keyboard_id, key);
-    }
-
-    fn cancel_backspace_repeat(ctx: &mut Context, host_keyboard_id: HostId) {
-        ctx.key_generations
-            .cancel_backspace_repeat(host_keyboard_id, EVDEV_KEY_BACKSPACE);
-    }
-
     fn initialize_host_keyboard_enter_state(
         ctx: &mut Context,
         host_keyboard_id: HostId,
@@ -365,7 +357,6 @@ impl KeyboardHandler {
     /// and ending a suppression would let the IME hand the accelerator's
     /// key to the guest.
     fn clear_host_keyboard_keymap(ctx: &mut Context, host_keyboard_id: HostId) {
-        ctx.keyboard_keymaps.remove(&host_keyboard_id);
         ctx.keyboard_xkb_states.remove(&host_keyboard_id);
         ctx.keyboard_repeatable_keys.remove(&host_keyboard_id);
     }
@@ -571,7 +562,6 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 Self::apply_modifiers(&mut state, modifiers);
             }
             ctx.keyboard_xkb_states.insert(host_keyboard_id, state);
-            ctx.keyboard_keymaps.insert(host_keyboard_id, keymap);
             ctx.keyboard_repeatable_keys
                 .insert(host_keyboard_id, repeatable_keys);
             log::info!("XKB keymap loaded successfully");
@@ -661,7 +651,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
 
         let focus_update = ctx.keyboard_focus.enter(host_keyboard_id, focus);
         for retired_keyboard in &focus_update.retired_keyboards {
-            Self::clear_host_keyboard_state(ctx, *retired_keyboard);
+            ctx.key_generations.clear_keyboard(*retired_keyboard);
         }
         Self::initialize_host_keyboard_enter_state(ctx, host_keyboard_id, keys);
         // The protocol requires a modifiers event after every enter, but Exo
@@ -738,7 +728,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             return Action::Drop;
         }
         for retired_keyboard in &focus_update.retired_keyboards {
-            Self::clear_host_keyboard_state(ctx, *retired_keyboard);
+            ctx.key_generations.clear_keyboard(*retired_keyboard);
         }
         // The IME core sends the leave after the commit of a preedit the
         // focus change ends (F1).
@@ -796,7 +786,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             };
         }
 
-        let guest_owner = ctx.guest_key_owner(host_keyboard_id, key);
+        let guest_owner = ctx.key_generations.guest_owner(host_keyboard_id, key);
         let key_class = match state {
             KEY_STATE_PRESSED => Self::classify_key(ctx, host_keyboard_id, key),
             _ => KeyClass::Guest,
@@ -831,7 +821,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         let decision = match state {
             KEY_STATE_PRESSED => {
                 if key != EVDEV_KEY_BACKSPACE {
-                    Self::cancel_backspace_repeat(ctx, host_keyboard_id);
+                    ctx.key_generations
+                        .cancel_backspace_repeat(host_keyboard_id, EVDEV_KEY_BACKSPACE);
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
@@ -844,7 +835,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 let host_accelerator =
                     !compositor_shortcut && key_class == KeyClass::HostAccelerator;
                 if compositor_shortcut || host_accelerator {
-                    Self::invalidate_peek_key_press(ctx, host_keyboard_id, key);
+                    ctx.key_generations.invalidate_peek(host_keyboard_id, key);
                 }
                 let event = if claims_shortcut {
                     GuestKeyEvent::CompositorShortcutPress
@@ -854,11 +845,15 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                         ime_repeat_active: backspace_repeat_active,
                     }
                 };
-                ctx.transition_guest_key(host_keyboard_id, key, event)
+                ctx.key_generations
+                    .transition_guest_key(host_keyboard_id, key, event)
             }
             KEY_STATE_RELEASED => {
-                let decision =
-                    ctx.transition_guest_key(host_keyboard_id, key, GuestKeyEvent::PhysicalRelease);
+                let decision = ctx.key_generations.transition_guest_key(
+                    host_keyboard_id,
+                    key,
+                    GuestKeyEvent::PhysicalRelease,
+                );
                 if key == EVDEV_KEY_BACKSPACE {
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
@@ -938,18 +933,19 @@ pub(crate) fn forget_keyboard(ctx: &mut Context, guest_keyboard_id: u32, host_ke
     crate::handler::ime_keys::forget_recovery_of_keyboard(ctx, guest_keyboard_id);
     ctx.keyboard_to_seat.remove(&guest_keyboard_id);
     let focus_update = ctx.keyboard_focus.release(host_keyboard_id);
-    // Clear per-keyboard keymap, dropped keys, XKB state, and modifiers.
-    // All must be reset so that a re-created keyboard starts from a clean
-    // slate and doesn't inherit stale state from the previous session.
+    // Clear the keyboard's XKB state, key generations and modifiers, so
+    // that a re-created keyboard starts from a clean slate and doesn't
+    // inherit stale state from the previous session.
     //
-    // accelerator suppression: a key dropped under the old session would
-    //   cause its release event to be silently swallowed on the new keyboard.
+    // key generations: an accelerator's key suppressed under the old
+    //   session would have its release silently swallowed on the new
+    //   keyboard.
     // modifiers: if the new keyboard receives a key event before the first
     //   wl_keyboard.modifiers, the accelerator check would use stale modifier
     //   bits and could produce wrong NOT_HANDLED/HANDLED decisions. Only the
     //   keyboard's end clears them; see `Context::keyboard_modifiers`.
     KeyboardHandler::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-    KeyboardHandler::clear_host_keyboard_state(ctx, host_keyboard_id);
+    ctx.key_generations.clear_keyboard(host_keyboard_id);
     ctx.keyboard_modifiers.remove(&host_keyboard_id);
     if let Some(host_extended_id) = ctx.keyboard_to_extended_keyboard.remove(&host_keyboard_id) {
         ctx.extended_keyboard_to_keyboard.remove(&host_extended_id);
@@ -1072,7 +1068,8 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
         match input {
             // The press of another key ends the Backspace repeat lease.
             PeekInput::Press { .. } if key != EVDEV_KEY_BACKSPACE => {
-                Self::cancel_backspace_repeat(ctx, host_keyboard_id);
+                ctx.key_generations
+                    .cancel_backspace_repeat(host_keyboard_id, EVDEV_KEY_BACKSPACE);
                 if let Some(guest_seat) = guest_seat {
                     crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
                 }
@@ -1299,7 +1296,7 @@ mod tests {
             let size = keymap.len() as u32;
             let action = self.keymap_of(k, KEYMAP_FORMAT_XKB_V1, &keymap, size);
             assert_eq!(action, Action::Forward);
-            assert!(self.ctx.keyboard_keymaps.contains_key(&HostId(k.host)));
+            assert!(self.ctx.keyboard_xkb_states.contains_key(&HostId(k.host)));
         }
 
         /// `k`'s host holds the `depressed` modifiers.
@@ -1352,7 +1349,7 @@ mod tests {
         }
 
         fn owner(&self, k: Mapped, key: u32) -> Option<GuestKeyOwner> {
-            self.ctx.guest_key_owner(HostId(k.host), key)
+            self.ctx.key_generations.guest_owner(HostId(k.host), key)
         }
 
         fn held(&self, k: Mapped, key: u32) -> bool {
@@ -1899,16 +1896,26 @@ mod tests {
         let key = 24;
         let mut ctx = Context::new_for_test(false, false, vec![]);
 
-        let press = ctx.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
+        let press = ctx.key_generations.transition_guest_key(
+            keyboard,
+            key,
+            GuestKeyEvent::CompositorShortcutPress,
+        );
         assert_eq!(press.delivery, GuestKeyDelivery::Drop);
         assert_eq!(press.ack_handled, Some(true));
-        assert_eq!(ctx.guest_key_owner(keyboard, key), Some(CompositorShortcut));
+        assert_eq!(
+            ctx.key_generations.guest_owner(keyboard, key),
+            Some(CompositorShortcut)
+        );
 
-        let release =
-            ctx.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutRelease);
+        let release = ctx.key_generations.transition_guest_key(
+            keyboard,
+            key,
+            GuestKeyEvent::CompositorShortcutRelease,
+        );
         assert_eq!(release.delivery, GuestKeyDelivery::Drop);
         assert_eq!(release.ack_handled, Some(true));
-        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        assert_eq!(ctx.key_generations.guest_owner(keyboard, key), None);
     }
 
     // -----------------------------------------------------------------------
@@ -2246,9 +2253,10 @@ mod tests {
     fn a_chord_the_guest_already_received_stays_the_guests() {
         let mut p = placeable_shortcut();
         let keyboard = HostId(PLACING.host);
-        let decision = p
-            .ctx
-            .transition_guest_key(keyboard, KEY_Q, GuestKeyEvent::RecoverIme);
+        let decision =
+            p.ctx
+                .key_generations
+                .transition_guest_key(keyboard, KEY_Q, GuestKeyEvent::RecoverIme);
         assert_eq!(decision.delivery, GuestKeyDelivery::EmitBalancedPair);
         assert_eq!(
             p.key(PLACING, 2, 100, KEY_Q, PRESSED),
@@ -2374,6 +2382,7 @@ mod tests {
         );
         assert_eq!(
             p.ctx
+                .key_generations
                 .transition_guest_key(keyboard, KEY_Q, GuestKeyEvent::RecoverIme)
                 .delivery,
             GuestKeyDelivery::Drop,
@@ -2623,7 +2632,7 @@ mod tests {
         let repeatable = &p.ctx.keyboard_repeatable_keys[&keyboard];
         assert!(repeatable.contains(&KEY_SPACE) && repeatable.contains(&BACKSPACE));
         assert!(!repeatable.contains(&KEY_LEFTSHIFT));
-        let keymap = &p.ctx.keyboard_keymaps[&keyboard];
+        let keymap = state.get_keymap();
         let mask = |name| 1 << keymap.mod_get_index(name);
         assert_eq!(
             [SHIFT, CAPS_LOCK, CONTROL, ALT],
@@ -2753,7 +2762,6 @@ mod tests {
             );
 
             let ctx = &p.ctx;
-            assert!(!ctx.keyboard_keymaps.contains_key(&keyboard), "{case}");
             assert!(!ctx.keyboard_xkb_states.contains_key(&keyboard), "{case}");
             assert!(
                 !ctx.keyboard_repeatable_keys.contains_key(&keyboard),
@@ -2777,8 +2785,7 @@ mod tests {
             );
             let other = HostId(OTHER_KEYBOARD.host);
             assert!(
-                ctx.keyboard_keymaps.contains_key(&other)
-                    && ctx.keyboard_xkb_states.contains_key(&other),
+                ctx.keyboard_xkb_states.contains_key(&other),
                 "{case}: another keyboard's keymap stays"
             );
         }
@@ -2827,7 +2834,9 @@ mod tests {
                 Action::Forward
             );
             assert_eq!(
-                p.ctx.keyboard_keymaps.contains_key(&HostId(KEYBOARD.host)),
+                p.ctx
+                    .keyboard_xkb_states
+                    .contains_key(&HostId(KEYBOARD.host)),
                 accepted,
                 "a keymap of {size} bytes"
             );
