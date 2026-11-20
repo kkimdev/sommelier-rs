@@ -115,13 +115,14 @@
   held across an input-method restart stops repeating until its next
   press, and while it is held no empty confirmation recovers another
   held key.
-- No host trace is recorded yet ([traces/](traces/README.md)). The first
-  should hold a Space held after 가 (E13, E15 of
-  [IME.md](docs/IME.md#24-exo-facts-the-models-implement)), and replace
-  the hand-written capture that `held_space_repeats_after_ime_commit_until_physical_release`
-  holds as those facts' source; the checks of IME.md 5.2 follow. A
-  replay cannot stand in for a render node, placement, accelerators or
-  `--gpu-accel`, and gives a keymap the default US one.
+- One host trace is recorded: `traces/held-space-after-ga.trace` (gedit,
+  Korean input method, 가 then Space held; it replays). Still to do: cite
+  it from E13 and E15 of
+  [IME.md](docs/IME.md#24-exo-facts-the-models-implement) and let it
+  replace the hand-written capture that
+  `held_space_repeats_after_ime_commit_until_physical_release` holds as
+  those facts' source; the checks of IME.md 5.2 follow. A replay cannot
+  stand in for a render node, placement, accelerators or `--gpu-accel`.
 - Exo's deletes and preedit regions that the Exo mirror cannot measure
   are dropped ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A drop
   never deletes or loses text, but the input method goes on as if it
