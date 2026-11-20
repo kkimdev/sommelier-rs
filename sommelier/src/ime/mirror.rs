@@ -208,11 +208,17 @@ pub(crate) struct Key {
 impl Key {
     /// `DefaultHasher::new` uses fixed keys, so a text has one key.
     pub(super) fn of(text: &str) -> Self {
-        let mut hasher = DefaultHasher::new();
-        hasher.write(text.as_bytes());
+        Self::of_rest(DefaultHasher::new(), 0, text)
+    }
+
+    /// The key of a text whose first `len` bytes `start` has hashed and
+    /// whose other bytes are `rest`. `Hasher::write` streams, so it is the
+    /// key of the whole text.
+    fn of_rest(mut start: DefaultHasher, len: usize, rest: &str) -> Self {
+        start.write(rest.as_bytes());
         Self {
-            len: text.len(),
-            hash: hasher.finish(),
+            len: len + rest.len(),
+            hash: start.finish(),
         }
     }
 }
@@ -251,15 +257,19 @@ impl Fingerprint {
     }
 
     /// `state`'s fingerprint, whose selection is one of `vague`, if given.
+    /// It hashes the text before the composition once, for both the text's
+    /// key and the key of the text without the composition.
     fn of(state: &ExoState, vague: Option<&[Span]>) -> Self {
         let composition = state.composition.clone();
+        let text = &state.text;
+        let mut before = DefaultHasher::new();
+        before.write(&text.as_bytes()[..composition.start]);
         let split = (!composition.is_empty()).then(|| {
-            let mut rest = state.text[..composition.start].to_owned();
-            rest.push_str(&state.text[composition.end..]);
-            (Key::of(&rest), Key::of(state.composition_text()))
+            let rest = Key::of_rest(before.clone(), composition.start, &text[composition.end..]);
+            (rest, Key::of(state.composition_text()))
         });
         Self {
-            text: Key::of(&state.text),
+            text: Key::of_rest(before, composition.start, &text[composition.start..]),
             selection: match vague {
                 Some(selections) => Selection::Vague(selections.to_vec()),
                 None => Selection::Exact(state.selection),
@@ -1197,6 +1207,39 @@ mod tests {
         let token = BarrierToken(2);
         mirror.sent(token, Sent::Cancel);
         mirror.barrier_done(token);
+    }
+
+    /// A fingerprint's keys are those of whole texts: of the text, and with
+    /// a composition, of the text without it and of its text, however the
+    /// composition splits the text's bytes.
+    #[test]
+    fn a_fingerprint_keys_whole_texts() {
+        let mut rng = crate::test_support::Rng::new(1);
+        for _ in 0..2_000 {
+            let len = rng.below(40);
+            let text: String = (0..len)
+                .map(|_| *rng.pick(&['a', 'é', '가', '😀']))
+                .collect();
+            let mut boundaries: Vec<usize> = (0..=text.len())
+                .filter(|&at| text.is_char_boundary(at))
+                .collect();
+            let start = *rng.pick(&boundaries);
+            boundaries.retain(|&at| at >= start);
+            let composition = composition(start..*rng.pick(&boundaries));
+            let state = ExoState {
+                text: text.clone(),
+                selection: Span::at(composition.end),
+                composition: composition.clone(),
+            };
+            let print = Fingerprint::of(&state, None);
+            assert_eq!(print.text, Key::of(&text), "{state:?}");
+            let split = (!composition.is_empty()).then(|| {
+                let mut rest = text[..composition.start].to_owned();
+                rest.push_str(&text[composition.end..]);
+                (Key::of(&rest), Key::of(&text[composition.clone()]))
+            });
+            assert_eq!(print.split, split, "{state:?}");
+        }
     }
 
     /// The constructor's state, from `ResetInternal(u"", 0, Range(0))`
