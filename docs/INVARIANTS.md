@@ -327,7 +327,14 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   compile.
   Tests: `test_handlers_get_typed_senders_and_objects`,
   `requests_resolve_live_objects_of_the_expected_interface`.
-- **Destructors wait for `delete_id`.** A generated destructor request keeps
+- **Destructors wait for `delete_id`.** A destructor request's handler
+  returns how its object ends (`wire::Destructor`: forwarded before or
+  after the handler's output, after the end's own output, with its host
+  object still in use, or with a host object that has no destructor), and
+  the generated dispatcher ends the object in every case, unless the
+  handler ended the session; a handler has no way to drop a destructor
+  and leave its object live. A local object's destructor completes in
+  the proxy. A destructor request keeps
   its guest/host pairing until the host sends the matching
   `wl_display.delete_id` (`ShadowTable::guest_destroyed`). Meanwhile the
   guest object rejects new requests and stale host events do not reach its
@@ -335,7 +342,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   translated and forwarded. Handlers that synthesize `delete_id` themselves
   (such as `wl_callback.done`) may end their guest object when they queue
   it.
-  Test: `destructor_mapping_survives_until_host_delete_id`.
+  Tests: `destructor_mapping_survives_until_host_delete_id`,
+  `test_generate_wayland`.
 - **An ID is reused only once the peer has forgotten it.** An ID the
   proxy allocated on the host connection becomes reusable only through
   `ShadowTable::release_deleted_host_id`, on the host's `delete_id`: the
@@ -405,11 +413,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   what the guest's destructor would but sends nothing to the deleted
   object. The `delete_id` that acknowledges a destructor forgets nothing
   again, and a render buffer, which outlives its guest object while the
-  host shows it, ends when the host releases its ID. An asynchronous
-  dma-buf create ends with its params; releasing the host ID drops it
-  too, as a backstop. A new map of per-object
-  state gets its arm in `state::lifecycle::forget_object` and its check in
-  `Context::assert_no_orphans`. Ending an object sends its teardown in the
+  host shows it, ends when the host releases its ID. State only the
+  object owns is kept in its table entry (`ObjectData`), which only a
+  live object keeps, so it ends with the object by construction; an
+  asynchronous dma-buf create is its params'. Per-object state kept
+  outside the table gets its arm in `state::lifecycle::forget_object` and
+  its check in `Context::assert_no_orphans`. Ending an object sends its teardown in the
   current message's effects, in the wire order its destructor handler
   had: the Aura objects of a surface or toplevel are released before its
   destructor, and a surface's text-input leave and buffer retirement

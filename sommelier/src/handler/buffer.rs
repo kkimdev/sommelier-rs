@@ -21,7 +21,7 @@ limitations under the License.
 use crate::handler::Handlers;
 use crate::protocols;
 use crate::state::{Context, EventSender, GuestId, HostId, RequestSender, SurfaceState};
-use crate::wire::Action;
+use crate::wire::{Action, Destructor};
 use std::collections::BTreeMap;
 
 /// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
@@ -160,8 +160,23 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
     }
 }
 
+/// Whether `event` of a buffer the guest destroyed still reaches its
+/// handler (`handler::outlives_destroy`): the `release` of one the host
+/// still shows, which retires it.
+pub(crate) fn outlives_destroy(
+    ctx: &Context,
+    sender: &crate::state::EventSender,
+    event: &protocols::wayland::wl_buffer::Event,
+) -> bool {
+    match event {
+        protocols::wayland::wl_buffer::Event::Release {} => {
+            ctx.host_buffer_is_guest_destroyed(sender.host)
+        }
+    }
+}
+
 impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
-    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Action {
+    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Destructor {
         let guest_id = sender.guest;
         let host_id = ctx.shadow_table.get_host_id(guest_id);
         // wl_surface.attach is forwarded immediately, while the submitted
@@ -181,20 +196,25 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
             && (!ctx.buffer_is_released(guest_id) || uncommitted_attach)
         {
             if !ctx.mark_buffer_guest_destroyed(guest_id) {
-                return ctx.fail(format_args!(
+                // Ends the session, so the object ends with it.
+                let _ = ctx.fail(format_args!(
                     "Render buffer {guest_id} could not enter guest-destroyed state"
                 ));
             }
-            ctx.guest_destroyed_in_use(guest_id);
-            return Action::Drop;
+            return Destructor::HostInUse;
         }
 
         if let Some(host_id) = host_id {
-            queue_host_buffer_destroy(ctx, host_id);
-            retire_destroyed_buffer_mapping(ctx, guest_id, host_id);
+            if !ctx.render_buffer_destroy_queued(guest_id, host_id) {
+                // Ends the session, so the object ends with it.
+                let _ = ctx.fail(format_args!(
+                    "Render buffer generation diverged while destroying guest {} host {}",
+                    guest_id, host_id
+                ));
+            }
         }
         clear_surface_buffer_references(ctx, guest_id);
-        Action::Drop
+        Destructor::Forward
     }
 
     fn on_release(ctx: &mut Context, sender: EventSender) -> Action {

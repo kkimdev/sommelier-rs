@@ -17,22 +17,15 @@ limitations under the License.
 use crate::allocator::{PendingFence, VirtGpuNode};
 use crate::client_kind;
 use crate::connection::{LastSubmission, OutgoingMessages, WaylandConnection};
-use crate::handler::Handlers;
 use crate::placement_config::{self, PlacementConfig};
-use crate::protocols;
-use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
-use crate::protocols::wayland::{wl_buffer, wl_keyboard};
-use crate::protocols::{AnyEvent, Iface};
 use crate::settings::{HostTransport, Settings};
-use crate::state::{
-    ConnectionFacts, Context, EventSender, GuestId, HostId, PostDispatch, SessionEnd,
-};
+use crate::state::{ConnectionFacts, Context, GuestId, HostId, SessionEnd};
 use crate::trace::{Recorder, Stream, Traces};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::warn_once::WarnOnce;
-use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, ToGuest, ToHost, WireMessage};
+use crate::wire::{Framing, MessageHeader, ProtocolError};
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +34,7 @@ use tokio::io::Interest;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::Instant;
 
+mod dispatch;
 #[cfg(test)]
 mod frame_cost;
 #[cfg(test)]
@@ -103,124 +97,6 @@ impl Direction {
         match self {
             Self::ClientToHost => Stream::FromGuest,
             Self::HostToClient => Stream::FromHost,
-        }
-    }
-}
-
-/// Whether `event`, which `sender` sent, is stale: its guest object was
-/// destroyed, and the event reaches neither the guest nor a handler.
-///
-/// Two events still reach their handler. A buffer the host still shows
-/// when the guest destroys it is released later (`wl_buffer.release`). An
-/// asynchronous linux-dmabuf create can legally be followed by
-/// params.destroy before the compositor emits `created` or `failed`; the
-/// host still owns a newly created `wl_buffer` then, which the handler
-/// turns into a host-only buffer and destroys. Dropping `created` here
-/// would leak the host buffer, because the generated `new_id` mapping only
-/// runs when the event is forwarded.
-fn pending_host_event_is_stale(ctx: &Context, sender: &EventSender, event: &AnyEvent) -> bool {
-    if !sender.guest.is_some_and(|guest| guest.destroyed) {
-        return false;
-    }
-    match event {
-        AnyEvent::WlBuffer(wl_buffer::Event::Release {}) => {
-            !ctx.host_buffer_is_guest_destroyed(sender.host)
-        }
-        AnyEvent::ZwpLinuxBufferParamsV1(
-            zwp_linux_buffer_params_v1::Event::Created { .. }
-            | zwp_linux_buffer_params_v1::Event::Failed {},
-        ) => false,
-        _ => true,
-    }
-}
-
-/// The forward of a message, to the peer its direction goes to.
-enum Forward {
-    /// A guest request's, for the host.
-    Host(ToHost),
-    /// A host event's, for the guest.
-    Guest(ToGuest),
-}
-
-/// Log forward `message`, which the dispatcher translated.
-fn translated<I>(message: Outgoing<I>) -> Outgoing<I> {
-    log::debug!(
-        "  -> translated ({} bytes, {} fds)",
-        message.bytes().len(),
-        message.fds().len()
-    );
-    message
-}
-
-/// What the proxy read of a host event.
-enum HostRead {
-    /// Its sender is no live host object the proxy tracks.
-    Untracked,
-    /// The event, whole.
-    Event(EventSender, AnyEvent),
-    /// An event the generated code cannot read: an unknown opcode, or
-    /// arguments that do not decode whole.
-    Unreadable(EventSender, ProtocolError),
-}
-
-/// Whether an event from an object only the proxy uses has failed to
-/// decode yet. Only the first warns.
-static UNREADABLE_INTERNAL_EVENT: WarnOnce = WarnOnce::new();
-
-/// Drop an event that `sender`, an object only the proxy uses (its own
-/// `zaura_shell` binding, say), sent with `opcode`, and that the proxy
-/// cannot read (`error`): it reaches no guest object, so the guest's
-/// session goes on, as it did when the proxy skipped the events of its
-/// own Aura objects unread.
-fn unreadable_internal_event(sender: EventSender, opcode: u16, error: &ProtocolError) {
-    log::log!(
-        UNREADABLE_INTERNAL_EVENT.level(),
-        "Dropping event {opcode} of host {} {}, which only the proxy uses: {error}",
-        sender.iface,
-        sender.host
-    );
-}
-
-/// `decoded`, the result of decoding `msg` from an object of `iface`,
-/// unless it left trailing bytes (see [`WireMessage::check_consumed`]),
-/// which are logged.
-fn whole<T>(
-    msg: &WireMessage,
-    iface: Iface,
-    decoded: Result<T, ProtocolError>,
-) -> Result<T, ProtocolError> {
-    let decoded = msg.check_consumed(decoded);
-    if decoded.as_ref().err() == Some(&ProtocolError::TrailingData) {
-        log::error!(
-            "Protocol message left {} trailing payload byte(s): interface={iface}, opcode={}",
-            msg.payload.len() - msg.offset,
-            msg.opcode
-        );
-    }
-    decoded
-}
-
-/// How a message the proxy cannot frame, decode or dispatch ends the
-/// session.
-fn rejection(direction: Direction, error: &ProtocolError) -> SessionEnd {
-    match direction {
-        // Tell the guest why, as libwayland-server does.
-        Direction::ClientToHost => crate::handler::display::request_error(error),
-        // The host broke the protocol; the guest did nothing wrong.
-        Direction::HostToClient => SessionEnd::internal(),
-    }
-}
-
-/// Apply the work a handler deferred until its message was forwarded (see
-/// [`PostDispatch`]).
-fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
-    match effect {
-        PostDispatch::XdgToplevelCreated {
-            xdg_surface,
-            xdg_toplevel,
-        } => crate::handler::compositor::record_xdg_toplevel(ctx, xdg_surface, xdg_toplevel),
-        PostDispatch::KeyboardCreated { keyboard, seat } => {
-            crate::handler::keyboard::keyboard_created(ctx, keyboard, seat)
         }
     }
 }
@@ -539,7 +415,7 @@ impl Client {
                     // libwayland-server reports a length under 8 or over
                     // 4096 the same way (the alignment check is the proxy's
                     // own); the stream cannot be framed past it.
-                    end = Some(rejection(
+                    end = Some(dispatch::rejection(
                         direction,
                         &ProtocolError::InvalidMessageLength(header.len),
                     ));
@@ -566,263 +442,62 @@ impl Client {
             }
 
             let packet = &conn.read_buf[offset..message_end];
-            let queued_fds = conn.read_fds.len();
-
-            // The message takes its descriptors from the front of the
-            // queue; dropping it unforwarded closes them.
-            let msg = |fds| {
-                WireMessage::new(sender_id, opcode, &packet[MessageHeader::LEN..]).with_fds(fds)
-            };
-            // The text of a host keymap, which a trace records.
-            let mut keymap = None;
-            let result = match direction {
-                Direction::ClientToHost => match self.ctx.shadow_table.resolve_request(sender_id) {
-                    Some(sender) => {
-                        log::trace!("[{direction:?}] {}:{opcode} (len={len})", sender.iface);
-                        let mut msg = msg(&mut conn.read_fds);
-                        let forward = protocols::dispatch_request::<Handlers>(
-                            sender,
-                            &mut msg,
-                            &mut self.ctx,
-                        );
-                        whole(&msg, sender.iface, forward).map(|forward| forward.map(Forward::Host))
-                    }
-                    // A guest request is only valid when its sender is a
-                    // live object owned by this connection. Unlike a stale
-                    // host event (which may have raced object teardown),
-                    // silently dropping an unknown client request makes the
-                    // client believe the request was accepted and can
-                    // desynchronize protocol state.
-                    None => Err(ProtocolError::InvalidSender(sender_id)),
+            let frame = dispatch::Frame {
+                direction,
+                header: MessageHeader {
+                    sender_id,
+                    opcode,
+                    len,
                 },
-                Direction::HostToClient => {
-                    let read = match self.ctx.shadow_table.resolve_event(sender_id) {
-                        None => HostRead::Untracked,
-                        Some(sender) => {
-                            log::trace!("[{direction:?}] {}:{opcode} (len={len})", sender.iface);
-                            // Each host event is decoded once, whole, for
-                            // everything that reads it.
-                            let mut msg = msg(&mut conn.read_fds);
-                            let event = AnyEvent::decode(sender.iface, &mut msg);
-                            match msg.check_consumed(event) {
-                                Ok(event) => HostRead::Event(sender, event),
-                                Err(error) => HostRead::Unreadable(sender, error),
-                            }
-                        }
-                    };
-                    if let (
-                        Some(_),
-                        HostRead::Event(
-                            _,
-                            AnyEvent::WlKeyboard(wl_keyboard::Event::Keymap { fd, size, .. }),
-                        ),
-                    ) = (&self.trace, &read)
-                    {
-                        keymap = Some(crate::keymap::bytes(fd.as_fd(), *size).unwrap_or_default());
-                    }
-                    match read {
-                        // One that does not decode ends the session before
-                        // anything reads it, unless only the proxy uses its
-                        // object (below).
-                        HostRead::Unreadable(sender, error) if sender.guest.is_some() => Err(error),
-                        read => {
-                            let event = match &read {
-                                HostRead::Event(sender, event) => Some((sender, event)),
-                                _ => None,
-                            };
-                            // A destructor has already been forwarded for a
-                            // stale event's object: it reaches no handler
-                            // and not the guest.
-                            let stale = event.is_some_and(|(sender, event)| {
-                                pending_host_event_is_stale(&self.ctx, sender, event)
-                            });
-                            // An empty IME confirmation's recovery of a held
-                            // key waits for the host's next event, which may
-                            // show that it was Exo's confirmation before a
-                            // new press. What it sends the guest precedes
-                            // this event's own forward.
-                            crate::handler::keyboard::before_host_event(
-                                &mut self.ctx,
-                                event,
-                                stale,
-                            );
-                            {
-                                let decided = self.ctx.take_effects();
-                                debug_assert!(decided.end.is_none() && decided.wait.is_none());
-                                for message in decided.to_guest {
-                                    self.to_guest.push(message);
-                                }
-                                for message in decided.to_host {
-                                    self.to_host.push(message);
-                                }
-                            }
-                            match read {
-                                HostRead::Event(..) if stale => Ok(None),
-                                HostRead::Event(sender, event) => {
-                                    let forward = protocols::dispatch_event::<Handlers>(
-                                        sender,
-                                        event,
-                                        len - MessageHeader::LEN,
-                                        &mut self.ctx,
-                                    );
-                                    match forward {
-                                        Err(error @ ProtocolError::UnsupportedVersion { .. })
-                                            if sender.guest.is_none() =>
-                                        {
-                                            unreadable_internal_event(sender, opcode, &error);
-                                            Ok(None)
-                                        }
-                                        forward => {
-                                            forward.map(|forward| forward.map(Forward::Guest))
-                                        }
-                                    }
-                                }
-                                read => {
-                                    if let HostRead::Unreadable(sender, error) = &read {
-                                        unreadable_internal_event(*sender, opcode, error);
-                                    } else {
-                                        log::debug!(
-                                            "[{direction:?}] untracked host id {sender_id} opcode {opcode} (len={len})"
-                                        );
-                                    }
-                                    // SCM_RIGHTS descriptors form an ordered
-                                    // stream independent of byte-buffer
-                                    // boundaries. A descriptor received
-                                    // alongside a complete message the proxy
-                                    // cannot read may belong to a later
-                                    // message whose bytes are still partial
-                                    // in this buffer. Do not terminate the
-                                    // connection merely because the unread
-                                    // message cannot tell us how many
-                                    // descriptors it consumes; leave the
-                                    // descriptor queued for the next
-                                    // complete message and let the
-                                    // connection close it if the peer goes
-                                    // away before that message arrives.
-                                    if !conn.read_fds.is_empty() {
-                                        conn.ambiguous_untracked_fd = true;
-                                    }
-                                    Ok(None)
-                                }
-                            }
-                        }
-                    }
-                }
+                payload: &packet[MessageHeader::LEN..],
+                fds: &mut conn.read_fds,
             };
-
-            let forward = match result {
-                Ok(forward) => forward,
-                Err(e) => {
-                    let interface = match direction {
-                        Direction::ClientToHost => self
-                            .ctx
-                            .shadow_table
-                            .resolve_request(sender_id)
-                            .map(|sender| sender.iface),
-                        Direction::HostToClient => self
-                            .ctx
-                            .shadow_table
-                            .resolve_event(sender_id)
-                            .map(|sender| sender.iface),
-                    }
-                    .map_or("unknown", Iface::name);
-                    log::error!("Protocol error: {e} (direction={direction:?}, id={sender_id}, interface={interface}, opcode={opcode})");
-                    self.ctx.end_session(rejection(direction, &e));
-                    None
-                }
+            let mut out = dispatch::Outbox {
+                to_host: &mut self.to_host,
+                to_guest: &mut self.to_guest,
             };
-            let after_forward = self.ctx.take_post_dispatch();
-            // Only a guest request waits for a fence, and only one that
-            // takes no descriptors and has no forward, output or deferred
-            // work: its descriptors would be gone when it is dispatched
-            // again, and the rest would be lost. A host event that waited
-            // would spin the loop. Any other wait is a proxy bug, which
-            // ends the session before its deferred work changes anything.
-            if self.ctx.waits_for_fence() && !self.ctx.is_fatal() {
-                let broken = [
-                    (direction != Direction::ClientToHost, "it is a host event"),
-                    (conn.read_fds.len() != queued_fds, "it took descriptors"),
-                    (forward.is_some(), "it has a forward"),
-                    (!after_forward.is_empty(), "it deferred work"),
-                    (self.ctx.sends_anything(), "it queued output"),
-                ]
-                .into_iter()
-                .find_map(|(broken, why)| broken.then_some(why));
-                if let Some(why) = broken {
-                    log::error!(
-                        "A {direction:?} message from object {sender_id} waits for a fence, \
-                         but {why}; ending the session"
-                    );
-                    self.ctx.end_session(SessionEnd::internal());
-                }
-            }
-            // Work deferred until the message is forwarded runs only if it
-            // is, which a message that ends the session never is.
-            if forward.is_some() && !self.ctx.is_fatal() {
-                for effect in after_forward {
-                    apply_post_dispatch(&mut self.ctx, effect);
-                }
-            }
-            // A message's effects are committed whole or not at all: one
-            // that ends the session sends nothing, and dropping its forward
-            // and effects closes their descriptors. The messages before it
-            // were valid and are sent as usual.
-            let effects = self.ctx.take_effects();
+            let report = dispatch::dispatch(&mut self.ctx, frame, &mut out, self.trace.is_some());
+            conn.ambiguous_untracked_fd |= report.ambiguous_fds;
             // A message is recorded once it is handled, or ends the
             // session: one that waits for a fence is handled again.
             if let Some(trace) = &mut self.trace {
-                if effects.wait.is_none() || effects.end.is_some() {
-                    trace.record(
-                        direction.handled(),
-                        packet,
-                        queued_fds - conn.read_fds.len(),
-                    );
+                if !matches!(report.dispatched, dispatch::Dispatched::Waits(_)) {
+                    trace.record(direction.handled(), packet, report.fds);
                 }
-                if let Some(keymap) = &keymap {
+                if let Some(keymap) = &report.keymap {
                     trace.keymap(keymap);
                 }
             }
-            if let Some(session_end) = effects.end {
-                end = Some(session_end);
-                break;
-            }
-            // A message that waits for a fence changed nothing, so it stays
-            // buffered with everything after it, and is dispatched again
-            // when it is due. Nothing overtakes it.
-            if let Some(wait) = effects.wait {
-                let now = Instant::now();
-                let timeout = wait.timeout;
-                let parked = match resumed {
-                    Some(parked) if offset == 0 => parked.wait_again(wait.fence),
-                    _ => ParkedRequest::new(wait.fence, now + timeout),
-                };
-                if now >= parked.deadline {
-                    if let Some(trace) = &mut self.trace {
-                        trace.record(direction.handled(), packet, 0);
-                    }
-                    log::error!(
-                        "A dma-buf fence did not signal within {timeout:?} for a request \
-                         from guest object {sender_id}; ending the session"
-                    );
-                    end = Some(SessionEnd::internal());
-                } else {
-                    self.parked = Some(parked);
+            match report.dispatched {
+                dispatch::Dispatched::Handled => {}
+                dispatch::Dispatched::Ends(session_end) => {
+                    end = Some(session_end);
+                    break;
                 }
-                break;
-            }
-            // The generated dispatcher encoded the forward under the sender
-            // it translated before the handler ran, so a handler that retires
-            // the sender's mapping cannot change it.
-            match forward {
-                Some(Forward::Host(message)) => self.to_host.push(translated(message)),
-                Some(Forward::Guest(message)) => self.to_guest.push(translated(message)),
-                None => {}
-            }
-            for message in effects.to_host {
-                self.to_host.push(message);
-            }
-            for message in effects.to_guest {
-                self.to_guest.push(message);
+                // A message that waits for a fence changed nothing, so it
+                // stays buffered with everything after it, and is
+                // dispatched again when it is due. Nothing overtakes it.
+                dispatch::Dispatched::Waits(wait) => {
+                    let now = Instant::now();
+                    let timeout = wait.timeout;
+                    let parked = match resumed {
+                        Some(parked) if offset == 0 => parked.wait_again(wait.fence),
+                        _ => ParkedRequest::new(wait.fence, now + timeout),
+                    };
+                    if now >= parked.deadline {
+                        if let Some(trace) = &mut self.trace {
+                            trace.record(direction.handled(), packet, 0);
+                        }
+                        log::error!(
+                            "A dma-buf fence did not signal within {timeout:?} for a request \
+                             from guest object {sender_id}; ending the session"
+                        );
+                        end = Some(SessionEnd::internal());
+                    } else {
+                        self.parked = Some(parked);
+                    }
+                    break;
+                }
             }
 
             offset = message_end;
@@ -843,11 +518,7 @@ impl Client {
             trace.flush();
         }
 
-        // Host linux-dmabuf capability discovery emits one format event and
-        // then a long modifier stream. The dmabuf handler coalesces feedback
-        // refreshes within this dispatch batch; allow the next batch to
-        // publish a newer table after more capabilities have arrived.
-        self.ctx.synthetic_feedback_refresh_pending.clear();
+        self.ctx.end_batch();
         // A session that ends rolls nothing back, so in tests every batch
         // that keeps it must leave no state behind an ended object.
         #[cfg(test)]
@@ -1122,13 +793,15 @@ mod tests {
     use super::Direction::{ClientToHost, HostToClient};
     use super::*;
     use crate::handler::test_support::session_with_shm;
-    use crate::protocols::AnyRequest;
-    use crate::state::PlaneFenceForTest;
+    use crate::protocols;
+    use crate::protocols::{AnyEvent, AnyRequest, Iface};
+    use crate::state::{PlaneFenceForTest, PostDispatch};
     use crate::test_support::{
         any_fd_has_identity, fd_identity, fds_with_identity, raw_dispatch, respell, shm_pool_file,
         TestFdIdentity,
     };
     use crate::wire::Outgoing;
+    use crate::wire::WireMessage;
     use crate::wire::{MessageBuilder, WL_DISPLAY_ID};
     use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -2273,11 +1946,11 @@ mod tests {
     }
 
     /// A message that ends the session discards what its handler queued
-    /// before the failure: a dma-buf `create` whose host params generation
-    /// is already pending must not send its plane and create to the host.
+    /// before the failure: a dma-buf `create_immed` whose host buffer the
+    /// proxy cannot record must not send its plane and create to the host.
     #[tokio::test]
     async fn a_handler_error_discards_its_earlier_output() {
-        use crate::state::{HostId, PendingNativeCreate};
+        use crate::state::HostId;
         use protocols::linux_dmabuf_v1::{
             zwp_linux_buffer_params_v1 as params, zwp_linux_dmabuf_v1,
         };
@@ -2292,18 +1965,20 @@ mod tests {
         s.guest([params::req::add(id, plane, 0, 0, 64, 0, 0)]).await;
         assert_eq!(s.host_received(), [], "the plane waits for the create");
 
-        // Injects a fault no peer can cause: a create already pending for
-        // the params' host ID, which the proxy allocates itself.
-        let pending = PendingNativeCreate {
-            guest_params_id: GuestId::for_test(id),
-            dimensions: (16, 8),
-            sync_fds: Vec::new(),
-        };
-        s.ctx()
-            .pending_native_creates
-            .insert(HostId::for_test(host), pending);
-        s.guest_fatal([params::req::create(id, 16, 8, DRM_FORMAT_ARGB8888, 0)])
-            .await;
+        // Injects a fault no peer can cause: a render buffer already under
+        // the host ID the proxy allocates next, for the buffer.
+        let next = HostId::for_test(host + 1);
+        assert!(s.ctx().register_native_buffer(next, (16, 8), Vec::new()));
+        let buffer = s.new_id();
+        s.guest_fatal([params::req::create_immed(
+            id,
+            buffer,
+            16,
+            8,
+            DRM_FORMAT_ARGB8888,
+            0,
+        )])
+        .await;
         assert_eq!(s.host_received(), []);
         assert_eq!(
             s.guest_received_and_error(),
@@ -2932,7 +2607,10 @@ mod tests {
             zaura_shell::evt::layout_mode(shell, 1),
         ])
         .await;
-        assert!(UNREADABLE_INTERNAL_EVENT.logged(), "the first warns");
+        assert!(
+            dispatch::UNREADABLE_INTERNAL_EVENT.logged(),
+            "the first warns"
+        );
         assert_eq!(s.guest_received(), []);
         assert_eq!(s.host_received(), []);
     }

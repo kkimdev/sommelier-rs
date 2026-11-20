@@ -17,7 +17,7 @@ limitations under the License.
 use crate::handler::Handlers;
 use crate::protocols::wayland::wl_seat;
 use crate::state::{Context, GuestId, PostDispatch, RequestSender};
-use crate::wire::Action;
+use crate::wire::{Action, Destructor};
 
 impl wl_seat::WlSeatHandler for Handlers {
     fn on_get_keyboard(ctx: &mut Context, sender: RequestSender, id: GuestId) -> Action {
@@ -29,7 +29,7 @@ impl wl_seat::WlSeatHandler for Handlers {
         Action::Forward
     }
 
-    fn on_release(_ctx: &mut Context, _sender: RequestSender) -> Action {
+    fn on_release(_ctx: &mut Context, _sender: RequestSender) -> Destructor {
         // `wl_seat.release` destroys only this parent object. Existing
         // `wl_keyboard`, `wl_pointer`, and `wl_touch` children have their own
         // protocol lifetimes and remain usable until their respective
@@ -37,7 +37,7 @@ impl wl_seat::WlSeatHandler for Handlers {
         // clearing child routing or IME state here would drop later events
         // (including a key release paired with a press sent before this
         // request).
-        Action::Forward
+        Destructor::Forward
     }
 }
 

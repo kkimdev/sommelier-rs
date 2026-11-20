@@ -93,8 +93,9 @@ pub(crate) fn insert(ctx: &mut Context, guest: GuestId, active: Active) {
         // A context without the host's extension names none, as no
         // request of the test's goes to it.
         manager: ctx
-            .host_text_input_extension_v1_id
-            .unwrap_or(HostId::for_test(0)),
+            .globals
+            .text_input_factories()
+            .map_or(HostId::for_test(0), |(_, extension)| extension),
     };
     let host = HostTi {
         v1: active.host,
@@ -104,7 +105,7 @@ pub(crate) fn insert(ctx: &mut Context, guest: GuestId, active: Active) {
     let focus = active.focus.map(SurfaceId);
     ctx.ime
         .insert_for_test(ti, SeatId(active.seat), host, focus);
-    let env = CtxEnv::new(&ctx.shadow_table, &ctx.keyboard_focus);
+    let env = CtxEnv::new(&ctx.shadow_table, ctx.keys.focus());
     let t = ctx.ime.get_mut(ti).expect("just inserted");
     if let Some(committed) = t.committed_mut_for_test() {
         committed.enabled = active.enabled;
@@ -134,7 +135,7 @@ pub(crate) fn insert(ctx: &mut Context, guest: GuestId, active: Active) {
         }
     }
     ctx.ime
-        .assert_invariants(&CtxEnv::new(&ctx.shadow_table, &ctx.keyboard_focus));
+        .assert_invariants(&CtxEnv::new(&ctx.shadow_table, ctx.keys.focus()));
 }
 
 /// What the host text input has applied.

@@ -18,10 +18,11 @@ limitations under the License.
 //! keys, as a sans-IO state machine, the IME core's twin.
 //! [`KeyboardCore::step`] takes one [`KeyInput`] and returns the
 //! [`KeyEffects`] the adapter (`crate::handler::keyboard`) applies; it
-//! reads the facts it does not own (the keyboard focus, the shortcut
-//! bindings, the IME's gate) through [`Env`].
+//! reads the facts it does not own (the shortcut bindings, the IME's gate)
+//! through [`Env`].
 //!
-//! It owns one record per host keyboard ([`Keyboard`]), each key's
+//! It owns the keyboard focus ([`focus`]), one record per host keyboard
+//! ([`Keyboard`]), each key's
 //! generations with their delivery, the IME's Backspace repeat lease and
 //! the peek watermarks (`generations`), the recovery of an empty IME
 //! confirmation's held key (`recovery`), and the host accelerators,
@@ -31,6 +32,7 @@ limitations under the License.
 //! core's requests reach it as [`KeyInput::Ime`], and it hands the IME core
 //! [`ime::Input`]s ([`KeyEffects::ime`], [`KeyEffects::recovered`]).
 
+mod focus;
 mod generations;
 mod keyboards;
 mod recovery;
@@ -43,13 +45,15 @@ use crate::accelerator::{Accelerator, BindingId, HostAccelerators};
 use crate::ime::{self, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
 use crate::keymap::{KeyboardModifiers, Keymap};
 use crate::protocols::wayland::wl_keyboard::{self, KEY_STATE_PRESSED, KEY_STATE_RELEASED};
-use crate::state::{GuestId, HostId, KeyboardFocusUpdate};
+use crate::state::{GuestId, HostId};
 use crate::wire::ToGuest;
+use focus::KeyboardFocusUpdate;
 use generations::{
     ChordClass, KeyAdmission, KeyGenerationRegistry, LeaseInput, PeekInput, PhysicalKey,
 };
 use recovery::{HostSignal, PendingRecovery};
 
+pub(crate) use focus::{KeyboardFocus, KeyboardFocusRegistry};
 pub(crate) use generations::EVDEV_KEY_BACKSPACE;
 #[cfg(test)]
 pub(crate) use generations::{GuestKeyOwner, PeekKeyProvenance};
@@ -76,9 +80,9 @@ pub(crate) enum KeyInput {
         keyboard: HostId,
         keymap: Option<xkb::Keymap>,
     },
-    /// `keyboard` ended: its record and its keys end, and so does a
-    /// recovery of a key it holds. Its extended keyboard comes back in
-    /// [`KeyEffects::ended`].
+    /// `keyboard` ended: its record, its focus and its keys end, and so
+    /// does a recovery of a key it holds. Its extended keyboard comes back
+    /// in [`KeyEffects::ended`]; the seat's focus moves as at a leave.
     Ended(HostId),
 
     // Host events a waiting recovery reads (`HostSignal`), each decoded
@@ -119,18 +123,32 @@ pub(crate) enum KeyInput {
     /// ([`KeyboardCore::awaits_host_event`]).
     HostEvent,
 
-    // The keyboard focus, and what ends.
-    /// The keyboard focus registry moved (`update`): each keyboard it
-    /// retired loses its keys; then `enter`'s keyboard holds the keys its
-    /// `wl_keyboard.enter` listed; then each seat whose focus changed loses
-    /// its peek watermarks and its Backspace leases, and the IME core
-    /// hears of the change (F1), with the guest's copy of the keyboard
-    /// events that moved it, `keyboard`.
-    Focus {
-        update: KeyboardFocusUpdate,
-        enter: Option<(HostId, Vec<u32>)>,
-        keyboard: Vec<ToGuest>,
+    // The keyboard focus, and what ends. Each moves the focus
+    // ([`focus::KeyboardFocusRegistry`]): each keyboard the move retired
+    // loses its keys; then an entered keyboard holds the keys its
+    // `wl_keyboard.enter` listed; then each seat whose focus changed loses
+    // its peek watermarks and its Backspace leases, and the IME core hears
+    // of the change (F1), with the guest's copy of the keyboard events that
+    // moved it.
+    /// `wl_keyboard.enter` of `keyboard` on `focus`, holding `keys`, which
+    /// the guest gets as `events`.
+    Enter {
+        keyboard: HostId,
+        focus: KeyboardFocus,
+        keys: Vec<u32>,
+        events: Vec<ToGuest>,
     },
+    /// `wl_keyboard.leave` of `keyboard` from host surface `surface`, which
+    /// the guest gets as `events` unless it leaves no focus of the keyboard.
+    Leave {
+        keyboard: HostId,
+        surface: HostId,
+        events: Vec<ToGuest>,
+    },
+    /// Guest surface `surface` ended: no keyboard focuses it, and the IME
+    /// core hears of it before the focus changes its end caused, so that
+    /// no field commits its preedit into it.
+    SurfaceDestroyed(GuestId),
     /// The guest's text input `ti` ended: a recovery for it ends.
     TextInputEnded(TiId),
 
@@ -195,13 +213,8 @@ pub(crate) struct Ack {
 }
 
 /// Read-only facts the core needs and does not own. The adapter answers
-/// them from the keyboard focus, the shortcut subscriber and the IME core;
-/// tests use maps.
+/// them from the shortcut subscriber and the IME core; tests use maps.
 pub(crate) trait Env {
-    /// The guest surface the keyboards of guest seat `seat` focus.
-    fn seat_focus(&self, seat: GuestId) -> Option<GuestId>;
-    /// Whether host keyboard `keyboard` focuses guest surface `surface`.
-    fn focuses(&self, keyboard: HostId, surface: GuestId) -> bool;
     /// The shortcut binding of `chord`, if a subscriber binds it now.
     fn shortcut(&self, chord: &Accelerator) -> Option<BindingId>;
     /// X2': whether text input `ti` still passes the IME core's gate
@@ -239,6 +252,8 @@ pub(crate) struct KeyboardCore {
     accelerators: HostAccelerators,
     /// What the keyboards' keymaps are compiled in.
     keymaps: crate::keymap::Compiler,
+    /// Which surface each keyboard focuses.
+    focus: KeyboardFocusRegistry,
     keyboards: Keyboards,
     generations: KeyGenerationRegistry,
     /// X2': an empty IME confirmation's recovery of a held key, which
@@ -253,6 +268,7 @@ impl KeyboardCore {
         Self {
             accelerators,
             keymaps: crate::keymap::Compiler::default(),
+            focus: KeyboardFocusRegistry::default(),
             keyboards: Keyboards::default(),
             generations: KeyGenerationRegistry::default(),
             recovery: None,
@@ -263,6 +279,12 @@ impl KeyboardCore {
     /// takes it ([`KeyInput::Keymap`]).
     pub(crate) fn keymaps(&self) -> &crate::keymap::Compiler {
         &self.keymaps
+    }
+
+    /// Which surface each keyboard focuses, which only a focus input
+    /// moves.
+    pub(crate) fn focus(&self) -> &KeyboardFocusRegistry {
+        &self.focus
     }
 
     /// The host keyboards' records.
@@ -303,7 +325,11 @@ impl KeyboardCore {
                     }
                 }
             }
-            KeyInput::Ended(keyboard) => self.ended(keyboard, &mut fx),
+            KeyInput::Ended(keyboard) => {
+                let update = self.focus.release(keyboard);
+                self.ended(keyboard, &mut fx);
+                self.focus_moved(update, None, Vec::new(), &mut fx);
+            }
             KeyInput::Modifiers {
                 keyboard,
                 modifiers,
@@ -336,17 +362,41 @@ impl KeyboardCore {
             | KeyInput::UnhandledKey { .. }
             | KeyInput::UnhandledModifiers
             | KeyInput::HostEvent => {}
-            KeyInput::Focus {
-                update,
-                enter,
+            KeyInput::Enter {
                 keyboard,
-            } => self.focus(update, enter, keyboard, &mut fx),
+                focus,
+                keys,
+                events,
+            } => {
+                let update = self.focus.enter(keyboard, focus);
+                self.focus_moved(update, Some((keyboard, keys)), events, &mut fx);
+            }
+            KeyInput::Leave {
+                keyboard,
+                surface,
+                events,
+            } => {
+                let update = self.focus.leave(keyboard, surface);
+                if update.accepted {
+                    self.focus_moved(update, None, events, &mut fx);
+                } else {
+                    log::debug!(
+                        "Ignoring a stale leave of keyboard {keyboard} from host surface {surface}"
+                    );
+                }
+            }
+            KeyInput::SurfaceDestroyed(surface) => {
+                let update = self.focus.destroy_surface(surface);
+                fx.ime
+                    .push(ime::Input::SurfaceDestroyed(SurfaceId(surface)));
+                self.focus_moved(update, None, Vec::new(), &mut fx);
+            }
             KeyInput::TextInputEnded(ti) => {
                 if self.recovery.is_some_and(|pending| pending.ti == ti) {
                     self.recovery = None;
                 }
             }
-            KeyInput::Ime(effect) => self.ime(effect, env, &mut fx),
+            KeyInput::Ime(effect) => self.ime(effect, &mut fx),
         }
         fx
     }
@@ -396,7 +446,9 @@ impl KeyboardCore {
             | KeyInput::ExtendedBound { .. }
             | KeyInput::Keymap { .. }
             | KeyInput::Ended(_)
-            | KeyInput::Focus { .. }
+            | KeyInput::Enter { .. }
+            | KeyInput::Leave { .. }
+            | KeyInput::SurfaceDestroyed(_)
             | KeyInput::TextInputEnded(_)
             | KeyInput::Ime(_) => return None,
         };
@@ -565,9 +617,10 @@ impl KeyboardCore {
                 );
             }
             if let Some(seat) = seat {
-                let focused = env
-                    .seat_focus(seat)
-                    .filter(|&surface| env.focuses(keyboard, surface));
+                let focused = self
+                    .focus
+                    .surface_for_seat(seat)
+                    .filter(|&surface| self.focus.keyboard_owns_surface(keyboard, surface));
                 self.generations
                     .record_latest_peek(seat, focused, keyboard, sequence);
             }
@@ -585,8 +638,8 @@ impl KeyboardCore {
         }
     }
 
-    /// The keyboard focus moved; see [`KeyInput::Focus`].
-    fn focus(
+    /// The keyboard focus moved (`update`), as [`KeyInput::Enter`] says.
+    fn focus_moved(
         &mut self,
         update: KeyboardFocusUpdate,
         enter: Option<(HostId, Vec<u32>)>,
@@ -641,12 +694,12 @@ impl KeyboardCore {
     }
 
     /// A request of the IME core.
-    fn ime(&mut self, effect: KeyEffect, env: &impl Env, fx: &mut KeyEffects) {
+    fn ime(&mut self, effect: KeyEffect, fx: &mut KeyEffects) {
         match effect {
             KeyEffect::Lease { ti, seat, outcome } => {
                 self.lease(Some(seat.0), LeaseInput::Ime { ti, outcome });
             }
-            KeyEffect::RecoverHeldKey { ti, seat } => self.hold_recovery(ti, seat, env, fx),
+            KeyEffect::RecoverHeldKey { ti, seat } => self.hold_recovery(ti, seat, fx),
             KeyEffect::InputMethodDetached { seat } => self.detached(seat),
         }
     }

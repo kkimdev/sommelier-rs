@@ -18,7 +18,9 @@ limitations under the License.
 //! mandatory ones at once, each optional one once the host reports it),
 //! their DRM codes, and their bytes per pixel.
 
+use super::GuestShm;
 use crate::protocols::wayland::wl_shm;
+use crate::protocols::Iface;
 use crate::state::{Context, GuestId};
 
 /// The one list of pixel formats the proxy converts and advertises: the
@@ -58,7 +60,7 @@ pub(crate) fn is_supported_drm_format(format: u32) -> bool {
 /// or its linux-dmabuf. ARGB/XRGB are always available per the wl_shm
 /// contract and need no report.
 fn host_reported_shm_format(ctx: &Context, format: u32) -> bool {
-    ctx.host_wl_shm_formats.contains(&format) || ctx.host_dmabuf_shm_formats.contains(&format)
+    ctx.shm_formats.wl.contains(&format) || ctx.shm_formats.dmabuf.contains(&format)
 }
 
 pub(super) fn guest_shm_format_available(ctx: &Context, format: u32) -> bool {
@@ -69,7 +71,7 @@ pub(super) fn guest_shm_format_available(ctx: &Context, format: u32) -> bool {
         || if ctx.virtwayland_channel().is_some() {
             host_reported_shm_format(ctx, format)
         } else {
-            ctx.host_wl_shm_formats.contains(&format)
+            ctx.shm_formats.wl.contains(&format)
         }
 }
 
@@ -82,27 +84,24 @@ fn record_host_shm_format(ctx: &mut Context, format: u32) {
     }
     // A format one source already reported may become available to the
     // guest only now; each guest binding sends a format once.
-    let guest_ids: Vec<GuestId> = ctx.guest_shms.keys().copied().collect();
+    if !guest_shm_format_available(ctx, format) {
+        return;
+    }
+    let guest_ids: Vec<GuestId> = ctx
+        .shadow_table
+        .data_of_mut::<GuestShm>()
+        .filter_map(|(guest_id, shm)| {
+            (!shm.stale && shm.formats.insert(format)).then_some(guest_id)
+        })
+        .collect();
     for guest_id in guest_ids {
-        if ctx.stale_shm_guest_objects.contains(&guest_id) {
-            continue;
-        }
-        if !guest_shm_format_available(ctx, format) {
-            continue;
-        }
-        let should_send = ctx
-            .guest_shms
-            .get_mut(&guest_id)
-            .is_some_and(|shm| shm.formats.insert(format));
-        if should_send {
-            ctx.send_guest(wl_shm::evt::format(guest_id, format));
-        }
+        ctx.send_guest(wl_shm::evt::format(guest_id, format));
     }
 }
 
 pub(super) fn record_host_shm_wl_format(ctx: &mut Context, format: u32) {
     if supported_shm_format(format) {
-        ctx.host_wl_shm_formats.insert(format);
+        ctx.shm_formats.wl.insert(format);
     }
     record_host_shm_format(ctx, format);
 }
@@ -112,39 +111,41 @@ pub(super) fn record_host_shm_wl_format(ctx: &mut Context, format: u32) {
 /// dmabuf-backed SHM buffers.
 pub(crate) fn record_host_shm_drm_format(ctx: &mut Context, format: u32) {
     if let Some(shm_format) = shm_format_from_drm(format) {
-        ctx.host_dmabuf_shm_formats.insert(shm_format);
+        ctx.shm_formats.dmabuf.insert(shm_format);
         record_host_shm_format(ctx, shm_format);
     }
 }
 
 pub(crate) fn clear_host_shm_wl_formats(ctx: &mut Context) {
-    ctx.host_wl_shm_formats.clear();
+    ctx.shm_formats.wl.clear();
 }
 
 pub(crate) fn clear_host_shm_dmabuf_formats(ctx: &mut Context) {
-    ctx.host_dmabuf_shm_formats.clear();
+    ctx.shm_formats.dmabuf.clear();
 }
 
-/// Register synthetic guest wl_shm object `guest_id`, bound from host global
-/// `global_name`, and send every capability known so far. ARGB/XRGB are
-/// mandatory wl_shm formats; optional formats are sent only after the host
-/// reports support.
-pub(crate) fn register_guest_shm(ctx: &mut Context, guest_id: GuestId, global_name: u32) {
-    // `forget_shm` clears the mark before the ID can be bound again.
-    debug_assert!(!ctx.stale_shm_guest_objects.contains(&guest_id));
+/// Create synthetic guest wl_shm object `guest_id` at `version`, bound
+/// from host global `global_name`, and send every capability known so far.
+/// ARGB/XRGB are mandatory wl_shm formats; optional formats are sent only
+/// after the host reports support.
+pub(crate) fn register_guest_shm(
+    ctx: &mut Context,
+    guest_id: GuestId,
+    version: u32,
+    global_name: u32,
+) {
     let formats: Vec<u32> = SUPPORTED_SHM_FORMATS
         .iter()
         .copied()
         .filter(|format| guest_shm_format_available(ctx, *format))
         .collect();
-    ctx.guest_shms.insert(
-        guest_id,
-        crate::state::GuestShm {
-            global_name,
-            formats: formats.iter().copied().collect(),
-        },
-    );
-
+    let shm = GuestShm {
+        global_name,
+        formats: formats.iter().copied().collect(),
+        stale: false,
+    };
+    ctx.shadow_table
+        .create_local_with(guest_id, Iface::WlShm, version, shm);
     for format in formats {
         ctx.send_guest(wl_shm::evt::format(guest_id, format));
     }
@@ -289,13 +290,13 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_shm = GuestId::for_test(20);
         let format = 0x3631_4752;
-        register_guest_shm(&mut ctx, guest_shm, 10);
+        register_guest_shm(&mut ctx, guest_shm, 1, 10);
         ctx.clear_queues_for_test();
 
         record_host_shm_wl_format(&mut ctx, format);
         record_host_shm_drm_format(&mut ctx, format);
-        assert!(ctx.host_wl_shm_formats.contains(&format));
-        assert!(ctx.host_dmabuf_shm_formats.contains(&format));
+        assert!(ctx.shm_formats.wl.contains(&format));
+        assert!(ctx.shm_formats.dmabuf.contains(&format));
         assert!(host_reported_shm_format(&ctx, format));
         assert_eq!(ctx.guest_queue_for_test().len(), 1);
 
@@ -316,7 +317,7 @@ mod tests {
             0,
             "an existing object must not receive a duplicate format event"
         );
-        register_guest_shm(&mut ctx, GuestId::for_test(21), 10);
+        register_guest_shm(&mut ctx, GuestId::for_test(21), 1, 10);
         assert!(
             decoded(ctx.guest_queue_for_test(), wl_shm::Event::from_wire)
                 .contains(&(21, wl_shm::Event::Format { format })),

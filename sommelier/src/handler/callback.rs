@@ -163,7 +163,7 @@ mod tests {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         // Stands in for a virtio-gpu render node, which the proxy
         // synthesizes feedback for and a test cannot have.
-        ctx.synthetic_feedback_available_for_test = true;
+        ctx.dmabuf.set_feedback_available_for_test(true);
         let mut s = Session::with_context(ctx);
         let registry = s.registry().await;
         let old = s.advertise(dmabuf, 4).await;

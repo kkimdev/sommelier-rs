@@ -27,11 +27,13 @@ use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry, wl_shm, wl_su
 use crate::protocols::Iface;
 use crate::settings::Settings;
 use crate::state::{
-    Binding, Context, EventSender, GtkShellState, GuestId, HostGlobal, HostId, InternalCallback,
-    PendingDmabufGlobal, RequestObject, RequestSender, Singleton, INERT_BIND_INTERFACE,
+    Binding, Context, EventSender, GuestId, HostGlobal, HostId, InternalCallback, RequestObject,
+    RequestSender, Singleton, INERT_BIND_INTERFACE,
 };
+use crate::state::{RegistryRecord, Singletons};
 use crate::wire::Action;
 use log::error;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The newest `zwp_linux_dmabuf_v1` the proxy binds on the host. This is a
 /// different fact from the guest version: the legacy format and modifier
@@ -39,7 +41,7 @@ use log::error;
 /// proxy synthesizes the guest's feedback object from. `create_immed` is
 /// available since v2 and explicit modifier events since v3, so bind at v3
 /// when the host supports it.
-const LINUX_DMABUF_CAPABILITY_VERSION: u32 = zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
+pub(crate) const LINUX_DMABUF_CAPABILITY_VERSION: u32 = zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
 // The host binding has no feedback requests, so no host feedback object
 // exists (see `ZwpLinuxDmabufFeedbackV1Handler for LinuxDmabufHandler`).
 const _: () =
@@ -141,13 +143,160 @@ pub(crate) enum Policy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Internal {
     /// Bound once per connection, and bound anew when the binding's global
-    /// retires (`Context::singletons`).
+    /// retires ([`Globals::singletons`]).
     Singleton(Singleton),
     /// The first `zwp_text_input_manager_v1`, kept for the connection: the
     /// guest is offered a `zwp_text_input_manager_v3` under its name.
     TextInputManager,
     /// The first `zcr_text_input_extension_v1`, kept for the connection.
     TextInputExtension,
+}
+
+/// What the connection knows of the host's globals and the proxy's own
+/// bindings of them (`Context::globals`). Its fields are this module's, so
+/// only the registry policy adds, retires or binds a global; other modules
+/// read the bindings ([`Self::singletons`], [`Self::text_input_factories`]).
+#[derive(Default)]
+pub(crate) struct Globals {
+    /// Host globals visible to the guest, keyed by their unique numeric name.
+    host_globals: BTreeMap<u32, HostGlobal>,
+    /// Every host global the proxy may bind as a singleton, by name, with
+    /// the host's interface and version, while a registry lists it; see
+    /// [`Singleton`].
+    singleton_candidates: BTreeMap<u32, HostGlobal>,
+    /// What each host registry has advertised, by host registry ID (see
+    /// [`RegistryRecord`]).
+    registries: BTreeMap<HostId, RegistryRecord>,
+    /// Every global name whose removal a registry has seen. A name is one
+    /// global for the connection's life, so it stays here: a global event
+    /// that names it again breaks the protocol ([`accept_global`]). It
+    /// outlives the registries that saw the removal, which a guest may
+    /// destroy before the last registry that lists the global sees it. It
+    /// grows by one name per global removal, for the connection's life:
+    /// negligible, and by design, because libwayland never reuses a name.
+    removed_globals: BTreeSet<u32>,
+    /// The proxy's binding of each host global it binds once per
+    /// connection, for its own use.
+    singletons: Singletons,
+    /// The proxy's `zwp_text_input_manager_v1` ([`Internal::TextInputManager`]).
+    text_input_manager: Option<HostId>,
+    /// The proxy's `zcr_text_input_extension_v1` ([`Internal::TextInputExtension`]).
+    text_input_extension: Option<HostId>,
+    /// Guest-facing v4 linux-dmabuf globals withheld until the internal v3
+    /// binding has delivered its complete legacy format/modifier
+    /// capability set.
+    pending_dmabuf: Vec<PendingDmabufGlobal>,
+}
+
+/// A synthetic linux-dmabuf v4 global waiting for legacy host capability
+/// discovery to complete.
+///
+/// The host registry object is retained because each guest registry needs its
+/// own `global` event; the registry's removal of the global drops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingDmabufGlobal {
+    registry_host_id: HostId,
+    name: u32,
+    version: u32,
+}
+
+impl Globals {
+    /// The proxy's binding of each singleton.
+    pub(crate) fn singletons(&self) -> &Singletons {
+        &self.singletons
+    }
+
+    /// The proxy's text-input manager and extension, once it has bound both.
+    pub(crate) fn text_input_factories(&self) -> Option<(HostId, HostId)> {
+        Some((self.text_input_manager?, self.text_input_extension?))
+    }
+
+    /// Whether a guest global waits for the capabilities of host
+    /// linux-dmabuf global `global`.
+    pub(crate) fn awaits_dmabuf_capabilities(&self, global: u32) -> bool {
+        self.pending_dmabuf
+            .iter()
+            .any(|pending| pending.name == global)
+    }
+
+    /// Whether a registry still lists global `name`: it has not seen its
+    /// `global_remove` yet.
+    pub(crate) fn still_seen(&self, name: u32) -> bool {
+        self.listing(name).is_some()
+    }
+
+    /// The lowest host registry that still lists global `name`, if any (see
+    /// [`Self::still_seen`]).
+    fn listing(&self, name: u32) -> Option<HostId> {
+        self.registries
+            .iter()
+            .filter(|(_, record)| record.lists(name))
+            .map(|(&registry, _)| registry)
+            .min()
+    }
+
+    /// Bind `singleton` as host object `host`, as the registry would.
+    #[cfg(test)]
+    pub(crate) fn bind_for_test(&mut self, singleton: Singleton, host: HostId) {
+        self.singletons.bind_for_test(singleton, host);
+    }
+
+    /// Forget `singleton`'s binding, for a test of a proxy that has none.
+    #[cfg(test)]
+    pub(crate) fn unbind_for_test(&mut self, singleton: Singleton) {
+        self.singletons.unbind_for_test(singleton);
+    }
+
+    /// Set the proxy's text-input manager and extension, for a test of a
+    /// proxy that has, or lacks, them.
+    #[cfg(test)]
+    pub(crate) fn set_text_input_factories_for_test(
+        &mut self,
+        manager: Option<HostId>,
+        extension: Option<HostId>,
+    ) {
+        self.text_input_manager = manager;
+        self.text_input_extension = extension;
+    }
+
+    /// Panic if a registry record outlived its registry, or a global or
+    /// candidate outlived every registry that lists it.
+    #[cfg(test)]
+    pub(crate) fn assert_no_orphans(&self, table: &crate::state::ShadowTable) {
+        let pending = self
+            .pending_dmabuf
+            .iter()
+            .map(|pending| &pending.registry_host_id);
+        for &registry in self.registries.keys().chain(pending) {
+            assert!(
+                table
+                    .get_guest_id(registry)
+                    .is_some_and(|guest| table.live_object(guest, Iface::WlRegistry).is_some()),
+                "registry globals outlived host wl_registry {registry}"
+            );
+        }
+        // A singleton candidate is a name a registry still lists, and so
+        // is an advertised global whose removal a registry has seen: it
+        // retires with the last registry that lists it.
+        for &name in self.singleton_candidates.keys() {
+            assert!(
+                self.still_seen(name),
+                "singleton candidate {name} outlived every registry that lists it"
+            );
+        }
+        for &name in self.host_globals.keys() {
+            assert!(
+                !self.removed_globals.contains(&name) || self.still_seen(name),
+                "removed global {name} outlived every registry that lists it"
+            );
+        }
+    }
+
+    /// The names of the singleton candidates, for a test.
+    #[cfg(test)]
+    pub(crate) fn singleton_candidates_for_test(&self) -> Vec<u32> {
+        self.singleton_candidates.keys().copied().collect()
+    }
 }
 
 /// A global forwarded whatever the settings, offered at most at `ceiling`.
@@ -271,29 +420,13 @@ fn should_bind_internal_dmabuf(gpu_accel: bool, virtwl_supports_dmabuf: bool) ->
     gpu_accel || virtwl_supports_dmabuf
 }
 
-/// Whether a registry still lists global `name`: it has not seen its
-/// `global_remove` yet.
-pub(crate) fn global_still_seen(ctx: &Context, name: u32) -> bool {
-    registry_listing(ctx, name).is_some()
-}
-
-/// The lowest host registry that still lists global `name`, if any (see
-/// [`global_still_seen`]).
-fn registry_listing(ctx: &Context, name: u32) -> Option<HostId> {
-    ctx.registries
-        .iter()
-        .filter(|(_, record)| record.lists(name))
-        .map(|(&registry, _)| registry)
-        .min()
-}
-
 /// Whether the host removed global `name`, as a registry has seen.
 fn global_removal_seen(ctx: &Context, name: u32) -> bool {
-    ctx.removed_globals.contains(&name)
+    ctx.globals.removed_globals.contains(&name)
 }
 
 /// Retire global `name`, which the host removed, once no registry still
-/// lists it ([`global_still_seen`]): reset the internal binding it backed,
+/// lists it ([`Globals::still_seen`]): reset the internal binding it backed,
 /// and drop its connection-wide metadata, whose absence refuses new binds.
 ///
 /// `wl_registry.global_remove` invalidates only the *global name*. Any
@@ -304,8 +437,8 @@ fn global_removal_seen(ctx: &Context, name: u32) -> bool {
 fn retire_unseen_global(ctx: &mut Context, name: u32) {
     reset_internal_binding_for_global(ctx, name);
     crate::handler::shm::retire_guest_shms(ctx, name);
-    ctx.singleton_candidates.remove(&name);
-    ctx.host_globals.remove(&name);
+    ctx.globals.singleton_candidates.remove(&name);
+    ctx.globals.host_globals.remove(&name);
     if ensure_all_bound(ctx).is_err() {
         // The failed bind ended the session in `ctx`, which is all its
         // result says; the message's handler cannot do more.
@@ -346,8 +479,8 @@ fn defer_synthetic_dmabuf_global(
         name,
         version,
     };
-    if !ctx.pending_dmabuf_globals.contains(&pending) {
-        ctx.pending_dmabuf_globals.push(pending);
+    if !ctx.globals.pending_dmabuf.contains(&pending) {
+        ctx.globals.pending_dmabuf.push(pending);
     }
     set_registry_global_visibility(ctx, registry_host_id, name, false);
 }
@@ -357,7 +490,7 @@ fn defer_synthetic_dmabuf_global(
 pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, name: u32) {
     let can_publish = crate::handler::linux_dmabuf::has_synthetic_feedback_formats(ctx, name);
     let mut matching = Vec::new();
-    ctx.pending_dmabuf_globals.retain(|pending| {
+    ctx.globals.pending_dmabuf.retain(|pending| {
         if pending.name == name {
             matching.push(pending.clone());
             false
@@ -373,6 +506,7 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, name: u32) {
 
     for pending in matching {
         let listed = ctx
+            .globals
             .registries
             .get(&pending.registry_host_id)
             .is_some_and(|record| record.lists(pending.name));
@@ -380,7 +514,7 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, name: u32) {
             continue;
         }
 
-        ctx.host_globals.insert(
+        ctx.globals.host_globals.insert(
             pending.name,
             HostGlobal {
                 interface: zwp_linux_dmabuf_v1::NAME.to_string(),
@@ -396,7 +530,7 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, name: u32) {
         );
         set_registry_global_visibility(ctx, pending.registry_host_id, pending.name, visible);
         if !visible {
-            ctx.host_globals.remove(&pending.name);
+            ctx.globals.host_globals.remove(&pending.name);
         }
     }
 }
@@ -460,9 +594,10 @@ impl Singleton {
                 // the dmabuf factory object after we bind it.
                 let bound_version = version.min(LINUX_DMABUF_CAPABILITY_VERSION);
                 let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-                ctx.singletons
+                ctx.globals
+                    .singletons
                     .bind(self, binding(host_id, name, bound_version));
-                ctx.dmabuf_capabilities.entry(name).or_default();
+                crate::handler::linux_dmabuf::start_capability_discovery(ctx, name);
                 bind_internally(
                     ctx,
                     registry_host_id,
@@ -471,7 +606,7 @@ impl Singleton {
                     bound_version,
                     host_id,
                 )?;
-                if can_synthesize_dmabuf_feedback(ctx, version) {
+                if crate::handler::linux_dmabuf::can_synthesize_feedback(ctx, version) {
                     queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { global: name });
                 }
             }
@@ -483,7 +618,8 @@ impl Singleton {
                 // get_extended_keyboard requests.
                 let bound_version = keyboard_extension_version(version);
                 let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-                ctx.singletons
+                ctx.globals
+                    .singletons
                     .bind(self, binding(host_id, name, bound_version));
                 bind_internally(
                     ctx,
@@ -501,7 +637,8 @@ impl Singleton {
                 // GTK startup IDs.
                 let bound_version = version.min(ZAURA_SHELL_MAX_VERSION);
                 let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-                ctx.singletons
+                ctx.globals
+                    .singletons
                     .bind(self, binding(host_id, name, bound_version));
                 bind_internally(
                     ctx,
@@ -520,7 +657,8 @@ impl Singleton {
                 // sends synthetic format events. The host's format events
                 // reach this binding, which records them (`shm::pool`).
                 let host_id = ctx.shadow_table.create_host_only(interface, WL_SHM_VERSION);
-                ctx.singletons
+                ctx.globals
+                    .singletons
                     .bind(self, binding(host_id, name, WL_SHM_VERSION));
                 bind_internally(
                     ctx,
@@ -548,7 +686,7 @@ fn binding(host: HostId, name: u32, version: u32) -> Binding {
 /// Record host global `name` of `singleton`, which the host advertises at
 /// `version`, as a candidate binding.
 fn add_candidate(ctx: &mut Context, singleton: Singleton, name: u32, version: u32) {
-    ctx.singleton_candidates.insert(
+    ctx.globals.singleton_candidates.insert(
         name,
         HostGlobal {
             interface: singleton.interface().name().to_string(),
@@ -565,10 +703,11 @@ fn add_candidate(ctx: &mut Context, singleton: Singleton, name: u32, version: u3
 ///
 /// The session's end if the bind cannot be encoded.
 fn ensure_bound(ctx: &mut Context, singleton: Singleton) -> Result<(), Action> {
-    if ctx.singletons.get(singleton).is_some() {
+    if ctx.globals.singletons.get(singleton).is_some() {
         return Ok(());
     }
     let candidate = ctx
+        .globals
         .singleton_candidates
         .iter()
         .filter(|(_, global)| global.interface == singleton.interface().name())
@@ -576,7 +715,7 @@ fn ensure_bound(ctx: &mut Context, singleton: Singleton) -> Result<(), Action> {
             if global_removal_seen(ctx, name) {
                 return None;
             }
-            let registry_host_id = registry_listing(ctx, name)?;
+            let registry_host_id = ctx.globals.listing(name)?;
             Some((name, registry_host_id, global.version))
         })
         .min();
@@ -606,7 +745,7 @@ fn ensure_all_bound(ctx: &mut Context) -> Result<(), Action> {
 /// create children from them after their globals go, so they are never
 /// reset or rebound (see `text_input_manager_global`).
 fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
-    let Some((singleton, binding)) = ctx.singletons.release_named(name) else {
+    let Some((singleton, binding)) = ctx.globals.singletons.release_named(name) else {
         return;
     };
     match singleton {
@@ -661,7 +800,7 @@ fn advertise_synthetic_global(
     interface: &str,
     version: u32,
 ) {
-    ctx.host_globals.insert(
+    ctx.globals.host_globals.insert(
         name,
         HostGlobal {
             interface: interface.to_string(),
@@ -696,25 +835,8 @@ fn set_registry_global_visibility(
     name: u32,
     visible: bool,
 ) {
-    if let Some(record) = ctx.registries.get_mut(&registry_host_id) {
+    if let Some(record) = ctx.globals.registries.get_mut(&registry_host_id) {
         record.set_visibility(name, visible);
-    }
-}
-
-fn can_synthesize_dmabuf_feedback(ctx: &Context, version: u32) -> bool {
-    if version < LINUX_DMABUF_CAPABILITY_VERSION {
-        return false;
-    }
-    if ctx.virtgpu().is_some() {
-        return true;
-    }
-    #[cfg(test)]
-    {
-        ctx.synthetic_feedback_available_for_test
-    }
-    #[cfg(not(test))]
-    {
-        false
     }
 }
 
@@ -754,6 +876,7 @@ fn admit_guest_bind(
     // wl_global_remove. A host that destroyed it at once would answer the
     // bind with INVALID_OBJECT, as it would a native client's.
     if let Some(removal) = ctx
+        .globals
         .registries
         .get(&registry_host_id)
         .and_then(|record| record.removal(name))
@@ -765,8 +888,8 @@ fn admit_guest_bind(
         return inert.then_some(BindAdmission::Inert);
     }
 
-    let global = ctx.host_globals.get(&name)?;
-    if let Some(record) = ctx.registries.get(&registry_host_id) {
+    let global = ctx.globals.host_globals.get(&name)?;
+    if let Some(record) = ctx.globals.registries.get(&registry_host_id) {
         if !record.lists(name) {
             return None;
         }
@@ -810,6 +933,7 @@ fn accept_global(
         return Err(Action::Drop);
     }
     let advertised = ctx
+        .globals
         .registries
         .get(&registry)
         .is_some_and(|record| record.advertised(name));
@@ -819,7 +943,11 @@ fn accept_global(
              {registry}, which breaks the protocol"
         )));
     }
-    ctx.registries.entry(registry).or_default().list(name);
+    ctx.globals
+        .registries
+        .entry(registry)
+        .or_default()
+        .list(name);
     Ok(())
 }
 
@@ -843,7 +971,8 @@ fn dmabuf_global(ctx: &mut Context, registry: HostId, name: u32, version: u32) -
     // A v3 host still has enough legacy format/modifier information
     // for our synthetic v4 feedback object. Advertise v4 to the
     // guest while clamping only the internal host bind to v3.
-    let can_synthesize_feedback = can_synthesize_dmabuf_feedback(ctx, version);
+    let can_synthesize_feedback =
+        crate::handler::linux_dmabuf::can_synthesize_feedback(ctx, version);
     let client_version = if can_synthesize_feedback {
         GUEST_DMABUF_VERSION
     } else {
@@ -860,10 +989,7 @@ fn dmabuf_global(ctx: &mut Context, registry: HostId, name: u32, version: u32) -
         // One host dmabuf object is shared for capability discovery,
         // and a guest global for it waits until the binding of its
         // own name has the capabilities.
-        let capability_ready = ctx
-            .dmabuf_capabilities
-            .get(&name)
-            .is_some_and(|capabilities| capabilities.ready);
+        let capability_ready = crate::handler::linux_dmabuf::capabilities_ready(ctx, name);
         if can_synthesize_feedback && !capability_ready {
             defer_synthetic_dmabuf_global(ctx, registry, name, client_version);
         } else if !can_synthesize_feedback
@@ -900,14 +1026,14 @@ fn text_input_manager_global(
         zwp_text_input_manager_v3::NAME,
         zwp_text_input_manager_v3::VERSION,
     );
-    if ctx.host_text_input_manager_v1_id.is_some() {
+    if ctx.globals.text_input_manager.is_some() {
         return Action::Drop;
     }
     let interface = Iface::ZwpTextInputManagerV1;
     let bound_version = version.min(TEXT_INPUT_MANAGER_VERSION);
     // This object is internal: there is no guest-side pair.
     let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-    ctx.host_text_input_manager_v1_id = Some(host_id);
+    ctx.globals.text_input_manager = Some(host_id);
     dropped(bind_internally(
         ctx,
         registry,
@@ -928,12 +1054,12 @@ fn text_input_extension_global(
 ) -> Action {
     let interface = Iface::ZcrTextInputExtensionV1;
     hide_global(ctx, registry, name);
-    if ctx.host_text_input_extension_v1_id.is_some() {
+    if ctx.globals.text_input_extension.is_some() {
         return Action::Drop;
     }
     let bound_version = version.min(TEXT_INPUT_EXTENSION_VERSION);
     let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-    ctx.host_text_input_extension_v1_id = Some(host_id);
+    ctx.globals.text_input_extension = Some(host_id);
     dropped(bind_internally(
         ctx,
         registry,
@@ -1007,7 +1133,7 @@ fn forwarded_global(
         advertise_synthetic_global(ctx, registry, name, iface.name(), advertised_version);
         return Action::Drop;
     }
-    ctx.host_globals.insert(
+    ctx.globals.host_globals.insert(
         name,
         HostGlobal {
             interface: iface.name().to_string(),
@@ -1071,7 +1197,7 @@ impl wl_registry::WlRegistryHandler for Handlers {
 
     fn on_global_remove(ctx: &mut Context, sender: EventSender, name: u32) -> Action {
         let registry_id = sender.host;
-        let Some(record) = ctx.registries.get(&registry_id) else {
+        let Some(record) = ctx.globals.registries.get(&registry_id) else {
             return Action::Drop;
         };
         if !record.lists(name) {
@@ -1079,8 +1205,9 @@ impl wl_registry::WlRegistryHandler for Handlers {
         }
         let was_visible = record
             .visibility(name)
-            .unwrap_or_else(|| ctx.host_globals.contains_key(&name));
-        ctx.pending_dmabuf_globals
+            .unwrap_or_else(|| ctx.globals.host_globals.contains_key(&name));
+        ctx.globals
+            .pending_dmabuf
             .retain(|pending| !(pending.registry_host_id == registry_id && pending.name == name));
         // A bound wl_output remains a valid Wayland object after its global
         // advertisement disappears, but it must stop feeding
@@ -1098,18 +1225,19 @@ impl wl_registry::WlRegistryHandler for Handlers {
         // crossed this removal is told apart from a bind of a name it never
         // saw.
         let inert_bind_version = ctx
+            .globals
             .host_globals
             .get(&name)
             .filter(|global| was_visible && global.interface == INERT_BIND_INTERFACE)
             .map(|global| global.version);
-        if let Some(record) = ctx.registries.get_mut(&registry_id) {
+        if let Some(record) = ctx.globals.registries.get_mut(&registry_id) {
             record.remove(name, inert_bind_version);
         }
         // Host registries are independent Wayland objects, and each gets
         // its own global_remove. The connection-wide metadata stays until
         // every registry that lists the global has seen it.
-        ctx.removed_globals.insert(name);
-        if !global_still_seen(ctx, name) {
+        ctx.globals.removed_globals.insert(name);
+        if !ctx.globals.still_seen(name) {
             retire_unseen_global(ctx, name);
         }
         // Only globals previously exposed to the guest should generate a
@@ -1180,15 +1308,12 @@ impl wl_registry::WlRegistryHandler for Handlers {
         };
 
         if interface == Iface::WlShm {
-            // Do NOT forward wl_shm to host. We emulate it.
-            ctx.shadow_table
-                .create_local(*guest_new_id, interface, *version);
-
-            // Advertise mandatory formats immediately and optional formats
-            // only after the host wl_shm/dmabuf capability event has arrived.
-            // This mirrors ChromiumOS Sommelier and prevents a guest from
+            // Do NOT forward wl_shm to host. We emulate it. Advertise
+            // mandatory formats immediately and optional formats only after
+            // the host wl_shm/dmabuf capability event has arrived. This
+            // mirrors ChromiumOS Sommelier and prevents a guest from
             // selecting a format that the host cannot import.
-            register_guest_shm(ctx, *guest_new_id, name);
+            register_guest_shm(ctx, *guest_new_id, *version, name);
 
             // The host-side wl_shm object was bound when the host global was
             // observed. Binding the synthetic guest global must not issue a
@@ -1204,10 +1329,7 @@ impl wl_registry::WlRegistryHandler for Handlers {
                 .create_local(*guest_new_id, interface, *version);
             return;
         } else if interface == Iface::GtkShell1 {
-            ctx.shadow_table
-                .create_local(*guest_new_id, interface, *version);
-            ctx.gtk_shells
-                .insert(*guest_new_id, GtkShellState::default());
+            crate::handler::gtk_shell::create_shell(ctx, *guest_new_id, *version);
             queue_internal_sync(
                 ctx,
                 InternalCallback::GtkShellCapabilities {
@@ -1261,7 +1383,7 @@ impl wl_registry::WlRegistryHandler for Handlers {
             crate::handler::window_placement::output_bound(ctx, host_new_id);
         }
         if interface == Iface::ZwpLinuxDmabufV1 {
-            ctx.dmabuf_factories.insert(*guest_new_id, name);
+            crate::handler::linux_dmabuf::factory_bound(ctx, *guest_new_id, name);
         }
         if interface == Iface::WlSeat {
             // A text input whose seat had no host object can activate now.
@@ -1279,11 +1401,16 @@ impl wl_registry::WlRegistryHandler for Handlers {
 /// registry that still lists it (see `on_global_remove`). If this was the
 /// last one, it will never see the removal, so the global is retired now.
 pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: HostId) {
-    let record = ctx.registries.remove(&registry_host_id).unwrap_or_default();
-    ctx.pending_dmabuf_globals
+    let record = ctx
+        .globals
+        .registries
+        .remove(&registry_host_id)
+        .unwrap_or_default();
+    ctx.globals
+        .pending_dmabuf
         .retain(|pending| pending.registry_host_id != registry_host_id);
     for name in record.listed() {
-        if global_removal_seen(ctx, name) && !global_still_seen(ctx, name) {
+        if global_removal_seen(ctx, name) && !ctx.globals.still_seen(name) {
             retire_unseen_global(ctx, name);
         }
     }
@@ -1292,13 +1419,14 @@ pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: HostId) {
     }
     // A candidate no registry lists any more can never be bound.
     let unlisted: Vec<u32> = ctx
+        .globals
         .singleton_candidates
         .keys()
         .copied()
-        .filter(|&name| !global_still_seen(ctx, name))
+        .filter(|&name| !ctx.globals.still_seen(name))
         .collect();
     for name in unlisted {
-        ctx.singleton_candidates.remove(&name);
+        ctx.globals.singleton_candidates.remove(&name);
     }
 }
 
@@ -1394,7 +1522,7 @@ mod tests {
             let mut ctx = Context::new_for_test(true, false, vec![]);
             // Stands in for a virtio-gpu render node, which the proxy
             // synthesizes feedback for and a test cannot have.
-            ctx.synthetic_feedback_available_for_test = feedback;
+            ctx.dmabuf.set_feedback_available_for_test(feedback);
             Self::with_context(ctx).await
         }
 
@@ -2458,7 +2586,7 @@ mod tests {
             );
             // Reads state no peer can observe: the guest global that waited
             // for the binding's capabilities, which no registry lists now.
-            assert!(r.s.ctx().pending_dmabuf_globals.is_empty(), "{interface}");
+            assert!(r.s.ctx().globals.pending_dmabuf.is_empty(), "{interface}");
 
             r.global(A, 11, interface, version).await;
             let new = binding(11, r.s.host_received());
@@ -2763,7 +2891,7 @@ mod tests {
             assert_eq!(host, Vec::from_iter(expected), "{}", case.name);
             // Reads state no peer can observe: the names a later
             // retirement could bind.
-            let mut candidates = Vec::from_iter(r.s.ctx().singleton_candidates.keys().copied());
+            let mut candidates = Vec::from_iter(r.s.ctx().globals.singleton_candidates_for_test());
             candidates.sort_unstable();
             assert_eq!(candidates, case.candidates, "{}", case.name);
 

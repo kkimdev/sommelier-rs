@@ -252,6 +252,33 @@ pub enum Action {
     Drop,
 }
 
+/// How a destructor request's object ends, as its handler decides. The
+/// generated dispatcher ends the object in every case, so a handler cannot
+/// drop a destructor and leave its object live; a local object's destructor
+/// completes in the proxy whatever its handler returns, and a handler that
+/// ends the session ends nothing (INVARIANTS "Object lifetimes").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "the generated dispatcher ends the object as this says"]
+pub enum Destructor {
+    /// Forward the destructor ahead of the handler's own output, then end
+    /// the object, whose end's output follows (the default).
+    Forward,
+    /// Send the destructor after the handler's own output, then end the
+    /// object: a `wl_surface`'s after the release of its Aura objects.
+    AfterOutput,
+    /// End the object, whose end's output goes first, then send the
+    /// destructor: an `xdg_toplevel`'s or `wl_output`'s after the release
+    /// of its Aura child.
+    AfterEnd,
+    /// End the guest object only: its host object stays in use, as a buffer
+    /// the host still shows, and the proxy destroys it later.
+    HostInUse,
+    /// End the guest object, and keep its host object, which has no
+    /// destructor (a v3 text input's v1): its `delete_id` comes from the
+    /// proxy.
+    HostKept,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProtocolError {
     InsufficientData,

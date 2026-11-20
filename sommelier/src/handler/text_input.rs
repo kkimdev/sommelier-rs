@@ -23,6 +23,7 @@ use crate::ime::{
     self, Edit, Env, HostExt, HostIme, HostOut, HostTi, Input, Piece, SeatId, SurfaceId, TiId,
 };
 use crate::keys::KeyInput;
+use crate::keys::KeyboardFocusRegistry;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
@@ -30,10 +31,10 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::state::{
-    Context, EventObject, EventSender, GuestId, HostId, InternalCallback, KeyboardFocusRegistry,
-    RequestObject, RequestSender, ShadowTable,
+    Context, EventObject, EventSender, GuestId, HostId, InternalCallback, RequestObject,
+    RequestSender, ShadowTable,
 };
-use crate::wire::{Action, IndexedString, ToGuest};
+use crate::wire::{Action, Destructor, IndexedString, ToGuest};
 
 /// The facts the IME core reads and does not own: the object table's and
 /// the keyboard focus's. It borrows only those, so that the core can step
@@ -46,7 +47,7 @@ pub(crate) struct CtxEnv<'a> {
 impl<'a> CtxEnv<'a> {
     #[cfg(test)]
     pub(crate) fn of(ctx: &'a Context) -> Self {
-        Self::new(&ctx.shadow_table, &ctx.keyboard_focus)
+        Self::new(&ctx.shadow_table, ctx.keys.focus())
     }
 
     /// The facts of the context whose object table is `table` and whose
@@ -81,7 +82,7 @@ impl Env for CtxEnv<'_> {
 pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
     // Not `CtxEnv::of`, which would borrow the whole context while its IME
     // core steps.
-    let env = CtxEnv::new(&ctx.shadow_table, &ctx.keyboard_focus);
+    let env = CtxEnv::new(&ctx.shadow_table, ctx.keys.focus());
     let fx = ctx.ime.step(input, &env);
     ctx.send_guest_all(fx.to_guest);
     for out in fx.to_host {
@@ -377,13 +378,6 @@ fn host_ext_event(ctx: &mut Context, sender: EventSender, event: Edit) -> Action
 }
 
 impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for Handlers {
-    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Action {
-        // This manager is synthetic and has no host-side object. The
-        // generated local-only destructor path queues its guest delete_id
-        // after this handler returns.
-        Action::Drop
-    }
-
     fn on_get_text_input(
         ctx: &mut Context,
         sender: RequestSender,
@@ -443,8 +437,7 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for Handlers {
 /// `confirm_preedit`, which the IME core's Exo mirror reads (`docs/IME.md`
 /// E14).
 fn host_text_input_managers(ctx: &Context) -> Option<(HostId, HostId)> {
-    let manager = ctx.host_text_input_manager_v1_id?;
-    let ext_manager = ctx.host_text_input_extension_v1_id?;
+    let (manager, ext_manager) = ctx.globals.text_input_factories()?;
     ctx.shadow_table
         .host_object_version(ext_manager)
         .is_some_and(|version| version >= zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE)
@@ -550,26 +543,14 @@ fn guest_request(ctx: &mut Context, input: Input) -> Action {
 }
 
 impl zwp_text_input_v3::ZwpTextInputV3Handler for Handlers {
-    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Action {
-        let guest_id = sender.guest;
-        // A text input with no input method is local, and its destructor
-        // completes in the proxy.
-        if ctx.shadow_table.is_local(guest_id) {
-            return Action::Drop;
-        }
+    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Destructor {
         // The v3 object is guest-facing but backed by a v1 host object whose
         // protocol has no destructor, so the host object stays for the
-        // connection and the guest lifecycle completes locally. Ending the
-        // object forgets its state (see `forget_text_input`).
-        if ctx.guest_ended_host_kept(guest_id) {
-            ctx.queue_delete_id(guest_id);
-        } else {
-            log::debug!(
-                "Text input {} had already been retired before its destroy handler ran",
-                guest_id
-            );
-        }
-        Action::Drop
+        // connection and the guest lifecycle completes locally. A text input
+        // with no input method is local, and its destructor completes in the
+        // proxy. Ending the object forgets its state (see
+        // `forget_text_input`).
+        Destructor::HostKept
     }
 
     fn on_enable(ctx: &mut Context, sender: RequestSender) -> Action {

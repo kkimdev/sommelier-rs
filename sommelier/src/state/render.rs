@@ -28,23 +28,6 @@ use super::outputs::transformed_extent;
 use super::HostMapping;
 use super::{GuestId, HostId};
 
-/// A guest `wl_shm_pool`.
-///
-/// The bridge reads the pool's pixels with `pread` and never maps the file.
-/// A client may shrink the file after `wl_shm.create_pool`, and a read
-/// through a mapping past the new end of file raises SIGBUS, which would
-/// kill the proxy and every guest GUI app with it. A short `pread` is an
-/// ordinary error instead.
-pub struct ShmPool {
-    /// The pool's file, shared with every buffer created from the pool, so
-    /// it outlives `wl_shm_pool.destroy` while those buffers live.
-    pub file: Arc<File>,
-    /// The size the client declared. `wl_shm_pool.resize` only grows it.
-    pub size: usize,
-    /// The guest `wl_shm` that created it, whose host global it depends on.
-    pub shm: GuestId,
-}
-
 pub struct BufferState {
     /// The file of the pool the buffer was created from.
     pub pool_file: Arc<File>,

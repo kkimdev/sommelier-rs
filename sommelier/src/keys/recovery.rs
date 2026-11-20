@@ -211,8 +211,8 @@ impl KeyboardCore {
     /// no `peek_key` (`Keyboard::OnKeyEvent` handles a press only of a key
     /// it does not hold), only the confirmation before it (E13), which no
     /// wire event tells from an autorepeat.
-    fn held_repeat_key(&self, guest_seat: GuestId, env: &impl Env) -> Option<HeldRepeatKey> {
-        let active_surface = env.seat_focus(guest_seat);
+    fn held_repeat_key(&self, guest_seat: GuestId) -> Option<HeldRepeatKey> {
+        let active_surface = self.focus.surface_for_seat(guest_seat);
         let mut candidates = Vec::new();
         let mut stale_key_held = false;
 
@@ -222,8 +222,8 @@ impl KeyboardCore {
                 continue;
             };
             stale_key_held |= self.generations.holds_a_stale_key(host_keyboard_id);
-            let focused =
-                active_surface.is_some_and(|surface| env.focuses(host_keyboard_id, surface));
+            let focused = active_surface
+                .is_some_and(|surface| self.focus.keyboard_owns_surface(host_keyboard_id, surface));
             for (key, press) in self.generations.peek_keys(host_keyboard_id) {
                 candidates.push((
                     focused,
@@ -300,18 +300,12 @@ impl KeyboardCore {
     /// nothing is sent, and the Backspace lease ends. With one, the
     /// recovery waits for the host's next event, and the core syncs with
     /// the host.
-    pub(super) fn hold_recovery(
-        &mut self,
-        ti: TiId,
-        seat: SeatId,
-        env: &impl Env,
-        fx: &mut KeyEffects,
-    ) {
+    pub(super) fn hold_recovery(&mut self, ti: TiId, seat: SeatId, fx: &mut KeyEffects) {
         debug_assert!(
             self.recovery.is_none(),
             "the confirmation's own event decided the recovery before it"
         );
-        let Some(held) = self.held_repeat_key(seat.0, env) else {
+        let Some(held) = self.held_repeat_key(seat.0) else {
             self.end_lease(seat, ti);
             log::debug!(
                 "Ignoring confirm_preedit without an active preedit for guest {}",

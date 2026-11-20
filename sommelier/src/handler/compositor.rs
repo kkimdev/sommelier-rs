@@ -34,7 +34,7 @@ use crate::state::{
     SurfaceState, ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::{Action, ToHost};
+use crate::wire::{Action, Destructor, ToHost};
 use log::trace;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
@@ -439,8 +439,7 @@ pub(crate) fn forget_surface(
 ) {
     release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
     ctx.outputs.surface_destroyed(wl_surface_host_id);
-    ctx.gtk_surfaces
-        .retain(|_, state| state.wl_surface_id != wl_surface_guest_id);
+    crate::handler::gtk_shell::forget_wl_surface(ctx, wl_surface_guest_id);
     // A submitted buffer may have been detached from another surface and
     // still be waiting for wl_buffer.release; only buffers that this host
     // surface actually held may be retired merely because its destructor
@@ -454,46 +453,34 @@ pub(crate) fn forget_surface(
     // Pending-only objects do not receive a host release event. Retire
     // every buffer made eligible by removing this surface in one pass.
     crate::handler::buffer::retire_eligible_buffers(ctx);
-    ctx.viewport_to_wl_surface
-        .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
+    for (_, viewport) in ctx.shadow_table.data_of_mut::<Viewport>() {
+        if viewport.surface == Some(wl_surface_guest_id) {
+            viewport.surface = None;
+        }
+    }
     ctx.pointer_focus.forget_surface(wl_surface_guest_id);
-    // Surface destruction can race the host's wl_keyboard.leave event.
-    // Transition the authoritative registry first, then emit the mandatory
-    // v3 leave while the guest surface ID is still valid. A later host leave
-    // matches no live generation and is idempotent. The IME core hears of
-    // the destroy before the focus changes it caused, so that no field
-    // commits its preedit into the destroyed surface, as one the focus
-    // leaves does.
-    let focus_update = ctx.keyboard_focus.destroy_surface(wl_surface_guest_id);
-    let surface = crate::ime::SurfaceId(wl_surface_guest_id);
-    crate::handler::text_input::ime(ctx, crate::ime::Input::SurfaceDestroyed(surface));
-    let focus = crate::keys::KeyInput::Focus {
-        update: focus_update,
-        enter: None,
-        keyboard: Vec::new(),
-    };
-    crate::handler::keyboard::keys(ctx, focus);
+    // Surface destruction can race the host's wl_keyboard.leave event. The
+    // keyboard core moves the focus off the surface first, and the IME core
+    // sends the mandatory v3 leave while the guest surface ID is still
+    // valid; a later host leave matches no live generation and is
+    // idempotent. The IME core hears of the destroy before the focus
+    // changes it caused, so that no field commits its preedit into the
+    // destroyed surface, as one the focus leaves does.
+    let destroyed = crate::keys::KeyInput::SurfaceDestroyed(wl_surface_guest_id);
+    crate::handler::keyboard::keys(ctx, destroyed);
 }
 
 impl WlSurfaceHandler for Handlers {
-    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Action {
-        let wl_surface_guest_id = sender.guest;
-        let Some(wl_surface_host_id) = sender.host_id() else {
-            return ctx.fail(format_args!(
-                "Unable to destroy wl_surface {wl_surface_guest_id} without its host generation"
-            ));
-        };
-        // The generated dispatcher cannot express the ordering required by
-        // the aura-shell integration: the Aura objects' releases precede the
-        // wl_surface destructor, and what ending the surface sends follows
-        // it (see `forget_surface`).
-        release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
-        ctx.send_host(wl_surface::req::destroy(wl_surface_host_id));
-        // Retain the numeric mapping until the host acknowledges the
+    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Destructor {
+        // The Aura objects' releases precede the wl_surface destructor, and
+        // what ending the surface sends follows it (see `forget_surface`).
+        // The numeric mapping stays until the host acknowledges the
         // destructor with wl_display.delete_id, so the guest can safely
         // reuse the ID only after that acknowledgement.
-        ctx.guest_destroyed(wl_surface_guest_id);
-        Action::Drop
+        if let Some(wl_surface_host_id) = sender.host_id() {
+            release_surface_aura_objects(ctx, sender.guest, wl_surface_host_id);
+        }
+        Destructor::AfterOutput
     }
 
     /// An enter or leave naming a surface or output the guest has destroyed
@@ -792,6 +779,37 @@ impl WlRegionHandler for Handlers {}
 impl WlSubcompositorHandler for Handlers {}
 impl WlSubsurfaceHandler for Handlers {}
 
+/// A guest `wp_viewport`; its table entry keeps it.
+#[derive(Debug)]
+pub(crate) struct Viewport {
+    /// The `wl_surface` it scales, until that ends: then its requests
+    /// raise `no_surface`, and a later surface under the ID is not its.
+    surface: Option<GuestId>,
+}
+
+#[cfg(test)]
+impl Viewport {
+    /// The surface it scales, for the orphan check.
+    pub(crate) fn surface_for_test(&self) -> Option<GuestId> {
+        self.surface
+    }
+}
+
+/// The surface of live viewport `viewport`, or the error a request of one
+/// that has none ends the session with.
+fn viewport_surface(ctx: &mut Context, viewport: GuestId) -> Result<GuestId, Action> {
+    let surface = ctx.shadow_table.data::<Viewport>(viewport);
+    surface
+        .and_then(|viewport| viewport.surface)
+        .ok_or_else(|| {
+            ctx.reject(
+                viewport,
+                wp_viewport::ERROR_NO_SURFACE,
+                "wp_viewport has no associated wl_surface",
+            )
+        })
+}
+
 impl wp_viewporter::WpViewporterHandler for Handlers {
     fn on_get_viewport(
         ctx: &mut Context,
@@ -801,9 +819,9 @@ impl wp_viewporter::WpViewporterHandler for Handlers {
     ) -> Action {
         let surface = surface.guest;
         if ctx
-            .viewport_to_wl_surface
-            .values()
-            .any(|&owner| owner == surface)
+            .shadow_table
+            .data_of::<Viewport>()
+            .any(|(_, viewport)| viewport.surface == Some(surface))
         {
             log::warn!("Rejecting duplicate wp_viewport for wl_surface {}", surface);
             return ctx.reject(
@@ -816,7 +834,13 @@ impl wp_viewporter::WpViewporterHandler for Handlers {
             return ctx.missing_surface_state(surface);
         };
         state.pending.viewport = Some(Some(ViewportState::new()));
-        ctx.viewport_to_wl_surface.insert(id, surface);
+        let viewport = Viewport {
+            surface: Some(surface),
+        };
+        ctx.defer_until_forwarded(PostDispatch::Attach {
+            object: id,
+            data: viewport.into(),
+        });
         Action::Forward
     }
 }
@@ -830,12 +854,9 @@ impl wp_viewport::WpViewportHandler for Handlers {
         width: i32,
         height: i32,
     ) -> Action {
-        let Some(&surface_id) = ctx.viewport_to_wl_surface.get(&sender.guest) else {
-            return ctx.reject(
-                sender.guest,
-                wp_viewport::ERROR_NO_SURFACE,
-                "wp_viewport has no associated wl_surface",
-            );
+        let surface_id = match viewport_surface(ctx, sender.guest) {
+            Ok(surface) => surface,
+            Err(action) => return action,
         };
         let unset = (x, y, width, height) == (-256, -256, -256, -256);
         if !unset && (x < 0 || y < 0 || width <= 0 || height <= 0) {
@@ -859,12 +880,9 @@ impl wp_viewport::WpViewportHandler for Handlers {
         width: i32,
         height: i32,
     ) -> Action {
-        let Some(&surface_id) = ctx.viewport_to_wl_surface.get(&sender.guest) else {
-            return ctx.reject(
-                sender.guest,
-                wp_viewport::ERROR_NO_SURFACE,
-                "wp_viewport has no associated wl_surface",
-            );
+        let surface_id = match viewport_surface(ctx, sender.guest) {
+            Ok(surface) => surface,
+            Err(action) => return action,
         };
         let unset = width == -1 && height == -1;
         if !unset && (width <= 0 || height <= 0) {
@@ -887,14 +905,12 @@ impl wp_viewport::WpViewportHandler for Handlers {
     }
 }
 
-/// Forget guest `wp_viewport` `viewport_id`, which ended (see
+/// Forget guest `wp_viewport` `viewport`, which ended (see
 /// `crate::state::lifecycle`): its surface's next commit removes the
 /// viewport.
-pub(crate) fn forget_viewport(ctx: &mut Context, viewport_id: GuestId) {
-    if let Some(surface_id) = ctx.viewport_to_wl_surface.remove(&viewport_id) {
-        if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-            surface.pending.viewport = Some(None);
-        }
+pub(crate) fn forget_viewport(ctx: &mut Context, viewport: Viewport) {
+    if let Some(surface) = viewport.surface.and_then(|id| ctx.surfaces.get_mut(&id)) {
+        surface.pending.viewport = Some(None);
     }
 }
 
@@ -961,20 +977,12 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for Handlers {
 }
 
 impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Handlers {
-    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Action {
-        let xdg_toplevel_id = sender.guest;
-        let Some(host_xdg_toplevel_id) = sender.host_id() else {
-            return ctx.fail(format_args!(
-                "Unable to destroy xdg_toplevel {xdg_toplevel_id} without its host generation"
-            ));
-        };
+    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Destructor {
         // Ending the toplevel releases its Aura toplevel (see
         // `forget_xdg_toplevel`), which goes before the role destructor (see
         // `aura_objects::release`). The guest ID is retained until the host
         // acknowledges the role destructor.
-        ctx.guest_destroyed(xdg_toplevel_id);
-        ctx.send_host(xdg_toplevel::req::destroy(host_xdg_toplevel_id));
-        Action::Drop
+        Destructor::AfterEnd
     }
 
     fn on_set_app_id(ctx: &mut Context, sender: RequestSender, app_id: &String) -> Action {
@@ -1630,7 +1638,7 @@ mod tests {
         );
         assert_eq!(s.host_received(), []);
         // Reads state no peer can observe once the session has ended.
-        assert!(s.ctx().viewport_to_wl_surface.is_empty());
+        assert!(s.ctx().shadow_table.data_of::<Viewport>().next().is_none());
     }
 
     /// The side of the square ARGB8888 frames of the copy tests.
@@ -3520,10 +3528,7 @@ mod tests {
         // watermarks, which reach no peer until a confirmation.
         let keyboard = first.keyboard.host_id();
         assert!(
-            s.ctx()
-                .keyboard_focus
-                .focus_for_keyboard(keyboard)
-                .is_none(),
+            s.ctx().keys.focus().focus_for_keyboard(keyboard).is_none(),
             "destroying a surface must retire per-keyboard focus"
         );
         let keys = &s.ctx().keys;
@@ -3732,8 +3737,9 @@ mod tests {
             replacement_host_surface,
             Iface::WlSurface,
         );
-        ctx.keyboard_focus.set_for_test(
-            h(900),
+        crate::handler::keyboard::for_test::focus(
+            &mut ctx,
+            900,
             seat_with_replacement,
             replacement_surface,
             replacement_host_surface,
@@ -3769,7 +3775,8 @@ mod tests {
         crate::handler::keyboard::for_test::extended(&mut ctx, 900, 950);
         crate::handler::keyboard::for_test::peek(&mut ctx, 950, 1, 30, 1);
         assert!(
-            ctx.keyboard_focus
+            ctx.keys
+                .focus()
                 .surface_for_seat(seat_without_owner)
                 .is_none(),
             "one stale projection must have no remaining keyboard owner"
@@ -3779,14 +3786,10 @@ mod tests {
         assert_eq!(state.focus, Some(replacement_surface));
         assert!(state.pending);
         let healthy = text_input::snapshot(&ctx, healthy_on_replacement);
-        let sender = ctx
-            .shadow_table
-            .resolve_request(SURFACE.guest)
-            .expect("the surface");
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx, sender),
-            Action::Drop
-        );
+        let mut destroy =
+            crate::wire::WireMessage::new(SURFACE.guest, wl_surface::REQ_DESTROY, &[]);
+        let forward = crate::test_support::dispatch_request(&mut ctx, &mut destroy);
+        assert_eq!(crate::test_support::raw_dispatch(forward), Ok(None));
 
         let repaired = text_input::view(&ctx, stale_with_replacement);
         assert_eq!(repaired.focus, Some(replacement_surface));

@@ -193,10 +193,14 @@ it is:
   `handler::Handlers` implements.
 - The one flat dispatch: `dispatch_request`, by the resolved sender's
   `Iface`, and `dispatch_event`, by the variant of the `AnyEvent` the
-  proxy decoded the host event into. `Client::handle_msgs` decodes a host
+  proxy decoded the host event into. `proxy::dispatch` decodes a host
   event whole, once (`AnyEvent::decode`), before anything reads it: the
   keyboard core's recovery (`handler::keyboard::before_host_event`), the
-  stale-event filter, and then its handler. A host event that does not
+  stale-event filter, and then its handler. The filter drops every event
+  of an object the guest destroyed, except the ones its interface's owner
+  declares end what the destroy left (`handler::outlives_destroy`: a
+  buffer's `release` while the host shows it, and an asynchronous
+  dma-buf create's `created` or `failed`). A host event that does not
   decode ends the session before any of them sees it, unless only the
   proxy uses its object (see
   [Wire messages](INVARIANTS.md#wire-messages)).
@@ -221,7 +225,10 @@ one list it cannot check:
      of its own in its place. A forwarded global needs nothing more. An
      interface that is no global is hidden.
    - `state::lifecycle::forget_object`: whether its objects have state of
-     their own to forget when they end.
+     their own outside their table entry to forget when they end. State
+     only the object owns goes in its entry instead (an `ObjectData`
+     variant; see [Object ends](#object-ends)), whose `match` in
+     `forget_object` says whether ending it does more than drop it.
    - `ProtocolHandlers`: `handler::Handlers` implements its handler
      trait, either in the module that owns the interface or, if every
      message forwards as it is, in the list in `handler/mod.rs`.
@@ -239,8 +246,8 @@ one list it cannot check:
    arm in `on_global`'s `match` on the singleton; its bind
    (`Singleton::bind`) and its release
    (`reset_internal_binding_for_global`), each a `match` on the
-   singleton. Its binding is `Context::singletons`' entry, which other
-   modules read (`ctx.singletons.host(Singleton::Shm)`).
+   singleton. Its binding is an entry of `Context::globals`, which other
+   modules read (`ctx.globals.singletons().host(Singleton::Shm)`).
 
 Tests: `every_interface_has_one_global_policy`,
 `every_interface_resolves_by_its_name`.
@@ -320,15 +327,26 @@ so a handler acts only on the `Context` it is given; the XKB context the
 keymaps are compiled in belongs to the keyboard core
 (`keymap::Compiler`), next to the keymaps compiled from it.
 
+`Context` holds sub-states, not loose collections: each is a type whose
+fields are private to the module that owns its concern, so a write from
+any other module does not compile, and others read it through narrow
+methods. The registry owns the host's globals and the proxy's bindings
+(`registry::Globals`), the keyboard core its keyboards, keys and focus
+(`keys::KeyboardCore`), `handler::shm` the host's SHM formats
+(`ShmFormats`), `handler::linux_dmabuf` the dma-buf capabilities
+(`Dmabuf`), and so on for the IME core, outputs, internal callbacks,
+placement and clipboard pumps. State that one object owns is in that
+object's table entry instead ([Object ends](#object-ends)).
+
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of host globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
-| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
-| Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (keyboard and pointer focus); `sommelier/src/keys` (the keyboard core: one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
+| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`); `shm::ShmFormats`; each `wl_shm`, `wl_shm_pool` and `wp_viewport`'s entry |
+| Dma-buf | `linux_dmabuf.rs` | `linux_dmabuf::Dmabuf` (capabilities), each params, factory and feedback object's entry, `allocator.rs` |
+| Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (pointer focus); `sommelier/src/keys` (the keyboard core: the keyboard focus, one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
-| ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
+| ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs`, each GTK shell and surface's entry |
 | Window placement | `window_placement.rs` | `window_placement.rs` |
 
 Two mechanisms let a handler act outside its own message:
@@ -410,9 +428,21 @@ binds no chord of its own. The contract is in
 
 ### Object ends
 
-Per-object state lives with the module that owns it (`surfaces`,
-`OutputRegistry`, the keyboard maps, and so on), keyed by the object's
-guest or host ID. `state/lifecycle.rs` ends it with the object, whichever
+State that only one object owns lives in the object's own table entry
+(`state/object_data.rs`): an `ObjectData` of the object's interface, such
+as a `wl_shm`'s formats, a `wl_shm_pool`'s file, a dma-buf params
+object's planes and pending create, or a viewport's or GTK surface's
+link to its `wl_surface`, which that surface's end clears. Only a live entry keeps data, the
+table attaches it only to an object of its interface (`ShadowTable::attach`,
+`create_local_with`; an object the generated code creates gets it after
+its forward, `PostDispatch::Attach`), and the owning module reads it by
+kind (`ShadowTable::data::<T>`). So such state cannot outlive its object,
+be read under a reused ID, or be checked after the fact: the transition
+that ends the object takes it. State that a core owns (the keyboard and
+IME cores), that spans objects (`OutputRegistry`, `XdgRoles`), that every
+frame scans (`SurfaceState`, which buffer references read), or that
+outlives its guest object (render buffers) lives with its owner, keyed by the object's
+guest or host ID. `state/lifecycle.rs` ends both with the object, whichever
 way the object ends: each `Context` wrapper of a table transition that
 ends an object runs one hook. A `wl_surface`'s `SurfaceState` is created
 with the surface, by `wl_compositor.create_surface`; a live surface without
@@ -421,23 +451,29 @@ its state is an internal divergence that ends the session.
 - `forget_object` runs once per object, at its first end: a guest
   destructor, a terminal event, a local destructor, a bind that never
   reached the host, or a host `delete_id` while the guest object was live
-  (`DeletedHostId::Paired` reports `was_live`). Its one `match` on the
-  interface is the inventory of per-object state: each arm calls the
-  owner's `forget_*` function (`forget_surface`, `forget_keyboard`,
+  (`DeletedHostId::Paired` reports `was_live`). It gets the data the
+  entry kept, whose `match` says what ending each kind does beyond
+  dropping it (a dma-buf factory's or feedback's hold on its global's
+  capabilities), and its `match` on the interface is the inventory of
+  per-object state kept elsewhere: each arm calls the owner's `forget_*`
+  function (`forget_surface`, `forget_keyboard`,
   `forget_output`, `forget_registry`, ...). It is the one place `state`
   calls into handlers, because ending an object can send requests, such
   as an Aura release or an extended keyboard's destructor.
 - `forget_host_id` runs when the host releases the ID, for state that
-  outlives the guest object: a render buffer the host still shows. It
-  drops an asynchronous dma-buf create too, as a backstop, though
-  `forget_params` already did at the params' end.
+  outlives the guest object: a render buffer the host still shows.
 
 What a hook sends joins the current message's effects, so the wire order
-is the handler's: a destructor handler that must order its own destructor
-against that output queues the part that goes first before it calls the
-wrapper (`wl_surface.destroy` releases the surface's Aura objects first).
-In tests, `Context::assert_no_orphans` checks every per-object key, and
-every object such state names, against the table; a test's `Client`,
+is the handler's. A destructor request's handler never ends its object
+itself: it returns a `wire::Destructor`, which says where the destructor
+goes (ahead of the handler's output, after it, or after what the end
+sends), or that the host object stays (in use, or without a destructor),
+and the generated dispatcher ends the object accordingly
+(`wl_surface.destroy` releases the surface's Aura objects, then has its
+destructor sent after them; `xdg_toplevel.destroy` and `wl_output.release`
+have theirs sent after their end releases their Aura child).
+In tests, `Context::assert_no_orphans` checks every per-object key kept
+outside the table, and every object such state names, against the table; a test's `Client`,
 the fuzzer's included, runs it after every batch that keeps the session.
 A seat reference is the exception: it outlives its seat
 ([Object lifetimes](INVARIANTS.md#object-lifetimes)), so only its copies
@@ -456,16 +492,25 @@ work deferred until the forward (`defer_until_forwarded`), and, if the
 message ends the session, a `state::SessionEnd`. A handler ends one with
 `return ctx.reject(object, code, message)` for a protocol error or
 `return ctx.fail(why)` for the proxy's own failure; the first protocol
-or host error wins over an internal failure. After dispatch,
-`Client::handle_msgs` takes the message's `state::Effects` once
-(`Context::take_effects`):
+or host error wins over an internal failure.
+
+`proxy::dispatch` is that transaction without I/O: it takes one framed
+message (`Frame`: its header, its payload, and the descriptors its
+connection has queued), dispatches it, takes its `state::Effects` once
+(`Context::take_effects`), and reports whether it was handled, ends the
+session or waits for a fence, with what a trace records of it (test:
+`a_frame_dispatches_without_a_connection`).
+`Client::handle_msgs` is the shell around it: it frames each
+connection's bytes, records the trace, parks a request that waits, ends
+the batch (`Context::end_batch`, the one place batch-scoped state is
+reset) and sends. The core commits the effects:
 
 - If the message did not end the session, it queues the forward, then the
   output in the same direction, and the output back toward the message's
   source, each for its peer ([Fair dispatch](#fair-dispatch) says when it
   is sent).
 - If it did, it drops the forward and every effect, which closes their
-  descriptors, and ends the batch. After the batch's earlier, valid
+  descriptors, and the shell ends the batch. After the batch's earlier, valid
   messages, `handler::display::session_error` encodes the session's one
   `wl_display.error`. Nothing else writes one.
 - If it waits for a guest GPU fence (`return ctx.wait_for_fence(wait)`,
@@ -690,8 +735,10 @@ sent them for the composition the press committed. The rules are under
 The keyboard core (`sommelier/src/keys`, `Context::keys`) is the IME
 core's twin: a sans-IO state machine that owns every fact of the host
 keyboards and their keys, takes one `keys::KeyInput` through
-`KeyboardCore::step`, returns `keys::KeyEffects`, and reads the keyboard
-focus, the shortcut bindings and the IME core's gate through `keys::Env`.
+`KeyboardCore::step`, returns `keys::KeyEffects`, and reads the shortcut
+bindings and the IME core's gate through `keys::Env`. It owns the keyboard
+focus, which a focus input moves in the same step as what the move ends of
+the keys, and which the IME core and placement read.
 `handler/keyboard.rs` is its adapter. The two cores talk only through
 typed messages: the IME core's `ime::KeyEffect`s are keyboard inputs, and
 the keyboard core hands the IME core `ime::Input`s.

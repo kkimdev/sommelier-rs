@@ -97,6 +97,12 @@ mod tests {
         );
         assert!(
             compact.contains(
+                "fnon_destroy(_ctx:&mutContext,_sender:RequestSender,)->Destructor{Destructor::Forward}"
+            ),
+            "a destructor's handler says how its object ends, and cannot drop it"
+        );
+        assert!(
+            compact.contains(
                 "pubfndispatch_request<H:WlDisplayHandler>(sender:RequestSender,msg:&mutWireMessage,ctx:&mutContext,)"
             ),
             "a request is dispatched from a sender the table resolved"
