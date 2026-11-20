@@ -819,7 +819,9 @@ impl SpecText {
 
     /// X2': an empty confirmation stands for the eligible held key, the
     /// one with the latest peek, if it is the latest peek since the focus
-    /// moved and not a cancelled Backspace. With no eligible key, nothing
+    /// moved and not a cancelled Backspace, and no key is held across Exo's
+    /// detach, whose next press Exo may announce with the confirmation
+    /// alone (`Keyboard::OnKeyEvent`). With no eligible key, nothing
     /// goes out, and the lease ends. With one, the recovery waits for the
     /// host's next event ([`SpecText::decide_recovery`]): Exo confirms
     /// before every press its input method does not handle (E13), and sends
@@ -828,8 +830,9 @@ impl SpecText {
     /// before.
     fn recover_held_key(&mut self, origin: Origin) -> Option<(Txn, (i32, i32))> {
         let backspace = keymap::keycode(Key::Backspace).0;
+        let stale = self.held.values().any(|held| held.stale);
         let latest = self.held.iter().max_by_key(|(_, held)| held.sequence);
-        let eligible = latest.filter(|&(&key, held)| {
+        let eligible = latest.filter(|_| !stale).filter(|&(&key, held)| {
             self.latest_peek
                 .is_none_or(|sequence| sequence == held.sequence)
                 && !(key == backspace && held.cancelled)

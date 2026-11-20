@@ -706,10 +706,18 @@ for user actions (U→E), and the mojo pipe between Exo and the engine
   IMA's rules: it buffers a key's text until the engine's callback for
   that key; a handled press goes out before its text, and an unhandled
   press after its text (E8); an unhandled press is preceded by a
-  confirmation (E13); a reset drops IMA's buffer (E5).
+  confirmation (E13), which first composes a buffered region and shows a
+  buffered composition, unless IMA holds only a commit
+  (`InputMethodAsh::ConfirmComposition`); a reset drops IMA's buffer
+  (E5).
 - **Keys.** A key on the focused surface with an attached text input
   goes to the engine. **With no attached text input, the key goes raw
-  (E7)**: during a drain or before the first `activate`.
+  (E7)**: during a drain or before the first `activate`. The keyboard
+  passes a press only of a key it does not hold, so a key whose release
+  died with the input method gets only the confirmation of its next
+  press (E13), until the keyboard's next `enter`: `Keyboard::SetFocus`
+  takes the keys it holds from the seat, which the model's `enter`
+  lists as none.
 - **Engine results.** A preedit, a commit (`confirm_preedit` or
   `commit_string`, as E9 and the case's draw say), or a delete measured
   in the predicted text (E10). If IMA serves no text input, the text is
@@ -877,7 +885,10 @@ The DST also holds the proxy to Exo's real text:
 - A withheld report (G9c) is accepted only while the guest shows a
   preedit, and the simulated tracker's history must hold the report with
   that preedit as its composition at the report's cursor
-  (`Exo::holds_with_composition`).
+  (`Exo::holds_with_composition`), whether or not an input method is
+  attached: Exo keeps the tracker without one (E4), so a report withheld
+  after Exo moved the focus, which reaches Exo after its detach, is held
+  to it too.
 
 ## 5. Open questions
 

@@ -309,12 +309,12 @@ impl ExoView {
         });
     }
 
-    /// Report suppression (G9c): whether the core withholds the guest's report `report`, from a guest that
-    /// shows `shown`, which Exo could not match only for the composition
-    /// the guest shows outside its text, so that it would only drop that
-    /// composition (E4). A withheld report puts the guest in step as a
-    /// matched one does, at the state with that composition, and states
-    /// every key and press before it.
+    /// Report suppression (G9c): whether the core withholds the guest's report
+    /// `report`, from a guest that shows `shown`, which Exo could not match
+    /// only for the composition the guest shows outside its text, so that it
+    /// would only drop that composition (E4). A withheld report puts the guest
+    /// in step as a matched one does, at the state with that composition, and
+    /// states every key and press before it.
     pub(super) fn withholds(
         &mut self,
         (text, cursor, anchor): &(String, u32, u32),

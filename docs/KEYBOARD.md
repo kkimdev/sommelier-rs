@@ -113,7 +113,9 @@ or the confirmation Exo sends before a press its input method does not
 handle (INVARIANTS: "An empty confirmation recovers a held key only once
 the host shows it repeated"). `ime_keys::PendingRecovery` holds the
 recovery, and `PendingRecovery::decide` is its transition for each host
-event, read as a `HostSignal`:
+event, read as a `HostSignal`. No recovery starts while a keyboard of
+the seat holds a key `stale`, whose next press Exo may announce with the
+confirmation alone (`held_repeat_key_for_seat`).
 
 | Waiting for | Event | Step |
 | --- | --- | --- |

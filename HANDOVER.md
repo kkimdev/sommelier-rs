@@ -95,7 +95,8 @@
   there only when it had buffered a composition as well as a commit,
   which makes the confirmation not empty; no DST case does it. A key
   held across an input-method restart stops repeating until its next
-  press.
+  press, and while it is held no empty confirmation recovers another
+  held key.
 - Exo's deletes and preedit regions that the Exo mirror cannot measure
   are dropped ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A drop
   never deletes or loses text, but the input method goes on as if it
@@ -202,17 +203,6 @@
 - Chromium's IMA keeps composing after a composition empties (ㄱ then
   Backspace), so an earlier key's text can be lost; host behaviour, not
   mitigated.
-- The v11-only DST fails 8 free cases in a 20,000-case release soak
-  (seeds from 0). Base `43962c5` fails the same seeds when its extension
-  draw is forced to v11, so these bugs predate the change; their fixes
-  are pending:
-  - Report suppression (G9c) withholds a report that Exo's tracker does
-    not hold with the shown composition: seeds 4372, 13346, 14054, 16626
-    and 19984.
-  - A held key is recovered for Exo's confirmation before another key's
-    press (`recoveries_before_a_press`): seeds 13104 and 16710.
-  - The guest's preedit is neither what Exo tracks nor what its engine
-    composes: seed 14452.
 - The DST models only Chromium, GTK3 and GTK4 (no selection, one text
   input), and nothing checks independently that a real autorepeat is
   never dropped (`SpecText::decide_recovery`).

@@ -1080,17 +1080,22 @@ impl Exo {
         self.text_inputs[&id].text.hidden.clone()
     }
 
-    /// Whether the tracker of the text input attached on the focused
-    /// surface holds a state with the composition `composition` at the
-    /// cursor of the report `(text, cursor, anchor)`, which that state is
-    /// without it: a report that would only drop the composition.
+    /// Whether the tracker of the case's one host text input holds a state
+    /// with the composition `composition` at the cursor of the report
+    /// `(text, cursor, anchor)`, which that state is without it: a report
+    /// that would only drop the composition. Exo keeps the tracker with or
+    /// without an input method (E4), so this holds whether or not one is
+    /// attached and wherever the seat's focus is: a report the proxy
+    /// withholds after Exo moved the focus would reach Exo after its
+    /// detach, whose confirmation leaves the state in the history.
     pub(super) fn holds_with_composition(
         &self,
         (text, cursor, anchor): &(String, u32, u32),
         composition: &str,
     ) -> bool {
-        let Some(id) = self.composing_text_inputs().first().copied() else {
-            return false;
+        let mut text_inputs = self.text_inputs.values();
+        let (Some(text_input), None) = (text_inputs.next(), text_inputs.next()) else {
+            panic!("the DST makes one host text input");
         };
         let at = *cursor as usize;
         let holds = |state: &Predicted| {
@@ -1101,7 +1106,7 @@ impl Exo {
                     && text.get(at..) == Some(&state.text[range.end..])
             })
         };
-        cursor == anchor && self.text_inputs[&id].text.expected.iter().any(holds)
+        cursor == anchor && text_input.text.expected.iter().any(holds)
     }
 
     /// The host text inputs an input method is attached to on the focused
@@ -1364,14 +1369,21 @@ impl Exo {
 
     /// `InputMethodAsh::ConfirmComposition(reset_engine = true)` for text
     /// input `id`, which IMA serves. With only a commit buffered, nothing
-    /// happens. Otherwise a buffered composition is shown, the composition
+    /// happens. Otherwise a buffered region is composed, which makes IMA
+    /// composing, and then a buffered composition is shown; the composition
     /// Exo tracks is confirmed if there is one, or always where the
     /// extension has `confirm_preedit` (`SupportsAlwaysConfirmComposition`),
     /// and IMA resets, keeping the buffered commit. Returns whether it
-    /// showed the buffered composition.
+    /// sent the buffered region or composition.
     fn confirm_composition(&mut self, id: u32) -> bool {
-        if self.ima.commit.is_some() && self.ima.composition.is_none() {
+        let ima = &self.ima;
+        if ima.commit.is_some() && ima.composition.is_none() && ima.region.is_none() {
             return false;
+        }
+        let region = self.ima.region.take();
+        if let Some((before, after)) = region {
+            self.set_composition_from_existing_text(id, before, after);
+            self.ima.composing = true;
         }
         let shown = self.ima.composition.take();
         if let Some(text) = &shown {
@@ -1385,7 +1397,7 @@ impl Exo {
         let commit = self.ima.commit.take();
         self.reset_context();
         self.ima.commit = commit;
-        shown.is_some()
+        region.is_some() || shown.is_some()
     }
 
     /// `TextInput::ConfirmCompositionText(keep_selection = true)`: with
@@ -1629,7 +1641,12 @@ impl Exo {
     }
 
     /// `keyboard` enters `surface`, after the modifiers, as Exo sends them.
+    /// `Keyboard::SetFocus` takes the keys it holds from the seat's, which
+    /// the enter lists, here none: a key whose release died with the input
+    /// method ([`Exo::destroy_input_method`]) is no longer held, and its
+    /// next press gets its `peek_key` again.
     fn keyboard_enter(&mut self, keyboard: u32, surface: u32) {
+        self.pressed.clear();
         let serial = self.next_serial();
         let modifiers = self.modifiers;
         self.events.push(wl_keyboard::evt::modifiers(

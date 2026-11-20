@@ -367,6 +367,136 @@ Regression {
     ],
     choices: &[1, 0, 0, 0, 0, 0, 0, 2991, 0, 714, 0, 0, 280, 2019, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2393, 0, 0, 0, 0, 0, 0, 0, 0, 2886, 0, 0, 0, 1799, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 243, 1417, 0, 0, 0, 0, 0, 0, 299, 0, 1, 17, 8632, 122, 807, 0, 0, 2655, 1575, 0, 0, 0, 0, 0, 0, 1823, 969, 0, 1, 12, 847, 0, 0, 0, 0, 8556, 818, 2785, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2547, 1392, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1468, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 186, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2903, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1178, 2573, 0, 0, 0, 0, 1008, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 390, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1614, 1080, 626, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1701, 1085, 0, 0, 0, 0, 0, 0, 0, 0, 2202, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1230, 1859, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1948, 2072, 0, 2536, 0, 0, 0, 0, 0, 0, 0, 2157, 0, 0, 162, 1, 0, 0, 0, 1004, 0, 0, 0, 0, 0, 0, 0, 0, 214, 1628, 0, 0, 0, 0, 0, 0, 1642, 0, 0, 0, 0, 0, 0, 858, 1280, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 933, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 234, 0, 1797, 0, 0, 0, 0, 0, 0, 0, 1659, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 705, 0, 1122, 0, 0, 0, 0, 0, 0, 791, 0, 0, 645, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2115, 0, 0, 798, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 6, 0, 2182],
 },
+// Seed 4372, shrunk. A reconversion makes a region of committed text the
+// preedit, and the user moves the focus at once: GTK4's report without the
+// preedit, which the proxy withholds, reaches it after Exo moved the focus
+// and detached the input method. Exo's tracker still holds the report with
+// that composition (E4), so the withholding is right; the oracle looked
+// only at a text input with an input method attached.
+Regression {
+    name: "a report withheld after Exo moved the focus is held to the detached text input's tracker",
+    client: ClientKind::Gtk4,
+    settled: false,
+    latin: false,
+    texts: &["0닭1a2b", "0닭닭12닭닭"],
+    actions: &[
+        UserAction::Click { field: 1, at: Target::BeforeMarker(2) },
+        UserAction::Key(Key::Char('f')),
+        UserAction::Key(Key::Char('m')),
+        UserAction::Click { field: 1, at: Target::BeforeMarker(2) },
+        UserAction::Reopen(0),
+        UserAction::Reconvert,
+        UserAction::Focus(0),
+    ],
+    choices: &[0, 0, 0, 0, 0, 0, 0, 0, 0, 1224, 0, 1751, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2722, 0, 0, 0, 0, 0, 0, 0, 0, 1571, 0, 0, 0, 963, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1763, 1871, 2812, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 446, 0, 90, 357, 0, 1668, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2075, 0, 0, 0, 322, 1173, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 902, 0, 0, 0, 0, 0, 1213, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1432, 0, 0, 1588, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 719, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1762, 0, 0, 1150, 0, 0, 0, 0, 0, 1302, 0, 806, 0, 1, 8, 1799, 0, 0, 0, 0, 2064, 0, 1882, 0, 0, 0, 1912, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 271, 1119, 0, 0, 0, 0, 1125, 0, 0, 0, 0, 0, 0, 0, 1481, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1914, 0, 0, 1862, 0, 0, 0, 0, 0, 0, 0, 0, 641, 0, 0, 0, 0, 0, 331, 969, 1743, 1, 0, 0, 1, 3, 1685, 0, 0, 0, 0, 0, 0, 295, 830, 0, 0, 1877],
+},
+// Seeds 13104 and 16710, shrunk. Space's release dies with the input
+// method as it restarts, so Exo's keyboard still holds Space, and Space
+// pressed again while Backspace is held gets no peek, only the input
+// method's empty confirmation (E13), which the proxy took for Backspace's
+// autorepeat. In 13104 the input method took Space; in 16710 it reached
+// the guest.
+Regression {
+    name: "a confirmation while a key held across a restart is held recovers nothing",
+    client: ClientKind::Gtk3,
+    settled: false,
+    latin: false,
+    texts: &["0가12", "01닭2가"],
+    actions: &[
+        UserAction::Tap { field: 1, at: Target::BeforeMarker(1) },
+        UserAction::Key(Key::Char('a')),
+        UserAction::Key(Key::Char('w')),
+        UserAction::Key(Key::Char('e')),
+        UserAction::Key(Key::Char('m')),
+        UserAction::Key(Key::Char('w')),
+        UserAction::Key(Key::Char('x')),
+        UserAction::Key(Key::Char(' ')),
+        UserAction::Key(Key::Char('s')),
+        UserAction::RestartInputMethod,
+        UserAction::KeyDown(Key::Backspace),
+        UserAction::Key(Key::Char(' ')),
+        UserAction::KeyUp(Key::Backspace),
+    ],
+    choices: &[2, 0, 0, 0, 0, 0, 0, 2654, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1797, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1441, 0, 0, 0, 0, 0, 0, 0, 227, 1587, 1932, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 931, 1480, 0, 0, 1916, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 766, 0, 0, 0, 0, 0, 0, 205, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 261, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1304, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+},
+Regression {
+    name: "a confirmation before the unannounced press of a key forwarded before a restart recovers nothing",
+    client: ClientKind::Chromium,
+    settled: false,
+    latin: false,
+    texts: &["0닭1닭2가a", "0가a12닭b"],
+    actions: &[
+        UserAction::Click { field: 1, at: Target::BeforeMarker(2) },
+        UserAction::Click { field: 0, at: Target::BeforeMarker(1) },
+        UserAction::Click { field: 1, at: Target::Start },
+        UserAction::KeyDown(Key::Char(' ')),
+        UserAction::KeyUp(Key::Char(' ')),
+        UserAction::Key(Key::Char('c')),
+        UserAction::RestartInputMethod,
+        UserAction::KeyDown(Key::Backspace),
+        UserAction::Key(Key::Char(' ')),
+        UserAction::KeyUp(Key::Backspace),
+    ],
+    choices: &[2, 1, 0, 0, 0, 0, 0, 2310, 2829, 1770, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1598, 1830, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 886, 1521, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 755, 0, 0, 0, 0, 0, 0, 2, 1197, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1717, 0, 0, 0, 0, 913, 0, 0, 0, 0, 0, 0, 1131, 0, 0, 1477, 0, 0, 450, 0, 0, 0, 0, 0, 1430, 1619, 0, 0, 0, 0, 0, 0, 0, 1, 4, 0, 1435, 1943, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2315, 0, 118, 0, 1703, 0, 0, 1831, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1682, 1, 1041, 0, 0, 0, 1931, 0, 0, 0, 0, 2000, 0, 0, 1615, 0, 529, 1233, 0, 0, 0, 1408, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 435, 0, 0, 0, 0, 0, 918, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1042, 0, 0, 0, 0, 1, 9, 0, 0, 0, 0, 1],
+},
+// Seed 16710, shrunk again once the proxy recovered nothing while Space
+// was held across the restart. A click moves the focus before Space,
+// pressed again, reaches Exo's keyboard, which takes the keys it holds
+// from the seat as it enters the new surface (`Keyboard::SetFocus`), so
+// it announces that press with a peek: the model kept Space held, sent
+// only the confirmation, and the proxy, whose keyboard the leave cleared,
+// recovered Backspace for it.
+Regression {
+    name: "a keyboard enter forgets a key whose release died with the input method",
+    client: ClientKind::Chromium,
+    settled: false,
+    latin: false,
+    texts: &["0닭1닭2가a", "0가a12닭b"],
+    actions: &[
+        UserAction::Click { field: 1, at: Target::Start },
+        UserAction::Key(Key::Char('w')),
+        UserAction::Click { field: 0, at: Target::BeforeMarker(0) },
+        UserAction::KeyDown(Key::Char(' ')),
+        UserAction::KeyUp(Key::Char(' ')),
+        UserAction::Key(Key::Char('c')),
+        UserAction::RestartInputMethod,
+        UserAction::KeyDown(Key::Backspace),
+        UserAction::Key(Key::Char(' ')),
+        UserAction::KeyUp(Key::Backspace),
+        UserAction::Click { field: 1, at: Target::BeforeMarker(1) },
+    ],
+    choices: &[2, 1, 0, 0, 0, 0, 0, 2310, 2829, 1770, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2070, 0, 0, 0, 0, 2899, 0, 0, 0, 0, 0, 0, 0, 1154, 0, 0, 0, 0, 1280, 0, 0, 0, 0, 0, 0, 2254, 0, 0, 0, 0, 0, 0, 0, 0, 535, 0, 0, 0, 0, 0, 0, 0, 652, 0, 0, 0, 0, 0, 0, 0, 2063, 0, 0, 0, 0, 0, 0, 1061, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1809, 0, 0, 317, 0, 0, 66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13, 0, 0, 0, 0, 0, 0, 0, 193, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 853, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 776, 0, 0, 0, 0, 0, 1963, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 862, 0, 0, 0, 0, 2919, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 614, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 624, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 122, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 19, 0, 0, 0, 0, 0, 0, 1],
+},
+// Seed 14452, shrunk. A reconversion's region is held in IMA for the
+// Backspace in flight, which the engine commits over and does not handle.
+// IMA's confirmation before passing Backspace on composes the held region
+// and confirms it (`ConfirmComposition` returns early only with a commit
+// alone); the model returned early, then sent the region after the
+// commit, so Exo composed a region it never confirmed, which the guest
+// showed while Backspace edited around it.
+Regression {
+    name: "a confirmation before an unhandled key composes the region IMA holds for it",
+    client: ClientKind::Chromium,
+    settled: false,
+    latin: false,
+    texts: &["012ba", "0가a1가2b닭"],
+    actions: &[
+        UserAction::Key(Key::Char('e')),
+        UserAction::Click { field: 0, at: Target::BeforeMarker(0) },
+        UserAction::Click { field: 0, at: Target::BeforeMarker(1) },
+        UserAction::Click { field: 1, at: Target::BeforeMarker(1) },
+        UserAction::Key(Key::Char(' ')),
+        UserAction::Key(Key::Char(' ')),
+        UserAction::Key(Key::Char('k')),
+        UserAction::Key(Key::Char('h')),
+        UserAction::Focus(1),
+        UserAction::Key(Key::Char('d')),
+        UserAction::RestartInputMethod,
+        UserAction::Reconvert,
+        UserAction::Key(Key::Backspace),
+    ],
+    choices: &[2, 1, 0, 0, 0, 0, 0, 0, 0, 1275, 0, 2926, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 424, 0, 0, 0, 0, 0, 0, 0, 0, 2992, 0, 0, 0, 0, 1, 0, 1224, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 1297, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 934, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 148, 1073, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1546, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19],
+},
 ];
 
 #[test]

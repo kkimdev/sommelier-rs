@@ -3956,6 +3956,55 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.recovered(again));
     }
 
+    /// A key held across Exo's detach (H2) may stay pressed in Exo's
+    /// keyboard, as its release died with the input method, and
+    /// `Keyboard::OnKeyEvent` handles a press only of a key it does not
+    /// hold: the key's next press gets no peek and no `wl_keyboard.key`,
+    /// only the input method's empty confirmation before it (E13). While
+    /// such a key is held, an empty confirmation is that press's as likely
+    /// as an autorepeat of the eligible held key, here Backspace, so it
+    /// recovers nothing, as a guessed Backspace would delete text (DST
+    /// seeds 13104 and 16710, shrunk). Once the old key's release comes,
+    /// the next confirmation recovers Backspace again.
+    #[tokio::test]
+    async fn a_confirmation_while_a_key_held_across_a_detach_recovers_nothing() {
+        let mut f = Field::typing().await;
+        let space = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 700,
+            time: 1_234,
+        };
+        f.s.host([f.peek(space), f.preedit("가", ""), f.commit("가 ")])
+            .await;
+        f.s.guest_received();
+        f.s.host([f.confirm(), v1::leave(f.host)]).await;
+        let callback = barrier(&f.host_received().await);
+        let answer = wl_callback::evt::done(callback, 0);
+        f.s.host([answer, v1::enter(f.host, f.surface.host)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        let backspace = Stroke {
+            key: BACKSPACE,
+            serial: 701,
+            time: 1_400,
+            ..space
+        };
+        f.s.host([f.peek(backspace), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
+        assert_eq!(f.s.guest_received(), [], "Space's press, unseen");
+
+        let release = Stroke {
+            state: RELEASED,
+            serial: 702,
+            time: 1_450,
+            ..space
+        };
+        f.s.host([f.peek(release), f.confirm()]).await;
+        f.answer_recovery_syncs().await;
+        assert_eq!(f.s.guest_received(), f.recovered(backspace));
+    }
+
     /// Exo's own detach (H2) ends only the recovery of the keys held
     /// across it, which stay the guest's keys: the keysym of `1` reaches
     /// the guest. Their releases died with the input method, so a

@@ -814,7 +814,14 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   never sees two presses without a release between, and its autorepeat of
   the old press stops. Being a new press, it also leaves a waiting
   recovery waiting, as the press of a key not held does
-  (`KeyGenerationRegistry::peek_press_is_new`).
+  (`KeyGenerationRegistry::peek_press_is_new`), though only another
+  seat's can wait then: Exo's keyboard may still hold such a key, its
+  release having died, and `Keyboard::OnKeyEvent` handles a press only
+  of a key it does not hold, so the key's next press may come as the
+  input method's confirmation alone, with no peek, which nothing tells
+  from an autorepeat. So while a keyboard of the seat holds a key across
+  the detach, an empty confirmation recovers no key: a guessed key, such
+  as Backspace, would edit text, and a dropped autorepeat loses none.
   Tests: `a_confirmation_before_an_unhandled_press_recovers_no_held_key`,
   `a_confirmation_before_a_handled_press_recovers_the_held_key`,
   `a_press_on_another_seats_keyboard_keeps_a_recovery_waiting`,
@@ -823,8 +830,8 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `a_key_held_across_a_detach_is_typed_and_recovered_again`,
   `a_press_after_a_detach_releases_the_old_press_the_guest_holds`,
   `a_recovered_key_pressed_again_after_a_detach_reaches_the_guest`,
-  `a_press_of_a_key_held_across_a_detach_keeps_a_recovery_waiting`,
   `a_key_held_since_enter_is_pressed_anew_after_a_detach`,
+  `a_confirmation_while_a_key_held_across_a_detach_recovers_nothing`,
   `a_press_after_a_detach_ends_an_accelerators_suppression`,
   `a_late_release_of_a_press_retired_by_a_detach_is_dropped`,
   `keys_held_since_enter_are_ordered_by_their_peeks`.
@@ -907,14 +914,14 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   of the IME core (`ImeCore::step`) `ime::reconcile` brings every text
   input to the state its guest committed: it sends the committed content
   type, with its support, whenever the attached input method lacks it:
-  after every `activate`, including one a drain barrier
-  or a seat without a host object deferred, when the guest changes it,
-  when the field's surrounding text appears or goes, and when an enable
-  or a disable starts a new field (an enable of an enabled field does
-  not). It sends none while no input method is attached and
-  none the host already has. Exo keeps surrounding
-  text and the cursor rectangle without an input method, so they are
-  forwarded as committed and never replayed.
+  after every `activate`, including one a drain barrier or a seat
+  without a host object deferred, when the guest changes it, when the
+  field's surrounding text appears or goes, and when an enable or a
+  disable starts a new field (an enable of an enabled field does not).
+  It sends none while no input method is attached and none the host
+  already has. Exo keeps surrounding text and the cursor rectangle
+  without an input method, so they are forwarded as committed and never
+  replayed.
   Exo reports every attach of its input method as
   `zwp_text_input_v1.enter` and every detach as `leave`, including those
   it makes on its own. It detaches on its own when its seat's focus
@@ -927,22 +934,23 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   Exo's detach confirms first (E6 of
   [IME.md](IME.md#24-exo-facts-the-models-implement)) with
   `confirm_preedit`, which reaches the proxy while it is attached and
-  commits the preedit the guest shows. A preedit the guest still shows at
-  the `leave` is one that confirmation did not commit (the DST reaches it
-  in rare races). The guest commits it then, with `preedit_string("")`, `commit_string` and
-  `done`, which keeps the user's text where an input method that restarts
-  would lose it, and commits nothing twice. If that `leave` beats the
-  `wl_keyboard.leave` of the same focus change, the activation finds Exo
-  unfocused and the keyboard leave drains it. Exo attaches on its own
-  only when focus reaches a surface an `activate` found unfocused, after
-  a `wl_keyboard.leave` that set the proxy draining, so an `enter` while
+  commits the preedit the guest shows. A preedit the guest still shows
+  at the `leave` is one that confirmation did not commit (the DST
+  reaches it in rare races). The guest commits it then, with
+  `preedit_string("")`, `commit_string` and `done`, which keeps the
+  user's text where an input method that restarts would lose it, and
+  commits nothing twice. If that `leave` beats the `wl_keyboard.leave`
+  of the same focus change, the activation finds Exo unfocused and the
+  keyboard leave drains it. Exo attaches on its own only when focus
+  reaches a surface an `activate` found unfocused, after a
+  `wl_keyboard.leave` that set the proxy draining, so an `enter` while
   active answers the proxy's own `activate` and resends nothing.
   `LinkState` is therefore sound only while every host
   `zwp_text_input_v1.leave`, `wl_keyboard.leave` and `wl_keyboard.enter`
   reaches the text-input state in order with the events around it, never
   dropped, delayed or coalesced with its pair: otherwise the proxy would
-  believe an input method attached that Exo detached, or the reverse, and
-  send content types Exo drops or withhold the one it needs.
+  believe an input method attached that Exo detached, or the reverse,
+  and send content types Exo drops or withhold the one it needs.
   Tests: `reconcile_reaches_every_target_with_only_needed_requests`,
   `surrounding_text_support_follows_the_field_and_resends_only_on_change`,
   `a_deferred_activation_replays_the_committed_content_type`,
@@ -1187,9 +1195,9 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
 - **Exo's deletes and regions are measured in the Exo mirror, or
   dropped.** Every text input has a mirror (`ime::exo_view::ExoView`'s
   `mirror`, an `ime::mirror::ExoMirror`), which the host's extension at
-  v11 makes possible ("A text input needs the host's extension at v11"). The mirror is a
-  replica of the
-  `ui::SurroundingTextTracker` Exo keeps for the host text input
+  v11 makes possible ("A text input needs the host's extension at v11").
+  The mirror is a replica of the `ui::SurroundingTextTracker` Exo keeps
+  for the host text input
   ([IME.md](IME.md#22-host-events) X1 and H9; Chromium `main` 6975bb48a8cd),
   and the core feeds it every event of the text input before the gate,
   since stale and fenced events changed Exo's tracker too.
@@ -1307,10 +1315,10 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
     no-op, and one that names none resets Exo to the guest's text. Nothing
     is ever inserted into a report, so a wrong mirror can only leave Exo
     stale until the composition ends, never put the preedit in Exo's text.
-  The DST holds the mirror to the simulated Exo's tracker at every
-  sync, and each delete and region to what that Exo held
-  ([IME.md](IME.md#48-the-mirror-checks)); it fails a
-  settled case with a drop the mirror could measure.
+  The DST holds the mirror to the simulated Exo's tracker at every sync,
+  and each delete and region to what that Exo held
+  ([IME.md](IME.md#48-the-mirror-checks)); it fails a settled case with
+  a drop the mirror could measure.
   Tests: `a_report_reaches_the_host_with_its_barrier`,
   `a_reports_barrier_is_glued_into_its_entry`,
   `a_forwarded_key_holds_back_exos_delete_until_the_guest_commits`,
@@ -1336,9 +1344,8 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `an_ambiguous_report_stays_unknown`,
   `a_report_unlike_a_vague_selection_heals_it`,
   `a_report_without_the_shown_preedit_is_withheld`.
-  The core's row tests of X1 and H9, and of
-  report suppression, are listed in their rows of
-  [IME.md](IME.md#2-behavioural-specification).
+  The core's row tests of X1 and H9, and of report suppression, are
+  listed in their rows of [IME.md](IME.md#2-behavioural-specification).
 - **Every commit that leaves a field enabled gets a `done`.** The proxy
   answers each such v3 `commit` with a `done` that carries its serial, as
   mutter and KWin do. The protocol has a client send its surrounding text,
