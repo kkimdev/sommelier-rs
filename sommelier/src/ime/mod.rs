@@ -24,6 +24,7 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
+use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::wire::{IndexedString, Outgoing};
 
 mod exo_view;
@@ -42,7 +43,7 @@ mod tests;
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
 #[cfg(test)]
-pub(crate) use state::{Assembly, LinkState, TextInput, V3Committed, V3Pending};
+pub(crate) use state::{LinkState, TextInput, V3Committed, V3Pending};
 #[cfg(test)]
 pub(crate) use step::{take_drops_for_test, Drops};
 
@@ -113,7 +114,7 @@ pub enum Input {
     V1(TiId, HostIme),
     Ext {
         ext: u32,
-        event: HostIme,
+        event: Edit,
     },
     BarrierDone(BarrierToken),
 
@@ -150,16 +151,25 @@ pub enum Input {
 /// extension.
 #[derive(Debug)]
 pub enum HostIme {
-    PreeditStyling {
-        index: u32,
-        length: u32,
-        style: u32,
-    },
-    PreeditCursor(i32),
-    CursorPosition {
-        index: i32,
-        anchor: i32,
-    },
+    Piece(Piece),
+    Edit(Edit),
+}
+
+/// A v1 event that describes the edit Exo sends right after it (H4 to
+/// H6), which takes it ([`V1Pieces`]).
+#[derive(Debug)]
+pub enum Piece {
+    /// H4 `preedit_styling`.
+    Styling { index: u32, length: u32, style: u32 },
+    /// H5 `preedit_cursor`.
+    Cursor(i32),
+    /// H6 `cursor_position`.
+    CursorPosition { index: i32, anchor: i32 },
+}
+
+/// An event that changes Exo's text (H7 to H9, X1 and X2).
+#[derive(Debug)]
+pub enum Edit {
     Preedit {
         serial: u32,
         text: IndexedString,
@@ -181,6 +191,55 @@ pub enum HostIme {
         /// `confirm_preedit`'s selection behavior is `unchanged`.
         keep_selection: bool,
     },
+}
+
+impl From<Piece> for HostIme {
+    fn from(piece: Piece) -> Self {
+        Self::Piece(piece)
+    }
+}
+
+impl From<Edit> for HostIme {
+    fn from(edit: Edit) -> Self {
+        Self::Edit(edit)
+    }
+}
+
+/// The v1 pieces Exo sent since its last edit, which the next edit takes,
+/// whatever becomes of it: Exo sends each piece only right before the edit
+/// it describes. The mirror reads them all; the guest's preedit takes the
+/// cursor and the selection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct V1Pieces {
+    /// H5's index.
+    pub(crate) cursor: Option<i32>,
+    /// H4's spans, in order: index, length and style.
+    pub(crate) styling: Vec<(u32, u32, u32)>,
+    /// H6's index and anchor.
+    pub(crate) cursor_position: Option<(i32, i32)>,
+}
+
+impl V1Pieces {
+    /// Record `piece`.
+    fn record(&mut self, piece: Piece) {
+        match piece {
+            Piece::Styling {
+                index,
+                length,
+                style,
+            } => self.styling.push((index, length, style)),
+            Piece::Cursor(index) => self.cursor = Some(index),
+            Piece::CursorPosition { index, anchor } => self.cursor_position = Some((index, anchor)),
+        }
+    }
+
+    /// The last selection span, which v3 can show only as the preedit's
+    /// cursor.
+    fn selection(&self) -> Option<(u32, u32)> {
+        let selection = zwp_text_input_v1::PREEDIT_STYLE_SELECTION;
+        let mut spans = self.styling.iter().rev();
+        spans.find_map(|&(index, length, style)| (style == selection).then_some((index, length)))
+    }
 }
 
 /// What one step asks the adapter to send and do, each in order.

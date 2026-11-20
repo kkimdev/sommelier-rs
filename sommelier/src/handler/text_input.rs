@@ -22,8 +22,8 @@ use crate::handler::ime_keys::{
     forget_recovery_of_text_input, held_backspace_keyboard_for_seat, hold_recovery,
 };
 use crate::ime::{
-    self, Env, HostExt, HostIme, HostOut, HostTi, Input, KeyEffect, LeaseOutcome, SeatId,
-    SurfaceId, TiId,
+    self, Edit, Env, HostExt, HostIme, HostOut, HostTi, Input, KeyEffect, LeaseOutcome, Piece,
+    SeatId, SurfaceId, TiId,
 };
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
@@ -168,18 +168,18 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         text: &IndexedString,
         commit: &String,
     ) -> Action {
-        let event = HostIme::Preedit {
+        let edit = Edit::Preedit {
             serial,
             text: text.clone(),
             commit: commit.clone(),
         };
-        host_v1_event(ctx, event)
+        host_v1_event(ctx, edit)
     }
 
     /// H8.
     fn on_commit_string(&mut self, ctx: &mut Context, serial: u32, text: &String) -> Action {
         let text = text.clone();
-        host_v1_event(ctx, HostIme::Commit { serial, text })
+        host_v1_event(ctx, Edit::Commit { serial, text })
     }
 
     /// H10: dropped. Exo sends no keysym for a physical key: its one
@@ -244,32 +244,30 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         length: u32,
         style: u32,
     ) -> Action {
-        host_v1_event(
-            ctx,
-            HostIme::PreeditStyling {
-                index,
-                length,
-                style,
-            },
-        )
+        let piece = Piece::Styling {
+            index,
+            length,
+            style,
+        };
+        host_v1_event(ctx, piece)
     }
 
     /// H5.
     fn on_preedit_cursor(&mut self, ctx: &mut Context, index: i32) -> Action {
-        host_v1_event(ctx, HostIme::PreeditCursor(index))
+        host_v1_event(ctx, Piece::Cursor(index))
     }
 
-    /// H6: Exo sends it only right before a commit_string, and
-    /// text-input-v3 has no cursor-position event.
+    /// H6: Exo sends it only right before a commit_string, which reads it
+    /// as a selection; text-input-v3 has no cursor-position event.
     fn on_cursor_position(&mut self, ctx: &mut Context, index: i32, anchor: i32) -> Action {
-        host_v1_event(ctx, HostIme::CursorPosition { index, anchor })
+        host_v1_event(ctx, Piece::CursorPosition { index, anchor })
     }
 
     /// H9. Exo counts `index` from the start of the surrounding text,
     /// against the v1 XML (docs/INVARIANTS.md, "Exo's deletes are absolute
     /// and stand alone").
     fn on_delete_surrounding_text(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
-        host_v1_event(ctx, HostIme::Delete { index, length })
+        host_v1_event(ctx, Edit::Delete { index, length })
     }
 
     fn on_language(&mut self, ctx: &mut Context, serial: u32, _language: &String) -> Action {
@@ -307,9 +305,9 @@ fn v1_sender(ctx: &Context) -> Option<TiId> {
 }
 
 /// H4 to H9: hand a host `zwp_text_input_v1` event to the IME core.
-fn host_v1_event(ctx: &mut Context, event: HostIme) -> Action {
+fn host_v1_event(ctx: &mut Context, event: impl Into<HostIme>) -> Action {
     if let Some(ti) = v1_sender(ctx) {
-        ime(ctx, Input::V1(ti, event));
+        ime(ctx, Input::V1(ti, event.into()));
     }
     Action::Drop
 }
@@ -321,7 +319,7 @@ pub struct ExtendedTextInputV1Handler;
 impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextInputV1Handler {
     /// X1: Exo's cursor-relative region of its text becomes the preedit.
     fn on_set_preedit_region(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
-        host_ext_event(ctx, HostIme::PreeditRegion { index, length })
+        host_ext_event(ctx, Edit::PreeditRegion { index, length })
     }
     fn on_clear_grammar_fragments(&mut self, _ctx: &mut Context, _start: u32, _end: u32) -> Action {
         log::trace!(
@@ -375,13 +373,13 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
     fn on_confirm_preedit(&mut self, ctx: &mut Context, selection_behavior: u32) -> Action {
         let keep_selection = selection_behavior
             == zcr_extended_text_input_v1::CONFIRM_PREEDIT_SELECTION_BEHAVIOR_UNCHANGED;
-        host_ext_event(ctx, HostIme::Confirm { keep_selection })
+        host_ext_event(ctx, Edit::Confirm { keep_selection })
     }
 }
 
 /// X1 and X2: hand a host `zcr_extended_text_input_v1` event to the IME
 /// core, which knows each extension's text input.
-fn host_ext_event(ctx: &mut Context, event: HostIme) -> Action {
+fn host_ext_event(ctx: &mut Context, event: Edit) -> Action {
     let ext = ctx.last_sender_id;
     ime(ctx, Input::Ext { ext, event });
     Action::Drop
@@ -4980,9 +4978,8 @@ pub(super) mod tests {
 
     /// Host text too long for a message is dropped whole: the guest gets
     /// nothing, and the text input and its repeat lease stay as they were,
-    /// except that the event takes what the host recorded for it: a
-    /// preedit or a confirmation the preedit cursor and styling, a commit
-    /// the cursor position. Otherwise the next one would apply them. (A
+    /// except that the event takes the pieces Exo sent before it, as every
+    /// edit does (B3). Otherwise the next one would apply them. (A
     /// region is measured only in step with the Exo mirror, which state set
     /// up directly is not.) Only host
     /// text the proxy lengthened by replacing invalid UTF-8 fits the host's
@@ -5003,15 +5000,14 @@ pub(super) mod tests {
             ime.settle();
             let state = ime.state();
             state.show_for_test(&oversized);
-            state.set_assembly_for_test(crate::ime::Assembly {
+            state.set_pieces_for_test(crate::ime::V1Pieces {
                 cursor: Some(1),
-                selection: Some((0, 1)),
+                styling: vec![(0, 1, zwp_text_input_v1::PREEDIT_STYLE_SELECTION)],
+                cursor_position: Some((1, 1)),
             });
             ime.lease_backspace_repeat(TI);
             let mut expected = ime.state().clone();
-            if case != "commit" {
-                expected.set_assembly_for_test(crate::ime::Assembly::default());
-            }
+            expected.set_pieces_for_test(crate::ime::V1Pieces::default());
 
             event(&mut ime, &oversized);
             assert_eq!(ime.events(), [], "{case}");

@@ -66,7 +66,7 @@ use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hasher};
 use std::ops::Range;
 
-use super::BarrierToken;
+use super::{BarrierToken, V1Pieces};
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 
 /// The most history states the mirror keeps. Exo keeps every one (STT has
@@ -428,14 +428,6 @@ pub(super) struct ExoMirror {
     /// Requests sent and not yet known to be processed, each with the
     /// barrier sent after it, oldest first.
     in_flight: VecDeque<(BarrierToken, Sent)>,
-    /// The `preedit_cursor` since the last `preedit_string`.
-    preedit_cursor: Option<i32>,
-    /// The highlight `preedit_styling` spans since the last
-    /// `preedit_string`.
-    highlights: Vec<Span>,
-    /// The `cursor_position(index, anchor)` since the last
-    /// `commit_string`.
-    cursor_position: Option<(i32, i32)>,
     /// While the prediction is vague, the selections it may have
     /// ([`Selection::Vague`]).
     vague: Vec<Span>,
@@ -453,9 +445,6 @@ impl ExoMirror {
             expected: VecDeque::new(),
             unmarked: false,
             in_flight: VecDeque::new(),
-            preedit_cursor: None,
-            highlights: Vec::new(),
-            cursor_position: None,
             vague: Vec::new(),
             diverged: false,
         };
@@ -590,23 +579,6 @@ impl ExoMirror {
     // The wire. Each event Exo sends is matched to the tracker call that
     // sent it, and applied if it agrees with the mirror (the echo check).
 
-    /// H4 `preedit_styling`: a span of the next `preedit_string`. A
-    /// highlight is IMA's composition selection (ZTIM 166-182; IMA
-    /// `ExtractCompositionText`), whose end the wire does not carry.
-    pub(super) fn preedit_styling(&mut self, index: u32, length: u32, style: u32) {
-        if style == zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT && length > 0 {
-            let start = index as usize;
-            self.highlights
-                .push(Span::new(start, start.saturating_add(length as usize)));
-        }
-    }
-
-    /// H5 `preedit_cursor`: the first half of `SetCompositionText` (ZTIM
-    /// 166-182).
-    pub(super) fn preedit_cursor(&mut self, index: i32) {
-        self.preedit_cursor = Some(index);
-    }
-
     /// H7 `preedit_string(text, commit)`: `TI::SetCompositionText` →
     /// `OnSetCompositionText` (TI 235-238; ZTIM 166-182). The cursor is
     /// the composition's selection start; its end is not on the wire, so
@@ -620,9 +592,19 @@ impl ExoMirror {
     /// composition selection the mirror cannot know, so the selection is
     /// [`Health::Vague`]: empty at the cursor, or between it and such a
     /// highlight's other end. Without one, the cursor sets it.
-    pub(super) fn preedit_string(&mut self, text: &str, commit: &str) {
-        let cursor = self.preedit_cursor.take();
-        let highlights = std::mem::take(&mut self.highlights);
+    ///
+    /// The cursor is H5 `preedit_cursor`, the first half of
+    /// `SetCompositionText` (ZTIM 166-182), and a highlight is an H4
+    /// `preedit_styling` span of style HIGHLIGHT: IMA's composition
+    /// selection (ZTIM 166-182; IMA `ExtractCompositionText`), whose end the
+    /// wire does not carry. Both are among `pieces`.
+    pub(super) fn preedit_string(&mut self, text: &str, commit: &str, pieces: &V1Pieces) {
+        let cursor = pieces.cursor;
+        let highlights = pieces.styling.iter().filter_map(|&(index, length, style)| {
+            let start = index as usize;
+            let highlight = style == zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT && length > 0;
+            highlight.then(|| Span::new(start, start.saturating_add(length as usize)))
+        });
         self.observe(|mirror| {
             let cursor = match cursor {
                 None => text.len(),
@@ -645,7 +627,7 @@ impl ExoMirror {
                 false => predicted.composition.start,
             };
             let at = begin + cursor;
-            let others = highlights.iter().filter_map(|span| match () {
+            let others = highlights.filter_map(|span| match () {
                 _ if span.start == cursor => Some(span.end),
                 _ if span.end == cursor => Some(span.start),
                 _ => None,
@@ -670,12 +652,6 @@ impl ExoMirror {
         self.observe(|_| Err(Miss::Unknowable));
     }
 
-    /// H6 `cursor_position(index, anchor)`: `SetCursor` (ZTIM 192-199),
-    /// which the next `commit_string` completes.
-    pub(super) fn cursor_position(&mut self, index: i32, anchor: i32) {
-        self.cursor_position = Some((index, anchor));
-    }
-
     /// H8 `commit_string(text)`. Alone, it is `TI::InsertText` →
     /// `OnInsertText(text, kMoveCursorAfterText)` (TI 274-280), which over
     /// a composition holding the selection replaces the composition
@@ -688,8 +664,11 @@ impl ExoMirror {
     ///
     /// Echo, for a pair: the range is in the text, and `text` is the
     /// composition's.
-    pub(super) fn commit_string(&mut self, text: &str) {
-        let cursor_position = self.cursor_position.take();
+    ///
+    /// The pair's first half is H6 `cursor_position(index, anchor)`,
+    /// `SetCursor` (ZTIM 192-199), among `pieces`.
+    pub(super) fn commit_string(&mut self, text: &str, pieces: &V1Pieces) {
+        let cursor_position = pieces.cursor_position;
         self.observe(|mirror| {
             let vague = mirror.health == Health::Vague;
             let composing = !mirror.predicted.composition.is_empty();
@@ -1138,6 +1117,37 @@ fn erase(text: &mut String, pos: usize, n: usize) {
 mod tests {
     use super::*;
 
+    /// No pieces before an edit.
+    fn none() -> V1Pieces {
+        V1Pieces::default()
+    }
+
+    /// A `preedit_cursor(index)` before a `preedit_string`.
+    fn cursor(index: i32) -> V1Pieces {
+        V1Pieces {
+            cursor: Some(index),
+            ..V1Pieces::default()
+        }
+    }
+
+    /// A `preedit_styling(index, length, style)` and a
+    /// `preedit_cursor(cursor)` before a `preedit_string`.
+    fn styled(cursor: i32, index: u32, length: u32, style: u32) -> V1Pieces {
+        V1Pieces {
+            cursor: Some(cursor),
+            styling: vec![(index, length, style)],
+            cursor_position: None,
+        }
+    }
+
+    /// A `cursor_position(index, anchor)` before a `commit_string`.
+    fn position(index: i32, anchor: i32) -> V1Pieces {
+        V1Pieces {
+            cursor_position: Some((index, anchor)),
+            ..V1Pieces::default()
+        }
+    }
+
     /// Something that happens to a mirror.
     type Event = fn(&mut ExoMirror);
 
@@ -1344,8 +1354,7 @@ mod tests {
 
         // On the wire.
         let mut mirror = at(state("가", (3, 3), NO_COMPOSITION));
-        mirror.preedit_cursor(3);
-        mirror.preedit_string("나", "나");
+        mirror.preedit_string("나", "나", &cursor(3));
         // `가` with the cursor at 3 is still in the history; at 0 it is not.
         report(&mut mirror, "가", 3, 3);
         let composition = |mirror: &ExoMirror| mirror.predicted().composition.clone();
@@ -1439,10 +1448,9 @@ mod tests {
         assert_pushed(&mirror, &state("가글", (3, 3), 3..6));
         // On the wire, the cursor is `preedit_cursor`, or else the end.
         let mut mirror = at(state(GANADA, (3, 3), NO_COMPOSITION));
-        mirror.preedit_cursor(0);
-        mirror.preedit_string("한", "한");
+        mirror.preedit_string("한", "한", &cursor(0));
         assert_pushed(&mirror, &state("가한나다", (3, 3), 3..6));
-        mirror.preedit_string("한글", "한글");
+        mirror.preedit_string("한글", "한글", &none());
         assert_pushed(&mirror, &state("가한글나다", (9, 9), 3..9));
         assert_eq!(mirror.health(), Health::Exact);
     }
@@ -1454,7 +1462,7 @@ mod tests {
     #[test]
     fn an_empty_preedit_with_no_composition_deletes_the_selection() {
         let mut mirror = at(state(GANADA, (6, 3), NO_COMPOSITION));
-        mirror.preedit_string("", "");
+        mirror.preedit_string("", "", &none());
         assert_pushed(&mirror, &state("가다", (3, 3), NO_COMPOSITION));
 
         let composing = state(GANADA, (6, 6), 3..6);
@@ -1462,7 +1470,7 @@ mod tests {
         cleared.on_clear_composition_text();
         assert_pushed(&cleared, &state("가다", (3, 3), NO_COMPOSITION));
         let mut mirror = at(composing);
-        mirror.preedit_string("", "");
+        mirror.preedit_string("", "", &none());
         assert_pushed(&mirror, cleared.predicted());
     }
 
@@ -1540,7 +1548,7 @@ mod tests {
     #[test]
     fn insert_replaces_the_selection() {
         let mut mirror = at(state(GANADA, (3, 3), NO_COMPOSITION));
-        mirror.commit_string("한");
+        mirror.commit_string("한", &none());
         assert_pushed(&mirror, &state("가한나다", (6, 6), NO_COMPOSITION));
         let mut mirror = at(state(GANADA, (9, 3), NO_COMPOSITION));
         mirror.on_insert_text("글", CursorBehavior::MoveCursorBeforeText);
@@ -1562,7 +1570,7 @@ mod tests {
             ((9, 3), state("가한", (6, 6), NO_COMPOSITION)),
         ] {
             let mut mirror = at(state(GANADA, selection, 3..6));
-            mirror.commit_string("한");
+            mirror.commit_string("한", &none());
             assert_pushed(&mirror, &expected);
         }
     }
@@ -1574,15 +1582,15 @@ mod tests {
     fn insert_over_a_disjoint_composition_erases_it() {
         // The composition before the selection, the cursor at its end.
         let mut mirror = at(state(GANADA, (6, 6), 3..6));
-        mirror.commit_string("한");
+        mirror.commit_string("한", &none());
         assert_pushed(&mirror, &state("가한다", (6, 6), NO_COMPOSITION));
         // Before a reversed selection, which keeps its length.
         let mut mirror = at(state(GANADA, (9, 6), 0..3));
-        mirror.commit_string("한");
+        mirror.commit_string("한", &none());
         assert_pushed(&mirror, &state("나한", (6, 6), NO_COMPOSITION));
         // After the selection: nothing shifts.
         let mut mirror = at(state(GANADA, (0, 0), 6..9));
-        mirror.commit_string("한");
+        mirror.commit_string("한", &none());
         assert_pushed(&mirror, &state("한가나", (3, 3), NO_COMPOSITION));
     }
 
@@ -1660,7 +1668,7 @@ mod tests {
     #[test]
     fn cancel_empties_the_history() {
         let mut mirror = at(state(GANADA, (9, 9), NO_COMPOSITION));
-        mirror.preedit_string("라", "라");
+        mirror.preedit_string("라", "라", &none());
         cancel(&mut mirror);
         assert_eq!(
             mirror.predicted(),
@@ -1674,7 +1682,7 @@ mod tests {
         // An event after the cancel leaves a history of its own state.
         let mut mirror = at(state(GANADA, (9, 9), NO_COMPOSITION));
         cancel(&mut mirror);
-        mirror.commit_string("라");
+        mirror.commit_string("라", &none());
         assert_eq!(
             history(&mirror),
             [state("가나다라", (12, 12), NO_COMPOSITION)]
@@ -1693,7 +1701,7 @@ mod tests {
         assert_eq!(history(&mirror), [state(GANADA, (3, 9), NO_COMPOSITION)]);
         for (cursor, anchor) in [(1, 1), (3, 4), (10, 0)] {
             let mut ignored = mirror.clone();
-            ignored.preedit_string("라", "라");
+            ignored.preedit_string("라", "라", &none());
             let before = (ignored.predicted().clone(), history(&ignored));
             report(&mut ignored, GANADA, cursor, anchor);
             assert_eq!((ignored.predicted().clone(), history(&ignored)), before);
@@ -1709,7 +1717,7 @@ mod tests {
         mirror.sent(BarrierToken(7), sent_report("가", 0, 0));
         mirror.sent(BarrierToken(8), Sent::Cancel);
         // Exo composed before it processed the report.
-        mirror.preedit_string("나", "나");
+        mirror.preedit_string("나", "나", &none());
         let composing = state("가나", (6, 6), 3..6);
         assert_pushed(&mirror, &composing);
         mirror.barrier_done(BarrierToken(8));
@@ -1726,7 +1734,7 @@ mod tests {
         // composition, which would then have stayed.
         let mut early = at(state("가", (3, 3), NO_COMPOSITION));
         report(&mut early, "가", 0, 0);
-        early.preedit_string("나", "나");
+        early.preedit_string("나", "나", &none());
         assert_eq!(early.predicted(), &state("나가", (3, 3), 0..3));
     }
 
@@ -1742,17 +1750,15 @@ mod tests {
             ((9, 0), state(GANADA, (0, 9), 3..6)),
         ] {
             let mut mirror = at(composing.clone());
-            mirror.cursor_position(index, anchor);
-            mirror.commit_string("나");
+            mirror.commit_string("나", &position(index, anchor));
             assert_pushed(&mirror, &expected);
             // The pair is spent: the next commit is an insert.
-            mirror.commit_string("라");
+            mirror.commit_string("라", &none());
             assert!(mirror.predicted().text.contains('라'));
         }
         // With no composition, the pair commits "".
         let mut mirror = at(state(GANADA, (3, 3), NO_COMPOSITION));
-        mirror.cursor_position(6, 6);
-        mirror.commit_string("");
+        mirror.commit_string("", &position(6, 6));
         assert_pushed(&mirror, &state(GANADA, (6, 6), NO_COMPOSITION));
     }
 
@@ -1765,35 +1771,28 @@ mod tests {
         let idle = state(GANADA, (6, 3), NO_COMPOSITION);
         let cases: [(&str, &ExoState, Event); 15] = [
             ("a preedit whose commit differs", &idle, |m| {
-                m.preedit_string("라", "마")
+                m.preedit_string("라", "마", &none())
             }),
             ("a preedit cursor inside a character", &idle, |m| {
-                m.preedit_cursor(1);
-                m.preedit_string("라", "라");
+                m.preedit_string("라", "라", &cursor(1));
             }),
             ("a preedit cursor past its end", &idle, |m| {
-                m.preedit_cursor(4);
-                m.preedit_string("라", "라");
+                m.preedit_string("라", "라", &cursor(4));
             }),
             ("a negative preedit cursor", &idle, |m| {
-                m.preedit_cursor(-1);
-                m.preedit_string("라", "라");
+                m.preedit_string("라", "라", &cursor(-1));
             }),
             ("a pair that commits other text", &composing, |m| {
-                m.cursor_position(6, 6);
-                m.commit_string("다");
+                m.commit_string("다", &position(6, 6));
             }),
             ("a pair that commits text with no composition", &idle, |m| {
-                m.cursor_position(6, 6);
-                m.commit_string("다");
+                m.commit_string("다", &position(6, 6));
             }),
             ("a pair out of the text", &composing, |m| {
-                m.cursor_position(10, 6);
-                m.commit_string("나");
+                m.commit_string("나", &position(10, 6));
             }),
             ("a pair inside a character", &composing, |m| {
-                m.cursor_position(4, 4);
-                m.commit_string("나");
+                m.commit_string("나", &position(4, 4));
             }),
             ("a delete while composing", &composing, |m| {
                 m.delete_surrounding_text(3, 3)
@@ -1846,7 +1845,7 @@ mod tests {
         for _ in 0..100 {
             mirror.confirm_preedit(true);
         }
-        mirror.commit_string("가");
+        mirror.commit_string("가", &none());
         assert_eq!(mirror.expected().len(), 102);
         report(&mut mirror, "", 0, 0);
         assert_eq!(mirror.health(), Health::Exact);
@@ -1874,9 +1873,9 @@ mod tests {
     fn long_text_makes_it_unknown() {
         let full = "가".repeat(TEXT_CAP / 3);
         let mut mirror = at(state(&full, (full.len(), full.len()), NO_COMPOSITION));
-        mirror.commit_string("a");
+        mirror.commit_string("a", &none());
         assert_eq!(mirror.predicted().text.len(), TEXT_CAP);
-        mirror.commit_string("가");
+        mirror.commit_string("가", &none());
         assert_eq!(mirror.health(), Health::Unknown);
         assert_eq!(mirror.expected().back(), Some(&Entry::Unknown));
         mirror.delete_surrounding_text(30, 3);
@@ -1929,7 +1928,7 @@ mod tests {
         assert_eq!(mirror.health(), Health::Unknown);
         // An event between the press's reset and the report.
         cancel(&mut mirror);
-        mirror.commit_string("나");
+        mirror.commit_string("나", &none());
         report(&mut mirror, "다", 3, 3);
         assert_eq!(mirror.health(), Health::Unknown);
 
@@ -1972,9 +1971,16 @@ mod tests {
     /// A conversion's preedit `text`, its first `selected` bytes
     /// highlighted, with the cursor at their end.
     fn convert(mirror: &mut ExoMirror, text: &str, selected: u32) {
-        mirror.preedit_styling(0, selected, zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT);
-        mirror.preedit_cursor(selected as i32);
-        mirror.preedit_string(text, text);
+        mirror.preedit_string(
+            text,
+            text,
+            &styled(
+                selected as i32,
+                0,
+                selected,
+                zwp_text_input_v1::PREEDIT_STYLE_HIGHLIGHT,
+            ),
+        );
     }
 
     /// IMA makes a composition selection from a highlight span with the
@@ -2005,9 +2011,7 @@ mod tests {
             ),
         ] {
             let mut mirror = at(state("", (0, 0), NO_COMPOSITION));
-            mirror.preedit_styling(index, length, style);
-            mirror.preedit_cursor(3);
-            mirror.preedit_string(GANADA, GANADA);
+            mirror.preedit_string(GANADA, GANADA, &styled(3, index, length, style));
             let health = [Health::Exact, Health::Vague][usize::from(other.is_some())];
             assert_eq!(mirror.health(), health, "{case}");
             let vague =
@@ -2020,8 +2024,7 @@ mod tests {
             };
             assert_eq!(history(&mirror).last(), Some(&pushed), "{case}");
             // The spans are spent.
-            mirror.preedit_cursor(3);
-            mirror.preedit_string("가", "가");
+            mirror.preedit_string("가", "가", &cursor(3));
             assert_eq!(mirror.health(), Health::Exact, "{case}");
         }
 
@@ -2033,14 +2036,13 @@ mod tests {
         let converted = state("가나다漢字", (15, 15), NO_COMPOSITION);
         // A commit replaces the composition, which holds the selection.
         let mut mirror = vague();
-        mirror.commit_string("漢字");
+        mirror.commit_string("漢字", &none());
         assert_pushed(&mirror, &converted);
         let mut mirror = vague();
         mirror.confirm_preedit(false);
         assert_pushed(&mirror, &converted);
         let mut mirror = vague();
-        mirror.cursor_position(9, 9);
-        mirror.commit_string("漢字");
+        mirror.commit_string("漢字", &position(9, 9));
         assert_pushed(&mirror, &state("가나다漢字", (9, 9), 9..15));
         // A confirm that keeps the selection keeps it vague, and a delete
         // over it sets it.
@@ -2056,7 +2058,7 @@ mod tests {
         assert_eq!(mirror.health(), Health::Unknown);
         let mut mirror = vague();
         mirror.confirm_preedit(true);
-        mirror.commit_string("라");
+        mirror.commit_string("라", &none());
         assert_eq!(mirror.health(), Health::Unknown);
         assert!(!mirror.take_diverged());
     }
@@ -2069,7 +2071,7 @@ mod tests {
         mirror.sent(BarrierToken(1), split_report("가", 0));
         mirror.barrier_done(BarrierToken(1));
         assert_pushed(&mirror, &state("가", (0, 0), NO_COMPOSITION));
-        mirror.commit_string("나");
+        mirror.commit_string("나", &none());
         assert_pushed(&mirror, &state("나가", (3, 3), NO_COMPOSITION));
     }
 
@@ -2081,7 +2083,7 @@ mod tests {
     fn a_split_report_with_an_event_is_unknown() {
         let mut mirror = at(state("가", (3, 3), NO_COMPOSITION));
         mirror.sent(BarrierToken(1), split_report("가", 0));
-        mirror.commit_string("나");
+        mirror.commit_string("나", &none());
         assert_eq!(mirror.health(), Health::Unknown);
         assert!(!mirror.take_diverged());
         mirror.barrier_done(BarrierToken(1));
@@ -2100,7 +2102,7 @@ mod tests {
     #[test]
     fn a_report_crosses_when_it_will_name_no_state() {
         let mut mirror = at(state("ab", (2, 2), NO_COMPOSITION));
-        mirror.commit_string("c");
+        mirror.commit_string("c", &none());
         let sent = |text: &str, cursor| sent_report(text, cursor, cursor);
         mirror.sent(BarrierToken(1), sent("ab", 2));
         mirror.sent(BarrierToken(2), sent("abc", 3));
@@ -2122,11 +2124,11 @@ mod tests {
     fn a_matched_report_finds_the_guest_without_a_composition() {
         let applied = |second: bool| {
             let mut mirror = at(state("", (0, 0), NO_COMPOSITION));
-            mirror.preedit_string("가", "가");
+            mirror.preedit_string("가", "가", &none());
             mirror.mark(false);
-            mirror.commit_string("가");
+            mirror.commit_string("가", &none());
             mirror.mark(true);
-            mirror.preedit_string("나", "나");
+            mirror.preedit_string("나", "나", &none());
             mirror.mark(second);
             let token = BarrierToken(1);
             mirror.sent(token, sent_report("가", 3, 3));
@@ -2146,13 +2148,11 @@ mod tests {
     fn korean_typing_through_the_wire() {
         let mut mirror = ExoMirror::new();
         for syllable in ["ㅎ", "하", "한"] {
-            mirror.preedit_cursor(3);
-            mirror.preedit_string(syllable, syllable);
+            mirror.preedit_string(syllable, syllable, &cursor(3));
         }
         assert_pushed(&mirror, &state("한", (3, 3), 0..3));
-        mirror.commit_string("한");
-        mirror.preedit_cursor(3);
-        mirror.preedit_string("ㄱ", "ㄱ");
+        mirror.commit_string("한", &none());
+        mirror.preedit_string("ㄱ", "ㄱ", &cursor(3));
         assert_pushed(&mirror, &state("한ㄱ", (6, 6), 3..6));
         // The guest reports the commit, not the preedit it shows. That
         // matches the oldest state equal to it, the preedit `한`, as
@@ -2161,7 +2161,7 @@ mod tests {
         assert_eq!(history(&mirror)[0], state("한", (3, 3), 0..3));
         assert_eq!(history(&mirror).len(), 3);
         assert_eq!(mirror.predicted(), &state("한ㄱ", (6, 6), 3..6));
-        mirror.preedit_string("글", "글");
+        mirror.preedit_string("글", "글", &none());
         mirror.confirm_preedit(false);
         assert_pushed(&mirror, &state("한글", (6, 6), NO_COMPOSITION));
         report(&mut mirror, "한글", 6, 6);

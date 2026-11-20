@@ -503,7 +503,7 @@ pub(super) struct SpecText {
     link: Link,
     fence: Fence,
     shown: Option<Shown>,
-    /// The last `preedit_cursor` since a terminal event (H5).
+    /// The last `preedit_cursor` since a terminal event (H5, B3).
     assembly: Option<i32>,
     /// The step's delete or region ([`Measuring`]).
     measuring: Option<Measuring>,
@@ -1045,7 +1045,6 @@ impl SpecText {
             if let Some(shown) = self.shown.take() {
                 self.counts.press_commits += 1;
                 self.end_lease();
-                self.assembly = None;
                 self.expected.reset = true;
                 let txn = Txn {
                     commit: shown.text,
@@ -1076,9 +1075,8 @@ impl SpecText {
                 }
                 self.leave_attached(Link::Detached);
             }
-            &v1::Event::PreeditCursor { index } if self.link == Link::Attached => {
-                self.assembly = Some(index);
-            }
+            // B3: it waits for its edit, whatever the link.
+            &v1::Event::PreeditCursor { index } => self.assembly = Some(index),
             v1::Event::PreeditString { text, .. } => {
                 self.region_dropped = false;
                 let IndexedString::Utf8(text) = text else {
@@ -1351,7 +1349,6 @@ impl SpecText {
     fn leave_attached(&mut self, link: Link) {
         self.link = link;
         self.shown = None;
-        self.assembly = None;
     }
 
     /// A request the proxy sent the host, as far as the IME decides it.

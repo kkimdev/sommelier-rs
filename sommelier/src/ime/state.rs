@@ -19,7 +19,7 @@ limitations under the License.
 //! or a press can change what the guest is shown only through
 //! [`Current`], which only [`TextInput::current`] makes.
 
-use super::exo_view::{Edit, ExoView, Frame, Unmeasured};
+use super::exo_view::{ExoView, Frame, Reached, Unmeasured};
 use super::guest::{resolve_preedit_cursor, GuestTxn, Preedit, TooLong};
 #[cfg(test)]
 use super::host;
@@ -27,7 +27,9 @@ use super::host::HostContentType;
 use super::serial::{CommitCount, Serial};
 #[cfg(test)]
 use super::Env;
-use super::{BarrierToken, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
+use super::{
+    BarrierToken, HostTi, KeyEffect, LeaseOutcome, Piece, SeatId, SurfaceId, TiId, V1Pieces,
+};
 use crate::wire::Outgoing;
 
 /// A text-input-v3 content type: `(hint, purpose)`.
@@ -87,6 +89,8 @@ pub(crate) struct TextInput {
     /// Exo's text, which the host text input keeps for its whole life, so
     /// it lives beside the link too.
     exo: ExoView,
+    /// The pieces of Exo's next edit, which arrive whatever the link.
+    pieces: V1Pieces,
     composition: Composition,
     warned: Warned,
 }
@@ -123,20 +127,11 @@ pub(crate) enum LinkState {
     Draining { barrier: BarrierToken },
 }
 
-/// What the guest shows, and the v1 pieces of the next host event. What
-/// Exo holds is the Exo mirror's ([`ExoView`]).
+/// What the guest shows. What Exo holds is the Exo mirror's
+/// ([`ExoView`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Composition {
     shown: Option<Preedit>,
-    assembly: Assembly,
-}
-
-/// The v1 `preedit_cursor` and `preedit_styling` selection that the next
-/// preedit or preedit region applies.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Assembly {
-    pub(crate) cursor: Option<i32>,
-    pub(crate) selection: Option<(u32, u32)>,
 }
 
 /// What the proxy warned of, so that it warns once per text input. The
@@ -168,6 +163,7 @@ impl TextInput {
             link: LinkState::Detached,
             fence: None,
             exo: ExoView::new(),
+            pieces: V1Pieces::default(),
             composition: Composition::default(),
             warned: Warned::default(),
         }
@@ -241,8 +237,9 @@ impl TextInput {
 
     /// After a tracker-changing host event, with `frame` the one made
     /// before it and `edit` what reached the guest (`ExoView::after`).
-    pub(super) fn exo_after(&mut self, frame: Option<&Frame>, edit: Option<Edit>) {
-        self.exo.after(frame, edit, self.composition.shown.as_ref());
+    pub(super) fn exo_after(&mut self, frame: Option<&Frame>, reached: Option<Reached>) {
+        self.exo
+            .after(frame, reached, self.composition.shown.as_ref());
     }
 
     /// The pending state a commit consumes, or `None` while unfocused
@@ -332,15 +329,15 @@ impl TextInput {
         old
     }
 
-    /// H4 and H5 record into the assembly only while attached.
-    pub(super) fn assembly_mut(&mut self) -> Option<&mut Assembly> {
-        self.is_attached().then_some(&mut self.composition.assembly)
+    /// H4 to H6: record a piece of Exo's next edit.
+    pub(super) fn record_piece(&mut self, piece: Piece) {
+        self.pieces.record(piece);
     }
 
-    /// B3: take the assembly, which a host composition event or a press
-    /// used up (design H9).
-    pub(super) fn take_assembly(&mut self) -> Assembly {
-        std::mem::take(&mut self.composition.assembly)
+    /// B3: an edit takes the pieces Exo sent before it, whatever becomes of
+    /// the edit.
+    pub(super) fn take_pieces(&mut self) -> V1Pieces {
+        std::mem::take(&mut self.pieces)
     }
 
     /// The gate of every host composition event and press: the link is
@@ -470,8 +467,8 @@ impl TextInput {
                 panic!("I1b: {ti:?} is attached with no target: {self:?}")
             }
         }
-        let Composition { shown, assembly } = &self.composition;
-        if shown.is_some() || *assembly != Assembly::default() {
+        let Composition { shown } = &self.composition;
+        if shown.is_some() {
             assert!(attached, "I2: {ti:?} composes while not attached");
         }
         if shown.is_some() {
@@ -532,13 +529,13 @@ impl TextInput {
         &self.pending
     }
 
-    pub(crate) fn assembly_for_test(&self) -> Assembly {
-        self.composition.assembly
+    pub(crate) fn pieces_for_test(&self) -> &V1Pieces {
+        &self.pieces
     }
 
-    /// Record `assembly`, whatever the link.
-    pub(crate) fn set_assembly_for_test(&mut self, assembly: Assembly) {
-        self.composition.assembly = assembly;
+    /// Record `pieces` for Exo's next edit.
+    pub(crate) fn set_pieces_for_test(&mut self, pieces: V1Pieces) {
+        self.pieces = pieces;
     }
 
     /// Take `other`'s view of Exo's text.
@@ -620,12 +617,12 @@ impl<'a> Current<'a> {
     }
 
     /// H7. Exo's commit text is always the preedit's, so it is not read.
-    pub(super) fn preedit(self, text: String, assembly: Assembly) -> Planned<'a> {
+    pub(super) fn preedit(self, text: String, pieces: &V1Pieces) -> Planned<'a> {
         let lease = match text.is_empty() && self.shown().is_some() {
             true => LeaseOutcome::ArmIfBackspaceHeld,
             false => LeaseOutcome::End,
         };
-        let cursor = resolve_preedit_cursor(&text, assembly.selection, assembly.cursor);
+        let cursor = resolve_preedit_cursor(&text, pieces.selection(), pieces.cursor);
         let txn = GuestTxn {
             preedit: Preedit::new(text, cursor),
             ..GuestTxn::default()
@@ -652,11 +649,6 @@ impl<'a> Current<'a> {
             });
         }
         Confirm::Commit(self.commit_shown())
-    }
-
-    /// The assembly, which a preedit and a region apply (B3).
-    pub(super) fn take_assembly(&mut self) -> Assembly {
-        std::mem::take(&mut self.composition.assembly)
     }
 
     /// F4: a press commits the shown preedit, and fences the host's
@@ -692,10 +684,10 @@ pub(super) struct Planned<'a> {
 
 impl Planned<'_> {
     /// What reaches the guest of the transaction, if it applies.
-    pub(super) fn edit(&self) -> Edit {
+    pub(super) fn reached(&self) -> Reached {
         let txn = &self.txn;
         let (deleted_before, deleted_after) = txn.delete.unwrap_or_default();
-        Edit {
+        Reached {
             deleted_before,
             deleted: (deleted_before, deleted_after) != (0, 0),
             committed: txn.commit.as_ref().map_or(0, String::len),

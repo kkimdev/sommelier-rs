@@ -26,8 +26,8 @@ use std::ops::Range;
 
 use super::guest::{resolve_preedit_cursor, GuestTxn, Preedit};
 use super::mirror::{Applied, ExoMirror, ExoState, Health, Sent};
-use super::state::{Assembly, DeleteDrop, RegionDrop};
-use super::{BarrierToken, HostIme, TiId};
+use super::state::{DeleteDrop, RegionDrop};
+use super::{BarrierToken, Edit, TiId, V1Pieces};
 use crate::wire::IndexedString;
 
 /// The guest's edits so far: the tracker-changing transactions it got,
@@ -92,9 +92,9 @@ pub(crate) enum Unmeasured {
     OutOfStep,
 }
 
-/// What reached the guest of one host event.
+/// What reached the guest of one host edit.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Edit {
+pub(super) struct Reached {
     /// The bytes it deleted before the cursor, and whether it deleted any.
     pub(super) deleted_before: u32,
     pub(super) deleted: bool,
@@ -154,14 +154,10 @@ impl ExoView {
         self.warned
     }
 
-    /// The frame of host event `event`, before the mirror takes it: Exo's
+    /// The frame of host edit `edit`, before the mirror takes it: Exo's
     /// state, if the mirror knows it exactly and a guest that shows `shown`
     /// can be in step with it.
-    pub(super) fn frame(
-        &self,
-        shown: Option<&Preedit>,
-        event: &HostIme,
-    ) -> Result<Frame, Unmeasured> {
+    pub(super) fn frame(&self, shown: Option<&Preedit>, edit: &Edit) -> Result<Frame, Unmeasured> {
         let state = self.mirror.exact().ok_or(Unmeasured::Unsure)?;
         let preedit = preedit_in(state, shown).ok_or(Unmeasured::OutOfStep)?;
         let cursor = state.selection.end;
@@ -173,9 +169,9 @@ impl ExoView {
         };
         // H9 measures from the text's start; X1 from Exo's cursor (ZTIM
         // 248-268).
-        let (range, region_text) = match *event {
-            HostIme::Delete { index, length } => (named(index.into(), length), String::new()),
-            HostIme::PreeditRegion { index, length } => {
+        let (range, region_text) = match *edit {
+            Edit::Delete { index, length } => (named(index.into(), length), String::new()),
+            Edit::PreeditRegion { index, length } => {
                 let range = named(cursor as i64 + i64::from(index), length);
                 let text = range.clone().map(|range| match range.is_empty() {
                     true => &state.text[preedit.clone()],
@@ -220,27 +216,21 @@ impl ExoView {
             .ok_or(Unmeasured::OutOfStep)
     }
 
-    /// The mirror takes host event `event`, before the gate: stale events
-    /// and those behind a fence changed Exo's tracker too.
-    pub(super) fn observe(&mut self, ti: TiId, event: &HostIme) {
+    /// The mirror takes host edit `edit`, with the pieces Exo sent before
+    /// it, before the gate: stale edits and those behind a fence changed
+    /// Exo's tracker too.
+    pub(super) fn observe(&mut self, ti: TiId, edit: &Edit, pieces: &V1Pieces) {
         let mirror = &mut self.mirror;
         let health = mirror.health();
-        match event {
-            &HostIme::PreeditStyling {
-                index,
-                length,
-                style,
-            } => mirror.preedit_styling(index, length, style),
-            &HostIme::PreeditCursor(index) => mirror.preedit_cursor(index),
-            &HostIme::CursorPosition { index, anchor } => mirror.cursor_position(index, anchor),
-            HostIme::Preedit { text, commit, .. } => match text {
-                IndexedString::Utf8(text) => mirror.preedit_string(text, commit),
+        match edit {
+            Edit::Preedit { text, commit, .. } => match text {
+                IndexedString::Utf8(text) => mirror.preedit_string(text, commit, pieces),
                 IndexedString::NotUtf8(_) => mirror.unreadable(),
             },
-            HostIme::Commit { text, .. } => mirror.commit_string(text),
-            &HostIme::Delete { index, length } => mirror.delete_surrounding_text(index, length),
-            &HostIme::PreeditRegion { index, length } => mirror.set_preedit_region(index, length),
-            &HostIme::Confirm { keep_selection } => mirror.confirm_preedit(keep_selection),
+            Edit::Commit { text, .. } => mirror.commit_string(text, pieces),
+            &Edit::Delete { index, length } => mirror.delete_surrounding_text(index, length),
+            &Edit::PreeditRegion { index, length } => mirror.set_preedit_region(index, length),
+            &Edit::Confirm { keep_selection } => mirror.confirm_preedit(keep_selection),
         }
         if mirror.take_diverged() {
             // A misreading of Chromium's: a bug to report, and the same one
@@ -266,7 +256,7 @@ impl ExoView {
     pub(super) fn after(
         &mut self,
         frame: Option<&Frame>,
-        edit: Option<Edit>,
+        edit: Option<Reached>,
         shown: Option<&Preedit>,
     ) {
         let cursor = frame.zip(edit).and_then(|(frame, edit)| {
@@ -441,7 +431,7 @@ impl Frame {
     /// region leaves Exo's composition as text, which the guest commits.
     ///
     /// The frame must be the region's.
-    pub(super) fn region(&self, assembly: Assembly) -> Result<GuestTxn, RegionDrop> {
+    pub(super) fn region(&self, pieces: &V1Pieces) -> Result<GuestTxn, RegionDrop> {
         let exo_cursor = self.cursor;
         let Range { start, end } = self.range.clone().ok_or(RegionDrop::NotAroundCursor)?;
         let text = &self.region_text;
@@ -465,8 +455,8 @@ impl Frame {
         // Both are at most the region's length.
         let delete = ((shown.start - start) as u32, (end - shown.end) as u32);
         let before = exo_cursor.clamp(start, end) - start;
-        let cursor = assembly.cursor.or(Some(before as i32));
-        let cursor = resolve_preedit_cursor(text, assembly.selection, cursor);
+        let cursor = pieces.cursor.or(Some(before as i32));
+        let cursor = resolve_preedit_cursor(text, pieces.selection(), cursor);
         let preedit = Preedit::new(text.clone(), cursor);
         let txn = GuestTxn {
             delete: Some(delete),
