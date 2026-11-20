@@ -739,13 +739,34 @@ unit tests, `proxy::fuzz` feeds whole clients random guest streams on the
 DST's scheduler, behind the host display the DST plays (`sim::display`),
 `sim` types into simulated text-input clients through a whole client on a
 virtual clock and checks their text against the specification and the
-user's intent, and
+user's intent, `proxy::replay` replays recorded host traces (below),
+and
 `sommelier/tests/weston_e2e.rs` runs
 real clients through the proxy against a headless weston; CONTRIBUTING
 says how to run them. `sommelier_test_app` is a standalone GUI for manual
 IME and glyph checks, and `sommelier/tests/gui_smoke.rs` (ignored by
 default) drives it through a real proxy on a Crostini VirtWL device; see
 the README.
+
+### Recorded host traces
+
+With `SOMMELIER_TRACE_DIR` set, `start_client` gives each `Client` a
+`trace::Recorder`, which writes a file of the connection's facts and each
+message `Client::handle_msgs` handles, once it is handled or ends the
+session, with the text of a host keymap, then what the batch gave each
+peer (`trace.rs` owns the format). Unset, `Client` has no recorder and
+the batch does nothing more. `proxy::replay` gives a `Session`'s proxy
+the trace's facts, has each peer send it what the trace says the proxy
+handled from that peer, a batch at a time, records the replay the same
+way, and requires the same records, no Exo mirror divergence or drop,
+and the protocol with both peers; a VirtWL channel is a stand-in
+(`VirtWaylandChannel::stand_in_for_test`). `Trace::decoded` prints a
+trace message by message.
+The corpus is [`traces/`](../traces/README.md), which says how to record
+on a Chromebook and what a replay stands in for (test:
+`every_recorded_trace_replays`). A DST case's recording replays too, and
+recording changes nothing the case sees (test:
+`a_dst_cases_wire_trace_replays`).
 
 ## Not in scope
 

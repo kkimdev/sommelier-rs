@@ -758,7 +758,8 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   no chord is classified until a usable keymap arrives, and it is still
   forwarded. The size of a VirtWL keymap cannot be checked against its
   file, and the proxy copies a keymap to compile it, so a size near 4 GiB
-  would otherwise abort every client.
+  would otherwise abort every client. A keymap whose text holds a NUL
+  before its end is unusable too: xkbcommon would panic on it.
   Tests: `on_keymap_ignores_a_keymap_over_the_size_limit`,
   `an_unusable_keymap_clears_the_loaded_one_and_is_forwarded`.
 - **A keymap ends no held key.** A keymap, whether the proxy can use it or
@@ -1674,6 +1675,21 @@ The proxy serves every Linux GUI app, so no single client may end it.
   lifetime and only then removes a stale socket. If another process holds
   the lock, the proxy exits and leaves that socket alone.
   Test: `a_held_socket_lock_protects_the_live_socket`.
+- **Recording is opt-in, private, and changes nothing.** Only
+  `SOMMELIER_TRACE_DIR` turns it on
+  ([recorded host traces](../traces/README.md)). Each connection then
+  writes a file of its own, which only the user can read, since it holds
+  everything typed; of the descriptors, only a keymap's text goes in it,
+  a layout the replay needs. A write that fails, or a trace that reaches
+  `MAX_TRACE_BYTES` (256 MiB), ends the recording, logged, never the
+  session, and recording changes nothing the proxy sends. A batch's
+  records are written whole at its end. The writes are synchronous, on
+  the loop's thread, so the directory must be local.
+  Tests: `each_connection_records_into_a_private_file_of_its_own`,
+  `a_failed_write_ends_only_the_recording`,
+  `a_full_trace_ends_its_recording_after_its_last_whole_batch`,
+  `a_keymap_is_recorded_from_its_descriptor`,
+  `a_dst_cases_wire_trace_replays`.
 - **A failed start is logged, not a panic.** When the proxy cannot start
   (no `XDG_RUNTIME_DIR`, no device or compositor, a socket it cannot
   claim or bind), it logs why and exits with status 1. No test covers

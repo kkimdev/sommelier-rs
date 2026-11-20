@@ -223,6 +223,7 @@ Sommelier reads the command line and the variables once, at startup.
 | `SOMMELIER_ACCELERATORS` | Comma-separated chords, such as `Super_L` or `<Alt>tab`, that the host compositor keeps. See [keyboard shortcut inhibition](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md#the-sommelier_accelerators-environment-variable). |
 | `SOMMELIER_WHEEL_FROM_TOUCHPAD` | Which clients get mouse-wheel steps (`wl_pointer.axis_discrete`) for touchpad scrolling, which Wine apps such as KakaoTalk need to scroll: `auto` (the default) Wine clients, `all` every client, `off` none. With `all`, a client that scrolls on both the steps and the smooth `axis`, as GTK, Qt and Firefox may, can scroll twice as far. See [the rule](docs/INVARIANTS.md#pointer-scrolling). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
+| `SOMMELIER_TRACE_DIR` | Record each client connection's Wayland traffic, as a file of its own in this local directory, for tests to replay. Off when unset. A trace holds everything typed into the client and the text of the field it was typed into, so set it only on a separate proxy, for a scenario typed for it: see [recorded host traces](traces/README.md). |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
 | `--virtio-wl PATH` | VirtWL device to reach the host compositor through; defaults to `/dev/wl0`. |
 | `--local-compositor PATH` | Reach a compositor socket on this machine instead, for debugging. It cannot be combined with `--virtio-wl`. |
@@ -273,6 +274,8 @@ release a draft until every upload has finished.
 - `packaging/systemd/` — user service template for VirtWL instances.
 - `docs/` — [design](docs/DESIGN.md) and the binding
   [runtime invariants](docs/INVARIANTS.md).
+- `traces/` — [recorded host traces](traces/README.md), which tests
+  replay.
 - `sommelier/docs/` — focused protocol and keyboard design notes.
 
 ## Scope and limitations

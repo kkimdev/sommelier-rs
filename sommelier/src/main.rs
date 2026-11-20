@@ -35,6 +35,7 @@ mod sim;
 mod state;
 #[cfg(test)]
 mod test_support;
+mod trace;
 mod virtwl;
 mod virtwl_channel;
 mod warn_once;

@@ -68,6 +68,7 @@ use crate::protocols::wayland::{
 };
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::Session;
+use crate::test_support::trace::Tape;
 use crate::test_support::{decode, Rng};
 use crate::wire::{Outgoing, WL_DISPLAY_ID};
 
@@ -260,6 +261,8 @@ pub(super) struct Setup<'a> {
     pub late_keyboard: bool,
     /// The fields' initial texts.
     pub texts: &'a [String],
+    /// Where the proxy records its wire trace (`crate::trace`), if it does.
+    pub wire: Option<&'a Tape>,
 }
 
 /// A press the guest got: its surface and the target it lands on.
@@ -429,6 +432,9 @@ impl<'t> World<'t> {
             settles: Vec::new(),
             trace,
         };
+        if let Some(wire) = setup.wire {
+            world.session.record(wire.clone());
+        }
         let registry = world.session.new_id();
         world.guest([wl_display::req::get_registry(WL_DISPLAY_ID, registry)]);
         world.run(&[]).await;

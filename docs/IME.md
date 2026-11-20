@@ -25,8 +25,11 @@ responses, is in `git show 15e045e:docs/IME_REDESIGN.md`.
 - **[F]** marks a fact read in source: Chromium (Exo,
   `InputMethodAsh`, which this document calls IMA, and the v3 client),
   GTK, mutter, KWin, winit, SDL3, Qt and kitty, at the revisions
-  INVARIANTS and the models cite. One captured host trace counts too
-  (test: `held_space_repeats_after_ime_commit_until_physical_release`).
+  INVARIANTS and the models cite. A host trace counts too: the one
+  captured by hand that a keyboard test holds (test:
+  `held_space_repeats_after_ime_commit_until_physical_release`), or one
+  recorded in [traces/](../traces/README.md), which the fact then cites
+  by file name in a "Trace:" clause, and whose replay pins it.
 - **[U]** marks an unknown that only a real Chromebook can settle.
   [5.2](#52-unknowns-and-manual-host-checks) lists each one with its
   check. The DST draws a [U] per case rather than fixing it.
@@ -929,7 +932,7 @@ The DST also holds the proxy to Exo's real text:
 
 | Risk | Mitigation |
 |---|---|
-| **The models are wrong** (Exo, the engine or the clients), so the DST passes on traces real hosts never produce, or fails on impossible ones. | Every model rule cites a source (2.4, 2.5) or is marked [U] and **drawn** (E9), so both branches stay covered. The host checks in 5.2 settle the rest. A DST failure is checked against the citations before any proxy fix. |
+| **The models are wrong** (Exo, the engine or the clients), so the DST passes on traces real hosts never produce, or fails on impossible ones. | Every model rule cites a source (2.4, 2.5) or is marked [U] and **drawn** (E9), so both branches stay covered. The host checks in 5.2 settle the rest. A DST failure is checked against the citations before any proxy fix. A recorded host trace ([traces/](../traces/README.md)) holds the proxy's Exo mirror to a real Exo when it replays. It does not yet hold the Exo model (4.3) to one: the model takes, besides the proxy's requests, the seat's focus moves, the user's keys and the engine's answers, which a trace shows only as Exo's events, mixed with its replies to the requests, so a check needs those events turned back into the model's inputs, by IMA's rules (E5 to E13), which the model would share. |
 | **`SpecText` and the core share a misreading of section 2.** | Tier 2 checks the outcome against user intent, independently of section 2. |
 | **The DST covers only some clients.** It models Chromium, GTK3 and GTK4, without selections, highlights, Qt, Firefox, terminals or several text inputs. | Row tests and Session tests pin the rest. Adding `anchor` to `TextModel` for selections is a local change in `sim/`. |
 | **The clock is unrealistic.** | Latencies come from three lag profiles with a spike. The host check U6, with timestamps, calibrates them. |
@@ -942,7 +945,8 @@ Each check runs on a Chromebook against an isolated test proxy, never by
 touching the primary Sommelier service (INVARIANTS
 [Manual verification](INVARIANTS.md#manual-verification)). Use
 `RUST_LOG=sommelier::ime=trace` and `WAYLAND_DEBUG=1` on the guest
-client.
+client, and record the check as a trace ([traces/](../traces/README.md)),
+so that the fact it settles cites the trace and its replay keeps it.
 
 | ID | Unknown | Check | Settles |
 |---|---|---|---|

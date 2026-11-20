@@ -65,6 +65,20 @@ pub(super) struct ExoView {
     warned: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How often an Exo mirror on this thread diverged from Exo.
+    static DIVERGENCES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How often an Exo mirror on this thread diverged from Exo since the
+/// last call: an event of Exo's did not agree with it, which a replayed
+/// host trace must never show (`proxy::replay`).
+#[cfg(test)]
+pub(crate) fn take_divergences_for_test() -> u64 {
+    DIVERGENCES.take()
+}
+
 /// A report on its way to Exo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InFlightReport {
@@ -290,6 +304,8 @@ impl ExoView {
             &Edit::Confirm { keep_selection } => mirror.confirm_preedit(keep_selection),
         }
         if mirror.take_diverged() {
+            #[cfg(test)]
+            DIVERGENCES.with(|count| count.set(count.get() + 1));
             // A misreading of Chromium's: a bug to report, and the same one
             // each time.
             let level = match std::mem::replace(&mut self.warned, true) {

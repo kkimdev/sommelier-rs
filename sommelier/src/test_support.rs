@@ -24,6 +24,7 @@ use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 
 pub(crate) mod counting;
 pub(crate) mod text_input;
+pub(crate) mod trace;
 pub(crate) mod wire_peer;
 
 /// A message's bytes and its descriptors' numbers.

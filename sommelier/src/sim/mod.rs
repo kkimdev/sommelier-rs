@@ -55,6 +55,7 @@ mod user;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use crate::test_support::trace::Tape;
 use crate::test_support::{env_u64, Rng};
 use editor::{Reference, TextModel, Typing, UserAction};
 use engine::Lag;
@@ -160,7 +161,32 @@ struct Outcome {
 }
 
 /// Runs `case` with `choices`, its trace in `trace`.
-fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
+fn run(case: &Case, choices: Choices, trace: &mut Vec<Line>) -> Outcome {
+    run_recorded(case, choices, trace, None)
+}
+
+/// The wire trace (`crate::trace`) the proxy recorded as it ran the case
+/// of `seed`, which passed, and ran as it does unrecorded.
+pub(crate) fn wire_trace(seed: u64) -> String {
+    let case = Case::new(seed, &ClientKind::ALL);
+    let (wire, mut recorded, mut unrecorded) = (Tape::default(), Vec::new(), Vec::new());
+    let outcome = run_recorded(&case, case.choices(), &mut recorded, Some(&wire));
+    assert_eq!(outcome.failures, [], "the case of seed {seed} failed");
+    run(&case, case.choices(), &mut unrecorded);
+    assert!(
+        recorded == unrecorded,
+        "recording changed the case of seed {seed}"
+    );
+    wire.text()
+}
+
+/// [`run`], with the proxy recording its wire trace in `wire`.
+fn run_recorded(
+    case: &Case,
+    mut choices: Choices,
+    trace: &mut Vec<Line>,
+    wire: Option<&Tape>,
+) -> Outcome {
     let lag = Lag::draw(&mut choices);
     // Half the guests bind their keyboard again once the text input is
     // active, as a client that rebuilds its seat devices does.
@@ -171,6 +197,7 @@ fn run(case: &Case, mut choices: Choices, trace: &mut Vec<Line>) -> Outcome {
         lag,
         late_keyboard,
         texts: &case.texts,
+        wire,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

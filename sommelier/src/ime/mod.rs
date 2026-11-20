@@ -39,7 +39,10 @@ mod tests;
 
 // What handler tests outside the core use: a pure helper they test, and
 // the state they set up and read directly, as no peer can
-// (`test_support::text_input`); and the drops the DST counts.
+// (`test_support::text_input`); the drops the DST counts; and the
+// divergences a replay counts.
+#[cfg(test)]
+pub(crate) use exo_view::take_divergences_for_test;
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
 #[cfg(test)]

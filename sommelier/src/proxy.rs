@@ -21,15 +21,16 @@ use crate::handler::Handlers;
 use crate::placement_config::{self, PlacementConfig};
 use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
-use crate::protocols::wayland::wl_buffer;
+use crate::protocols::wayland::{wl_buffer, wl_keyboard};
 use crate::protocols::{AnyEvent, Iface};
 use crate::settings::{HostTransport, Settings};
 use crate::state::{ConnectionFacts, Context, EventSender, PostDispatch, SessionEnd};
+use crate::trace::{Recorder, Stream, Traces};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::warn_once::WarnOnce;
 use crate::wire::{Framing, MessageHeader, ProtocolError, WireMessage};
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +45,8 @@ mod frame_cost;
 mod fuzz;
 #[cfg(test)]
 pub(crate) mod harness;
+#[cfg(test)]
+mod replay;
 
 // A frame can generate many small Wayland requests (damage, attach, commit,
 // callbacks, and buffer bookkeeping).  Keep one client from processing an
@@ -89,6 +92,17 @@ const MAX_FENCE_POLL_INTERVAL: Duration = Duration::from_millis(16);
 enum Direction {
     ClientToHost,
     HostToClient,
+}
+
+impl Direction {
+    /// The trace stream of the messages the proxy handles in this
+    /// direction.
+    fn handled(self) -> Stream {
+        match self {
+            Self::ClientToHost => Stream::FromGuest,
+            Self::HostToClient => Stream::FromHost,
+        }
+    }
 }
 
 /// Whether `event`, which `sender` sent, is stale: its guest object was
@@ -297,6 +311,10 @@ struct Client {
     /// or would make more than [`MAX_BATCHES_PER_FLUSH`].
     pending_from: Option<Direction>,
     pending_batches: usize,
+    /// Where the connection's traffic is recorded, if it is
+    /// (`SOMMELIER_TRACE_DIR`): each message `handle_msgs` handles, and
+    /// what each batch gives the peers.
+    trace: Option<Recorder>,
 }
 
 impl Client {
@@ -312,7 +330,13 @@ impl Client {
             to_guest: OutgoingMessages::default(),
             pending_from: None,
             pending_batches: 0,
+            trace: None,
         }
+    }
+
+    /// The client, recording its traffic with `trace`.
+    fn recorded(self, trace: Option<Recorder>) -> Self {
+        Self { trace, ..self }
     }
 
     async fn run(mut self) {
@@ -458,6 +482,8 @@ impl Client {
             Direction::ClientToHost => (&mut self.client_conn, &mut self.host_conn),
             Direction::HostToClient => (&mut self.host_conn, &mut self.client_conn),
         };
+        // What this batch gives each peer starts here.
+        let marks = (self.to_host.len(), self.to_guest.len());
 
         // Preserve the ordered Wayland byte/FD stream while translating
         // messages. A single transport submission may contain several
@@ -490,6 +516,10 @@ impl Client {
                 Framing::Partial => break,
                 Framing::Invalid(header) => {
                     log::error!("Invalid message length: {}", header.len);
+                    if let Some(trace) = &mut self.trace {
+                        let unframed = &conn.read_buf[offset..];
+                        trace.record(direction.handled(), unframed, conn.read_fds.len());
+                    }
                     // libwayland-server reports a length under 8 or over
                     // 4096 the same way (the alignment check is the proxy's
                     // own); the stream cannot be framed past it.
@@ -511,6 +541,10 @@ impl Client {
                 // Only host events can be untracked: a guest request from an
                 // unknown sender is an error. The events before this one were
                 // valid and reach the guest ahead of its one error.
+                if let Some(trace) = &mut self.trace {
+                    let message = &conn.read_buf[offset..message_end];
+                    trace.record(direction.handled(), message, 0);
+                }
                 end = Some(SessionEnd::internal());
                 break;
             }
@@ -523,6 +557,8 @@ impl Client {
             let msg = |fds| {
                 WireMessage::new(sender_id, opcode, &packet[MessageHeader::LEN..]).with_fds(fds)
             };
+            // The text of a host keymap, which a trace records.
+            let mut keymap = None;
             let result = match direction {
                 Direction::ClientToHost => match self.ctx.shadow_table.resolve_request(sender_id) {
                     Some(sender) => {
@@ -559,6 +595,16 @@ impl Client {
                             }
                         }
                     };
+                    if let (
+                        Some(_),
+                        HostRead::Event(
+                            _,
+                            AnyEvent::WlKeyboard(wl_keyboard::Event::Keymap { fd, size, .. }),
+                        ),
+                    ) = (&self.trace, &read)
+                    {
+                        keymap = Some(crate::keymap::bytes(fd.as_fd(), *size).unwrap_or_default());
+                    }
                     match read {
                         // One that does not decode ends the session before
                         // anything reads it, unless only the proxy uses its
@@ -711,6 +757,20 @@ impl Client {
             // and effects closes their descriptors. The messages before it
             // were valid and are sent as usual.
             let effects = self.ctx.take_effects();
+            // A message is recorded once it is handled, or ends the
+            // session: one that waits for a fence is handled again.
+            if let Some(trace) = &mut self.trace {
+                if effects.wait.is_none() || effects.end.is_some() {
+                    trace.record(
+                        direction.handled(),
+                        packet,
+                        queued_fds - conn.read_fds.len(),
+                    );
+                }
+                if let Some(keymap) = &keymap {
+                    trace.keymap(keymap);
+                }
+            }
             if let Some(session_end) = effects.end {
                 end = Some(session_end);
                 break;
@@ -726,6 +786,9 @@ impl Client {
                     _ => ParkedRequest::new(wait.fence, now + timeout),
                 };
                 if now >= parked.deadline {
+                    if let Some(trace) = &mut self.trace {
+                        trace.record(direction.handled(), packet, 0);
+                    }
                     log::error!(
                         "A dma-buf fence did not signal within {timeout:?} for a request \
                          from guest object {sender_id}; ending the session"
@@ -772,6 +835,15 @@ impl Client {
                 Direction::HostToClient => &mut *out,
             };
             to_guest.push(crate::handler::display::session_error(end));
+        }
+        if let Some(trace) = &mut self.trace {
+            let (to_host, to_guest) = match direction {
+                Direction::ClientToHost => (&*out, &*reverse_out),
+                Direction::HostToClient => (&*reverse_out, &*out),
+            };
+            trace.record_since(Stream::ToHost, to_host, marks.0);
+            trace.record_since(Stream::ToGuest, to_guest, marks.1);
+            trace.flush();
         }
 
         // Host linux-dmabuf capability discovery emits one format event and
@@ -844,6 +916,8 @@ struct Shared {
     settings: Rc<Settings>,
     virtgpu: VirtGpuNode,
     placement: PlacementConfig,
+    /// Where each connection's traffic is recorded, if it is.
+    traces: Option<Traces>,
 }
 
 impl Shared {
@@ -854,6 +928,7 @@ impl Shared {
         Self {
             virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
             placement: placement_config::load_and_watch(&settings),
+            traces: settings.trace_dir.clone().and_then(Traces::new),
             settings,
         }
     }
@@ -1002,11 +1077,9 @@ async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
             .decide(pid, client_kind::is_wine_process),
         placement: shared.placement.clone(),
     };
-    let client = Client::new(
-        client_conn,
-        host_conn,
-        Context::new(Rc::clone(&shared.settings), facts),
-    );
+    let ctx = Context::new(Rc::clone(&shared.settings), facts);
+    let trace = shared.traces.as_ref().and_then(|traces| traces.start(&ctx));
+    let client = Client::new(client_conn, host_conn, ctx).recorded(trace);
     tokio::task::spawn_local(async move {
         client.run().await;
         log::info!("Client disconnected");
@@ -1382,6 +1455,7 @@ mod tests {
             settings: Rc::new(Settings::for_test()),
             virtgpu: VirtGpuNode::absent_for_test(),
             placement: PlacementConfig::for_test(),
+            traces: None,
         }
     }
 
