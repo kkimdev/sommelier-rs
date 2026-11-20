@@ -390,6 +390,55 @@ Regression {
     ],
     choices: &[0, 0, 0, 0, 0, 0, 0, 0, 0, 1224, 0, 1751, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2722, 0, 0, 0, 0, 0, 0, 0, 0, 1571, 0, 0, 0, 963, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1763, 1871, 2812, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 446, 0, 90, 357, 0, 1668, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2075, 0, 0, 0, 322, 1173, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 902, 0, 0, 0, 0, 0, 1213, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1432, 0, 0, 1588, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 719, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1762, 0, 0, 1150, 0, 0, 0, 0, 0, 1302, 0, 806, 0, 1, 8, 1799, 0, 0, 0, 0, 2064, 0, 1882, 0, 0, 0, 1912, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 271, 1119, 0, 0, 0, 0, 1125, 0, 0, 0, 0, 0, 0, 0, 1481, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1914, 0, 0, 1862, 0, 0, 0, 0, 0, 0, 0, 0, 641, 0, 0, 0, 0, 0, 331, 969, 1743, 1, 0, 0, 1, 3, 1685, 0, 0, 0, 0, 0, 0, 295, 830, 0, 0, 1877],
 },
+// Seeds 13104 and 16710, shrunk. Space's release dies with the input
+// method as it restarts, so Exo's keyboard still holds Space, and Space
+// pressed again while Backspace is held gets no peek, only the input
+// method's empty confirmation (E13), which the proxy took for Backspace's
+// autorepeat. In 13104 the input method took Space; in 16710 it reached
+// the guest.
+Regression {
+    name: "a confirmation while a key held across a restart is held recovers nothing",
+    client: ClientKind::Gtk3,
+    settled: false,
+    latin: false,
+    texts: &["0가12", "01닭2가"],
+    actions: &[
+        UserAction::Tap { field: 1, at: Target::BeforeMarker(1) },
+        UserAction::Key(Key::Char('a')),
+        UserAction::Key(Key::Char('w')),
+        UserAction::Key(Key::Char('e')),
+        UserAction::Key(Key::Char('m')),
+        UserAction::Key(Key::Char('w')),
+        UserAction::Key(Key::Char('x')),
+        UserAction::Key(Key::Char(' ')),
+        UserAction::Key(Key::Char('s')),
+        UserAction::RestartInputMethod,
+        UserAction::KeyDown(Key::Backspace),
+        UserAction::Key(Key::Char(' ')),
+        UserAction::KeyUp(Key::Backspace),
+    ],
+    choices: &[2, 0, 0, 0, 0, 0, 0, 2654, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1797, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1441, 0, 0, 0, 0, 0, 0, 0, 227, 1587, 1932, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 931, 1480, 0, 0, 1916, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 766, 0, 0, 0, 0, 0, 0, 205, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 261, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1304, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+},
+Regression {
+    name: "a confirmation before the unannounced press of a key forwarded before a restart recovers nothing",
+    client: ClientKind::Chromium,
+    settled: false,
+    latin: false,
+    texts: &["0닭1닭2가a", "0가a12닭b"],
+    actions: &[
+        UserAction::Click { field: 1, at: Target::BeforeMarker(2) },
+        UserAction::Click { field: 0, at: Target::BeforeMarker(1) },
+        UserAction::Click { field: 1, at: Target::Start },
+        UserAction::KeyDown(Key::Char(' ')),
+        UserAction::KeyUp(Key::Char(' ')),
+        UserAction::Key(Key::Char('c')),
+        UserAction::RestartInputMethod,
+        UserAction::KeyDown(Key::Backspace),
+        UserAction::Key(Key::Char(' ')),
+        UserAction::KeyUp(Key::Backspace),
+    ],
+    choices: &[2, 1, 0, 0, 0, 0, 0, 2310, 2829, 1770, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1598, 1830, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 886, 1521, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 755, 0, 0, 0, 0, 0, 0, 2, 1197, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1717, 0, 0, 0, 0, 913, 0, 0, 0, 0, 0, 0, 1131, 0, 0, 1477, 0, 0, 450, 0, 0, 0, 0, 0, 1430, 1619, 0, 0, 0, 0, 0, 0, 0, 1, 4, 0, 1435, 1943, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2315, 0, 118, 0, 1703, 0, 0, 1831, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1682, 1, 1041, 0, 0, 0, 1931, 0, 0, 0, 0, 2000, 0, 0, 1615, 0, 529, 1233, 0, 0, 0, 1408, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 435, 0, 0, 0, 0, 0, 918, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1042, 0, 0, 0, 0, 1, 9, 0, 0, 0, 0, 1],
+},
 ];
 
 #[test]

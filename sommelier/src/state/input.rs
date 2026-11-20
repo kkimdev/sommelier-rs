@@ -955,6 +955,14 @@ impl KeyGenerationRegistry {
         !self.physically_held(keyboard, key) || self.held_key_is_stale(keyboard, key)
     }
 
+    /// Whether `keyboard` holds any key across the input method's own
+    /// detach (H2) (`KeyPhase::Held::stale`).
+    pub(crate) fn holds_a_stale_key(&self, keyboard: HostId) -> bool {
+        let mut generations = self.entries.get(&keyboard).into_iter().flatten();
+        generations
+            .any(|(_, generation)| matches!(generation.phase, KeyPhase::Held { stale: true, .. }))
+    }
+
     /// Whether `key` is held across the input method's own detach (H2)
     /// (`KeyPhase::Held::stale`).
     pub(crate) fn held_key_is_stale(&self, keyboard: HostId, key: u32) -> bool {

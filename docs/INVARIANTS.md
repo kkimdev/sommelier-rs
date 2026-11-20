@@ -814,7 +814,14 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   never sees two presses without a release between, and its autorepeat of
   the old press stops. Being a new press, it also leaves a waiting
   recovery waiting, as the press of a key not held does
-  (`KeyGenerationRegistry::peek_press_is_new`).
+  (`KeyGenerationRegistry::peek_press_is_new`), though only another
+  seat's can wait then: Exo's keyboard may still hold such a key, its
+  release having died, and `Keyboard::OnKeyEvent` handles a press only
+  of a key it does not hold, so the key's next press may come as the
+  input method's confirmation alone, with no peek, which nothing tells
+  from an autorepeat. So while a keyboard of the seat holds a key across
+  the detach, an empty confirmation recovers no key: a guessed key, such
+  as Backspace, would edit text, and a dropped autorepeat loses none.
   Tests: `a_confirmation_before_an_unhandled_press_recovers_no_held_key`,
   `a_confirmation_before_a_handled_press_recovers_the_held_key`,
   `a_press_on_another_seats_keyboard_keeps_a_recovery_waiting`,
@@ -823,8 +830,8 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `a_key_held_across_a_detach_is_typed_and_recovered_again`,
   `a_press_after_a_detach_releases_the_old_press_the_guest_holds`,
   `a_recovered_key_pressed_again_after_a_detach_reaches_the_guest`,
-  `a_press_of_a_key_held_across_a_detach_keeps_a_recovery_waiting`,
   `a_key_held_since_enter_is_pressed_anew_after_a_detach`,
+  `a_confirmation_while_a_key_held_across_a_detach_recovers_nothing`,
   `a_press_after_a_detach_ends_an_accelerators_suppression`,
   `a_late_release_of_a_press_retired_by_a_detach_is_dropped`,
   `keys_held_since_enter_are_ordered_by_their_peeks`.

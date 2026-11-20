@@ -417,9 +417,17 @@ pub(super) struct HeldRepeatKey {
 /// `wl_keyboard` delivery. `peek_key` provides both. Select the newest
 /// generation, preferring the keyboard focused on the seat's current surface,
 /// then validate that exact generation without falling back to an older key.
+///
+/// None while a keyboard of the seat holds a key across the input method's
+/// own detach (H2): its release may have died with the input method, so
+/// Exo's keyboard may still hold it and give its next press no `peek_key`
+/// (`Keyboard::OnKeyEvent` handles a press only of a key it does not hold),
+/// only the confirmation before it (E13), which no wire event tells from an
+/// autorepeat.
 pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option<HeldRepeatKey> {
     let active_surface = ctx.keyboard_focus.surface_for_seat(guest_seat);
     let mut candidates = Vec::new();
+    let mut stale_key_held = false;
 
     for (&guest_keyboard_id, &seat) in &ctx.keyboard_to_seat {
         if seat != guest_seat {
@@ -429,6 +437,7 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
         else {
             continue;
         };
+        stale_key_held |= ctx.key_generations.holds_a_stale_key(host_keyboard_id);
         let focused = active_surface.is_some_and(|surface| {
             ctx.keyboard_focus
                 .keyboard_owns_surface(host_keyboard_id, surface)
@@ -445,6 +454,13 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
         }
     }
 
+    if stale_key_held {
+        log::debug!(
+            "Ignoring empty IME confirmation while seat {guest_seat} holds a key across the \
+             input method's detach, whose unannounced press it may precede"
+        );
+        return None;
+    }
     let (_, _, guest_keyboard_id, host_keyboard_id, key, press) = candidates
         .into_iter()
         .filter(|candidate| active_surface.is_none() || candidate.0)
