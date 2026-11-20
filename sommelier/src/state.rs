@@ -411,7 +411,9 @@ pub struct Context {
     /// that names it again breaks the protocol
     /// (`handler::registry::accept_global`). It outlives the registries
     /// that saw the removal, which a guest may destroy before the last
-    /// registry that lists the global sees it.
+    /// registry that lists the global sees it. It grows by one name per
+    /// global removal, for the connection's life: negligible, and by
+    /// design, because libwayland never reuses a name.
     pub removed_globals: BTreeSet<u32>,
     pub pending_params: BTreeMap<GuestId, Vec<PendingParam>>,
     /// Guest linux-dmabuf params objects consumed by create/create_immed.
