@@ -32,7 +32,7 @@ use crate::protocols::Iface;
 use crate::state::{
     is_valid_transform, Context, EventSender, GuestId, HostId, RequestObject, RequestSender,
 };
-use crate::wire::Action;
+use crate::wire::{Action, Destructor};
 
 /// Host `wl_output` events feed [`crate::state::OutputRegistry`] and are
 /// forwarded unchanged. Events from a released output never get here: the
@@ -95,21 +95,12 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for Handlers {
         Action::Forward
     }
 
-    fn on_release(ctx: &mut Context, sender: RequestSender) -> Action {
-        let guest_output_id = sender.guest;
-        let Some(host_output_id) = sender.host_id() else {
-            // Only an inert output, whose bind crossed its global's removal,
-            // gets here without a host object. Nothing reaches the host; the
-            // generated dispatcher completes the destructor locally.
-            return Action::Drop;
-        };
+    fn on_release(_ctx: &mut Context, _sender: RequestSender) -> Destructor {
         // Ending the output releases its Aura child (see `forget_output`),
-        // which goes first (see `aura_objects::release`). Returning Forward
-        // would put wl_output.release ahead of the queued Aura release, so
-        // queue the translated destructor explicitly.
-        ctx.guest_destroyed(guest_output_id);
-        ctx.send_host(wl_output::req::release(host_output_id));
-        Action::Drop
+        // which goes first (see `aura_objects::release`). An inert output,
+        // whose bind crossed its global's removal, has no host object, and
+        // its destructor completes in the proxy.
+        Destructor::AfterEnd
     }
 }
 

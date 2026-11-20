@@ -775,16 +775,11 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
 /// The proxy never creates a host `zwp_linux_dmabuf_feedback_v1`: it binds
 /// the host's linux-dmabuf below the feedback version
 /// (`LINUX_DMABUF_CAPABILITY_VERSION`) and serves every guest feedback
-/// object itself ([`create_synthetic_feedback`]). No
-/// host event of the interface can therefore arrive, and only the guest's
-/// destructor needs handling.
-impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for Handlers {
-    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Action {
-        // The generated dispatcher completes the local object's destructor,
-        // which ends its state (see `forget_feedback`).
-        Action::Drop
-    }
-}
+/// object itself ([`create_synthetic_feedback`]). No host event of the
+/// interface can therefore arrive, and the generated dispatcher completes
+/// the local object's destructor, which ends its state (see
+/// `forget_feedback`).
+impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for Handlers {}
 
 impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
     fn on_add(

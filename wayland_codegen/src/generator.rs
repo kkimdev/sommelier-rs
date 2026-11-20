@@ -171,8 +171,8 @@ pub fn generate(protocol: &Protocol) -> String {
 
             use std::os::fd::OwnedFd;
             use crate::wire::{
-                Action, EventId, MessageBuilder, Outgoing, ProtocolError, RequestId, ToGuest,
-                ToHost, WireId, WireMessage,
+                Action, Destructor, EventId, MessageBuilder, Outgoing, ProtocolError, RequestId,
+                ToGuest, ToHost, WireId, WireMessage,
             };
             use crate::state::{
                 Context, EventObject, EventSender, GuestId, HostId, Link, RequestObject,
@@ -603,9 +603,28 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 let method_name = format_ident!("on_{}", req.name);
                 let method_args = generate_handler_args(&req.items, Side::Request);
                 let hand_written = is_hand_written(&interface.name, &req.name);
+                let destructor = req.msg_type.as_deref() == Some("destructor");
+                assert!(
+                    !(destructor && hand_written),
+                    "{}.{} is a destructor, which the generated code ends",
+                    interface.name,
+                    req.name
+                );
                 handler_methods.push(if hand_written {
                     quote! {
                         fn #method_name(ctx: &mut Context, sender: RequestSender, #method_args);
+                    }
+                } else if destructor {
+                    // A destructor's handler says how its object ends, and
+                    // the generated code ends it, whatever it says.
+                    quote! {
+                        fn #method_name(
+                            _ctx: &mut Context,
+                            _sender: RequestSender,
+                            #method_args
+                        ) -> Destructor {
+                            Destructor::Forward
+                        }
                     }
                 } else {
                     quote! {
@@ -711,29 +730,68 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                     }
                 }
 
-                // A local object's destructor completes in the proxy, whether
-                // its handler forwards or drops the request.
-                let (destructor_cleanup, local_destructor_cleanup, dropped_destructor_cleanup) =
-                    if req.msg_type.as_deref() == Some("destructor") {
-                        (
-                            quote! { ctx.guest_destroyed(sender.guest); },
-                            quote! { ctx.local_destroyed(sender.guest); },
-                            quote! {
-                                if sender.host.is_none() {
-                                    ctx.local_destroyed(sender.guest);
-                                }
-                            },
-                        )
-                    } else {
-                        (quote! {}, quote! {}, quote! {})
-                    };
-
                 dispatch_request_arms.push(if hand_written {
                     quote! {
                         Request::#var_name { #(#field_names_list),* } => {
                             #request_version_validation
                             #(#request_validations)*
                             H::#method_name(ctx, sender, #(#handler_call_args),*);
+                        }
+                    }
+                } else if destructor {
+                    // Every way a destructor's handler returns ends the
+                    // object, unless it ended the session, which rolls
+                    // nothing back. A local object's destructor completes
+                    // in the proxy.
+                    quote! {
+                        Request::#var_name { #(#field_names_list),* } => {
+                            #request_version_validation
+                            #(#request_validations)*
+                            let ending = H::#method_name(ctx, sender, #(#handler_call_args),*);
+                            if ctx.is_fatal() {
+                                return Ok(None);
+                            }
+                            let Some(host) = sender.host else {
+                                ctx.local_destroyed(sender.guest);
+                                return Ok(None);
+                            };
+                            match ending {
+                                Destructor::HostInUse => {
+                                    ctx.guest_destroyed_in_use(sender.guest);
+                                    return Ok(None);
+                                }
+                                Destructor::HostKept => {
+                                    if ctx.guest_ended_host_kept(sender.guest) {
+                                        ctx.queue_delete_id(sender.guest);
+                                    }
+                                    return Ok(None);
+                                }
+                                Destructor::Forward
+                                | Destructor::AfterOutput
+                                | Destructor::AfterEnd => {}
+                            }
+                            #(#local_object_checks)*
+                            #[allow(unused_mut)]
+                            let mut builder = MessageBuilder::with_capacity(msg.payload.len());
+                            #(#mapping_and_writing)*
+                            let outgoing = builder.try_build(host.id, #req_idx)?;
+                            let forward = match ending {
+                                Destructor::AfterOutput => {
+                                    ctx.send_host(outgoing);
+                                    ctx.guest_destroyed(sender.guest);
+                                    None
+                                }
+                                Destructor::AfterEnd => {
+                                    ctx.guest_destroyed(sender.guest);
+                                    ctx.send_host(outgoing);
+                                    None
+                                }
+                                _ => {
+                                    ctx.guest_destroyed(sender.guest);
+                                    Some(outgoing)
+                                }
+                            };
+                            return Ok(forward);
                         }
                     }
                 } else {
@@ -752,7 +810,6 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                         "Dropping request from local object {}",
                                         sender.guest
                                     );
-                                    #local_destructor_cleanup
                                     return Ok(None);
                                 };
                                 #(#local_object_checks)*
@@ -762,10 +819,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 let mut builder = MessageBuilder::with_capacity(msg.payload.len());
                                 #(#mapping_and_writing)*
                                 let outgoing = builder.try_build(host.id, #req_idx)?;
-                                #destructor_cleanup
                                 return Ok(Some(outgoing));
                             }
-                            #dropped_destructor_cleanup
                         }
                     }
                 });

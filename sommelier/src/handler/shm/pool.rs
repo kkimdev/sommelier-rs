@@ -294,12 +294,6 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for Handlers {
         }
     }
 
-    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Action {
-        // The generated local-only destructor path ends the synthetic pool,
-        // whose entry drops its state, and queues its guest delete_id.
-        Action::Drop
-    }
-
     fn on_resize(ctx: &mut Context, sender: RequestSender, size: i32) -> Action {
         let pool_id = sender.guest;
         let pool = match ctx.shadow_table.data_mut::<PoolData>(pool_id) {

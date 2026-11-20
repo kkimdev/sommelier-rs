@@ -34,7 +34,7 @@ use crate::state::{
     Context, EventObject, EventSender, GuestId, HostId, InternalCallback, RequestObject,
     RequestSender, ShadowTable,
 };
-use crate::wire::{Action, IndexedString, ToGuest};
+use crate::wire::{Action, Destructor, IndexedString, ToGuest};
 
 /// The facts the IME core reads and does not own: the object table's and
 /// the keyboard focus's. It borrows only those, so that the core can step
@@ -378,13 +378,6 @@ fn host_ext_event(ctx: &mut Context, sender: EventSender, event: Edit) -> Action
 }
 
 impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for Handlers {
-    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Action {
-        // This manager is synthetic and has no host-side object. The
-        // generated local-only destructor path queues its guest delete_id
-        // after this handler returns.
-        Action::Drop
-    }
-
     fn on_get_text_input(
         ctx: &mut Context,
         sender: RequestSender,
@@ -550,26 +543,14 @@ fn guest_request(ctx: &mut Context, input: Input) -> Action {
 }
 
 impl zwp_text_input_v3::ZwpTextInputV3Handler for Handlers {
-    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Action {
-        let guest_id = sender.guest;
-        // A text input with no input method is local, and its destructor
-        // completes in the proxy.
-        if ctx.shadow_table.is_local(guest_id) {
-            return Action::Drop;
-        }
+    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Destructor {
         // The v3 object is guest-facing but backed by a v1 host object whose
         // protocol has no destructor, so the host object stays for the
-        // connection and the guest lifecycle completes locally. Ending the
-        // object forgets its state (see `forget_text_input`).
-        if ctx.guest_ended_host_kept(guest_id) {
-            ctx.queue_delete_id(guest_id);
-        } else {
-            log::debug!(
-                "Text input {} had already been retired before its destroy handler ran",
-                guest_id
-            );
-        }
-        Action::Drop
+        // connection and the guest lifecycle completes locally. A text input
+        // with no input method is local, and its destructor completes in the
+        // proxy. Ending the object forgets its state (see
+        // `forget_text_input`).
+        Destructor::HostKept
     }
 
     fn on_enable(ctx: &mut Context, sender: RequestSender) -> Action {

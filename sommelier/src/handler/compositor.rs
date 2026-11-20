@@ -34,7 +34,7 @@ use crate::state::{
     SurfaceState, ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::{Action, ToHost};
+use crate::wire::{Action, Destructor, ToHost};
 use log::trace;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
@@ -471,24 +471,16 @@ pub(crate) fn forget_surface(
 }
 
 impl WlSurfaceHandler for Handlers {
-    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Action {
-        let wl_surface_guest_id = sender.guest;
-        let Some(wl_surface_host_id) = sender.host_id() else {
-            return ctx.fail(format_args!(
-                "Unable to destroy wl_surface {wl_surface_guest_id} without its host generation"
-            ));
-        };
-        // The generated dispatcher cannot express the ordering required by
-        // the aura-shell integration: the Aura objects' releases precede the
-        // wl_surface destructor, and what ending the surface sends follows
-        // it (see `forget_surface`).
-        release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
-        ctx.send_host(wl_surface::req::destroy(wl_surface_host_id));
-        // Retain the numeric mapping until the host acknowledges the
+    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Destructor {
+        // The Aura objects' releases precede the wl_surface destructor, and
+        // what ending the surface sends follows it (see `forget_surface`).
+        // The numeric mapping stays until the host acknowledges the
         // destructor with wl_display.delete_id, so the guest can safely
         // reuse the ID only after that acknowledgement.
-        ctx.guest_destroyed(wl_surface_guest_id);
-        Action::Drop
+        if let Some(wl_surface_host_id) = sender.host_id() {
+            release_surface_aura_objects(ctx, sender.guest, wl_surface_host_id);
+        }
+        Destructor::AfterOutput
     }
 
     /// An enter or leave naming a surface or output the guest has destroyed
@@ -985,20 +977,12 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for Handlers {
 }
 
 impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Handlers {
-    fn on_destroy(ctx: &mut Context, sender: RequestSender) -> Action {
-        let xdg_toplevel_id = sender.guest;
-        let Some(host_xdg_toplevel_id) = sender.host_id() else {
-            return ctx.fail(format_args!(
-                "Unable to destroy xdg_toplevel {xdg_toplevel_id} without its host generation"
-            ));
-        };
+    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Destructor {
         // Ending the toplevel releases its Aura toplevel (see
         // `forget_xdg_toplevel`), which goes before the role destructor (see
         // `aura_objects::release`). The guest ID is retained until the host
         // acknowledges the role destructor.
-        ctx.guest_destroyed(xdg_toplevel_id);
-        ctx.send_host(xdg_toplevel::req::destroy(host_xdg_toplevel_id));
-        Action::Drop
+        Destructor::AfterEnd
     }
 
     fn on_set_app_id(ctx: &mut Context, sender: RequestSender, app_id: &String) -> Action {
@@ -3802,14 +3786,10 @@ mod tests {
         assert_eq!(state.focus, Some(replacement_surface));
         assert!(state.pending);
         let healthy = text_input::snapshot(&ctx, healthy_on_replacement);
-        let sender = ctx
-            .shadow_table
-            .resolve_request(SURFACE.guest)
-            .expect("the surface");
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx, sender),
-            Action::Drop
-        );
+        let mut destroy =
+            crate::wire::WireMessage::new(SURFACE.guest, wl_surface::REQ_DESTROY, &[]);
+        let forward = crate::test_support::dispatch_request(&mut ctx, &mut destroy);
+        assert_eq!(crate::test_support::raw_dispatch(forward), Ok(None));
 
         let repaired = text_input::view(&ctx, stale_with_replacement);
         assert_eq!(repaired.focus, Some(replacement_surface));

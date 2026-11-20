@@ -449,9 +449,14 @@ its state is an internal divergence that ends the session.
   outlives the guest object: a render buffer the host still shows.
 
 What a hook sends joins the current message's effects, so the wire order
-is the handler's: a destructor handler that must order its own destructor
-against that output queues the part that goes first before it calls the
-wrapper (`wl_surface.destroy` releases the surface's Aura objects first).
+is the handler's. A destructor request's handler never ends its object
+itself: it returns a `wire::Destructor`, which says where the destructor
+goes (ahead of the handler's output, after it, or after what the end
+sends), or that the host object stays (in use, or without a destructor),
+and the generated dispatcher ends the object accordingly
+(`wl_surface.destroy` releases the surface's Aura objects, then has its
+destructor sent after them; `xdg_toplevel.destroy` and `wl_output.release`
+have theirs sent after their end releases their Aura child).
 In tests, `Context::assert_no_orphans` checks every per-object key kept
 outside the table, and every object such state names, against the table; a test's `Client`,
 the fuzzer's included, runs it after every batch that keeps the session.

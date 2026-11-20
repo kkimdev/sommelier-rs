@@ -745,20 +745,31 @@ impl Context {
         guest_buffer_id: GuestId,
         host_buffer_id: HostId,
     ) -> bool {
-        if self.shadow_table.get_host_id(guest_buffer_id) != Some(host_buffer_id) {
-            return false;
-        }
-
-        let render_buffer_ended = if self.shadow_table.is_guest_server_id(guest_buffer_id) {
-            self.render_buffers.remove(host_buffer_id)
-        } else {
-            !self.render_buffers.contains(host_buffer_id)
-                || self.render_buffers.mark_host_destroy_queued(host_buffer_id)
-        };
+        let render_buffer_ended =
+            self.render_buffer_destroy_queued(guest_buffer_id, host_buffer_id);
         if render_buffer_ended {
             self.guest_destroyed(guest_buffer_id);
         }
         render_buffer_ended
+    }
+
+    /// The render-buffer half of [`Self::complete_queued_buffer_destroy`],
+    /// for the guest's own destructor, whose object the generated code
+    /// ends.
+    pub(crate) fn render_buffer_destroy_queued(
+        &mut self,
+        guest_buffer_id: GuestId,
+        host_buffer_id: HostId,
+    ) -> bool {
+        if self.shadow_table.get_host_id(guest_buffer_id) != Some(host_buffer_id) {
+            return false;
+        }
+        if self.shadow_table.is_guest_server_id(guest_buffer_id) {
+            self.render_buffers.remove(host_buffer_id)
+        } else {
+            !self.render_buffers.contains(host_buffer_id)
+                || self.render_buffers.mark_host_destroy_queued(host_buffer_id)
+        }
     }
 
     pub(crate) fn buffer_is_submitted(&self, guest_buffer_id: GuestId) -> bool {
