@@ -89,6 +89,29 @@ impl Session {
         }
     }
 
+    /// Record what the proxy handles and sends from now on in `out`, as
+    /// `SOMMELIER_TRACE_DIR` records a connection (`crate::trace`).
+    /// Each peer keeps the bytes it gets from then on
+    /// ([`Self::take_received_bytes`]).
+    pub(crate) fn record(&mut self, out: impl std::io::Write + 'static) {
+        let facts = crate::trace::Facts::of(&self.client.ctx);
+        let recorder = crate::trace::Recorder::new(Box::new(out), &facts);
+        self.client.trace = Some(recorder.expect("start a trace"));
+        self.guest.bytes = Some(Vec::new());
+        self.host.bytes = Some(Vec::new());
+    }
+
+    /// The bytes the guest and the host got since the last call, if the
+    /// session records ([`Self::record`]).
+    pub(crate) fn take_received_bytes(&mut self) -> (Vec<u8>, Vec<u8>) {
+        let take = |bytes: &mut Option<Vec<u8>>| bytes.as_mut().map(std::mem::take);
+        let guest = take(&mut self.guest.bytes).expect("the session records");
+        (
+            guest,
+            take(&mut self.host.bytes).expect("the session records"),
+        )
+    }
+
     /// The proxy's state: `ctx()` reads state no peer can observe, or
     /// injects a fault no peer can cause; each use says which, in a
     /// comment.
@@ -716,6 +739,8 @@ struct Peer<M> {
     connection: WaylandConnection,
     wire: wire_peer::Peer,
     received: Vec<(u32, M)>,
+    /// The bytes it got, while the session records.
+    bytes: Option<Vec<u8>>,
 }
 
 impl<M: Message> Peer<M> {
@@ -728,6 +753,7 @@ impl<M: Message> Peer<M> {
                 Role::Server => wire_peer::Peer::new(role).in_step(),
             },
             received: Vec::new(),
+            bytes: None,
         }
     }
 
@@ -761,6 +787,9 @@ impl<M: Message> Peer<M> {
                 }
             };
             let message = &connection.read_buf[offset..offset + len];
+            if let Some(bytes) = &mut self.bytes {
+                bytes.extend_from_slice(message);
+            }
             let decoded = self
                 .wire
                 .receive(message, &mut connection.read_fds)

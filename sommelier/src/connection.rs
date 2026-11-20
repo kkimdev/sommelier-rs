@@ -95,6 +95,22 @@ impl OutgoingMessages {
         self.ends.is_empty()
     }
 
+    /// How many entries wait to be sent.
+    pub(crate) fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Each entry after the first `mark`, with how many descriptors it
+    /// carries.
+    pub(crate) fn since(&self, mark: usize) -> impl Iterator<Item = (&[u8], usize)> + '_ {
+        let start = mark.checked_sub(1).map_or((0, 0), |last| self.ends[last]);
+        self.ends[mark..].iter().scan(start, |start, &end| {
+            let entry = (&self.bytes[start.0..end.0], end.1 - start.1);
+            *start = end;
+            Some(entry)
+        })
+    }
+
     /// Where each submission of these messages ends in `bytes` and in
     /// `fds`, in order: each takes as many whole entries as fit in
     /// [`MAX_BYTES_PER_SEND`] and [`MAX_FDS_PER_SEND`], or one entry that

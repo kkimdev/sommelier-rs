@@ -43,6 +43,8 @@ const DRM_DEVICE: &str = "SOMMELIER_DRM_DEVICE";
 const VM_IDENTIFIER: &str = "SOMMELIER_VM_IDENTIFIER";
 /// Which clients get wheel steps from touchpad scrolling.
 const WHEEL_FROM_TOUCHPAD: &str = "SOMMELIER_WHEEL_FROM_TOUCHPAD";
+/// The directory to record each connection's traffic in.
+const TRACE_DIR: &str = "SOMMELIER_TRACE_DIR";
 
 /// The VirtWL device the proxy uses when the command line names no host.
 const DEFAULT_VIRTWL_DEVICE: &str = "/dev/wl0";
@@ -123,6 +125,10 @@ pub(crate) struct Settings {
     /// `XDG_CONFIG_HOME` nor `HOME` names an absolute directory, which
     /// leaves placement off for good.
     pub(crate) placement_bindings: Option<PathBuf>,
+    /// The directory `SOMMELIER_TRACE_DIR` names, where each connection's
+    /// traffic, typed text included, is recorded (`crate::trace`); `None`,
+    /// the default, records nothing.
+    pub(crate) trace_dir: Option<PathBuf>,
 }
 
 impl Settings {
@@ -169,6 +175,9 @@ impl Settings {
             wheel_from_touchpad: wheel_from_touchpad(var(WHEEL_FROM_TOUCHPAD)),
             host_accelerators: host_accelerators(var(ACCELERATORS)),
             placement_bindings,
+            trace_dir: var(TRACE_DIR)
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
         })
     }
 
@@ -186,6 +195,7 @@ impl Settings {
             wheel_from_touchpad: WheelFromTouchpad::Off,
             host_accelerators: HostAccelerators::default(),
             placement_bindings: None,
+            trace_dir: None,
         }
     }
 }
@@ -278,6 +288,7 @@ mod tests {
         assert_eq!(settings.wheel_from_touchpad, WheelFromTouchpad::Auto);
         assert_eq!(settings.host_accelerators, HostAccelerators::default());
         assert_eq!(settings.placement_bindings, None, "no HOME");
+        assert_eq!(settings.trace_dir, None, "nothing is recorded");
         assert_eq!(resolve(&[], &[]).unwrap_err(), SettingsError::NoRuntimeDir);
         assert_eq!(
             resolve(&[], &[("XDG_RUNTIME_DIR", "")]).unwrap_err(),
@@ -327,6 +338,7 @@ mod tests {
                 ("SOMMELIER_DRM_DEVICE", "/dev/dri/renderD129"),
                 ("SOMMELIER_VM_IDENTIFIER", "penguin"),
                 ("SOMMELIER_WHEEL_FROM_TOUCHPAD", " ALL "),
+                ("SOMMELIER_TRACE_DIR", "/tmp/traces"),
                 ("HOME", "/home/u"),
             ],
         )
@@ -343,6 +355,7 @@ mod tests {
         );
         assert_eq!(settings.vm_id, "penguin");
         assert_eq!(settings.wheel_from_touchpad, WheelFromTouchpad::All);
+        assert_eq!(settings.trace_dir, Some(PathBuf::from("/tmp/traces")));
         assert_eq!(
             settings.placement_bindings,
             Some(PathBuf::from(
@@ -352,8 +365,8 @@ mod tests {
     }
 
     /// A value that cannot be used means the default: an empty or non-UTF-8
-    /// VM name, an empty render node, an unknown wheel choice, and a
-    /// malformed or non-UTF-8 accelerator list.
+    /// VM name, an empty render node or trace directory, an unknown wheel
+    /// choice, and a malformed or non-UTF-8 accelerator list.
     #[test]
     fn unusable_values_fall_back_to_their_defaults() {
         let not_utf8 = || Some(OsString::from_vec(b"\xff".to_vec()));
@@ -362,8 +375,10 @@ mod tests {
         assert_eq!(vm_id(not_utf8()), "termina");
         assert_eq!(vm_id(Some("penguin".into())), "penguin");
 
-        let settings = resolve(&[], &[RUNTIME, ("SOMMELIER_DRM_DEVICE", "")]).unwrap();
+        let empty = [("SOMMELIER_DRM_DEVICE", ""), ("SOMMELIER_TRACE_DIR", "")];
+        let settings = resolve(&[], &[RUNTIME, empty[0], empty[1]]).unwrap();
         assert_eq!(settings.drm_device, None);
+        assert_eq!(settings.trace_dir, None);
 
         assert_eq!(wheel_from_touchpad(None), WheelFromTouchpad::Auto);
         assert_eq!(

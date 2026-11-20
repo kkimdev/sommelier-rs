@@ -244,6 +244,16 @@ fn compile(
     keymap
 }
 
+/// The `size` bytes of the keymap a `wl_keyboard.keymap` carries in `fd`,
+/// mapped as [`compile`] maps them, for a trace of the connection
+/// (`crate::trace`); `None` if they cannot be mapped.
+pub(crate) fn bytes(fd: BorrowedFd<'_>, size: u32) -> Option<Vec<u8>> {
+    if size > MAX_KEYMAP_SIZE {
+        return None;
+    }
+    MmapView::from_fd(fd, size as usize).map(|mapping| mapping.as_bytes().to_vec())
+}
+
 /// A private, read-only view of a keymap fd mapped into the process address space.
 ///
 /// All `unsafe` for the mmap/munmap pair is confined here:
