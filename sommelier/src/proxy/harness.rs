@@ -59,6 +59,7 @@ pub(crate) struct Session {
     next_global_name: u32,
     registry: Option<Object>,
     compositor: Option<u32>,
+    wm_base: Option<u32>,
     text_input_manager: Option<u32>,
     /// What the proxy cost while it dispatched, since [`Self::proxy_cost`]
     /// last took it.
@@ -83,6 +84,7 @@ impl Session {
             next_global_name: 1,
             registry: None,
             compositor: None,
+            wm_base: None,
             text_input_manager: None,
             proxy_cost: Counts::default(),
             piece: 4096,
@@ -420,6 +422,71 @@ impl Session {
         Object { id, host }
     }
 
+    /// A new `xdg_toplevel` of a new surface, from an `xdg_wm_base` the
+    /// guest binds on first use. What the proxy sends the host besides the
+    /// forwards that create the objects is not kept.
+    pub(crate) async fn toplevel(&mut self) -> Toplevel {
+        use crate::protocols::xdg_shell::{xdg_surface, xdg_wm_base};
+        let wm_base = match self.wm_base {
+            Some(wm_base) => wm_base,
+            None => {
+                let wm_base = self.bind("xdg_wm_base", xdg_wm_base::VERSION).await;
+                *self.wm_base.insert(wm_base)
+            }
+        };
+        let surface = self.surface().await;
+        let id = self.new_id();
+        let host = self
+            .create(xdg_wm_base::req::get_xdg_surface(wm_base, id, surface.id))
+            .await;
+        let xdg_surface = Object { id, host };
+        let id = self.new_id();
+        let earlier = self.host.received.len();
+        self.guest([xdg_surface::req::get_toplevel(xdg_surface.id, id)])
+            .await;
+        let forwarded = self.host.received.split_off(earlier);
+        let host = forwarded
+            .iter()
+            .find_map(|(sender, request)| match request {
+                AnyRequest::XdgSurface(xdg_surface::Request::GetToplevel { id })
+                    if *sender == xdg_surface.host =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the host got no toplevel: {forwarded:?}"));
+        Toplevel {
+            surface,
+            xdg_surface,
+            toplevel: Object { id, host },
+        }
+    }
+
+    /// The host advertises `zaura_shell`, which the proxy binds for itself
+    /// and advertises to the guest as `gtk_shell1`; returns the host
+    /// `zaura_shell`. Neither peer's messages are kept.
+    pub(crate) async fn aura_shell(&mut self) -> u32 {
+        use crate::protocols::aura_shell::zaura_shell;
+        self.registry().await;
+        self.advertise(zaura_shell::NAME, zaura_shell::VERSION)
+            .await;
+        let host = self.host_received();
+        let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))] = &host[..] else {
+            panic!("the proxy did not bind zaura_shell: {host:?}");
+        };
+        let advertised = self.guest_received();
+        assert!(
+            matches!(
+                &advertised[..],
+                [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { interface, .. }))]
+                    if interface == "gtk_shell1"
+            ),
+            "the guest was not advertised gtk_shell1: {advertised:?}"
+        );
+        id.2
+    }
+
     /// The guest's `wl_registry`, which it creates on first use.
     pub(crate) async fn registry(&mut self) -> Object {
         if let Some(registry) = self.registry {
@@ -609,6 +676,15 @@ impl Session {
         let keymap = wl_keyboard::Event::Keymap { format, fd, size };
         assert_eq!(self.guest_received(), [(keyboard.id, keymap.into())]);
     }
+}
+
+/// A guest `xdg_toplevel`, its `xdg_surface` and `wl_surface`, each with
+/// the host object the proxy paired it with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Toplevel {
+    pub(crate) surface: Object,
+    pub(crate) xdg_surface: Object,
+    pub(crate) toplevel: Object,
 }
 
 /// A guest text input and the host objects the proxy bridges it to.
@@ -837,6 +913,46 @@ impl Session {
         pool
     }
 
+    /// A new `width`x`height` XRGB8888 native `wl_buffer` that the guest
+    /// creates through its linux-dmabuf `dmabuf`, whose one plane is
+    /// `plane` with rows of `4 * width` bytes. What the proxy sends the
+    /// host for it is not kept.
+    pub(crate) async fn native_buffer(
+        &mut self,
+        dmabuf: u32,
+        plane: OwnedFd,
+        width: i32,
+        height: i32,
+    ) -> Object {
+        use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
+        const XRGB8888: u32 = 0x3432_5258;
+        let params = self.new_id();
+        self.create(zwp_linux_dmabuf_v1::req::create_params(dmabuf, params))
+            .await;
+        let stride = 4 * u32::try_from(width).expect("a width of at least 0");
+        self.guest([zwp_linux_buffer_params_v1::req::add(
+            params, plane, 0, 0, stride, 0, 0,
+        )])
+        .await;
+        let id = self.new_id();
+        self.guest([
+            zwp_linux_buffer_params_v1::req::create_immed(params, id, width, height, XRGB8888, 0),
+            zwp_linux_buffer_params_v1::req::destroy(params),
+        ])
+        .await;
+        let received = self.host_received();
+        let host = received
+            .iter()
+            .find_map(|(_, request)| match request {
+                AnyRequest::ZwpLinuxBufferParamsV1(
+                    zwp_linux_buffer_params_v1::Request::CreateImmed { buffer_id, .. },
+                ) => Some(*buffer_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the host got no buffer: {received:?}"));
+        Object { id, host }
+    }
+
     /// A new `width`x`height` ARGB8888 `wl_buffer` from the start of
     /// `pool`, with rows of `4 * width` bytes. The host gets a buffer of
     /// its own, from a pool the proxy creates for it; what the proxy sends
@@ -864,5 +980,43 @@ impl Session {
             })
             .unwrap_or_else(|| panic!("the host got no buffer: {forwarded:?}"));
         Object { id, host }
+    }
+
+    /// [`Self::shm_buffer`], which also returns the file of the pool the
+    /// proxy creates for the host's buffer: the host copy, into which the
+    /// proxy copies the guest's pixels before a commit shows them.
+    pub(crate) async fn shm_buffer_with_host_pool(
+        &mut self,
+        pool: u32,
+        width: i32,
+        height: i32,
+    ) -> (Object, std::fs::File) {
+        use crate::protocols::wayland::{wl_shm, wl_shm_pool};
+        let id = self.new_id();
+        let earlier = self.host.received.len();
+        self.guest([wl_shm_pool::req::create_buffer(
+            pool,
+            id,
+            0,
+            width,
+            height,
+            4 * width,
+            wl_shm::FORMAT_ARGB8888,
+        )])
+        .await;
+        let forwarded = self.host.received.split_off(earlier);
+        let host_pool = forwarded.iter().find_map(|(_, request)| match request {
+            AnyRequest::WlShm(wl_shm::Request::CreatePool { fd, .. }) => Some(fd),
+            _ => None,
+        });
+        let host = forwarded.iter().find_map(|(_, request)| match request {
+            AnyRequest::WlShmPool(wl_shm_pool::Request::CreateBuffer { id, .. }) => Some(*id),
+            _ => None,
+        });
+        let (Some(host_pool), Some(host)) = (host_pool, host) else {
+            panic!("the host got no pool and buffer: {forwarded:?}");
+        };
+        let host_pool = host_pool.try_clone().expect("duplicate the host pool");
+        (Object { id, host }, host_pool.into())
     }
 }

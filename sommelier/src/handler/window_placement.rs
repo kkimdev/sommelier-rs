@@ -1097,14 +1097,7 @@ mod fixture {
         pub(super) async fn unmeasured(placement: PlacementConfig) -> Self {
             let mut s = Session::with_context(Context::with_placement_for_test(placement));
             let registry = s.registry().await;
-            s.advertise("zaura_shell", zaura_shell::VERSION).await;
-            let host = s.host_received();
-            let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))] = &host[..]
-            else {
-                panic!("the proxy did not bind zaura_shell: {host:?}");
-            };
-            let shell = id.2;
-            assert_eq!(s.guest_received().len(), 1, "gtk_shell1 is advertised");
+            let shell = s.aura_shell().await;
 
             let output_name = s.advertise("wl_output", wl_output::VERSION).await;
             let advertised = s.guest_received();

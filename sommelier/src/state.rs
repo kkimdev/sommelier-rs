@@ -574,12 +574,6 @@ impl Context {
         self.session_end.is_some()
     }
 
-    /// Forget a session end, so a test can go on with the same context.
-    #[cfg(test)]
-    pub(crate) fn clear_session_end_for_test(&mut self) {
-        self.session_end = None;
-    }
-
     /// Bind host object `id` as the internal `zaura_shell` at the vendored
     /// protocol's version, as the registry would.
     #[cfg(test)]

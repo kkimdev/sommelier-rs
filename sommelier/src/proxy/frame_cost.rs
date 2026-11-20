@@ -24,12 +24,10 @@ limitations under the License.
 
 use super::harness::{Object, Session};
 use crate::handler::shm::{copy_shm_damage, ShmCopyLayout};
-use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
 use crate::protocols::wayland::{wl_buffer, wl_pointer, wl_seat, wl_shm, wl_surface};
 use crate::state::{BufferRect, Context, DamageRegion, PlaneFenceForTest};
 use crate::test_support::counting::Counts;
 use crate::test_support::{host_mapping, shm_pool_file};
-use std::os::fd::OwnedFd;
 
 /// The frames each test measures, after the warm-up frames that copy each
 /// buffer's host copy in full for the first time.
@@ -187,42 +185,6 @@ fn a_frame_into_padded_host_rows_costs_one_read() {
     }
 }
 
-/// A native buffer of [`WIDTH`]x[`HEIGHT`] that the guest creates through
-/// linux-dmabuf `dmabuf`, whose one plane is `plane`.
-async fn native_buffer(s: &mut Session, dmabuf: u32, plane: OwnedFd) -> Object {
-    const XRGB8888: u32 = 0x3432_5258;
-    let params = s.new_id();
-    s.create(zwp_linux_dmabuf_v1::req::create_params(dmabuf, params))
-        .await;
-    s.guest([zwp_linux_buffer_params_v1::req::add(
-        params,
-        plane,
-        0,
-        0,
-        4 * WIDTH as u32,
-        0,
-        0,
-    )])
-    .await;
-    let id = s.new_id();
-    s.guest([
-        zwp_linux_buffer_params_v1::req::create_immed(params, id, WIDTH, HEIGHT, XRGB8888, 0),
-        zwp_linux_buffer_params_v1::req::destroy(params),
-    ])
-    .await;
-    let received = s.host_received();
-    let host = received
-        .iter()
-        .find_map(|(_, request)| match request {
-            crate::protocols::AnyRequest::ZwpLinuxBufferParamsV1(
-                zwp_linux_buffer_params_v1::Request::CreateImmed { buffer_id, .. },
-            ) => Some(*buffer_id),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("the host got no buffer: {received:?}"));
-    Object { id, host }
-}
-
 /// A frame of a native buffer copies nothing; it checks the buffer's
 /// fence, which here has signalled.
 #[tokio::test]
@@ -239,8 +201,9 @@ async fn a_native_frame_reads_no_pixels() {
     let (plane, signal) = crate::test_support::pipe();
     assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
     let buffers = [
-        native_buffer(&mut s, dmabuf.id, plane.try_clone().unwrap()).await,
-        native_buffer(&mut s, dmabuf.id, plane).await,
+        s.native_buffer(dmabuf.id, plane.try_clone().unwrap(), WIDTH, HEIGHT)
+            .await,
+        s.native_buffer(dmabuf.id, plane, WIDTH, HEIGHT).await,
     ];
     let cost = cost_per_frame(&mut s, surface, buffers, PARTIAL_WIDTH).await;
     println!("frame cost, native dma-buf: {cost:?}");

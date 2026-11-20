@@ -2234,32 +2234,14 @@ mod tests {
         );
     }
 
-    /// A guest `xdg_toplevel` of a new surface, and the host's.
-    async fn session_with_a_toplevel() -> (Session, super::harness::Object) {
-        use protocols::xdg_shell::{xdg_surface, xdg_wm_base};
-        let (mut s, surface) = session_with_a_surface().await;
-        let wm_base = s.bind_paired("xdg_wm_base", xdg_wm_base::VERSION).await;
-        let xdg_surface = s.new_id();
-        s.create(xdg_wm_base::req::get_xdg_surface(
-            wm_base.id,
-            xdg_surface,
-            surface.id,
-        ))
-        .await;
-        let id = s.new_id();
-        let host = s
-            .create(xdg_surface::req::get_toplevel(xdg_surface, id))
-            .await;
-        (s, super::harness::Object { id, host })
-    }
-
     /// libwayland passes a string that is not UTF-8 through, so a client
     /// that sets its title from Latin-1 bytes keeps its session: the host
     /// gets the title with each invalid sequence replaced by U+FFFD.
     #[tokio::test]
     async fn a_guest_string_that_is_not_utf8_reaches_the_host_with_replacement_characters() {
         use protocols::xdg_shell::xdg_toplevel;
-        let (mut s, toplevel) = session_with_a_toplevel().await;
+        let mut s = Session::new();
+        let toplevel = s.toplevel().await.toplevel;
         let title = xdg_toplevel::req::set_title(toplevel.id, "Cafe creme").unwrap();
         s.guest([respell(title, "Cafe creme", b"Caf\xe9 cr\xe8me")])
             .await;
@@ -2323,7 +2305,8 @@ mod tests {
     async fn a_string_with_a_nul_inside_is_an_invalid_method() {
         use protocols::wayland::wl_display;
         use protocols::xdg_shell::xdg_toplevel;
-        let (mut s, toplevel) = session_with_a_toplevel().await;
+        let mut s = Session::new();
+        let toplevel = s.toplevel().await.toplevel;
         let title = xdg_toplevel::req::set_title(toplevel.id, "a b").unwrap();
         s.guest_fatal([respell(title, "a b", b"a\0b")]).await;
         assert_eq!(

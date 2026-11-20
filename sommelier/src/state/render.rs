@@ -97,15 +97,6 @@ impl StalePixels {
         }
     }
 
-    /// A host copy that already matches its buffer as shown on `surface`.
-    #[cfg(test)]
-    pub fn in_sync_on(surface: u32) -> Self {
-        Self {
-            damage: DamageRegion::Empty,
-            surface: Some(surface),
-        }
-    }
-
     /// The region to copy before the buffer is shown on `surface`.
     pub fn to_copy_on(&self, surface: u32) -> &DamageRegion<BufferSpace> {
         static FULL: DamageRegion<BufferSpace> = DamageRegion::Full;
