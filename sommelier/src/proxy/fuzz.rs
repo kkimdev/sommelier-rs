@@ -108,6 +108,60 @@ const DEFAULT_CASES: u64 = 5000;
 /// The fewest cases a run needs before it must have exercised ID reuse and
 /// server objects; a replay of one seed need not.
 const COVERAGE_CASES: u64 = 1000;
+
+/// What a run counts across all its cases, evidence of the paths they
+/// reached; the run prints them.
+#[derive(Debug)]
+struct Counters {
+    /// Guest objects the server created that [`check_guest_events`] saw:
+    /// evidence that their IDs were checked.
+    guest_server_objects: AtomicU64,
+    /// Host object IDs the fake compositor saw created again after their
+    /// `delete_id`: evidence that the proxy's ID reuse runs.
+    host_ids_reused: AtomicU64,
+    /// Frame callbacks the fake compositor destroyed with their surface.
+    frame_callbacks_cancelled: AtomicU64,
+    /// Live objects the compositor destroyed on its own.
+    live_objects_host_destroyed: AtomicU64,
+    /// `zwp_text_input_v1.leave` events the compositor sent.
+    text_input_leaves: AtomicU64,
+    /// Input methods that went away while attached, as when their process
+    /// restarts: one answer to a sync in eight takes them away.
+    input_method_restarts: AtomicU64,
+    /// Host text-input activations whose seat ended while active.
+    seatless_activations: AtomicU64,
+    /// `zwp_text_input_v1.deactivate` requests naming a seat the compositor
+    /// had destroyed, whose `delete_id` the proxy had not read yet.
+    deactivates_of_destroyed_seats: AtomicU64,
+    /// Compositor presses that made the proxy `reset` Exo's composition.
+    compositions_ended_by_presses: AtomicU64,
+    /// Input method restarts that followed, in the same reply, a press that
+    /// ended a composition (the proxy `reset` Exo).
+    restarts_after_presses: AtomicU64,
+    /// `zaura_toplevel` objects the proxy created, one per XDG toplevel of
+    /// a case with placement on.
+    aura_toplevels: AtomicU64,
+}
+
+static COUNTS: Counters = Counters {
+    guest_server_objects: AtomicU64::new(0),
+    host_ids_reused: AtomicU64::new(0),
+    frame_callbacks_cancelled: AtomicU64::new(0),
+    live_objects_host_destroyed: AtomicU64::new(0),
+    text_input_leaves: AtomicU64::new(0),
+    input_method_restarts: AtomicU64::new(0),
+    seatless_activations: AtomicU64::new(0),
+    deactivates_of_destroyed_seats: AtomicU64::new(0),
+    compositions_ended_by_presses: AtomicU64::new(0),
+    restarts_after_presses: AtomicU64::new(0),
+    aura_toplevels: AtomicU64::new(0),
+};
+
+/// Adds `n` to `counter`, one of [`COUNTS`].
+fn count(counter: &AtomicU64, n: usize) {
+    counter.fetch_add(n as u64, Ordering::Relaxed);
+}
+
 /// How long one case may take before it counts as a hang.
 const CASE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the proxy may take to finish once it has closed the guest
@@ -155,64 +209,46 @@ fn guest_streams_cannot_crash_hang_or_leak() {
             });
             *outcomes.entry(outcome).or_insert(0) += 1;
         }
-        let reused = HOST_IDS_REUSED.load(Ordering::Relaxed);
-        let server_objects = GUEST_SERVER_OBJECTS.load(Ordering::Relaxed);
-        let cancelled = FRAME_CALLBACKS_CANCELLED.load(Ordering::Relaxed);
-        let host_destroyed = LIVE_OBJECTS_HOST_DESTROYED.load(Ordering::Relaxed);
-        let leaves = TEXT_INPUT_LEAVES.load(Ordering::Relaxed);
-        let restarts = INPUT_METHOD_RESTARTS.load(Ordering::Relaxed);
-        let seatless = SEATLESS_ACTIVATIONS.load(Ordering::Relaxed);
-        let dead_seat_deactivates = DEACTIVATES_OF_DESTROYED_SEATS.load(Ordering::Relaxed);
-        let presses = COMPOSITIONS_ENDED_BY_PRESSES.load(Ordering::Relaxed);
-        let press_restarts = RESTARTS_AFTER_PRESSES.load(Ordering::Relaxed);
-        let aura_toplevels = AURA_TOPLEVELS.load(Ordering::Relaxed);
+        let reached = |counter: &AtomicU64| counter.load(Ordering::Relaxed) > 0;
         if cases >= COVERAGE_CASES {
             assert!(
-                aura_toplevels > 0,
+                reached(&COUNTS.aura_toplevels),
                 "no case created an Aura toplevel, so placement's went untested"
             );
             assert!(
-                presses > 0,
+                reached(&COUNTS.compositions_ended_by_presses),
                 "no press ended a composition, so the reset fence went untested"
             );
             assert!(
-                press_restarts > 0,
+                reached(&COUNTS.restarts_after_presses),
                 "no input method restarted after a press that ended a composition, so a leave during the reset fence went untested"
             );
             assert!(
-                reused > 0,
+                reached(&COUNTS.host_ids_reused),
                 "no case reused a host ID, so ID reuse went untested"
             );
             assert!(
-                server_objects > 0,
+                reached(&COUNTS.guest_server_objects),
                 "no checked case created a server object, so their IDs went untested"
             );
             assert!(
-                cancelled > 0,
+                reached(&COUNTS.frame_callbacks_cancelled),
                 "no case cancelled a frame callback, so host-destroyed objects went untested"
             );
             assert!(
-                host_destroyed > 0,
+                reached(&COUNTS.live_objects_host_destroyed),
                 "the host destroyed no live object, so forgetting one went untested"
             );
             assert!(
-                restarts > 0,
+                reached(&COUNTS.input_method_restarts),
                 "no input method restarted while attached, so Exo's own detach went untested"
             );
             assert!(
-                seatless > 0,
+                reached(&COUNTS.seatless_activations),
                 "no activation outlived its seat, so ending one without a seat went untested"
             );
         }
-        println!(
-            "{cases} cases from seed {first_seed} passed: {outcomes:?}, {reused} host IDs reused, \
-             {server_objects} guest server objects checked, {cancelled} frame callbacks cancelled, \
-             {leaves} text-input leaves sent, {restarts} input methods restarted, \
-             {seatless} activations outlived their seat, \
-             {dead_seat_deactivates} deactivates named a destroyed seat, \
-             {presses} compositions ended by a press, {press_restarts} restarts after a press, \
-             {aura_toplevels} Aura toplevels created"
-        );
+        println!("{cases} cases from seed {first_seed} passed: {outcomes:?}, {COUNTS:?}");
     });
 }
 
@@ -1155,10 +1191,6 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
     }
 }
 
-/// Guest objects the server created that [`check_guest_events`] saw, across
-/// all cases: evidence that their IDs were checked.
-static GUEST_SERVER_OBJECTS: AtomicU64 = AtomicU64::new(0);
-
 /// Check `events` against what the proxy should send the guest: each comes
 /// from, and names, only objects the guest has, live or destroyed and
 /// awaiting their `wl_display.delete_id`, with an opcode its interface has;
@@ -1239,7 +1271,7 @@ fn check_guest_events(
                         previous.is_none(),
                         "new server object {id:#x} reuses the ID of a guest {previous:?}"
                     );
-                    GUEST_SERVER_OBJECTS.fetch_add(1, Ordering::Relaxed);
+                    count(&COUNTS.guest_server_objects, 1);
                 }
             }
         }
@@ -1448,18 +1480,6 @@ fn read_until_closed(
     }
 }
 
-/// Frame callbacks the fake compositor destroyed with their surface,
-/// across all cases.
-static FRAME_CALLBACKS_CANCELLED: AtomicU64 = AtomicU64::new(0);
-
-/// `zaura_toplevel` objects the proxy created, one per XDG toplevel of a
-/// case with placement on, across all cases.
-static AURA_TOPLEVELS: AtomicU64 = AtomicU64::new(0);
-
-/// Host object IDs the fake compositor saw created again after their
-/// `delete_id`, across all cases: evidence that the proxy's ID reuse runs.
-static HOST_IDS_REUSED: AtomicU64 = AtomicU64::new(0);
-
 /// The IDs the fake compositor allocates for objects it creates. Like
 /// libwayland-server's map, it reuses an ID as soon as the client destroys
 /// its object, last freed first.
@@ -1592,10 +1612,10 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
             for (id, interface, version) in created {
                 pointers.created(sender, id, &interface, version);
                 if deleted.remove(&id) {
-                    HOST_IDS_REUSED.fetch_add(1, Ordering::Relaxed);
+                    count(&COUNTS.host_ids_reused, 1);
                 }
                 if interface == "zaura_toplevel" {
-                    AURA_TOPLEVELS.fetch_add(1, Ordering::Relaxed);
+                    count(&COUNTS.aura_toplevels, 1);
                 }
                 zombies.remove(&id);
                 let previous = objects.insert(id, interface);
@@ -1619,9 +1639,9 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
             match (interface.as_str(), opcode) {
                 // The proxy's own answer to a press on a composition.
                 ("zwp_text_input_v1", zwp_text_input_v1::REQ_RESET) if !zombie => {
-                    COMPOSITIONS_ENDED_BY_PRESSES.fetch_add(1, Ordering::Relaxed);
+                    count(&COUNTS.compositions_ended_by_presses, 1);
                     if restarted_after_press {
-                        RESTARTS_AFTER_PRESSES.fetch_add(1, Ordering::Relaxed);
+                        count(&COUNTS.restarts_after_presses, 1);
                         restarted_after_press = false;
                     }
                 }
@@ -1631,7 +1651,7 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                 ("zwp_text_input_v1", zwp_text_input_v1::REQ_DEACTIVATE) => {
                     // The proxy had not yet read the seat's delete_id.
                     if zombies.contains_key(&named[0]) {
-                        DEACTIVATES_OF_DESTROYED_SEATS.fetch_add(1, Ordering::Relaxed);
+                        count(&COUNTS.deactivates_of_destroyed_seats, 1);
                     }
                     activations.remove(&sender);
                 }
@@ -1697,7 +1717,7 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                 // A destroyed surface's pending frame callbacks go first,
                 // without `done`, as in weston's surface destructor.
                 let cancelled = frame_callbacks.remove(&sender).unwrap_or_default();
-                FRAME_CALLBACKS_CANCELLED.fetch_add(cancelled.len() as u64, Ordering::Relaxed);
+                count(&COUNTS.frame_callbacks_cancelled, cancelled.len());
                 ended.extend(cancelled);
                 // A destroyed object's destructor crossed its delete_id.
                 if !zombie {
@@ -1751,7 +1771,7 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                 let live = objects.contains_key(text_input);
                 let seat_live = objects.get(seat).is_some_and(|seat| seat == "wl_seat");
                 if live && !seat_live {
-                    SEATLESS_ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+                    count(&COUNTS.seatless_activations, 1);
                 }
                 live && seat_live
             });
@@ -1768,7 +1788,7 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                 let sent = pointers.presses(&exo, &objects, &mut serial, &mut rng);
                 reply.extend(sent.events);
                 if !fence && rng.one_in(8) && exo.destroy_input_method() {
-                    INPUT_METHOD_RESTARTS.fetch_add(1, Ordering::Relaxed);
+                    count(&COUNTS.input_method_restarts, 1);
                     restarted_after_press = sent.pressed;
                 }
             }
@@ -1825,9 +1845,6 @@ fn guest_interface(host: &str) -> &str {
     }
 }
 
-/// Live objects the compositor destroyed on its own, across all cases.
-static LIVE_OBJECTS_HOST_DESTROYED: AtomicU64 = AtomicU64::new(0);
-
 /// Whether a compositor that destroys live host objects of `destroyed` on
 /// its own may destroy the guest's object of `interface`: one of those, or
 /// the frame callback of a surface it destroyed.
@@ -1861,7 +1878,7 @@ fn destroy_live_objects(
         .filter(|&(&id, live)| id < SERVER_ID_START && live == interface)
         .map(|(&id, _)| id)
         .collect();
-    LIVE_OBJECTS_HOST_DESTROYED.fetch_add(destroyed.len() as u64, Ordering::Relaxed);
+    count(&COUNTS.live_objects_host_destroyed, destroyed.len());
     let callbacks: Vec<u32> = destroyed
         .iter()
         .flat_map(|surface| frame_callbacks.remove(surface).unwrap_or_default())
@@ -1878,23 +1895,6 @@ fn destroy_live_objects(
         .collect()
 }
 
-/// Host text-input activations whose seat ended while active, across all
-/// cases.
-static SEATLESS_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
-
-/// `zwp_text_input_v1.deactivate` requests naming a seat the compositor
-/// had destroyed, whose `delete_id` the proxy had not read yet, across all
-/// cases.
-static DEACTIVATES_OF_DESTROYED_SEATS: AtomicU64 = AtomicU64::new(0);
-
-/// Input methods that went away while attached, as when their process
-/// restarts: one answer to a sync in eight takes them away. Across all
-/// cases.
-static INPUT_METHOD_RESTARTS: AtomicU64 = AtomicU64::new(0);
-
-/// `zwp_text_input_v1.leave` events the compositor sent, across all cases.
-static TEXT_INPUT_LEAVES: AtomicU64 = AtomicU64::new(0);
-
 /// `events`, which Exo sent, after counting their `zwp_text_input_v1.leave`
 /// events: the requests Exo is given here make it send nothing else.
 fn text_input_events(events: Vec<Outgoing>) -> Vec<Vec<u8>> {
@@ -1902,17 +1902,9 @@ fn text_input_events(events: Vec<Outgoing>) -> Vec<Vec<u8>> {
         .iter()
         .filter(|(event, _)| msg_opcode(event) == zwp_text_input_v1::EVT_LEAVE)
         .count();
-    TEXT_INPUT_LEAVES.fetch_add(leaves as u64, Ordering::Relaxed);
+    count(&COUNTS.text_input_leaves, leaves);
     events.into_iter().map(|(event, _)| event).collect()
 }
-
-/// Compositor presses that made the proxy `reset` Exo's composition, across
-/// all cases.
-static COMPOSITIONS_ENDED_BY_PRESSES: AtomicU64 = AtomicU64::new(0);
-
-/// Input method restarts that followed, in the same reply, a press that
-/// ended a composition (the proxy `reset` Exo), across all cases.
-static RESTARTS_AFTER_PRESSES: AtomicU64 = AtomicU64::new(0);
 
 /// The compositor's pointers and touches: what they are bound at, and
 /// where each pointer is.
