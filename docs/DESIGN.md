@@ -412,7 +412,7 @@ guest memfd cannot reach the host. The proxy therefore implements guest
 `wl_shm` itself:
 
 - Guest pools are never mapped in the proxy: the copy reads pixels with
-  `pread` from the pool's file, so a client that shrinks the file after
+  `pread` and `preadv` from the pool's file, so a client that shrinks the file after
   `create_pool` makes a read fail instead of raising SIGBUS in the proxy.
   Each guest `wl_buffer` gets host storage, chosen once by
   `select_shm_backing` (`shm/storage.rs`): VirtWL shared memory laid out
@@ -431,7 +431,7 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   `wl_shm.invalid_fd`; a host storage failure (mapping, dma-buf sync) drops
   the commit and forces a full copy next time. This is a copy, not
   zero-copy. The proxy's mapping of the host storage is a `HostMapping`,
-  which only the kernel writes, as `pread` fills a range of it: the
+  which only the kernel writes, as a read fills its rows: the
   host may read that memory at any time, so the proxy never holds a Rust
   reference to it.
 - Damage carries its coordinate space in its type: `BufferRect` for

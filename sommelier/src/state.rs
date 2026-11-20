@@ -34,7 +34,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 
 pub(crate) use self::aura_surfaces::AuraSurfaces;
-pub(crate) use self::host_mapping::HostMapping;
+pub(crate) use self::host_mapping::{HostMapping, Rows};
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::MAX_PENDING_DAMAGE_RECTS;

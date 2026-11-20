@@ -127,12 +127,12 @@ async fn shm_frame_cost(name: &str, damage: Damage) -> Counts {
     cost
 }
 
-/// A frame whose damage spans every row but not every column copies each
-/// row on its own.
+/// A frame whose damage spans every row but not every column copies its
+/// rows in one read, which skips the columns between them.
 #[tokio::test]
-async fn a_partial_width_shm_frame_costs_a_read_per_row() {
+async fn a_partial_width_shm_frame_costs_one_read() {
     let cost = shm_frame_cost("SHM, partial-width damage", PARTIAL_WIDTH).await;
-    assert_eq!(cost.pool_reads, HEIGHT as u64);
+    assert_eq!(cost.pool_reads, 1);
     assert_eq!(cost.host_maps, 0);
     assert!(cost.allocations <= 36, "{cost:?}");
 }
@@ -148,10 +148,10 @@ async fn a_full_shm_frame_costs_one_read() {
 }
 
 /// A host copy whose rows are longer than the guest's, as a VirtWL dma-buf
-/// allocator pads them (`--gpu-accel`), copies a full frame a row at a
-/// time. A session has no VirtWL, so this measures the copy alone.
+/// allocator pads them (`--gpu-accel`), takes a frame in one read too. A
+/// session has no VirtWL, so this measures the copy alone.
 #[test]
-fn a_full_frame_into_padded_host_rows_costs_a_read_per_row() {
+fn a_frame_into_padded_host_rows_costs_one_read() {
     let (width, height) = (WIDTH as usize, HEIGHT as usize);
     let src_stride = 4 * width;
     let dst_stride = src_stride + 256;
@@ -182,7 +182,7 @@ fn a_full_frame_into_padded_host_rows_costs_a_read_per_row() {
         let (cost, copied) = Counts::of(|| copy_shm_damage(&source, &destination, layout, &damage));
         copied.unwrap();
         println!("copy cost, padded host rows, {name}: {cost:?}");
-        assert_eq!(cost.pool_reads, height as u64, "{name}");
+        assert_eq!(cost.pool_reads, 1, "{name}");
     }
 }
 
