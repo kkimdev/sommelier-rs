@@ -496,19 +496,17 @@ mod tests {
     use super::super::copy::{copy_shm_damage, ShmCopyLayout};
     use super::super::dmabuf::map_dmabuf;
     use super::super::dmabuf_layout::validate_dmabuf_layout;
-    use super::{create_dmabuf_buffer, create_shared_buffer, DmabufAllocation, ShmBufferRequest};
-    use crate::handler::test_support::session_with_shm;
-    use crate::handler::Handlers;
+    use super::{create_dmabuf_buffer, DmabufAllocation, ShmBufferRequest};
+    use crate::handler::test_support::{bind_shm, session_with_shm, shm_global};
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
-    use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
     use crate::protocols::wayland::{wl_display, wl_registry, wl_shm, wl_shm_pool, wl_surface};
     use crate::protocols::AnyRequest;
     use crate::protocols::Iface;
     use crate::proxy::harness::Session;
     use crate::state::Singleton;
-    use crate::state::{BufferState, Context, DamageRegion, ShmPool};
+    use crate::state::{BufferState, Context, DamageRegion};
     use crate::test_support::counting::Counts;
-    use crate::test_support::{decode, protocol_error_code, shm_pool_file};
+    use crate::test_support::{decode, shm_pool_file};
     use crate::wire::{Action, WL_DISPLAY_ID};
     use std::fs::File;
     use std::os::fd::AsFd;
@@ -527,37 +525,58 @@ mod tests {
     /// as a `wl_shm` pool of the guest buffer's layout, copies each plane
     /// where that layout puts it: NV12's plane 1 right after plane 0's
     /// rows.
-    #[test]
-    fn a_shared_host_copy_takes_each_plane_where_the_guest_layout_puts_it() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_shm = ctx.shadow_table.create_host_only(Iface::WlShm, 1);
-        ctx.singletons.bind_for_test(Singleton::Shm, host_shm);
-        let host_copy = shm_pool_file(&[0; 12]);
-        let request = ShmBufferRequest {
-            id: 30,
-            pool_id: 20,
-            // The 2x2 Y plane, then the one row of the UV plane, each row
-            // padded to 4 bytes.
-            pool_file: Arc::new(shm_pool_file(&[
-                1, 2, 0xee, 0xee, 3, 4, 0xee, 0xee, 5, 6, 0xee, 0xee,
-            ])),
-            offset: 0,
-            width: 2,
-            height: 2,
-            stride: 4,
-            format: wl_shm::FORMAT_NV12,
-            size: 12,
+    #[tokio::test]
+    async fn a_shared_host_copy_takes_each_plane_where_the_guest_layout_puts_it() {
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        let (name, host_shm) = shm_global(&mut s).await;
+        let shm = bind_shm(&mut s, registry.id, name).await;
+        s.host([wl_shm::evt::format(host_shm, wl_shm::FORMAT_NV12)])
+            .await;
+        s.guest_received();
+        let surface = s.surface().await;
+        // The 2x2 Y plane, then the one row of the UV plane, each row
+        // padded to 4 bytes.
+        let pool = s
+            .shm_pool(
+                shm,
+                shm_pool_file(&[1, 2, 0xee, 0xee, 3, 4, 0xee, 0xee, 5, 6, 0xee, 0xee]),
+            )
+            .await;
+        let buffer = s.new_id();
+        s.guest([wl_shm_pool::req::create_buffer(
+            pool,
+            buffer,
+            0,
+            2,
+            2,
+            4,
+            wl_shm::FORMAT_NV12,
+        )])
+        .await;
+        let received = s.host_received();
+        let Some(host_copy) = received.iter().find_map(|(_, request)| match request {
+            AnyRequest::WlShm(wl_shm::Request::CreatePool { fd, size, .. }) => {
+                assert_eq!(*size, 12, "the host pool has the guest buffer's layout");
+                Some(fd)
+            }
+            _ => None,
+        }) else {
+            panic!("the host got no pool: {received:?}");
         };
 
-        assert_eq!(
-            create_shared_buffer(&mut ctx, request, host_copy.try_clone().unwrap().into()),
-            Action::Drop
-        );
-        assert!(!ctx.is_fatal());
-        copy_every_pixel(ctx.local_buffer(30).expect("the buffer's state"));
+        s.guest([
+            wl_surface::req::attach(surface.id, Some(buffer), 0, 0),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
+        s.host_received();
         let mut pixels = [0; 12];
-        host_copy.read_exact_at(&mut pixels, 0).unwrap();
+        File::from(host_copy.try_clone().unwrap())
+            .read_exact_at(&mut pixels, 0)
+            .unwrap();
         assert_eq!(pixels, [1, 2, 0, 0, 3, 4, 0, 0, 5, 6, 0, 0]);
+        assert_eq!(s.guest_received(), []);
     }
 
     /// A buffer whose host copy is a dma-buf tells the host the
@@ -565,7 +584,9 @@ mod tests {
     /// Plane 1 of this NV12 buffer starts after a gap past plane 0, with
     /// rows of another stride. A memfd stands in for the VirtWL dma-buf,
     /// which `map_dmabuf` maps the same way. The copy writes the mapping
-    /// the allocation made, so the buffer maps nothing more.
+    /// the allocation made, so the buffer maps nothing more. Kept a unit
+    /// test: only a VirtWL channel, which no session has, allocates a
+    /// dma-buf host copy.
     #[test]
     fn a_dmabuf_host_copy_takes_each_plane_where_its_layout_puts_it() {
         use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
@@ -777,38 +798,38 @@ mod tests {
     /// Host storage that cannot be set up (here: the host has no wl_shm to
     /// import the backing into) fails the buffer, which is fatal and leaves
     /// no trace of the buffer behind.
-    #[test]
-    fn failed_host_storage_is_fatal_without_creating_a_ghost_buffer() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let pool_id = 20;
-        let buffer_id = 30;
-        ctx.pools.insert(
-            pool_id,
-            ShmPool {
-                file: Arc::new(shm_pool_file(&[0; 4096])),
-                size: 4096,
-                shm: 10,
-            },
-        );
-        ctx.shadow_table.create_local(pool_id, Iface::WlShmPool, 1);
-        ctx.last_sender_id = pool_id;
-
+    #[tokio::test]
+    async fn failed_host_storage_is_fatal_without_creating_a_ghost_buffer() {
+        let (mut s, shm) = session_with_shm().await;
+        let pool = s.shm_pool(shm, shm_pool_file(&[0; 4096])).await;
+        // Injects a fault no peer can cause: the proxy loses its host
+        // wl_shm, which it has while the guest's is live.
+        s.ctx().singletons.unbind_for_test(Singleton::Shm);
+        let buffer = s.new_id();
+        s.guest_fatal([wl_shm_pool::req::create_buffer(
+            pool,
+            buffer,
+            0,
+            1,
+            1,
+            4,
+            wl_shm::FORMAT_ARGB8888,
+        )])
+        .await;
+        let (events, (_, code)) = s.guest_received_and_error();
+        assert_eq!(events, []);
         assert_eq!(
-            <Handlers as WlShmPoolHandler>::on_create_buffer(&mut ctx, buffer_id, 0, 1, 1, 4, 0),
-            Action::Drop
-        );
-
-        assert!(ctx.is_fatal());
-        assert_eq!(
-            protocol_error_code(&ctx),
+            code,
             wl_shm::ERROR_INVALID_FD,
             "a buffer whose storage fails reports wl_shm.invalid_fd"
         );
-        assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);
-        assert_eq!(ctx.shadow_table.get_interface(buffer_id), None);
-        assert!(ctx.shadow_table.is_guest_id_available(buffer_id));
+        assert_eq!(s.host_received(), []);
+        // Reads state no peer can observe: the session has ended, and the
+        // proxy keeps nothing of the buffer.
+        let ctx = s.ctx();
+        assert_eq!(ctx.shadow_table.get_interface(buffer), None);
+        assert!(ctx.shadow_table.is_guest_id_available(buffer));
         assert_eq!(ctx.render_buffer_count(), 0);
-        assert!(ctx.client_to_host_queue.is_empty());
     }
 
     /// A host buffer ID that already has render state is the proxy's own

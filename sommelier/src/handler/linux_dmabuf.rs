@@ -882,154 +882,246 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for Handlers {
 mod tests {
     use super::{
         build_synthetic_feedback_messages, feedback_pairs, is_supported_drm_format,
-        maybe_reclaim_capability_generation, DRM_FORMAT_MOD_INVALID, MAX_FEEDBACK_FORMATS,
+        DRM_FORMAT_MOD_INVALID, MAX_FEEDBACK_FORMATS,
     };
     use crate::handler::Handlers;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::{
-        self, evt, ZwpLinuxBufferParamsV1Handler,
+        self, evt, req, ZwpLinuxBufferParamsV1Handler,
     };
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1 as feedback;
-    use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
-    use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
-    use crate::protocols::wayland::{wl_buffer, wl_shm};
-    use crate::state::{Context, HostId, PendingNativeCreate, PendingParam, SessionEnd};
-    use crate::test_support::{
-        any_fd_has_identity, decoded, fd_identity, msg_opcode, msg_sender, protocol_error,
-        TestFdIdentity,
-    };
-    use crate::wire::{Action, MessageHeader, Outgoing, WireMessage, WL_DISPLAY_ID};
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
+    use crate::protocols::wayland::wl_surface;
+    use crate::protocols::wayland::{wl_buffer, wl_callback, wl_display, wl_registry, wl_shm};
+    use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::proxy::harness::{Object, Session};
+    use crate::state::{Context, PlaneFenceForTest, SessionEnd};
+    use crate::test_support::wire_peer::SERVER_ID_START;
+    use crate::test_support::{any_fd_has_identity, decoded, fd_identity, msg_opcode, msg_sender};
+    use crate::wire::{Action, MessageHeader, WL_DISPLAY_ID};
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
     const XRGB8888: u32 = 0x3432_5258;
+    /// The `wl_buffer` the host's first `created` event creates: its first
+    /// server ID.
+    const HOST_BUFFER: u32 = SERVER_ID_START;
 
-    /// A guest `zwp_linux_buffer_params_v1` and the host object it is
-    /// paired with.
-    #[derive(Clone, Copy)]
-    struct Params {
-        guest: u32,
-        host: u32,
-    }
-
-    const PARAMS: Params = Params { guest: 7, host: 8 };
-    /// The `wl_buffer` the guest's `create_immed` names.
-    const BUFFER: u32 = 90;
-    /// The `wl_buffer` the host's `created` event creates, a server ID.
-    const HOST_BUFFER: u32 = 0xff00_0042;
-
-    /// One end of a new pipe: a descriptor whose file no other test shares.
+    /// One end of a new pipe: a descriptor whose file no other test shares,
+    /// and that nothing else in the process holds.
     fn pipe_fd() -> OwnedFd {
         let (reader, _writer) = std::io::pipe().expect("a pipe");
         reader.into()
     }
 
-    /// Plane `plane_idx` at `offset` with `stride` bytes per row, on `fd`.
-    fn plane_on(fd: OwnedFd, plane_idx: u32, offset: u32, stride: u32) -> PendingParam {
-        PendingParam {
-            fd,
-            plane_idx,
-            offset,
-            stride,
-            modifier_hi: 0,
-            modifier_lo: 0,
+    /// A session with GPU access, whose guest has bound the host's
+    /// linux-dmabuf at v3, without synthetic feedback.
+    async fn dmabuf_session() -> (Session, Object) {
+        let mut s = Session::with_context(Context::new_for_test(true, false, vec![]));
+        let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await;
+        (s, dmabuf)
+    }
+
+    /// New params of `dmabuf` that the guest gives `planes`, each a
+    /// descriptor, its index, offset and stride; the host gets nothing for
+    /// the planes before a create.
+    async fn params_with(
+        s: &mut Session,
+        dmabuf: u32,
+        planes: Vec<(OwnedFd, u32, u32, u32)>,
+    ) -> Object {
+        let id = s.new_id();
+        let host = s
+            .create(zwp_linux_dmabuf_v1::req::create_params(dmabuf, id))
+            .await;
+        s.guest(planes.into_iter().map(|(fd, plane_idx, offset, stride)| {
+            req::add(id, fd, plane_idx, offset, stride, 0, 0)
+        }))
+        .await;
+        assert_eq!(s.host_received(), [], "the proxy holds the planes");
+        Object { id, host }
+    }
+
+    /// The guest's asynchronous `create` of a 16x8 XRGB8888 buffer from new
+    /// params of `dmabuf` whose one plane is `plane`; returns the params.
+    async fn create(s: &mut Session, dmabuf: u32, plane: OwnedFd) -> Object {
+        let params = params_with(s, dmabuf, vec![(plane, 0, 0, 64)]).await;
+        s.guest([req::create(params.id, 16, 8, XRGB8888, 0)]).await;
+        let received = s.host_received();
+        assert!(
+            matches!(
+                &received[..],
+                [
+                    (
+                        _,
+                        AnyRequest::ZwpLinuxBufferParamsV1(
+                            zwp_linux_buffer_params_v1::Request::Add { .. }
+                        )
+                    ),
+                    _
+                ]
+            ) && received[1]
+                == (
+                    params.host,
+                    zwp_linux_buffer_params_v1::Request::Create {
+                        width: 16,
+                        height: 8,
+                        format: XRGB8888,
+                        flags: 0,
+                    }
+                    .into()
+                ),
+            "the host got {received:?}"
+        );
+        params
+    }
+
+    /// The host creates [`HOST_BUFFER`] for `params`' create; returns the
+    /// guest's buffer, which the guest gets.
+    async fn created(s: &mut Session, params: Object) -> Object {
+        s.host([evt::created(params.host, HOST_BUFFER)]).await;
+        let received = s.guest_received();
+        let [(
+            sender,
+            AnyEvent::ZwpLinuxBufferParamsV1(zwp_linux_buffer_params_v1::Event::Created { buffer }),
+        )] = received[..]
+        else {
+            panic!("the guest got no buffer: {received:?}");
+        };
+        assert_eq!(sender, params.id);
+        Object {
+            id: buffer,
+            host: HOST_BUFFER,
         }
     }
 
-    /// [`plane_on`] a new pipe.
-    fn plane(plane_idx: u32, offset: u32, stride: u32) -> PendingParam {
-        plane_on(pipe_fd(), plane_idx, offset, stride)
-    }
-
-    /// Pair `params` at version 4 and give it `planes`, as the sender of
-    /// the next request.
-    fn add_params(ctx: &mut Context, params: Params, planes: Vec<PendingParam>) {
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            params.guest,
-            params.host,
-            "zwp_linux_buffer_params_v1",
-            4,
-        );
-        ctx.pending_params.insert(params.guest, planes);
-        ctx.last_sender_id = params.guest;
-    }
-
-    /// A context whose [`PARAMS`] hold `planes`.
-    fn params_with(planes: Vec<PendingParam>) -> Context {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        add_params(&mut ctx, PARAMS, planes);
-        ctx
-    }
-
-    /// The guest's asynchronous `create` of a 16x8 XRGB8888 buffer from
-    /// `params`, with one plane.
-    fn create(ctx: &mut Context, params: Params) {
-        add_params(ctx, params, vec![plane(0, 0, 64)]);
-        assert_eq!(Handlers::on_create(ctx, 16, 8, XRGB8888, 0), Action::Drop);
-    }
-
-    /// The host sends params event `event`, which the proxy dispatches;
-    /// returns what it forwards.
-    fn params_event(ctx: &mut Context, (event, _): Outgoing) -> Option<Outgoing> {
-        ctx.last_sender_id = msg_sender(&event);
-        let mut event = WireMessage::new(
-            ctx.last_sender_id,
-            msg_opcode(&event),
-            &event[MessageHeader::LEN..],
-        );
-        crate::test_support::dispatch_event(ctx, &mut event).expect("the event decodes")
-    }
-
-    /// `forward` is the `created` of guest buffer `buffer`, from `params`.
-    fn forwarded_created(forward: Option<Outgoing>, params: Params, buffer: u32) {
-        let forward = forward.expect("created reaches the guest");
-        assert_eq!(
-            decoded(&[forward], zwp_linux_buffer_params_v1::Event::from_wire),
-            [(
-                params.guest,
-                zwp_linux_buffer_params_v1::Event::Created { buffer }
-            )]
-        );
-    }
-
-    /// Give [`PARAMS`] (paired, without planes) the 16x8 asynchronous create
-    /// the host still owes an answer, as `on_create` leaves it, with a fence
-    /// descriptor no other test shares; returns that descriptor's identity.
-    fn pending_create(ctx: &mut Context) -> TestFdIdentity {
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            PARAMS.guest,
-            PARAMS.host,
-            "zwp_linux_buffer_params_v1",
-            4,
-        );
-        let fence = pipe_fd();
-        let identity = fd_identity(fence.as_raw_fd());
-        let pending = PendingNativeCreate {
-            guest_params_id: PARAMS.guest,
-            dimensions: (16, 8),
-            sync_fds: vec![fence],
+    /// The guest commits `buffer` on a new surface while the fence of one
+    /// of its planes, whose pipe `signal` writes, is pending: the commit
+    /// waits for it, and reaches the host once it signals. Each plane
+    /// stands in for its own sync_file, which a readable pipe is once the
+    /// guest GPU is done.
+    async fn commit_waits_for_fence(s: &mut Session, buffer: Object, signal: OwnedFd) {
+        let surface = s.surface().await;
+        // Injects what no peer can provide: a plane's fence.
+        s.ctx().plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
+        s.guest([
+            wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
+        assert!(s.parked(), "the commit waits for the plane's fence");
+        let attach = wl_surface::Request::Attach {
+            buffer: buffer.host,
+            x: 0,
+            y: 0,
         };
-        ctx.pending_native_creates
-            .insert(HostId(PARAMS.host), pending);
-        ctx.last_sender_id = PARAMS.guest;
-        identity
+        assert_eq!(s.host_received(), [(surface.host, attach.into())]);
+        assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+        s.resume().await;
+        let received = s.host_received();
+        assert!(
+            matches!(
+                received.last(),
+                Some((host, AnyRequest::WlSurface(wl_surface::Request::Commit {})))
+                    if *host == surface.host
+            ),
+            "the commit reached the host once the fence signalled: {received:?}"
+        );
+        assert_eq!(s.guest_received(), []);
     }
 
-    #[test]
-    fn capability_snapshot_is_reclaimed_after_its_last_reference() {
-        let generation = 9;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.dmabuf_capabilities.entry(generation).or_default();
-        ctx.dmabuf_guest_generations.insert(7, generation);
+    /// A guest linux-dmabuf v4 factory, which the proxy serves synthetic
+    /// feedback for, and the global it was bound from.
+    struct Factory {
+        /// The host's global.
+        name: u32,
+        /// The proxy's own binding of it.
+        internal: u32,
+        factory: Object,
+    }
 
-        maybe_reclaim_capability_generation(&mut ctx, generation);
-        assert!(
-            ctx.dmabuf_capabilities.contains_key(&generation),
+    /// A session whose guest has bound linux-dmabuf v4, once the host has
+    /// reported, on the proxy's own binding, XRGB8888 with the linear
+    /// modifier and answered the proxy's sync.
+    async fn feedback_session() -> (Session, Factory) {
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        // Stands in for the virtio-gpu render node that synthetic feedback
+        // needs, as the process would find it at startup.
+        ctx.synthetic_feedback_available_for_test = true;
+        let mut s = Session::with_context(ctx);
+        let registry = s.registry().await;
+        let (name, internal) = s.advertise_internal(zwp_linux_dmabuf_v1::NAME, 4).await;
+        assert_eq!(s.guest_received(), [], "the global waits for its formats");
+        let received = s.host_received();
+        let [(WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            received[..]
+        else {
+            panic!("the proxy did not ask for the formats: {received:?}");
+        };
+        s.host([
+            zwp_linux_dmabuf_v1::evt::modifier(internal, XRGB8888, 0, 0),
+            wl_callback::evt::done(callback, 0),
+            wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+        ])
+        .await;
+        let global = wl_registry::Event::Global {
+            name,
+            interface: zwp_linux_dmabuf_v1::NAME.to_string(),
+            version: 4,
+        };
+        assert_eq!(s.guest_received(), [(registry.id, global.into())]);
+        let id = s.new_id();
+        let bind = wl_registry::req::bind(registry.id, name, zwp_linux_dmabuf_v1::NAME, 4, id);
+        s.guest([bind.unwrap()]).await;
+        let received = s.host_received();
+        let [(
+            _,
+            AnyRequest::WlRegistry(wl_registry::Request::Bind {
+                id: (_, 3, host), ..
+            }),
+        )] = received[..]
+        else {
+            panic!("the guest's factory was not bound at v3: {received:?}");
+        };
+        let factory = Factory {
+            name,
+            internal,
+            factory: Object { id, host },
+        };
+        (s, factory)
+    }
+
+    /// The host removes `dmabuf`'s global, which the guest gets, and the
+    /// proxy destroys its own binding.
+    async fn remove_global(s: &mut Session, dmabuf: &Factory) {
+        let registry = s.registry().await;
+        s.host([wl_registry::evt::global_remove(registry.host, dmabuf.name)])
+            .await;
+        let removal = wl_registry::Event::GlobalRemove { name: dmabuf.name };
+        assert_eq!(s.guest_received(), [(registry.id, removal.into())]);
+        let destroy = zwp_linux_dmabuf_v1::Request::Destroy {};
+        assert_eq!(s.host_received(), [(dmabuf.internal, destroy.into())]);
+    }
+
+    /// A capability snapshot lives while anything holds its generation:
+    /// here a guest factory outlives the host's global, and the snapshot
+    /// goes with the factory.
+    #[tokio::test]
+    async fn capability_snapshot_is_reclaimed_after_its_last_reference() {
+        let (mut s, dmabuf) = feedback_session().await;
+        remove_global(&mut s, &dmabuf).await;
+        // Reads state no peer can observe: the snapshots the proxy keeps.
+        assert_eq!(
+            s.ctx().dmabuf_capabilities.len(),
+            1,
             "a live factory must retain its immutable capability snapshot"
         );
 
-        ctx.dmabuf_guest_generations.remove(&7);
-        maybe_reclaim_capability_generation(&mut ctx, generation);
+        s.guest([zwp_linux_dmabuf_v1::req::destroy(dmabuf.factory.id)])
+            .await;
+        let destroy = zwp_linux_dmabuf_v1::Request::Destroy {};
+        assert_eq!(s.host_received(), [(dmabuf.factory.host, destroy.into())]);
+        // Reads state no peer can observe: the snapshots the proxy keeps.
         assert!(
-            !ctx.dmabuf_capabilities.contains_key(&generation),
+            s.ctx().dmabuf_capabilities.is_empty(),
             "an unreferenced removed generation must not accumulate forever"
         );
     }
@@ -1108,80 +1200,108 @@ mod tests {
         assert!(indices.eq(0..MAX_FEEDBACK_FORMATS));
     }
 
-    /// Guest factory 7 asks for its default feedback 90.
-    fn get_default_feedback(ctx: &mut Context) -> Action {
-        ctx.last_sender_id = 7;
-        <Handlers as ZwpLinuxDmabufV1Handler>::on_get_default_feedback(ctx, 90)
-    }
-
-    /// A context, with `gpu_accel`, whose guest factory 7 holds capability
-    /// generation 42, `ready` or not.
-    fn factory(gpu_accel: bool, ready: bool) -> Context {
-        let mut ctx = Context::new_for_test(gpu_accel, false, vec![]);
-        ctx.dmabuf_guest_generations.insert(7, 42);
-        ctx.dmabuf_capabilities.entry(42).or_default().ready = ready;
-        ctx
+    /// The guest asks `dmabuf`'s factory for its default feedback; returns
+    /// the feedback.
+    fn get_default_feedback(s: &mut Session, dmabuf: &Factory) -> (u32, crate::wire::Outgoing) {
+        let id = s.new_id();
+        let request = zwp_linux_dmabuf_v1::req::get_default_feedback(dmabuf.factory.id, id);
+        (id, request)
     }
 
     /// A factory without a capability generation is the proxy's own
     /// bookkeeping failure. `zwp_linux_dmabuf_v1` declares no errors, so the
     /// display reports it as an implementation error.
-    #[test]
-    fn feedback_from_an_untracked_factory_is_an_implementation_error() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        assert_eq!(get_default_feedback(&mut ctx), Action::Drop);
+    #[tokio::test]
+    async fn feedback_from_an_untracked_factory_is_an_implementation_error() {
+        let (mut s, dmabuf) = feedback_session().await;
+        // Injects a fault no peer can cause: the proxy loses the factory's
+        // capability generation.
+        s.ctx().dmabuf_guest_generations.clear();
+        let (_, request) = get_default_feedback(&mut s, &dmabuf);
+        s.guest_fatal([request]).await;
         assert_eq!(
-            protocol_error(&ctx),
-            (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
+        assert_eq!(s.host_received(), []);
     }
 
     /// Feedback the proxy cannot allocate (here, without a virtio-gpu device
     /// to name) is the compositor running out of resources, not a client
     /// error: libwayland reports that as `wl_display.no_memory`.
-    #[test]
-    fn unallocatable_feedback_is_a_no_memory_error() {
-        let mut ctx = factory(false, true);
-        assert_eq!(get_default_feedback(&mut ctx), Action::Drop);
+    #[tokio::test]
+    async fn unallocatable_feedback_is_a_no_memory_error() {
+        let (mut s, dmabuf) = feedback_session().await;
+        let (_, request) = get_default_feedback(&mut s, &dmabuf);
+        s.guest_fatal([request]).await;
         assert_eq!(
-            protocol_error(&ctx),
-            (WL_DISPLAY_ID, wl_display::ERROR_NO_MEMORY)
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_NO_MEMORY))
         );
+        assert_eq!(s.host_received(), []);
     }
 
-    #[test]
-    fn synthetic_feedback_waits_for_capability_barrier() {
-        let mut ctx = factory(true, false);
-        assert_eq!(get_default_feedback(&mut ctx), Action::Drop);
-        assert_eq!(ctx.synthetic_feedback_objects.get(&90), Some(&42));
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
+    /// Mark every capability generation as still awaiting the host's
+    /// formats.
+    fn capabilities_pending(s: &mut Session) {
+        // Injects a state no peer can reach: the proxy offers the guest a
+        // v4 factory only once its capabilities are ready, so this stands
+        // for a factory whose capabilities are still on their way, as the
+        // feedback's own guard allows.
+        for capabilities in s.ctx().dmabuf_capabilities.values_mut() {
+            capabilities.ready = false;
+        }
+    }
+
+    /// Feedback whose capabilities are not ready yet waits for them: the
+    /// guest gets nothing, and no error, until the host's capability
+    /// callback.
+    #[tokio::test]
+    async fn synthetic_feedback_waits_for_capability_barrier() {
+        let (mut s, dmabuf) = feedback_session().await;
+        capabilities_pending(&mut s);
+        let (_, request) = get_default_feedback(&mut s, &dmabuf);
+        s.guest([request]).await;
+        assert_eq!(
+            s.guest_received(),
+            [],
             "feedback must remain pending until the host capability callback"
         );
-        assert!(!ctx.dmabuf_capabilities[&42].ready);
+        assert_eq!(s.host_received(), []);
     }
 
-    #[test]
-    fn synthetic_feedback_destroy_completes_locally() {
-        let mut ctx = factory(true, false);
-        assert_eq!(get_default_feedback(&mut ctx), Action::Drop);
-        // With its factory gone, the feedback holds the last reference to
-        // the capability snapshot.
-        ctx.dmabuf_guest_generations.remove(&7);
+    /// The feedback object is the proxy's own: its destructor reaches no
+    /// host, the guest gets its `delete_id`, and the capability snapshot
+    /// goes with the last object that held it.
+    #[tokio::test]
+    async fn synthetic_feedback_destroy_completes_locally() {
+        let (mut s, dmabuf) = feedback_session().await;
+        capabilities_pending(&mut s);
+        let (feedback, request) = get_default_feedback(&mut s, &dmabuf);
+        s.guest([request]).await;
+        // With the host's global and the factory gone, the feedback holds
+        // the last reference to the capability snapshot.
+        remove_global(&mut s, &dmabuf).await;
+        s.guest([zwp_linux_dmabuf_v1::req::destroy(dmabuf.factory.id)])
+            .await;
+        s.host_received();
 
-        ctx.last_sender_id = 90;
-        let mut destroy = WireMessage::new(90, feedback::REQ_DESTROY, &[]);
-        let dispatched = crate::test_support::dispatch_request(&mut ctx, &mut destroy);
-        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
-        assert!(ctx.client_to_host_queue.is_empty());
+        s.guest([feedback::req::destroy(feedback)]).await;
+        assert_eq!(s.host_received(), []);
         assert_eq!(
-            decoded(&ctx.host_to_client_queue, wl_display::Event::from_wire),
-            [(WL_DISPLAY_ID, wl_display::Event::DeleteId { id: 90 })]
+            s.guest_received(),
+            [(
+                WL_DISPLAY_ID,
+                wl_display::Event::DeleteId { id: feedback }.into()
+            )]
         );
-        assert!(!ctx.synthetic_feedback_objects.contains_key(&90));
-        assert!(!ctx.dmabuf_capabilities.contains_key(&42));
+        // Reads state no peer can observe: the snapshots the proxy keeps.
+        assert!(s.ctx().dmabuf_capabilities.is_empty());
     }
 
+    /// A pure function of the capability table: the pairs reach a peer
+    /// only in a feedback's format table, which needs a virtio-gpu device
+    /// no test has.
     #[test]
     fn capability_snapshots_remain_isolated_by_global_generation() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
@@ -1197,24 +1317,41 @@ mod tests {
         assert_eq!(feedback_pairs(&ctx, 2), vec![(XRGB8888, 2)]);
     }
 
-    #[test]
-    fn legacy_capability_events_are_hidden_from_synthetic_v4_factory() {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        let capabilities = |ctx: &mut Context, host| {
-            ctx.last_sender_id = host;
+    /// The host's format and modifier events reach a guest factory of v3,
+    /// which has no feedback, but not one of v4, which gets its formats
+    /// from the synthetic feedback.
+    #[tokio::test]
+    async fn legacy_capability_events_are_hidden_from_synthetic_v4_factory() {
+        let capabilities = |factory: u32| {
             [
-                Handlers::on_format(ctx, XRGB8888),
-                Handlers::on_modifier(ctx, XRGB8888, 0, 0),
+                zwp_linux_dmabuf_v1::evt::format(factory, XRGB8888),
+                zwp_linux_dmabuf_v1::evt::modifier(factory, XRGB8888, 0, 0),
             ]
         };
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 20, "zwp_linux_dmabuf_v1", 4);
-        assert_eq!(capabilities(&mut ctx, 20), [Action::Drop; 2]);
+        let (mut s, dmabuf) = feedback_session().await;
+        s.host(capabilities(dmabuf.factory.host)).await;
+        assert_eq!(s.guest_received(), []);
 
-        ctx.release_deleted_host_id(20);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(11, 21, "zwp_linux_dmabuf_v1", 3);
-        assert_eq!(capabilities(&mut ctx, 21), [Action::Forward; 2]);
+        let (mut s, dmabuf) = dmabuf_session().await;
+        s.host(capabilities(dmabuf.host)).await;
+        assert_eq!(
+            s.guest_received(),
+            [
+                (
+                    dmabuf.id,
+                    zwp_linux_dmabuf_v1::Event::Format { format: XRGB8888 }.into()
+                ),
+                (
+                    dmabuf.id,
+                    zwp_linux_dmabuf_v1::Event::Modifier {
+                        format: XRGB8888,
+                        modifier_hi: 0,
+                        modifier_lo: 0,
+                    }
+                    .into()
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1232,41 +1369,50 @@ mod tests {
         assert!(!is_supported_drm_format(0xdead_beef));
     }
 
-    #[test]
-    fn create_immed_without_tracked_params_does_not_map_buffer() {
-        let mut ctx = params_with(Vec::new());
-        ctx.pending_params.remove(&PARAMS.guest);
+    #[tokio::test]
+    async fn create_immed_without_tracked_params_does_not_map_buffer() {
+        let (mut s, dmabuf) = dmabuf_session().await;
+        let params = params_with(&mut s, dmabuf.id, Vec::new()).await;
+        // Injects a fault no peer can cause: the proxy loses the params'
+        // planes, which `create_params` records.
+        s.ctx().pending_params.remove(&params.id);
 
-        assert_eq!(
-            Handlers::on_create_immed(&mut ctx, BUFFER, 16, 16, XRGB8888, 0),
-            Action::Drop
-        );
-        assert_eq!(ctx.shadow_table.get_host_id(BUFFER), None);
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert!(!ctx.is_fatal());
+        let buffer = s.new_id();
+        s.guest([req::create_immed(params.id, buffer, 16, 16, XRGB8888, 0)])
+            .await;
+        assert_eq!(s.host_received(), []);
+        assert_eq!(s.guest_received(), []);
+        // Reads state no peer can observe: no host object stands for the
+        // buffer.
+        assert_eq!(s.ctx().shadow_table.get_host_id(buffer), None);
     }
 
-    #[test]
-    fn create_immed_registers_one_complete_buffer_generation() {
-        let fd = pipe_fd();
-        let added = fd.try_clone().expect("duplicate the plane");
-        let mut ctx = params_with(vec![plane_on(fd, 0, 0, 64)]);
+    /// `create_immed` sends the host the params' plane and the buffer, which
+    /// keeps its size and its plane's fence: a commit of it waits for the
+    /// fence.
+    #[tokio::test]
+    async fn create_immed_registers_one_complete_buffer_generation() {
+        let (mut s, dmabuf) = dmabuf_session().await;
+        let (plane, signal) = crate::test_support::pipe();
+        let added = plane.try_clone().expect("duplicate the plane");
+        let params = params_with(&mut s, dmabuf.id, vec![(plane, 0, 0, 64)]).await;
 
+        let buffer = s.new_id();
+        s.guest([req::create_immed(params.id, buffer, 16, 8, XRGB8888, 0)])
+            .await;
+        let received = s.host_received();
+        let Some((host_buffer, _)) = received
+            .get(1)
+            .and_then(|(_, request)| request.new_object())
+        else {
+            panic!("the host got no buffer: {received:?}");
+        };
+        assert_ne!(host_buffer, buffer);
         assert_eq!(
-            Handlers::on_create_immed(&mut ctx, BUFFER, 16, 8, XRGB8888, 0),
-            Action::Drop
-        );
-
-        let host_buffer = ctx.shadow_table.get_host_id(BUFFER).expect("a host buffer");
-        assert_ne!(host_buffer, BUFFER);
-        assert_eq!(
-            decoded(
-                &ctx.client_to_host_queue,
-                zwp_linux_buffer_params_v1::Request::from_wire
-            ),
+            received,
             [
                 (
-                    PARAMS.host,
+                    params.host,
                     zwp_linux_buffer_params_v1::Request::Add {
                         fd: added,
                         plane_idx: 0,
@@ -1275,9 +1421,10 @@ mod tests {
                         modifier_hi: 0,
                         modifier_lo: 0,
                     }
+                    .into()
                 ),
                 (
-                    PARAMS.host,
+                    params.host,
                     zwp_linux_buffer_params_v1::Request::CreateImmed {
                         buffer_id: host_buffer,
                         width: 16,
@@ -1285,42 +1432,48 @@ mod tests {
                         format: XRGB8888,
                         flags: 0,
                     }
+                    .into()
                 ),
             ]
         );
-        assert_eq!(ctx.buffer_dimensions(BUFFER), Some((16, 8)));
-        assert_eq!(
-            ctx.native_buffer_sync_fds(BUFFER)
-                .map(|sync_fds| sync_fds.len()),
-            Some(1)
-        );
-        assert!(ctx.has_render_buffer_host(HostId(host_buffer)));
-        assert!(ctx.used_dmabuf_params.contains(&PARAMS.guest));
+        // Reads state no peer can observe: the size the proxy keeps for
+        // the buffer.
+        assert_eq!(s.ctx().buffer_dimensions(buffer), Some((16, 8)));
+        let buffer = Object {
+            id: buffer,
+            host: host_buffer,
+        };
+        commit_waits_for_fence(&mut s, buffer, signal).await;
     }
 
-    #[test]
-    fn reused_params_report_already_used_without_mapping_a_buffer() {
-        let mut ctx = params_with(Vec::new());
-        ctx.pending_params.remove(&PARAMS.guest);
-        ctx.used_dmabuf_params.insert(PARAMS.guest);
+    #[tokio::test]
+    async fn reused_params_report_already_used_without_mapping_a_buffer() {
+        let (mut s, dmabuf) = dmabuf_session().await;
+        let params = params_with(&mut s, dmabuf.id, vec![(pipe_fd(), 0, 0, 64)]).await;
+        let buffer = s.new_id();
+        s.guest([req::create_immed(params.id, buffer, 16, 8, XRGB8888, 0)])
+            .await;
+        s.host_received();
 
+        let reused = s.new_id();
+        s.guest_fatal([req::create_immed(params.id, reused, 16, 8, XRGB8888, 0)])
+            .await;
         assert_eq!(
-            Handlers::on_create_immed(&mut ctx, BUFFER, 16, 8, XRGB8888, 0),
-            Action::Drop
+            s.guest_received_and_error(),
+            (
+                vec![],
+                (params.id, zwp_linux_buffer_params_v1::ERROR_ALREADY_USED)
+            )
         );
-
-        assert_eq!(
-            protocol_error(&ctx),
-            (PARAMS.guest, zwp_linux_buffer_params_v1::ERROR_ALREADY_USED)
-        );
-        assert_eq!(ctx.shadow_table.get_host_id(BUFFER), None);
-        assert!(ctx.client_to_host_queue.is_empty());
+        assert_eq!(s.host_received(), []);
     }
 
     /// A plane the proxy cannot duplicate, here because the process may
     /// open no more descriptors, ends the session as the proxy's own
     /// failure. The descriptor limit is the whole process's, so the test
-    /// lowers it only in a child process that runs it alone.
+    /// lowers it only in a child process that runs it alone. It calls the
+    /// handler directly: under the limit the proxy could not receive the
+    /// plane in the first place.
     #[test]
     fn a_plane_the_proxy_cannot_duplicate_is_its_own_failure() {
         crate::test_support::in_own_process(
@@ -1362,8 +1515,8 @@ mod tests {
 
     /// An `add` or `create` the params cannot take ends the session with
     /// the params' declared error, and nothing reaches the host.
-    #[test]
-    fn invalid_plane_requests_queue_declared_protocol_errors() {
+    #[tokio::test]
+    async fn invalid_plane_requests_queue_declared_protocol_errors() {
         use zwp_linux_buffer_params_v1::{
             ERROR_INCOMPLETE, ERROR_INVALID_DIMENSIONS, ERROR_OUT_OF_BOUNDS, ERROR_PLANE_IDX,
             ERROR_PLANE_SET,
@@ -1378,22 +1531,24 @@ mod tests {
                 format: u32,
             },
         }
-        let cases: [(&str, Vec<PendingParam>, Request, u32); 6] = [
+        /// A plane's index, offset and stride.
+        type Plane = (u32, u32, u32);
+        let cases: [(&str, &[Plane], Request, u32); 6] = [
             (
                 "an add past the last plane",
-                vec![],
+                &[],
                 Request::Add { plane_idx: 2 },
                 ERROR_PLANE_IDX,
             ),
             (
                 "an add of a plane already set",
-                vec![plane(0, 0, 64)],
+                &[(0, 0, 64)],
                 Request::Add { plane_idx: 0 },
                 ERROR_PLANE_SET,
             ),
             (
                 "a zero width",
-                vec![plane(0, 0, 64)],
+                &[(0, 0, 64)],
                 Request::Create {
                     width: 0,
                     height: 16,
@@ -1403,7 +1558,7 @@ mod tests {
             ),
             (
                 "two planes for a one-plane format",
-                vec![plane(0, 0, 64), plane(0, 4096, 64)],
+                &[(0, 0, 64), (1, 4096, 64)],
                 Request::Create {
                     width: 16,
                     height: 16,
@@ -1412,19 +1567,19 @@ mod tests {
                 ERROR_INCOMPLETE,
             ),
             (
-                "plane 0 twice for a two-plane format",
-                vec![plane(0, 0, 16), plane(0, 128, 16)],
+                "plane 1 of a one-plane format",
+                &[(1, 0, 64)],
                 Request::Create {
                     width: 16,
-                    height: 8,
-                    format: wl_shm::FORMAT_NV12,
+                    height: 16,
+                    format: XRGB8888,
                 },
-                ERROR_PLANE_SET,
+                ERROR_PLANE_IDX,
             ),
             (
                 // XRGB8888 needs four bytes per pixel.
                 "a stride shorter than one row",
-                vec![plane(0, 0, 4 * 3)],
+                &[(0, 0, 4 * 3)],
                 Request::Create {
                     width: 4,
                     height: 4,
@@ -1434,224 +1589,199 @@ mod tests {
             ),
         ];
         for (case, planes, request, code) in cases {
-            let mut ctx = params_with(planes);
-            let action = match request {
+            let (mut s, dmabuf) = dmabuf_session().await;
+            let planes = planes
+                .iter()
+                .map(|&(plane_idx, offset, stride)| (pipe_fd(), plane_idx, offset, stride))
+                .collect();
+            let params = params_with(&mut s, dmabuf.id, planes).await;
+            let request = match request {
                 Request::Add { plane_idx } => {
-                    let fd = pipe_fd();
-                    Handlers::on_add(&mut ctx, fd.as_fd(), plane_idx, 0, 64, 0, 0)
+                    req::add(params.id, pipe_fd(), plane_idx, 0, 64, 0, 0)
                 }
                 Request::Create {
                     width,
                     height,
                     format,
-                } => Handlers::on_create(&mut ctx, width, height, format, 0),
+                } => req::create(params.id, width, height, format, 0),
             };
-            assert_eq!(action, Action::Drop, "{case}");
-            assert_eq!(protocol_error(&ctx), (PARAMS.guest, code), "{case}");
-            assert!(ctx.client_to_host_queue.is_empty(), "{case}");
+            s.guest_fatal([request]).await;
+            assert_eq!(
+                s.guest_received_and_error(),
+                (vec![], (params.id, code)),
+                "{case}"
+            );
+            assert_eq!(s.host_received(), [], "{case}");
         }
     }
 
-    #[test]
-    fn async_dmabuf_created_event_moves_dimensions_to_host_buffer() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        create(&mut ctx, PARAMS);
-        let pending = &ctx.pending_native_creates[&HostId(PARAMS.host)];
+    /// An asynchronous create keeps the buffer's size and its plane's fence
+    /// until the host's `created`, which gives them to the buffer.
+    #[tokio::test]
+    async fn async_dmabuf_created_event_moves_dimensions_to_host_buffer() {
+        let (mut s, dmabuf) = dmabuf_session().await;
+        let (plane, signal) = crate::test_support::pipe();
+        let params = create(&mut s, dmabuf.id, plane).await;
+
+        let buffer = created(&mut s, params).await;
+        // Reads state no peer can observe: the size the proxy keeps for
+        // the buffer.
         assert_eq!(
-            pending.dimensions,
-            (16, 8),
+            s.ctx().buffer_dimensions(buffer.id),
+            Some((16, 8)),
             "async create must retain dimensions until the host emits created"
         );
-        assert_eq!(
-            pending.sync_fds.len(),
-            1,
-            "async create must retain a dma-buf fence descriptor until created"
-        );
-        assert!(!ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
-
-        let forward = params_event(&mut ctx, evt::created(PARAMS.host, HOST_BUFFER));
-        let guest_buffer = ctx
-            .shadow_table
-            .get_guest_id(HOST_BUFFER)
-            .expect("generated created event must map the host buffer");
-        forwarded_created(forward, PARAMS, guest_buffer);
-        assert!(ctx.pending_native_creates.is_empty());
-        assert_eq!(
-            ctx.buffer_dimensions_for_host(HostId(HOST_BUFFER)),
-            Some((16, 8))
-        );
-        assert!(
-            ctx.native_buffer_sync_fds(guest_buffer)
-                .is_some_and(|sync_fds| !sync_fds.is_empty()),
-            "created must move the retained fence descriptor to the host buffer"
-        );
-        assert_eq!(
-            ctx.buffer_dimensions(guest_buffer),
-            Some((16, 8)),
-            "guest lookup must resolve the canonical host-ID keyed generation"
-        );
-        assert_eq!(ctx.render_buffer_count(), 1);
+        commit_waits_for_fence(&mut s, buffer, signal).await;
     }
 
     /// Every plane of a multi-plane create keeps a fence descriptor of its
     /// own, whether the planes are distinct dma-bufs or descriptors of one.
-    #[test]
-    fn multi_plane_create_retains_a_fence_for_every_plane() {
+    #[tokio::test]
+    async fn multi_plane_create_retains_a_fence_for_every_plane() {
         for shared in [false, true] {
-            let first = pipe_fd();
-            let second = if shared {
-                first.try_clone().expect("duplicate the plane")
+            let (mut s, dmabuf) = dmabuf_session().await;
+            let (first, signal) = crate::test_support::pipe();
+            let (second, second_signal) = if shared {
+                (first.try_clone().expect("duplicate the plane"), None)
             } else {
-                pipe_fd()
+                let (second, signal) = crate::test_support::pipe();
+                (second, Some(signal))
             };
-            let mut ctx = params_with(vec![
-                plane_on(first, 0, 0, 16),
-                plane_on(second, 1, 128, 16),
-            ]);
-            assert_eq!(
-                Handlers::on_create(&mut ctx, 16, 8, wl_shm::FORMAT_NV12, 0),
-                Action::Drop
-            );
-            assert_eq!(
-                ctx.pending_native_creates[&HostId(PARAMS.host)]
-                    .sync_fds
-                    .len(),
-                2,
-                "shared backing: {shared}"
-            );
+            let planes = vec![(first, 0, 0, 16), (second, 1, 128, 16)];
+            let params = params_with(&mut s, dmabuf.id, planes).await;
+            s.guest([req::create(params.id, 16, 8, wl_shm::FORMAT_NV12, 0)])
+                .await;
+            s.host_received();
+            let Some(second_signal) = second_signal else {
+                // Reads state no peer can observe: two descriptors of one
+                // file wait the same.
+                let fences = s
+                    .ctx()
+                    .pending_native_creates
+                    .values()
+                    .map(|create| create.sync_fds.len())
+                    .collect::<Vec<_>>();
+                assert_eq!(fences, [2], "shared backing");
+                continue;
+            };
+            let buffer = created(&mut s, params).await;
+            // Plane 0 is done; the commit waits for plane 1.
+            assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+            commit_waits_for_fence(&mut s, buffer, second_signal).await;
         }
     }
 
-    #[test]
-    fn async_created_buffer_destroy_allows_ordered_host_id_reuse() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        create(&mut ctx, PARAMS);
-        let forward = params_event(&mut ctx, evt::created(PARAMS.host, HOST_BUFFER));
-        let first_guest_buffer = ctx
-            .shadow_table
-            .get_guest_id(HOST_BUFFER)
-            .expect("created must allocate a guest server ID");
-        forwarded_created(forward, PARAMS, first_guest_buffer);
-        assert!(ctx.shadow_table.is_guest_server_id(first_guest_buffer));
-        assert!(ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
+    /// A server-created buffer the guest destroys sends the host its
+    /// destructor at once, and no `delete_id` to the guest; the host may
+    /// then create a buffer under the same ID, which the guest gets under
+    /// the guest ID it freed.
+    #[tokio::test]
+    async fn async_created_buffer_destroy_allows_ordered_host_id_reuse() {
+        let (mut s, dmabuf) = dmabuf_session().await;
+        let first = s
+            .created_buffer(dmabuf.id, pipe_fd(), 16, 8, HOST_BUFFER)
+            .await;
 
-        ctx.client_to_host_queue.clear();
-        ctx.last_sender_id = first_guest_buffer;
-        let mut destroy = WireMessage::new(first_guest_buffer, wl_buffer::REQ_DESTROY, &[]);
-        let dispatched = crate::test_support::dispatch_request(&mut ctx, &mut destroy);
-        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
-        assert_eq!(ctx.shadow_table.get_host_id(first_guest_buffer), None);
-        assert_eq!(ctx.shadow_table.get_guest_id(HOST_BUFFER), None);
-        assert!(!ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
-        assert!(ctx.shadow_table.is_host_id_available(HOST_BUFFER));
-        assert!(!ctx
-            .shadow_table
-            .is_pending_destroy_guest(first_guest_buffer));
-        assert!(!ctx.shadow_table.is_retired_host(HOST_BUFFER));
-        assert!(ctx.host_to_client_queue.is_empty());
+        s.guest([wl_buffer::req::destroy(first.id)]).await;
         assert_eq!(
-            decoded(&ctx.client_to_host_queue, wl_buffer::Request::from_wire),
-            [(HOST_BUFFER, wl_buffer::Request::Destroy {})],
+            s.host_received(),
+            [(HOST_BUFFER, wl_buffer::Request::Destroy {}.into())],
             "destroy must queue exactly one host wl_buffer destructor"
         );
+        assert_eq!(s.guest_received(), [], "a server ID gets no delete_id");
 
-        let next_params = Params { guest: 9, host: 10 };
-        create(&mut ctx, next_params);
-        let reused = params_event(&mut ctx, evt::created(next_params.host, HOST_BUFFER));
-        let second_guest_buffer = ctx
-            .shadow_table
-            .get_guest_id(HOST_BUFFER)
-            .expect("reused host buffer ID must map to a new guest server ID");
-        forwarded_created(reused, next_params, second_guest_buffer);
+        let second = s
+            .created_buffer(dmabuf.id, pipe_fd(), 16, 8, HOST_BUFFER)
+            .await;
         assert_eq!(
-            second_guest_buffer, first_guest_buffer,
+            second.id, first.id,
             "a destroyed server-created buffer's guest ID is reused first"
         );
-        assert!(ctx.shadow_table.is_guest_server_id(second_guest_buffer));
-        assert!(ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
-        assert!(!ctx.is_fatal());
     }
 
-    #[test]
-    fn async_dmabuf_failed_event_discards_pending_dimensions() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        create(&mut ctx, PARAMS);
-        assert!(ctx
-            .pending_native_creates
-            .contains_key(&HostId(PARAMS.host)));
+    /// A failed create drops what the create kept: its plane's fence.
+    #[tokio::test]
+    async fn async_dmabuf_failed_event_discards_pending_dimensions() {
+        let (mut s, dmabuf) = dmabuf_session().await;
+        let plane = pipe_fd();
+        let fence = fd_identity(plane.as_raw_fd());
+        let params = create(&mut s, dmabuf.id, plane).await;
 
-        let forward = params_event(&mut ctx, evt::failed(PARAMS.host));
+        s.host([evt::failed(params.host)]).await;
         assert_eq!(
-            decoded(
-                &[forward.expect("failed must still be forwarded to the guest")],
-                zwp_linux_buffer_params_v1::Event::from_wire
-            ),
-            [(PARAMS.guest, zwp_linux_buffer_params_v1::Event::Failed {})]
+            s.guest_received(),
+            [(
+                params.id,
+                zwp_linux_buffer_params_v1::Event::Failed {}.into()
+            )],
+            "failed must still be forwarded to the guest"
         );
-        assert!(ctx.pending_native_creates.is_empty());
-        assert_eq!(ctx.render_buffer_count(), 0);
+        assert!(
+            !any_fd_has_identity(fence),
+            "a failed create must close its fence descriptor"
+        );
     }
 
-    #[test]
-    fn orphaned_async_created_buffer_is_destroyed_locally() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        pending_create(&mut ctx);
-        // This is what the generated params.destroy dispatcher records after
-        // forwarding a destroy request, before the delayed created event can
-        // arrive from the host.
-        ctx.guest_destroyed(PARAMS.guest);
+    /// The host may create a buffer for params the guest has destroyed:
+    /// no guest object can take it, so the proxy destroys it, and the host
+    /// may use its ID again.
+    #[tokio::test]
+    async fn orphaned_async_created_buffer_is_destroyed_locally() {
+        let (mut s, dmabuf) = dmabuf_session().await;
+        let params = create(&mut s, dmabuf.id, pipe_fd()).await;
+        s.guest([req::destroy(params.id)]).await;
+        let destroy = zwp_linux_buffer_params_v1::Request::Destroy {};
+        assert_eq!(s.host_received(), [(params.host, destroy.into())]);
 
-        let forward = params_event(&mut ctx, evt::created(PARAMS.host, HOST_BUFFER));
-        assert!(
-            forward.is_none(),
+        s.host([evt::created(params.host, HOST_BUFFER)]).await;
+        assert_eq!(
+            s.guest_received(),
+            [],
             "orphaned buffer must not be exposed to guest"
         );
-        assert!(ctx.pending_native_creates.is_empty());
-        assert!(!ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
         assert_eq!(
-            decoded(&ctx.client_to_host_queue, wl_buffer::Request::from_wire),
-            [(HOST_BUFFER, wl_buffer::Request::Destroy {})]
+            s.host_received(),
+            [(HOST_BUFFER, wl_buffer::Request::Destroy {}.into())]
         );
-        assert!(
-            ctx.shadow_table.accepts_host_new_id(HOST_BUFFER),
-            "the host frees a server ID once the object is destroyed"
-        );
+        // The host frees a server ID once the object is destroyed.
+        s.created_buffer(dmabuf.id, pipe_fd(), 16, 8, HOST_BUFFER)
+            .await;
     }
 
-    #[test]
-    fn params_delete_id_ends_an_orphaned_async_create() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let fence = pending_create(&mut ctx);
-        ctx.guest_destroyed(PARAMS.guest);
-        assert!(ctx.pending_native_creates.is_empty());
+    /// Destroying params whose create the host has not answered closes the
+    /// create's fence; the host's `delete_id` then ends the params, which
+    /// the guest gets, and frees its host ID.
+    #[tokio::test]
+    async fn params_delete_id_ends_an_orphaned_async_create() {
+        let (mut s, dmabuf) = dmabuf_session().await;
+        let plane = pipe_fd();
+        let fence = fd_identity(plane.as_raw_fd());
+        let params = create(&mut s, dmabuf.id, plane).await;
+
+        s.guest([req::destroy(params.id)]).await;
+        let destroy = zwp_linux_buffer_params_v1::Request::Destroy {};
+        assert_eq!(s.host_received(), [(params.host, destroy.into())]);
         assert!(
             !any_fd_has_identity(fence),
             "destroying the params must close its generation's synchronization descriptor"
         );
-        // The generated dispatcher records the guest destructor after the
-        // handler returns.
-        ctx.guest_destroyed(PARAMS.guest);
-        assert!(ctx.shadow_table.is_pending_destroy_guest(PARAMS.guest));
 
         // The host destroyed the params object before emitting created or
-        // failed, so it can no longer emit either: nothing waits for them,
-        // and the host ID is free for the next object.
-        ctx.last_sender_id = WL_DISPLAY_ID;
+        // failed, so it can no longer emit either.
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, params.host)])
+            .await;
         assert_eq!(
-            <Handlers as WlDisplayHandler>::on_delete_id(&mut ctx, PARAMS.host),
-            Action::Drop
-        );
-        assert!(!ctx.shadow_table.is_pending_destroy_guest(PARAMS.guest));
-        assert_eq!(ctx.shadow_table.get_guest_id(PARAMS.host), None);
-        assert_eq!(ctx.shadow_table.get_host_interface(PARAMS.host), None);
-        assert!(ctx.shadow_table.is_host_id_available(PARAMS.host));
-        assert_eq!(
-            decoded(&ctx.host_to_client_queue, wl_display::Event::from_wire),
+            s.guest_received(),
             [(
                 WL_DISPLAY_ID,
-                wl_display::Event::DeleteId { id: PARAMS.guest }
+                wl_display::Event::DeleteId { id: params.id }.into()
             )],
             "params delete_id must still reach the guest"
+        );
+        let next = params_with(&mut s, dmabuf.id, Vec::new()).await;
+        assert_eq!(
+            next.host, params.host,
+            "the host ID is free for the next object"
         );
     }
 }

@@ -179,12 +179,6 @@ pub fn protocol_error(ctx: &crate::state::Context) -> (u32, u32) {
     (word(8), word(12))
 }
 
-/// The code of the `wl_display.error` that ends the session with the
-/// message `ctx` is dispatching.
-pub fn protocol_error_code(ctx: &crate::state::Context) -> u32 {
-    protocol_error(ctx).1
-}
-
 /// The `(sender, opcode)` of every message in a proxy message queue.
 pub fn queued_headers(queue: &[crate::wire::Outgoing]) -> Vec<(u32, u16)> {
     queue
@@ -379,59 +373,10 @@ pub enum BufferKind {
 
 pub const BUFFER_KINDS: [BufferKind; 2] = [BufferKind::Shm, BufferKind::Native];
 
-/// Register a 1x1 `kind` buffer `guest_id`, paired with host buffer
-/// `host_id`. An SHM buffer's host copy is wholly stale, as a new one's
-/// is, so a commit of it copies its pixels.
-pub fn register_test_buffer(
-    ctx: &mut crate::state::Context,
-    kind: BufferKind,
-    guest_id: u32,
-    host_id: u32,
-) {
-    use crate::state::StalePixels;
-    ctx.shadow_table
-        .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
-    assert!(match kind {
-        BufferKind::Shm => ctx.register_local_buffer(
-            guest_id,
-            host_id,
-            mapped_test_buffer(1, 1, 4, StalePixels::all())
-        ),
-        BufferKind::Native => ctx.register_native_buffer(host_id, (1, 1), Vec::new()),
-    });
-}
-
 /// A host copy that holds `bytes`: a mapping of a memfd.
 pub fn host_mapping(bytes: &[u8]) -> crate::state::HostMapping {
     crate::state::HostMapping::map_shared(shm_pool_file(bytes).as_fd(), bytes.len(), 0)
         .expect("a mapping of a memfd")
-}
-
-/// The state of a `width`x`height` local-copy buffer with rows of `stride`
-/// bytes, from a pool of zeros, whose host copy is a mapping a test can
-/// read.
-pub fn mapped_test_buffer(
-    width: i32,
-    height: i32,
-    stride: u32,
-    stale: crate::state::StalePixels,
-) -> crate::state::BufferState {
-    let size = usize::try_from(height).unwrap() * stride as usize;
-    crate::state::BufferState {
-        pool_file: std::sync::Arc::new(shm_pool_file(&vec![0; size])),
-        offset: 0,
-        width,
-        height,
-        stride,
-        format: 0,
-        dmabuf_fd: None,
-        dest_stride: stride,
-        dmabuf_plane1_offset: 0,
-        dmabuf_plane1_stride: 0,
-        dmabuf_sync: false,
-        host_copy: Some(host_mapping(&vec![0; size])),
-        stale,
-    }
 }
 
 /// A seeded pseudo-random generator (SplitMix64) for randomized tests.

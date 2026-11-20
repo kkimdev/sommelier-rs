@@ -235,87 +235,150 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
 
 #[cfg(test)]
 mod tests {
-    use super::retire_eligible_buffers;
-    use crate::handler::test_support::{
-        buffer_host_destroy_is_queued, buffer_is_guest_destroyed, mark_test_buffer_guest_destroyed,
-    };
-    use crate::handler::Handlers;
-    use crate::protocols::wayland::wl_buffer;
-    use crate::protocols::wayland::wl_buffer::WlBufferHandler;
-    use crate::protocols::Iface;
-    use crate::state::{Context, HostId};
-    use crate::test_support::{queued_headers, register_test_buffer, BufferKind, BUFFER_KINDS};
-    use crate::wire::Action;
+    use crate::protocols::wayland::{wl_buffer, wl_display, wl_shm, wl_surface};
+    use crate::protocols::AnyRequest;
+    use crate::proxy::harness::{Object, Session};
+    use crate::state::Context;
+    use crate::test_support::wire_peer::SERVER_ID_START;
+    use crate::test_support::{shm_pool_file, BufferKind, BUFFER_KINDS};
+    use crate::wire::WL_DISPLAY_ID;
 
-    fn register_test_server_native(ctx: &mut Context, host_id: u32) -> u32 {
-        let guest_id = ctx
-            .shadow_table
-            .adopt_host_created(host_id, Iface::WlBuffer, 1);
-        assert!(ctx.register_native_buffer(host_id, (1, 1), Vec::new()));
-        guest_id
+    /// The first server ID, under which the host creates a buffer.
+    const HOST_BUFFER: u32 = SERVER_ID_START;
+
+    /// A session with GPU access whose guest has bound `wl_shm` and the
+    /// host's linux-dmabuf, so that it can make buffers of either kind.
+    struct Guest {
+        s: Session,
+        shm: u32,
+        dmabuf: u32,
     }
 
-    #[test]
-    fn destroying_a_submitted_buffer_defers_its_host_destroy_until_release() {
-        let (guest_buffer, host_buffer, surface) = (20, 30, 40);
+    impl Guest {
+        async fn new() -> Self {
+            let mut s = Session::with_context(Context::new_for_test(true, false, vec![]));
+            let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+            let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await.id;
+            Self { s, shm, dmabuf }
+        }
+
+        /// A new 1x1 buffer of `kind`.
+        async fn buffer(&mut self, kind: BufferKind) -> Object {
+            let pixels = shm_pool_file(&[0; 4]);
+            match kind {
+                BufferKind::Shm => {
+                    let pool = self.s.shm_pool(self.shm, pixels).await;
+                    self.s.shm_buffer(pool, 1, 1).await
+                }
+                BufferKind::Native => {
+                    let s = &mut self.s;
+                    s.native_buffer(self.dmabuf, pixels.into(), 1, 1).await
+                }
+            }
+        }
+
+        /// A new 1x1 buffer that the host creates under [`HOST_BUFFER`].
+        async fn created_buffer(&mut self) -> Object {
+            let plane = shm_pool_file(&[0; 4]).into();
+            let s = &mut self.s;
+            s.created_buffer(self.dmabuf, plane, 1, 1, HOST_BUFFER)
+                .await
+        }
+
+        /// The guest attaches `buffer`, or detaches with `None`, and
+        /// commits `surface`, which reaches the host; returns what the host
+        /// got.
+        async fn commit(
+            &mut self,
+            surface: Object,
+            buffer: Option<Object>,
+        ) -> Vec<(u32, AnyRequest)> {
+            self.s
+                .guest([
+                    wl_surface::req::attach(surface.id, buffer.map(|buffer| buffer.id), 0, 0),
+                    wl_surface::req::commit(surface.id),
+                ])
+                .await;
+            let received = self.s.host_received();
+            assert!(
+                matches!(
+                    received.last(),
+                    Some((host, AnyRequest::WlSurface(wl_surface::Request::Commit {})))
+                        if *host == surface.host
+                ),
+                "the commit reached the host: {received:?}"
+            );
+            received
+        }
+
+        /// The host releases `buffer`, which the guest gets.
+        async fn release(&mut self, buffer: Object) {
+            self.s.host([wl_buffer::evt::release(buffer.host)]).await;
+            assert_eq!(
+                self.s.guest_received(),
+                [(buffer.id, wl_buffer::Event::Release {}.into())]
+            );
+        }
+
+        /// The host acknowledges the destructor of client-range `buffer`,
+        /// whose `delete_id` the guest gets: the proxy kept its host ID
+        /// until then.
+        async fn delete_id(&mut self, buffer: Object) {
+            self.s
+                .host([wl_display::evt::delete_id(WL_DISPLAY_ID, buffer.host)])
+                .await;
+            assert_eq!(
+                self.s.guest_received(),
+                [(
+                    WL_DISPLAY_ID,
+                    wl_display::Event::DeleteId { id: buffer.id }.into()
+                )]
+            );
+        }
+    }
+
+    /// The host's `wl_buffer.destroy` of `buffer`.
+    fn host_destroy(buffer: Object) -> (u32, AnyRequest) {
+        (buffer.host, wl_buffer::Request::Destroy {}.into())
+    }
+
+    /// A buffer the host still holds outlives the guest's destroy: the
+    /// host's release then destroys the host buffer, once, and the guest
+    /// gets the `delete_id` only when the host acknowledges it.
+    #[tokio::test]
+    async fn destroying_a_submitted_buffer_defers_its_host_destroy_until_release() {
         for (kind, shown) in BUFFER_KINDS
             .into_iter()
             .flat_map(|kind| [(kind, false), (kind, true)])
         {
             let case = format!("{kind:?}, shown on a surface: {shown}");
-            let mut ctx = Context::new_for_test(false, false, vec![]);
-            register_test_buffer(&mut ctx, kind, guest_buffer, host_buffer);
-            if shown {
-                ctx.surface_for_test(surface)
-                    .set_current_buffer_for_test(Some(guest_buffer), Some((1, 1)));
+            let mut g = Guest::new().await;
+            let surface = g.s.surface().await;
+            let buffer = g.buffer(kind).await;
+            g.commit(surface, Some(buffer)).await;
+            if !shown {
+                g.commit(surface, None).await;
             }
-            assert!(ctx.mark_buffer_submitted(guest_buffer));
 
-            ctx.last_sender_id = guest_buffer;
+            g.s.guest([wl_buffer::req::destroy(buffer.id)]).await;
             assert_eq!(
-                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-            assert!(buffer_is_guest_destroyed(&ctx, guest_buffer), "{case}");
-            assert!(ctx.buffer_is_submitted(guest_buffer), "{case}");
-            assert_eq!(
-                ctx.shadow_table.get_host_id(guest_buffer),
-                Some(host_buffer),
-                "the host mapping stays reserved until release ({case})"
-            );
-            assert!(
-                ctx.shadow_table.is_pending_destroy_guest(guest_buffer),
-                "{case}"
-            );
-            assert_eq!(
-                ctx.client_to_host_queue.len(),
-                0,
+                g.s.host_received(),
+                [],
                 "the host buffer stays alive until its release ({case})"
             );
+            assert_eq!(g.s.guest_received(), [], "{case}");
 
-            ctx.last_sender_id = host_buffer;
+            g.s.host([wl_buffer::evt::release(buffer.host)]).await;
             assert_eq!(
-                <Handlers as WlBufferHandler>::on_release(&mut ctx),
-                Action::Drop
-            );
-            assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer), "{case}");
-            assert!(!ctx.buffer_is_submitted(guest_buffer), "{case}");
-            assert_eq!(
-                ctx.shadow_table.get_host_id(guest_buffer),
-                Some(host_buffer),
-                "{case}"
-            );
-            assert!(
-                ctx.shadow_table.is_pending_destroy_guest(guest_buffer),
-                "{case}"
-            );
-            assert_eq!(
-                queued_headers(&ctx.client_to_host_queue),
-                [(host_buffer, wl_buffer::REQ_DESTROY)],
+                g.s.host_received(),
+                [host_destroy(buffer)],
                 "release queues the deferred host destroy once ({case})"
             );
+            assert_eq!(g.s.guest_received(), [], "{case}");
             if shown {
-                let surface = &ctx.surfaces[&surface];
+                // Reads state no peer can observe: what the surface
+                // remembers of the content it shows.
+                let surface = &g.s.ctx().surfaces[&surface.id];
                 assert_eq!(surface.current_buffer_id(), None, "{case}");
                 assert_eq!(
                     surface.current_buffer_dimensions(),
@@ -324,232 +387,141 @@ mod tests {
                      content metadata ({case})"
                 );
             }
+            g.delete_id(buffer).await;
         }
     }
 
-    #[test]
-    fn a_release_before_guest_destroy_is_recorded_and_destroy_is_immediate() {
-        let (guest_buffer, host_buffer, surface) = (20, 30, 40);
+    /// A release that came before the guest's destroy needs no second
+    /// one, which cannot come: the destroy reaches the host at once, even
+    /// while a surface still shows the buffer.
+    #[tokio::test]
+    async fn a_release_before_guest_destroy_is_recorded_and_destroy_is_immediate() {
         for (kind, shown) in BUFFER_KINDS
             .into_iter()
             .flat_map(|kind| [(kind, false), (kind, true)])
         {
             let case = format!("{kind:?}, shown on a surface: {shown}");
-            let mut ctx = Context::new_for_test(false, false, vec![]);
-            register_test_buffer(&mut ctx, kind, guest_buffer, host_buffer);
-            assert!(ctx.mark_buffer_submitted(guest_buffer));
-
-            ctx.last_sender_id = host_buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_release(&mut ctx),
-                Action::Forward
-            );
-            assert!(ctx.buffer_is_released(guest_buffer), "{case}");
-
-            // The surface may still show the released buffer. Destroying the
-            // guest object uses the recorded release instead of waiting for
-            // a second one that cannot arrive.
-            if shown {
-                ctx.surface_for_test(surface)
-                    .set_current_buffer_for_test(Some(guest_buffer), None);
+            let mut g = Guest::new().await;
+            let surface = g.s.surface().await;
+            let buffer = g.buffer(kind).await;
+            g.commit(surface, Some(buffer)).await;
+            g.release(buffer).await;
+            if !shown {
+                g.commit(surface, None).await;
             }
-            ctx.last_sender_id = guest_buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-            assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer), "{case}");
-            assert!(ctx.host_buffer_use(guest_buffer).is_none(), "{case}");
-            assert_eq!(
-                queued_headers(&ctx.client_to_host_queue),
-                [(host_buffer, wl_buffer::REQ_DESTROY)],
-                "{case}"
-            );
-            assert_eq!(
-                ctx.shadow_table.get_host_id(guest_buffer),
-                Some(host_buffer),
-                "{case}"
-            );
-            assert!(
-                ctx.shadow_table.is_pending_destroy_guest(guest_buffer),
-                "{case}"
-            );
+
+            g.s.guest([wl_buffer::req::destroy(buffer.id)]).await;
+            assert_eq!(g.s.host_received(), [host_destroy(buffer)], "{case}");
+            assert_eq!(g.s.guest_received(), [], "{case}");
+            g.delete_id(buffer).await;
         }
     }
 
-    #[test]
-    fn destroying_idle_server_created_buffer_ends_without_delete_id() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_buffer = 0xff00_0030;
-        let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
+    /// A server-created buffer the host still holds also outlives the
+    /// guest's destroy until the host releases it; neither side sends a
+    /// `delete_id` for it, and its host ID is free once its destructor is
+    /// sent.
+    #[tokio::test]
+    async fn destroying_submitted_server_created_buffer_retires_after_release() {
+        let mut g = Guest::new().await;
+        let surface = g.s.surface().await;
+        let buffer = g.created_buffer().await;
+        g.commit(surface, Some(buffer)).await;
 
-        ctx.last_sender_id = guest_buffer;
+        g.s.guest([wl_buffer::req::destroy(buffer.id)]).await;
         assert_eq!(
-            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
-        assert_eq!(ctx.shadow_table.get_guest_id(host_buffer), None);
-        assert!(!ctx.shadow_table.is_retired_host(host_buffer));
-        assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
-        assert!(ctx.shadow_table.is_host_id_available(host_buffer));
-        assert!(ctx.host_to_client_queue.is_empty());
-
-        let reused_guest = register_test_server_native(&mut ctx, host_buffer);
-        assert_eq!(
-            reused_guest, guest_buffer,
-            "a destroyed server-created buffer's guest ID is reused first"
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_id(reused_guest),
-            Some(host_buffer),
-            "a later ordered host event may reuse the server-owned buffer ID"
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "server-created guest IDs never receive wl_display.delete_id"
-        );
-    }
-
-    #[test]
-    fn destroying_submitted_server_created_buffer_retires_after_release() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_buffer = 0xff00_0030;
-        let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
-        ctx.mark_buffer_submitted(guest_buffer);
-
-        ctx.last_sender_id = guest_buffer;
-        assert_eq!(
-            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_id(guest_buffer),
-            Some(host_buffer),
+            g.s.host_received(),
+            [],
             "the mapping must remain until a delayed host release can resolve"
         );
-        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
-        assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
+        g.s.host([wl_buffer::evt::release(buffer.host)]).await;
+        assert_eq!(g.s.host_received(), [host_destroy(buffer)]);
+        assert_eq!(g.s.guest_received(), [], "server IDs get no delete_id");
 
-        ctx.last_sender_id = host_buffer;
-        assert_eq!(
-            <Handlers as WlBufferHandler>::on_release(&mut ctx),
-            Action::Drop
-        );
-        assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
-        assert_eq!(ctx.shadow_table.get_guest_id(host_buffer), None);
-        assert!(!ctx.shadow_table.is_retired_host(host_buffer));
-        assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
-        assert!(ctx.shadow_table.is_host_id_available(host_buffer));
-        assert!(ctx.host_to_client_queue.is_empty());
+        let reused = g.created_buffer().await;
+        assert_eq!(reused.id, buffer.id);
     }
 
-    #[test]
-    fn released_server_created_buffer_retires_on_later_guest_destroy() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_buffer = 0xff00_0030;
-        let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
-        ctx.mark_buffer_submitted(guest_buffer);
+    /// A released server-created buffer goes at the guest's destroy.
+    #[tokio::test]
+    async fn released_server_created_buffer_retires_on_later_guest_destroy() {
+        let mut g = Guest::new().await;
+        let surface = g.s.surface().await;
+        let buffer = g.created_buffer().await;
+        g.commit(surface, Some(buffer)).await;
+        g.release(buffer).await;
 
-        ctx.last_sender_id = host_buffer;
-        assert_eq!(
-            <Handlers as WlBufferHandler>::on_release(&mut ctx),
-            Action::Forward
-        );
-        assert!(ctx.buffer_is_released(guest_buffer));
+        g.s.guest([wl_buffer::req::destroy(buffer.id)]).await;
+        assert_eq!(g.s.host_received(), [host_destroy(buffer)]);
+        assert_eq!(g.s.guest_received(), [], "server IDs get no delete_id");
 
-        ctx.last_sender_id = guest_buffer;
-        assert_eq!(
-            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
-        assert!(!ctx.shadow_table.is_retired_host(host_buffer));
-        assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
-        assert!(ctx.shadow_table.is_host_id_available(host_buffer));
-        assert!(ctx.host_to_client_queue.is_empty());
+        let reused = g.created_buffer().await;
+        assert_eq!(reused.id, buffer.id);
     }
 
-    #[test]
-    fn local_copy_and_native_buffers_share_one_retirement_oracle() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let local_buffer = 20;
-        let local_host = 30;
-        let native_buffer = 21;
-        let native_host = 31;
+    /// A destroyed buffer attached again but not committed waits for that
+    /// attach even once released: a commit could still show it. Replacing
+    /// the attach retires it, after the attach that replaced it. SHM and
+    /// native buffers make the same decision.
+    #[tokio::test]
+    async fn local_copy_and_native_buffers_share_one_retirement_oracle() {
+        for kind in BUFFER_KINDS {
+            let mut g = Guest::new().await;
+            let surface = g.s.surface().await;
+            let buffer = g.buffer(kind).await;
+            g.commit(surface, Some(buffer)).await;
+            g.s.guest([wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0)])
+                .await;
+            g.s.host_received();
+            g.s.guest([wl_buffer::req::destroy(buffer.id)]).await;
+            g.s.host([wl_buffer::evt::release(buffer.host)]).await;
+            assert_eq!(g.s.host_received(), [], "{kind:?}");
+            assert_eq!(g.s.guest_received(), [], "{kind:?}");
 
-        register_test_buffer(&mut ctx, BufferKind::Shm, local_buffer, local_host);
-        register_test_buffer(&mut ctx, BufferKind::Native, native_buffer, native_host);
-        for guest_id in [local_buffer, native_buffer] {
-            mark_test_buffer_guest_destroyed(&mut ctx, guest_id);
-            assert!(ctx.mark_buffer_submitted(guest_id));
-            assert!(ctx.mark_buffer_released(guest_id));
+            g.s.guest([wl_surface::req::attach(surface.id, None, 0, 0)])
+                .await;
+            let detach = wl_surface::Request::Attach {
+                buffer: 0,
+                x: 0,
+                y: 0,
+            };
+            assert_eq!(
+                g.s.host_received(),
+                [(surface.host, detach.into()), host_destroy(buffer)],
+                "local-copy and native buffers must make the same lifecycle decision ({kind:?})"
+            );
+            g.delete_id(buffer).await;
         }
-        ctx.surface_for_test(40).pending.attachment =
-            crate::state::SurfaceAttachment::Attach(local_buffer);
-        ctx.surface_for_test(41).pending.attachment =
-            crate::state::SurfaceAttachment::Attach(native_buffer);
-
-        retire_eligible_buffers(&mut ctx);
-        assert!(buffer_is_guest_destroyed(&ctx, local_buffer));
-        assert!(buffer_is_guest_destroyed(&ctx, native_buffer));
-
-        ctx.surfaces.get_mut(&40).unwrap().pending.attachment =
-            crate::state::SurfaceAttachment::Detach;
-        ctx.surfaces.get_mut(&41).unwrap().pending.attachment =
-            crate::state::SurfaceAttachment::Detach;
-        retire_eligible_buffers(&mut ctx);
-
-        assert!(buffer_host_destroy_is_queued(&ctx, local_buffer));
-        assert!(buffer_host_destroy_is_queued(&ctx, native_buffer));
-        assert!(ctx.host_buffer_use(local_buffer).is_none());
-        assert!(ctx.host_buffer_use(native_buffer).is_none());
-        let mut destroyed_hosts = ctx
-            .client_to_host_queue
-            .iter()
-            .map(|(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap()))
-            .collect::<Vec<_>>();
-        destroyed_hosts.sort_unstable();
-        assert_eq!(
-            destroyed_hosts,
-            vec![local_host, native_host],
-            "local-copy and native buffers must make the same lifecycle decision"
-        );
     }
 
-    #[test]
-    fn retired_collection_waits_for_host_release() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let guest_buffer = 20;
-        let host_buffer = 30;
-        register_test_buffer(&mut ctx, BufferKind::Shm, guest_buffer, host_buffer);
-        ctx.mark_buffer_submitted(guest_buffer);
-        mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
-        assert!(
-            ctx.shadow_table.is_pending_destroy_guest(guest_buffer),
+    /// A commit that replaces a destroyed buffer the host has not released
+    /// leaves its host buffer alone; the host's release then retires it.
+    #[tokio::test]
+    async fn retired_collection_waits_for_host_release() {
+        let mut g = Guest::new().await;
+        let surface = g.s.surface().await;
+        let buffer = g.buffer(BufferKind::Shm).await;
+        let next = g.buffer(BufferKind::Shm).await;
+        g.commit(surface, Some(buffer)).await;
+        g.s.guest([wl_buffer::req::destroy(buffer.id)]).await;
+        assert_eq!(g.s.host_received(), []);
+        assert_eq!(
+            g.s.guest_received(),
+            [],
             "the guest object waits for the host to release the buffer"
         );
 
-        retire_eligible_buffers(&mut ctx);
-        assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
-
-        assert!(ctx.mark_buffer_released(guest_buffer));
-        retire_eligible_buffers(&mut ctx);
-        assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
-        assert_eq!(
-            ctx.shadow_table.get_host_id(guest_buffer),
-            Some(host_buffer),
-            "the host mapping remains reserved until wl_display.delete_id"
-        );
-        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
+        let committed = g.commit(surface, Some(next)).await;
         assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .any(
-                    |(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap())
-                        == host_buffer
-                ),
+            !committed.contains(&host_destroy(buffer)),
+            "the host still holds the buffer: {committed:?}"
+        );
+        g.s.host([wl_buffer::evt::release(buffer.host)]).await;
+        assert_eq!(
+            g.s.host_received(),
+            [host_destroy(buffer)],
             "retiring a released buffer must queue its host destructor"
         );
+        g.delete_id(buffer).await;
     }
 }

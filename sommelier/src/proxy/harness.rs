@@ -789,6 +789,83 @@ pub(crate) fn default_keymap() -> Vec<u8> {
     text
 }
 
+/// Globals the proxy binds for itself, and native buffers the host
+/// creates.
+impl Session {
+    /// The host advertises global `interface` at `version`, which the
+    /// proxy binds for itself; returns the global's name and the host
+    /// object the proxy binds. What the guest gets for the global is kept,
+    /// and so is what the proxy sends the host besides the bind.
+    pub(crate) async fn advertise_internal(&mut self, interface: &str, version: u32) -> (u32, u32) {
+        self.registry().await;
+        let earlier = self.host.received.len();
+        let name = self.advertise(interface, version).await;
+        let bind = self.host.received[earlier..]
+            .iter()
+            .position(|(_, request)| {
+                matches!(
+                    request,
+                    AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. })
+                        if id.0 == interface
+                )
+            })
+            .unwrap_or_else(|| {
+                let host = &self.host.received[earlier..];
+                panic!("the proxy did not bind {interface}: {host:?}")
+            });
+        let (_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. })) =
+            self.host.received.remove(earlier + bind)
+        else {
+            unreachable!("the request found is a bind");
+        };
+        (name, id.2)
+    }
+
+    /// A new `width`x`height` XRGB8888 native `wl_buffer` that the host
+    /// creates under `host`, its next server ID, for the guest's
+    /// asynchronous `create` through its linux-dmabuf `dmabuf`, whose one
+    /// plane is `plane` with rows of `4 * width` bytes. The guest gets the
+    /// `created` event, and then destroys the params. What the proxy sends
+    /// the host for it is not kept.
+    pub(crate) async fn created_buffer(
+        &mut self,
+        dmabuf: u32,
+        plane: OwnedFd,
+        width: i32,
+        height: i32,
+        host: u32,
+    ) -> Object {
+        use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
+        const XRGB8888: u32 = 0x3432_5258;
+        let earlier = self.host.received.len();
+        let params = self.new_id();
+        let host_params = self
+            .create(zwp_linux_dmabuf_v1::req::create_params(dmabuf, params))
+            .await;
+        let stride = 4 * u32::try_from(width).expect("a width of at least 0");
+        self.guest([
+            zwp_linux_buffer_params_v1::req::add(params, plane, 0, 0, stride, 0, 0),
+            zwp_linux_buffer_params_v1::req::create(params, width, height, XRGB8888, 0),
+        ])
+        .await;
+        self.host([zwp_linux_buffer_params_v1::evt::created(host_params, host)])
+            .await;
+        let received = self.guest_received();
+        let [(
+            sender,
+            AnyEvent::ZwpLinuxBufferParamsV1(zwp_linux_buffer_params_v1::Event::Created { buffer }),
+        )] = received[..]
+        else {
+            panic!("the guest got no buffer: {received:?}");
+        };
+        assert_eq!(sender, params, "another params got the buffer");
+        self.guest([zwp_linux_buffer_params_v1::req::destroy(params)])
+            .await;
+        self.host.received.truncate(earlier);
+        Object { id: buffer, host }
+    }
+}
+
 impl Drop for Session {
     /// A test reads all the proxy sent, so that nothing it did not expect
     /// goes unnoticed.
