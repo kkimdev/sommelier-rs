@@ -221,6 +221,9 @@ struct Entry {
 struct Armed {
     watches: BTreeMap<WatchDescriptor, (AddWatchFlags, Watch)>,
     directories: usize,
+    /// A path exchanged its inode while this armed, so a watch may name
+    /// an inode the path no longer leads to.
+    changed: bool,
     /// A failure other than a missing or unwatchable directory.
     error: Option<Errno>,
 }
@@ -367,9 +370,9 @@ impl Watcher {
     /// Watch, on every path of the [`chain`] as it is now, the file, the
     /// deepest directory that exists and that directory's parent, and each
     /// link of the chain where it is, and nothing else. A directory on a
-    /// path that appears while this arms makes it start over; the watches
-    /// of an attempt that starts over are removed unless the last one
-    /// keeps them.
+    /// path that appears while this arms, or a path whose inode changes
+    /// while it is watched, makes it start over; the watches of an attempt
+    /// that starts over are removed unless the last one keeps them.
     ///
     /// # Errors
     ///
@@ -392,7 +395,7 @@ impl Watcher {
             for link in &chain.links {
                 self.arm_link(&mut armed, link);
             }
-            if settled {
+            if settled && !armed.changed {
                 break;
             }
         }
@@ -512,6 +515,12 @@ impl Watcher {
     /// new to this arming takes exactly its events, which drops those an
     /// earlier arming asked of the inode.
     ///
+    /// A watch new to the arming is made twice: the first names the inode
+    /// the watch is for, and the second sets its events, since only a new
+    /// watch can drop events. If the path's inode changed between them, the
+    /// second watch names another inode, which this arming does not keep:
+    /// it is removed, and `armed` records that the arming must start over.
+    ///
     /// # Returns
     ///
     /// Whether the watch was made, new or joined, or not, for a missing,
@@ -544,7 +553,15 @@ impl Watcher {
                     Ok(Added::Joined)
                 }
                 None => {
-                    inotify.add_watch(path, events)?;
+                    let second = inotify.add_watch(path, events)?;
+                    if second != watch {
+                        // The path's inode changed between the two watches,
+                        // so the second one names an inode this arming does
+                        // not keep; remove it rather than leak it, and arm
+                        // again where the path leads now.
+                        let _ = inotify.rm_watch(second);
+                        armed.changed = true;
+                    }
                     armed.watches.insert(watch, (events, watch_for));
                     Ok(Added::New)
                 }
