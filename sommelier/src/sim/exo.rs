@@ -1369,14 +1369,21 @@ impl Exo {
 
     /// `InputMethodAsh::ConfirmComposition(reset_engine = true)` for text
     /// input `id`, which IMA serves. With only a commit buffered, nothing
-    /// happens. Otherwise a buffered composition is shown, the composition
+    /// happens. Otherwise a buffered region is composed, which makes IMA
+    /// composing, and then a buffered composition is shown; the composition
     /// Exo tracks is confirmed if there is one, or always where the
     /// extension has `confirm_preedit` (`SupportsAlwaysConfirmComposition`),
     /// and IMA resets, keeping the buffered commit. Returns whether it
-    /// showed the buffered composition.
+    /// sent the buffered region or composition.
     fn confirm_composition(&mut self, id: u32) -> bool {
-        if self.ima.commit.is_some() && self.ima.composition.is_none() {
+        let ima = &self.ima;
+        if ima.commit.is_some() && ima.composition.is_none() && ima.region.is_none() {
             return false;
+        }
+        let region = self.ima.region.take();
+        if let Some((before, after)) = region {
+            self.set_composition_from_existing_text(id, before, after);
+            self.ima.composing = true;
         }
         let shown = self.ima.composition.take();
         if let Some(text) = &shown {
@@ -1390,7 +1397,7 @@ impl Exo {
         let commit = self.ima.commit.take();
         self.reset_context();
         self.ima.commit = commit;
-        shown.is_some()
+        region.is_some() || shown.is_some()
     }
 
     /// `TextInput::ConfirmCompositionText(keep_selection = true)`: with

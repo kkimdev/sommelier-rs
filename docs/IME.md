@@ -706,7 +706,10 @@ for user actions (U→E), and the mojo pipe between Exo and the engine
   IMA's rules: it buffers a key's text until the engine's callback for
   that key; a handled press goes out before its text, and an unhandled
   press after its text (E8); an unhandled press is preceded by a
-  confirmation (E13); a reset drops IMA's buffer (E5).
+  confirmation (E13), which first composes a buffered region and shows a
+  buffered composition, unless IMA holds only a commit
+  (`InputMethodAsh::ConfirmComposition`); a reset drops IMA's buffer
+  (E5).
 - **Keys.** A key on the focused surface with an attached text input
   goes to the engine. **With no attached text input, the key goes raw
   (E7)**: during a drain or before the first `activate`. The keyboard
