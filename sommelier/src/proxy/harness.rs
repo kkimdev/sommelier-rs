@@ -22,11 +22,14 @@ limitations under the License.
 //! `req::` and `evt::` encoders, it dispatches them as `Client::run` does,
 //! and it decodes everything the proxy sends either peer into typed
 //! messages ([`AnyRequest`], [`AnyEvent`]). Like a Wayland client library,
-//! each peer learns an object's interface from the message that creates
-//! it, so a test names objects by their IDs on the wire, learns host IDs
-//! from the forwarded requests and never reads the object table. Every
-//! batch that keeps the session checks that the proxy holds no state for an
-//! ended object (`Context::assert_no_orphans`).
+//! each peer follows its objects through the messages that create and end
+//! them ([`wire_peer`]), so a test names objects by their IDs on the wire,
+//! learns host IDs from the forwarded requests and never reads the object
+//! table, and each peer holds what the proxy sends it to the protocol: it
+//! names only objects the peer has, creates objects under free IDs of the
+//! proxy's range and ends them as the protocol allows. Every batch that
+//! keeps the session checks that the proxy holds no state for an ended
+//! object (`Context::assert_no_orphans`).
 
 use super::{Client, Direction, ParkedRequest};
 use crate::connection::WaylandConnection;
@@ -34,9 +37,9 @@ use crate::protocols::wayland::{wl_compositor, wl_display, wl_registry};
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::state::Context;
 use crate::test_support::counting::Counts;
-use crate::test_support::decode;
-use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage, WL_DISPLAY_ID};
-use std::collections::{BTreeMap, VecDeque};
+use crate::test_support::wire_peer::{self, Message, Role};
+use crate::wire::{Framing, MessageHeader, Outgoing, WL_DISPLAY_ID};
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
@@ -72,8 +75,8 @@ impl Session {
             |socket: UnixStream| WaylandConnection::new(socket.into()).expect("register a socket");
         Self {
             client: Client::new(connection(guest_socket), connection(host_socket), ctx),
-            guest: Peer::new(connection(guest)),
-            host: Peer::new(connection(host)),
+            guest: Peer::new(connection(guest), Role::Client),
+            host: Peer::new(connection(host), Role::Server),
             next_id: WL_DISPLAY_ID + 1,
             next_global_name: 1,
             registry: None,
@@ -224,14 +227,38 @@ impl Session {
         id
     }
 
+    /// Pair guest object `id` with host object `host`, of `interface` at
+    /// `version`, as the proxy pairs an object that no peer here can have
+    /// it create, such as a native dma-buf buffer: the proxy and both peers
+    /// have it from now on.
+    pub(crate) fn pair_for_test(
+        &mut self,
+        id: u32,
+        host: u32,
+        interface: &'static str,
+        version: u32,
+    ) {
+        let shadow_table = &mut self.client.ctx.shadow_table;
+        shadow_table.insert_paired_with_version_for_test(id, host, interface, version);
+        self.guest.wire.adopt(id, interface, version);
+        self.host.wire.adopt(host, interface, version);
+    }
+
+    /// Let the proxy end on its own the guest objects for which
+    /// `may_end(id, interface)` holds, as it does when the host ends their
+    /// host objects. By default it may end only the frame callbacks of a
+    /// surface that ended (`wire_peer::Peer::server_may_end`).
+    pub(crate) fn host_may_end(&mut self, may_end: impl Fn(u32, &str) -> bool + Send + 'static) {
+        self.guest.wire.server_may_end(may_end);
+    }
+
     /// The guest sends `request`, which creates one object; returns the host
     /// ID of the object its forward creates. The forward is not kept for
     /// [`Self::host_received`].
     pub(crate) async fn create(&mut self, request: Outgoing) -> u32 {
         let (_, interface) = self
             .guest
-            .objects
-            .learn::<AnyRequest>(&request)
+            .created::<AnyRequest>(&request)
             .expect("the request creates an object");
         let earlier = self.host.received.len();
         self.guest([request]).await;
@@ -355,27 +382,30 @@ impl Session {
         *self.registry.insert(Object { id, host })
     }
 
-    /// Queue `messages` on the proxy's connection to their sender and
-    /// dispatch them as `Client::run` does, up to a guest request that
-    /// waits for a fence ([`Self::resume`]); returns whether the session
-    /// goes on. It dispatches one direction and then sends everything, so
-    /// it never interleaves directions, and cannot show when a batch's
-    /// output leaves relative to the other peer's batches; the tests of
-    /// that drive `Client::handle_msgs` directly.
+    /// Send `messages` over their sender's socket, which the proxy
+    /// receives as `Client::run` does, and dispatch them, up to a guest
+    /// request that waits for a fence ([`Self::resume`]); returns whether
+    /// the session goes on. It dispatches one direction and then sends
+    /// everything, so it never interleaves directions, and cannot show when
+    /// a batch's output leaves relative to the other peer's batches; the
+    /// tests of that drive `Client::handle_msgs` directly.
     async fn send(
         &mut self,
         direction: Direction,
         messages: impl IntoIterator<Item = Outgoing>,
     ) -> bool {
         for message in messages {
-            match direction {
-                Direction::ClientToHost => self.guest.objects.learn::<AnyRequest>(&message),
-                Direction::HostToClient => self.host.objects.learn::<AnyEvent>(&message),
+            let peer = match direction {
+                Direction::ClientToHost => &mut self.guest.wire,
+                Direction::HostToClient => &mut self.host.wire,
             };
-            let (bytes, fds) = message;
-            let connection = self.client.connection_mut(direction);
-            connection.read_buf.extend(bytes);
-            connection.read_fds.extend(fds);
+            peer.send(&message);
+            if !self.transmit(direction, message) {
+                // The proxy refuses what it received, as `Client::run`
+                // ends the session on a failed receive.
+                self.client.ended = true;
+                return false;
+            }
         }
         let before = Counts::now();
         let goes_on = loop {
@@ -391,6 +421,54 @@ impl Session {
         self.guest.receive();
         self.host.receive();
         goes_on
+    }
+}
+
+/// The transport between each peer and the proxy.
+impl Session {
+    /// Write `bytes` to the socket of the peer that sends in `direction`,
+    /// `fds` with their first byte, a receive's worth at a time, and have
+    /// the proxy receive each piece, as `Client::run` does, so that it
+    /// reads them through its own transport. Returns `false` if the proxy
+    /// refuses what it receives.
+    fn transmit(&mut self, direction: Direction, (bytes, fds): Outgoing) -> bool {
+        use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+        use std::io::IoSlice;
+        // A stream socket carries descriptors only with a byte: with none,
+        // the kernel sends nothing, and they are lost.
+        let peer = match direction {
+            Direction::ClientToHost => &self.guest.connection,
+            Direction::HostToClient => &self.host.connection,
+        };
+        let socket = peer
+            .unix_socket_for_test()
+            .expect("a peer's connection is a Unix socket")
+            .as_raw_fd();
+        let raw: Vec<_> = fds.iter().map(AsRawFd::as_raw_fd).collect();
+        let mut sent = 0;
+        while sent < bytes.len() {
+            let rights = [ControlMessage::ScmRights(&raw)];
+            let cmsgs: &[ControlMessage] = if sent == 0 && !raw.is_empty() {
+                &rights
+            } else {
+                &[]
+            };
+            let end = bytes.len().min(sent + 4096);
+            let iov = [IoSlice::new(&bytes[sent..end])];
+            sent += sendmsg::<()>(socket, &iov, cmsgs, MsgFlags::MSG_NOSIGNAL, None)
+                .expect("send to the proxy");
+            let connection = self.client.connection_mut(direction);
+            loop {
+                match connection.try_recv() {
+                    Ok(Some(bytes)) if bytes > 0 => {}
+                    Ok(_) => break,
+                    Err(_) => return false,
+                }
+            }
+        }
+        // The kernel holds its own references to the descriptors it carries.
+        drop(fds);
+        true
     }
 }
 
@@ -605,25 +683,35 @@ impl Drop for Session {
     }
 }
 
-/// A peer of the proxy: its end of the connection, the objects it knows
-/// and what it received, decoded.
+/// A peer of the proxy: its end of the connection, its objects and what
+/// it received, decoded.
 struct Peer<M> {
     connection: WaylandConnection,
-    objects: Objects,
+    wire: wire_peer::Peer,
     received: Vec<(u32, M)>,
 }
 
 impl<M: Message> Peer<M> {
-    fn new(connection: WaylandConnection) -> Self {
+    fn new(connection: WaylandConnection, role: Role) -> Self {
         Self {
             connection,
-            objects: Objects(BTreeMap::from([(WL_DISPLAY_ID, "wl_display".to_string())])),
+            // The proxy reads each host event as the host sends it.
+            wire: match role {
+                Role::Client => wire_peer::Peer::new(role),
+                Role::Server => wire_peer::Peer::new(role).in_step(),
+            },
             received: Vec::new(),
         }
     }
 
-    /// Decode every whole message the proxy has sent. Each must decode, as
-    /// sent by an object the peer knows.
+    /// Decode every whole message the proxy has sent. Each must decode, and
+    /// keep the protocol ([`wire_peer`]).
+    ///
+    /// # Panics
+    ///
+    /// On a message that breaks the protocol, a stream that cannot be
+    /// framed, or anything left over once the proxy has sent all it holds:
+    /// part of a message, or a descriptor no message took.
     fn receive(&mut self) {
         while self
             .connection
@@ -631,85 +719,50 @@ impl<M: Message> Peer<M> {
             .expect("receive from the proxy")
             .is_some_and(|bytes| bytes > 0)
         {}
+        let peer = match self.wire.role() {
+            Role::Client => "guest",
+            Role::Server => "host",
+        };
         let connection = &mut self.connection;
         let mut offset = 0;
-        while let Framing::Complete(MessageHeader { len, .. }) =
-            MessageHeader::frame(&connection.read_buf[offset..])
-        {
+        loop {
+            let len = match MessageHeader::frame(&connection.read_buf[offset..]) {
+                Framing::Complete(MessageHeader { len, .. }) => len,
+                Framing::Partial => break,
+                Framing::Invalid(header) => {
+                    panic!("the proxy sent the {peer} a header it cannot frame: {header:?}")
+                }
+            };
             let message = &connection.read_buf[offset..offset + len];
             let decoded = self
-                .objects
-                .decode(message, &mut connection.read_fds)
-                .unwrap_or_else(|error| panic!("the proxy sent {message:?}: {error}"));
+                .wire
+                .receive(message, &mut connection.read_fds)
+                .unwrap_or_else(|violation| panic!("the proxy sent the {peer} {violation}"));
             self.received.push(decoded);
             offset += len;
         }
         connection.read_buf.drain(..offset);
-    }
-}
-
-/// The interface of each object a peer knows, by ID.
-struct Objects(BTreeMap<u32, String>);
-
-impl Objects {
-    /// Decode `message`, sent by an object this peer knows, and learn the
-    /// object it creates.
-    fn decode<M: Message>(
-        &mut self,
-        message: &[u8],
-        fds: &mut VecDeque<OwnedFd>,
-    ) -> Result<(u32, M), ProtocolError> {
-        let decoded = decode(message, fds, |msg| {
-            let interface = self
-                .0
-                .get(&msg.sender_id)
-                .ok_or(ProtocolError::InvalidSender(msg.sender_id))?;
-            M::from_wire(interface, msg)
-        })?;
-        if let Some((id, interface)) = decoded.1.new_object() {
-            self.0.insert(id, interface.to_string());
-        }
-        Ok(decoded)
+        assert!(
+            connection.read_buf.is_empty() && connection.read_fds.is_empty(),
+            "the proxy left the {peer} part of a message ({} bytes) or descriptors no message \
+             took ({})",
+            connection.read_buf.len(),
+            connection.read_fds.len()
+        );
     }
 
-    /// Learn the object `message`, which this peer sends, creates, and
-    /// return its ID and interface. A malformed message creates none; the
-    /// proxy reports it.
-    fn learn<M: Message>(&mut self, (message, fds): &Outgoing) -> Option<(u32, String)> {
+    /// The ID and interface of the object `message`, which this peer is
+    /// about to send, creates; `None` for a malformed one, which creates
+    /// none.
+    fn created<S: Message>(&self, (message, fds): &Outgoing) -> Option<(u32, String)> {
         let mut fds = fds
             .iter()
             .map(|fd| fd.try_clone().expect("duplicate a descriptor"))
-            .collect();
-        let (_, decoded) = self.decode::<M>(message, &mut fds).ok()?;
+            .collect::<VecDeque<_>>();
+        let (_, decoded) = self.wire.decode::<S>(message, &mut fds).ok()?;
         decoded
             .new_object()
             .map(|(id, interface)| (id, interface.to_string()))
-    }
-}
-
-/// A message of any interface, as [`Objects`] decodes it.
-trait Message: Sized {
-    fn from_wire(interface: &str, msg: &mut WireMessage) -> Result<Self, ProtocolError>;
-    fn new_object(&self) -> Option<(u32, &str)>;
-}
-
-impl Message for AnyRequest {
-    fn from_wire(interface: &str, msg: &mut WireMessage) -> Result<Self, ProtocolError> {
-        AnyRequest::from_wire(interface, msg)
-    }
-
-    fn new_object(&self) -> Option<(u32, &str)> {
-        AnyRequest::new_object(self)
-    }
-}
-
-impl Message for AnyEvent {
-    fn from_wire(interface: &str, msg: &mut WireMessage) -> Result<Self, ProtocolError> {
-        AnyEvent::from_wire(interface, msg)
-    }
-
-    fn new_object(&self) -> Option<(u32, &str)> {
-        AnyEvent::new_object(self)
     }
 }
 

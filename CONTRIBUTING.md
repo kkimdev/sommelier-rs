@@ -75,6 +75,28 @@ assert_eq!(
   `resume`.
 - Read everything each peer received: a `Session` dropped with output
   the test never read fails.
+- Each peer receives the proxy's bytes over a real socket, follows its
+  objects as libwayland does, and fails on output the protocol forbids
+  (`test_support::wire_peer`):
+  - a message from, or naming, an object the peer does not have, one of
+    another interface, one the sending side ended, or null where the
+    argument may not be;
+  - a message newer than its object's version;
+  - a new object under an ID outside the sender's range, still in use,
+    or more than one past the highest that range has used;
+  - a `delete_id` of an object no destructor ended, or a second one: the
+    host may end a live guest object on its own only if it is a frame
+    callback of a surface that ended, or the test allows it with
+    `Session::host_may_end`;
+  - a request from, or naming, a host object after the proxy read the
+    host's `delete_id` for it: the proxy reads each host event as the
+    test sends it, so no request can cross one;
+  - a header that cannot be framed, part of a message, or a descriptor
+    no message took, once the proxy has sent all it holds.
+
+  A test that gives the proxy an object no peer can have it create, such
+  as a native dma-buf buffer, pairs it with `Session::pair_for_test`,
+  which both peers learn.
 - Learn host IDs from what the proxy forwards (`create`, `surface`), not
   from the object table. `Session::ctx()` reads state no peer can
   observe, or injects a fault no peer can cause; each use says which, in

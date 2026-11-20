@@ -654,7 +654,9 @@ process (`warn_once::WarnOnce`, the one such flag, such as
 one. A test passes the function that reads it a `WarnOnce` of its own, or
 runs in its own process (`test_support::in_own_process`). `proxy::harness::Session` drives a whole
 `Client` as its guest and host, decoding what the proxy sends each into
-the generated message types; CONTRIBUTING says how to write a test with
+the generated message types and holding it to the protocol, as one end
+of a connection that follows its objects as libwayland does
+(`test_support::wire_peer`); CONTRIBUTING says how to write a test with
 it. `proxy::frame_cost` measures what a steady stream of frames costs a
 session's proxy, in heap allocations and in the system calls that copy
 pixels into or map a host copy, which the test binary counts per thread

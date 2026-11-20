@@ -258,6 +258,10 @@
   which has not been checked against a Home Manager activation on a host
   yet; the unit tests swap links the way an activation does.
 
+- Tests that drive `Client::handle_msgs` directly, rather than through
+  `proxy::harness::Session`, bypass the peers' protocol checks
+  (`test_support::wire_peer`); they move to `Session` with the handler
+  tests.
 - Wheel steps for touchpad scrolling in Wine apps
   ([pointer scrolling](docs/INVARIANTS.md#pointer-scrolling)) have not
   been checked with KakaoTalk on a host yet; a scroll that feels too fast

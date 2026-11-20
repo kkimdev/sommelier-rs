@@ -325,7 +325,7 @@ pub(super) struct World<'t> {
     /// Each event to the guest, the press it is, if it is one: where the
     /// guest's pointer or finger is on which of its surfaces; and whether
     /// it is a key that reaches no window ([`World::keyboard_gone`]).
-    p_to_c: Channel<(u32, AnyEvent, Option<Press>, bool)>,
+    p_to_c: Channel<(AnyEvent, Option<Press>, bool)>,
     /// Each run of requests Exo's display dispatches in one read: one
     /// request, or a surrounding text or a `reset` and the barrier glued
     /// to it.
@@ -536,8 +536,8 @@ impl<'t> World<'t> {
                     self.deliver_guest_request(request, edits).await;
                 }
                 Source::GuestEvents => {
-                    let (sender, event, press, gone) = self.p_to_c.take();
-                    self.deliver_to_guest(sender, event, press, gone);
+                    let (event, press, gone) = self.p_to_c.take();
+                    self.deliver_to_guest(event, press, gone);
                 }
                 Source::HostRequests => {
                     for (sender, request) in self.p_to_e.take() {
@@ -919,7 +919,7 @@ impl<'t> World<'t> {
             let gone = self.keyboard_gone
                 && matches!(event, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }));
             self.p_to_c
-                .send(self.now, (sender, event, press, gone), &mut self.choices);
+                .send(self.now, (event, press, gone), &mut self.choices);
         }
         self.see(Seen::StepEnd);
         self.ended |= !goes_on;
@@ -967,7 +967,7 @@ impl<'t> World<'t> {
     /// If a key gone to no window reaches a client with the keyboard
     /// focus: the proxy kept from it the `leave` that came before the enter
     /// it dropped.
-    fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>, gone: bool) {
+    fn deliver_to_guest(&mut self, event: AnyEvent, press: Option<Press>, gone: bool) {
         let now = self.now;
         self.edits.got.follow(&event);
         let key = matches!(event, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }));
@@ -995,7 +995,7 @@ impl<'t> World<'t> {
             }
             (AnyEvent::WlPointer(wl_pointer::Event::Button { .. }), None)
             | (AnyEvent::WlTouch(wl_touch::Event::Up { .. }), None) => client.release(now, false),
-            (AnyEvent::ZwpTextInputV3(event), _) => client.event(now, sender, event),
+            (AnyEvent::ZwpTextInputV3(event), _) => client.event(now, event),
             (AnyEvent::WlDisplay(wl_display::Event::DeleteId { id }), _) => {
                 client.deleted(id);
                 Vec::new()

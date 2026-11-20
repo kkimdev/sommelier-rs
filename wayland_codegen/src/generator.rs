@@ -424,9 +424,16 @@ fn generate_any_message(
     let decode_arms = interfaces.iter().map(|(name, variant, module)| {
         quote! { #name => #module::#message_type::from_wire(msg).map(Self::#variant), }
     });
-    let new_object_arms = interfaces.iter().map(|(_, variant, _)| {
-        quote! { Self::#variant(message) => message.new_object(), }
-    });
+    let forward = |method: TokenStream| {
+        interfaces
+            .iter()
+            .map(|(_, variant, _)| quote! { Self::#variant(message) => message.#method(), })
+            .collect::<Vec<_>>()
+    };
+    let new_object_arms = forward(quote! { new_object });
+    let object_args_arms = forward(quote! { object_args });
+    let destructor_arms = forward(quote! { is_destructor });
+    let since_arms = forward(quote! { since });
     let conversions = interfaces.iter().map(|(_, variant, module)| {
         quote! {
             #[cfg(test)]
@@ -459,6 +466,28 @@ fn generate_any_message(
             pub fn new_object(&self) -> Option<(u32, &str)> {
                 match self {
                     #(#new_object_arms)*
+                }
+            }
+
+            /// Each object argument: the ID it names (0 for null), the
+            /// interface it declares, if any, and whether it may be null.
+            pub fn object_args(&self) -> Vec<(u32, Option<&'static str>, bool)> {
+                match self {
+                    #(#object_args_arms)*
+                }
+            }
+
+            /// Whether the message destroys its sender.
+            pub fn is_destructor(&self) -> bool {
+                match self {
+                    #(#destructor_arms)*
+                }
+            }
+
+            /// The object version that introduced the message.
+            pub fn since(&self) -> u32 {
+                match self {
+                    #(#since_arms)*
                 }
             }
         }
@@ -1067,15 +1096,41 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
 /// Generate what tests need of a decoded message type, `Request` or
 /// `Event`: equality, which compares a descriptor by the file it refers
 /// to (`test_support::same_file`), since descriptors have no equality of
-/// their own, and `new_object`, the ID and interface of the object a
+/// their own; `new_object`, the ID and interface of the object a
 /// message creates, which lets a test peer follow the objects it is told
-/// about as a Wayland client library does. No vendored message creates
-/// more than one object (`test_no_message_creates_two_objects`).
+/// about as a Wayland client library does; and the rest of the message's
+/// declaration a peer checks it against (`test_support::wire_peer`): the
+/// objects it names, whether it destroys its sender, and the version that
+/// introduced it. No vendored message creates more than one object
+/// (`test_no_message_creates_two_objects`).
 fn generate_test_impls(enum_name: &Ident, messages: &[&Message]) -> TokenStream {
     let mut eq_arms = Vec::new();
     let mut new_object_arms = Vec::new();
+    let mut object_arms = Vec::new();
+    let mut destructor_arms = Vec::new();
+    let mut since_arms = Vec::new();
     for message in messages {
         let variant = format_ident!("{}", snake_to_camel(&message.name));
+        let objects: Vec<_> = args(&message.items)
+            .filter(|arg| arg.typ == "object")
+            .collect();
+        let object_fields = objects.iter().map(|arg| sanitize_ident(&arg.name));
+        let object_values = objects.iter().map(|arg| {
+            let field = sanitize_ident(&arg.name);
+            let interface = match &arg.interface {
+                Some(interface) => quote! { Some(#interface) },
+                None => quote! { None },
+            };
+            let nullable = arg.allow_null.unwrap_or(false);
+            quote! { (*#field, #interface, #nullable) }
+        });
+        object_arms.push(quote! {
+            Self::#variant { #(#object_fields,)* .. } => vec![#(#object_values),*],
+        });
+        let destructor = message.msg_type.as_deref() == Some("destructor");
+        destructor_arms.push(quote! { Self::#variant { .. } => #destructor, });
+        let since = message.since.unwrap_or(1);
+        since_arms.push(quote! { Self::#variant { .. } => #since, });
         let mut fields = Vec::new();
         let mut left = Vec::new();
         let mut right = Vec::new();
@@ -1134,6 +1189,37 @@ fn generate_test_impls(enum_name: &Ident, messages: &[&Message]) -> TokenStream 
                     #(#new_object_arms)*
                     #[allow(unreachable_patterns)]
                     _ => None,
+                }
+            }
+
+            /// Each object argument: the ID it names (0 for null), the
+            /// interface it declares, if any, and whether it may be null.
+            pub fn object_args(&self) -> Vec<(u32, Option<&'static str>, bool)> {
+                match self {
+                    #(#object_arms)*
+                    // An interface without such messages has an empty enum.
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!(),
+                }
+            }
+
+            /// Whether the message destroys its sender.
+            pub fn is_destructor(&self) -> bool {
+                match self {
+                    #(#destructor_arms)*
+                    // An interface without such messages has an empty enum.
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!(),
+                }
+            }
+
+            /// The object version that introduced the message.
+            pub fn since(&self) -> u32 {
+                match self {
+                    #(#since_arms)*
+                    // An interface without such messages has an empty enum.
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!(),
                 }
             }
         }

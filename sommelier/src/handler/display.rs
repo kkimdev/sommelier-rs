@@ -367,6 +367,7 @@ mod tests {
 
         // The session's check that no state outlives its object pins that
         // the proxy forgets the text input.
+        s.host_may_end(|_, interface| interface == zwp_text_input_v3::NAME);
         s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, text_input.host)])
             .await;
         assert_eq!(
