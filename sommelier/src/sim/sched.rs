@@ -273,6 +273,42 @@ enum Pointer {
     Gone,
 }
 
+/// What can happen next in a [`World`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// C→P delivers.
+    GuestRequests,
+    /// P→C delivers.
+    GuestEvents,
+    /// P→E delivers.
+    HostRequests,
+    /// E→P delivers.
+    HostEvents,
+    /// E→Eng delivers.
+    EngineInput,
+    /// The engine answers.
+    EngineAnswers,
+    /// A held key repeats.
+    Repeat,
+    /// The user acts.
+    User,
+}
+
+impl Source {
+    /// Every source, in the order whose position a tie's choice picks
+    /// ([`earliest`]): reordering it changes every recorded schedule.
+    const ORDER: [Self; 8] = [
+        Self::GuestRequests,
+        Self::GuestEvents,
+        Self::HostRequests,
+        Self::HostEvents,
+        Self::EngineInput,
+        Self::EngineAnswers,
+        Self::Repeat,
+        Self::User,
+    ];
+}
+
 /// One case's client, proxy, Exo, engine and display, joined by channels.
 pub(super) struct World<'t> {
     now: Micros,
@@ -476,16 +512,8 @@ impl<'t> World<'t> {
         let mut actions = actions.iter().copied().peekable();
         let mut next = self.now;
         while !self.ended {
-            let idle = [
-                self.c_to_p.ready_at(),
-                self.p_to_c.ready_at(),
-                self.p_to_e.ready_at(),
-                self.e_to_p.ready_at(),
-                self.to_engine.ready_at(),
-                self.engine.ready_at(),
-            ];
             let user = match actions.peek() {
-                Some(UserAction::Settle) if idle.iter().any(Option::is_some) => None,
+                Some(UserAction::Settle) if self.busy() => None,
                 Some(_) => Some(next.max(self.now)),
                 None => None,
             };
@@ -494,39 +522,40 @@ impl<'t> World<'t> {
             if actions.peek().is_none() {
                 self.repeat = None;
             }
-            let mut sources = idle.to_vec();
-            sources.push(self.repeat.map(|(_, at)| at));
-            sources.push(user);
-            let Some(source) = earliest(&sources, &mut self.choices) else {
+            let ready = Source::ORDER.map(|source| match source {
+                Source::User => user,
+                source => self.ready_at(source),
+            });
+            let Some(source) = earliest(&ready, &mut self.choices) else {
                 return;
             };
-            self.now = self.now.max(sources[source].expect("a ready source"));
-            match source {
-                0 => {
+            self.now = self.now.max(ready[source].expect("a ready source"));
+            match Source::ORDER[source] {
+                Source::GuestRequests => {
                     let (request, edits) = self.c_to_p.take();
                     self.deliver_guest_request(request, edits).await;
                 }
-                1 => {
+                Source::GuestEvents => {
                     let (sender, event, press, gone) = self.p_to_c.take();
                     self.deliver_to_guest(sender, event, press, gone);
                 }
-                2 => {
+                Source::HostRequests => {
                     for (sender, request) in self.p_to_e.take() {
                         self.reports_got += u64::from(is_report(&request));
                         let events = self.display.request(sender, &request, &mut self.exo);
                         self.host_sends(events, false);
                     }
                 }
-                3 => {
+                Source::HostEvents => {
                     let (event, origin, truth, reports) = self.e_to_p.take();
                     self.deliver_host_event(event, origin, truth, reports).await;
                 }
-                4 => {
+                Source::EngineInput => {
                     let input = self.to_engine.take();
                     self.engine.send(self.now, input, &mut self.choices);
                 }
-                5 => self.engine_answers(),
-                6 => {
+                Source::EngineAnswers => self.engine_answers(),
+                Source::Repeat => {
                     let (key, at) = self.repeat.expect("a held key");
                     self.repeat = Some((key, at + REPEAT_INTERVAL));
                     self.log(Place::User, format!("repeat {key:?}"));
@@ -536,7 +565,7 @@ impl<'t> World<'t> {
                     }
                     self.host_sends(Vec::new(), false);
                 }
-                _ => {
+                Source::User => {
                     let action = actions.next().expect("an action");
                     self.act(action);
                     next = self.now
@@ -553,6 +582,28 @@ impl<'t> World<'t> {
                 }
             }
         }
+    }
+
+    /// When `source` is next ready, `None` while it is idle; the user's
+    /// next action is [`World::run`]'s to time, and is `None` here.
+    fn ready_at(&self, source: Source) -> Option<Micros> {
+        match source {
+            Source::GuestRequests => self.c_to_p.ready_at(),
+            Source::GuestEvents => self.p_to_c.ready_at(),
+            Source::HostRequests => self.p_to_e.ready_at(),
+            Source::HostEvents => self.e_to_p.ready_at(),
+            Source::EngineInput => self.to_engine.ready_at(),
+            Source::EngineAnswers => self.engine.ready_at(),
+            Source::Repeat => self.repeat.map(|(_, at)| at),
+            Source::User => None,
+        }
+    }
+
+    /// Whether a channel or the engine has something to do, which a
+    /// `Settle` waits for; a held key's repeats it does not.
+    fn busy(&self) -> bool {
+        let busy = |&source: &Source| source != Source::Repeat && self.ready_at(source).is_some();
+        Source::ORDER.iter().any(busy)
     }
 
     /// The user acts: Exo takes a key's press and release; a click or a
