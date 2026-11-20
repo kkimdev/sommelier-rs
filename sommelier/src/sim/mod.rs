@@ -23,10 +23,10 @@ limitations under the License.
 //! drawn latency on one virtual clock ([`sched`]), so the only reorderings
 //! are those the real system allows, and a seed fixes everything, timing
 //! included. The user ([`user`]) types Korean or Latin, clicks, taps and
-//! moves the focus. Two oracles judge the case once it settles
-//! ([`oracle`]): tier 1, every case, holds the proxy to the specification
-//! of `docs/IME.md`, section 2, whatever the timing; tier 2,
-//! settled cases only, holds the client to the user's intent. The design's
+//! moves the focus. Two oracles judge the case ([`oracle`]): tier 1,
+//! every case, holds what the guest gets to what the simulation did,
+//! whatever the timing; tier 2, settled cases only, holds the client to the
+//! user's intent. The design's
 //! section 4 describes it whole.
 //!
 //! - `SOMMELIER_DST_SEED` (0) and `SOMMELIER_DST_CASES` (600) choose the
@@ -215,7 +215,7 @@ fn run_recorded(
             lag,
             choices: world.choices.recorded().to_vec(),
         };
-        let (Some(spec), Some(_), false) = (&world.spec, &world.shadow, world.ended) else {
+        let (Some(judge), false) = (&world.judge, world.ended) else {
             outcome.failures.push(Failure {
                 tier: Tier::Exact,
                 check: Check::Session,
@@ -224,12 +224,11 @@ fn run_recorded(
             });
             return outcome;
         };
-        outcome.counts = spec.counts;
+        outcome.counts = judge.counts;
         outcome.counts.drops = drops;
         outcome.counts.exo = world.exo.reached;
         let (engine, resets) = (world.engine_composition(), world.engine_resets());
-        let (exo, steps) = (&world.exo, &world.steps);
-        let mut failures = oracle::exact(steps, spec, exo, &engine, resets);
+        let mut failures = oracle::exact(judge, &world.exo, &engine, resets);
         if case.settled {
             let start = case.reference_at_start();
             let (actions, settles) = (&case.actions, &world.settles);
@@ -468,10 +467,10 @@ fn pinned(test: &str, body: impl FnOnce()) {
 /// (H2), its deletes (H9) and its preedit regions (X1); in free cases,
 /// fence drops, late answers the guest got, engine answers a reset made
 /// late or dropped (E5), raw keys, reports that crossed an edit (P4),
-/// autorepeats of a held key, empty confirmations that recovered it,
-/// skipped its pair, found none or turned out to be Exo's before a press
-/// or a detach (X2'), Backspace leases armed and ended, and destroyed
-/// surfaces; and in a run of 5,000 or more the rarer region
+/// autorepeats of a held key, those the guest got as the key's press and
+/// those of a key it held itself (X2'), Exo's empty confirmations before
+/// a press or at a detach while a key was held, and destroyed surfaces;
+/// and in a run of 5,000 or more the rarer region
 /// and delete paths; in settled ones, no fence drop, which a settled case
 /// must not cause.
 fn check(test: &str, settled: bool) {
@@ -502,14 +501,11 @@ fn check(test: &str, settled: bool) {
             reached.extend([
                 counts.fence_drops,
                 counts.late_shown,
-                counts.raw_keys,
+                counts.exo.raw_presses,
                 counts.crossed_reports,
                 counts.repeats,
                 counts.recovered_keys,
                 counts.recoveries_skipped,
-                counts.confirms_unheld,
-                counts.leases,
-                counts.leases_ended,
                 counts.surface_destroys,
                 counts.focused_surface_destroys,
                 counts.late,
