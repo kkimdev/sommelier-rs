@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     /// CPU time this thread has used.
-    fn thread_cpu_time() -> std::time::Duration {
+    pub(super) fn thread_cpu_time() -> std::time::Duration {
         let mut now = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
