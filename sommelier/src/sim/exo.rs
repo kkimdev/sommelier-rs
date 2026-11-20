@@ -1080,17 +1080,22 @@ impl Exo {
         self.text_inputs[&id].text.hidden.clone()
     }
 
-    /// Whether the tracker of the text input attached on the focused
-    /// surface holds a state with the composition `composition` at the
-    /// cursor of the report `(text, cursor, anchor)`, which that state is
-    /// without it: a report that would only drop the composition.
+    /// Whether the tracker of the case's one host text input holds a state
+    /// with the composition `composition` at the cursor of the report
+    /// `(text, cursor, anchor)`, which that state is without it: a report
+    /// that would only drop the composition. Exo keeps the tracker with or
+    /// without an input method (E4), so this holds whether or not one is
+    /// attached and wherever the seat's focus is: a report the proxy
+    /// withholds after Exo moved the focus would reach Exo after its
+    /// detach, whose confirmation leaves the state in the history.
     pub(super) fn holds_with_composition(
         &self,
         (text, cursor, anchor): &(String, u32, u32),
         composition: &str,
     ) -> bool {
-        let Some(id) = self.composing_text_inputs().first().copied() else {
-            return false;
+        let mut text_inputs = self.text_inputs.values();
+        let (Some(text_input), None) = (text_inputs.next(), text_inputs.next()) else {
+            panic!("the DST makes one host text input");
         };
         let at = *cursor as usize;
         let holds = |state: &Predicted| {
@@ -1101,7 +1106,7 @@ impl Exo {
                     && text.get(at..) == Some(&state.text[range.end..])
             })
         };
-        cursor == anchor && self.text_inputs[&id].text.expected.iter().any(holds)
+        cursor == anchor && text_input.text.expected.iter().any(holds)
     }
 
     /// The host text inputs an input method is attached to on the focused

@@ -202,13 +202,10 @@
 - Chromium's IMA keeps composing after a composition empties (ㄱ then
   Backspace), so an earlier key's text can be lost; host behaviour, not
   mitigated.
-- The v11-only DST fails 8 free cases in a 20,000-case release soak
+- The v11-only DST fails 3 free cases in a 20,000-case release soak
   (seeds from 0). Base `43962c5` fails the same seeds when its extension
   draw is forced to v11, so these bugs predate the change; their fixes
   are pending:
-  - Report suppression (G9c) withholds a report that Exo's tracker does
-    not hold with the shown composition: seeds 4372, 13346, 14054, 16626
-    and 19984.
   - A held key is recovered for Exo's confirmation before another key's
     press (`recoveries_before_a_press`): seeds 13104 and 16710.
   - The guest's preedit is neither what Exo tracks nor what its engine

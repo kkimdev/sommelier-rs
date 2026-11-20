@@ -877,7 +877,10 @@ The DST also holds the proxy to Exo's real text:
 - A withheld report (G9c) is accepted only while the guest shows a
   preedit, and the simulated tracker's history must hold the report with
   that preedit as its composition at the report's cursor
-  (`Exo::holds_with_composition`).
+  (`Exo::holds_with_composition`), whether or not an input method is
+  attached: Exo keeps the tracker without one (E4), so a report withheld
+  after Exo moved the focus, which reaches Exo after its detach, is held
+  to it too.
 
 ## 5. Open questions
 
