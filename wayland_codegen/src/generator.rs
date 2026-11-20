@@ -653,15 +653,21 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             "new_id" => {
                                 if let Some(ref interface_name) = arg.interface {
                                     // A child object takes its parent's
-                                    // version on each side. No local is
+                                    // version on each side; a parent
+                                    // without one is a bookkeeping fault
+                                    // that ends the session. No local is
                                     // bound, so none can shadow a later
                                     // argument.
                                     mapping_and_writing.push(quote! {
                                         builder.write_u32(ctx.shadow_table.create_paired(
                                             #name,
                                             #interface_name,
-                                            ctx.shadow_table.guest_object_version_or_unknown(msg.sender_id),
-                                            ctx.shadow_table.host_object_version_or_unknown(host_sender_id),
+                                            ctx.shadow_table
+                                                .guest_object_version(msg.sender_id)
+                                                .ok_or(ProtocolError::InvalidSender(msg.sender_id))?,
+                                            ctx.shadow_table
+                                                .host_object_version(host_sender_id)
+                                                .ok_or(ProtocolError::InvalidSender(msg.sender_id))?,
                                         ));
                                     });
                                 } else {
@@ -838,7 +844,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                     builder.write_u32(ctx.shadow_table.adopt_host_created(
                                         #name,
                                         #interface_name,
-                                        ctx.shadow_table.host_object_version_or_unknown(msg.sender_id),
+                                        ctx.shadow_table
+                                            .host_object_version(msg.sender_id)
+                                            .ok_or(ProtocolError::InvalidSender(msg.sender_id))?,
                                     ));
                                 });
                             }

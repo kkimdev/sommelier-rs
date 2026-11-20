@@ -410,9 +410,13 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
     fn on_get_text_input(&mut self, ctx: &mut Context, id: u32, seat: u32) -> Action {
         // A new object takes its parent's version: the guest text input its
         // guest manager's, and each host object its host manager's.
-        let guest_manager_version = ctx
-            .shadow_table
-            .guest_object_version_or_unknown(ctx.last_sender_id);
+        let guest_manager = ctx.last_sender_id;
+        let Some(guest_manager_version) = ctx.shadow_table.guest_object_version(guest_manager)
+        else {
+            return ctx.fail(format_args!(
+                "zwp_text_input_manager_v3 {guest_manager} has no version"
+            ));
+        };
         let managers = host_text_input_managers(ctx);
         let Some((host_manager_id, host_ext_manager_id)) = managers else {
             // The guest owns the ID, so its requests must still find an
@@ -422,9 +426,14 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
                 .create_local(id, zwp_text_input_v3::NAME, guest_manager_version);
             return Action::Drop;
         };
-        let host_manager_version = ctx
-            .shadow_table
-            .host_object_version_or_unknown(host_manager_id);
+        let versions = [host_manager_id, host_ext_manager_id]
+            .map(|manager| ctx.shadow_table.host_object_version(manager));
+        let [Some(host_manager_version), Some(host_ext_version)] = versions else {
+            return ctx.fail(format_args!(
+                "host text-input managers {host_manager_id} and {host_ext_manager_id} \
+                 have versions {versions:?}"
+            ));
+        };
         let host_v1_id = ctx.shadow_table.create_bridged(
             id,
             zwp_text_input_v3::NAME,
@@ -432,9 +441,6 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             zwp_text_input_v1::NAME,
             host_manager_version,
         );
-        let host_ext_version = ctx
-            .shadow_table
-            .host_object_version_or_unknown(host_ext_manager_id);
         let host_ext_id = ctx
             .shadow_table
             .create_host_only(zcr_extended_text_input_v1::NAME, host_ext_version);
@@ -463,8 +469,9 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
 fn host_text_input_managers(ctx: &Context) -> Option<(u32, u32)> {
     let manager = ctx.host_text_input_manager_v1_id?;
     let ext_manager = ctx.host_text_input_extension_v1_id?;
-    let version = ctx.shadow_table.host_object_version_or_unknown(ext_manager);
-    (version >= zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE)
+    ctx.shadow_table
+        .host_object_version(ext_manager)
+        .is_some_and(|version| version >= zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE)
         .then_some((manager, ext_manager))
 }
 
@@ -2262,6 +2269,28 @@ pub(super) mod tests {
         let warned = AtomicBool::new(false);
         assert!(warn_no_input_method(&warned));
         assert!(!warn_no_input_method(&warned));
+    }
+
+    /// An extension whose version the proxy cannot find gives no input
+    /// method: the v11 check fails closed instead of passing.
+    #[test]
+    fn an_extension_of_unknown_version_gives_no_input_method() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let since = zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE;
+        let manager = ctx
+            .shadow_table
+            .create_host_only(zwp_text_input_manager_v1::NAME, 1);
+        let extension = ctx
+            .shadow_table
+            .create_host_only(zcr_text_input_extension_v1::NAME, since);
+        ctx.host_text_input_manager_v1_id = Some(manager);
+        ctx.host_text_input_extension_v1_id = Some(extension);
+        assert_eq!(host_text_input_managers(&ctx), Some((manager, extension)));
+
+        // No peer can make the proxy lose a bound extension's version;
+        // retiring its object stands in for that bookkeeping fault.
+        ctx.shadow_table.retire_host(extension);
+        assert_eq!(host_text_input_managers(&ctx), None);
     }
 
     /// A leave is a hard boundary: what the guest requests until the next
@@ -5087,9 +5116,17 @@ pub(super) mod tests {
     #[test]
     fn text_input_creation_without_host_manager_does_not_create_broken_state() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        let manager = 5;
+        ctx.shadow_table.create_local(
+            manager,
+            zwp_text_input_manager_v3::NAME,
+            zwp_text_input_manager_v3::VERSION,
+        );
+        ctx.last_sender_id = manager;
         let mut handler = TextInputManagerV3Handler;
 
         assert_eq!(handler.on_get_text_input(&mut ctx, 20, 7), Action::Drop);
+        assert!(!ctx.is_fatal());
         assert!(ctx.ime.get(TiId(20)).is_none());
         assert!(ctx.shadow_table.is_local(20));
         assert!(ctx.client_to_host_queue.is_empty());

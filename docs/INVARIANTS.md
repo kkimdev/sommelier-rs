@@ -532,8 +532,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   cannot make the guest send requests the proxy cannot decode. A child
   object takes its parent's version, and a request is sent to a host
   object only if that object's version has it: an Aura surface keeps the
-  version of the shell generation that created it.
+  version of the shell generation that created it. A version the proxy
+  cannot find fails closed: no child gets a guessed one, and a feature
+  gated on a version is off.
   Tests: `child_objects_inherit_their_manager_versions`,
+  `an_extension_of_unknown_version_gives_no_input_method`,
   `unset_snap_is_sent_only_to_an_aura_surface_that_has_it`,
   `every_forwarded_global_is_capped_at_its_xml_version`.
 

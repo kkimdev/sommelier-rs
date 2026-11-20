@@ -182,10 +182,10 @@ impl ShadowTable {
     /// [`Self::GUEST_SERVER_ID_START`]) up to `WL_MAP_MAX_OBJECTS` inclusive.
     const SERVER_IDS: std::ops::Range<u32> =
         Self::GUEST_SERVER_ID_START..Self::GUEST_SERVER_ID_START + WL_MAP_MAX_OBJECTS + 1;
-    /// The version of an object created without a negotiated version. In
-    /// practice only test fixtures, and children created from them, have
-    /// it. It passes every version check.
-    const UNKNOWN_OBJECT_VERSION: u32 = u32::MAX;
+    /// What [`Self::guest_object_version_or_unknown`] gives for an object
+    /// the table does not know: below every message's `since`, so a child
+    /// created from it fails every version check.
+    const UNKNOWN_OBJECT_VERSION: u32 = 0;
 
     pub fn new() -> Self {
         Self {
@@ -511,17 +511,13 @@ impl ShadowTable {
         Some(self.hosts.get(&HostId(host_id))?.interface()?.version)
     }
 
-    /// The guest object's version, or the unknown version when none is
-    /// recorded. A child object created from it takes this version.
+    /// The guest object's version, or the unknown version, which fails
+    /// closed, when none is recorded. A child object created from it takes
+    /// this version. Only the window-placement code still uses it, for
+    /// senders that always have a version; elsewhere a missing version is
+    /// a bookkeeping fault that ends the session.
     pub(crate) fn guest_object_version_or_unknown(&self, guest_id: u32) -> u32 {
         self.guest_object_version(guest_id)
-            .unwrap_or(Self::UNKNOWN_OBJECT_VERSION)
-    }
-
-    /// The host object's version, or the unknown version when none is
-    /// recorded. A child object created from it takes this version.
-    pub(crate) fn host_object_version_or_unknown(&self, host_id: u32) -> u32 {
-        self.host_object_version(host_id)
             .unwrap_or(Self::UNKNOWN_OBJECT_VERSION)
     }
 
@@ -760,8 +756,8 @@ impl ShadowTable {
     // Test fixtures.
 
     /// Pair the hard-coded IDs of a test fixture as one object of
-    /// `interface`, with no negotiated version, and keep both allocators
-    /// from handing those IDs out.
+    /// `interface`, at the newest version its protocol file defines, and
+    /// keep both allocators from handing those IDs out.
     ///
     /// # Panics
     ///
@@ -796,11 +792,17 @@ impl ShadowTable {
         host_interface: &str,
     ) {
         self.reserve_for_test(guest_id, host_id);
+        // Each side at the newest version its protocol file defines.
+        let newest = |name: &str| {
+            let version = crate::protocols::interface_version(name)
+                .unwrap_or_else(|| panic!("{name} is a vendored interface"));
+            Interface::new(name, version)
+        };
         self.insert_pair(
             GuestId(guest_id),
-            Interface::new(interface, Self::UNKNOWN_OBJECT_VERSION),
+            newest(interface),
             HostId(host_id),
-            Interface::new(host_interface, Self::UNKNOWN_OBJECT_VERSION),
+            newest(host_interface),
         );
     }
 

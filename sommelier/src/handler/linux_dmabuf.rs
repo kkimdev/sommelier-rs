@@ -881,7 +881,9 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         };
         // The request is dropped and rebuilt here, so create the buffer the
         // generated dispatcher would have created for it.
-        let buffer_version = ctx.shadow_table.guest_object_version_or_unknown(params_id);
+        let Some(buffer_version) = ctx.shadow_table.guest_object_version(params_id) else {
+            return ctx.fail(format_args!("dma-buf params {params_id} have no version"));
+        };
         let host_buffer_id = ctx.shadow_table.create_paired(
             buffer_id,
             wl_buffer::NAME,
