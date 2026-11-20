@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::Handlers;
 use crate::protocols::wayland::wl_callback::{self, WlCallbackHandler};
 use crate::protocols::wayland::wl_display;
 use crate::state::{Context, HostId, InternalCallback};
 use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
 use log::debug;
-
-pub struct CallbackHandler;
 
 /// Issue a host-only `wl_display.sync` whose `done` means `waits_for` has
 /// happened (see [`InternalCallback`]).
@@ -46,8 +45,8 @@ pub(crate) fn internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> (
     (callback, wl_display::req::sync(WL_DISPLAY_ID, callback.0))
 }
 
-impl WlCallbackHandler for CallbackHandler {
-    fn on_done(&mut self, ctx: &mut Context, callback_data: u32) -> Action {
+impl WlCallbackHandler for Handlers {
+    fn on_done(ctx: &mut Context, callback_data: u32) -> Action {
         let host_id = ctx.last_sender_id;
         if let Some(waits_for) = ctx.internal_callbacks.complete(HostId(host_id)) {
             // wl_callback.done destroys the host callback resource. Reserve
@@ -56,9 +55,7 @@ impl WlCallbackHandler for CallbackHandler {
             ctx.retire_destroyed_host_object(host_id);
             match waits_for {
                 InternalCallback::DmabufCapabilities { generation } => {
-                    crate::handler::linux_dmabuf::LinuxDmabufHandler::complete_capability_discovery(
-                        ctx, generation,
-                    );
+                    crate::handler::linux_dmabuf::complete_capability_discovery(ctx, generation);
                     crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(
                         ctx, generation,
                     );
@@ -107,8 +104,7 @@ impl WlCallbackHandler for CallbackHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::CallbackHandler;
-    use crate::handler::display::DisplayHandler;
+    use crate::handler::Handlers;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::state::{Context, HostId, InternalCallback};
@@ -156,8 +152,7 @@ mod tests {
         );
         ctx.last_sender_id = callback_id;
 
-        let mut handler = CallbackHandler;
-        assert_eq!(handler.on_done(&mut ctx, 0), Action::Drop);
+        assert_eq!(Handlers::on_done(&mut ctx, 0), Action::Drop);
         assert!(ctx.dmabuf_capabilities[&generation].ready);
         assert_eq!(ctx.internal_callbacks.get(HostId(callback_id)), None);
         assert!(ctx.shadow_table.is_retired_host(callback_id));
@@ -172,8 +167,7 @@ mod tests {
             .insert_paired_with_version_for_test(guest_id, host_id, "wl_callback", 1);
         ctx.last_sender_id = host_id;
 
-        let mut handler = CallbackHandler;
-        assert_eq!(handler.on_done(&mut ctx, 7), Action::Drop);
+        assert_eq!(Handlers::on_done(&mut ctx, 7), Action::Drop);
         assert_eq!(ctx.host_to_client_queue.len(), 2);
         assert_eq!(ctx.shadow_table.get_host_id(guest_id), None);
         assert_eq!(ctx.shadow_table.get_guest_id(host_id), None);
@@ -181,7 +175,7 @@ mod tests {
         assert!(!ctx.shadow_table.is_host_id_available(host_id));
 
         ctx.last_sender_id = 1;
-        assert_eq!(DisplayHandler.on_delete_id(&mut ctx, host_id), Action::Drop);
+        assert_eq!(Handlers::on_delete_id(&mut ctx, host_id), Action::Drop);
         assert_eq!(
             ctx.host_to_client_queue.len(),
             2,
@@ -208,8 +202,7 @@ mod tests {
         );
         ctx.last_sender_id = callback_id;
 
-        let mut handler = CallbackHandler;
-        assert_eq!(handler.on_done(&mut ctx, 123), Action::Drop);
+        assert_eq!(Handlers::on_done(&mut ctx, 123), Action::Drop);
         assert_eq!(ctx.internal_callbacks.count(), 0);
         assert!(ctx.client_to_host_queue.is_empty());
         assert!(ctx.host_to_client_queue.is_empty());
@@ -217,10 +210,7 @@ mod tests {
         assert!(!ctx.shadow_table.is_host_id_available(callback_id));
 
         ctx.last_sender_id = 1;
-        assert_eq!(
-            DisplayHandler.on_delete_id(&mut ctx, callback_id),
-            Action::Drop
-        );
+        assert_eq!(Handlers::on_delete_id(&mut ctx, callback_id), Action::Drop);
         assert!(ctx.shadow_table.is_host_id_available(callback_id));
     }
 }

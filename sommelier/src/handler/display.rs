@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::Handlers;
 use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
 use crate::state::{Context, DeletedHostId, SessionEnd};
 use crate::wire::{Action, MessageHeader, Outgoing, ProtocolError, WL_DISPLAY_ID};
 use log::error;
-
-pub struct DisplayHandler;
 
 /// How a guest request the proxy cannot decode or dispatch ends the
 /// session, as libwayland-server's `wl_client_connection_data` reports one:
@@ -73,25 +72,8 @@ fn bounded(message: &str) -> &str {
     &message[..end]
 }
 
-/// Queue the `wl_display.delete_id` that ends guest object `guest_id`, for
-/// an object whose host object cannot send it: one the proxy implements, or
-/// one backed by a host object without a destructor. The caller ends the
-/// object in the [`crate::state::ShadowTable`] first.
-pub(crate) fn queue_delete_id(ctx: &mut Context, guest_id: u32) {
-    ctx.host_to_client_queue
-        .push(wl_display::evt::delete_id(WL_DISPLAY_ID, guest_id));
-}
-
-/// End local guest object `guest_id` and queue its `delete_id`, as its host
-/// would for a host object. Nothing happens unless it is a local object.
-pub(crate) fn queue_local_delete_id(ctx: &mut Context, guest_id: u32) {
-    if ctx.local_destroyed(guest_id) {
-        queue_delete_id(ctx, guest_id);
-    }
-}
-
-impl wl_display::WlDisplayHandler for DisplayHandler {
-    fn on_get_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
+impl wl_display::WlDisplayHandler for Handlers {
+    fn on_get_registry(ctx: &mut Context, registry: u32) -> Action {
         let host_registry_id = ctx.shadow_table.create_paired(
             registry,
             wl_registry::NAME,
@@ -107,7 +89,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         Action::Drop
     }
 
-    fn on_sync(&mut self, ctx: &mut Context, callback: u32) -> Action {
+    fn on_sync(ctx: &mut Context, callback: u32) -> Action {
         let host_callback_id = ctx.shadow_table.create_paired(
             callback,
             wl_callback::NAME,
@@ -121,25 +103,19 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         Action::Drop
     }
 
-    fn on_delete_id(&mut self, ctx: &mut Context, id: u32) -> Action {
+    fn on_delete_id(ctx: &mut Context, id: u32) -> Action {
         // The host has destroyed the object, so no later event can name it,
         // and the ID may go to the next new object: the object's state ends
         // with the ID (see `crate::state::lifecycle`).
         if let DeletedHostId::Paired { guest, .. } = ctx.release_deleted_host_id(id) {
             // Forward the translated acknowledgement for the guest object,
             // after whatever ending it sent the guest.
-            queue_delete_id(ctx, guest);
+            ctx.queue_delete_id(guest);
         }
         Action::Drop
     }
 
-    fn on_error(
-        &mut self,
-        ctx: &mut Context,
-        object_id: u32,
-        code: u32,
-        message: &String,
-    ) -> Action {
+    fn on_error(ctx: &mut Context, object_id: u32, code: u32, message: &String) -> Action {
         // The host ends the connection after its error, so the session is
         // over, and its error is the guest's one error.
         let Some(guest_id) = ctx.shadow_table.get_guest_id(object_id) else {
@@ -171,7 +147,7 @@ mod tests {
     struct ProbeHandler;
 
     impl WlDisplayHandler for ProbeHandler {
-        fn on_get_registry(&mut self, ctx: &mut Context, _registry: u32) -> Action {
+        fn on_get_registry(ctx: &mut Context, _registry: u32) -> Action {
             ctx.fail("the probe handler ran")
         }
     }
@@ -182,10 +158,7 @@ mod tests {
         const UNTRACKED: u32 = 40;
         assert!(ctx.register_native_buffer(UNTRACKED, (1, 1), Vec::new()));
 
-        assert_eq!(
-            DisplayHandler.on_delete_id(&mut ctx, UNTRACKED),
-            Action::Drop
-        );
+        assert_eq!(Handlers::on_delete_id(&mut ctx, UNTRACKED), Action::Drop);
         assert!(
             ctx.has_render_buffer_host(HostId(UNTRACKED)),
             "a delete_id the table does not track must not end other state"
@@ -199,7 +172,7 @@ mod tests {
     /// starts clean.
     #[test]
     fn a_host_destroyed_output_is_forgotten() {
-        use crate::handler::registry::RegistryHandler;
+        use crate::handler::Handlers;
         use crate::protocols::aura_shell::zaura_output;
         use crate::protocols::wayland::wl_registry::WlRegistryHandler;
         let mut ctx = Context::with_placement_for_test(
@@ -208,15 +181,15 @@ mod tests {
         ctx.last_sender_id = 1;
         ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let output = "wl_output".to_string();
-        RegistryHandler.on_global(&mut ctx, 11, &"zaura_shell".to_string(), 38);
-        RegistryHandler.on_global(&mut ctx, 10, &output, 3);
-        RegistryHandler.on_bind(&mut ctx, 10, &(output.clone(), 3, 20));
+        Handlers::on_global(&mut ctx, 11, &"zaura_shell".to_string(), 38);
+        Handlers::on_global(&mut ctx, 10, &output, 3);
+        Handlers::on_bind(&mut ctx, 10, &(output.clone(), 3, 20));
         let host = ctx.shadow_table.get_host_id(20).expect("a bound output");
         let aura_output = ctx.outputs.aura_output(host).expect("an Aura output");
         ctx.client_to_host_queue.clear();
         ctx.host_to_client_queue.clear();
 
-        DisplayHandler.on_delete_id(&mut ctx, host);
+        Handlers::on_delete_id(&mut ctx, host);
 
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
@@ -230,14 +203,14 @@ mod tests {
         ctx.assert_no_orphans();
 
         // The next output gets the freed host ID.
-        RegistryHandler.on_bind(&mut ctx, 10, &(output, 3, 21));
+        Handlers::on_bind(&mut ctx, 10, &(output, 3, 21));
         assert_eq!(ctx.shadow_table.get_host_id(21), Some(host));
         assert_eq!(ctx.outputs.live_outputs(), [host]);
     }
 
     #[test]
     fn a_host_destroyed_keyboard_is_forgotten() {
-        use crate::handler::keyboard::KeyboardHandler;
+        use crate::handler::Handlers;
         use crate::protocols::keyboard_extension_unstable_v1::{
             zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
         };
@@ -250,7 +223,7 @@ mod tests {
         ctx.host_keyboard_extension_id = Some(HostId(EXTENSION));
         let host = ctx.shadow_table.create_paired(20, "wl_keyboard", 1, 1);
         crate::handler::keyboard::for_test::created(&mut ctx, 20, host, SEAT);
-        KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
+        crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
         let extended = ctx
             .keys
             .keyboards()
@@ -258,7 +231,7 @@ mod tests {
             .unwrap();
         ctx.client_to_host_queue.clear();
 
-        DisplayHandler.on_delete_id(&mut ctx, host);
+        Handlers::on_delete_id(&mut ctx, host);
 
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
@@ -277,7 +250,7 @@ mod tests {
             host
         );
         crate::handler::keyboard::for_test::created(&mut ctx, 21, host, SEAT);
-        KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
+        crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
             [(
@@ -292,18 +265,18 @@ mod tests {
     /// extended keyboard is destroyed and retired once.
     #[test]
     fn a_delete_id_after_the_destructor_forgets_nothing_again() {
-        use crate::handler::keyboard::KeyboardHandler;
+        use crate::handler::Handlers;
         const EXTENSION: u32 = 100;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table
             .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
         ctx.host_keyboard_extension_id = Some(HostId(EXTENSION));
         let host = ctx.shadow_table.create_paired(20, "wl_keyboard", 1, 1);
-        KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
+        crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
         ctx.guest_destroyed(20);
         ctx.client_to_host_queue.clear();
 
-        DisplayHandler.on_delete_id(&mut ctx, host);
+        Handlers::on_delete_id(&mut ctx, host);
 
         assert!(ctx.client_to_host_queue.is_empty());
         assert!(!ctx.is_fatal(), "the extended keyboard is retired once");
@@ -326,7 +299,7 @@ mod tests {
                 .expect("an Aura surface");
         ctx.client_to_host_queue.clear();
 
-        DisplayHandler.on_delete_id(&mut ctx, host);
+        Handlers::on_delete_id(&mut ctx, host);
 
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
@@ -386,13 +359,10 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let payload = 20u32.to_ne_bytes();
         let mut msg = WireMessage::new(999, wl_display::REQ_GET_REGISTRY, &payload);
-        let mut handler = ProbeHandler;
 
         assert_eq!(
-            raw_dispatch(wl_display::dispatch_request(
-                &mut msg,
-                &mut handler,
-                &mut ctx
+            raw_dispatch(wl_display::dispatch_request::<ProbeHandler>(
+                &mut msg, &mut ctx
             )),
             Err(ProtocolError::InvalidSender(999))
         );
@@ -405,10 +375,9 @@ mod tests {
     #[test]
     fn unmapped_host_error_is_not_encoded_with_invalid_object_zero() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let mut handler = DisplayHandler;
 
         assert_eq!(
-            handler.on_error(&mut ctx, 77, 3, &"internal error".to_string()),
+            Handlers::on_error(&mut ctx, 77, 3, &"internal error".to_string()),
             Action::Drop
         );
         assert_eq!(
@@ -425,7 +394,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
 
-        DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(2_000));
+        Handlers::on_error(&mut ctx, 77, 3, &"x".repeat(2_000));
 
         assert_eq!(protocol_error(&ctx), (7, 3));
         let (error, _) = session_error(ctx.session_end().expect("the session ends"));

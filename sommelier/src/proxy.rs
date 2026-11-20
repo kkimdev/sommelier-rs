@@ -17,9 +17,9 @@ limitations under the License.
 use crate::allocator::{PendingFence, VirtGpuNode};
 use crate::client_kind;
 use crate::connection::{LastSubmission, OutgoingMessages, WaylandConnection};
+use crate::handler::Handlers;
 use crate::placement_config::{self, PlacementConfig};
 use crate::protocols;
-use crate::protocols::aura_shell::{zaura_output, zaura_toplevel};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::wayland::wl_buffer;
 use crate::settings::{HostTransport, Settings};
@@ -138,56 +138,6 @@ fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
     }
 }
 
-struct SommelierHandler {
-    display: crate::handler::display::DisplayHandler,
-    registry: crate::handler::registry::RegistryHandler,
-    compositor: crate::handler::compositor::CompositorHandler,
-    output: crate::handler::output::OutputHandler,
-    gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
-    callback: crate::handler::callback::CallbackHandler,
-    shm: crate::handler::shm::ShmHandler,
-    buffer: crate::handler::buffer::BufferHandler,
-    linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
-    data_device: crate::handler::data_device::DataDeviceHandler,
-    text_input_manager_v1: crate::handler::text_input::TextInputManagerV1Handler,
-    text_input_v1: crate::handler::text_input::TextInputV1Handler,
-    text_input_extension_v1: crate::handler::text_input::TextInputExtensionV1Handler,
-    extended_text_input_v1: crate::handler::text_input::ExtendedTextInputV1Handler,
-    text_input_manager_v3: crate::handler::text_input::TextInputManagerV3Handler,
-    text_input_v3: crate::handler::text_input::TextInputV3Handler,
-    keyboard: crate::handler::keyboard::KeyboardHandler,
-    pointer: crate::handler::pointer::PointerHandler,
-    seat: crate::handler::seat::SeatHandler,
-    touch: crate::handler::touch::TouchHandler,
-}
-
-impl SommelierHandler {
-    fn new() -> Self {
-        Self {
-            display: crate::handler::display::DisplayHandler,
-            registry: crate::handler::registry::RegistryHandler,
-            compositor: crate::handler::compositor::CompositorHandler,
-            output: crate::handler::output::OutputHandler,
-            gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
-            callback: crate::handler::callback::CallbackHandler,
-            shm: crate::handler::shm::ShmHandler,
-            buffer: crate::handler::buffer::BufferHandler,
-            linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
-            data_device: crate::handler::data_device::DataDeviceHandler,
-            text_input_manager_v1: crate::handler::text_input::TextInputManagerV1Handler,
-            text_input_v1: crate::handler::text_input::TextInputV1Handler,
-            text_input_extension_v1: crate::handler::text_input::TextInputExtensionV1Handler,
-            extended_text_input_v1: crate::handler::text_input::ExtendedTextInputV1Handler,
-            text_input_manager_v3: crate::handler::text_input::TextInputManagerV3Handler,
-            text_input_v3: crate::handler::text_input::TextInputV3Handler,
-            keyboard: crate::handler::keyboard::KeyboardHandler::new(),
-            pointer: crate::handler::pointer::PointerHandler,
-            seat: crate::handler::seat::SeatHandler,
-            touch: crate::handler::touch::TouchHandler,
-        }
-    }
-}
-
 /// A guest request that waits for a fence ([`Context::wait_for_fence`]).
 /// It stays first in the guest stream's buffer, and the guest stream is
 /// neither read nor dispatched until the request is dispatched again.
@@ -279,7 +229,6 @@ struct Client {
     client_conn: WaylandConnection,
     host_conn: WaylandConnection,
     ctx: Context,
-    handler: SommelierHandler,
     /// Whether a batch ended the session: one of its messages did, or a send
     /// failed. No later batch dispatches anything, so the guest gets at most
     /// one error. A failed receive or a closed peer stops `run` without it.
@@ -304,7 +253,6 @@ impl Client {
             client_conn,
             host_conn,
             ctx,
-            handler: SommelierHandler::new(),
             ended: false,
             parked: None,
             to_host: OutgoingMessages::default(),
@@ -436,7 +384,6 @@ impl Client {
     }
 
     fn dispatch_request(
-        handler: &mut SommelierHandler,
         ctx: &mut Context,
         interface: &str,
         msg: &mut WireMessage,
@@ -444,49 +391,14 @@ impl Client {
         let Some(family) = protocols::classify_interface(interface) else {
             return Ok(None);
         };
-
-        // Aura objects are bound internally and have no guest request path.
-        if family == protocols::ProtocolFamily::AuraShell {
-            return Ok(None);
-        }
-
-        protocols::dispatch_request(family, interface, msg, handler, ctx)
+        protocols::dispatch_request::<Handlers>(family, interface, msg, ctx)
     }
 
-    fn dispatch_event(
-        handler: &mut SommelierHandler,
-        ctx: &mut Context,
-        interface: &str,
-        msg: &mut WireMessage,
-    ) -> DispatchResult {
+    fn dispatch_event(ctx: &mut Context, interface: &str, msg: &mut WireMessage) -> DispatchResult {
         let Some(family) = protocols::classify_interface(interface) else {
             return Ok(None);
         };
-
-        if family == protocols::ProtocolFamily::AuraShell {
-            if interface == zaura_toplevel::NAME {
-                return protocols::aura_shell::zaura_toplevel::dispatch_event(
-                    msg,
-                    &mut handler.compositor,
-                    ctx,
-                );
-            }
-            if interface == zaura_output::NAME {
-                return protocols::aura_shell::zaura_output::dispatch_event(
-                    msg,
-                    &mut handler.output,
-                    ctx,
-                );
-            }
-
-            // Other Aura objects are bound internally and have no guest event
-            // path. Consume their payload so an event from one of these
-            // objects cannot tear down the client connection.
-            msg.offset = msg.payload.len();
-            return Ok(None);
-        }
-
-        protocols::dispatch_event(family, interface, msg, handler, ctx)
+        protocols::dispatch_event::<Handlers>(family, interface, msg, ctx)
     }
 
     fn consume_event(interface: &str, msg: &mut WireMessage) -> Result<(), ProtocolError> {
@@ -627,12 +539,9 @@ impl Client {
                 self.ctx.last_sender_id = sender_id;
 
                 let res = match direction {
-                    Direction::ClientToHost => Self::dispatch_request(
-                        &mut self.handler,
-                        &mut self.ctx,
-                        interface,
-                        &mut msg,
-                    ),
+                    Direction::ClientToHost => {
+                        Self::dispatch_request(&mut self.ctx, interface, &mut msg)
+                    }
                     Direction::HostToClient if suppress_host_event => {
                         // A destructor has already been forwarded for this
                         // object. Decode the queued event so its payload and
@@ -641,7 +550,7 @@ impl Client {
                         Self::consume_event(interface, &mut msg).map(|()| None)
                     }
                     Direction::HostToClient => {
-                        Self::dispatch_event(&mut self.handler, &mut self.ctx, interface, &mut msg)
+                        Self::dispatch_event(&mut self.ctx, interface, &mut msg)
                     }
                 };
                 let res = msg.check_consumed(res);
@@ -879,6 +788,205 @@ impl Client {
             self.ended = true;
         }
         !self.ended
+    }
+}
+
+/// What every client connection shares: the process's settings and the
+/// resources built from them once.
+struct Shared {
+    settings: Rc<Settings>,
+    virtgpu: VirtGpuNode,
+    placement: PlacementConfig,
+}
+
+impl Shared {
+    /// Build what the connections share from `settings`, and start
+    /// watching the placement bindings file on the current `LocalSet`.
+    fn new(settings: Settings) -> Self {
+        let settings = Rc::new(settings);
+        Self {
+            virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
+            placement: placement_config::load_and_watch(&settings),
+            settings,
+        }
+    }
+}
+
+/// Serve guest clients on `settings.socket` for the life of the process.
+///
+/// Exits the process when the host cannot be reached or the socket cannot
+/// be claimed, before any client connects.
+pub(crate) async fn run(settings: Settings) {
+    match &settings.host {
+        HostTransport::VirtWl(path) => {
+            if let Err(e) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
+                log::error!(
+                    "Failed to open virtio-wayland device {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+        HostTransport::Local(path) => {
+            if let Err(e) = std::os::unix::net::UnixStream::connect(path) {
+                log::error!(
+                    "Failed to connect to local compositor socket {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let display = settings.socket.clone();
+    // Held until the process exits, like the socket itself.
+    let _socket_lock = claim_display_socket(&display).unwrap_or_else(|error| {
+        log::error!(
+            "Cannot claim the Wayland socket {}: {error}",
+            display.display()
+        );
+        std::process::exit(1);
+    });
+    let listener = UnixListener::bind(&display).unwrap_or_else(|error| {
+        log::error!(
+            "Cannot bind the Wayland socket {}: {error}",
+            display.display()
+        );
+        std::process::exit(1);
+    });
+    log::info!("Listening on {}", display.display());
+
+    // Each client's Context holds xkb state, which is !Send. Keep each
+    // client task on this executor's thread instead of using `tokio::spawn`
+    // (whose Send bound would require an unsound manual Send implementation).
+    // `LocalSet::run_until` also makes the ownership requirement visible in
+    // this function's future type: callers cannot accidentally move the
+    // proxy's client tasks to another executor thread.
+    tokio::task::LocalSet::new()
+        .run_until(async move { serve(listener, Shared::new(settings)).await })
+        .await;
+}
+
+/// Claim the socket path `display` for this process, as libwayland claims
+/// its socket: take an exclusive lock on `<display>.lock` and, only while
+/// holding it, remove a socket a previous owner left behind.
+///
+/// The lock lasts as long as the returned value. Fails, leaving the socket
+/// alone, while another process holds the lock: that process is serving
+/// the socket, and removing it would cut its clients off from new
+/// connections.
+fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flock<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut lock_path = display.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o660)
+        .open(&lock_path)?;
+    let lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, errno)| match errno {
+            nix::errno::Errno::EWOULDBLOCK => io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "another process holds its lock and is serving it",
+            ),
+            errno => io::Error::from(errno),
+        })?;
+    match std::fs::remove_file(display) {
+        Ok(()) => log::info!("Removed the stale socket {}", display.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(lock)
+}
+
+/// Accept guest clients for the life of the process.
+///
+/// A failure concerning one client is logged and ends only that client.
+/// Must run inside a `LocalSet`, like the clients it spawns.
+async fn serve(listener: UnixListener, shared: Shared) {
+    // Log a run of failed accepts once, not every retry.
+    let mut accept_failing = false;
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                if std::mem::take(&mut accept_failing) {
+                    log::info!("Accepting clients again");
+                }
+                log::info!("New client connected");
+                if let Err(error) = start_client(stream, &shared).await {
+                    log::error!("Closing the new client: {error}");
+                }
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut accept_failing, true) {
+                    log::error!(
+                        "Accept error: {e}; retrying every {ACCEPT_RETRY_DELAY:?} until one succeeds"
+                    );
+                }
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+/// Pair an accepted guest connection with a new host connection and serve
+/// the pair on its own task.
+async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
+    // The peer's process, as it was when it connected.
+    let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
+    let (host_conn, virtwl) = connect_host(&shared.settings.host).await?;
+    let facts = ConnectionFacts {
+        virtwl,
+        virtgpu: shared.virtgpu.get(),
+        wheel: shared
+            .settings
+            .wheel_from_touchpad
+            .decide(pid, client_kind::is_wine_process),
+        placement: shared.placement.clone(),
+    };
+    let client = Client::new(
+        client_conn,
+        host_conn,
+        Context::new(Rc::clone(&shared.settings), facts),
+    );
+    tokio::task::spawn_local(async move {
+        client.run().await;
+        log::info!("Client disconnected");
+    });
+    Ok(())
+}
+
+/// Open this client's connection to the host compositor over `host`,
+/// with its VirtWL channel when there is one.
+async fn connect_host(
+    host: &HostTransport,
+) -> io::Result<(WaylandConnection, Option<Arc<VirtWaylandChannel>>)> {
+    match host {
+        HostTransport::VirtWl(path) => {
+            let channel = Arc::new(VirtWaylandChannel::new(path).map_err(|error| {
+                io::Error::other(format!(
+                    "cannot open a virtio-wayland channel at {}: {error}",
+                    path.display()
+                ))
+            })?);
+            let conn = WaylandConnection::new_virtwayland(Arc::clone(&channel));
+            Ok((conn, Some(channel)))
+        }
+        HostTransport::Local(path) => {
+            let stream = UnixStream::connect(path).await?;
+            Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
+        }
     }
 }
 
@@ -3344,7 +3452,6 @@ mod tests {
     }
 
     fn dispatch_raw_request_result(
-        handler: &mut SommelierHandler,
         ctx: &mut Context,
         interface: &str,
         message: Vec<u8>,
@@ -3355,7 +3462,7 @@ mod tests {
             header.opcode,
             &message[MessageHeader::LEN..],
         );
-        let result = Client::dispatch_request(handler, ctx, interface, &mut wire)
+        let result = Client::dispatch_request(ctx, interface, &mut wire)
             .expect("raw guest request must dispatch");
         assert!(
             wire.is_payload_consumed(),
@@ -3386,10 +3493,7 @@ mod tests {
         let request =
             request.build_message(GTK_SHELL, protocols::gtk::gtk_shell1::REQ_GET_GTK_SURFACE);
 
-        let mut handler = SommelierHandler::new();
-        assert!(
-            dispatch_raw_request_result(&mut handler, &mut ctx, "gtk_shell1", request).is_none()
-        );
+        assert!(dispatch_raw_request_result(&mut ctx, "gtk_shell1", request).is_none());
         assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
         assert_eq!(ctx.client_to_host_queue.len(), 2);
         assert_eq!(
@@ -3401,7 +3505,7 @@ mod tests {
         bell.write_u32(GTK_SURFACE);
         let bell = bell.build_message(GTK_SHELL, protocols::gtk::gtk_shell1::REQ_SYSTEM_BELL);
         assert!(
-            dispatch_raw_request_result(&mut handler, &mut ctx, "gtk_shell1", bell).is_none(),
+            dispatch_raw_request_result(&mut ctx, "gtk_shell1", bell).is_none(),
             "a local gtk_surface object must be accepted by a local no-op request"
         );
     }
@@ -3421,7 +3525,6 @@ mod tests {
         let guest_id = 20;
         ctx.shadow_table
             .create_local(guest_id, "zwp_text_input_manager_v3", 1);
-        let mut handler = SommelierHandler::new();
 
         let mut destroy = WireMessage::new(
             guest_id,
@@ -3430,11 +3533,9 @@ mod tests {
         );
         assert_eq!(
             raw_dispatch(
-                protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request(
-                    &mut destroy,
-                    &mut handler,
-                    &mut ctx,
-                )
+                protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request::<
+                    Handlers,
+                >(&mut destroy, &mut ctx,)
             ),
             Ok(None)
         );
@@ -3452,11 +3553,9 @@ mod tests {
         );
         assert_eq!(
             raw_dispatch(
-                protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request(
-                    &mut duplicate_destroy,
-                    &mut handler,
-                    &mut ctx,
-                )
+                protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request::<
+                    Handlers,
+                >(&mut duplicate_destroy, &mut ctx,)
             ),
             Err(ProtocolError::InvalidSender(guest_id))
         );
@@ -3472,16 +3571,16 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let guest_id = 21;
         ctx.shadow_table.create_local(guest_id, "wl_shm_pool", 1);
-        let mut handler = SommelierHandler::new();
 
         let mut destroy =
             WireMessage::new(guest_id, protocols::wayland::wl_shm_pool::REQ_DESTROY, &[]);
         assert_eq!(
-            raw_dispatch(protocols::wayland::wl_shm_pool::dispatch_request(
-                &mut destroy,
-                &mut handler,
-                &mut ctx,
-            )),
+            raw_dispatch(
+                protocols::wayland::wl_shm_pool::dispatch_request::<Handlers>(
+                    &mut destroy,
+                    &mut ctx,
+                )
+            ),
             Ok(None)
         );
         assert_eq!(ctx.shadow_table.get_interface(guest_id), None);
@@ -3570,11 +3669,10 @@ mod tests {
             .insert_paired_with_version_for_test(1, 1, "wl_display", 1);
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
-        let mut handler = SommelierHandler::new();
 
         let mut destroy = WireMessage::new(10, protocols::wayland::wl_region::REQ_DESTROY, &[]);
         let forwarded =
-            protocols::wayland::dispatch_request("wl_region", &mut destroy, &mut handler, &mut ctx)
+            protocols::wayland::dispatch_request::<Handlers>("wl_region", &mut destroy, &mut ctx)
                 .expect("destructor request should dispatch");
         assert!(forwarded.is_some());
         assert_eq!(
@@ -3591,10 +3689,9 @@ mod tests {
         let mut delete_id =
             WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
         assert_eq!(
-            raw_dispatch(protocols::wayland::dispatch_event(
+            raw_dispatch(protocols::wayland::dispatch_event::<Handlers>(
                 "wl_display",
                 &mut delete_id,
-                &mut handler,
                 &mut ctx
             )),
             Ok(None)
@@ -3617,7 +3714,6 @@ mod tests {
             .insert_paired_with_version_for_test(5, 15, "wl_fixes", 1);
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 20, "wl_registry", 1);
-        let mut handler = SommelierHandler::new();
 
         let payload = 10u32.to_ne_bytes();
         let mut destroy_registry = WireMessage::new(
@@ -3625,10 +3721,9 @@ mod tests {
             protocols::wayland::wl_fixes::REQ_DESTROY_REGISTRY,
             &payload,
         );
-        let (forwarded, fds) = protocols::wayland::dispatch_request(
+        let (forwarded, fds) = protocols::wayland::dispatch_request::<Handlers>(
             "wl_fixes",
             &mut destroy_registry,
-            &mut handler,
             &mut ctx,
         )
         .expect("destroy_registry request should dispatch")
@@ -3651,10 +3746,9 @@ mod tests {
         let mut delete_id =
             WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
         assert_eq!(
-            raw_dispatch(protocols::wayland::dispatch_event(
+            raw_dispatch(protocols::wayland::dispatch_event::<Handlers>(
                 "wl_display",
                 &mut delete_id,
-                &mut handler,
                 &mut ctx
             )),
             Ok(None)
@@ -3712,7 +3806,7 @@ mod tests {
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 20, "wl_output", 3);
         ctx.last_sender_id = 10;
-        WlOutputHandler::on_release(&mut crate::handler::output::OutputHandler, &mut ctx);
+        <Handlers as WlOutputHandler>::on_release(&mut ctx);
         for opcode in [EVT_GEOMETRY, EVT_MODE, EVT_DONE, EVT_SCALE] {
             assert!(
                 pending_host_event_is_stale(&ctx, 20, opcode),
@@ -3763,7 +3857,6 @@ mod tests {
     fn created_surface_keeps_separate_guest_and_host_versions() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let host_compositor = ctx.shadow_table.create_paired(10, "wl_compositor", 4, 3);
-        let mut handler = SommelierHandler::new();
         let payload = 30u32.to_ne_bytes();
         let mut msg = WireMessage::new(
             10,
@@ -3771,7 +3864,7 @@ mod tests {
             &payload,
         );
         let (forwarded, fds) =
-            protocols::wayland::dispatch_request("wl_compositor", &mut msg, &mut handler, &mut ctx)
+            protocols::wayland::dispatch_request::<Handlers>("wl_compositor", &mut msg, &mut ctx)
                 .expect("create_surface dispatch")
                 .expect("create_surface forwarded");
         assert!(fds.is_empty());
@@ -3802,11 +3895,9 @@ mod tests {
             protocols::xdg_shell::xdg_positioner::REQ_SET_REACTIVE,
             &payload,
         );
-        let mut handler = SommelierHandler::new();
-        let result = protocols::xdg_shell::dispatch_request(
+        let result = protocols::xdg_shell::dispatch_request::<Handlers>(
             "xdg_positioner",
             &mut msg,
-            &mut handler,
             &mut ctx,
         );
 
@@ -3856,14 +3947,11 @@ mod tests {
             protocols::wayland::wl_subcompositor::REQ_GET_SUBSURFACE,
             &payload,
         );
-        let mut handler = SommelierHandler::new();
 
         assert_eq!(
-            raw_dispatch(protocols::wayland::wl_subcompositor::dispatch_request(
-                &mut msg,
-                &mut handler,
-                &mut ctx,
-            )),
+            raw_dispatch(protocols::wayland::wl_subcompositor::dispatch_request::<
+                Handlers,
+            >(&mut msg, &mut ctx,)),
             Err(ProtocolError::InvalidObjectId(surface)),
             "requests must not retain a pending-destroy object through another argument"
         );
@@ -3886,9 +3974,8 @@ mod tests {
             protocols::xdg_shell::xdg_toplevel::EVT_CONFIGURE_BOUNDS,
             &payload,
         );
-        let mut handler = SommelierHandler::new();
         let result =
-            protocols::xdg_shell::dispatch_event("xdg_toplevel", &mut msg, &mut handler, &mut ctx);
+            protocols::xdg_shell::dispatch_event::<Handlers>("xdg_toplevel", &mut msg, &mut ctx);
 
         assert_eq!(
             raw_dispatch(result),
@@ -3910,313 +3997,13 @@ mod tests {
         builder.write_string(&"x".repeat(4_084));
         let payload = builder.into_payload();
         let mut msg = WireMessage::new(10, protocols::wayland::wl_data_source::REQ_OFFER, &payload);
-        let mut handler = SommelierHandler::new();
 
         assert_eq!(
-            raw_dispatch(protocols::wayland::wl_data_source::dispatch_request(
-                &mut msg,
-                &mut handler,
-                &mut ctx,
-            )),
+            raw_dispatch(protocols::wayland::wl_data_source::dispatch_request::<
+                Handlers,
+            >(&mut msg, &mut ctx,)),
             Err(ProtocolError::MessageTooLarge(4_100)),
             "generated forwarding must not truncate the Wayland length field"
         );
-    }
-}
-
-// Wayland Protocol
-protocols::wayland::impl_sommelier_delegates!(SommelierHandler, {
-    wl_display: display,
-    wl_registry: registry,
-    wl_callback: callback,
-    wl_compositor: compositor,
-    wl_surface: compositor,
-    wl_subcompositor: compositor,
-    wl_subsurface: compositor,
-    wl_region: compositor,
-    wl_shm: shm,
-    wl_shm_pool: shm,
-    wl_buffer: buffer,
-    wl_data_device_manager: data_device,
-    wl_data_device: data_device,
-    wl_data_source: data_device,
-    wl_data_offer: data_device,
-    wl_keyboard: keyboard,
-    wl_pointer: pointer,
-    wl_touch: touch,
-    wl_seat: seat,
-    wl_output: output,
-    wl_fixes: registry
-});
-impl protocols::wayland::ProtocolHandler for SommelierHandler {}
-
-// XDG Shell Protocol
-protocols::xdg_shell::impl_sommelier_delegates!(SommelierHandler, {
-    xdg_wm_base: compositor,
-    xdg_surface: compositor,
-    xdg_toplevel: compositor
-});
-impl protocols::xdg_shell::ProtocolHandler for SommelierHandler {}
-
-// Linux DMABuf Protocol
-protocols::linux_dmabuf_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zwp_linux_dmabuf_v1: linux_dmabuf,
-    zwp_linux_buffer_params_v1: linux_dmabuf,
-    zwp_linux_dmabuf_feedback_v1: linux_dmabuf
-});
-impl protocols::linux_dmabuf_v1::ProtocolHandler for SommelierHandler {}
-
-// Text Input unstable v1 Protocol
-protocols::text_input_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zwp_text_input_manager_v1: text_input_manager_v1,
-    zwp_text_input_v1: text_input_v1
-});
-impl protocols::text_input_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// Text Input Extension unstable v1 Protocol
-protocols::text_input_extension_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zcr_text_input_extension_v1: text_input_extension_v1,
-    zcr_extended_text_input_v1: extended_text_input_v1
-});
-impl protocols::text_input_extension_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// Text Input unstable v3 Protocol
-protocols::text_input_unstable_v3::impl_sommelier_delegates!(SommelierHandler, {
-    zwp_text_input_manager_v3: text_input_manager_v3,
-    zwp_text_input_v3: text_input_v3
-});
-impl protocols::text_input_unstable_v3::ProtocolHandler for SommelierHandler {}
-
-// Viewporter Protocol
-protocols::viewporter::impl_sommelier_delegates!(SommelierHandler, {
-    wp_viewporter: compositor,
-    wp_viewport: compositor
-});
-impl protocols::viewporter::ProtocolHandler for SommelierHandler {}
-
-// XDG Decoration Protocol
-protocols::xdg_decoration_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {});
-impl protocols::xdg_decoration_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// Fractional Scale Protocol
-protocols::fractional_scale_v1::impl_sommelier_delegates!(SommelierHandler, {});
-impl protocols::fractional_scale_v1::ProtocolHandler for SommelierHandler {}
-
-// XDG Output Protocol
-protocols::xdg_output_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zxdg_output_manager_v1: output
-});
-impl protocols::xdg_output_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// Keyboard Extension Protocol (ChromeOS-specific)
-protocols::keyboard_extension_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zcr_keyboard_extension_v1: keyboard,
-    zcr_extended_keyboard_v1: keyboard
-});
-impl protocols::keyboard_extension_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// GTK shell protocol, translated to ChromeOS Aura surface metadata.
-protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
-    gtk_shell1: gtk_shell,
-    gtk_surface1: gtk_shell
-});
-impl protocols::gtk::ProtocolHandler for SommelierHandler {}
-
-/// What every client connection shares: the process's settings and the
-/// resources built from them once.
-struct Shared {
-    settings: Rc<Settings>,
-    virtgpu: VirtGpuNode,
-    placement: PlacementConfig,
-}
-
-impl Shared {
-    /// Build what the connections share from `settings`, and start
-    /// watching the placement bindings file on the current `LocalSet`.
-    fn new(settings: Settings) -> Self {
-        let settings = Rc::new(settings);
-        Self {
-            virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
-            placement: placement_config::load_and_watch(&settings),
-            settings,
-        }
-    }
-}
-
-/// Serve guest clients on `settings.socket` for the life of the process.
-///
-/// Exits the process when the host cannot be reached or the socket cannot
-/// be claimed, before any client connects.
-pub(crate) async fn run(settings: Settings) {
-    match &settings.host {
-        HostTransport::VirtWl(path) => {
-            if let Err(e) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-            {
-                log::error!(
-                    "Failed to open virtio-wayland device {}: {}",
-                    path.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
-        HostTransport::Local(path) => {
-            if let Err(e) = std::os::unix::net::UnixStream::connect(path) {
-                log::error!(
-                    "Failed to connect to local compositor socket {}: {}",
-                    path.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let display = settings.socket.clone();
-    // Held until the process exits, like the socket itself.
-    let _socket_lock = claim_display_socket(&display).unwrap_or_else(|error| {
-        log::error!(
-            "Cannot claim the Wayland socket {}: {error}",
-            display.display()
-        );
-        std::process::exit(1);
-    });
-    let listener = UnixListener::bind(&display).unwrap_or_else(|error| {
-        log::error!(
-            "Cannot bind the Wayland socket {}: {error}",
-            display.display()
-        );
-        std::process::exit(1);
-    });
-    log::info!("Listening on {}", display.display());
-
-    // Each client's Context holds xkb state, which is !Send. Keep each
-    // client task on this executor's thread instead of using `tokio::spawn`
-    // (whose Send bound would require an unsound manual Send implementation).
-    // `LocalSet::run_until` also makes the ownership requirement visible in
-    // this function's future type: callers cannot accidentally move the
-    // proxy's client tasks to another executor thread.
-    tokio::task::LocalSet::new()
-        .run_until(async move { serve(listener, Shared::new(settings)).await })
-        .await;
-}
-
-/// Claim the socket path `display` for this process, as libwayland claims
-/// its socket: take an exclusive lock on `<display>.lock` and, only while
-/// holding it, remove a socket a previous owner left behind.
-///
-/// The lock lasts as long as the returned value. Fails, leaving the socket
-/// alone, while another process holds the lock: that process is serving
-/// the socket, and removing it would cut its clients off from new
-/// connections.
-fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flock<std::fs::File>> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut lock_path = display.as_os_str().to_owned();
-    lock_path.push(".lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o660)
-        .open(&lock_path)?;
-    let lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-        .map_err(|(_, errno)| match errno {
-            nix::errno::Errno::EWOULDBLOCK => io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "another process holds its lock and is serving it",
-            ),
-            errno => io::Error::from(errno),
-        })?;
-    match std::fs::remove_file(display) {
-        Ok(()) => log::info!("Removed the stale socket {}", display.display()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    Ok(lock)
-}
-
-/// Accept guest clients for the life of the process.
-///
-/// A failure concerning one client is logged and ends only that client.
-/// Must run inside a `LocalSet`, like the clients it spawns.
-async fn serve(listener: UnixListener, shared: Shared) {
-    // Log a run of failed accepts once, not every retry.
-    let mut accept_failing = false;
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                if std::mem::take(&mut accept_failing) {
-                    log::info!("Accepting clients again");
-                }
-                log::info!("New client connected");
-                if let Err(error) = start_client(stream, &shared).await {
-                    log::error!("Closing the new client: {error}");
-                }
-            }
-            Err(e) => {
-                if !std::mem::replace(&mut accept_failing, true) {
-                    log::error!(
-                        "Accept error: {e}; retrying every {ACCEPT_RETRY_DELAY:?} until one succeeds"
-                    );
-                }
-                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
-            }
-        }
-    }
-}
-
-/// Pair an accepted guest connection with a new host connection and serve
-/// the pair on its own task.
-async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
-    // The peer's process, as it was when it connected.
-    let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
-    let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
-    let (host_conn, virtwl) = connect_host(&shared.settings.host).await?;
-    let facts = ConnectionFacts {
-        virtwl,
-        virtgpu: shared.virtgpu.get(),
-        wheel: shared
-            .settings
-            .wheel_from_touchpad
-            .decide(pid, client_kind::is_wine_process),
-        placement: shared.placement.clone(),
-    };
-    let client = Client::new(
-        client_conn,
-        host_conn,
-        Context::new(Rc::clone(&shared.settings), facts),
-    );
-    tokio::task::spawn_local(async move {
-        client.run().await;
-        log::info!("Client disconnected");
-    });
-    Ok(())
-}
-
-/// Open this client's connection to the host compositor over `host`,
-/// with its VirtWL channel when there is one.
-async fn connect_host(
-    host: &HostTransport,
-) -> io::Result<(WaylandConnection, Option<Arc<VirtWaylandChannel>>)> {
-    match host {
-        HostTransport::VirtWl(path) => {
-            let channel = Arc::new(VirtWaylandChannel::new(path).map_err(|error| {
-                io::Error::other(format!(
-                    "cannot open a virtio-wayland channel at {}: {error}",
-                    path.display()
-                ))
-            })?);
-            let conn = WaylandConnection::new_virtwayland(Arc::clone(&channel));
-            Ok((conn, Some(channel)))
-        }
-        HostTransport::Local(path) => {
-            let stream = UnixStream::connect(path).await?;
-            Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
-        }
     }
 }

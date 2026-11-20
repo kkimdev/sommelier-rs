@@ -18,6 +18,7 @@ use crate::allocator::DmabufFence;
 use crate::handler::aura_objects;
 use crate::handler::shm::{copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout};
 use crate::handler::window_placement;
+use crate::handler::Handlers;
 use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
@@ -36,8 +37,6 @@ use crate::wire::{queue_or_drop, Action, Outgoing};
 use log::trace;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
-
-pub struct CompositorHandler;
 
 /// RAII guard for the VirtWL dma-buf CPU-write interval.
 ///
@@ -166,8 +165,8 @@ fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> std::io::Result<DmabufFe
     crate::allocator::dmabuf_fence(plane, ctx.virtgpu())
 }
 
-impl WlCompositorHandler for CompositorHandler {
-    fn on_create_surface(&mut self, ctx: &mut Context, id: u32) -> Action {
+impl WlCompositorHandler for Handlers {
+    fn on_create_surface(ctx: &mut Context, id: u32) -> Action {
         ctx.create_surface(id);
         Action::Forward
     }
@@ -471,8 +470,8 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
     crate::handler::keyboard::keys(ctx, focus);
 }
 
-impl WlSurfaceHandler for CompositorHandler {
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
+impl WlSurfaceHandler for Handlers {
+    fn on_destroy(ctx: &mut Context) -> Action {
         let wl_surface_guest_id = ctx.last_sender_id;
         let Some(wl_surface_host_id) = ctx.shadow_table.get_host_id(wl_surface_guest_id) else {
             return ctx.fail(format_args!(
@@ -496,19 +495,19 @@ impl WlSurfaceHandler for CompositorHandler {
     /// An enter or leave naming a surface or output the guest has destroyed
     /// never gets here: the proxy suppresses events from a destroyed sender,
     /// and generated validation drops events naming a destroyed object.
-    fn on_enter(&mut self, ctx: &mut Context, output: u32) -> Action {
+    fn on_enter(ctx: &mut Context, output: u32) -> Action {
         // An output whose global was removed is still a valid guest object,
         // so the event is forwarded; the registry ignores it for placement.
         ctx.outputs.surface_entered(ctx.last_sender_id, output);
         Action::Forward
     }
 
-    fn on_leave(&mut self, ctx: &mut Context, output: u32) -> Action {
+    fn on_leave(ctx: &mut Context, output: u32) -> Action {
         ctx.outputs.surface_left(ctx.last_sender_id, output);
         Action::Forward
     }
 
-    fn on_attach(&mut self, ctx: &mut Context, buffer: u32, x: i32, y: i32) -> Action {
+    fn on_attach(ctx: &mut Context, buffer: u32, x: i32, y: i32) -> Action {
         let surface_id = ctx.last_sender_id;
         // An inert buffer, from a pool whose host wl_shm was removed, has
         // no host object, so it reaches the host as no buffer.
@@ -534,7 +533,7 @@ impl WlSurfaceHandler for CompositorHandler {
         Action::Forward
     }
 
-    fn on_damage(&mut self, ctx: &mut Context, x: i32, y: i32, width: i32, height: i32) -> Action {
+    fn on_damage(ctx: &mut Context, x: i32, y: i32, width: i32, height: i32) -> Action {
         let surface_id = ctx.last_sender_id;
         let Some(surface) = ctx.surface_mut(surface_id) else {
             return ctx.missing_surface_state(surface_id);
@@ -549,14 +548,7 @@ impl WlSurfaceHandler for CompositorHandler {
         Action::Drop
     }
 
-    fn on_damage_buffer(
-        &mut self,
-        ctx: &mut Context,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    ) -> Action {
+    fn on_damage_buffer(ctx: &mut Context, x: i32, y: i32, width: i32, height: i32) -> Action {
         let surface_id = ctx.last_sender_id;
         let Some(surface) = ctx.surface_mut(surface_id) else {
             return ctx.missing_surface_state(surface_id);
@@ -570,7 +562,7 @@ impl WlSurfaceHandler for CompositorHandler {
         Action::Drop
     }
 
-    fn on_set_buffer_scale(&mut self, ctx: &mut Context, scale: i32) -> Action {
+    fn on_set_buffer_scale(ctx: &mut Context, scale: i32) -> Action {
         if scale <= 0 {
             log::warn!("Rejecting invalid wl_surface buffer scale {}", scale);
             return ctx.reject(
@@ -587,7 +579,7 @@ impl WlSurfaceHandler for CompositorHandler {
         Action::Forward
     }
 
-    fn on_set_buffer_transform(&mut self, ctx: &mut Context, transform: i32) -> Action {
+    fn on_set_buffer_transform(ctx: &mut Context, transform: i32) -> Action {
         if !is_valid_transform(transform) {
             log::warn!(
                 "Rejecting invalid wl_surface buffer transform {}",
@@ -607,7 +599,7 @@ impl WlSurfaceHandler for CompositorHandler {
         Action::Forward
     }
 
-    fn on_commit(&mut self, ctx: &mut Context) -> Action {
+    fn on_commit(ctx: &mut Context) -> Action {
         let surface_id = ctx.last_sender_id;
 
         // A native dma-buf's fence belongs to the contents an attach
@@ -771,12 +763,12 @@ impl WlSurfaceHandler for CompositorHandler {
     }
 }
 
-impl WlRegionHandler for CompositorHandler {}
-impl WlSubcompositorHandler for CompositorHandler {}
-impl WlSubsurfaceHandler for CompositorHandler {}
+impl WlRegionHandler for Handlers {}
+impl WlSubcompositorHandler for Handlers {}
+impl WlSubsurfaceHandler for Handlers {}
 
-impl wp_viewporter::WpViewporterHandler for CompositorHandler {
-    fn on_get_viewport(&mut self, ctx: &mut Context, id: u32, surface: u32) -> Action {
+impl wp_viewporter::WpViewporterHandler for Handlers {
+    fn on_get_viewport(ctx: &mut Context, id: u32, surface: u32) -> Action {
         if ctx
             .viewport_to_wl_surface
             .values()
@@ -798,15 +790,8 @@ impl wp_viewporter::WpViewporterHandler for CompositorHandler {
     }
 }
 
-impl wp_viewport::WpViewportHandler for CompositorHandler {
-    fn on_set_source(
-        &mut self,
-        ctx: &mut Context,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    ) -> Action {
+impl wp_viewport::WpViewportHandler for Handlers {
+    fn on_set_source(ctx: &mut Context, x: i32, y: i32, width: i32, height: i32) -> Action {
         let Some(&surface_id) = ctx.viewport_to_wl_surface.get(&ctx.last_sender_id) else {
             return ctx.reject(
                 ctx.last_sender_id,
@@ -830,7 +815,7 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
         Action::Forward
     }
 
-    fn on_set_destination(&mut self, ctx: &mut Context, width: i32, height: i32) -> Action {
+    fn on_set_destination(ctx: &mut Context, width: i32, height: i32) -> Action {
         let Some(&surface_id) = ctx.viewport_to_wl_surface.get(&ctx.last_sender_id) else {
             return ctx.reject(
                 ctx.last_sender_id,
@@ -881,8 +866,8 @@ pub(crate) fn forget_viewport(ctx: &mut Context, viewport_id: u32) {
 // and end it in the destructors, so set_app_id can resolve the underlying
 // wl_surface and create or reuse its host zaura_surface.
 
-impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHandler {
-    fn on_get_xdg_surface(&mut self, ctx: &mut Context, id: u32, surface: u32) -> Action {
+impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for Handlers {
+    fn on_get_xdg_surface(ctx: &mut Context, id: u32, surface: u32) -> Action {
         ctx.xdg_roles.add_xdg_surface(id, surface);
         Action::Forward
     }
@@ -909,8 +894,8 @@ pub(crate) fn forget_xdg_toplevel(ctx: &mut Context, xdg_toplevel_id: u32) {
     ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
 }
 
-impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorHandler {
-    fn on_configure(&mut self, ctx: &mut Context, serial: u32) -> Action {
+impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for Handlers {
+    fn on_configure(ctx: &mut Context, serial: u32) -> Action {
         let host_xdg_surface_id = ctx.last_sender_id;
         let Some(guest_xdg_surface_id) = ctx.shadow_table.get_guest_id(host_xdg_surface_id) else {
             return Action::Drop;
@@ -919,7 +904,7 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
         Action::Forward
     }
 
-    fn on_get_toplevel(&mut self, ctx: &mut Context, id: u32) -> Action {
+    fn on_get_toplevel(ctx: &mut Context, id: u32) -> Action {
         ctx.defer_until_forwarded(PostDispatch::XdgToplevelCreated {
             xdg_surface: ctx.last_sender_id,
             xdg_toplevel: id,
@@ -928,8 +913,8 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
     }
 }
 
-impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for CompositorHandler {
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
+impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Handlers {
+    fn on_destroy(ctx: &mut Context) -> Action {
         let xdg_toplevel_id = ctx.last_sender_id;
         let Some(host_xdg_toplevel_id) = ctx.shadow_table.get_host_id(xdg_toplevel_id) else {
             return ctx.fail(format_args!(
@@ -946,7 +931,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         Action::Drop
     }
 
-    fn on_set_app_id(&mut self, ctx: &mut Context, app_id: &String) -> Action {
+    fn on_set_app_id(ctx: &mut Context, app_id: &String) -> Action {
         let xdg_toplevel_id = ctx.last_sender_id;
 
         let Some(xdg_toplevel_host_id) = ctx.shadow_table.get_host_id(xdg_toplevel_id) else {
@@ -980,13 +965,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         Action::Drop
     }
 
-    fn on_configure(
-        &mut self,
-        ctx: &mut Context,
-        _width: i32,
-        _height: i32,
-        _states: &[u8],
-    ) -> Action {
+    fn on_configure(ctx: &mut Context, _width: i32, _height: i32, _states: &[u8]) -> Action {
         if ctx.shadow_table.get_guest_id(ctx.last_sender_id).is_none() {
             return Action::Drop;
         }
@@ -994,9 +973,8 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
     }
 }
 
-impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for CompositorHandler {
+impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Handlers {
     fn on_configure(
-        &mut self,
         ctx: &mut Context,
         x: i32,
         y: i32,
@@ -1017,7 +995,7 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
         Action::Drop
     }
 
-    fn on_origin_change(&mut self, ctx: &mut Context, x: i32, y: i32) -> Action {
+    fn on_origin_change(ctx: &mut Context, x: i32, y: i32) -> Action {
         // xdg_toplevel has no origin-change event: placement keeps the
         // origin, and the guest gets nothing.
         window_placement::origin_changed(ctx, ctx.last_sender_id, x, y);
@@ -1075,7 +1053,7 @@ mod tests {
         let payload = inert_output.to_ne_bytes();
         let mut request =
             crate::wire::WireMessage::new(toplevel_guest, REQ_SET_FULLSCREEN, &payload);
-        let forwarded = dispatch_request(&mut request, &mut CompositorHandler, &mut ctx)
+        let forwarded = dispatch_request::<Handlers>(&mut request, &mut ctx)
             .expect("valid request")
             .expect("forwarded");
         assert_eq!(
@@ -1095,9 +1073,9 @@ mod tests {
         ctx.last_sender_id = 100;
         let event = |ctx: &mut Context, enter: bool, output: u32| {
             let action = if enter {
-                WlSurfaceHandler::on_enter(&mut CompositorHandler, ctx, output)
+                <Handlers as WlSurfaceHandler>::on_enter(ctx, output)
             } else {
-                WlSurfaceHandler::on_leave(&mut CompositorHandler, ctx, output)
+                <Handlers as WlSurfaceHandler>::on_leave(ctx, output)
             };
             assert_eq!(action, Action::Forward);
             ctx.outputs.entered_for_test(100)
@@ -1137,7 +1115,7 @@ mod tests {
         let payload = output_host.to_ne_bytes();
         for opcode in [EVT_ENTER, EVT_LEAVE] {
             let mut event = crate::wire::WireMessage::new(surface_host, opcode, &payload);
-            let dispatched = dispatch_event(&mut event, &mut CompositorHandler, &mut ctx);
+            let dispatched = dispatch_event::<Handlers>(&mut event, &mut ctx);
             assert!(matches!(dispatched, Ok(None)), "opcode {opcode}");
             assert_eq!(ctx.outputs.entered_for_test(surface_host), None);
         }
@@ -1154,7 +1132,7 @@ mod tests {
         assert!(removed_aura_outputs.is_empty());
         ctx.last_sender_id = 100;
         assert_eq!(
-            WlSurfaceHandler::on_enter(&mut CompositorHandler, &mut ctx, 20),
+            <Handlers as WlSurfaceHandler>::on_enter(&mut ctx, 20),
             Action::Forward
         );
         assert_eq!(ctx.outputs.entered_for_test(100), None);
@@ -1277,10 +1255,9 @@ mod tests {
             vec![unsupported_dmabuf_sync_fd()],
         );
 
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = surface;
-        assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert!(!ctx.is_fatal());
         assert!(ctx.native_buffer_uses_implicit_sync(buffer));
         assert_eq!(
@@ -1289,8 +1266,8 @@ mod tests {
         );
 
         ctx.client_to_host_queue.clear();
-        assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert!(!ctx.is_fatal());
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue).last(),
@@ -1309,10 +1286,9 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
         register_test_native_with_sync_fds(&mut ctx, buffer, (1, 1), vec![sync_fd]);
 
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = surface;
-        assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.is_fatal());
         assert!(!ctx.native_buffer_uses_implicit_sync(buffer));
@@ -1333,12 +1309,11 @@ mod tests {
         let buffer = 50;
         let (fence, signal) = crate::test_support::pipe();
         register_test_native_with_sync_fds(&mut ctx, buffer, (1, 1), vec![fence]);
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
         let before = ctx.surfaces[&TEST_SURFACE].clone();
 
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         let wait = {
             let effects = ctx.take_effects();
             assert!(effects.end.is_none());
@@ -1353,7 +1328,7 @@ mod tests {
         );
 
         assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         let effects = ctx.take_effects();
         assert!(effects.end.is_none() && effects.wait.is_none());
         assert_eq!(
@@ -1366,37 +1341,39 @@ mod tests {
     /// the session, not a state the proxy recreates.
     #[test]
     fn a_live_surface_without_state_ends_the_session() {
-        type Request = fn(&mut CompositorHandler, &mut Context) -> Action;
+        type Request = fn(&mut Context) -> Action;
         let requests: [(&str, Request); 9] = [
-            ("attach", |h, ctx| h.on_attach(ctx, 0, 0, 0)),
-            ("damage", |h, ctx| h.on_damage(ctx, 0, 0, 1, 1)),
-            ("damage_buffer", |h, ctx| {
-                h.on_damage_buffer(ctx, 0, 0, 1, 1)
+            ("attach", |ctx| Handlers::on_attach(ctx, 0, 0, 0)),
+            ("damage", |ctx| Handlers::on_damage(ctx, 0, 0, 1, 1)),
+            ("damage_buffer", |ctx| {
+                Handlers::on_damage_buffer(ctx, 0, 0, 1, 1)
             }),
-            ("set_buffer_scale", |h, ctx| h.on_set_buffer_scale(ctx, 1)),
-            ("commit", |h, ctx| h.on_commit(ctx)),
-            ("set_buffer_transform", |h, ctx| {
-                h.on_set_buffer_transform(ctx, 0)
+            ("set_buffer_scale", |ctx| {
+                Handlers::on_set_buffer_scale(ctx, 1)
             }),
-            ("get_viewport", |h, ctx| {
-                h.on_get_viewport(ctx, 700, TEST_SURFACE)
+            ("commit", |ctx| Handlers::on_commit(ctx)),
+            ("set_buffer_transform", |ctx| {
+                Handlers::on_set_buffer_transform(ctx, 0)
             }),
-            ("set_source", |h, ctx| {
+            ("get_viewport", |ctx| {
+                Handlers::on_get_viewport(ctx, 700, TEST_SURFACE)
+            }),
+            ("set_source", |ctx| {
                 ctx.viewport_to_wl_surface.insert(700, TEST_SURFACE);
                 ctx.last_sender_id = 700;
-                h.on_set_source(ctx, 0, 0, 1, 1)
+                Handlers::on_set_source(ctx, 0, 0, 1, 1)
             }),
-            ("set_destination", |h, ctx| {
+            ("set_destination", |ctx| {
                 ctx.viewport_to_wl_surface.insert(700, TEST_SURFACE);
                 ctx.last_sender_id = 700;
-                h.on_set_destination(ctx, 1, 1)
+                Handlers::on_set_destination(ctx, 1, 1)
             }),
         ];
         for (name, request) in requests {
             let mut ctx = toplevel_ctx();
             ctx.surfaces.remove(&TEST_SURFACE);
             ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(request(&mut CompositorHandler, &mut ctx), Action::Drop);
+            assert_eq!(request(&mut ctx), Action::Drop);
             assert_eq!(
                 ctx.session_end(),
                 Some(&crate::state::SessionEnd::Internal),
@@ -1414,7 +1391,7 @@ mod tests {
         ctx.surfaces.remove(&TEST_SURFACE);
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            CompositorHandler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
+            Handlers::on_get_viewport(&mut ctx, 700, TEST_SURFACE),
             Action::Drop
         );
         assert!(ctx.viewport_to_wl_surface.is_empty());
@@ -1440,20 +1417,18 @@ mod tests {
     }
 
     fn attach_and_commit(ctx: &mut Context, surface: u32, buffer: u32) {
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = surface;
-        assert_eq!(handler.on_attach(ctx, buffer, 0, 0), Action::Forward);
-        assert_eq!(handler.on_commit(ctx), Action::Drop);
+        assert_eq!(Handlers::on_attach(ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_commit(ctx), Action::Drop);
         assert!(!ctx.is_fatal());
     }
 
     /// Commit buffer scale `scale` on its own, as a HiDPI client does once,
     /// so that later frames keep the mapping.
     fn commit_test_buffer_scale(ctx: &mut Context, scale: i32) {
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_set_buffer_scale(ctx, scale), Action::Forward);
-        assert_eq!(handler.on_commit(ctx), Action::Drop);
+        assert_eq!(Handlers::on_set_buffer_scale(ctx, scale), Action::Forward);
+        assert_eq!(Handlers::on_commit(ctx), Action::Drop);
         assert!(!ctx.is_fatal());
     }
 
@@ -1497,9 +1472,11 @@ mod tests {
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         commit_test_buffer_scale(&mut ctx, 2);
         draw_test_frame(&ctx, 42, 0x22);
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 1, 1, 2), Action::Drop);
+        assert_eq!(
+            Handlers::on_damage_buffer(&mut ctx, 1, 1, 1, 2),
+            Action::Drop
+        );
         attach_and_commit(&mut ctx, TEST_SURFACE, 42);
         assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 1, 1, 2));
     }
@@ -1513,9 +1490,8 @@ mod tests {
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         commit_test_buffer_scale(&mut ctx, 2);
         draw_test_frame(&ctx, 42, 0x22);
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_damage(&mut ctx, 1, 0, 1, 1), Action::Drop);
+        assert_eq!(Handlers::on_damage(&mut ctx, 1, 0, 1, 1), Action::Drop);
         attach_and_commit(&mut ctx, TEST_SURFACE, 42);
         assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(2, 0, 2, 2));
     }
@@ -1525,14 +1501,13 @@ mod tests {
         let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         draw_test_frame(&ctx, 42, 0x22);
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
         // WL_OUTPUT_TRANSFORM_90: the bridge does not rotate surface damage.
         assert_eq!(
-            handler.on_set_buffer_transform(&mut ctx, 1),
+            Handlers::on_set_buffer_transform(&mut ctx, 1),
             Action::Forward
         );
-        assert_eq!(handler.on_damage(&mut ctx, 1, 1, 1, 1), Action::Drop);
+        assert_eq!(Handlers::on_damage(&mut ctx, 1, 1, 1, 1), Action::Drop);
         attach_and_commit(&mut ctx, TEST_SURFACE, 42);
         assert_eq!(
             copied_pixels(&ctx, 42, 0x22),
@@ -1547,18 +1522,20 @@ mod tests {
         // units, as a client that does not use damage_buffer does.
         let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
+            Handlers::on_get_viewport(&mut ctx, 700, TEST_SURFACE),
             Action::Forward
         );
         ctx.last_sender_id = 700;
-        assert_eq!(handler.on_set_destination(&mut ctx, 8, 8), Action::Forward);
+        assert_eq!(
+            Handlers::on_set_destination(&mut ctx, 8, 8),
+            Action::Forward
+        );
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         draw_test_frame(&ctx, 42, 0x22);
-        assert_eq!(handler.on_damage(&mut ctx, 0, 0, 2, 2), Action::Drop);
+        assert_eq!(Handlers::on_damage(&mut ctx, 0, 0, 2, 2), Action::Drop);
         attach_and_commit(&mut ctx, TEST_SURFACE, 42);
         // Surface units 0..2 are pixels 0..1, grown by a pixel.
         assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(0, 0, 2, 2));
@@ -1578,10 +1555,9 @@ mod tests {
         let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         draw_test_frame(&ctx, 42, 0x22);
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            handler.on_damage_buffer(&mut ctx, 0, 0, i32::MAX, i32::MAX),
+            Handlers::on_damage_buffer(&mut ctx, 0, 0, i32::MAX, i32::MAX),
             Action::Drop
         );
         attach_and_commit(&mut ctx, TEST_SURFACE, 42);
@@ -1603,9 +1579,8 @@ mod tests {
                 .expect("a whole request");
             let mut request =
                 crate::wire::WireMessage::new(header.sender_id, header.opcode, payload);
-            crate::test_support::raw_dispatch(wl_surface::dispatch_request(
+            crate::test_support::raw_dispatch(wl_surface::dispatch_request::<Handlers>(
                 &mut request,
-                &mut CompositorHandler,
                 ctx,
             ))
         };
@@ -1633,7 +1608,7 @@ mod tests {
     ) -> Vec<(u32, AnyRequest)> {
         ctx.last_sender_id = xdg_toplevel_id;
         assert_eq!(
-            CompositorHandler.on_set_app_id(ctx, &app_id.to_string()),
+            Handlers::on_set_app_id(ctx, &app_id.to_string()),
             Action::Drop
         );
         host_requests(ctx)
@@ -1765,8 +1740,7 @@ mod tests {
         ctx.last_sender_id = TOPLEVEL.guest;
         let oversized = "x".repeat(4_084);
 
-        let mut handler = CompositorHandler;
-        assert_eq!(handler.on_set_app_id(&mut ctx, &oversized), Action::Drop);
+        assert_eq!(Handlers::on_set_app_id(&mut ctx, &oversized), Action::Drop);
         assert!(
             ctx.client_to_host_queue.is_empty(),
             "an app ID exceeding the Wayland message limit must not be queued"
@@ -1786,11 +1760,10 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
         register_test_native(&mut ctx, 42, (1, 1));
 
-        assert_eq!(handler.on_attach(&mut ctx, 42, 0, 0), Action::Forward);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_attach(&mut ctx, 42, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
@@ -1800,7 +1773,7 @@ mod tests {
 
         // A commit without an attach keeps the surface contents, but it does
         // not submit or copy the wl_buffer object again.
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
@@ -1810,8 +1783,8 @@ mod tests {
 
         // An explicit attach(NULL) is different from omitting attach and must
         // clear the current buffer.
-        assert_eq!(handler.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_attach(&mut ctx, 0, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
@@ -1827,14 +1800,13 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
         register_test_native(&mut ctx, 42, (1, 1));
-        assert_eq!(handler.on_attach(&mut ctx, 42, 0, 0), Action::Forward);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_attach(&mut ctx, 42, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         ctx.shadow_table.create_local(43, "wl_buffer", 1);
 
-        assert_eq!(handler.on_attach(&mut ctx, 43, 0, 0), Action::Forward);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_attach(&mut ctx, 43, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert!(!ctx.is_fatal());
         assert_eq!(
@@ -1858,10 +1830,10 @@ mod tests {
 
             ctx.last_sender_id = TEST_SURFACE;
             assert_eq!(
-                CompositorHandler.on_damage_buffer(&mut ctx, 0, 0, 1, 1),
+                Handlers::on_damage_buffer(&mut ctx, 0, 0, 1, 1),
                 Action::Drop
             );
-            assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
+            assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
             assert_eq!(
                 ctx.host_buffer_use(buffer),
                 Some(RenderBufferUse::Released),
@@ -1885,12 +1857,11 @@ mod tests {
         ctx.surface_for_test(surface_id).current_buffer_transform = 1;
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
         assert_eq!(
-            handler.on_damage_buffer(&mut ctx, 10, 10, 20, 20),
+            Handlers::on_damage_buffer(&mut ctx, 10, 10, 20, 20),
             Action::Drop
         );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         // The whole rotated 100x50 buffer, not a 1x1 fallback.
         assert_eq!(host_damage(&ctx), [(0, 0, 50, 100)]);
@@ -1906,12 +1877,11 @@ mod tests {
         set_test_surface_content(&mut ctx, surface_id, None, Some((100, 50)));
         ctx.last_sender_id = surface_id;
 
-        let mut handler = CompositorHandler;
         assert_eq!(
-            handler.on_damage_buffer(&mut ctx, 10, 10, 20, 20),
+            Handlers::on_damage_buffer(&mut ctx, 10, 10, 20, 20),
             Action::Drop
         );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         // The whole rotated 100x50 content snapshot, not a 1x1 fallback.
         assert_eq!(host_damage(&ctx), [(0, 0, 50, 100)]);
@@ -1927,19 +1897,17 @@ mod tests {
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.mark_buffer_submitted(buffer_id);
 
-        let mut buffer_handler = crate::handler::buffer::BufferHandler;
         ctx.last_sender_id = host_buffer_id;
         assert_eq!(
-            WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
+            <Handlers as WlBufferHandler>::on_release(&mut ctx),
             Action::Forward
         );
         assert!(ctx.buffer_is_released(buffer_id));
 
         // A commit without attach changes surface state but does not begin
         // another wl_buffer access interval.
-        let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface_id;
-        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert!(ctx.buffer_is_released(buffer_id));
         assert!(!ctx.buffer_is_submitted(buffer_id));
 
@@ -1947,7 +1915,10 @@ mod tests {
         // the host destructor immediately instead of waiting forever for an
         // event that cannot arrive.
         ctx.last_sender_id = buffer_id;
-        assert_eq!(buffer_handler.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(
+            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
+            Action::Drop
+        );
         assert_eq!(
             host_requests(&ctx).last(),
             Some(&(host_buffer_id, wl_buffer::Request::Destroy {}.into())),
@@ -1968,10 +1939,9 @@ mod tests {
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         assert!(ctx.mark_buffer_submitted(buffer_id));
 
-        let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface_id;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut compositor, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert!(
@@ -1979,10 +1949,9 @@ mod tests {
             "the ordered surface destructor ends the buffer's use"
         );
 
-        let mut buffer_handler = crate::handler::buffer::BufferHandler;
         ctx.last_sender_id = host_buffer_id;
         assert_eq!(
-            WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
+            <Handlers as WlBufferHandler>::on_release(&mut ctx),
             Action::Forward,
             "the guest still gets its wl_buffer.release"
         );
@@ -2005,24 +1974,20 @@ mod tests {
             set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
             assert!(ctx.mark_buffer_submitted(buffer));
 
-            let mut buffer_handler = crate::handler::buffer::BufferHandler;
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_release(&mut ctx),
                 Action::Forward
             );
             ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(
-                CompositorHandler.on_attach(&mut ctx, buffer, 0, 0),
-                Action::Forward
-            );
+            assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
 
             // No commit follows the attach yet. Keep the host object alive
             // until the pending state is resolved; otherwise a later commit
             // could race the queued destructor.
             ctx.last_sender_id = buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut buffer_handler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
                 Action::Drop
             );
             assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
@@ -2031,10 +1996,7 @@ mod tests {
             // Replacing the pending attach proves that it will never commit,
             // so the host destructor can now be ordered safely.
             ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(
-                CompositorHandler.on_attach(&mut ctx, 0, 0, 0),
-                Action::Forward
-            );
+            assert_eq!(Handlers::on_attach(&mut ctx, 0, 0, 0), Action::Forward);
             assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
             assert_eq!(
                 host_requests(&ctx),
@@ -2054,13 +2016,12 @@ mod tests {
             assert!(ctx.mark_buffer_submitted(buffer));
 
             ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(
-                CompositorHandler.on_attach(&mut ctx, buffer, 0, 0),
-                Action::Forward
-            );
-            let mut buffer_handler = crate::handler::buffer::BufferHandler;
+            assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
             ctx.last_sender_id = buffer;
-            assert_eq!(buffer_handler.on_destroy(&mut ctx), Action::Drop);
+            assert_eq!(
+                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
+                Action::Drop
+            );
             assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
 
             // This release belongs to the old committed interval. It must not
@@ -2068,7 +2029,7 @@ mod tests {
             // commit.
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_release(&mut ctx),
                 Action::Drop
             );
             assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
@@ -2076,7 +2037,7 @@ mod tests {
             assert_eq!(host_requests(&ctx), [], "{kind:?}");
 
             ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
+            assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
             assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
             assert!(ctx.buffer_is_submitted(buffer), "{kind:?}");
 
@@ -2084,7 +2045,7 @@ mod tests {
             // permits the host destructor.
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_release(&mut ctx),
                 Action::Drop
             );
             assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
@@ -2105,12 +2066,14 @@ mod tests {
 
             ctx.last_sender_id = TEST_SURFACE;
             assert_eq!(
-                CompositorHandler.on_attach(&mut ctx, old_buffer, 0, 0),
+                Handlers::on_attach(&mut ctx, old_buffer, 0, 0),
                 Action::Forward
             );
-            let mut buffer_handler = crate::handler::buffer::BufferHandler;
             ctx.last_sender_id = old_buffer;
-            assert_eq!(buffer_handler.on_destroy(&mut ctx), Action::Drop);
+            assert_eq!(
+                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
+                Action::Drop
+            );
             assert!(
                 buffer_is_guest_destroyed(&ctx, old_buffer),
                 "a pending attach keeps the {kind:?} buffer alive until replaced"
@@ -2120,7 +2083,7 @@ mod tests {
             // the compositor, so no wl_buffer.release can arrive for it.
             ctx.last_sender_id = TEST_SURFACE;
             assert_eq!(
-                CompositorHandler.on_attach(&mut ctx, new_buffer, 0, 0),
+                Handlers::on_attach(&mut ctx, new_buffer, 0, 0),
                 Action::Forward
             );
             assert!(buffer_host_destroy_is_queued(&ctx, old_buffer), "{kind:?}");
@@ -2146,9 +2109,8 @@ mod tests {
         // attach must not mistake that state for an uncommitted pending attach.
         ctx.mark_buffer_submitted(guest_buffer);
 
-        let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface_id;
-        assert_eq!(compositor.on_attach(&mut ctx, 44, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_attach(&mut ctx, 44, 0, 0), Action::Forward);
         assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
         assert_eq!(
             host_requests(&ctx),
@@ -2204,18 +2166,23 @@ mod tests {
         let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         commit_test_frame(&mut ctx, TEST_SURFACE, 44);
-        let mut handler = CompositorHandler;
 
         draw_test_frame(&ctx, 44, 0x22);
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_damage_buffer(&mut ctx, 0, 0, 2, 1), Action::Drop);
+        assert_eq!(
+            Handlers::on_damage_buffer(&mut ctx, 0, 0, 2, 1),
+            Action::Drop
+        );
         attach_and_commit(&mut ctx, TEST_SURFACE, 44);
         assert_eq!(copied_pixels(&ctx, 44, 0x22), rect_pixels(0, 0, 2, 1));
 
         // A's next frame holds B's change too, but damages only its own.
         draw_test_frame(&ctx, 42, 0x33);
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_damage_buffer(&mut ctx, 2, 3, 1, 1), Action::Drop);
+        assert_eq!(
+            Handlers::on_damage_buffer(&mut ctx, 2, 3, 1, 1),
+            Action::Drop
+        );
         attach_and_commit(&mut ctx, TEST_SURFACE, 42);
         let mut expected = rect_pixels(0, 0, 2, 1);
         expected.extend(rect_pixels(2, 3, 1, 1));
@@ -2226,7 +2193,7 @@ mod tests {
         ctx.last_sender_id = surface;
         let (x, y, width, height) = rect;
         assert_eq!(
-            CompositorHandler.on_damage_buffer(ctx, x, y, width, height),
+            Handlers::on_damage_buffer(ctx, x, y, width, height),
             Action::Drop
         );
     }
@@ -2256,7 +2223,7 @@ mod tests {
         assert!(ctx.mark_buffer_released(42));
         draw_test_frame(&ctx, 42, 0x22);
         damage_test_buffer(&mut ctx, TEST_SURFACE, (1, 2, 2, 1));
-        assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
 
         attach_and_commit(&mut ctx, TEST_SURFACE, 42);
@@ -2319,7 +2286,7 @@ mod tests {
         commit_test_frame(&mut ctx, TEST_SURFACE, 44);
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            CompositorHandler.on_set_buffer_transform(&mut ctx, 2),
+            Handlers::on_set_buffer_transform(&mut ctx, 2),
             Action::Forward
         );
         damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
@@ -2345,7 +2312,7 @@ mod tests {
         draw_test_frame(&ctx, 42, 0x33);
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            CompositorHandler.on_set_buffer_transform(&mut ctx, 2),
+            Handlers::on_set_buffer_transform(&mut ctx, 2),
             Action::Forward
         );
         damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
@@ -2368,9 +2335,11 @@ mod tests {
         attach_and_commit(&mut ctx, TEST_SURFACE, 46);
 
         draw_test_frame(&ctx, 42, 0x33);
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_damage_buffer(&mut ctx, 0, 0, 1, 1), Action::Drop);
+        assert_eq!(
+            Handlers::on_damage_buffer(&mut ctx, 0, 0, 1, 1),
+            Action::Drop
+        );
         attach_and_commit(&mut ctx, TEST_SURFACE, 42);
         assert_eq!(
             copied_pixels(&ctx, 42, 0x33),
@@ -2394,7 +2363,7 @@ mod tests {
 
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert!(!in_sync(&ctx));
@@ -2410,10 +2379,12 @@ mod tests {
         ctx.client_to_host_queue.clear();
         draw_test_frame(&ctx, 42, 0x22);
 
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 2, 2, 1), Action::Drop);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(
+            Handlers::on_damage_buffer(&mut ctx, 1, 2, 2, 1),
+            Action::Drop
+        );
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 2, 2, 1));
         assert_eq!(
@@ -2514,10 +2485,12 @@ mod tests {
         ctx.client_to_host_queue.clear();
         draw_test_frame(&ctx, 42, 0x22);
 
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 2, 2, 1), Action::Drop);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(
+            Handlers::on_damage_buffer(&mut ctx, 1, 2, 2, 1),
+            Action::Drop
+        );
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
         assert_eq!(
@@ -2544,11 +2517,11 @@ mod tests {
             ctx.last_sender_id = TEST_SURFACE;
             if let Some((x, y, width, height)) = damage {
                 assert_eq!(
-                    CompositorHandler.on_damage_buffer(&mut ctx, x, y, width, height),
+                    Handlers::on_damage_buffer(&mut ctx, x, y, width, height),
                     Action::Drop
                 );
             }
-            assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
+            assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
             assert!(!ctx.is_fatal());
             assert_eq!(
                 queued_headers(&ctx.client_to_host_queue).last(),
@@ -2573,19 +2546,20 @@ mod tests {
         assert!(ctx.mark_buffer_submitted(buffer_id));
         assert!(ctx.mark_buffer_released(buffer_id));
 
-        let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface_id;
         assert_eq!(
-            compositor.on_attach(&mut ctx, buffer_id, 0, 0),
+            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
             Action::Forward
         );
 
         // Wayland permits destroying the guest object after attach and before
         // commit. The host attach is already queued, so the local backing and
         // pending surface reference must survive until commit.
-        let mut buffer_handler = crate::handler::buffer::BufferHandler;
         ctx.last_sender_id = buffer_id;
-        assert_eq!(buffer_handler.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(
+            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
+            Action::Drop
+        );
         assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
         assert_eq!(
             ctx.surfaces
@@ -2596,7 +2570,7 @@ mod tests {
 
         pool.write_all_at(&[0x22; BUFFER_BYTES], 0).unwrap();
         ctx.last_sender_id = surface_id;
-        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         // The guest object is gone, but the local backing is not.
         assert_eq!(
             test_destination(&ctx, buffer_id)[..BUFFER_BYTES],
@@ -2617,21 +2591,19 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
 
         // A client gets one error, so each rejection starts afresh.
-        let mut rejected = |reject: &dyn Fn(&mut CompositorHandler, &mut Context) -> Action,
-                            code: u32| {
+        let mut rejected = |reject: &dyn Fn(&mut Context) -> Action, code: u32| {
             ctx.host_to_client_queue.clear();
             ctx.clear_session_end_for_test();
-            assert_eq!(reject(&mut handler, &mut ctx), Action::Drop);
+            assert_eq!(reject(&mut ctx), Action::Drop);
             assert_eq!(protocol_error_code(&ctx), code);
         };
         // wl_surface.invalid_scale for 0 and negative scales, and
         // invalid_transform outside wl_output.transform's 0..=7.
-        rejected(&|handler, ctx| handler.on_set_buffer_scale(ctx, 0), 0);
-        rejected(&|handler, ctx| handler.on_set_buffer_scale(ctx, -2), 0);
-        rejected(&|handler, ctx| handler.on_set_buffer_transform(ctx, 8), 1);
+        rejected(&|ctx| Handlers::on_set_buffer_scale(ctx, 0), 0);
+        rejected(&|ctx| Handlers::on_set_buffer_scale(ctx, -2), 0);
+        rejected(&|ctx| Handlers::on_set_buffer_transform(ctx, 8), 1);
         assert!(
             ctx.surfaces.get(&surface_id).is_none_or(|surface| {
                 surface.pending.buffer_scale.is_none() && surface.pending.buffer_transform.is_none()
@@ -2645,9 +2617,8 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
 
-        assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Forward);
+        assert_eq!(Handlers::on_attach(&mut ctx, 42, 3, 4), Action::Forward);
         let surface = ctx.surfaces.get_mut(&surface_id).expect("surface state");
         assert_eq!(surface.prepare_commit().buffer_offset, (3, 4));
         assert_eq!(
@@ -2662,14 +2633,16 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
 
-        assert_eq!(handler.on_damage_buffer(&mut ctx, 4, 5, 6, 7), Action::Drop);
+        assert_eq!(
+            Handlers::on_damage_buffer(&mut ctx, 4, 5, 6, 7),
+            Action::Drop
+        );
         assert!(
             ctx.client_to_host_queue.is_empty(),
             "damage_buffer must not be forwarded with its guest opcode"
         );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
@@ -2691,12 +2664,11 @@ mod tests {
         );
 
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
         assert_eq!(
-            handler.on_attach(&mut ctx, buffer_id, 0, 0),
+            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
             Action::Forward
         );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
@@ -2715,12 +2687,11 @@ mod tests {
         register_test_local(&mut ctx, buffer_id, buffer);
 
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
         assert_eq!(
-            handler.on_attach(&mut ctx, buffer_id, 0, 0),
+            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
             Action::Forward
         );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert!(
             ctx.client_to_host_queue.is_empty(),
             "stale or uninitialised host pixels must never be committed"
@@ -2737,11 +2708,10 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
-        assert_eq!(handler.on_damage(&mut ctx, 1, 2, 3, 4), Action::Drop);
+        assert_eq!(Handlers::on_damage(&mut ctx, 1, 2, 3, 4), Action::Drop);
         ctx.release_deleted_host_id(200);
 
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
@@ -2757,13 +2727,12 @@ mod tests {
         assert!(ctx.complete_queued_buffer_destroy(buffer_id, host_id));
 
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
         assert_eq!(
-            handler.on_attach(&mut ctx, buffer_id, 0, 0),
+            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
             Action::Forward
         );
 
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
@@ -2778,12 +2747,11 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
 
         for _ in 0..300 {
-            assert_eq!(handler.on_damage(&mut ctx, 0, 0, 0, 10), Action::Drop);
+            assert_eq!(Handlers::on_damage(&mut ctx, 0, 0, 0, 10), Action::Drop);
             assert_eq!(
-                handler.on_damage_buffer(&mut ctx, 0, 0, 10, -1),
+                Handlers::on_damage_buffer(&mut ctx, 0, 0, 10, -1),
                 Action::Drop
             );
         }
@@ -2791,7 +2759,7 @@ mod tests {
         assert!(surface.pending.surface_damage.is_empty());
         assert!(surface.pending.buffer_damage.is_empty());
 
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert_eq!(msg_opcode(&ctx.client_to_host_queue[0].0), REQ_COMMIT);
     }
@@ -2803,19 +2771,18 @@ mod tests {
         let buffer_id = 42;
         register_test_native(&mut ctx, buffer_id, (8, 6));
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
         assert_eq!(
-            handler.on_attach(&mut ctx, buffer_id, 0, 0),
+            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
             Action::Forward
         );
         for index in 0..=256 {
             assert_eq!(
-                handler.on_damage_buffer(&mut ctx, index, index, 1, 1),
+                Handlers::on_damage_buffer(&mut ctx, index, index, 1, 1),
                 Action::Drop
             );
         }
 
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
@@ -2829,10 +2796,9 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
 
-        assert_eq!(handler.on_damage(&mut ctx, 10, 20, 1, 1), Action::Drop);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_damage(&mut ctx, 10, 20, 1, 1), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(host_damage(&ctx), [(9, 19, 3, 3)]);
     }
@@ -2882,12 +2848,11 @@ mod tests {
         set_test_surface_content(&mut ctx, TEST_SURFACE, None, Some(size));
         ctx.last_sender_id = TEST_SURFACE;
         let (x, y, width, height) = rect;
-        let mut handler = CompositorHandler;
         assert_eq!(
-            handler.on_damage_buffer(&mut ctx, x, y, width, height),
+            Handlers::on_damage_buffer(&mut ctx, x, y, width, height),
             Action::Drop
         );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         host_damage(&ctx)
     }
 
@@ -2952,16 +2917,15 @@ mod tests {
         );
 
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
         assert_eq!(
-            handler.on_set_buffer_transform(&mut ctx, 1),
+            Handlers::on_set_buffer_transform(&mut ctx, 1),
             Action::Forward
         );
         assert_eq!(
-            handler.on_attach(&mut ctx, buffer_id, 0, 0),
+            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
             Action::Forward
         );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(host_damage(&ctx), [(0, 0, 6, 8)]);
     }
@@ -3001,8 +2965,7 @@ mod tests {
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), Some((8, 6)));
         ctx.last_sender_id = surface_id;
 
-        let mut handler = CompositorHandler;
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert!(
             ctx.client_to_host_queue
@@ -3028,9 +2991,11 @@ mod tests {
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), Some((8, 6)));
         ctx.last_sender_id = surface_id;
 
-        let mut handler = CompositorHandler;
-        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 1, 1, 1), Action::Drop);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(
+            Handlers::on_damage_buffer(&mut ctx, 1, 1, 1, 1),
+            Action::Drop
+        );
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(
             host_damage(&ctx),
@@ -3043,13 +3008,12 @@ mod tests {
     fn extreme_surface_damage_is_clamped_before_host_encoding() {
         let mut ctx = toplevel_ctx();
         ctx.last_sender_id = 100;
-        let mut handler = CompositorHandler;
 
         assert_eq!(
-            handler.on_damage(&mut ctx, i32::MIN, 0, i32::MAX, 1),
+            Handlers::on_damage(&mut ctx, i32::MIN, 0, i32::MAX, 1),
             Action::Drop
         );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(host_damage(&ctx), [(i32::MIN / 10, -1, 214_748_364, 3)]);
     }
@@ -3090,19 +3054,18 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
-        let mut handler = CompositorHandler;
 
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 700, surface_id),
+            Handlers::on_get_viewport(&mut ctx, 700, surface_id),
             Action::Forward
         );
         ctx.last_sender_id = 700;
         assert_eq!(
-            handler.on_set_source(&mut ctx, 65_536, 131_072, 262_144, 262_144),
+            Handlers::on_set_source(&mut ctx, 65_536, 131_072, 262_144, 262_144),
             Action::Forward
         );
         assert_eq!(
-            handler.on_set_destination(&mut ctx, 200, 100),
+            Handlers::on_set_destination(&mut ctx, 200, 100),
             Action::Forward
         );
 
@@ -3111,19 +3074,19 @@ mod tests {
         // pixels into destination coordinates. (A buffer attached with a new
         // mapping damages the whole host surface.)
         ctx.last_sender_id = surface_id;
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         ctx.client_to_host_queue.clear();
         register_test_local(
             &mut ctx,
             42,
             mapped_test_buffer(2048, 2048, 8192, StalePixels::in_sync_on(TEST_SURFACE)),
         );
-        assert_eq!(handler.on_attach(&mut ctx, 42, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_attach(&mut ctx, 42, 0, 0), Action::Forward);
         assert_eq!(
-            handler.on_damage_buffer(&mut ctx, 256, 512, 256, 256),
+            Handlers::on_damage_buffer(&mut ctx, 256, 512, 256, 256),
             Action::Drop
         );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
 
         // The damage, grown by a buffer pixel, starts just left of and above
         // the source, so its mapped edges round outward to -1.
@@ -3190,17 +3153,16 @@ mod tests {
     fn destroying_viewport_is_double_buffered_until_surface_commit() {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
-        let mut handler = CompositorHandler;
 
         ctx.last_sender_id = surface_id;
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 700, surface_id),
+            Handlers::on_get_viewport(&mut ctx, 700, surface_id),
             Action::Forward
         );
         // The generated dispatcher pairs the forwarded viewport.
         ctx.shadow_table
             .insert_paired_for_test(700, 701, "wp_viewport");
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert!(ctx
             .surfaces
             .get(&surface_id)
@@ -3217,7 +3179,7 @@ mod tests {
         );
 
         ctx.last_sender_id = surface_id;
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert!(
             ctx.surfaces
                 .get(&surface_id)
@@ -3231,28 +3193,30 @@ mod tests {
     fn invalid_viewport_values_and_dead_surface_are_fatal() {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
-        let mut handler = CompositorHandler;
 
         ctx.last_sender_id = surface_id;
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 700, surface_id),
+            Handlers::on_get_viewport(&mut ctx, 700, surface_id),
             Action::Forward
         );
         ctx.last_sender_id = 700;
-        assert_eq!(handler.on_set_source(&mut ctx, -1, 0, 10, 10), Action::Drop);
+        assert_eq!(
+            Handlers::on_set_source(&mut ctx, -1, 0, 10, 10),
+            Action::Drop
+        );
         assert_eq!(protocol_error_code(&ctx), 0);
         assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
         ctx.clear_session_end_for_test();
-        assert_eq!(handler.on_set_destination(&mut ctx, 0, 10), Action::Drop);
+        assert_eq!(Handlers::on_set_destination(&mut ctx, 0, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 0);
         assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
         ctx.clear_session_end_for_test();
         ctx.viewport_to_wl_surface.remove(&700);
-        assert_eq!(handler.on_set_destination(&mut ctx, 10, 10), Action::Drop);
+        assert_eq!(Handlers::on_set_destination(&mut ctx, 10, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 3);
         assert!(ctx.is_fatal());
     }
@@ -3261,18 +3225,17 @@ mod tests {
     fn duplicate_viewport_is_a_fatal_viewporter_error() {
         let mut ctx = toplevel_ctx();
         let surface_id = 100;
-        let mut handler = CompositorHandler;
 
         ctx.last_sender_id = surface_id;
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 700, surface_id),
+            Handlers::on_get_viewport(&mut ctx, 700, surface_id),
             Action::Forward
         );
         ctx.host_to_client_queue.clear();
         ctx.clear_session_end_for_test();
         ctx.last_sender_id = surface_id;
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 701, surface_id),
+            Handlers::on_get_viewport(&mut ctx, 701, surface_id),
             Action::Drop
         );
         assert_eq!(protocol_error_code(&ctx), 0);
@@ -3284,10 +3247,9 @@ mod tests {
         // Exo takes the fractional source size as the surface size, and the
         // host damage covers it, rounded up.
         let mut ctx = toplevel_ctx();
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
+            Handlers::on_get_viewport(&mut ctx, 700, TEST_SURFACE),
             Action::Forward
         );
         set_test_viewport_source(&mut ctx, (0, 0, 128, 256));
@@ -3299,11 +3261,10 @@ mod tests {
 
     /// Set the viewport source of `TEST_SURFACE`, whose viewport is 700.
     fn set_test_viewport_source(ctx: &mut Context, source: (i32, i32, i32, i32)) {
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = 700;
         let (x, y, width, height) = source;
         assert_eq!(
-            handler.on_set_source(ctx, x, y, width, height),
+            Handlers::on_set_source(ctx, x, y, width, height),
             Action::Forward
         );
         ctx.last_sender_id = TEST_SURFACE;
@@ -3314,17 +3275,16 @@ mod tests {
     /// source be fractional.
     fn commit_viewport_source(size: (i32, i32), source: (i32, i32, i32, i32)) -> Context {
         let mut ctx = toplevel_ctx();
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
+            Handlers::on_get_viewport(&mut ctx, 700, TEST_SURFACE),
             Action::Forward
         );
-        assert_eq!(handler.on_set_buffer_scale(&mut ctx, 2), Action::Forward);
+        assert_eq!(Handlers::on_set_buffer_scale(&mut ctx, 2), Action::Forward);
         set_test_viewport_source(&mut ctx, source);
         ctx.last_sender_id = 700;
         assert_eq!(
-            handler.on_set_destination(&mut ctx, 10, 10),
+            Handlers::on_set_destination(&mut ctx, 10, 10),
             Action::Forward
         );
         register_test_native(&mut ctx, 42, size);
@@ -3361,10 +3321,9 @@ mod tests {
 
         // Detaching the buffer in the same commit exempts any source.
         let mut ctx = commit_viewport_source((8, 6), whole);
-        let mut handler = CompositorHandler;
-        assert_eq!(handler.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
+        assert_eq!(Handlers::on_attach(&mut ctx, 0, 0, 0), Action::Forward);
         set_test_viewport_source(&mut ctx, (0, 0, 100 * ONE, 100 * ONE));
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert_eq!(forwarded_and_logged(&ctx), (true, false));
 
         // An odd buffer ends at a fractional unit, 3.5x2.5, which the source
@@ -3378,7 +3337,6 @@ mod tests {
     fn xdg_toplevel_destroy_cleans_up_map() {
         let mut ctx = toplevel_ctx();
 
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = TOPLEVEL.guest;
 
         assert!(ctx
@@ -3387,7 +3345,7 @@ mod tests {
             .is_some());
 
         ctx.last_sender_id = TOPLEVEL.guest;
-        let action = XdgToplevelHandler::on_destroy(&mut handler, &mut ctx);
+        let action = <Handlers as XdgToplevelHandler>::on_destroy(&mut ctx);
         assert_eq!(action, Action::Drop);
 
         assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(TOPLEVEL.guest), None);
@@ -3402,7 +3360,7 @@ mod tests {
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         // The released Aura surface no longer decodes: its dispatch
@@ -3429,7 +3387,7 @@ mod tests {
 
             ctx.last_sender_id = TEST_SURFACE;
             assert_eq!(
-                WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+                <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
                 Action::Drop
             );
 
@@ -3468,10 +3426,9 @@ mod tests {
             set_test_surface_content(&mut ctx, surface, Some(guest_buffer), None);
         }
 
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = first_surface;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
@@ -3484,7 +3441,7 @@ mod tests {
 
         ctx.last_sender_id = second_surface;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
@@ -3522,10 +3479,9 @@ mod tests {
         ctx.surface_for_test(second_surface).pending.attachment =
             SurfaceAttachment::Attach(guest_buffer);
 
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = first_surface;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(
@@ -3542,7 +3498,7 @@ mod tests {
 
         ctx.last_sender_id = second_surface;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
@@ -3568,10 +3524,9 @@ mod tests {
         ctx.mark_buffer_submitted(guest_buffer);
         set_test_surface_content(&mut ctx, wl_surface_guest, Some(guest_buffer), None);
 
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = wl_surface_guest;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert!(
@@ -3583,10 +3538,9 @@ mod tests {
         // its surface. Once it eventually destroys the buffer, host teardown
         // must be ordered after the already-queued surface destructor instead
         // of waiting forever for a release that may never arrive.
-        let mut buffer_handler = crate::handler::buffer::BufferHandler;
         ctx.last_sender_id = guest_buffer;
         assert_eq!(
-            WlBufferHandler::on_destroy(&mut buffer_handler, &mut ctx),
+            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
@@ -3613,10 +3567,9 @@ mod tests {
         // the submitted marker is global.
         ctx.mark_buffer_submitted(guest_buffer);
 
-        let mut handler = CompositorHandler;
         ctx.last_sender_id = 100;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
 
@@ -3667,17 +3620,16 @@ mod tests {
                 "{kind:?}"
             );
 
-            let mut buffer_handler = crate::handler::buffer::BufferHandler;
             ctx.last_sender_id = buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut buffer_handler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
                 Action::Drop
             );
             ctx.client_to_host_queue.clear();
 
             ctx.last_sender_id = second_surface;
             assert_eq!(
-                WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+                <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
                 Action::Drop
             );
             assert_eq!(
@@ -3698,7 +3650,7 @@ mod tests {
 
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_release(&mut ctx),
                 Action::Drop
             );
             assert!(
@@ -3726,21 +3678,17 @@ mod tests {
             // surface commits.
             assert!(ctx.mark_buffer_submitted(buffer));
             ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(
-                CompositorHandler.on_attach(&mut ctx, buffer, 0, 0),
-                Action::Forward
-            );
-            let mut buffer_handler = crate::handler::buffer::BufferHandler;
+            assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
             ctx.last_sender_id = buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut buffer_handler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
                 Action::Drop
             );
             assert_eq!(buffer_lifecycle(&ctx, buffer), awaiting_release, "{kind:?}");
 
             ctx.last_sender_id = TEST_SURFACE;
             assert_eq!(
-                WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+                <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
                 Action::Drop
             );
             assert_eq!(
@@ -3757,7 +3705,7 @@ mod tests {
 
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_release(&mut ctx),
                 Action::Drop
             );
             assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
@@ -3782,9 +3730,8 @@ mod tests {
             .add_toplevel_role_for_test(603, wl_surface_guest_id, 602);
         ctx.last_sender_id = wl_surface_guest_id;
 
-        let mut handler = CompositorHandler;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(ctx.xdg_roles.toplevel_of_xdg_surface(603), None);
@@ -3814,8 +3761,7 @@ mod tests {
             .set_for_test(crate::state::HostId(701), 2, 999, 1999);
         let key = |ctx: &mut Context, serial, key, state| {
             ctx.last_sender_id = 700;
-            let mut keyboard = crate::handler::keyboard::KeyboardHandler::new();
-            WlKeyboardHandler::on_key(&mut keyboard, ctx, serial, serial, key, state)
+            <Handlers as WlKeyboardHandler>::on_key(ctx, serial, serial, key, state)
         };
         // The input method takes Backspace and repeats it, until the press
         // of key 30 ends the lease; key 30's guest press then waits for its
@@ -3837,9 +3783,8 @@ mod tests {
         peek(&mut ctx, 751, 5, 57, 1);
         ctx.last_sender_id = wl_surface_guest_id;
 
-        let mut handler = CompositorHandler;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert!(
@@ -4031,7 +3976,7 @@ mod tests {
         let unaffected = text_input::snapshot(&ctx, 720);
         ctx.last_sender_id = destroyed_surface;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
 
@@ -4077,11 +4022,10 @@ mod tests {
 
         let guest_queue_len = ctx.host_to_client_queue.len();
         let host_queue_len = ctx.client_to_host_queue.len();
-        let mut keyboard = crate::handler::keyboard::KeyboardHandler::new();
         for host_keyboard in [900, 901] {
             ctx.last_sender_id = host_keyboard;
             assert_eq!(
-                WlKeyboardHandler::on_leave(&mut keyboard, &mut ctx, 10, SURFACE.host,),
+                <Handlers as WlKeyboardHandler>::on_leave(&mut ctx, 10, SURFACE.host,),
                 Action::Drop
             );
         }
@@ -4159,7 +4103,7 @@ mod tests {
         let healthy = text_input::snapshot(&ctx, healthy_on_replacement);
         ctx.last_sender_id = destroyed_surface;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
 
@@ -4203,8 +4147,7 @@ mod tests {
             .version = 37;
         ctx.last_sender_id = TOPLEVEL.guest;
 
-        let mut handler = CompositorHandler;
-        handler.on_set_app_id(&mut ctx, &"legacy".to_string());
+        Handlers::on_set_app_id(&mut ctx, &"legacy".to_string());
         let zaura_surface_host = ctx
             .aura_surfaces
             .get(SURFACE.host)
@@ -4213,7 +4156,7 @@ mod tests {
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = 100;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert!(

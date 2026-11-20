@@ -140,11 +140,42 @@ fn is_modifier_keysym(sym: u32) -> bool {
         || sym == KEY_Num_Lock
 }
 
-/// Compile the keymap of `format` and `size` that a `wl_keyboard.keymap`
-/// carries in `fd`, or log why the proxy cannot use it and return
-/// `None`. The keymap is mapped rather than read, so the descriptor's
-/// offset is untouched when it is forwarded to the guest.
-pub(crate) fn compile(
+/// The XKB context a connection compiles its host keyboards' keymaps in.
+/// It is `!Send` and `!Sync`, like the keymaps and states compiled from it.
+pub(crate) struct Compiler {
+    context: xkb::Context,
+}
+
+impl std::fmt::Debug for Compiler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Compiler")
+    }
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        Self {
+            context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+        }
+    }
+}
+
+impl Compiler {
+    /// Compile the keymap of `format` and `size` that a
+    /// `wl_keyboard.keymap` carries in `fd`, or log why the proxy cannot use
+    /// it and return `None`. The keymap is mapped rather than read, so the
+    /// descriptor's offset is untouched when it is forwarded to the guest.
+    pub(crate) fn compile(
+        &self,
+        format: u32,
+        fd: BorrowedFd<'_>,
+        size: u32,
+    ) -> Option<xkb::Keymap> {
+        compile(&self.context, format, fd, size)
+    }
+}
+
+fn compile(
     context: &xkb::Context,
     format: u32,
     fd: BorrowedFd<'_>,

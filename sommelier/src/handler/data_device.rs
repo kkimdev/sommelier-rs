@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::Handlers;
 use crate::protocols::wayland::wl_data_device;
 use crate::protocols::wayland::wl_data_device_manager;
 use crate::protocols::wayland::wl_data_offer;
@@ -31,14 +32,12 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
-pub struct DataDeviceHandler;
+impl wl_data_device_manager::WlDataDeviceManagerHandler for Handlers {}
 
-impl wl_data_device_manager::WlDataDeviceManagerHandler for DataDeviceHandler {}
+impl wl_data_device::WlDataDeviceHandler for Handlers {}
 
-impl wl_data_device::WlDataDeviceHandler for DataDeviceHandler {}
-
-impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
-    fn on_receive(&mut self, ctx: &mut Context, mime_type: &String, fd: BorrowedFd<'_>) -> Action {
+impl wl_data_offer::WlDataOfferHandler for Handlers {
+    fn on_receive(ctx: &mut Context, mime_type: &String, fd: BorrowedFd<'_>) -> Action {
         debug!(
             "wl_data_offer.receive: mime_type={}, fd={}",
             mime_type,
@@ -125,7 +124,7 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
     }
 }
 
-impl wl_data_source::WlDataSourceHandler for DataDeviceHandler {}
+impl wl_data_source::WlDataSourceHandler for Handlers {}
 
 /// How many bytes a clipboard pump reads at a time.
 const PUMP_BUFFER_LEN: usize = 64 * 1024;
@@ -343,7 +342,8 @@ fn retry_interrupted<R>(mut op: impl FnMut() -> io::Result<R>) -> io::Result<R> 
 
 #[cfg(test)]
 mod tests {
-    use super::{pump, reopen, write_nowait, DataDeviceHandler, PUMP_IDLE_TIMEOUT};
+    use super::{pump, reopen, write_nowait, PUMP_IDLE_TIMEOUT};
+    use crate::handler::Handlers;
     use crate::protocols::wayland::wl_data_device;
     use crate::state::Context;
     use crate::test_support::{raw_dispatch, Rng};
@@ -659,8 +659,7 @@ mod tests {
         let host_offer_id: u32 = 0xff00_0123;
         let payload = host_offer_id.to_ne_bytes();
         let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-        let mut handler = DataDeviceHandler;
-        let result = wl_data_device::dispatch_event(&mut msg, &mut handler, &mut ctx)
+        let result = wl_data_device::dispatch_event::<Handlers>(&mut msg, &mut ctx)
             .expect("data_offer should decode")
             .expect("data_offer should be forwarded");
 
@@ -698,8 +697,7 @@ mod tests {
 
         let payload = host_surface.to_ne_bytes();
         let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-        let mut handler = DataDeviceHandler;
-        let result = wl_data_device::dispatch_event(&mut msg, &mut handler, &mut ctx);
+        let result = wl_data_device::dispatch_event::<Handlers>(&mut msg, &mut ctx);
 
         assert_eq!(
             raw_dispatch(result),
@@ -722,7 +720,7 @@ mod tests {
 
         let payload = 123u32.to_ne_bytes();
         let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-        let result = wl_data_device::dispatch_event(&mut msg, &mut DataDeviceHandler, &mut ctx);
+        let result = wl_data_device::dispatch_event::<Handlers>(&mut msg, &mut ctx);
 
         assert_eq!(
             raw_dispatch(result),
@@ -742,10 +740,8 @@ mod tests {
         let mut offer = WireMessage::new(81, wl_data_device::EVT_DATA_OFFER, &payload);
 
         assert_eq!(
-            raw_dispatch(wl_data_device::dispatch_event(
-                &mut offer,
-                &mut DataDeviceHandler,
-                &mut ctx
+            raw_dispatch(wl_data_device::dispatch_event::<Handlers>(
+                &mut offer, &mut ctx
             )),
             Ok(None)
         );
@@ -797,7 +793,7 @@ mod tests {
             zxdg_output_manager_v1::REQ_GET_XDG_OUTPUT,
             &payload,
         );
-        let result = zxdg_output_manager_v1::dispatch_request(&mut get, &mut Forwarding, &mut ctx);
+        let result = zxdg_output_manager_v1::dispatch_request::<Forwarding>(&mut get, &mut ctx);
 
         assert_eq!(raw_dispatch(result), Ok(None));
         assert!(
@@ -819,7 +815,6 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 80, "wl_data_device", 3);
-        let mut handler = DataDeviceHandler;
         let mut first_guest_offer = None;
 
         for round in 0..1000u32 {
@@ -827,7 +822,7 @@ mod tests {
             let host_offer = 0xff00_0000 + round % 3;
             let payload = host_offer.to_ne_bytes();
             let mut offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-            let (event, _) = wl_data_device::dispatch_event(&mut offer, &mut handler, &mut ctx)
+            let (event, _) = wl_data_device::dispatch_event::<Handlers>(&mut offer, &mut ctx)
                 .expect("data_offer should decode")
                 .expect("data_offer should be forwarded");
             let guest_offer = u32::from_ne_bytes(event[8..12].try_into().unwrap());
@@ -842,9 +837,8 @@ mod tests {
                 crate::protocols::wayland::wl_data_offer::REQ_DESTROY,
                 &[],
             );
-            crate::protocols::wayland::wl_data_offer::dispatch_request(
+            crate::protocols::wayland::wl_data_offer::dispatch_request::<Handlers>(
                 &mut destroy,
-                &mut handler,
                 &mut ctx,
             )
             .expect("data_offer.destroy should decode");
@@ -857,12 +851,11 @@ mod tests {
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 80, "wl_data_device", 3);
         let host_offer_id = 0xff00_0000u32;
-        let mut handler = DataDeviceHandler;
 
         let payload = host_offer_id.to_ne_bytes();
         let mut first_offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let (first_event, _) =
-            wl_data_device::dispatch_event(&mut first_offer, &mut handler, &mut ctx)
+            wl_data_device::dispatch_event::<Handlers>(&mut first_offer, &mut ctx)
                 .expect("first data_offer should decode")
                 .expect("first data_offer should be forwarded");
         let first_guest_id = u32::from_ne_bytes(first_event[8..12].try_into().unwrap());
@@ -876,11 +869,9 @@ mod tests {
             crate::protocols::wayland::wl_data_offer::REQ_DESTROY,
             &[],
         );
-        let (destroy_request, _) = crate::protocols::wayland::wl_data_offer::dispatch_request(
-            &mut destroy,
-            &mut handler,
-            &mut ctx,
-        )
+        let (destroy_request, _) = crate::protocols::wayland::wl_data_offer::dispatch_request::<
+            Handlers,
+        >(&mut destroy, &mut ctx)
         .expect("data_offer.destroy should decode")
         .expect("data_offer.destroy should be forwarded");
         assert_eq!(
@@ -893,7 +884,7 @@ mod tests {
 
         let mut replacement = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let (replacement_event, _) =
-            wl_data_device::dispatch_event(&mut replacement, &mut handler, &mut ctx)
+            wl_data_device::dispatch_event::<Handlers>(&mut replacement, &mut ctx)
                 .expect("reused server ID should decode")
                 .expect("replacement data_offer should be forwarded");
         let replacement_guest_id = u32::from_ne_bytes(replacement_event[8..12].try_into().unwrap());

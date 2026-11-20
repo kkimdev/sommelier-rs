@@ -35,16 +35,47 @@ pub(crate) const BYTE_INDEXED_STRINGS: &[(&str, &str, &str)] = &[
     ("zwp_text_input_v3", "preedit_string", "text"),
 ];
 
+/// The requests a handler implements whole, as `(interface, request)`:
+/// the generated code never forwards one, so its handler method returns
+/// nothing and has no default. A request whose `new_id` names no
+/// interface must be one, because only its handler knows what it creates;
+/// `wl_registry.bind` is the only such request.
+pub(crate) const HAND_WRITTEN_REQUESTS: &[(&str, &str)] = &[("wl_registry", "bind")];
+
 /// Panic unless every entry of [`BYTE_INDEXED_STRINGS`] names exactly one
 /// string argument of `protocols`, all the protocols the proxy generates,
 /// so that a stale entry fails the build instead of leaving its string
-/// lossy.
+/// lossy, and unless every entry of [`HAND_WRITTEN_REQUESTS`] names a
+/// request.
 pub fn check_byte_indexed_strings(protocols: &[Protocol]) {
     let unmatched = unmatched_entries(protocols, BYTE_INDEXED_STRINGS);
     assert!(
         unmatched.is_empty(),
         "BYTE_INDEXED_STRINGS entries that name no single string argument: {unmatched:?}"
     );
+    let unmatched: Vec<_> = HAND_WRITTEN_REQUESTS
+        .iter()
+        .filter(|&&(interface, request)| {
+            !protocols
+                .iter()
+                .flat_map(|protocol| &protocol.items)
+                .filter_map(|item| match item {
+                    ProtocolItem::Interface(found) if found.name == interface => Some(found),
+                    _ => None,
+                })
+                .flat_map(|found| &found.items)
+                .any(|item| matches!(item, InterfaceItem::Request(found) if found.name == request))
+        })
+        .collect();
+    assert!(
+        unmatched.is_empty(),
+        "HAND_WRITTEN_REQUESTS entries that name no request: {unmatched:?}"
+    );
+}
+
+/// Whether `interface.request` is in [`HAND_WRITTEN_REQUESTS`].
+fn is_hand_written(interface: &str, request: &str) -> bool {
+    HAND_WRITTEN_REQUESTS.contains(&(interface, request))
 }
 
 /// The entries of `table` that name no single string argument of
@@ -132,10 +163,10 @@ pub fn generate(protocol: &Protocol) -> String {
             handler_trait_names.push(quote! { #mod_name::#handler_trait_name });
 
             dispatch_request_cases.push(quote! {
-                #name => #mod_name::dispatch_request(msg, handler, ctx),
+                #name => #mod_name::dispatch_request::<H>(msg, ctx),
             });
             dispatch_event_cases.push(quote! {
-                #name => #mod_name::dispatch_event(msg, handler, ctx),
+                #name => #mod_name::dispatch_event::<H>(msg, ctx),
             });
             consume_event_cases.push(quote! {
                 #name => #mod_name::consume_event(msg),
@@ -146,7 +177,6 @@ pub fn generate(protocol: &Protocol) -> String {
     }
 
     let protocol_name = format_ident!("{}", protocol.name);
-    let delegation_macro = generate_delegation_macro(protocol);
 
     let expanded = quote! {
         pub mod #protocol_name {
@@ -175,10 +205,11 @@ pub fn generate(protocol: &Protocol) -> String {
                 #(#handler_trait_names +)*
             {}
 
-            pub fn dispatch_request<H: ProtocolHandler + ?Sized>(
+            impl<T: #(#handler_trait_names +)*> ProtocolHandler for T {}
+
+            pub fn dispatch_request<H: ProtocolHandler>(
                 interface: &str,
                 msg: &mut WireMessage,
-                handler: &mut H,
                 ctx: &mut Context,
             ) -> Result<Option<Outgoing>, ProtocolError> {
                 ctx.last_sender_id = msg.sender_id;
@@ -188,10 +219,9 @@ pub fn generate(protocol: &Protocol) -> String {
                 }
             }
 
-            pub fn dispatch_event<H: ProtocolHandler + ?Sized>(
+            pub fn dispatch_event<H: ProtocolHandler>(
                 interface: &str,
                 msg: &mut WireMessage,
-                handler: &mut H,
                 ctx: &mut Context,
             ) -> Result<Option<Outgoing>, ProtocolError> {
                 ctx.last_sender_id = msg.sender_id;
@@ -210,16 +240,12 @@ pub fn generate(protocol: &Protocol) -> String {
                     _ => Err(ProtocolError::InvalidObjectId(msg.sender_id)),
                 }
             }
-
-            #delegation_macro
         }
     };
 
     // `quote` already emits valid Rust. Running rustfmt here is unnecessary
-    // for generated build output, and large delegation macros can trigger
-    // rustfmt source-map ICEs instead of producing a diagnostic. Keep code
-    // generation deterministic and leave source formatting to handwritten
-    // files.
+    // for generated build output. Keep code generation deterministic and
+    // leave source formatting to handwritten files.
     expanded.to_string()
 }
 
@@ -236,8 +262,6 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
     let mut classify_arms = Vec::new();
     let mut dispatch_request_arms = Vec::new();
     let mut dispatch_event_arms = Vec::new();
-    let mut special_request_arms = Vec::new();
-    let mut special_event_arms = Vec::new();
     let mut consume_event_arms = Vec::new();
     let mut version_arms = Vec::new();
     let mut name_arms = Vec::new();
@@ -250,27 +274,13 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
         let family_name = format_ident!("{}", snake_to_camel(&protocol.name));
 
         family_variants.push(quote! { #family_name });
-        // Aura objects are internal to Sommelier. Their event payload is
-        // consumed by the proxy's explicit special case, and no aggregate
-        // handler implementation exists for the generated Aura interfaces.
-        // Keep the family in the classifier while leaving it out of the
-        // generic handler bounds and dispatch arms.
-        if protocol.name != "aura_shell" {
-            handler_traits.push(quote! { #protocol_name::ProtocolHandler });
-            dispatch_request_arms.push(quote! {
-                ProtocolFamily::#family_name => #protocol_name::dispatch_request(interface, msg, handler, ctx),
-            });
-            dispatch_event_arms.push(quote! {
-                ProtocolFamily::#family_name => #protocol_name::dispatch_event(interface, msg, handler, ctx),
-            });
-        } else {
-            special_request_arms.push(quote! {
-                ProtocolFamily::#family_name => Ok(None),
-            });
-            special_event_arms.push(quote! {
-                ProtocolFamily::#family_name => Ok(None),
-            });
-        }
+        handler_traits.push(quote! { #protocol_name::ProtocolHandler });
+        dispatch_request_arms.push(quote! {
+            ProtocolFamily::#family_name => #protocol_name::dispatch_request::<H>(interface, msg, ctx),
+        });
+        dispatch_event_arms.push(quote! {
+            ProtocolFamily::#family_name => #protocol_name::dispatch_event::<H>(interface, msg, ctx),
+        });
         consume_event_arms.push(quote! {
             ProtocolFamily::#family_name => #protocol_name::consume_event(interface, msg),
         });
@@ -335,7 +345,7 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
             #(#handler_traits +)*
         {}
 
-        impl<T: ?Sized> AllProtocolHandlers for T
+        impl<T> AllProtocolHandlers for T
         where
             T: #(#handler_traits +)*
         {}
@@ -367,29 +377,25 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
             }
         }
 
-        pub fn dispatch_request<H: AllProtocolHandlers + ?Sized>(
+        pub fn dispatch_request<H: AllProtocolHandlers>(
             family: ProtocolFamily,
             interface: &str,
             msg: &mut WireMessage,
-            handler: &mut H,
             ctx: &mut Context,
         ) -> Result<Option<Outgoing>, ProtocolError> {
             match family {
                 #(#dispatch_request_arms)*
-                #(#special_request_arms)*
             }
         }
 
-        pub fn dispatch_event<H: AllProtocolHandlers + ?Sized>(
+        pub fn dispatch_event<H: AllProtocolHandlers>(
             family: ProtocolFamily,
             interface: &str,
             msg: &mut WireMessage,
-            handler: &mut H,
             ctx: &mut Context,
         ) -> Result<Option<Outgoing>, ProtocolError> {
             match family {
                 #(#dispatch_event_arms)*
-                #(#special_event_arms)*
             }
         }
 
@@ -633,12 +639,21 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                     Request::#var_name { .. } => #req_idx,
                 });
 
-                // Handler method
+                // A handler method, which forwards unless a handler
+                // overrides it, or one the handler must write, which
+                // forwards nothing.
                 let method_name = format_ident!("on_{}", req.name);
                 let method_args = generate_handler_args(&req.items);
-                handler_methods.push(quote! {
-                    fn #method_name(&mut self, _ctx: &mut Context, #method_args) -> Action {
-                        Action::Forward
+                let hand_written = is_hand_written(&interface.name, &req.name);
+                handler_methods.push(if hand_written {
+                    quote! {
+                        fn #method_name(ctx: &mut Context, #method_args);
+                    }
+                } else {
+                    quote! {
+                        fn #method_name(_ctx: &mut Context, #method_args) -> Action {
+                            Action::Forward
+                        }
                     }
                 });
 
@@ -714,22 +729,13 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                         ));
                                     });
                                 } else {
-                                    // The table keeps the generated name;
-                                    // an interface no vendored protocol
-                                    // defines cannot be routed.
-                                    mapping_and_writing.push(quote! {
-                                        builder.write_string(&#name.0);
-                                        builder.write_u32(#name.1);
-                                        builder.write_u32(
-                                            ctx.shadow_table.create_paired(
-                                                #name.2,
-                                                crate::protocols::interface_name(&#name.0)
-                                                    .ok_or(ProtocolError::InvalidObjectId(#name.2))?,
-                                                #name.1,
-                                                #name.1,
-                                            ),
-                                        );
-                                    });
+                                    // Only its handler knows what it
+                                    // creates; the arm forwards nothing.
+                                    assert!(
+                                        hand_written,
+                                        "{}.{} creates an object of no interface, so it must be in HAND_WRITTEN_REQUESTS",
+                                        interface.name, req.name
+                                    );
                                 }
                             }
                             _ => {
@@ -746,10 +752,10 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                     if req.msg_type.as_deref() == Some("destructor") {
                         (
                             quote! { ctx.guest_destroyed(msg.sender_id); },
-                            quote! { crate::handler::display::queue_local_delete_id(ctx, msg.sender_id); },
+                            quote! { ctx.local_destroyed(msg.sender_id); },
                             quote! {
                                 if sender == Link::Local {
-                                    crate::handler::display::queue_local_delete_id(ctx, msg.sender_id);
+                                    ctx.local_destroyed(msg.sender_id);
                                 }
                             },
                         )
@@ -757,35 +763,45 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         (quote! {}, quote! {}, quote! {})
                     };
 
-                dispatch_request_arms.push(quote! {
-                    Request::#var_name { #(#field_names_list),* } => {
-                        #request_version_validation
-                        #(#request_validations)*
-                        let handler_action = handler.#method_name(ctx, #(#handler_call_args),*);
-                        if handler_action == Action::Forward {
-                            // Check the sender and every object argument
-                            // before mapping any new_id: a dropped request
-                            // must not consume or map an ID, since
-                            // libwayland-server refuses a gap in client IDs.
-                            let Link::Host(host_sender_id) = sender else {
-                                log::debug!(
-                                    "Dropping request from local object {}",
-                                    msg.sender_id
-                                );
-                                #local_destructor_cleanup
-                                return Ok(None);
-                            };
-                            #(#local_object_checks)*
-                            // Translating IDs keeps the length; only a
-                            // string with replaced bytes grows.
-                            #[allow(unused_mut)]
-                            let mut builder = MessageBuilder::with_capacity(msg.payload.len());
-                            #(#mapping_and_writing)*
-                            let outgoing = builder.try_build(host_sender_id, #req_idx)?;
-                            #destructor_cleanup
-                            return Ok(Some(outgoing));
+                dispatch_request_arms.push(if hand_written {
+                    quote! {
+                        Request::#var_name { #(#field_names_list),* } => {
+                            #request_version_validation
+                            #(#request_validations)*
+                            H::#method_name(ctx, #(#handler_call_args),*);
                         }
-                        #dropped_destructor_cleanup
+                    }
+                } else {
+                    quote! {
+                        Request::#var_name { #(#field_names_list),* } => {
+                            #request_version_validation
+                            #(#request_validations)*
+                            let handler_action = H::#method_name(ctx, #(#handler_call_args),*);
+                            if handler_action == Action::Forward {
+                                // Check the sender and every object argument
+                                // before mapping any new_id: a dropped request
+                                // must not consume or map an ID, since
+                                // libwayland-server refuses a gap in client IDs.
+                                let Link::Host(host_sender_id) = sender else {
+                                    log::debug!(
+                                        "Dropping request from local object {}",
+                                        msg.sender_id
+                                    );
+                                    #local_destructor_cleanup
+                                    return Ok(None);
+                                };
+                                #(#local_object_checks)*
+                                // Translating IDs keeps the length; only a
+                                // string with replaced bytes grows.
+                                #[allow(unused_mut)]
+                                let mut builder = MessageBuilder::with_capacity(msg.payload.len());
+                                #(#mapping_and_writing)*
+                                let outgoing = builder.try_build(host_sender_id, #req_idx)?;
+                                #destructor_cleanup
+                                return Ok(Some(outgoing));
+                            }
+                            #dropped_destructor_cleanup
+                        }
                     }
                 });
 
@@ -825,7 +841,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 let method_name = format_ident!("on_{}", evt.name);
                 let method_args = generate_handler_args(&evt.items);
                 handler_methods.push(quote! {
-                    fn #method_name(&mut self, _ctx: &mut Context, #method_args) -> Action {
+                    fn #method_name(_ctx: &mut Context, #method_args) -> Action {
                         Action::Forward
                     }
                 });
@@ -932,7 +948,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         // the wire, and destructor cleanup must remove that
                         // same object rather than looking it up again.
                         let mapped_guest_sender_id = ctx.shadow_table.get_guest_id(msg.sender_id);
-                        if handler.#method_name(ctx, #(#handler_call_args),*) == Action::Forward {
+                        if H::#method_name(ctx, #(#handler_call_args),*) == Action::Forward {
                             // Check the sender and every object argument
                             // before mapping any new_id: a dropped event must
                             // not consume a guest server ID, since
@@ -1048,9 +1064,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 #(#handler_methods)*
             }
 
-            pub fn dispatch_request<H: #handler_trait_name + ?Sized>(
+            pub fn dispatch_request<H: #handler_trait_name>(
                 msg: &mut WireMessage,
-                handler: &mut H,
                 ctx: &mut Context,
             ) -> Result<Option<Outgoing>, ProtocolError> {
                 // The sender comes first, as in libwayland-server: a request
@@ -1068,9 +1083,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 Ok(None)
             }
 
-            pub fn dispatch_event<H: #handler_trait_name + ?Sized>(
+            pub fn dispatch_event<H: #handler_trait_name>(
                 msg: &mut WireMessage,
-                handler: &mut H,
                 ctx: &mut Context,
             ) -> Result<Option<Outgoing>, ProtocolError> {
                 // The proxy dispatches an event by its sender's interface
@@ -1223,69 +1237,6 @@ fn generate_test_impls(enum_name: &Ident, messages: &[&Message]) -> TokenStream 
                 }
             }
         }
-    }
-}
-
-fn generate_delegation_macro(protocol: &Protocol) -> TokenStream {
-    let mut dispatch_arms = Vec::new();
-    let mut entry_point_calls = Vec::new();
-    let protocol_name = format_ident!("{}", protocol.name);
-
-    for item in &protocol.items {
-        if let ProtocolItem::Interface(interface) = item {
-            let iface_name = &interface.name;
-            let iface_ident = format_ident!("{}", iface_name);
-            let mod_name = format_ident!("{}", iface_name);
-            let handler_trait_name = format_ident!("{}Handler", snake_to_camel(iface_name));
-
-            // Entry point call
-            entry_point_calls.push(quote! {
-                $crate::protocols::#protocol_name::impl_sommelier_delegates!(@dispatch $target, #iface_ident, [ $($iface : $field,)* ]);
-            });
-
-            let mut method_impls = Vec::new();
-            for item in &interface.items {
-                let (name, args_items) = match item {
-                    InterfaceItem::Request(req) => (&req.name, &req.items),
-                    InterfaceItem::Event(evt) => (&evt.name, &evt.items),
-                    _ => continue,
-                };
-
-                let method_name = format_ident!("on_{}", name);
-                let sig_args = generate_handler_args(args_items);
-                let call_args = generate_forwarding_call_args(args_items);
-
-                method_impls.push(quote! {
-                     fn #method_name(&mut self, ctx: &mut $crate::state::Context, #sig_args) -> $crate::wire::Action {
-                         self.$field.#method_name(ctx, #call_args)
-                     }
-                 });
-            }
-
-            dispatch_arms.push(quote! {
-                (@dispatch $target:ty, #iface_ident, [ #iface_ident : $field:ident, $($rest:tt)* ]) => {
-                    impl $crate::protocols::#protocol_name::#mod_name::#handler_trait_name for $target {
-                        #(#method_impls)*
-                    }
-                };
-                (@dispatch $target:ty, #iface_ident, [ $other:ident : $field:ident, $($rest:tt)* ]) => {
-                    $crate::protocols::#protocol_name::impl_sommelier_delegates!(@dispatch $target, #iface_ident, [ $($rest)* ]);
-                };
-                (@dispatch $target:ty, #iface_ident, []) => {
-                    impl $crate::protocols::#protocol_name::#mod_name::#handler_trait_name for $target {}
-                };
-            });
-        }
-    }
-
-    quote! {
-        macro_rules! impl_sommelier_delegates {
-            ($target:ty, { $($iface:ident : $field:ident),* }) => {
-                #( #entry_point_calls )*
-            };
-            #(#dispatch_arms)*
-        }
-        pub(crate) use impl_sommelier_delegates;
     }
 }
 
@@ -1762,8 +1713,7 @@ fn generate_fields(items: &[MessageItem]) -> TokenStream {
     quote! { #(#fields),* }
 }
 
-/// The parameters of a handler method. Types are fully qualified, because
-/// the delegation macro expands them in the handler's module.
+/// The parameters of a handler method.
 ///
 /// A handler borrows the message's descriptors: the dispatcher owns them,
 /// forwards them or closes them, and a handler that keeps one clones it.
@@ -1784,17 +1734,6 @@ fn generate_handler_args(items: &[MessageItem]) -> TokenStream {
             } else {
                 args.push(quote! { #name: #ty });
             }
-        }
-    }
-    quote! { #(#args),* }
-}
-
-fn generate_forwarding_call_args(items: &[MessageItem]) -> TokenStream {
-    let mut args = Vec::new();
-    for item in items {
-        if let MessageItem::Arg(arg) = item {
-            let name = format_ident!("_{}", sanitize_ident(&arg.name));
-            args.push(quote! { #name });
         }
     }
     quote! { #(#args),* }

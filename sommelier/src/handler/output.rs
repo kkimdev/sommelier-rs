@@ -24,6 +24,7 @@ limitations under the License.
 //! integer `wl_output.scale` cannot.
 
 use crate::handler::aura_objects;
+use crate::handler::Handlers;
 use crate::protocols::aura_shell::zaura_output::{self, ZauraOutputHandler};
 use crate::protocols::wayland::wl_output;
 use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::ZxdgOutputManagerV1Handler;
@@ -31,15 +32,12 @@ use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1;
 use crate::state::{is_valid_transform, Context};
 use crate::wire::Action;
 
-pub struct OutputHandler;
-
 /// Host `wl_output` events feed [`crate::state::OutputRegistry`] and are
 /// forwarded unchanged. Events from a released output never get here: the
 /// proxy suppresses host events for objects awaiting `delete_id`. Events
 /// from an output whose global was removed change nothing.
-impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
+impl crate::protocols::wayland::wl_output::WlOutputHandler for Handlers {
     fn on_geometry(
-        &mut self,
         ctx: &mut Context,
         x: i32,
         y: i32,
@@ -69,14 +67,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
         Action::Forward
     }
 
-    fn on_mode(
-        &mut self,
-        ctx: &mut Context,
-        flags: u32,
-        width: i32,
-        height: i32,
-        _refresh: i32,
-    ) -> Action {
+    fn on_mode(ctx: &mut Context, flags: u32, width: i32, height: i32, _refresh: i32) -> Action {
         ctx.outputs.update(ctx.last_sender_id, |output| {
             if flags & wl_output::MODE_CURRENT != 0
                 || output.mode_width <= 0
@@ -89,12 +80,12 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
         Action::Forward
     }
 
-    fn on_done(&mut self, ctx: &mut Context) -> Action {
+    fn on_done(ctx: &mut Context) -> Action {
         ctx.outputs.commit(ctx.last_sender_id);
         Action::Forward
     }
 
-    fn on_release(&mut self, ctx: &mut Context) -> Action {
+    fn on_release(ctx: &mut Context) -> Action {
         // This is a client→host request, so `last_sender_id` is the guest
         // wl_output ID. Translate it before touching host-side output state or
         // queueing the destructor. Keeping the direction explicit avoids
@@ -128,15 +119,8 @@ pub(crate) fn forget_output(ctx: &mut Context, host_output_id: u32) {
 /// `zaura_output` is host-only, so none of its events reach the guest. Its
 /// events for an unknown or no longer live output are stale and dropped
 /// (see [`crate::state::OutputRegistry::aura_event_target`]).
-impl ZauraOutputHandler for OutputHandler {
-    fn on_insets(
-        &mut self,
-        ctx: &mut Context,
-        top: i32,
-        left: i32,
-        bottom: i32,
-        right: i32,
-    ) -> Action {
+impl ZauraOutputHandler for Handlers {
+    fn on_insets(ctx: &mut Context, top: i32, left: i32, bottom: i32, right: i32) -> Action {
         let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
             return Action::Drop;
         };
@@ -163,7 +147,7 @@ impl ZauraOutputHandler for OutputHandler {
         Action::Drop
     }
 
-    fn on_scale(&mut self, ctx: &mut Context, flags: u32, scale: u32) -> Action {
+    fn on_scale(ctx: &mut Context, flags: u32, scale: u32) -> Action {
         // Preferred scales describe choices, not the active DP geometry.
         if flags & zaura_output::SCALE_PROPERTY_CURRENT == 0 {
             return Action::Drop;
@@ -181,7 +165,7 @@ impl ZauraOutputHandler for OutputHandler {
         Action::Drop
     }
 
-    fn on_device_scale_factor(&mut self, ctx: &mut Context, scale: u32) -> Action {
+    fn on_device_scale_factor(ctx: &mut Context, scale: u32) -> Action {
         let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
             return Action::Drop;
         };
@@ -196,7 +180,7 @@ impl ZauraOutputHandler for OutputHandler {
     }
 
     /// Not used: see [`crate::state::OutputState::panel_transform`].
-    fn on_logical_transform(&mut self, _ctx: &mut Context, _transform: i32) -> Action {
+    fn on_logical_transform(_ctx: &mut Context, _transform: i32) -> Action {
         Action::Drop
     }
 }
@@ -204,8 +188,8 @@ impl ZauraOutputHandler for OutputHandler {
 /// `zxdg_output_manager_v1` is forwarded. The generated code translates
 /// the IDs of its `zxdg_output_v1` children and their events, and checks
 /// each event against the child's version, which is its manager's.
-impl ZxdgOutputManagerV1Handler for OutputHandler {
-    fn on_get_xdg_output(&mut self, ctx: &mut Context, id: u32, output: u32) -> Action {
+impl ZxdgOutputManagerV1Handler for Handlers {
+    fn on_get_xdg_output(ctx: &mut Context, id: u32, output: u32) -> Action {
         if ctx.shadow_table.get_host_id(output).is_some() {
             return Action::Forward;
         }
@@ -230,7 +214,7 @@ impl ZxdgOutputManagerV1Handler for OutputHandler {
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::*;
-    use crate::handler::registry::RegistryHandler;
+    use crate::handler::Handlers;
     use crate::protocols::wayland::wl_output::WlOutputHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
@@ -283,10 +267,7 @@ pub(crate) mod fixture {
         }
         ctx.last_sender_id = 1;
         let shell = "zaura_shell".to_string();
-        assert_eq!(
-            RegistryHandler.on_global(&mut ctx, 99, &shell, 38),
-            Action::Drop
-        );
+        assert_eq!(Handlers::on_global(&mut ctx, 99, &shell, 38), Action::Drop);
         ctx
     }
 
@@ -305,9 +286,9 @@ pub(crate) mod fixture {
     ) -> u32 {
         ctx.last_sender_id = registry;
         let output = "wl_output".to_string();
-        RegistryHandler.on_global(ctx, name, &output, 3);
+        Handlers::on_global(ctx, name, &output, 3);
         let bind = (output, 3, guest_output);
-        assert_eq!(RegistryHandler.on_bind(ctx, name, &bind), Action::Drop);
+        Handlers::on_bind(ctx, name, &bind);
         let host_output = ctx.shadow_table.get_host_id(guest_output).expect("bound");
         send_metrics(ctx, host_output, display);
         host_output
@@ -315,30 +296,28 @@ pub(crate) mod fixture {
 
     /// Send one Exo display-metrics group for `host_output`.
     pub(crate) fn send_metrics(ctx: &mut Context, host_output: u32, display: Display) {
-        let mut handler = OutputHandler;
         let no_name = String::new();
         ctx.last_sender_id = host_output;
         let (x, y) = display.origin;
         let (width, height) = display.mode;
-        handler.on_geometry(ctx, x, y, 0, 0, 0, &no_name, &no_name, display.transform);
-        handler.on_mode(ctx, wl_output::MODE_CURRENT, width, height, 60);
+        Handlers::on_geometry(ctx, x, y, 0, 0, 0, &no_name, &no_name, display.transform);
+        Handlers::on_mode(ctx, wl_output::MODE_CURRENT, width, height, 60);
         ctx.last_sender_id = ctx.outputs.aura_output(host_output).expect("Aura output");
         let current = zaura_output::SCALE_PROPERTY_CURRENT;
-        ZauraOutputHandler::on_scale(&mut handler, ctx, current, 1000);
-        handler.on_device_scale_factor(ctx, display.device_scale);
-        handler.on_insets(ctx, 0, 0, display.shelf, 0);
+        <Handlers as ZauraOutputHandler>::on_scale(ctx, current, 1000);
+        Handlers::on_device_scale_factor(ctx, display.device_scale);
+        Handlers::on_insets(ctx, 0, 0, display.shelf, 0);
         ctx.last_sender_id = host_output;
-        WlOutputHandler::on_done(&mut handler, ctx);
+        <Handlers as WlOutputHandler>::on_done(ctx);
     }
 
     /// Exo moving `host_surface` to `to`: `leave(from)`, then `enter(to)`.
     pub(crate) fn move_surface(ctx: &mut Context, host_surface: u32, from: Option<u32>, to: u32) {
-        let mut handler = crate::handler::compositor::CompositorHandler;
         ctx.last_sender_id = host_surface;
         if let Some(from) = from {
-            WlSurfaceHandler::on_leave(&mut handler, ctx, from);
+            <Handlers as WlSurfaceHandler>::on_leave(ctx, from);
         }
-        WlSurfaceHandler::on_enter(&mut handler, ctx, to);
+        <Handlers as WlSurfaceHandler>::on_enter(ctx, to);
     }
 
     /// The work area placement would use for `host_surface`.
@@ -411,33 +390,33 @@ mod tests {
         fn geometry(&mut self, origin: (i32, i32), transform: i32) -> Action {
             let name = String::new();
             let (x, y) = origin;
-            OutputHandler.on_geometry(self.output(), x, y, 0, 0, 0, &name, &name, transform)
+            Handlers::on_geometry(self.output(), x, y, 0, 0, 0, &name, &name, transform)
         }
 
         /// The current `wl_output.mode`.
         fn mode(&mut self, width: i32, height: i32) -> Action {
-            OutputHandler.on_mode(self.output(), wl_output::MODE_CURRENT, width, height, 60)
+            Handlers::on_mode(self.output(), wl_output::MODE_CURRENT, width, height, 60)
         }
 
         fn done(&mut self) -> Action {
-            WlOutputHandler::on_done(&mut OutputHandler, self.output())
+            <Handlers as WlOutputHandler>::on_done(self.output())
         }
 
         /// `zaura_output.scale` with `flags`.
         fn scale(&mut self, flags: u32, scale: u32) -> Action {
-            ZauraOutputHandler::on_scale(&mut OutputHandler, self.aura(), flags, scale)
+            <Handlers as ZauraOutputHandler>::on_scale(self.aura(), flags, scale)
         }
 
         fn device_scale(&mut self, factor: u32) -> Action {
-            OutputHandler.on_device_scale_factor(self.aura(), factor)
+            Handlers::on_device_scale_factor(self.aura(), factor)
         }
 
         fn insets(&mut self, top: i32, left: i32, bottom: i32, right: i32) -> Action {
-            OutputHandler.on_insets(self.aura(), top, left, bottom, right)
+            Handlers::on_insets(self.aura(), top, left, bottom, right)
         }
 
         fn logical_transform(&mut self, transform: i32) -> Action {
-            ZauraOutputHandler::on_logical_transform(&mut OutputHandler, self.aura(), transform)
+            <Handlers as ZauraOutputHandler>::on_logical_transform(self.aura(), transform)
         }
 
         fn committed(&self) -> Option<OutputState> {
@@ -658,7 +637,7 @@ mod tests {
             // host ID.
             ctx.last_sender_id = output_guest;
             assert_eq!(
-                WlOutputHandler::on_release(&mut OutputHandler, &mut ctx),
+                <Handlers as WlOutputHandler>::on_release(&mut ctx),
                 Action::Drop
             );
             let mut expected = vec![(OUTPUT_HOST, wl_output::REQ_RELEASE)];
@@ -696,7 +675,7 @@ mod tests {
         for output_guest in [10, 11] {
             ctx.last_sender_id = output_guest;
             assert_eq!(
-                WlOutputHandler::on_release(&mut OutputHandler, &mut ctx),
+                <Handlers as WlOutputHandler>::on_release(&mut ctx),
                 Action::Drop
             );
         }
@@ -884,7 +863,7 @@ mod tests {
     #[test]
     fn hotplug_moves_placement_between_outputs() {
         use super::fixture::{context, dock, move_surface, placement_area, EXTERNAL, PANEL};
-        use crate::handler::registry::RegistryHandler;
+        use crate::handler::Handlers;
         use crate::protocols::wayland::wl_registry::WlRegistryHandler;
         let surface = 500;
         let mut ctx = context();
@@ -904,10 +883,7 @@ mod tests {
         move_surface(&mut ctx, surface, Some(external), panel);
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = 1;
-        assert_eq!(
-            RegistryHandler.on_global_remove(&mut ctx, 11),
-            Action::Forward
-        );
+        assert_eq!(Handlers::on_global_remove(&mut ctx, 11), Action::Forward);
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
             [(external_aura, REQ_RELEASE_AURA_OUTPUT)]
@@ -930,7 +906,7 @@ mod tests {
     #[test]
     fn an_output_bound_through_two_registries_is_two_outputs() {
         use super::fixture::{context, dock, send_metrics, EXTERNAL, PANEL};
-        use crate::handler::registry::RegistryHandler;
+        use crate::handler::Handlers;
         use crate::protocols::wayland::wl_registry::WlRegistryHandler;
         let mut ctx = context();
         let first = dock(&mut ctx, 1, 10, 30, PANEL);
@@ -953,10 +929,7 @@ mod tests {
 
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = 1;
-        assert_eq!(
-            RegistryHandler.on_global_remove(&mut ctx, 10),
-            Action::Forward
-        );
+        assert_eq!(Handlers::on_global_remove(&mut ctx, 10), Action::Forward);
         assert!(ctx.outputs.live_outputs().is_empty());
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
@@ -964,10 +937,7 @@ mod tests {
         );
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = 2;
-        assert_eq!(
-            RegistryHandler.on_global_remove(&mut ctx, 10),
-            Action::Forward
-        );
+        assert_eq!(Handlers::on_global_remove(&mut ctx, 10), Action::Forward);
         assert!(ctx.client_to_host_queue.is_empty(), "already released");
     }
 }

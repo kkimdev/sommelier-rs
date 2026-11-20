@@ -15,8 +15,7 @@ limitations under the License.
 */
 
 use super::*;
-use crate::handler::callback::CallbackHandler;
-use crate::handler::keyboard::KeyboardHandler;
+use crate::handler::Handlers;
 use crate::ime::{map_v3_content_type, LinkState};
 use crate::keys::GuestKeyOwner;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
@@ -4147,17 +4146,17 @@ impl Ime {
     pub(in crate::handler) fn preedit(&mut self, text: &str, commit: &str) {
         self.ctx.last_sender_id = HOST;
         let (text, commit) = (IndexedString::from(text), commit.to_string());
-        TextInputV1Handler.on_preedit_string(&mut self.ctx, 0, &text, &commit);
+        <Handlers as ZwpTextInputV1Handler>::on_preedit_string(&mut self.ctx, 0, &text, &commit);
     }
 
     pub(in crate::handler) fn commit(&mut self, text: &str) {
         self.ctx.last_sender_id = HOST;
-        TextInputV1Handler.on_commit_string(&mut self.ctx, 0, &text.to_string());
+        <Handlers as ZwpTextInputV1Handler>::on_commit_string(&mut self.ctx, 0, &text.to_string());
     }
 
     pub(in crate::handler) fn preedit_region(&mut self, index: i32, length: u32) {
         self.ctx.last_sender_id = HOST_EXT;
-        ExtendedTextInputV1Handler.on_set_preedit_region(&mut self.ctx, index, length);
+        Handlers::on_set_preedit_region(&mut self.ctx, index, length);
     }
 
     /// The host input method's empty confirmation, then a host event
@@ -4166,13 +4165,13 @@ impl Ime {
     /// (`crate::keys::recovery`).
     pub(in crate::handler) fn confirm(&mut self) {
         self.ctx.last_sender_id = HOST_EXT;
-        ExtendedTextInputV1Handler.on_confirm_preedit(&mut self.ctx, 0);
+        Handlers::on_confirm_preedit(&mut self.ctx, 0);
         crate::handler::keyboard::before_host_event(&mut self.ctx, 0, None, 0, false);
     }
 
     pub(in crate::handler) fn peek(&mut self, key: u32, state: u32, serial: u32, time: u32) {
         self.ctx.last_sender_id = HOST_EXTENDED_KEYBOARD;
-        KeyboardHandler::new().on_peek_key(&mut self.ctx, serial, time, key, state);
+        Handlers::on_peek_key(&mut self.ctx, serial, time, key, state);
     }
 
     /// Hold repeatable `key` on `keyboard`, whose press `peek_key`
@@ -4191,7 +4190,7 @@ impl Ime {
             crate::handler::keyboard::for_test::default_keymap(&mut self.ctx, keyboard.0);
         }
         self.ctx.last_sender_id = self.extended(keyboard);
-        KeyboardHandler::new().on_peek_key(&mut self.ctx, serial, time, key, PRESSED);
+        Handlers::on_peek_key(&mut self.ctx, serial, time, key, PRESSED);
     }
 
     /// Hold Backspace on [`HOST_KEYBOARD`], with its IME repeat leased
@@ -4213,7 +4212,7 @@ impl Ime {
     /// what the handler does with it.
     pub(in crate::handler) fn key(&mut self, key: u32, state: u32, serial: u32) -> Action {
         self.ctx.last_sender_id = HOST_KEYBOARD.0;
-        KeyboardHandler::new().on_key(&mut self.ctx, serial, 1, key, state)
+        Handlers::on_key(&mut self.ctx, serial, 1, key, state)
     }
 
     pub(in crate::handler) fn repeat_active(&self) -> bool {
@@ -4265,8 +4264,8 @@ fn a_reports_barrier_is_glued_into_its_entry() {
     let mut ime = Ime::new();
     ime.ctx.last_sender_id = TI;
     let text = IndexedString::from("ab");
-    TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &text, 2, 2);
-    TextInputV3Handler.on_commit(&mut ime.ctx);
+    <Handlers as ZwpTextInputV3Handler>::on_set_surrounding_text(&mut ime.ctx, &text, 2, 2);
+    Handlers::on_commit(&mut ime.ctx);
     let report = ime.ctx.client_to_host_queue.iter().find(|(bytes, _)| {
         crate::test_support::msg_header(bytes).opcode == zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT
     });
@@ -4339,8 +4338,7 @@ fn child_objects_inherit_their_manager_versions() {
         .create_local(40, "zwp_text_input_manager_v3", 5);
     ctx.last_sender_id = 40;
 
-    let mut handler = TextInputManagerV3Handler;
-    assert_eq!(handler.on_get_text_input(&mut ctx, 20, 30), Action::Drop);
+    assert_eq!(Handlers::on_get_text_input(&mut ctx, 20, 30), Action::Drop);
     let host = ctx.ime.get(TiId(20)).expect("the text input").host();
     assert_eq!(
         ctx.shadow_table.host_object_version(host.ext.id),
@@ -4394,7 +4392,7 @@ fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
     ime.ctx.client_to_host_queue.clear();
 
     ime.ctx.last_sender_id = callback;
-    CallbackHandler.on_done(&mut ime.ctx, 0);
+    <Handlers as WlCallbackHandler>::on_done(&mut ime.ctx, 0);
     assert!(!ime.state().is_attached());
     assert!(ime.ctx.client_to_host_queue.is_empty());
 }
@@ -4406,7 +4404,7 @@ fn guest_commit_serial_wraps_and_is_forwarded_unchanged() {
     state.set_commits_for_test(u32::MAX);
     state.set_link_for_test(LinkState::Detached);
     ime.ctx.last_sender_id = TI;
-    TextInputV3Handler.on_commit(&mut ime.ctx);
+    Handlers::on_commit(&mut ime.ctx);
 
     assert_eq!(ime.state().serial().get(), 0);
     let queue = std::mem::take(&mut ime.ctx.client_to_host_queue);
@@ -4440,9 +4438,8 @@ fn text_input_creation_without_host_manager_does_not_create_broken_state() {
         zwp_text_input_manager_v3::VERSION,
     );
     ctx.last_sender_id = manager;
-    let mut handler = TextInputManagerV3Handler;
 
-    assert_eq!(handler.on_get_text_input(&mut ctx, 20, 7), Action::Drop);
+    assert_eq!(Handlers::on_get_text_input(&mut ctx, 20, 7), Action::Drop);
     assert!(!ctx.is_fatal());
     assert!(ctx.ime.get(TiId(20)).is_none());
     assert!(ctx.shadow_table.is_local(20));

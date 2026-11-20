@@ -125,9 +125,15 @@ under [transport invariants](INVARIANTS.md#transport-and-file-descriptors).
 [`third_party/protocols/`](../third_party/protocols/README.md) into Rust at
 build time (`sommelier/build.rs`). For each protocol it generates:
 
-- Typed decoders and a `ProtocolHandler` trait with one `on_*` method per
-  message. A handler returns `Action::Forward` or `Action::Drop`; the
-  default forwards.
+- Typed decoders and a handler trait per interface (`WlSurfaceHandler`)
+  with one `on_*` function per message, which takes the connection's
+  `Context` and returns `Action::Forward` or `Action::Drop`; the default
+  forwards. A request in `HAND_WRITTEN_REQUESTS` has no default and
+  returns nothing, so the generated code never forwards it:
+  `wl_registry.bind`, whose `new_id` names no interface, so only its
+  handler knows what it creates. The generated code reaches the proxy
+  only through the object table (`ctx.shadow_table`) and the `Context`
+  lifecycle wrappers, never through a handler module.
 - Pre-dispatch validation: the sender, object and `new_id` arguments are
   resolved through the shadow table before the handler runs, so a
   repeated, null or reserved ID cannot overwrite an entry, and each
@@ -229,7 +235,13 @@ about the host ID and frees it (`Context::release_deleted_host_id`).
 ## Handlers and state
 
 Handlers translate wire events and delegate policy; policy modules never
-encode wire bytes ad hoc.
+encode wire bytes ad hoc. `handler::Handlers` is the one handler type: a
+unit struct that implements every interface's generated trait, each in
+the module that owns the interface, and lists the interfaces whose
+messages all forward as they are in `handler/mod.rs`. It holds no state,
+so a handler acts only on the `Context` it is given; the XKB context the
+keymaps are compiled in belongs to the keyboard core
+(`keymap::Compiler`), next to the keymaps compiled from it.
 
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
@@ -489,7 +501,7 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   (`NeverSubmitted`, `AwaitingRelease`, `ReleaseOwed`, `Released`), so
   `wl_buffer.release` reaches the guest exactly when the host is done,
   including after the surface that showed it is destroyed.
-  `BufferHandler` (`handler/buffer.rs`) handles every guest `wl_buffer`,
+  `handler/buffer.rs` handles every guest `wl_buffer`,
   SHM or dma-buf: its destroy and release, and its deferred retirement.
 
 `handler/shm.rs` holds a submodule per concern, and re-exports what other

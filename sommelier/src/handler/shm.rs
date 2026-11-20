@@ -32,5 +32,3 @@ pub(crate) use self::formats::{
     record_host_shm_drm_format, register_guest_shm,
 };
 pub(crate) use self::pool::{forget_pool, forget_shm, retire_guest_shms};
-
-pub struct ShmHandler;

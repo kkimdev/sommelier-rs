@@ -491,9 +491,9 @@ mod tests {
     use super::super::copy::{copy_shm_damage, ShmCopyLayout};
     use super::super::dmabuf::map_dmabuf;
     use super::super::dmabuf_layout::validate_dmabuf_layout;
-    use super::super::ShmHandler;
     use super::{create_dmabuf_buffer, create_shared_buffer, DmabufAllocation, ShmBufferRequest};
     use crate::handler::test_support::session_with_shm;
+    use crate::handler::Handlers;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
     use crate::protocols::wayland::{wl_display, wl_registry, wl_shm, wl_shm_pool, wl_surface};
@@ -786,7 +786,7 @@ mod tests {
         ctx.last_sender_id = pool_id;
 
         assert_eq!(
-            WlShmPoolHandler::on_create_buffer(&mut ShmHandler, &mut ctx, buffer_id, 0, 1, 1, 4, 0),
+            <Handlers as WlShmPoolHandler>::on_create_buffer(&mut ctx, buffer_id, 0, 1, 1, 4, 0),
             Action::Drop
         );
 

@@ -19,6 +19,7 @@ use crate::handler::linux_dmabuf::GUEST_DMABUF_VERSION;
 use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
+use crate::handler::Handlers;
 use crate::protocols::aura_shell::zaura_shell;
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
 use crate::protocols::gtk::{gtk_shell1, ALLOWED_INTERFACES as GTK_ALLOWED};
@@ -1112,19 +1113,11 @@ fn forwarded_global(ctx: &mut Context, name: u32, interface: &str, version: u32)
     Action::Forward
 }
 
-pub struct RegistryHandler;
-
-impl wl_registry::WlRegistryHandler for RegistryHandler {
+impl wl_registry::WlRegistryHandler for Handlers {
     /// A host global: the proxy binds it for itself, advertises a global
     /// of its own in its place, forwards it, or hides it, by its
     /// interface.
-    fn on_global(
-        &mut self,
-        ctx: &mut Context,
-        name: u32,
-        interface: &String,
-        version: u32,
-    ) -> Action {
+    fn on_global(ctx: &mut Context, name: u32, interface: &String, version: u32) -> Action {
         if let Err(action) = accept_global(ctx, name, interface, version) {
             return action;
         }
@@ -1139,7 +1132,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         }
     }
 
-    fn on_global_remove(&mut self, ctx: &mut Context, name: u32) -> Action {
+    fn on_global_remove(ctx: &mut Context, name: u32) -> Action {
         let registry_id = ctx.last_sender_id;
         let Some(record) = ctx.registries.get(&registry_id) else {
             return Action::Drop;
@@ -1212,7 +1205,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         }
     }
 
-    fn on_bind(&mut self, ctx: &mut Context, name: u32, id: &(String, u32, u32)) -> Action {
+    /// A guest bind, which only this handler knows how to serve: the
+    /// generated code forwards nothing for it
+    /// (`wayland_codegen::generator::HAND_WRITTEN_REQUESTS`).
+    fn on_bind(ctx: &mut Context, name: u32, id: &(String, u32, u32)) {
         // id is (interface, version, new_id)
         let (requested, version, guest_new_id) = id;
 
@@ -1236,14 +1232,14 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // destructor completes in the proxy.
                 ctx.shadow_table
                     .create_local(*guest_new_id, interface, *version);
-                return Action::Drop;
+                return;
             }
             None => {
                 error!(
                     "Rejecting bind for unadvertised, unsupported, or too-new global {}:{} v{}",
                     name, requested, version
                 );
-                return ctx.reject(
+                let _ = ctx.reject(
                     ctx.last_sender_id,
                     wl_display::ERROR_INVALID_OBJECT,
                     format!(
@@ -1251,6 +1247,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                         name, requested, version
                     ),
                 );
+                return;
             }
         };
 
@@ -1268,7 +1265,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // The host-side wl_shm object was bound when the host global was
             // observed. Binding the synthetic guest global must not issue a
             // second host bind or create a guest→host alias.
-            return Action::Drop;
+            return;
         } else if interface == zwp_text_input_manager_v3::NAME {
             // This is a synthetic guest-only manager. Every guest manager
             // shares the one internal host v1 manager, so mapping each guest
@@ -1277,7 +1274,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // the shared host object.
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
-            return Action::Drop;
+            return;
         } else if interface == gtk_shell1::NAME {
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
@@ -1289,7 +1286,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     gtk_shell: *guest_new_id,
                 },
             );
-            return Action::Drop;
+            return;
         }
 
         // Every other global is paired with a host binding.
@@ -1313,7 +1310,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         let registry_guest_id = ctx.last_sender_id;
         let Some(registry_host_id) = ctx.shadow_table.get_host_id(registry_guest_id) else {
             error!("Registry not mapped! Guest ID: {}", registry_guest_id);
-            return Action::Drop;
+            return;
         };
         let host_new_id =
             ctx.shadow_table
@@ -1328,9 +1325,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             host_new_id,
         ) {
             ctx.abandon(*guest_new_id);
-            return ctx.fail(format_args!(
+            let _ = ctx.fail(format_args!(
                 "Failed to bind host {interface} for the guest"
             ));
+            return;
         }
         if interface == wl_output::NAME {
             // Register the output only once its bind is queued, so the
@@ -1353,8 +1351,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             let seat = crate::ime::SeatId(*guest_new_id);
             crate::handler::text_input::ime(ctx, crate::ime::Input::SeatBound(seat));
         }
-
-        Action::Drop
     }
 }
 
@@ -1392,8 +1388,8 @@ pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
     }
 }
 
-impl wl_fixes::WlFixesHandler for RegistryHandler {
-    fn on_destroy_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
+impl wl_fixes::WlFixesHandler for Handlers {
+    fn on_destroy_registry(ctx: &mut Context, registry: u32) -> Action {
         // wl_fixes destroys the registry passed as an object argument rather
         // than its own request sender. Reserve that guest/host mapping until
         // wl_display.delete_id acknowledges the host-side destruction.
@@ -1406,12 +1402,11 @@ impl wl_fixes::WlFixesHandler for RegistryHandler {
 mod tests {
     use super::{
         forwarded_global_version, keyboard_extension_version, should_bind_internal_dmabuf,
-        RegistryHandler, Singleton, FORWARDED_PROTOCOLS, KEYBOARD_EXTENSION_VERSION,
+        Singleton, FORWARDED_PROTOCOLS, KEYBOARD_EXTENSION_VERSION,
         LINUX_DMABUF_CAPABILITY_VERSION, WL_SHM_VERSION, XDG_DECORATION_ALLOWED,
         ZAURA_SHELL_MIN_VERSION,
     };
-    use crate::handler::callback::CallbackHandler;
-    use crate::handler::linux_dmabuf::LinuxDmabufHandler;
+    use crate::handler::Handlers;
     use crate::placement_config::PlacementConfig;
     use crate::protocols::aura_shell::{zaura_output, zaura_shell};
     use crate::protocols::gtk::gtk_shell1;
@@ -1451,32 +1446,25 @@ mod tests {
         /// The host advertises global `name` on this registry.
         fn global(self, ctx: &mut Context, name: u32, interface: &str, version: u32) -> Action {
             ctx.last_sender_id = self.host;
-            RegistryHandler.on_global(ctx, name, &interface.to_string(), version)
+            Handlers::on_global(ctx, name, &interface.to_string(), version)
         }
 
         /// The host removes global `name` from this registry.
         fn remove(self, ctx: &mut Context, name: u32) -> Action {
             ctx.last_sender_id = self.host;
-            RegistryHandler.on_global_remove(ctx, name)
+            Handlers::on_global_remove(ctx, name)
         }
 
         /// The guest binds global `name` as `interface` at `version`, as
         /// its new object `id`.
-        fn bind(
-            self,
-            ctx: &mut Context,
-            name: u32,
-            interface: &str,
-            version: u32,
-            id: u32,
-        ) -> Action {
+        fn bind(self, ctx: &mut Context, name: u32, interface: &str, version: u32, id: u32) {
             ctx.last_sender_id = self.guest;
-            RegistryHandler.on_bind(ctx, name, &(interface.to_string(), version, id))
+            Handlers::on_bind(ctx, name, &(interface.to_string(), version, id));
         }
 
         /// The guest destroys this registry through `wl_fixes`.
         fn destroy(self, ctx: &mut Context) -> Action {
-            RegistryHandler.on_destroy_registry(ctx, self.guest)
+            Handlers::on_destroy_registry(ctx, self.guest)
         }
     }
 
@@ -1636,7 +1624,7 @@ mod tests {
                     "{interface} as {name_on_b} on B"
                 );
 
-                assert_eq!(B.bind(&mut ctx, name_on_b, advertised, 1, 20), Action::Drop);
+                B.bind(&mut ctx, name_on_b, advertised, 1, 20);
                 assert!(!ctx.is_fatal(), "{interface} as {name_on_b} on B");
                 assert_eq!(
                     ctx.shadow_table.get_interface(20),
@@ -1657,7 +1645,7 @@ mod tests {
         guest_globals(&mut ctx);
         ctx.client_to_host_queue.clear();
 
-        assert_eq!(A.bind(&mut ctx, 7, "gtk_shell1", 1, 50), Action::Drop);
+        A.bind(&mut ctx, 7, "gtk_shell1", 1, 50);
         assert!(ctx.shadow_table.is_local(50));
         assert!(ctx.gtk_shells.contains_key(&50));
         assert_eq!(guest_globals(&mut ctx), []);
@@ -1673,7 +1661,7 @@ mod tests {
         );
 
         ctx.last_sender_id = callback;
-        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert_eq!(Handlers::on_done(&mut ctx, 0), Action::Drop);
         assert_eq!(
             decoded(&ctx.host_to_client_queue, gtk_shell1::Event::from_wire),
             [(50, gtk_shell1::Event::Capabilities { capabilities: 0 })]
@@ -1795,7 +1783,7 @@ mod tests {
                 .expect("capability generation")
                 .format_modifiers
                 .extend_from_slice(formats);
-            LinuxDmabufHandler::complete_capability_discovery(&mut ctx, generation);
+            crate::handler::linux_dmabuf::complete_capability_discovery(&mut ctx, generation);
 
             assert!(ctx.pending_dmabuf_globals.is_empty());
             assert_eq!(
@@ -1852,7 +1840,7 @@ mod tests {
         let mut ctx = aura_placement_context();
         assert_eq!(A.global(&mut ctx, 11, "zaura_shell", 38), Action::Drop);
         assert_eq!(A.global(&mut ctx, 10, "wl_output", 2), Action::Forward);
-        assert_eq!(A.bind(&mut ctx, 10, "wl_output", 2, 20), Action::Drop);
+        A.bind(&mut ctx, 10, "wl_output", 2, 20);
         let output = ctx.shadow_table.get_host_id(20).expect("bound output");
         let aura_output = ctx.outputs.aura_output(output).expect("Aura output");
         ctx.client_to_host_queue.clear();
@@ -1878,10 +1866,7 @@ mod tests {
             guest: 12,
             host: 102,
         };
-        assert_eq!(
-            unmapped.bind(&mut ctx, 10, "wl_output", 3, 20),
-            Action::Drop
-        );
+        unmapped.bind(&mut ctx, 10, "wl_output", 3, 20);
         assert!(!ctx.is_fatal());
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
         assert_eq!(host_requests(&mut ctx, &[]), []);
@@ -1999,10 +1984,7 @@ mod tests {
             ctx.client_to_host_queue.clear();
 
             let (name, interface, version) = case.bind;
-            assert_eq!(
-                case.through.bind(&mut ctx, name, interface, version, 20),
-                Action::Drop
-            );
+            case.through.bind(&mut ctx, name, interface, version, 20);
             assert!(ctx.is_fatal(), "{} must end the session", case.name);
             assert_eq!(
                 protocol_error(&ctx),
@@ -2021,7 +2003,7 @@ mod tests {
     fn late_zaura_shell_binding_attaches_existing_outputs() {
         let mut ctx = aura_placement_context();
         assert_eq!(A.global(&mut ctx, 10, "wl_output", 3), Action::Forward);
-        assert_eq!(A.bind(&mut ctx, 10, "wl_output", 3, 20), Action::Drop);
+        A.bind(&mut ctx, 10, "wl_output", 3, 20);
         let output = ctx.shadow_table.get_host_id(20).expect("bound output");
         assert_eq!(
             ctx.outputs.aura_output(output),
@@ -2065,7 +2047,7 @@ mod tests {
         guest_globals(&mut ctx);
         ctx.client_to_host_queue.clear();
 
-        assert_eq!(A.bind(&mut ctx, 7, "wl_shm", 1, 20), Action::Drop);
+        A.bind(&mut ctx, 7, "wl_shm", 1, 20);
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
         assert_eq!(ctx.shadow_table.get_interface(20), Some("wl_shm"));
         assert_eq!(host_requests(&mut ctx, &[]), [], "no second host bind");
@@ -2092,17 +2074,13 @@ mod tests {
             .host_text_input_manager_v1_id
             .expect("host manager binding");
         for id in [20, 21] {
-            assert_eq!(
-                A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, id),
-                Action::Drop
-            );
+            A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, id);
             assert_eq!(ctx.shadow_table.get_host_id(id), None);
         }
 
         ctx.last_sender_id = 20;
-        let mut manager_handler = crate::handler::text_input::TextInputManagerV3Handler;
         assert_eq!(
-            ZwpTextInputManagerV3Handler::on_destroy(&mut manager_handler, &mut ctx),
+            <Handlers as ZwpTextInputManagerV3Handler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(
@@ -2118,8 +2096,8 @@ mod tests {
         assert_eq!(A.global(&mut ctx, 10, "wl_seat", 5), Action::Forward);
         assert_eq!(A.global(&mut ctx, 11, "wl_seat", 5), Action::Forward);
 
-        assert_eq!(A.bind(&mut ctx, 10, "wl_seat", 5, 20), Action::Drop);
-        assert_eq!(A.bind(&mut ctx, 11, "wl_seat", 5, 21), Action::Drop);
+        A.bind(&mut ctx, 10, "wl_seat", 5, 20);
+        A.bind(&mut ctx, 11, "wl_seat", 5, 21);
         let host = |id| ctx.shadow_table.get_host_id(id).expect("a host seat");
         let expected = [
             (A.host, bind_request(10, "wl_seat", 5, host(20))),
@@ -2148,10 +2126,7 @@ mod tests {
 
         // The synthetic v3 global is advertised under the host manager's
         // numeric name. Bind a guest manager before removing the host globals.
-        assert_eq!(
-            A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, 20),
-            Action::Drop
-        );
+        A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, 20);
         assert_eq!(A.remove(&mut ctx, 9), Action::Forward);
         assert_eq!(A.remove(&mut ctx, 10), Action::Drop);
         assert_eq!(ctx.host_text_input_manager_v1_id, Some(manager));
@@ -2162,9 +2137,8 @@ mod tests {
         // text-input children must still be created through both retained
         // host-side factories.
         ctx.last_sender_id = 20;
-        let mut manager_handler = crate::handler::text_input::TextInputManagerV3Handler;
         assert_eq!(
-            ZwpTextInputManagerV3Handler::on_get_text_input(&mut manager_handler, &mut ctx, 21, 30),
+            <Handlers as ZwpTextInputManagerV3Handler>::on_get_text_input(&mut ctx, 21, 30),
             Action::Drop
         );
         let host = host_requests(
@@ -2218,10 +2192,7 @@ mod tests {
         // bound host wl_keyboard. The child owns its own destructor and must
         // outlive the manager global.
         crate::handler::keyboard::for_test::created(&mut ctx, 41, 40, 42);
-        crate::handler::keyboard::KeyboardHandler::ensure_extended_keyboard_bound(
-            &mut ctx,
-            HostId(40),
-        );
+        crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(40));
         let child_id = ctx
             .keys
             .keyboards()
@@ -2747,7 +2718,7 @@ mod tests {
             .expect("the replacement's capabilities")
             .format_modifiers
             .push(XRGB8888_LINEAR);
-        LinuxDmabufHandler::complete_capability_discovery(&mut ctx, replacement);
+        crate::handler::linux_dmabuf::complete_capability_discovery(&mut ctx, replacement);
 
         assert_eq!(
             ctx.host_globals.get(&11),
@@ -2775,7 +2746,7 @@ mod tests {
         assert_eq!(A.remove(&mut ctx, 10), Action::Forward);
         assert_eq!(B.global(&mut ctx, 11, "wl_seat", 5), Action::Forward);
 
-        assert_eq!(A.bind(&mut ctx, 10, "wl_output", 3, 20), Action::Drop);
+        A.bind(&mut ctx, 10, "wl_output", 3, 20);
         assert!(!ctx.is_fatal());
         assert_eq!(host_requests(&mut ctx, &[]), [], "nothing reaches the host");
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
@@ -2783,7 +2754,7 @@ mod tests {
         assert_eq!(ctx.shadow_table.guest_object_version(20), Some(3));
         assert!(ctx.outputs.is_empty_for_test());
 
-        assert_eq!(B.bind(&mut ctx, 10, "wl_output", 3, 21), Action::Drop);
+        B.bind(&mut ctx, 10, "wl_output", 3, 21);
         assert_eq!(
             protocol_error(&ctx),
             (B.guest, wl_display::ERROR_INVALID_OBJECT),
@@ -2887,11 +2858,7 @@ mod tests {
         );
         ctx.assert_no_orphans();
 
-        assert_eq!(
-            A.bind(&mut ctx, 7, "wl_seat", 5, 20),
-            Action::Drop,
-            "the replacement global must remain bindable from registry A"
-        );
+        A.bind(&mut ctx, 7, "wl_seat", 5, 20);
         assert!(ctx.shadow_table.get_host_id(20).is_some());
     }
 
@@ -2915,11 +2882,7 @@ mod tests {
             "the replacement hidden global must own the numeric name"
         );
 
-        assert_eq!(
-            A.bind(&mut ctx, 7, "wl_seat", 5, 20),
-            Action::Drop,
-            "a bind for the previous interface must be rejected after name reuse"
-        );
+        A.bind(&mut ctx, 7, "wl_seat", 5, 20);
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
     }
 
@@ -3009,10 +2972,7 @@ mod tests {
                 .then(|| (A.guest, global_event(7, compositor, guest_version)));
             assert_eq!(guest_globals(&mut ctx), Vec::from_iter(advertised));
 
-            assert_eq!(
-                A.bind(&mut ctx, 7, compositor, guest_version, 20),
-                Action::Drop
-            );
+            A.bind(&mut ctx, 7, compositor, guest_version, 20);
             assert!(!ctx.is_fatal());
             let host_id = ctx
                 .shadow_table
@@ -3031,10 +2991,7 @@ mod tests {
                 [(A.host, bind_request(7, compositor, bound_version, host_id))]
             );
 
-            assert_eq!(
-                A.bind(&mut ctx, 7, compositor, guest_version + 1, 21),
-                Action::Drop
-            );
+            A.bind(&mut ctx, 7, compositor, guest_version + 1, 21);
             assert_eq!(
                 protocol_error(&ctx),
                 (A.guest, wl_display::ERROR_INVALID_OBJECT)

@@ -92,7 +92,7 @@ mod tests {
             "a request's sender must be checked before its new_id is mapped"
         );
         assert!(
-            compact.contains("queue_local_delete_id"),
+            compact.contains("ctx.local_destroyed(msg.sender_id)"),
             "generated local-only destructors must synthesize a guest delete_id"
         );
         assert!(
@@ -384,7 +384,7 @@ mod tests {
         );
         assert!(
             wayland.contains(
-                "fnon_create_pool(&mutself,_ctx:&mutContext,_id:u32,_fd:std::os::fd::BorrowedFd<'_>,_size:i32)"
+                "fnon_create_pool(_ctx:&mutContext,_id:u32,_fd:std::os::fd::BorrowedFd<'_>,_size:i32)"
             ),
             "a handler borrows the message's descriptors"
         );
@@ -504,19 +504,31 @@ mod tests {
             }
             let protocol = parse(&path).expect("parse a vendored protocol");
             // Every request and event with a `new_id` argument has one
-            // dispatch arm, whose forward block maps it.
+            // dispatch arm, whose forward block maps it, except a request
+            // its handler writes whole, which has no forward block.
             let creating_messages = protocol
                 .items
                 .iter()
                 .filter_map(|item| match item {
-                    ProtocolItem::Interface(interface) => Some(&interface.items),
+                    ProtocolItem::Interface(interface) => Some(interface),
                     _ => None,
                 })
-                .flatten()
-                .filter(|item| {
-                    let (InterfaceItem::Request(message) | InterfaceItem::Event(message)) = item
-                    else {
-                        return false;
+                .flat_map(|interface| {
+                    interface
+                        .items
+                        .iter()
+                        .map(move |item| (interface.name.as_str(), item))
+                })
+                .filter(|(interface, item)| {
+                    let message = match item {
+                        InterfaceItem::Request(message)
+                            if !generator::HAND_WRITTEN_REQUESTS
+                                .contains(&(*interface, message.name.as_str())) =>
+                        {
+                            message
+                        }
+                        InterfaceItem::Event(message) => message,
+                        _ => return false,
                     };
                     message
                         .items
@@ -605,6 +617,50 @@ mod tests {
         let protocol: crate::protocol::Protocol =
             quick_xml::de::from_str(xml).expect("Failed to parse XML");
         generator::generate(&protocol);
+    }
+
+    /// A request whose `new_id` names no interface creates an object only
+    /// its handler knows, so generation stops unless the request is
+    /// declared hand-written.
+    #[test]
+    #[should_panic(expected = "thing.make creates an object of no interface")]
+    fn test_generate_rejects_an_undeclared_request_of_no_interface() {
+        let xml = r#"
+        <protocol name="untyped">
+          <interface name="thing" version="1">
+            <request name="make">
+              <arg name="id" type="new_id"/>
+            </request>
+          </interface>
+        </protocol>
+        "#;
+        let protocol: crate::protocol::Protocol =
+            quick_xml::de::from_str(xml).expect("Failed to parse XML");
+        generator::generate(&protocol);
+    }
+
+    /// `wl_registry.bind`'s handler writes it whole: its method has no
+    /// default and returns nothing, and its arm forwards nothing.
+    #[test]
+    fn test_a_hand_written_request_forwards_nothing() {
+        let compact = generate_compact("wayland.xml");
+        assert!(
+            compact.contains("fnon_bind(ctx:&mutContext,_name:u32,_id:&(String,u32,u32));"),
+            "a hand-written request's method has no default"
+        );
+        let arm = &compact[compact
+            .find("Request::Bind{name,id}=>{")
+            .expect("the bind arm")..];
+        let end = ["}Request::", "_=>{}"]
+            .iter()
+            .filter_map(|next| arm.find(next))
+            .min()
+            .expect("the end of the bind arm");
+        let arm = &arm[..end];
+        assert!(
+            arm.contains("H::on_bind(ctx,name,&id);") && !arm.contains("try_build"),
+            "a hand-written request is never forwarded: {arm}"
+        );
     }
 
     #[test]

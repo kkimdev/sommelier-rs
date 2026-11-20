@@ -20,6 +20,7 @@ limitations under the License.
 //! and gives some clients wheel steps for touchpad scrolling
 //! ([`WheelSteps`]).
 
+use crate::handler::Handlers;
 use std::collections::BTreeMap;
 
 use crate::client_kind::WheelClient;
@@ -126,11 +127,8 @@ fn restart_steps(ctx: &mut Context, pointer: HostId) {
     ctx.wheel_steps.pointers.remove(&pointer);
 }
 
-pub struct PointerHandler;
-
-impl wl_pointer::WlPointerHandler for PointerHandler {
+impl wl_pointer::WlPointerHandler for Handlers {
     fn on_enter(
-        &mut self,
         ctx: &mut Context,
         _serial: u32,
         surface: u32,
@@ -149,7 +147,7 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
         Action::Forward
     }
 
-    fn on_leave(&mut self, ctx: &mut Context, _serial: u32, surface: u32) -> Action {
+    fn on_leave(ctx: &mut Context, _serial: u32, surface: u32) -> Action {
         // The dispatcher resolved the surface, as for `enter`.
         if let Some(guest_surface) = ctx.shadow_table.get_guest_id(surface) {
             ctx.pointer_focus
@@ -161,7 +159,7 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
 
     /// The client's first scroll after its detection answered settles
     /// whether it gets wheel steps ([`WheelClient::settle`]).
-    fn on_axis_source(&mut self, ctx: &mut Context, axis_source: u32) -> Action {
+    fn on_axis_source(ctx: &mut Context, axis_source: u32) -> Action {
         let pointer = HostId::from_event_sender(ctx);
         let steps = &mut ctx.wheel_steps;
         if steps.client.settle() {
@@ -174,7 +172,7 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
         Action::Forward
     }
 
-    fn on_frame(&mut self, ctx: &mut Context) -> Action {
+    fn on_frame(ctx: &mut Context) -> Action {
         let pointer = HostId::from_event_sender(ctx);
         if let Some(stepper) = stepper(ctx, pointer) {
             stepper.frame();
@@ -182,7 +180,7 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
         Action::Forward
     }
 
-    fn on_axis_stop(&mut self, ctx: &mut Context, _time: u32, axis: u32) -> Action {
+    fn on_axis_stop(ctx: &mut Context, _time: u32, axis: u32) -> Action {
         let pointer = HostId::from_event_sender(ctx);
         if let Some(stepper) = stepper(ctx, pointer) {
             stepper.stop(axis);
@@ -194,7 +192,7 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
     /// a client with [`WheelSteps`] as `axis_discrete`, then the `axis`,
     /// which the protocol says it precedes. A wheel's `axis` comes with
     /// the host's own `axis_discrete`, and passes as it is.
-    fn on_axis(&mut self, ctx: &mut Context, time: u32, axis: u32, value: i32) -> Action {
+    fn on_axis(ctx: &mut Context, time: u32, axis: u32, value: i32) -> Action {
         let pointer = HostId::from_event_sender(ctx);
         let Some(guest_pointer) = ctx.shadow_table.get_guest_id(pointer.0) else {
             return Action::Forward;
@@ -212,14 +210,7 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
 
     /// A press on the surface of a composition ends it before the guest
     /// gets the press.
-    fn on_button(
-        &mut self,
-        ctx: &mut Context,
-        serial: u32,
-        time: u32,
-        button: u32,
-        state: u32,
-    ) -> Action {
+    fn on_button(ctx: &mut Context, serial: u32, time: u32, button: u32, state: u32) -> Action {
         if state != wl_pointer::BUTTON_STATE_PRESSED {
             return Action::Forward;
         }

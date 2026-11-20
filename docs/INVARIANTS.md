@@ -338,8 +338,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   handler runs; the one of no interface, `wl_display.error`'s, resolves as
   the event is forwarded, also before any mapping. A handler that returns
   `Forward` must not map the request's own `new_id`; mapping belongs to
-  the generated arm. Handlers that map it themselves (`on_bind`,
-  `on_get_registry`, `on_sync`, `on_get_text_input`) return `Drop`. Freed
+  the generated arm. Handlers that map it themselves (`on_get_registry`,
+  `on_sync`, `on_get_text_input`) return `Drop`; `wl_registry.bind`,
+  whose `new_id` names no interface, is hand-written whole: its handler
+  returns nothing, and the generated code never forwards it. Freed
   IDs are reused first, so the ID
   spaces stay as dense as the live objects, and each stays within
   libwayland's map limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`)
@@ -365,6 +367,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `test_request_object_arguments_are_checked_before_new_id_mapping`,
   `test_event_object_arguments_are_checked_before_new_id_mapping`,
   `test_no_forward_drops_after_mapping_a_new_id`,
+  `test_a_hand_written_request_forwards_nothing`,
+  `test_generate_rejects_an_undeclared_request_of_no_interface`,
   `host_ids_stay_within_libwayland_servers_client_range`.
 - **An object's state ends with it, once.** Every end of an object goes
   through a `Context` wrapper of its table transition (the transitions

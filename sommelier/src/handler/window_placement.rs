@@ -846,7 +846,7 @@ pub(crate) fn surface_configured(ctx: &mut Context, guest_xdg_surface_id: u32, s
 #[cfg(test)]
 mod fixture {
     use super::*;
-    use crate::handler::compositor::CompositorHandler;
+    use crate::handler::Handlers;
     use crate::placement_config::PlacementConfig;
     use crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler;
     use crate::protocols::aura_shell::{zaura_output, zaura_shell};
@@ -977,10 +977,7 @@ mod fixture {
         use crate::protocols::wayland::wl_callback::WlCallbackHandler;
 
         ctx.last_sender_id = callback.0;
-        assert_eq!(
-            crate::handler::callback::CallbackHandler.on_done(ctx, 0),
-            Action::Drop
-        );
+        assert_eq!(crate::handler::Handlers::on_done(ctx, 0), Action::Drop);
     }
 
     /// The host's `zaura_toplevel.configure` of `aura_toplevel`, at
@@ -993,14 +990,8 @@ mod fixture {
         states: &[u8],
     ) {
         ctx.last_sender_id = aura_toplevel;
-        let action = ZauraToplevelHandler::on_configure(
-            &mut CompositorHandler,
-            ctx,
-            origin.0,
-            origin.1,
-            size.0,
-            size.1,
-            states,
+        let action = <Handlers as ZauraToplevelHandler>::on_configure(
+            ctx, origin.0, origin.1, size.0, size.1, states,
         );
         assert_eq!(action, Action::Drop);
     }
@@ -1198,8 +1189,7 @@ mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
-    use crate::handler::compositor::CompositorHandler;
-    use crate::handler::display::DisplayHandler;
+    use crate::handler::Handlers;
     use crate::placement_config::PlacementConfig;
     use crate::protocols::aura_shell::zaura_shell;
     use crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler;
@@ -1843,7 +1833,7 @@ mod tests {
 
         ctx.last_sender_id = SURFACE.guest;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(
@@ -1864,7 +1854,7 @@ mod tests {
         ctx.last_sender_id = TOPLEVEL.guest;
 
         assert_eq!(
-            XdgToplevelHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            <Handlers as XdgToplevelHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(
@@ -1884,7 +1874,7 @@ mod tests {
         assert!(!ctx.shadow_table.is_host_id_available(aura_id));
 
         ctx.last_sender_id = WL_DISPLAY_ID;
-        assert_eq!(DisplayHandler.on_delete_id(&mut ctx, aura_id), Action::Drop);
+        assert_eq!(Handlers::on_delete_id(&mut ctx, aura_id), Action::Drop);
         assert!(!ctx.shadow_table.is_retired_host(aura_id));
         assert!(ctx.shadow_table.is_host_id_available(aura_id));
     }
@@ -1945,7 +1935,7 @@ mod tests {
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = aura_id;
         assert_eq!(
-            ZauraToplevelHandler::on_origin_change(&mut CompositorHandler, &mut ctx, 123, 456),
+            <Handlers as ZauraToplevelHandler>::on_origin_change(&mut ctx, 123, 456),
             Action::Drop
         );
         assert!(ctx.host_to_client_queue.is_empty());

@@ -18,18 +18,16 @@ limitations under the License.
 //! the surface of an IME composition ends it first
 //! ([`crate::handler::text_input::end_composition_on_press`]).
 
+use crate::handler::Handlers;
 use crate::protocols::wayland::wl_touch;
 use crate::state::{Context, HostId};
 use crate::wire::Action;
 
-pub struct TouchHandler;
-
-impl wl_touch::WlTouchHandler for TouchHandler {
+impl wl_touch::WlTouchHandler for Handlers {
     /// A touch-down on the surface of a composition ends it before the
     /// guest gets the down, as a pointer press does. A down names its
     /// surface, so no focus is tracked.
     fn on_down(
-        &mut self,
         ctx: &mut Context,
         serial: u32,
         time: u32,

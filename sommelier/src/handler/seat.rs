@@ -14,23 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::Handlers;
 use crate::protocols::wayland::wl_seat;
 use crate::state::{Context, PostDispatch};
 use crate::wire::Action;
 
-pub struct SeatHandler;
-
-impl wl_seat::WlSeatHandler for SeatHandler {
-    fn on_get_keyboard(&mut self, ctx: &mut Context, id: u32) -> Action {
+impl wl_seat::WlSeatHandler for Handlers {
+    fn on_get_keyboard(ctx: &mut Context, id: u32) -> Action {
         let seat = ctx.last_sender_id;
         // The keyboard's record is keyed by its host ID, which the forward
         // maps. Its zcr_extended_keyboard_v1 is bound at its first enter
-        // (`keyboard::KeyboardHandler::ensure_extended_keyboard_bound`).
+        // (`keyboard::ensure_extended_keyboard_bound`).
         ctx.defer_until_forwarded(PostDispatch::KeyboardCreated { keyboard: id, seat });
         Action::Forward
     }
 
-    fn on_release(&mut self, _ctx: &mut Context) -> Action {
+    fn on_release(_ctx: &mut Context) -> Action {
         // `wl_seat.release` destroys only this parent object. Existing
         // `wl_keyboard`, `wl_pointer`, and `wl_touch` children have their own
         // protocol lifetimes and remain usable until their respective
@@ -153,7 +152,10 @@ mod tests {
         crate::handler::keyboard::for_test::peek(&mut ctx, 31, 1, 14, 1);
         ctx.last_sender_id = guest_seat;
 
-        assert_eq!(SeatHandler.on_release(&mut ctx), Action::Forward);
+        assert_eq!(
+            <Handlers as WlSeatHandler>::on_release(&mut ctx),
+            Action::Forward
+        );
         assert_eq!(ctx.keyboard_focus.surface_for_seat(guest_seat), Some(40));
         assert_eq!(
             ctx.keys.keyboards().seat(HostId(host_keyboard)),
@@ -262,10 +264,8 @@ mod tests {
         // The child press was forwarded while the seat was live. Its release
         // must remain paired even if the parent seat is released first.
         ctx.last_sender_id = host_keyboard;
-        let mut keyboard = crate::handler::keyboard::KeyboardHandler::new();
         assert_eq!(
-            WlKeyboardHandler::on_key(
-                &mut keyboard,
+            <Handlers as WlKeyboardHandler>::on_key(
                 &mut ctx,
                 1,
                 100,
@@ -281,14 +281,16 @@ mod tests {
 
         // Release the parent seat without releasing its child keyboard.
         ctx.last_sender_id = guest_seat;
-        assert_eq!(SeatHandler.on_release(&mut ctx), Action::Forward);
+        assert_eq!(
+            <Handlers as WlSeatHandler>::on_release(&mut ctx),
+            Action::Forward
+        );
 
         // This is the behavior observed in ChromiumOS' proxy: the child
         // keyboard remains live and its matching release reaches the guest.
         ctx.last_sender_id = host_keyboard;
         assert_eq!(
-            WlKeyboardHandler::on_key(
-                &mut keyboard,
+            <Handlers as WlKeyboardHandler>::on_key(
                 &mut ctx,
                 2,
                 101,

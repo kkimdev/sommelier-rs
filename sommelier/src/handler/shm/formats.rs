@@ -431,35 +431,25 @@ mod tests {
 
     #[test]
     fn replacement_shm_capability_does_not_reach_stale_guest_object() {
-        use crate::handler::registry::RegistryHandler;
+        use crate::handler::Handlers;
         use crate::protocols::wayland::wl_registry::WlRegistryHandler;
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
         ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut registry_handler = RegistryHandler;
         let shm = "wl_shm".to_string();
 
-        assert_eq!(
-            registry_handler.on_global(&mut ctx, 10, &shm, 1),
-            Action::Drop
-        );
+        assert_eq!(Handlers::on_global(&mut ctx, 10, &shm, 1), Action::Drop);
         let old_guest_shm = 20;
         register_guest_shm(&mut ctx, old_guest_shm, 10);
         ctx.host_to_client_queue.clear();
 
-        assert_eq!(
-            registry_handler.on_global_remove(&mut ctx, 10),
-            Action::Forward
-        );
+        assert_eq!(Handlers::on_global_remove(&mut ctx, 10), Action::Forward);
         assert!(
             ctx.stale_shm_guest_objects.contains(&old_guest_shm),
             "removed host SHM generation must mark existing guest objects stale"
         );
-        assert_eq!(
-            registry_handler.on_global(&mut ctx, 10, &shm, 1),
-            Action::Drop
-        );
+        assert_eq!(Handlers::on_global(&mut ctx, 10, &shm, 1), Action::Drop);
         let new_guest_shm = 21;
         register_guest_shm(&mut ctx, new_guest_shm, 10);
         ctx.host_to_client_queue.clear();

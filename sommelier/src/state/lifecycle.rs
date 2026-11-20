@@ -47,9 +47,10 @@ use crate::protocols::linux_dmabuf_v1::{
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::protocols::viewporter::wp_viewport;
 use crate::protocols::wayland::{
-    wl_keyboard, wl_output, wl_pointer, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    wl_display, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
 use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
+use crate::wire::WL_DISPLAY_ID;
 
 impl Context {
     /// The guest destroyed guest object `guest_id`; see
@@ -80,14 +81,31 @@ impl Context {
         self.shadow_table.guest_ended_host_destroyed(guest_id);
     }
 
-    /// Local guest object `guest_id` ended; see
-    /// [`super::ShadowTable::local_destroyed`].
+    /// Local guest object `guest_id` ended: its destructor completed in the
+    /// proxy, which queues its `delete_id`, as its host would for a host
+    /// object; see [`super::ShadowTable::local_destroyed`].
+    ///
+    /// # Returns
+    ///
+    /// `false`, changing nothing, unless `guest_id` is a live local object.
     pub(crate) fn local_destroyed(&mut self, guest_id: u32) -> bool {
         if self.shadow_table.request_sender(guest_id) != Some(Link::Local) {
             return false;
         }
         self.forget(guest_id, None);
-        self.shadow_table.local_destroyed(guest_id)
+        let ended = self.shadow_table.local_destroyed(guest_id);
+        debug_assert!(ended, "a live local object ends");
+        self.queue_delete_id(guest_id);
+        true
+    }
+
+    /// Queue the `wl_display.delete_id` that ends guest object `guest_id`,
+    /// for an object whose host object cannot send it: one the proxy
+    /// implements, or one backed by a host object without a destructor.
+    /// The caller ends the object in the [`super::ShadowTable`] first.
+    pub(crate) fn queue_delete_id(&mut self, guest_id: u32) {
+        self.host_to_client_queue
+            .push(wl_display::evt::delete_id(WL_DISPLAY_ID, guest_id));
     }
 
     /// Guest object `guest_id` never reached the host; see
