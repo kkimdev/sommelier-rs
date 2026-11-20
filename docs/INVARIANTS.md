@@ -758,7 +758,8 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   no chord is classified until a usable keymap arrives, and it is still
   forwarded. The size of a VirtWL keymap cannot be checked against its
   file, and the proxy copies a keymap to compile it, so a size near 4 GiB
-  would otherwise abort every client.
+  would otherwise abort every client. A keymap whose text holds a NUL
+  before its end is unusable too: xkbcommon would panic on it.
   Tests: `on_keymap_ignores_a_keymap_over_the_size_limit`,
   `an_unusable_keymap_clears_the_loaded_one_and_is_forwarded`.
 - **A keymap ends no held key.** A keymap, whether the proxy can use it or

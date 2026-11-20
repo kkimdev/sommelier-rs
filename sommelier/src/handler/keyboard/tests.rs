@@ -1503,7 +1503,7 @@ fn keymap_loads_from_non_rewound_memfd() {
 
 /// A keymap the proxy cannot use for each way `on_keymap` rejects one:
 /// what the case is, and the keymap's format, file contents and size.
-fn unusable_keymaps() -> [(&'static str, u32, Vec<u8>, u32); 8] {
+fn unusable_keymaps() -> [(&'static str, u32, Vec<u8>, u32); 9] {
     let xkb_v1 = KEYMAP_FORMAT_XKB_V1;
     let not_xkb = b"this is not a valid xkb keymap\0".to_vec();
     let not_xkb_size = not_xkb.len() as u32;
@@ -1526,6 +1526,8 @@ fn unusable_keymaps() -> [(&'static str, u32, Vec<u8>, u32); 8] {
         ("a size beyond the file", xkb_v1, b"\0".to_vec(), 2),
         ("no trailing NUL", xkb_v1, b"xkb_keymap".to_vec(), 10),
         ("invalid UTF-8", xkb_v1, vec![0xFF, 0xFE, 0xFD, 0], 4),
+        // xkbcommon takes the text as a C string.
+        ("a NUL inside", xkb_v1, b"xkb\0keymap\0".to_vec(), 11),
         ("an invalid XKB keymap", xkb_v1, not_xkb, not_xkb_size),
     ]
 }

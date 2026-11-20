@@ -224,6 +224,11 @@ fn compile(
             return None;
         }
     };
+    // xkbcommon takes the text as a C string, and panics on a NUL inside.
+    if text.contains('\0') {
+        log::error!("on_keymap: keymap text holds a NUL before its end");
+        return None;
+    }
     let keymap = xkb::Keymap::new_from_string(
         context,
         // `new_from_string` takes ownership; copy required because `text`
