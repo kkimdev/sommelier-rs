@@ -81,7 +81,7 @@ pub(super) fn target(t: &TextInput, env: &impl Env) -> HostTarget {
             content_type: committed
                 .map(|committed| committed.content_type)
                 .unwrap_or_default(),
-            surrounding_text_support: committed.is_some_and(|c| c.surrounding_text.is_some()),
+            surrounding_text_support: committed.is_some_and(|c| c.surrounding_text_support),
         },
     }
 }

@@ -2562,3 +2562,99 @@ fn row_H9_in_step_again_after_a_matched_report() {
     assert_eq!(out.guest, [done(4)]);
     assert_eq!(ime.delete(1, 1).guest, [delete(1, 0), done(4)]);
 }
+
+// Cost.
+
+/// The syllables the IME cost test types into each field, after the
+/// warm-up ones that grow Exo's text past its seeding.
+const SYLLABLES: u64 = 100;
+const WARM_UP_SYLLABLES: u64 = 10;
+
+/// The host commits that make Exo's text before the IME cost test types:
+/// as many for each field, so that both histories grow alike.
+const SEED_COMMITS: usize = 64;
+
+/// The host events of `syllables` Korean syllables: three jamo, `ㅎ`, `하`
+/// and `한`, each a styling, a cursor and a preedit, then the syllable's
+/// commit.
+fn korean_typing(syllables: u64) -> Vec<HostIme> {
+    let mut events = Vec::new();
+    for _ in 0..syllables {
+        for jamo in ["ㅎ", "하", "한"] {
+            let length = jamo.len() as u32;
+            events.extend([
+                HostIme::PreeditStyling {
+                    index: 0,
+                    length,
+                    style: zwp_text_input_v1::PREEDIT_STYLE_UNDERLINE,
+                },
+                HostIme::PreeditCursor(length as i32),
+                HostIme::Preedit {
+                    serial: 0,
+                    text: jamo.into(),
+                    commit: jamo.to_owned(),
+                },
+            ]);
+        }
+        events.push(HostIme::Commit {
+            serial: 0,
+            text: "한".to_owned(),
+        });
+    }
+    events
+}
+
+/// What typing costs the core in a field whose Exo text is `len` bytes of
+/// committed Hangul, from a client that reports no surrounding text, as a
+/// terminal does, so that the text grows with each commit and the mirror
+/// predicts all of it: the cost of each host event of [`SYLLABLES`]
+/// syllables ([`korean_typing`]), and the time each syllable takes.
+fn typing_cost(len: usize) -> (crate::test_support::counting::Counts, std::time::Duration) {
+    use crate::test_support::counting::Counts;
+
+    let mut ime = Ime::enabled();
+    // Exo commits the text in pieces a message holds.
+    let piece = "가".repeat(len / 3 / SEED_COMMITS);
+    for _ in 0..SEED_COMMITS {
+        ime.host_commit(&piece);
+    }
+    assert_eq!(ime.mirror().predicted().text.len(), len);
+    for event in korean_typing(WARM_UP_SYLLABLES) {
+        ime.v1(event);
+    }
+    let events = korean_typing(SYLLABLES);
+    let steps = events.len() as u64;
+    let mut cost = Counts::default();
+    let mut time = std::time::Duration::ZERO;
+    for event in events {
+        let reaches_guest = !matches!(
+            event,
+            HostIme::PreeditStyling { .. } | HostIme::PreeditCursor(_)
+        );
+        let input = Input::V1(TI, event);
+        let started = std::time::Instant::now();
+        let (step, fx) = Counts::of(|| ime.core.step(input, &ime.world));
+        time += started.elapsed();
+        cost += step;
+        assert_eq!(!fx.to_guest.is_empty(), reaches_guest, "{fx:?}");
+    }
+    let typed = 3 * (WARM_UP_SYLLABLES + SYLLABLES) as usize;
+    assert_eq!(ime.mirror().predicted().text.len(), len + typed);
+    ime.core.assert_invariants(&ime.world);
+    (cost.per(steps), time / SYLLABLES as u32)
+}
+
+/// Each host event of typing costs the same allocations of the same bytes
+/// whether Exo's text is about 4 KB or, just under the mirror's cap of 256
+/// KiB, 252 KiB: no event copies or rebuilds Exo's text. Run with
+/// `--nocapture` to see the numbers.
+#[test]
+fn typing_costs_the_same_whatever_the_length_of_exos_text() {
+    let short = typing_cost(4_032);
+    let long = typing_cost(252 * 1024);
+    for (name, (cost, time)) in [("4032 B", short), ("252 KiB", long)] {
+        println!("IME cost, Exo text {name}: {cost:?} per host event; {time:?} per syllable");
+    }
+    let ((short, _), (long, _)) = (short, long);
+    assert_eq!(long, short);
+}

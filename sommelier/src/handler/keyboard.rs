@@ -3691,7 +3691,7 @@ mod tests {
         assert!(!state.pending);
         assert!(!state.enabled);
         assert_ne!(state.host, Host::Active);
-        assert_eq!(state.surrounding_text, None);
+        assert!(!state.surrounding_text_support);
         assert_eq!(state.preedit, None);
         assert_eq!(state.commits, 9);
         assert!(p.ctx.client_to_host_queue.iter().any(|(message, _)| {

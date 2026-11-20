@@ -106,9 +106,7 @@ pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
     let t = ctx.ime.get_mut(ti).expect("just inserted");
     if let Some(committed) = t.committed_mut_for_test() {
         committed.enabled = active.enabled;
-        committed.surrounding_text = active
-            .surrounding_text
-            .map(|(text, cursor, anchor)| (text.to_string(), cursor, anchor));
+        committed.surrounding_text_support = active.surrounding_text.is_some();
         if active.enabled {
             t.attach_for_test(&env);
         }
@@ -118,9 +116,12 @@ pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
     }
     t.set_commits_for_test(active.commits);
     if active.pending {
-        let surrounding_text = t
-            .field()
-            .map(|(_, committed)| committed.surrounding_text.clone());
+        // The guest states its committed text again.
+        let surrounding_text = t.field().map(|_| {
+            active
+                .surrounding_text
+                .map(|(text, cursor, anchor)| (text.to_string(), cursor, anchor))
+        });
         if let Some(pending) = t.pending_mut() {
             *pending = V3Pending {
                 enabled: Some(true),
@@ -160,8 +161,8 @@ pub(crate) struct View {
     pub(crate) focus: Option<u32>,
     /// Whether the committed field is enabled.
     pub(crate) enabled: bool,
-    /// The committed surrounding text, cursor and anchor.
-    pub(crate) surrounding_text: Option<(String, i32, i32)>,
+    /// Whether the committed field states its surrounding text.
+    pub(crate) surrounding_text_support: bool,
     pub(crate) host: Host,
     /// The preedit the guest shows, if any.
     pub(crate) preedit: Option<String>,
@@ -179,7 +180,8 @@ pub(crate) fn view(ctx: &Context, guest: u32) -> View {
     View {
         focus: t.focused_surface().map(|surface| surface.0),
         enabled: t.is_enabled(),
-        surrounding_text: committed.and_then(|committed| committed.surrounding_text.clone()),
+        surrounding_text_support: committed
+            .is_some_and(|committed| committed.surrounding_text_support),
         host: match t.link() {
             LinkState::Detached => Host::Inactive,
             LinkState::Attached { .. } => Host::Active,

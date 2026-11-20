@@ -630,11 +630,15 @@ the generated message types; CONTRIBUTING says how to write a test with
 it. `proxy::frame_cost` measures what a steady stream of frames costs a
 session's proxy, in heap allocations and in the system calls that copy
 pixels into or map a host copy, which the test binary counts per thread
-(`test_support::counting`), and holds each to a budget; run it with
-`--nocapture` to see the numbers. Beyond unit tests, `proxy::fuzz` feeds whole
-clients random guest streams, `sim` types into simulated text-input
-clients through a whole client on a virtual clock and checks their text
-against the specification and the user's intent, and
+(`test_support::counting`, which also counts the bytes allocated), and
+holds each to a budget. In the same way,
+`typing_costs_the_same_whatever_the_length_of_exos_text` (`ime::tests`)
+holds typing in the IME core to the same allocations whatever the length
+of Exo's text. Run them with `--nocapture` to see the numbers. Beyond
+unit tests, `proxy::fuzz` feeds whole clients random guest streams, `sim`
+types into simulated text-input clients through a whole client on a
+virtual clock and checks their text against the specification and the
+user's intent, and
 `sommelier/tests/weston_e2e.rs` runs
 real clients through the proxy against a headless weston; CONTRIBUTING
 says how to run them. `sommelier_test_app` is a standalone GUI for manual

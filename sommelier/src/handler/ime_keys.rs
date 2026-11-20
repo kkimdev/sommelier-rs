@@ -19,7 +19,10 @@ use crate::ime::{SeatId, TiId};
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{Context, GuestKeyDelivery, GuestKeyEvent, HostId, InternalCallback};
+use crate::state::{
+    Context, GuestKeyDelivery, GuestKeyEvent, HostId, InternalCallback, ShadowTable,
+};
+use std::collections::BTreeMap;
 
 /// Return whether the repeat fallback belongs to this physical host
 /// keyboard. A seat may expose multiple keyboard objects; checking only the
@@ -35,24 +38,26 @@ pub(crate) fn backspace_repeat_active_for_keyboard(
     )
 }
 
+/// The host keyboards of `guest_seat`, in the order of their guest IDs.
+/// It borrows only the fields it reads, so that a caller can change
+/// another field of the context as it walks them.
+fn host_keyboards_of_seat<'a>(
+    keyboard_to_seat: &'a BTreeMap<u32, u32>,
+    shadow_table: &'a ShadowTable,
+    guest_seat: u32,
+) -> impl Iterator<Item = HostId> + 'a {
+    keyboard_to_seat
+        .iter()
+        .filter(move |(_, &seat)| seat == guest_seat)
+        .filter_map(|(&guest_keyboard_id, _)| shadow_table.get_host_id(guest_keyboard_id))
+        .map(HostId)
+}
+
 /// The host keyboard of `guest_seat` with the lowest guest ID that holds
 /// Backspace with its repeat not cancelled, if any.
 pub(super) fn held_backspace_keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<HostId> {
-    let mut candidates: Vec<_> = ctx
-        .keyboard_to_seat
-        .iter()
-        .filter(|(_, seat)| **seat == guest_seat)
-        .filter_map(|(&guest_keyboard_id, _)| {
-            ctx.shadow_table
-                .get_host_id(guest_keyboard_id)
-                .map(|host_keyboard_id| (guest_keyboard_id, HostId(host_keyboard_id)))
-        })
-        .collect();
-    candidates.sort_unstable_by_key(|(guest_keyboard_id, _)| *guest_keyboard_id);
-    candidates
-        .into_iter()
-        .map(|(_, host_keyboard_id)| host_keyboard_id)
-        .find(|host_keyboard_id| {
+    host_keyboards_of_seat(&ctx.keyboard_to_seat, &ctx.shadow_table, guest_seat).find(
+        |host_keyboard_id| {
             !ctx.key_generations.backspace_repeat_cancelled(
                 *host_keyboard_id,
                 crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
@@ -60,7 +65,8 @@ pub(super) fn held_backspace_keyboard_for_seat(ctx: &Context, guest_seat: u32) -
                 *host_keyboard_id,
                 crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
             )
-        })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -69,15 +75,8 @@ pub(crate) fn backspace_pressed_for_seat(ctx: &Context, guest_seat: u32) -> bool
 }
 
 pub(crate) fn end_backspace_repeat_for_seat(ctx: &mut Context, guest_seat: u32) {
-    let host_keyboards: Vec<_> = ctx
-        .keyboard_to_seat
-        .iter()
-        .filter_map(|(&guest_keyboard_id, &seat)| {
-            (seat == guest_seat)
-                .then(|| ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId))
-                .flatten()
-        })
-        .collect();
+    let host_keyboards =
+        host_keyboards_of_seat(&ctx.keyboard_to_seat, &ctx.shadow_table, guest_seat);
     // Ending the IME fallback is distinct from releasing the physical key.
     // Keep the cancellation marker until that release arrives; otherwise the
     // next empty confirm_preedit in the same held-key session would synthesize
@@ -100,15 +99,8 @@ pub(super) fn end_backspace_repeat_for_text_input(
     guest_seat: u32,
     guest_text_input: u32,
 ) {
-    let host_keyboards: Vec<_> = ctx
-        .keyboard_to_seat
-        .iter()
-        .filter_map(|(&guest_keyboard_id, &seat)| {
-            (seat == guest_seat)
-                .then(|| ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId))
-                .flatten()
-        })
-        .collect();
+    let host_keyboards =
+        host_keyboards_of_seat(&ctx.keyboard_to_seat, &ctx.shadow_table, guest_seat);
     for host_keyboard_id in host_keyboards {
         ctx.key_generations.cancel_backspace_repeat_for_owner(
             host_keyboard_id,
@@ -735,7 +727,7 @@ mod tests {
         ];
         for (case, event) in cases {
             let mut ime = Ime::with_keyboard();
-            ime.committed().surrounding_text = Some(("가나다".to_string(), 9, 9));
+            ime.committed().surrounding_text_support = true;
             ime.state().show_for_test("가");
             ime.lease_backspace_repeat(TI);
 
@@ -747,7 +739,7 @@ mod tests {
     #[test]
     fn input_mode_switch_boundary_clears_stale_repeat_before_empty_confirmation() {
         let mut ime = Ime::with_keyboard();
-        ime.committed().surrounding_text = Some(("english".to_string(), 7, 7));
+        ime.committed().surrounding_text_support = true;
         ime.lease_backspace_repeat(TI);
         end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
 
@@ -757,10 +749,7 @@ mod tests {
             [],
             "a routine empty confirmation must not become a synthetic Backspace"
         );
-        assert_eq!(
-            ime.committed().surrounding_text,
-            Some(("english".to_string(), 7, 7))
-        );
+        assert!(ime.committed().surrounding_text_support);
     }
 
     /// Exo consumes a held Backspace over committed text and confirms an
@@ -770,7 +759,7 @@ mod tests {
     fn held_backspace_repeats_over_committed_korean_without_preedit() {
         let mut ime = Ime::with_keyboard();
         ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 700, 100);
-        ime.committed().surrounding_text = Some(("가나다라".to_string(), 12, 12));
+        ime.committed().surrounding_text_support = true;
 
         for _ in 0..3 {
             ime.confirm();
@@ -901,7 +890,7 @@ mod tests {
         let mut ime = Ime::with_keyboard();
         ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 701, 101);
         ime.state().set_commits_for_test(2);
-        ime.committed().surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.committed().surrounding_text_support = true;
         ime.preedit("가", "");
         ime.preedit("", "");
         ime.events();
@@ -916,10 +905,7 @@ mod tests {
                     (TI, V3::Done { serial: 2 }.into()),
                 ]
             );
-            assert_eq!(
-                ime.committed().surrounding_text,
-                Some(("A가".to_string(), 4, 4))
-            );
+            assert!(ime.committed().surrounding_text_support);
         }
 
         end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
@@ -938,7 +924,7 @@ mod tests {
             .ctx
             .claim_guest_key(HOST_KEYBOARD, BACKSPACE, GuestKeyOwner::Physical));
         ime.state().show_for_test("가");
-        ime.committed().surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.committed().surrounding_text_support = true;
         ime.preedit("", "");
         assert!(ime.repeat_active());
         ime.events();

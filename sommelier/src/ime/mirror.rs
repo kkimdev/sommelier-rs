@@ -208,11 +208,17 @@ pub(crate) struct Key {
 impl Key {
     /// `DefaultHasher::new` uses fixed keys, so a text has one key.
     pub(super) fn of(text: &str) -> Self {
-        let mut hasher = DefaultHasher::new();
-        hasher.write(text.as_bytes());
+        Self::of_rest(DefaultHasher::new(), 0, text)
+    }
+
+    /// The key of a text whose first `len` bytes `start` has hashed and
+    /// whose other bytes are `rest`. `Hasher::write` streams, so it is the
+    /// key of the whole text.
+    fn of_rest(mut start: DefaultHasher, len: usize, rest: &str) -> Self {
+        start.write(rest.as_bytes());
         Self {
-            len: text.len(),
-            hash: hasher.finish(),
+            len: len + rest.len(),
+            hash: start.finish(),
         }
     }
 }
@@ -251,15 +257,19 @@ impl Fingerprint {
     }
 
     /// `state`'s fingerprint, whose selection is one of `vague`, if given.
+    /// It hashes the text before the composition once, for both the text's
+    /// key and the key of the text without the composition.
     fn of(state: &ExoState, vague: Option<&[Span]>) -> Self {
         let composition = state.composition.clone();
+        let text = &state.text;
+        let mut before = DefaultHasher::new();
+        before.write(&text.as_bytes()[..composition.start]);
         let split = (!composition.is_empty()).then(|| {
-            let mut rest = state.text[..composition.start].to_owned();
-            rest.push_str(&state.text[composition.end..]);
-            (Key::of(&rest), Key::of(state.composition_text()))
+            let rest = Key::of_rest(before.clone(), composition.start, &text[composition.end..]);
+            (rest, Key::of(state.composition_text()))
         });
         Self {
-            text: Key::of(&state.text),
+            text: Key::of_rest(before, composition.start, &text[composition.start..]),
             selection: match vague {
                 Some(selections) => Selection::Vague(selections.to_vec()),
                 None => Selection::Exact(state.selection),
@@ -336,17 +346,33 @@ enum UpdateResult {
 /// A request the proxy sent Exo that changes its tracker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Sent {
-    /// v1 `set_surrounding_text(text, cursor, anchor)`: `Update`. `split`
-    /// if it and its barrier may reach Exo in two reads, between which Exo
-    /// may process an event.
+    /// v1 `set_surrounding_text(text, cursor, anchor)`: `Update`, made by
+    /// [`Sent::report`].
     Report {
         text: String,
-        cursor: u32,
-        anchor: u32,
+        /// What Exo compares of it with each history state: its text's key
+        /// and its selection; `None` if Exo ignores it
+        /// ([`report_selection`]).
+        compared: Option<(Key, Span)>,
+        /// It and its barrier may reach Exo in two reads, between which
+        /// Exo may process an event.
         split: bool,
     },
     /// v1 `reset`: `CancelComposition` (TI 152-156).
     Cancel,
+}
+
+impl Sent {
+    /// The report `set_surrounding_text(text, cursor, anchor)`, `split` as
+    /// [`Sent::Report`] says.
+    pub(super) fn report(text: String, cursor: u32, anchor: u32, split: bool) -> Self {
+        let compared = report_selection(&text, cursor, anchor).map(|span| (Key::of(&text), span));
+        Self::Report {
+            text,
+            compared,
+            split,
+        }
+    }
 }
 
 /// How much the mirror knows of Exo's prediction.
@@ -433,7 +459,7 @@ impl ExoMirror {
             vague: Vec::new(),
             diverged: false,
         };
-        mirror.reset_internal("", Span::at(0));
+        mirror.reset_internal(String::new(), Span::at(0));
         mirror
     }
 
@@ -469,10 +495,9 @@ impl ExoMirror {
         std::mem::take(&mut self.diverged)
     }
 
-    /// Where a report of `text` with `selection` stands in the history
-    /// from state `from` on.
-    fn lookup(&self, from: usize, text: &str, selection: Span) -> Lookup {
-        let text = Key::of(text);
+    /// Where a report of the text whose key is `text`, with `selection`,
+    /// stands in the history from state `from` on.
+    fn lookup(&self, from: usize, text: Key, selection: Span) -> Lookup {
         for (at, entry) in self.expected.iter().enumerate().skip(from) {
             let Entry::Known { print, .. } = entry else {
                 return Lookup::Ambiguous;
@@ -522,10 +547,11 @@ impl ExoMirror {
             return None;
         }
         let from = self.project().ok()?;
+        let text = Key::of(text);
         if self.lookup(from, text, selection) != Lookup::Missing {
             return None;
         }
-        let split = Some((Key::of(text), Key::of(shown)));
+        let split = Some((text, Key::of(shown)));
         let mut states = self.expected.iter().skip(from);
         states.find(|entry| {
             matches!(entry, Entry::Known { print, .. }
@@ -541,18 +567,12 @@ impl ExoMirror {
     fn project(&self) -> Result<usize, Stop> {
         let mut from = 0;
         for (at, (_, sent)) in self.in_flight.iter().enumerate() {
-            let Sent::Report {
-                text,
-                cursor,
-                anchor,
-                ..
-            } = sent
-            else {
+            let Sent::Report { compared, .. } = sent else {
                 let mut rest = self.in_flight.iter().skip(at);
                 let reports_after = rest.any(|(_, sent)| matches!(sent, Sent::Report { .. }));
                 return Err(Stop::Cancelled { reports_after });
             };
-            let Some(selection) = report_selection(text, *cursor, *anchor) else {
+            let Some((text, selection)) = *compared else {
                 continue;
             };
             match self.lookup(from, text, selection) {
@@ -820,12 +840,10 @@ impl ExoMirror {
         }
         let (_, sent) = self.in_flight.pop_front()?;
         match sent {
-            Sent::Report {
-                text,
-                cursor,
-                anchor,
-                ..
-            } => self.report(&text, cursor, anchor),
+            Sent::Report { text, compared, .. } => {
+                let (key, selection) = compared?;
+                Some(self.report(text, key, selection))
+            }
             Sent::Cancel => {
                 self.cancel_composition();
                 Some(Applied::Cancel)
@@ -833,19 +851,18 @@ impl ExoMirror {
         }
     }
 
-    /// `set_surrounding_text`, as Exo processes it: `SetSurroundingTextImpl`
-    /// (ZTIM 506-545) takes `minmax(cursor, anchor)` as the selection, and
-    /// ignores the whole request if an offset does not convert; then
+    /// `set_surrounding_text`, as Exo processes it, of `text`, whose key
+    /// is `key`: `SetSurroundingTextImpl` (ZTIM 506-545) takes
+    /// `minmax(cursor, anchor)` as the selection, `selection`, having
+    /// ignored the whole request if an offset did not convert; then
     /// `TI::SetSurroundingText` calls `Update` (TI 158-175).
-    fn report(&mut self, text: &str, cursor: u32, anchor: u32) -> Option<Applied> {
-        let selection = report_selection(text, cursor, anchor)?;
+    fn report(&mut self, text: String, key: Key, selection: Span) -> Applied {
         let cursor = selection.is_empty();
-        match self.update(text, selection) {
+        match self.update(text, key, selection) {
             UpdateResult::Updated => {
                 // A v3 guest reports no preedit, so it is at the first
                 // equal state with no composition, not at one whose
                 // composition it holds as text.
-                let text = Key::of(text);
                 let (mut found, mut in_step) = (false, cursor);
                 for entry in &self.expected {
                     match entry {
@@ -853,16 +870,16 @@ impl ExoMirror {
                         Entry::Known { print, .. } => {
                             found = print.composition.is_empty()
                                 && print.selection == Selection::Exact(selection)
-                                && print.text == text;
+                                && print.text == key;
                         }
                         Entry::Unknown => in_step = false,
                     }
                 }
-                Some(Applied::Matched {
+                Applied::Matched {
                     in_step: found && in_step,
-                })
+                }
             }
-            UpdateResult::Reset | UpdateResult::Ambiguous => Some(Applied::Reset { cursor }),
+            UpdateResult::Reset | UpdateResult::Ambiguous => Applied::Reset { cursor },
         }
     }
 
@@ -906,8 +923,8 @@ impl ExoMirror {
     /// whether Exo matched there: the history is unknown, and so is the
     /// prediction, unless it is the report's with no composition, which
     /// Exo's is then either way.
-    fn update(&mut self, text: &str, selection: Span) -> UpdateResult {
-        match self.lookup(0, text, selection) {
+    fn update(&mut self, text: String, key: Key, selection: Span) -> UpdateResult {
+        match self.lookup(0, key, selection) {
             Lookup::Match(at) => {
                 self.expected.drain(..at);
                 UpdateResult::Updated
@@ -1075,9 +1092,9 @@ impl ExoMirror {
     }
 
     /// `ResetInternal` (STT 374-381).
-    fn reset_internal(&mut self, text: &str, selection: Span) {
+    fn reset_internal(&mut self, text: String, selection: Span) {
         self.predicted = ExoState {
-            text: text.to_owned(),
+            text,
             selection,
             composition: NO_COMPOSITION,
         };
@@ -1177,13 +1194,13 @@ mod tests {
         assert!(predicted.fits(), "{predicted:?}");
     }
 
+    /// `Update` of a report of `text` with `selection`.
+    fn update(mirror: &mut ExoMirror, text: &str, selection: Span) -> UpdateResult {
+        mirror.update(text.to_owned(), Key::of(text), selection)
+    }
+
     fn sent_report(text: &str, cursor: u32, anchor: u32) -> Sent {
-        Sent::Report {
-            text: text.to_owned(),
-            cursor,
-            anchor,
-            split: false,
-        }
+        Sent::report(text.to_owned(), cursor, anchor, false)
     }
 
     /// Sends a report and its barrier, and lets Exo process both.
@@ -1197,6 +1214,39 @@ mod tests {
         let token = BarrierToken(2);
         mirror.sent(token, Sent::Cancel);
         mirror.barrier_done(token);
+    }
+
+    /// A fingerprint's keys are those of whole texts: of the text, and with
+    /// a composition, of the text without it and of its text, however the
+    /// composition splits the text's bytes.
+    #[test]
+    fn a_fingerprint_keys_whole_texts() {
+        let mut rng = crate::test_support::Rng::new(1);
+        for _ in 0..2_000 {
+            let len = rng.below(40);
+            let text: String = (0..len)
+                .map(|_| *rng.pick(&['a', 'é', '가', '😀']))
+                .collect();
+            let mut boundaries: Vec<usize> = (0..=text.len())
+                .filter(|&at| text.is_char_boundary(at))
+                .collect();
+            let start = *rng.pick(&boundaries);
+            boundaries.retain(|&at| at >= start);
+            let composition = composition(start..*rng.pick(&boundaries));
+            let state = ExoState {
+                text: text.clone(),
+                selection: Span::at(composition.end),
+                composition: composition.clone(),
+            };
+            let print = Fingerprint::of(&state, None);
+            assert_eq!(print.text, Key::of(&text), "{state:?}");
+            let split = (!composition.is_empty()).then(|| {
+                let mut rest = text[..composition.start].to_owned();
+                rest.push_str(&text[composition.end..]);
+                (Key::of(&rest), Key::of(&text[composition.clone()]))
+            });
+            assert_eq!(print.split, split, "{state:?}");
+        }
     }
 
     /// The constructor's state, from `ResetInternal(u"", 0, Range(0))`
@@ -1226,12 +1276,15 @@ mod tests {
 
         // `가ㄴ` with its cursor at 6 is the second state; the composition
         // is not compared ("intentionally ignored composition text").
-        assert_eq!(mirror.update("가ㄴ", Span::at(6)), UpdateResult::Updated);
+        assert_eq!(
+            update(&mut mirror, "가ㄴ", Span::at(6)),
+            UpdateResult::Updated
+        );
         assert_eq!(history(&mirror), states[1..]);
         assert_eq!(mirror.predicted(), &predicted);
         // An older state is gone, so it no longer matches.
         let mut reset = mirror.clone();
-        assert_eq!(reset.update("가", Span::at(3)), UpdateResult::Reset);
+        assert_eq!(update(&mut reset, "가", Span::at(3)), UpdateResult::Reset);
 
         // The oldest of two equal states matches, which erases nothing.
         let mut mirror = at(state("가", (3, 3), NO_COMPOSITION));
@@ -1239,7 +1292,10 @@ mod tests {
         mirror.on_extend_selection_and_delete(3, 0);
         let states = history(&mirror);
         assert_eq!(states[0], states[2]);
-        assert_eq!(mirror.update("가", Span::at(3)), UpdateResult::Updated);
+        assert_eq!(
+            update(&mut mirror, "가", Span::at(3)),
+            UpdateResult::Updated
+        );
         assert_eq!(history(&mirror), states);
     }
 
@@ -1253,11 +1309,11 @@ mod tests {
         mirror.on_set_editable_selection_range(Span::new(6, 3));
         let states = history(&mirror);
         assert_eq!(
-            mirror.clone().update(GANADA, Span::new(6, 3)),
+            update(&mut mirror.clone(), GANADA, Span::new(6, 3)),
             UpdateResult::Updated
         );
         assert_eq!(
-            mirror.clone().update(GANADA, Span::new(3, 6)),
+            update(&mut mirror.clone(), GANADA, Span::new(3, 6)),
             UpdateResult::Reset
         );
 
@@ -1281,7 +1337,7 @@ mod tests {
     fn update_with_no_match_resets_and_drops_the_composition() {
         let mut mirror = at(state("가", (3, 3), NO_COMPOSITION));
         mirror.on_set_composition_text("나", Span::at(3));
-        assert_eq!(mirror.update("가", Span::at(0)), UpdateResult::Reset);
+        assert_eq!(update(&mut mirror, "가", Span::at(0)), UpdateResult::Reset);
         let reported = state("가", (0, 0), NO_COMPOSITION);
         assert_eq!(history(&mirror), std::slice::from_ref(&reported));
         assert_pushed(&mirror, &reported);
@@ -1611,7 +1667,10 @@ mod tests {
             &state("가나다라", (12, 12), NO_COMPOSITION)
         );
         assert!(history(&mirror).is_empty());
-        assert_eq!(mirror.update("가나다라", Span::at(12)), UpdateResult::Reset);
+        assert_eq!(
+            update(&mut mirror, "가나다라", Span::at(12)),
+            UpdateResult::Reset
+        );
         // An event after the cancel leaves a history of its own state.
         let mut mirror = at(state(GANADA, (9, 9), NO_COMPOSITION));
         cancel(&mut mirror);
@@ -2033,12 +2092,7 @@ mod tests {
     }
 
     fn split_report(text: &str, cursor: u32) -> Sent {
-        Sent::Report {
-            text: text.to_owned(),
-            cursor,
-            anchor: cursor,
-            split: true,
-        }
+        Sent::report(text.to_owned(), cursor, cursor, true)
     }
 
     /// A report on its way to Exo crosses the events since it was sent if

@@ -220,21 +220,18 @@ impl ImeCore {
             t.exo_mut().unchanged();
         }
         // Encode the one request that can fail before changing anything.
-        let surrounding_text = match &pending.surrounding_text {
+        let request = match &pending.surrounding_text {
             None => None,
             Some(text) => {
                 let (text, cursor, anchor) =
                     text.as_ref().map_or(("", 0, 0), |(text, cursor, anchor)| {
-                        (text, *cursor, *anchor)
+                        (text.as_str(), *cursor, *anchor)
                     });
                 let (cursor, anchor) = (cursor as u32, anchor as u32);
                 let request =
                     zwp_text_input_v1::req::set_surrounding_text(t.host().v1, text, cursor, anchor);
                 match request {
-                    Ok(request) => {
-                        let stated = text_stated(&pending.surrounding_text);
-                        Some((request, ((text.to_owned(), cursor, anchor), stated)))
-                    }
+                    Ok(request) => Some(request),
                     // G9b: the commit counted and its pending state is
                     // spent, but nothing else changes.
                     Err(error) => {
@@ -253,10 +250,17 @@ impl ImeCore {
             );
         }
         let cursor_rect = pending.cursor_rect;
-        if t.apply_commit(pending, enable_conflict) {
+        if t.apply_commit(&pending, enable_conflict) {
             fx.keys.push(lease(ti, t, LeaseOutcome::End));
         }
         fx.to_guest.extend(t.answer(ti));
+        // The report takes the text the guest stated, or the empty
+        // stand-in.
+        let surrounding_text = request.map(|request| {
+            let stated = text_stated(&pending.surrounding_text);
+            let (text, cursor, anchor) = pending.surrounding_text.flatten().unwrap_or_default();
+            (request, ((text, cursor as u32, anchor as u32), stated))
+        });
         Some(GuestCommit {
             ti,
             surrounding_text,
@@ -318,7 +322,7 @@ impl ImeCore {
         let Some(t) = self.inputs.get_mut(&ti) else {
             return;
         };
-        let frame = t.exo().frame(t.shown());
+        let frame = t.exo().frame(t.shown(), &event);
         t.exo_mut().observe(ti, &event);
         match event {
             HostIme::PreeditStyling {
@@ -353,8 +357,7 @@ impl ImeCore {
             | HostIme::PreeditRegion { .. }
             | HostIme::Confirm { .. } => {}
         }
-        let measuring = t.exo().measuring(frame.clone());
-        let measuring = measuring.as_ref().map_err(|&why| why);
+        let measuring = t.exo().measuring(&frame);
         let edit = composition_event(ti, t, event, measuring, fx);
         t.exo_after(frame.as_ref().ok(), edit);
     }
@@ -589,7 +592,7 @@ fn composition_event(
         HostIme::Delete { index, length } => {
             let lengths = measuring
                 .map_err(DeleteDrop::Unmeasured)
-                .and_then(|frame| frame.delete(index, length));
+                .and_then(Frame::delete);
             match lengths {
                 Ok(lengths) => {
                     let txn = GuestTxn {
@@ -615,7 +618,7 @@ fn composition_event(
             let assembly = cur.take_assembly();
             let txn = measuring
                 .map_err(RegionDrop::Unmeasured)
-                .and_then(|frame| frame.region(index, length, assembly));
+                .and_then(|frame| frame.region(assembly));
             match txn {
                 Ok(txn) => (cur.plan(txn, LeaseOutcome::End), Takes::Before),
                 // Exo ends its composition at an empty region, measured or
