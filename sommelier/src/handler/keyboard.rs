@@ -414,7 +414,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
         // the surface as IME focus.
         let host_keyboard_id = sender.host;
         let Some(guest_keyboard_id) = sender.guest_id() else {
-            return Action::Forward;
+            return Action::Drop;
         };
         let guest_surface_id = surface.guest;
 
@@ -515,7 +515,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
         // `enter`.
         let host_keyboard_id = sender.host;
         let Some(guest_keyboard_id) = sender.guest_id() else {
-            return Action::Forward;
+            return Action::Drop;
         };
 
         log::info!(

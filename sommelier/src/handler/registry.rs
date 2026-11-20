@@ -313,16 +313,6 @@ fn retire_unseen_global(ctx: &mut Context, name: u32) {
     }
 }
 
-fn queue_synthetic_global(
-    ctx: &mut Context,
-    registry: HostId,
-    name: u32,
-    interface: &str,
-    version: u32,
-) -> bool {
-    queue_synthetic_global_for_registry(ctx, registry, name, interface, version)
-}
-
 fn queue_synthetic_global_for_registry(
     ctx: &mut Context,
     registry_host_id: HostId,
@@ -678,7 +668,7 @@ fn advertise_synthetic_global(
             version,
         },
     );
-    let visible = queue_synthetic_global(ctx, registry, name, interface, version);
+    let visible = queue_synthetic_global_for_registry(ctx, registry, name, interface, version);
     record_registry_global_visibility(ctx, registry, name, visible);
 }
 
@@ -1140,7 +1130,10 @@ impl wl_registry::WlRegistryHandler for Handlers {
         let (requested, version, guest_new_id) = id;
         // The proxy implements no wl_registry itself.
         let Some(registry_host_id) = sender.host_id() else {
-            error!("Registry {} has no host registry", sender.guest);
+            let _ = ctx.fail(format_args!(
+                "Registry {} has no host registry",
+                sender.guest
+            ));
             return;
         };
 
@@ -1975,10 +1968,11 @@ mod tests {
     }
 
     /// A bind through a guest registry with no host object cannot be sent,
-    /// so it registers no output. No peer can make such a registry, so this
-    /// test builds the proxy's state by hand.
+    /// so it registers no output and fails closed: the session ends. No peer
+    /// can make such a registry, so this test builds the proxy's state by
+    /// hand.
     #[test]
-    fn output_bind_through_an_unmapped_registry_registers_no_output() {
+    fn a_bind_through_an_unmapped_registry_fails_closed() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let (registry, host_registry) = (GuestId::for_test(10), HostId::for_test(100));
         ctx.shadow_table
@@ -1998,7 +1992,7 @@ mod tests {
         let sender = ctx.shadow_table.resolve_request(12).expect("the registry");
         let id = GuestId::for_test(20);
         Handlers::on_bind(&mut ctx, sender, 10, &(output, 3, id));
-        assert!(!ctx.is_fatal());
+        assert!(ctx.is_fatal());
         assert_eq!(ctx.shadow_table.get_host_id(id), None);
         assert!(!ctx.sends_anything());
         assert!(ctx.outputs.is_empty_for_test());
