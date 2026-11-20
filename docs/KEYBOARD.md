@@ -149,5 +149,5 @@ confirmation alone (`held_repeat_key_for_seat`).
   `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`.
 - The recovery's transition table. Test:
   `a_waiting_recovery_is_decided_by_the_hosts_next_event`.
-- The handler tests in `keyboard.rs`, `ime_keys.rs` and `text_input.rs`
-  and the DST pin the wire behaviour.
+- The handler tests of `keyboard.rs`, `ime_keys.rs` and `text_input.rs`
+  (each in its `tests.rs`) and the DST pin the wire behaviour.
