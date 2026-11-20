@@ -25,7 +25,7 @@ limitations under the License.
 //! | Child | Association owner | Used by |
 //! | :--- | :--- | :--- |
 //! | `zaura_surface` | [`crate::state::AuraSurfaces`] | XDG and GTK metadata, placement |
-//! | `zaura_toplevel` | [`crate::state::WindowPlacementState`] | placement |
+//! | `zaura_toplevel` | [`crate::state::PlacementState`] | placement |
 //! | `zaura_output` | [`crate::state::OutputRegistry`] | placement metadata |
 
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};

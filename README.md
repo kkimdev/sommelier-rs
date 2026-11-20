@@ -228,7 +228,7 @@ Sommelier reads the command line and the variables once, at startup.
 | `--local-compositor PATH` | Reach a compositor socket on this machine instead, for debugging. It cannot be combined with `--virtio-wl`. |
 | `--gpu-accel` | Copy guest `wl_shm` buffers into host dma-bufs when VirtWL can allocate them (see [Scope and limitations](#scope-and-limitations)). |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
-| `$XDG_CONFIG_HOME/sommelier-rs/window-placement.toml` | Optional TOML file of placement bindings (named actions or work-area rects); `~/.config/sommelier-rs/window-placement.toml` when `XDG_CONFIG_HOME` is unset. A valid file turns window placement on for apps that connect from then on. In an app that connected while placement was on, an edit takes effect on the next key press; an app that connected before the file existed is placed once it reconnects. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
+| `$XDG_CONFIG_HOME/sommelier-rs/window-placement.toml` | Optional TOML file of placement bindings (named actions or work-area rects); `~/.config/sommelier-rs/window-placement.toml` when `XDG_CONFIG_HOME` is unset. A valid file turns window placement on for apps that connect from then on. In an app that connected while placement was on, an edit takes effect as soon as it is saved; an app that connected before the file existed is placed once it reconnects. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 
 Window placement is opt-in and experimental. Sommelier binds no chord of
 its own: without the file, placement is off. With bindings in the file,

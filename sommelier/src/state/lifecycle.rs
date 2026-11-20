@@ -262,7 +262,9 @@ impl Context {
         }
 
         // Window placement.
-        self.window_placement.assert_no_orphans(&guest, &host_only);
+        if let Some(placement) = self.placement() {
+            placement.assert_no_orphans(&guest, &host_only);
+        }
 
         // Keyboards, their focus and keys, and text input.
         for &keyboard in self.keyboard_to_seat.keys() {

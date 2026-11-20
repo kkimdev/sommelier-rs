@@ -38,7 +38,7 @@ once per change of the file instead.
 | missing | Placement off, logged at `debug` only. |
 | valid | Placement on, with its bindings; logged at `info`. A valid file with no bindings turns placement on and binds nothing. |
 | unusable at startup (unreadable, invalid, or binding a `SOMMELIER_ACCELERATORS` chord) | Placement off; one warning. |
-| replaced by a valid version | Its bindings replace the last ones from the next key press, in apps that connected while placement was on (see below). |
+| replaced by a valid version | Its bindings replace the last ones at once, in apps that connected while placement was on (see below). |
 | replaced by an unusable version | The last good bindings stay, or placement stays off; one warning per version, not per key. |
 | removed | Its bindings are cleared and placement is off for new connections; logged at `info`. |
 
@@ -244,10 +244,10 @@ Choosing chords:
 
 ### Named actions
 
-`WindowLayoutAction::from_name` is the one parser of these names. Each stands for a
-fixed rectangle: `WindowLayoutAction::rect` in
-`sommelier/src/window_layout.rs` defines the values, and a unit test keeps
-this table and the code in sync.
+`NormalizedRect::preset` in `sommelier/src/window_layout.rs` is the one
+parser of these names. Each stands for a fixed rectangle, which a binding
+resolves to as the file is loaded; the `PRESETS` table in the same file
+defines the values, and a unit test keeps this table and the code in sync.
 
 | Action | Rectangle |
 | --- | --- |
@@ -366,12 +366,38 @@ The owner of this rule is `NormalizedRect::to_work_area_bounds` in
 
 ## Reloading
 
-Sommelier notices a changed file by itself; there is no signal, socket or
-watcher thread. Each key press on a connection with placement on `stat`s
-the path once, following symbolic links, before the key is classified, and
-loads the file again when its identity changed. A release, a repeated key
-and a connection with placement off check nothing. The identity is the
-device and inode, the modification and change times, and the size:
+Sommelier notices a changed file by itself, with inotify on the proxy's
+event loop; there is no signal, socket, thread or timer, and a key press
+never reads the file. The path may lead through symbolic links, of the
+file or of a directory on the path, and each link adds a path: its
+target's, with the rest of the path below it. On every such path the proxy
+watches:
+
+- the file, through symbolic links, for a write closed and a change of its
+  attributes, so an edit in place counts;
+- the deepest directory on the path that exists, for the entry below it on
+  the path: a rename over the file (an editor or a dotfile tool), a swap of
+  a link (a Home Manager activation, or a `current` link of a dotfiles
+  repository), a removal, and a directory, the file or a link's target
+  being created, so a link that dangles until its target appears, or
+  whose target is deleted and created anew, counts too;
+- that directory's parent, for the directory's own entry, which a Home
+  Manager activation can swap as a whole link.
+
+Only the directory that holds the file reports writes; the others report
+only their entries' changes, so writes elsewhere in the home directory do
+not wake the proxy. On a link's path a directory the proxy cannot write,
+such as the Nix store, is not watched: only the system changes it, and a
+swap of the link into it is seen where the link is.
+
+Each event that concerns a path arms these watches again, since the files
+behind the paths may have changed, and reloads the file. A regular file
+that has just been created is read only once its writer closes it or it
+is renamed into place, whatever other event comes with it, so a
+half-written file is not reported. A reload loads the file only when its
+identity changed, as `stat` sees it through symbolic links: the device and
+inode, the modification and change times, and the size. So the several
+events of one change load it once and warn once:
 
 - Home Manager installs the file as a link into `/nix/store`, where every
   file's modification time is 1. An activation points the link at another
@@ -385,8 +411,8 @@ Then:
 
 - The new document is validated completely, with the same rules and the same
   startup `SOMMELIER_ACCELERATORS` list. A valid one replaces the bindings
-  at once, and the press that loaded it already sees them; the log says how
-  many bindings are active.
+  at once, whole, and the next key press sees them; the log says how many
+  bindings are active.
 - An unusable one is logged once and the last good bindings stay (none, if
   the file was never valid). Removing the file clears the bindings.
 - A key already captured as a shortcut stays captured until it is released,
@@ -394,16 +420,24 @@ Then:
   release. Key repeat never repeats a placement.
 - A reload never changes Aura objects or placements in flight; whether a
   connection has placement is decided as it connects (see
-  [The file's states](#the-files-states)), which also refreshes the file.
-- The `zcr_extended_keyboard_v1.peek_key` of a press, which can arrive
-  before its `wl_keyboard.key`, sees the bindings as they were before that
-  press. It only decides whether the press may be an IME recovery
-  candidate.
+  [The file's states](#the-files-states)).
+- A reload lands between two messages the proxy handles, never during one,
+  so a message sees one version of the bindings. A press's
+  `zcr_extended_keyboard_v1.peek_key` and its `wl_keyboard.key`, which Exo
+  sends one right after the other, see the same version unless the file
+  changes in the instant between them.
 
-The check runs on the proxy's one thread, between other tasks' steps, so it
-never races a key event. The file is read synchronously there; the 64 KiB
-bound and the regular-file check keep that read short, and the file is
-expected on a local file system.
+A watch that cannot be made for another reason than a missing or
+unreadable directory, for example because the per-user inotify watch limit
+is reached, is warned about once. If no directory on the paths can be
+watched, or inotify cannot be set up at all, the proxy says it stopped
+watching and keeps the bindings it has; an edit then takes effect when it
+restarts.
+
+A reload runs on the proxy's one thread, between other tasks' steps. The
+file is read synchronously there; the 64 KiB bound and the regular-file
+check keep that read short. The file is expected on a local file system,
+whose changes inotify reports.
 
 ## Manual test plan
 
@@ -462,20 +496,21 @@ correctly, with no warning in the log.
 | File | Role |
 | --- | --- |
 | `sommelier/src/settings.rs` | `Settings`: the bindings file's path and the parsed `SOMMELIER_ACCELERATORS`, resolved once. |
-| `sommelier/src/placement_config.rs` | `PlacementConfig`: the identity check that reloads the bindings file, the hardened file read, the one validator (which takes the host accelerators as an input), and the current bindings. |
-| `sommelier/src/window_layout.rs` | `WindowLayoutAction` (named presets plus a configured rect) and its name parser; `NormalizedRect` validation and the rounding rule that maps it from a work-area `Rect` to window bounds. |
+| `sommelier/src/placement_config.rs` | `Bindings` (one validated version of the file), `PlacementConfig` (the current version, which every connection shares), `BindingsFile` (the identity check that reloads the file and publishes the result), the hardened file read, and the one validator (which takes the host accelerators as an input). |
+| `sommelier/src/placement_config/watch.rs` | `load_and_watch`: the chain of paths through the bindings file's links, the inotify watches on them, and the event-loop task that reloads the file. |
+| `sommelier/src/window_layout.rs` | `NormalizedRect`: the named presets and their parser, validation, and the rounding rule that maps a rectangle from a work-area `Rect` to window bounds. |
 | `sommelier/src/accelerator.rs` | Chord types and parsing only. |
-| `sommelier/src/state.rs` | `Context` holds the connection's owners below and its `host_zaura_shell` binding; `Context::new` decides whether the connection has placement; `refresh_placement_bindings` and `placement_action_for` ask the shared `PlacementConfig`, and `is_host_accelerator` the settings. |
-| `sommelier/src/state/window_placement.rs` | `WindowPlacementState` (`Off` holds nothing) and `PlacementState`: each toplevel's Aura toplevel, its last reported origin, the states and serial of its newest configure, and the placement in flight. |
+| `sommelier/src/state.rs` | `Context` holds the connection's owners below and its `host_zaura_shell` binding; `Context::new` decides whether the connection has placement; `placement_rect_for` asks the shared `PlacementConfig`, `is_host_accelerator` the settings, and `placement` and `placement_mut` give the placement state while placement is on. |
+| `sommelier/src/state/window_placement.rs` | `WindowPlacement` (present only while placement is on) and `PlacementState`: each toplevel's Aura toplevel, its last reported origin, the states and serial of its newest configure, and the placement in flight, keyed by typed guest and host IDs. |
 | `sommelier/src/state/aura_surfaces.rs` | `AuraSurfaces`: the one host Aura surface of each `wl_surface`, shared by XDG and GTK metadata and placement. |
 | `sommelier/src/state/xdg_roles.rs` | `XdgRoles`: which `wl_surface` each `xdg_surface` and `xdg_toplevel` belongs to; placement finds the focused toplevel here. |
 | `sommelier/src/state/internal_callbacks.rs` | `InternalCallbacks`: what each proxy-issued `wl_display.sync` waits for, including the placement barrier. |
 | `sommelier/src/state/outputs.rs` | `OutputRegistry`: live outputs, their committed metadata, and the output a surface is placed on; `OutputState::work_area`. |
-| `sommelier/src/handler/keyboard.rs` | `on_key` refreshes the bindings once per press; `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |
+| `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |
 | `sommelier/src/handler/window_placement.rs` | Placement: the focused toplevel, its output and the bounds, the three steps and their origin math, the Aura toplevel of each XDG toplevel, and the translation of its configures; one entry point per protocol event, listed in its module docs. |
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), sends the shelf application ID, and releases the `zaura_shell` binding. |
 | `sommelier/src/handler/callback.rs` | `queue_internal_sync` issues the placement barrier, and `wl_callback.done` dispatches it to `window_placement::complete_barrier`. |
-| `sommelier/src/proxy.rs` | `Shared` builds the configuration once and shares it with every connection. |
+| `sommelier/src/proxy.rs` | `Shared` loads and watches the bindings file once and shares the configuration with every connection. |
 
 ## Not carried over from the earlier draft
 
@@ -494,4 +529,4 @@ These parts were intentionally not reintroduced:
   disables what depends on it (see [The file's states](#the-files-states)).
 - A binding list in an environment variable, a path option, `SIGHUP`
   reloads, and a per-instance control socket. One file at a fixed path,
-  checked on each key press, replaces them all.
+  reloaded as it changes, replaces them all.

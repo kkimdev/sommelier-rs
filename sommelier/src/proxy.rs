@@ -17,7 +17,7 @@ limitations under the License.
 use crate::allocator::{PendingFence, VirtGpuNode};
 use crate::client_kind;
 use crate::connection::{LastSubmission, OutgoingMessages, WaylandConnection};
-use crate::placement_config::PlacementConfig;
+use crate::placement_config::{self, PlacementConfig};
 use crate::protocols;
 use crate::protocols::aura_shell::{zaura_output, zaura_toplevel};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
@@ -1225,7 +1225,7 @@ mod tests {
         Shared {
             settings: Rc::new(Settings::for_test()),
             virtgpu: VirtGpuNode::absent_for_test(),
-            placement: Arc::new(PlacementConfig::for_test()),
+            placement: PlacementConfig::for_test(),
         }
     }
 
@@ -3211,8 +3211,7 @@ mod tests {
         assert!(
             client
                 .ctx
-                .window_placement
-                .active()
+                .placement()
                 .map_or(0, |state| state.toplevel_count())
                 == 0,
             "failed get_toplevel requests must not leave an internal Aura child"
@@ -3244,10 +3243,10 @@ mod tests {
         );
         let aura_toplevel = client
             .ctx
-            .window_placement
-            .active()
-            .and_then(|state| state.aura_toplevel(XDG_TOPLEVEL))
-            .expect("placement Aura toplevel");
+            .placement()
+            .and_then(|state| state.aura_toplevel(crate::state::GuestId(XDG_TOPLEVEL)))
+            .expect("placement Aura toplevel")
+            .0;
         drop(client);
 
         assert_eq!(
@@ -3286,8 +3285,7 @@ mod tests {
         assert_eq!(
             client
                 .ctx
-                .window_placement
-                .active()
+                .placement()
                 .map_or(0, |state| state.toplevel_count()),
             0
         );
@@ -3311,8 +3309,7 @@ mod tests {
         assert_eq!(
             client
                 .ctx
-                .window_placement
-                .active()
+                .placement()
                 .map_or(0, |state| state.toplevel_count()),
             0
         );
@@ -4036,18 +4033,18 @@ impl protocols::gtk::ProtocolHandler for SommelierHandler {}
 struct Shared {
     settings: Rc<Settings>,
     virtgpu: VirtGpuNode,
-    placement: Arc<PlacementConfig>,
+    placement: PlacementConfig,
 }
 
 impl Shared {
+    /// Build what the connections share from `settings`, and start
+    /// watching the placement bindings file on the current `LocalSet`.
     fn new(settings: Settings) -> Self {
+        let settings = Rc::new(settings);
         Self {
             virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
-            placement: Arc::new(PlacementConfig::new(
-                settings.placement_bindings.clone(),
-                settings.host_accelerators.clone(),
-            )),
-            settings: Rc::new(settings),
+            placement: placement_config::load_and_watch(&settings),
+            settings,
         }
     }
 }
@@ -4109,7 +4106,7 @@ pub(crate) async fn run(settings: Settings) {
     // this function's future type: callers cannot accidentally move the
     // proxy's client tasks to another executor thread.
     tokio::task::LocalSet::new()
-        .run_until(serve(listener, Shared::new(settings)))
+        .run_until(async move { serve(listener, Shared::new(settings)).await })
         .await;
 }
 
@@ -4193,7 +4190,7 @@ async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
             .settings
             .wheel_from_touchpad
             .decide(pid, client_kind::is_wine_process),
-        placement: Arc::clone(&shared.placement),
+        placement: shared.placement.clone(),
     };
     let client = Client::new(
         client_conn,

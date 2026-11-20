@@ -356,7 +356,7 @@ impl Config {
         };
         let mut facts = crate::state::ConnectionFacts::for_test();
         if self.placement {
-            facts.placement = crate::placement_config::PlacementConfig::active_for_test(&[]).into();
+            facts.placement = crate::placement_config::PlacementConfig::active_for_test(&[]);
         }
         Context::new(std::rc::Rc::new(settings), facts)
     }

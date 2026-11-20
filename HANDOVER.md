@@ -232,6 +232,19 @@
   [How a window is moved](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#how-a-window-is-moved)
   its known limits. The ARC and remote-shell-v2 backends it replaced are
   at tag `placement-arc-remote-shell-final`.
+- Placement is decided per connection as it connects, while its bindings
+  follow the file live: an app that connected before the file existed
+  is placed only once it reconnects, and with the file present every XDG
+  toplevel gets an Aura toplevel whose configures the proxy translates.
+  Attaching the Aura toplevel lazily, at a window's first placement
+  chord, would remove both, but needs a host check first: whether Exo
+  reports a toplevel's origin when `set_supports_screen_coordinates`
+  arrives after its first commit (the "No origin" limit under
+  [How a window is moved](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#how-a-window-is-moved)).
+- The bindings file is reloaded through inotify
+  ([Reloading](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#reloading)),
+  which has not been checked against a Home Manager activation on a host
+  yet; the unit tests swap links the way an activation does.
 
 - Wheel steps for touchpad scrolling in Wine apps
   ([pointer scrolling](docs/INVARIANTS.md#pointer-scrolling)) have not

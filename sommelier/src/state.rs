@@ -65,7 +65,7 @@ pub(crate) use self::render::{
     SurfaceRect, SurfaceState, ViewportState,
 };
 pub(crate) use self::window_placement::{
-    Placement, PlacementState, PlacementStep, Point, WindowPlacementState,
+    Placement, PlacementState, PlacementStep, Point, WindowPlacement,
 };
 pub(crate) use self::xdg_roles::XdgRoles;
 use crate::placement_config::PlacementConfig;
@@ -470,10 +470,6 @@ pub struct Context {
     /// than after it, and not again with a new keymap, so focus changes and
     /// keymaps must not reset them.
     pub(crate) keyboard_modifiers: BTreeMap<HostId, KeyboardModifiers>,
-    /// The process-wide placement configuration: host accelerators and the
-    /// placement bindings. Shared, never copied:
-    /// bindings reloaded on any connection are visible to the next lookup.
-    placement: Arc<PlacementConfig>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
@@ -528,9 +524,9 @@ pub struct Context {
     /// The internal host zaura_shell binding (not exposed to the guest), if
     /// one is bound.
     pub(crate) host_zaura_shell: Option<HostAuraShell>,
-    /// This connection's window placement state (see
-    /// [`WindowPlacementState`] for what it owns). Built from `placement`.
-    pub(crate) window_placement: WindowPlacementState,
+    /// This connection's window placement, while it is on (see
+    /// [`WindowPlacement`] for what it owns); decided as it connects.
+    window_placement: Option<WindowPlacement>,
     /// This connection's bound host outputs (see [`OutputRegistry`] for what
     /// it owns).
     pub(crate) outputs: OutputRegistry,
@@ -971,10 +967,10 @@ impl Context {
     /// # Arguments
     ///
     /// * `settings` - the process's settings.
-    /// * `facts` - what the connection learned as it was set up. Its
-    ///   placement configuration is refreshed first, so a client that
-    ///   connects after the bindings file appeared gets placement, and one
-    ///   that connects after it went does not.
+    /// * `facts` - what the connection learned as it was set up. It has
+    ///   placement exactly while the shared bindings are valid now, so a
+    ///   client that connects after the bindings file appeared gets
+    ///   placement, and one that connects after it went does not.
     pub(crate) fn new(settings: Rc<Settings>, facts: ConnectionFacts) -> Self {
         let ConnectionFacts {
             virtwl,
@@ -982,8 +978,6 @@ impl Context {
             wheel,
             placement,
         } = facts;
-        placement.refresh();
-        let window_placement = WindowPlacementState::new(placement.is_active());
         Self {
             shadow_table: ShadowTable::new(),
             pools: BTreeMap::new(),
@@ -1028,7 +1022,6 @@ impl Context {
             keyboard_repeatable_keys: BTreeMap::new(),
             keyboard_xkb_states: BTreeMap::new(),
             keyboard_modifiers: BTreeMap::new(),
-            placement,
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
             registries: BTreeMap::new(),
@@ -1045,7 +1038,7 @@ impl Context {
             pending_dmabuf_globals: Vec::new(),
             dmabuf_guest_generations: BTreeMap::new(),
             host_zaura_shell: None,
-            window_placement,
+            window_placement: WindowPlacement::connect(placement),
             outputs: OutputRegistry::default(),
             gtk_shells: BTreeMap::new(),
             gtk_surfaces: BTreeMap::new(),
@@ -1076,14 +1069,14 @@ impl Context {
     /// A test's connection with the placement configuration `placement`,
     /// for example `PlacementConfig::active_for_test`.
     #[cfg(test)]
-    pub(crate) fn with_placement_for_test(placement: impl Into<Arc<PlacementConfig>>) -> Self {
-        Self::for_test(Settings::for_test(), placement.into())
+    pub(crate) fn with_placement_for_test(placement: PlacementConfig) -> Self {
+        Self::for_test(Settings::for_test(), placement)
     }
 
     /// A test's connection with `settings` and the placement
     /// configuration `placement`.
     #[cfg(test)]
-    pub(crate) fn for_test(settings: Settings, placement: Arc<PlacementConfig>) -> Self {
+    pub(crate) fn for_test(settings: Settings, placement: PlacementConfig) -> Self {
         Self::new(
             Rc::new(settings),
             ConnectionFacts {
@@ -1113,32 +1106,28 @@ impl Context {
         self.settings.host_accelerators.contains(chord)
     }
 
-    /// Return the placement action bound to a chord.
+    /// Where the placement bound to `chord` puts the focused window.
     ///
     /// `None` unless placement is on for this connection and the current
-    /// bindings bind the chord. Bindings that a
-    /// [`refresh_placement_bindings`](Self::refresh_placement_bindings)
-    /// adopted, on any connection, are seen here on the next lookup. Keys
-    /// already captured as compositor shortcuts are tracked by key
-    /// ownership, not by binding, so a dropped binding cannot strand a held
-    /// key.
-    pub(crate) fn placement_action_for(
+    /// bindings bind the chord. A reload of the bindings file replaces them
+    /// between two messages, so one message sees one version. Keys already
+    /// captured as compositor shortcuts are tracked by key ownership, not
+    /// by binding, so a dropped binding cannot strand a held key.
+    pub(crate) fn placement_rect_for(
         &self,
         chord: &crate::accelerator::Accelerator,
-    ) -> Option<crate::window_layout::WindowLayoutAction> {
-        if !self.window_placement.is_active() {
-            return None;
-        }
-        self.placement.action_for(chord)
+    ) -> Option<crate::window_layout::NormalizedRect> {
+        self.window_placement.as_ref()?.rect_for(chord)
     }
 
-    /// Load the bindings file again if it changed: one `stat` while
-    /// placement is on for this connection, nothing otherwise. The keyboard
-    /// calls it once per key press, before it classifies the key.
-    pub(crate) fn refresh_placement_bindings(&self) {
-        if self.window_placement.is_active() {
-            self.placement.refresh();
-        }
+    /// This connection's placement state, while placement is on for it.
+    pub(crate) fn placement(&self) -> Option<&PlacementState> {
+        Some(&self.window_placement.as_ref()?.state)
+    }
+
+    /// [`placement`](Self::placement), mutably.
+    pub(crate) fn placement_mut(&mut self) -> Option<&mut PlacementState> {
+        Some(&mut self.window_placement.as_mut()?.state)
     }
 }
 
@@ -1153,7 +1142,7 @@ pub(crate) struct ConnectionFacts {
     /// Whether its client gets wheel steps from touchpad scrolling.
     pub(crate) wheel: crate::client_kind::WheelClient,
     /// The process's window placement configuration.
-    pub(crate) placement: Arc<PlacementConfig>,
+    pub(crate) placement: PlacementConfig,
 }
 
 #[cfg(test)]
@@ -1165,7 +1154,7 @@ impl ConnectionFacts {
             virtwl: None,
             virtgpu: None,
             wheel: crate::client_kind::WheelClient::No,
-            placement: Arc::new(PlacementConfig::for_test()),
+            placement: PlacementConfig::for_test(),
         }
     }
 }
@@ -1185,41 +1174,34 @@ mod tests {
     /// placement when the file goes, with no bindings.
     #[test]
     fn a_connection_takes_placement_from_the_file_when_it_starts() {
-        use crate::window_layout::WindowLayoutAction;
         let dir = crate::test_support::TempDir::new("context-placement-file");
         let path = dir.path().join("window-placement.toml");
-        let placement = Arc::new(PlacementConfig::file_for_test(&path));
-        let before = Context::with_placement_for_test(Arc::clone(&placement));
-        assert!(!before.window_placement.is_active());
+        let (mut file, placement) = crate::placement_config::BindingsFile::loaded_for_test(&path);
+        let before = Context::with_placement_for_test(placement.clone());
+        assert!(before.placement().is_none());
 
         dir.write(
             "window-placement.toml",
             b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
         );
-        before.refresh_placement_bindings();
-        assert!(
-            !placement.is_active(),
-            "a connection that is off checks nothing"
-        );
-        let after = Context::with_placement_for_test(Arc::clone(&placement));
-        assert!(after.window_placement.is_active());
+        file.reload();
+        let after = Context::with_placement_for_test(placement.clone());
+        assert!(after.placement().is_some());
+        let left = crate::window_layout::NormalizedRect::preset("left");
+        assert_eq!(after.placement_rect_for(&alt_q()), left);
         assert_eq!(
-            after.placement_action_for(&alt_q()),
-            Some(WindowLayoutAction::Left)
-        );
-        assert_eq!(
-            before.placement_action_for(&alt_q()),
+            before.placement_rect_for(&alt_q()),
             None,
             "a connection that is off binds nothing"
         );
 
         std::fs::remove_file(&path).unwrap();
-        after.refresh_placement_bindings();
-        assert_eq!(after.placement_action_for(&alt_q()), None);
-        assert!(after.window_placement.is_active());
-        assert!(!Context::with_placement_for_test(placement)
-            .window_placement
-            .is_active());
+        file.reload();
+        assert_eq!(after.placement_rect_for(&alt_q()), None);
+        assert!(after.placement().is_some());
+        assert!(Context::with_placement_for_test(placement)
+            .placement()
+            .is_none());
     }
 
     #[test]

@@ -260,13 +260,24 @@ binds no chord of its own. The contract is in
 [Window placement shortcuts](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
 
 - **Configuration.** `placement_config.rs` owns where the bindings file
-  is, when it changed, and what it binds. Each key press on a connection
-  with placement on costs one `stat` of it; a changed file is loaded
-  before the press is classified, and one that cannot be used keeps the
-  last good bindings (tests:
+  is, what it binds (`Bindings`, one validated version, each named action
+  resolved to its rectangle) and which version is current
+  (`PlacementConfig`, which every connection shares). The one writer is
+  `BindingsFile::reload`, which an inotify watch on the event loop calls
+  as the path, or a path its links lead to, changes
+  (`placement_config/watch.rs`); it swaps the version
+  whole, between two messages, and one that cannot be used keeps the last
+  good bindings. The key path reads no file (tests:
+  `the_watcher_follows_every_change_of_the_file`,
+  `the_watcher_follows_a_swap_of_the_directory_link`,
+  `a_new_file_is_read_once_written`,
+  `a_file_being_written_is_not_read_for_another_event`,
+  `the_watcher_follows_the_target_of_a_link`,
+  `a_chain_follows_each_link_on_the_path`,
+  `load_and_watch_reloads_on_the_event_loop`,
   `a_bindings_file_edit_takes_effect_on_the_next_press`,
-  `refresh_follows_the_file`,
-  `refresh_follows_a_link_to_files_of_the_same_mtime`,
+  `reload_follows_the_file`,
+  `reload_follows_a_link_to_files_of_the_same_mtime`,
   `a_connection_takes_placement_from_the_file_when_it_starts`).
 
 - **One module.** `handler/window_placement.rs` is the only placement
@@ -288,13 +299,15 @@ binds no chord of its own. The contract is in
   which placement translates for the guest.
 - **State.** `state/window_placement.rs` owns, per connection, each
   toplevel's Aura toplevel, its last reported origin, the states and
-  serial of its newest configure, and the placement in flight; it is
-  reachable only while placement is on.
+  serial of its newest configure, and the placement in flight, keyed by
+  `GuestId` and `HostId`. It exists only while placement is on: an entry
+  point takes it with `Context::placement_mut`, which is `None` while
+  placement is off, so no path can reach it then.
 - **What placement needs from the host.** `zaura_shell` new enough for
   the work area (`shell_bound`, `output_bound`).
 - **Lifecycle.** Per-toplevel state ends through `release_toplevel`, which
   the owners' `forget_*` functions call from `forget_object` (see
-  [Object ends](#object-ends)), and `WindowPlacementState::assert_no_orphans`
+  [Object ends](#object-ends)), and `PlacementState::assert_no_orphans`
   checks it after every batch in tests.
 - **Off is the absence of placement.** With placement off a session's
   traffic is what it would be without placement (test:

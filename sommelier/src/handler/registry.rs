@@ -2050,9 +2050,8 @@ mod tests {
 
         assert_eq!(A.global(&mut ctx, 11, "zaura_shell", 38), Action::Drop);
         assert!(
-            ctx.window_placement
-                .active()
-                .and_then(|state| state.aura_toplevel(13))
+            ctx.placement()
+                .and_then(|state| state.aura_toplevel(crate::state::GuestId(13)))
                 .is_some(),
             "late shell binding must attach every recorded toplevel"
         );
