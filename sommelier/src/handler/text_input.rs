@@ -4985,7 +4985,7 @@ pub(super) mod tests {
         ];
         for (case, event) in cases {
             let mut ime = Ime::with_keyboard();
-            ime.committed().surrounding_text = Some((oversized.clone(), 4_084, 4_084));
+            ime.committed().surrounding_text_support = true;
             ime.settle();
             let state = ime.state();
             state.show_for_test(&oversized);

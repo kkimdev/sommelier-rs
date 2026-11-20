@@ -329,15 +329,8 @@ impl ExoView {
         one_read: bool,
         stated: bool,
     ) {
-        self.mirror.sent(
-            token,
-            Sent::Report {
-                text,
-                cursor,
-                anchor,
-                split: !one_read,
-            },
-        );
+        self.mirror
+            .sent(token, Sent::report(text, cursor, anchor, !one_read));
         let since = Edits {
             from_exo: self.at_commit.from_exo,
             unseen: self.edits.unseen,

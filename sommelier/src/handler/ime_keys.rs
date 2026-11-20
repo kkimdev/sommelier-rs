@@ -735,7 +735,7 @@ mod tests {
         ];
         for (case, event) in cases {
             let mut ime = Ime::with_keyboard();
-            ime.committed().surrounding_text = Some(("가나다".to_string(), 9, 9));
+            ime.committed().surrounding_text_support = true;
             ime.state().show_for_test("가");
             ime.lease_backspace_repeat(TI);
 
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn input_mode_switch_boundary_clears_stale_repeat_before_empty_confirmation() {
         let mut ime = Ime::with_keyboard();
-        ime.committed().surrounding_text = Some(("english".to_string(), 7, 7));
+        ime.committed().surrounding_text_support = true;
         ime.lease_backspace_repeat(TI);
         end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
 
@@ -757,10 +757,7 @@ mod tests {
             [],
             "a routine empty confirmation must not become a synthetic Backspace"
         );
-        assert_eq!(
-            ime.committed().surrounding_text,
-            Some(("english".to_string(), 7, 7))
-        );
+        assert!(ime.committed().surrounding_text_support);
     }
 
     /// Exo consumes a held Backspace over committed text and confirms an
@@ -770,7 +767,7 @@ mod tests {
     fn held_backspace_repeats_over_committed_korean_without_preedit() {
         let mut ime = Ime::with_keyboard();
         ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 700, 100);
-        ime.committed().surrounding_text = Some(("가나다라".to_string(), 12, 12));
+        ime.committed().surrounding_text_support = true;
 
         for _ in 0..3 {
             ime.confirm();
@@ -901,7 +898,7 @@ mod tests {
         let mut ime = Ime::with_keyboard();
         ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 701, 101);
         ime.state().set_commits_for_test(2);
-        ime.committed().surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.committed().surrounding_text_support = true;
         ime.preedit("가", "");
         ime.preedit("", "");
         ime.events();
@@ -916,10 +913,7 @@ mod tests {
                     (TI, V3::Done { serial: 2 }.into()),
                 ]
             );
-            assert_eq!(
-                ime.committed().surrounding_text,
-                Some(("A가".to_string(), 4, 4))
-            );
+            assert!(ime.committed().surrounding_text_support);
         }
 
         end_backspace_repeat_for_seat(&mut ime.ctx, SEAT);
@@ -938,7 +932,7 @@ mod tests {
             .ctx
             .claim_guest_key(HOST_KEYBOARD, BACKSPACE, GuestKeyOwner::Physical));
         ime.state().show_for_test("가");
-        ime.committed().surrounding_text = Some(("A가".to_string(), 4, 4));
+        ime.committed().surrounding_text_support = true;
         ime.preedit("", "");
         assert!(ime.repeat_active());
         ime.events();

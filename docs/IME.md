@@ -151,9 +151,12 @@ This is the contract:
    the assembly with no guest output, since the guest reset itself. An
    enable, or a rejected one, starts from a link that was not attached
    (I1a), so there is no composition and no content type to unset.
-4. **A stated surrounding text** becomes the committed one. The
-   reconcile forwards it to Exo, glued to a barrier at whose `done` the
-   Exo mirror applies it. Then the content type is applied.
+4. **A stated surrounding text** makes the committed field support
+   surrounding text; an enable or a disable that states none makes it
+   not. The
+   reconcile forwards the text to Exo, glued to a barrier at whose `done`
+   the Exo mirror applies it; the core keeps no other copy. Then the
+   content type is applied.
 
 **Report suppression** (M4). The reconcile withholds a
 report that would only make Exo drop its composition (E4), and its

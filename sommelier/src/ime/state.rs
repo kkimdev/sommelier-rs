@@ -62,11 +62,13 @@ impl V3Pending {
 }
 
 /// The text-input-v3 state a guest has committed, but the cursor
-/// rectangle, which only the host keeps.
+/// rectangle, which only the host keeps, and the surrounding text, which
+/// only its report keeps.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct V3Committed {
     pub(crate) enabled: bool,
-    pub(crate) surrounding_text: Option<SurroundingText>,
+    /// The guest states its surrounding text.
+    pub(crate) surrounding_text_support: bool,
     pub(crate) content_type: ContentType,
 }
 
@@ -256,7 +258,7 @@ impl TextInput {
     /// makes the reconcile leave `Attached`, which ends the composition
     /// with no guest output, since the guest reset itself; an enable or a
     /// rejected one starts from a link that was not attached (I1a).
-    pub(super) fn apply_commit(&mut self, pending: V3Pending, enable_conflict: bool) -> bool {
+    pub(super) fn apply_commit(&mut self, pending: &V3Pending, enable_conflict: bool) -> bool {
         let Field::Focused(f) = &mut self.field else {
             debug_assert!(false, "a commit applies only to a focused field");
             return false;
@@ -268,7 +270,7 @@ impl TextInput {
             cursor_rect: _,
         } = pending;
         let mut new_field = false;
-        if let Some(enabled) = enabled {
+        if let Some(enabled) = *enabled {
             new_field = enable_conflict || enabled != f.committed.enabled;
             if !enable_conflict {
                 f.committed.enabled = enabled;
@@ -278,9 +280,9 @@ impl TextInput {
             self.exo.step_lost();
         }
         if let Some(surrounding_text) = surrounding_text {
-            f.committed.surrounding_text = surrounding_text;
+            f.committed.surrounding_text_support = surrounding_text.is_some();
         }
-        if let Some(content_type) = content_type {
+        if let Some(content_type) = *content_type {
             f.committed.content_type = content_type;
         }
         new_field
