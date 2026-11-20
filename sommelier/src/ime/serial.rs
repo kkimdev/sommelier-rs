@@ -18,7 +18,7 @@ limitations under the License.
 //! carries (B4 in the design).
 
 /// The number of `commit` requests the guest made on one text input,
-/// counted whether or not the commit reached the host (INVARIANTS "Every
+/// counted whether or not the commit reached the host (IME.md "Every
 /// v3 commit counts"). Its field is private: a count starts at zero, and
 /// only [`Self::bump`] changes it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

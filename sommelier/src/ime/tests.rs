@@ -955,7 +955,7 @@ fn row_G9c_an_enable_while_another_is_enabled_applies_the_rest() {
     assert_eq!(out.keys, [Key::Lease(TI2, LeaseOutcome::End)]);
 }
 
-/// INVARIANTS "Every commit that leaves a field enabled gets a `done`":
+/// IME.md "Every commit that leaves a field enabled gets a `done`":
 /// an enable of an enabled field keeps its composition and the content
 /// type the host applied, while a commit that disables it starts a new
 /// field, whose reconcile ends the composition with the link, so the field
@@ -1014,7 +1014,7 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
     assert_eq!(ime.compose("다").guest, [preedit_at("다", 0, 3), done(4)]);
 }
 
-/// INVARIANTS "The host gets each content type once it can apply it, and
+/// IME.md "The host gets each content type once it can apply it, and
 /// only then": from every link, with or without a target surface and a
 /// live seat, one reconcile reaches the target with only the requests it
 /// needs, and the next has nothing left to send. The old code's test of

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! [`ImeCore::step`] (design 3.4): one arm per [`Input`], then a
+//! [`ImeCore::step`] (IME.md 3.4): one arm per [`Input`], then a
 //! reconcile of every text input, then removals. Each arm decides, which
-//! includes encoding, before it changes anything (design 3.5).
+//! includes encoding, before it changes anything (IME.md 3.5).
 
 use super::exo_view::{Frame, Observation, Unmeasured};
 use super::guest::{GuestTxn, TooLong};
@@ -35,7 +35,7 @@ use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::state::HostId;
 use crate::wire::{IndexedString, ToGuest, ToHost};
 
-/// The log target of the replayable trace (design 3.3): every input, every
+/// The log target of the replayable trace (IME.md 3.3): every input, every
 /// answer of [`Env`] the step reads, and every effect. It carries the
 /// user's text, so it is only ever at `trace`.
 const TRACE: &str = "sommelier::ime";

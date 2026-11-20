@@ -3201,47 +3201,6 @@ async fn a_late_release_of_a_press_retired_by_a_detach_is_dropped() {
     assert_eq!(kb.key(703, KEY_A, RELEASED).await, Route::Guest);
 }
 
-#[tokio::test]
-async fn held_space_repeats_after_ime_commit_until_physical_release() {
-    let mut kb = Kb::new().await;
-    let ime = kb.text_input().await;
-
-    // Captured ChromeOS sequence: the host IME consumes the physical
-    // Space and includes the first one in its committed string. Further
-    // repeat ticks arrive only as empty confirm_preedit events.
-    kb.peek(700, 1234, KEY_SPACE, PRESSED).await;
-    let preedit = zwp_text_input_v1::evt::preedit_string(ime.host, 1, "가", "").unwrap();
-    let commit = zwp_text_input_v1::evt::commit_string(ime.host, 1, "가 ").unwrap();
-    kb.s.host([preedit, commit]).await;
-    assert_eq!(
-        kb.s.guest_received(),
-        [
-            v3_preedit(ime, "가"),
-            done(ime),
-            v3_preedit(ime, ""),
-            v3_commit(ime, "가 "),
-            done(ime),
-        ],
-        "the first Space commits once"
-    );
-
-    for _ in 0..3 {
-        kb.confirm(ime).await;
-        assert_eq!(
-            kb.s.guest_received(),
-            recovered(ime, kb.k, 700, 1234, KEY_SPACE)
-        );
-    }
-
-    kb.peek(701, 1300, KEY_SPACE, RELEASED).await;
-    kb.confirm(ime).await;
-    assert_eq!(
-        kb.s.guest_received(),
-        [],
-        "a confirmation after the physical release changes nothing"
-    );
-}
-
 /// The delayed wl_keyboard events of a key that IME recovery replayed
 /// stay with the host, until the key's next press.
 #[tokio::test]

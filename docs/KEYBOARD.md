@@ -42,8 +42,8 @@ gate. It owns:
   peek watermarks (`keys/generations.rs`, below);
 - the recovery of an empty confirmation's held key (`keys/recovery.rs`,
   [below](#the-recovery-decision));
-- the host accelerators (`SOMMELIER_ACCELERATORS`), whose chords the
-  host keeps. A chord is the host's, a shortcut's, or the guest's
+- the host accelerators (`SOMMELIER_ACCELERATORS`, [below](#host-accelerators)),
+  whose chords the host keeps. A chord is the host's, a shortcut's, or the guest's
   (`KeyboardCore::classify`, which both key channels ask). A shortcut is
   generic: the core asks `Env` for a chord's binding
   (`accelerator::BindingId`), consumes its press and release, and hands
@@ -88,9 +88,9 @@ whose variants carry only the data that exists in them:
     the guest was a host accelerator. Its release is dropped whatever the
     phase.
 
-When a key is pressed again before `wl_keyboard` released the guest's
-previous press of it, the retired generation's release waits beside the
-new one (`retired_guest_releases`), at most one per key.
+A retired generation's release that `wl_keyboard` still owes the guest
+waits beside the new one (`retired_guest_releases`; INVARIANTS "A key
+waits for at most one late release").
 
 Phase and guest delivery are independent because the channels race: a
 `wl_keyboard` press can come after its peek release. The registry's model
@@ -163,12 +163,10 @@ The phase moves:
 
 ## The recovery decision
 
-An empty confirmation at extension v11 is either a held key's autorepeat
-or the confirmation Exo sends before a press its input method does not
-handle (INVARIANTS: "An empty confirmation recovers a held key only once
-the host shows it repeated"). `keys::recovery::PendingRecovery` holds
-the recovery, and `PendingRecovery::decide` is its transition for each
-host event, read as a `HostSignal`. The core reads the signal off the
+`keys::recovery::PendingRecovery` holds the recovery that INVARIANTS "An
+empty confirmation recovers a held key only once the host shows it
+repeated" defers, and `PendingRecovery::decide` is its transition for
+each host event, read as a `HostSignal`. The core reads the signal off the
 input itself, decoded once, by the dispatcher: `Key`, `Modifiers`,
 `Peek` and `TextInputLeave` are their events, and the adapter hands the
 core `HostEvent` before any other host event while a recovery waits
@@ -183,10 +181,9 @@ Any other event the proxy drops is any other event. What the recovery
 sends precedes the
 event: the adapter sends a `wl_keyboard.key` or `modifiers` it decided
 after it, in place of the forward (test:
-`a_recovery_reaches_the_guest_before_the_event_that_decides_it`). No
-recovery starts while a keyboard of the seat holds a key `stale`, whose
-next press Exo may announce with the confirmation alone
-(`KeyboardCore::held_repeat_key`).
+`a_recovery_reaches_the_guest_before_the_event_that_decides_it`).
+`KeyboardCore::held_repeat_key` keeps the rule's exception for a key
+held `stale` across a detach.
 
 | Waiting for | Event | Step |
 | --- | --- | --- |
@@ -196,6 +193,25 @@ next press Exo may announce with the confirmation alone
 | `Press` | a `wl_keyboard.key` of that keyboard the proxy drops undecoded, as the guest released the keyboard | drop |
 | any | the text input's `leave` (E6) | drop |
 | any | anything else | recover, then handle the event |
+
+## Host accelerators
+
+Exo runs a Chrome accelerator (Ctrl+T opens a tab, Ctrl+W closes one)
+on a key it also sends the client, unless the keyboard has a
+`zcr_extended_keyboard_v1`: then it holds each key's accelerator in
+`pending_key_acks_` until the client's `ack_key`, or for 1000 ms, and
+runs it only for `not_handled` (`Keyboard::AckKeyboardKey` in
+`components/exo/keyboard.cc`; `SetNeedKeyboardKeyAcks` in
+`components/exo/wayland/zcr_keyboard_extension.cc`). The proxy creates an
+extended keyboard for every host keyboard and acknowledges each key: a
+chord in `SOMMELIER_ACCELERATORS` (the chords the host keeps; ChromeOS's
+`cros-sommelier-override.conf` sets `Super_L`, `<Alt>bracketleft`,
+`<Alt>bracketright` and `<Alt>tab`) as `not_handled`, so Exo runs it and
+the guest does not get it, and every other key as `handled`, so the guest
+app gets Ctrl+T. `zwp_keyboard_shortcuts_inhibit_manager_v1` only sets a
+flag on the surface that Exo's accelerator path never reads
+(`components/exo/wayland/zwp_keyboard_shortcuts_inhibit_manager.cc`), so
+the proxy does not use it.
 
 ## Tests
 

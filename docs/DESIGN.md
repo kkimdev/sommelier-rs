@@ -3,15 +3,18 @@
 How the proxy is built and why. The [README](../README.md) owns what the
 fork is for, how to install and run it, and its configuration;
 [INVARIANTS.md](INVARIANTS.md) owns the rules every change must keep. This
-document explains the structure those rules live in.
+document explains the structure those rules live in, and points to the
+owner of each concern; the module docs own the mechanism.
 
-Feature documents own their own design:
+Concern documents own their own design:
 
+- [IME.md](IME.md): the IME bridge's behaviour and rules, the IME core and
+  the DST.
+- [KEYBOARD.md](KEYBOARD.md): the keyboard core, each key's states and
+  the host accelerators.
 - [Window placement shortcuts](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md):
   the placement contract, configuration resolution and reload, and a code
   map of every placement owner.
-- [Keyboard shortcut inhibition](../sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md):
-  how Exo routes keys and what `zcr_keyboard_extension_v1` changes.
 
 ## The proxy in one paragraph
 
@@ -52,9 +55,8 @@ handler intercepts the ones whose meaning changes across the boundary.
   current-thread Tokio runtime inside a `LocalSet`. Each `Context` holds
   xkb state, which is `!Send`; keeping every task on one thread avoids
   locks and makes that requirement part of the future's type. One thread
-  also means that a call that waits for a peer stalls every client, so
-  nothing on it waits on a guest client or on host data (see
-  [process invariants](INVARIANTS.md#process)).
+  also means that nothing on it may wait for a peer (INVARIANTS "Nothing
+  waits on a guest client or on host data").
 - The host side is VirtWL (`virtwl_channel.rs`, ioctls in `virtwl.rs`) or,
   for debugging only, a local compositor socket (`--local-compositor`).
   `connection.rs` hides the difference behind `WaylandConnection`, which
@@ -84,17 +86,10 @@ message no longer fits it, the rest (`Client::flush`) before a batch in
 the other direction, before a fifth batch in the same one
 (`MAX_BATCHES_PER_FLUSH`), before `run` waits, and when the session
 ends. Each submission is a synchronous VirtWL round trip, so a burst in
-one direction costs about one per 3,980 bytes rather than one per batch;
-per-message VirtWL ioctls would add latency without changing the byte
-and descriptor order (see
-[transport invariants](INVARIANTS.md#transport-and-file-descriptors)).
-A batch's output therefore waits behind no batch in the other direction,
-so a host key event goes out before the next guest batch, as fair
-dispatch intends, and behind at most three more batches in its own. A
-long one-way stream still awaits a send every four batches, where it
-awaited one every batch; as before, Tokio's cooperative budget decides
-when such an await lets another client run. Interleaved directions send
-once per switch, as one send per batch did. `proxy::harness::Session`
+one direction costs about one per 3,980 bytes rather than one per batch
+(INVARIANTS "Coalesced sends keep the order"). A long one-way stream
+awaits a send every four batches, and Tokio's cooperative budget decides
+when such an await lets another client run. `proxy::harness::Session`
 dispatches what one peer sent and then flushes, so tests of the
 interleaving dispatch a batch at a time (`Session::batch`).
 
@@ -166,16 +161,8 @@ it generates:
   the same protocol file carries its enum and `u32` otherwise, so
   `wl_output.transform` is `i32` although `preferred_buffer_transform`
   carries it as a `uint`.
-- `*_SINCE` and `VERSION` constants. Since-version checks use these, never
-  copied literals, and a child object takes its parent's negotiated
-  version. A global's version bound is either the generated `VERSION` or a
-  named constant in `registry.rs` that documents why it deliberately
-  differs: `wl_seat` v5 and `wl_output` v3 match ChromiumOS Sommelier's
-  caps, `wl_compositor` and `xdg_wm_base` are capped at the versions whose
-  semantics the proxy implements, `wl_shm` is offered at v1, which the
-  proxy implements itself, and `zaura_shell` has a v6 floor.
-  `offered_version` never offers a forwarded global above its generated
-  `VERSION`.
+- `*_SINCE` and `VERSION` constants, which version checks and bounds use
+  (INVARIANTS "Versions come from the XML or a documented constant").
 - A `NAME` constant, the interface's name. Handlers name an interface
   by it, never by a copied literal.
 
@@ -200,7 +187,7 @@ it is:
   of an object the guest destroyed, except the ones its interface's owner
   declares end what the destroy left (`handler::outlives_destroy`: a
   buffer's `release` while the host shows it, and an asynchronous
-  dma-buf create's `created` or `failed`). A host event that does not
+  dma-buf create's `created`). A host event that does not
   decode ends the session before any of them sees it, unless only the
   proxy uses its object (see
   [Wire messages](INVARIANTS.md#wire-messages)).
@@ -363,68 +350,19 @@ Two mechanisms let a handler act outside its own message:
 
 Window placement is opt-in and experimental: a connection has it exactly
 when the bindings file is valid as the connection starts, and Sommelier
-binds no chord of its own. The contract is in
-[Window placement shortcuts](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
+binds no chord of its own.
+[Window placement shortcuts](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md)
+owns its contract, how it moves a window, how the file reloads, and the
+code map of its owners. Two things shape the rest of the proxy:
 
-- **Configuration.** `placement_config.rs` owns where the bindings file
-  is, what it binds (`Bindings`, one validated version, each named action
-  resolved to its rectangle) and which version is current
-  (`PlacementConfig`, which every connection shares). The one writer is
-  `BindingsFile::reload`, which an inotify watch on the event loop calls
-  as the path, or a path its links lead to, changes
-  (`placement_config/watch.rs`); it swaps the version
-  whole, between two messages, and one that cannot be used keeps the last
-  good bindings. The key path reads no file (tests:
-  `the_watcher_follows_every_change_of_the_file`,
-  `the_watcher_follows_a_swap_of_the_directory_link`,
-  `a_new_file_is_read_once_written`,
-  `a_file_being_written_is_not_read_for_another_event`,
-  `the_watcher_follows_the_target_of_a_link`,
-  `the_watcher_follows_a_link_in_a_directory_it_cannot_write`,
-  `a_chain_follows_each_link_on_the_path`,
-  `load_and_watch_reloads_on_the_event_loop`,
-  `a_bindings_file_edit_takes_effect_on_the_next_press`,
-  `reload_follows_the_file`,
-  `reload_follows_a_link_to_files_of_the_same_mtime`,
-  `a_connection_takes_placement_from_the_file_when_it_starts`).
-
-- **Shortcuts.** The keyboard knows no placement: it asks for a chord's
-  binding (`accelerator::BindingId`), consumes the chord of one as a
-  shortcut, and hands the binding to its subscriber,
-  `window_placement::shortcut`, which resolves the binding's rectangle and
-  places the focused window.
-- **One module.** `handler/window_placement.rs` is the only placement
-  code the protocol handlers call, one entry point per event; the table
-  in its module docs is the one list of them. Each does nothing while
-  placement is off.
-- **Target resolution.** Which toplevel the keyboard focuses, the output
-  it entered last, and the bounds the bound rectangle maps to in that
-  output's work area (`resolve_target`).
-- **The move.** Exo lets only ARC windows set their bounds, and an ARC
-  window loses the ChromeOS IME, so placement moves a window with
-  `zaura_surface.set_parent(self, dx, dy)` and sizes it with a configure
-  the proxy sends the guest. A placement takes three steps (restore,
-  move, resize), each ended by a host barrier
-  (`InternalCallback::PlacementBarrier`), because the offset and the
-  size depend on the origin Exo reports after the step before. Every XDG
-  toplevel gets a host-only `zaura_toplevel` in screen coordinates, so
-  that Exo reports origins, and its configures replace the XDG ones,
-  which placement translates for the guest.
-- **State.** `state/window_placement.rs` owns, per connection, each
-  toplevel's Aura toplevel, its last reported origin, the states and
-  serial of its newest configure, and the placement in flight, keyed by
-  `GuestId` and `HostId`. It exists only while placement is on: an entry
-  point takes it with `Context::placement_mut`, which is `None` while
-  placement is off, so no path can reach it then.
-- **What placement needs from the host.** `zaura_shell` new enough for
-  the work area (`shell_bound`, `output_bound`).
-- **Lifecycle.** Per-toplevel state ends through `release_toplevel`, which
-  the owners' `forget_*` functions call from `forget_object` (see
-  [Object ends](#object-ends)), and `PlacementState::assert_no_orphans`
-  checks it after every batch in tests.
-- **Off is the absence of placement.** With placement off a session's
-  traffic is what it would be without placement (test:
-  `placement_off_traffic_is_unchanged`).
+- The keyboard knows no placement: it consumes a bound chord as a
+  shortcut (`accelerator::BindingId`) and hands the binding to its one
+  subscriber, `window_placement::shortcut`.
+- Placement state exists only while placement is on
+  (`Context::placement_mut` is `None` otherwise), so with placement off a
+  session's traffic is what it would be without placement (test:
+  `placement_off_traffic_is_unchanged`). Per-toplevel state ends through
+  `release_toplevel`, from `forget_object` ([Object ends](#object-ends)).
 
 ### Object ends
 
@@ -448,10 +386,9 @@ ends an object runs one hook. A `wl_surface`'s `SurfaceState` is created
 with the surface, by `wl_compositor.create_surface`; a live surface without
 its state is an internal divergence that ends the session.
 
-- `forget_object` runs once per object, at its first end: a guest
-  destructor, a terminal event, a local destructor, a bind that never
-  reached the host, or a host `delete_id` while the guest object was live
-  (`DeletedHostId::Paired` reports `was_live`). It gets the data the
+- `forget_object` runs once per object, at its first end (INVARIANTS
+  "An object's state ends with it, once"; `DeletedHostId::Paired` reports
+  whether a host `delete_id` found the object live). It gets the data the
   entry kept, whose `match` says what ending each kind does beyond
   dropping it (a dma-buf factory's or feedback's hold on its global's
   capabilities), and its `match` on the interface is the inventory of
@@ -528,16 +465,10 @@ reset) and sends. The core commits the effects:
   (`ParkedRequest`): it neither reads nor dispatches guest messages, and
   fair dispatch does not offer them, while host events and other clients
   go on. Once the exported sync_file is readable, or, for the virtio-gpu
-  fallback, which has no descriptor to wait on, a poll interval after it
-  parked, it dispatches the same message again, which
-  checks its fence afresh. The interval starts at `FENCE_POLL_INTERVAL`
-  (2 ms) and doubles each time the message waits again, up to
-  `MAX_FENCE_POLL_INTERVAL` (16 ms), since each ask costs several
-  ioctls; it ends at a fixed instant, which host traffic waking the loop
-  does not postpone. The deadline is set when the message first waits
-  and kept across those dispatches. At the deadline the message is
-  dispatched once more: if its fence has signalled by then, it goes
-  through; if it still waits, the session ends as an internal failure.
+  fallback, which has no descriptor to wait on, a growing poll interval
+  after it parked (`FENCE_POLL_INTERVAL`), it dispatches the same message
+  again, which checks its fence afresh, until the deadline
+  ([native buffers are fenced](INVARIANTS.md#dma-buf)).
 
 A session that ends never handles another message (`Client` remembers
 that it ended), so a fatal branch rolls nothing back: only output could
@@ -570,8 +501,7 @@ becomes an unused variable, which CI rejects. There is no generic
 - `V3Pending` (`ime/state.rs`) follows it for a text-input-v3 object's
   enable, surrounding text, content type and cursor rectangle, which
   `ime::TextInput::apply_commit` applies to `V3Committed`, except the cursor
-  rectangle, which only the host keeps and the commit forwards. A commit
-  whose surrounding text does not fit a v1 message resets it unapplied.
+  rectangle, which only the host keeps and the commit forwards.
 - `OutputRecord` (`outputs.rs`) is a deliberate exception: an output event
   edits a copy-on-write `Option<OutputState>` of the whole state, which
   `wl_output.done` publishes.
@@ -593,9 +523,8 @@ VirtWL can carry only descriptors the `virtio_wl` device allocated, so a
 guest memfd cannot reach the host. The proxy therefore implements guest
 `wl_shm` itself:
 
-- Guest pools are never mapped in the proxy: the copy reads pixels with
-  `pread` and `preadv` from the pool's file, so a client that shrinks the file after
-  `create_pool` makes a read fail instead of raising SIGBUS in the proxy.
+- Guest pools are read, never mapped
+  (INVARIANTS "Pools are read, never mapped, and must be regular files").
   Each guest `wl_buffer` gets host storage, chosen once by
   `select_shm_backing` (`shm/storage.rs`): VirtWL shared memory laid out
   exactly like the guest buffer and imported by the host as a `wl_shm`
@@ -606,12 +535,8 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   with or without `--gpu-accel` (see
   [Surfaces, damage and SHM](INVARIANTS.md#surfaces-damage-and-shm)).
   `ShmBacking` records the choice, so the copy path re-checks nothing.
-- On commit, the damaged region is copied from the guest pool into the host
-  storage before the host `wl_surface.commit` is queued, so the host never
-  samples stale or uninitialized pixels. A pool that cannot supply the
-  pixels (a short read) is the client's error and ends the session with
-  `wl_shm.invalid_fd`; a host storage failure (mapping, dma-buf sync) drops
-  the commit and forces a full copy next time. This is a copy, not
+- On commit, the damaged region is copied from the guest pool into the
+  host storage (INVARIANTS "Copy before commit"). This is a copy, not
   zero-copy. The proxy's mapping of the host storage is a `HostMapping`,
   which only the kernel writes, as a read fills its rows: the
   host may read that memory at any time, so the proxy never holds a Rust
@@ -651,13 +576,8 @@ again (see [Message effects](#message-effects)).
 The same descriptor problem applies to clipboard pipes: for each
 `wl_data_offer.receive`, `data_device.rs` sends the host a VirtWL pipe
 and pumps what the host writes into the guest's descriptor.
-`data_device::pump` waits on the VirtWL pipe, and on a guest pipe or
-socket, through `AsyncFd` (a regular file it writes directly), without
-touching the flags the guest's descriptor shares with the client. A peer
-that stalls parks only its own transfer, until `PUMP_IDLE_TIMEOUT` ends
-it. Ending it closes the guest's pipe as a whole transfer does, so the
-guest cannot tell a cut-off paste from a complete one; a pipe has no way
-to carry an error (see [process invariants](INVARIANTS.md#process)).
+`data_device::pump` waits on both through `AsyncFd`
+(INVARIANTS "A clipboard transfer is bounded").
 `Context::clipboard_pumps` (`ClipboardPumps`) owns a connection's pumps:
 it gives a `PumpSlot`, the only way to start one, while fewer than
 `MAX_CLIPBOARD_PUMPS` are in flight, and aborts them all when the
@@ -666,105 +586,44 @@ connection ends.
 ## Keyboard and IME
 
 Exo delivers IME input through `zwp_text_input_v1` and the
-`zcr_text_input_extension_v1` extension, while GTK and other toolkits speak
-`zwp_text_input_v3`. The proxy exposes a synthetic text-input-v3 manager
-and bridges each guest v3 object to a host v1 object plus its extension.
+`zcr_text_input_extension_v1` extension, while GTK and other toolkits
+speak `zwp_text_input_v3`. The proxy exposes a synthetic text-input-v3
+manager and bridges each guest v3 object to a host v1 object plus its
+extension.
 
-The IME core (`sommelier/src/ime`, `Context::ime`) owns the state of
-every text input: its field, its link to the host text input, its
-composition and its barriers. It is a sans-IO state machine
-([IME.md](IME.md#3-the-ime-core) section 3, which implements the
-behaviour table of its section 2): every message that can
-change that state reaches it as one `ime::Input` through `ImeCore::step`,
-which returns the guest events, host requests and barriers, and
-keyboard-concern requests it makes, and reads what it does not own (the
-object table's surfaces and seats, the keyboard focus) through
-`ime::Env`. `handler/text_input.rs` is its adapter: `text_input::ime`
-hands it an input and applies the effects where the message is handled.
-The inputs are the guest's `zwp_text_input_v3` requests and the object's
-end, the events of the host's `zwp_text_input_v1` and its extension, the
-`done` of the core's drain barriers and reset fences, each seat's
-keyboard focus change (`keyboard.rs`), a surface's end (`compositor.rs`),
-a `wl_seat` bind (`registry.rs`) and a pointer press or touch-down
-(`pointer.rs`, `touch.rs`), each key press the keyboard concern
-forwards to the guest, and the held key it recovers for an empty
-confirmation, each an input the keyboard core hands it. Nothing outside
-`ime` changes a text input, and only `ime/guest.rs` builds the v3
-transaction events.
+Two sans-IO state machines own every fact of the keyboard and the IME,
+each behind an adapter that hands it one input per message and applies
+the effects it returns where the message is handled:
 
-The bridge reconciles state rather than translating requests, because Exo
-applies a request against state the proxy cannot see: it drops a content
-type while no input method is attached, and attaching one resets the
-type. `ime::LinkState` models what the host text input has applied, by
-those rules, and the pure `ime::reconcile` returns the requests that
-make it match the target the guest committed (`HostTarget`): the
-activation step and, when the attached input method lacks it, the content
-type. `step` sends them for every text input at the end of each input, so
-between messages every link matches its target, but one that drains, one
-whose activation no live seat can carry, and an attached one whose seat
-has ended (I1b of [IME.md](IME.md#31-state)).
-The surrounding text and cursor rectangle are not reconciled: Exo keeps
-both regardless and edits its copy of the text as the input method
-commits, so each guest commit forwards the ones it states, but for a
-surrounding text that would only make Exo drop its composition, which
-the core withholds (below). In the other
-direction, the edits of Exo's input method reach the guest as v3
-transactions, each closed by a `done`. Exo measures its deletes and
-preedit regions in its own prediction of the text, so the core keeps a
-replica of it per text input, `ime/mirror.rs`, which takes every request
-the core sends at the `done` of a `wl_display.sync` glued to it, and every
-event Exo sends. `ime/exo_view.rs` owns the mirror and whether the guest is in step with
-Exo: it is the one model of Exo's text. The adapter gives a text input
-an input method only with the host's extension at v11, which the mirror
-needs. A delete or a region is measured in the mirror while the guest is
-in step, and dropped otherwise; and a guest report that leaves out the preedit it
-shows, which Exo holds inline, is withheld when the mirror finds that
-preedit the only difference from a state Exo will hold. `ime/state.rs`
-keeps only what the guest is shown. A guest commit that leaves the
-field enabled is answered with a `done`, which Chromium waits for before
-it sends more. A pointer
-press or a touch-down on the surface of a composition ends it before the
-guest gets the press, as mutter and KWin do: `pointer.rs` follows each
-pointer's surface, `touch.rs` reads a down's own, the guest commits the
-preedit it shows, and Exo is told to `reset`.
-Behind the `reset` goes a fence, a host `wl_display.sync`. Until it
-returns, the field's host composition events are dropped, because Exo
-sent them for the composition the press committed. The rules are under
-[Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
-
-The keyboard core (`sommelier/src/keys`, `Context::keys`) is the IME
-core's twin: a sans-IO state machine that owns every fact of the host
-keyboards and their keys, takes one `keys::KeyInput` through
-`KeyboardCore::step`, returns `keys::KeyEffects`, and reads the shortcut
-bindings and the IME core's gate through `keys::Env`. It owns the keyboard
-focus, which a focus input moves in the same step as what the move ends of
-the keys, and which the IME core and placement read.
-`handler/keyboard.rs` is its adapter. The two cores talk only through
-typed messages: the IME core's `ime::KeyEffect`s are keyboard inputs, and
-the keyboard core hands the IME core `ime::Input`s.
-Keys can reach the guest twice: as a `wl_keyboard.key` and as the press
-and release the proxy recovers for an empty IME confirmation; the host's
-text-input keysyms are dropped. The keyboard core assigns each physical
-key a generation and an owner (guest keyboard, IME recovery, or a
-shortcut), so a press is released through the path that
-delivered it, and never twice. Once the key is pressed again, only one
-older generation still waits for its release; see
-[Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
-[KEYBOARD.md](KEYBOARD.md) describes the core, each key's states and the
-one transition each input makes. Keymaps are compiled locally with
-xkbcommon (`keymap.rs`) to classify chords, which `Accelerator::of_key`
-computes; the keyboard core owns the host accelerators,
-`SOMMELIER_ACCELERATORS`, whose chords are acknowledged as not handled
-through `zcr_extended_keyboard_v1.ack_key`, so Exo keeps them as
-accelerators.
+- The IME core (`sommelier/src/ime`, `Context::ime`) owns every text
+  input: its field, its link to the host text input, its composition, its
+  barriers and its replica of Exo's text (`ime/mirror.rs`, which
+  `ime/exo_view.rs` owns). It takes one `ime::Input` through
+  `ImeCore::step` and reads what it does not own (the object table's
+  surfaces and seats, the keyboard focus) through `ime::Env`; its adapter
+  is `handler/text_input.rs`. Its inputs come from the guest's
+  `zwp_text_input_v3` requests, the host's v1 and extension events, the
+  `done` of its barriers, a surface's end (`compositor.rs`), a `wl_seat`
+  bind (`registry.rs`), a press (`pointer.rs`, `touch.rs`) and the
+  keyboard core. The bridge reconciles state rather than translating
+  requests, because Exo applies a request against state the proxy cannot
+  see. [IME.md](IME.md) owns its behaviour (section 2) and its shape
+  (section 3).
+- The keyboard core (`sommelier/src/keys`, `Context::keys`) owns the
+  keyboard focus, one record per host keyboard, each key's generations
+  and owner (guest keyboard, IME recovery or a shortcut), the Backspace
+  lease, the held-key recovery and the host accelerators. It takes one
+  `keys::KeyInput` through `KeyboardCore::step` and reads the shortcut
+  bindings and the IME core's gate through `keys::Env`; its adapter is
+  `handler/keyboard.rs`. Keymaps are compiled locally with xkbcommon
+  (`keymap.rs`) to classify chords. [KEYBOARD.md](KEYBOARD.md) owns its
+  design, and how the two cores talk.
 
 ## ChromeOS integration
 
-- **Shelf IDs.** Every `xdg_toplevel.set_app_id` and GTK application ID is
-  forwarded through `zaura_surface.set_application_id` as
-  `org.chromium.guest_os.<vm-id>.wayland.<app-id>`, so the ChromeOS shelf
-  matches windows to the guest's `.desktop` files.
-  `aura_objects::set_application_id` is the one place that sends it.
+- **Shelf IDs.** `aura_objects::set_application_id` is the one place
+  that sends the application ID the shelf matches
+  ([ChromeOS shelf application IDs](INVARIANTS.md#chromeos-shelf-application-ids)).
 - **Aura objects.** `aura_objects.rs` creates, versions and releases every
   host-only Aura child (`zaura_surface`, `zaura_toplevel`, `zaura_output`)
   from one table. The guest never sees them.
