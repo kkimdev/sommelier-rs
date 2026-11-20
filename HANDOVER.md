@@ -106,13 +106,10 @@
   press, and while it is held no empty confirmation recovers another
   held key.
 - One host trace is recorded: `traces/held-space-after-ga.trace` (gedit,
-  Korean input method, 가 then Space held; it replays). E13 and E15 of
-  [IME.md](docs/IME.md#24-exo-facts-the-models-implement) cite it in a
-  "Trace:" clause, so the citation is done. Still to do: retire the
-  hand-written capture that
-  `held_space_repeats_after_ime_commit_until_physical_release` holds as
-  those facts' source; the checks of IME.md 5.2 follow. A replay cannot
-  stand in for a render node, placement, accelerators or `--gpu-accel`.
+  Korean input method, 가 then Space held), the source of E13 and E15 of
+  [IME.md](docs/IME.md#24-exo-facts-the-models-implement). The checks of
+  IME.md 5.2 are still to record. A replay cannot stand in for a render
+  node, placement, accelerators or `--gpu-accel`.
 - Exo's deletes and preedit regions that the Exo mirror cannot measure
   are dropped ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A drop
   never deletes or loses text, but the input method goes on as if it
