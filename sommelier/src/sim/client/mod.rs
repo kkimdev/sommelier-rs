@@ -32,10 +32,10 @@ limitations under the License.
 //!   client a null surface);
 //! - a string that is not UTF-8;
 //! - a `done` serial past the commits it made;
-//! - a delete that fits none of the surrounding texts it sent since the
-//!   text input last entered ([`TextModel::delete_range`]); a delete that
-//!   fits one is applied as the client applies it, clamped to its current
-//!   text;
+//! - a delete that fits none of the surrounding texts it sent, or held to
+//!   send, since the text input last entered ([`TextModel::delete_range`]);
+//!   a delete that fits one is applied as the client applies it, clamped
+//!   to its current text;
 //! - `enter` while entered, `leave` of a surface not entered, a text input
 //!   still entered on a surface at its `delete_id`, and other events
 //!   outside `enter` and `leave`. The protocol does not forbid
@@ -193,9 +193,9 @@ struct Protocol {
     /// window has had it since: a key the proxy sent before it heard of the
     /// close goes nowhere (F2).
     closed: bool,
-    /// The surrounding texts the client sent since the text input last
-    /// entered, as text and cursor. A delete the proxy measured against
-    /// one can cross the client's next `enable` in flight.
+    /// The surrounding texts the client sent, or held to send, since the
+    /// text input last entered, as text and cursor. A delete the proxy
+    /// measured against one can cross the client's next `enable` in flight.
     sent: Vec<(String, usize)>,
 }
 
@@ -265,6 +265,14 @@ impl Protocol {
             .expect("the surrounding text fits a message")
     }
 
+    /// A surrounding text the client holds until it may send it (C1),
+    /// recorded as sent: a client in step with Exo reached it by applying
+    /// Exo's transactions, so Exo holds it too, and the proxy measures
+    /// Exo's next delete in it (H9).
+    fn held(&mut self, text: &str, cursor: usize) {
+        self.sent.push((text.to_owned(), cursor));
+    }
+
     /// The field on `surface`, or none if the client destroyed it and the
     /// proxy's event crossed the destroy, which then goes nowhere.
     ///
@@ -305,10 +313,10 @@ impl Protocol {
     }
 
     /// Checks that `delete_surrounding_text(before, after)` fits a
-    /// surrounding text the client sent since the text input last entered.
-    /// The proxy measures each delete against the text the client last
-    /// committed, and a delete may cross a newer one, or an `enable`, in
-    /// flight.
+    /// surrounding text the client sent, or held to send, since the text
+    /// input last entered. The proxy measures each delete in Exo's text,
+    /// which a client in step with Exo has sent or holds, and a delete may
+    /// cross a newer text, or an `enable`, in flight.
     fn check_delete(&self, before: u32, after: u32) {
         let fits = self.sent.iter().any(|(text, cursor)| {
             let sent = TextModel {
