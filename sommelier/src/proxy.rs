@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::allocator::PendingFence;
+use crate::client_kind::WheelFromTouchpad;
 use crate::connection::{OutgoingMessages, WaylandConnection};
 use crate::placement_config::PlacementConfig;
 use crate::protocols;
@@ -1166,6 +1167,7 @@ mod tests {
             xdg_decoration: false,
             vm_identifier: "termina".to_string(),
             placement: Arc::new(PlacementConfig::for_test(Vec::new())),
+            wheel_from_touchpad: WheelFromTouchpad::Off,
         }
     }
 
@@ -4004,6 +4006,8 @@ struct ClientConfig {
     xdg_decoration: bool,
     vm_identifier: String,
     placement: Arc<PlacementConfig>,
+    /// Which clients get wheel steps from touchpad scrolling.
+    wheel_from_touchpad: WheelFromTouchpad,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4015,6 +4019,7 @@ pub async fn run(
     virtio_wayland: Option<String>,
     vm_identifier: String,
     placement: Arc<PlacementConfig>,
+    wheel_from_touchpad: WheelFromTouchpad,
     reload_signal: Option<tokio::signal::unix::Signal>,
 ) {
     if let Some(path) = &virtio_wayland {
@@ -4056,6 +4061,7 @@ pub async fn run(
         xdg_decoration,
         vm_identifier,
         placement,
+        wheel_from_touchpad,
     };
     // Each client's Context holds xkb state, which is !Send. Keep each
     // client task on this executor's thread instead of using `tokio::spawn`
@@ -4154,6 +4160,9 @@ async fn serve(
 /// Pair an accepted guest connection with a new host connection and serve
 /// the pair on its own task.
 async fn start_client(stream: UnixStream, config: &ClientConfig) -> io::Result<()> {
+    // The peer's process, as it was when it connected.
+    let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    let wheel_steps = config.wheel_from_touchpad.applies_to(pid);
     let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
     let (host_conn, virtwayland_channel) = connect_host(config).await?;
     let mut client = Client::new(
@@ -4167,6 +4176,7 @@ async fn start_client(stream: UnixStream, config: &ClientConfig) -> io::Result<(
         ),
     );
     client.ctx.virtwayland_channel = virtwayland_channel;
+    client.ctx.wheel_steps = wheel_steps.then(Default::default);
     tokio::task::spawn_local(async move {
         client.run().await;
         log::info!("Client disconnected");

@@ -29,9 +29,13 @@ handler intercepts the ones whose meaning changes across the boundary.
 - `main.rs` parses the command line, installs the `SIGHUP` handler and
   raises the open-file soft limit (`prepare_process`), and resolves every
   process-wide setting once, before the first client connects: the VM
-  identifier (`state::vm_identifier_from_environment`) and the placement
-  configuration (`PlacementConfig::from_environment`). Connections receive
-  the results.
+  identifier (`state::vm_identifier_from_environment`), the placement
+  configuration (`PlacementConfig::from_environment`) and which clients
+  get wheel steps for touchpad scrolling
+  (`client_kind::WheelFromTouchpad::from_environment`). Connections
+  receive the results; `client_kind.rs`, the one owner of whether a
+  client is Wine, decides that per client from its process when it
+  connects ([pointer scrolling](INVARIANTS.md#pointer-scrolling)).
   `Context::from_parts` and the test constructors read no environment
   (test: `test_contexts_read_no_environment`), with two exceptions below
   `main`: `Context::new` creates the GBM allocator, which reads
@@ -202,7 +206,7 @@ encode wire bytes ad hoc.
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs` (the IME core's adapter), `ime_keys.rs` (held-key recovery, Backspace leases), `seat.rs` | `input.rs` (focus, key generations); the IME core, `sommelier/src/ime` (text inputs) |
+| Keyboard and IME | `keyboard.rs`, `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `ime_keys.rs` (held-key recovery, Backspace leases), `seat.rs` | `input.rs` (focus, key generations); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |

@@ -328,6 +328,9 @@ impl Context {
             host("pointer focus", pointer.0, "wl_pointer");
             guest("pointer focus", surface, "wl_surface");
         }
+        for pointer in self.wheel_steps.iter().flat_map(|s| s.pointers_for_test()) {
+            host("wheel steps", pointer.0, "wl_pointer");
+        }
         for (text_input, t) in self.ime.iter() {
             guest("text input state", text_input.0, "zwp_text_input_v3");
             // I5: a drain or a fence that outlived its callback would drop

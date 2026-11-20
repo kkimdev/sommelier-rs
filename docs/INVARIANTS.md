@@ -1516,6 +1516,31 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `a_touch_down_keeps_its_place_in_its_batch`,
   `ime_reaches_the_specified_text`, `ime_reaches_the_intended_text`.
 
+## Pointer scrolling
+
+- **Only a chosen client gets wheel steps for touchpad scrolling.** Exo
+  sends a touchpad scroll as `wl_pointer.axis` with `axis_source` finger
+  and no `axis_discrete`, and Wine's Wayland driver ignores `axis`: it
+  scrolls only on `axis_discrete`. So a client that
+  `client_kind::WheelFromTouchpad` chooses when it connects
+  (`SOMMELIER_WHEEL_FROM_TOUCHPAD`; by default a Wine process, by its
+  executable or its loader's environment through `SO_PEERCRED` and
+  `/proc`) gets one `axis_discrete` step, signed like the scroll, per 10
+  units of finger or continuous scrolling on an axis, just before the
+  `axis` that crosses it, as the protocol orders them. 10 is Exo's
+  distance for one wheel notch (`kWaylandScrollUnit`). The rest carries
+  over until that axis's `axis_stop`, the pointer's `enter` or `leave`,
+  or its end. Every other client, and every wheel scroll, which comes
+  with Exo's own `axis_discrete`, gets the events as the host sent them.
+  A source, and so a step, reaches only a pointer of v5 or later, which
+  has `axis_discrete`: the dispatcher rejects a newer event for an older
+  object.
+  Tests: `a_wine_client_gets_wheel_steps_from_touchpad_scrolling`,
+  `wheel_steps_leave_other_clients_and_wheels_alone`,
+  `wine_is_recognised_by_its_executable_or_its_loader_environment`,
+  `the_setting_chooses_wine_every_client_or_none`,
+  `event_since_guard_rejects_a_newer_event_for_an_old_host_object`.
+
 ## Process
 
 The proxy serves every Linux GUI app, so no single client and no signal may

@@ -16,11 +16,61 @@ limitations under the License.
 
 //! `wl_pointer` events, forwarded as they come. The proxy follows each
 //! pointer's surface so that a press on the surface of an IME composition
-//! can end it first ([`crate::handler::text_input::end_composition_on_press`]).
+//! can end it first ([`crate::handler::text_input::end_composition_on_press`]),
+//! and gives some clients wheel steps for touchpad scrolling
+//! ([`WheelSteps`]).
+
+use std::collections::BTreeMap;
 
 use crate::protocols::wayland::wl_pointer;
 use crate::state::{Context, HostId};
 use crate::wire::Action;
+
+/// The scroll distance of one wheel step, in 24.8 fixed-point surface
+/// units: Exo's own for one wheel notch (`kWaylandScrollUnit`, 10, in
+/// `WaylandPointerDelegate::OnPointerScroll`), so a touchpad scroll as far
+/// as one notch scrolls is one step.
+const WHEEL_STEP: i64 = 10 * 256;
+
+/// Wheel steps synthesized from touchpad scrolling, for a connection
+/// [`crate::client_kind`] chose: Exo sends a touchpad scroll as
+/// `wl_pointer.axis` alone, and Wine scrolls only on `axis_discrete`.
+/// Each host pointer keeps its frame's `axis_source` and, per axis, the
+/// finger or continuous distance not yet sent as a step. The remainder
+/// starts again at `axis_stop`, `enter` and `leave`.
+#[derive(Debug, Default)]
+pub(crate) struct WheelSteps(BTreeMap<HostId, Scroll>);
+
+// A source is known only on a pointer that has `axis_discrete`: the
+// dispatcher rejects an event newer than its object.
+const _: () = assert!(wl_pointer::EVT_AXIS_SOURCE_SINCE >= wl_pointer::EVT_AXIS_DISCRETE_SINCE);
+
+#[derive(Debug, Default)]
+struct Scroll {
+    source: Option<u32>,
+    /// Per axis (`AXIS_VERTICAL_SCROLL`, `AXIS_HORIZONTAL_SCROLL`).
+    remainder: [i64; 2],
+}
+
+impl WheelSteps {
+    /// The pointers it follows; every batch checks they are live.
+    #[cfg(test)]
+    pub(crate) fn pointers_for_test(&self) -> impl Iterator<Item = HostId> + '_ {
+        self.0.keys().copied()
+    }
+}
+
+/// `pointer`'s scroll, if the connection has wheel steps and it scrolled.
+fn scroll_of(ctx: &mut Context, pointer: HostId) -> Option<&mut Scroll> {
+    ctx.wheel_steps.as_mut()?.0.get_mut(&pointer)
+}
+
+/// Start `pointer`'s wheel steps again, if the connection has them.
+fn restart_steps(ctx: &mut Context, pointer: HostId) {
+    if let Some(steps) = &mut ctx.wheel_steps {
+        steps.0.remove(&pointer);
+    }
+}
 
 pub struct PointerHandler;
 
@@ -41,6 +91,7 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
             ctx.pointer_focus
                 .enter(HostId::from_event_sender(ctx), guest_surface);
         }
+        restart_steps(ctx, HostId::from_event_sender(ctx));
         Action::Forward
     }
 
@@ -50,7 +101,67 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
             ctx.pointer_focus
                 .leave(HostId::from_event_sender(ctx), guest_surface);
         }
+        restart_steps(ctx, HostId::from_event_sender(ctx));
         Action::Forward
+    }
+
+    fn on_axis_source(&mut self, ctx: &mut Context, axis_source: u32) -> Action {
+        let pointer = HostId::from_event_sender(ctx);
+        if let Some(steps) = &mut ctx.wheel_steps {
+            steps.0.entry(pointer).or_default().source = Some(axis_source);
+        }
+        Action::Forward
+    }
+
+    fn on_frame(&mut self, ctx: &mut Context) -> Action {
+        let pointer = HostId::from_event_sender(ctx);
+        if let Some(scroll) = scroll_of(ctx, pointer) {
+            scroll.source = None;
+        }
+        Action::Forward
+    }
+
+    fn on_axis_stop(&mut self, ctx: &mut Context, _time: u32, axis: u32) -> Action {
+        let pointer = HostId::from_event_sender(ctx);
+        if let Some(remainder) =
+            scroll_of(ctx, pointer).and_then(|s| s.remainder.get_mut(axis as usize))
+        {
+            *remainder = 0;
+        }
+        Action::Forward
+    }
+
+    /// A finger or continuous scroll that crosses [`WHEEL_STEP`]s reaches
+    /// a client with [`WheelSteps`] as `axis_discrete`, then the `axis`,
+    /// which the protocol says it precedes. A wheel's `axis` comes with
+    /// the host's own `axis_discrete`, and passes as it is.
+    fn on_axis(&mut self, ctx: &mut Context, time: u32, axis: u32, value: i32) -> Action {
+        let pointer = HostId::from_event_sender(ctx);
+        let Some(guest_pointer) = ctx.shadow_table.get_guest_id(pointer.0) else {
+            return Action::Forward;
+        };
+        let Some(scroll) = scroll_of(ctx, pointer) else {
+            return Action::Forward;
+        };
+        let continuous = matches!(
+            scroll.source,
+            Some(wl_pointer::AXIS_SOURCE_FINGER | wl_pointer::AXIS_SOURCE_CONTINUOUS)
+        );
+        let (true, Some(remainder)) = (continuous, scroll.remainder.get_mut(axis as usize)) else {
+            return Action::Forward;
+        };
+        let distance = *remainder + i64::from(value);
+        let steps = distance / WHEEL_STEP;
+        *remainder = distance - steps * WHEEL_STEP;
+        if steps == 0 {
+            return Action::Forward;
+        }
+        // |steps| <= |value| / WHEEL_STEP + 1, so it fits.
+        ctx.host_to_client_queue.extend([
+            wl_pointer::evt::axis_discrete(guest_pointer, axis, steps as i32),
+            wl_pointer::evt::axis(guest_pointer, time, axis, value),
+        ]);
+        Action::Drop
     }
 
     /// A press on the surface of a composition ends it before the guest
@@ -85,13 +196,15 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
 /// `crate::state::lifecycle`).
 pub(crate) fn forget_pointer(ctx: &mut Context, pointer: HostId) {
     ctx.pointer_focus.forget_pointer(pointer);
+    restart_steps(ctx, pointer);
 }
 
 #[cfg(test)]
 mod tests {
     use crate::protocols::wayland::{wl_pointer, wl_seat, wl_surface};
-    use crate::proxy::harness::Session;
-    use crate::state::HostId;
+    use crate::protocols::AnyEvent;
+    use crate::proxy::harness::{Object, Session};
+    use crate::state::{Context, HostId};
 
     /// A pointer's surface is forgotten when the surface ends, and the
     /// pointer when it ends; each batch of the session checks that no
@@ -116,5 +229,105 @@ mod tests {
         s.guest([wl_pointer::req::release(pointer.id)]).await;
         let release = wl_pointer::Request::Release {};
         assert_eq!(s.host_received(), [(pointer.host, release.into())]);
+    }
+
+    const VERTICAL: u32 = wl_pointer::AXIS_VERTICAL_SCROLL;
+    const HORIZONTAL: u32 = wl_pointer::AXIS_HORIZONTAL_SCROLL;
+    const FINGER: u32 = wl_pointer::AXIS_SOURCE_FINGER;
+
+    /// A session whose client gets wheel steps or not, with a pointer on a
+    /// surface; returns the pointer and the surface.
+    async fn scrolling(wheel_steps: bool) -> (Session, Object, Object) {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        // What `start_client` decides from the client's process.
+        ctx.wheel_steps = wheel_steps.then(Default::default);
+        let mut s = Session::with_context(ctx);
+        let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+        let surface = s.surface().await;
+        let pointer = s.pointer_on(seat.id, surface).await;
+        (s, pointer, surface)
+    }
+
+    /// Host pointer `p` scrolls `units` on `axis` from `source` in one
+    /// frame, and the guest gets it with `steps`.
+    async fn scroll(
+        s: &mut Session,
+        p: Object,
+        source: u32,
+        axis: u32,
+        units: i32,
+        steps: Option<i32>,
+    ) {
+        s.host([
+            wl_pointer::evt::axis_source(p.host, source),
+            wl_pointer::evt::axis(p.host, 7, axis, units * 256),
+            wl_pointer::evt::frame(p.host),
+        ])
+        .await;
+        let source = wl_pointer::Event::AxisSource {
+            axis_source: source,
+        };
+        let discrete = steps.map(|discrete| wl_pointer::Event::AxisDiscrete { axis, discrete });
+        let value = units * 256;
+        let axis = wl_pointer::Event::Axis {
+            time: 7,
+            axis,
+            value,
+        };
+        let expected: Vec<(u32, AnyEvent)> = [source]
+            .into_iter()
+            .chain(discrete)
+            .chain([axis, wl_pointer::Event::Frame {}])
+            .map(|event| (p.id, event.into()))
+            .collect();
+        assert_eq!(s.guest_received(), expected, "{units}");
+    }
+
+    /// Touchpad scrolling reaches a client with wheel steps as one
+    /// `axis_discrete` per 10 units crossed, before the `axis`; the rest
+    /// carries over, per axis, until an `axis_stop`, `leave` or `enter`.
+    #[tokio::test]
+    async fn a_wine_client_gets_wheel_steps_from_touchpad_scrolling() {
+        let (mut s, p, surface) = scrolling(true).await;
+        scroll(&mut s, p, FINGER, VERTICAL, 6, None).await;
+        scroll(&mut s, p, FINGER, VERTICAL, 9, Some(1)).await; // 15: 5 left
+        scroll(&mut s, p, FINGER, VERTICAL, 25, Some(3)).await; // 30: none left
+        scroll(&mut s, p, FINGER, HORIZONTAL, -12, Some(-1)).await; // -2 left
+        scroll(&mut s, p, FINGER, VERTICAL, 8, None).await; // 8 left
+
+        s.host([
+            wl_pointer::evt::axis_stop(p.host, 7, HORIZONTAL),
+            wl_pointer::evt::frame(p.host),
+        ])
+        .await;
+        let stop = wl_pointer::Event::AxisStop {
+            time: 7,
+            axis: HORIZONTAL,
+        };
+        let frame = wl_pointer::Event::Frame {};
+        assert_eq!(
+            s.guest_received(),
+            [(p.id, stop.into()), (p.id, frame.into())]
+        );
+        scroll(&mut s, p, FINGER, HORIZONTAL, -9, None).await; // -11 had it kept -2
+
+        s.host([
+            wl_pointer::evt::leave(p.host, 2, surface.host),
+            wl_pointer::evt::enter(p.host, 3, surface.host, 0, 0),
+        ])
+        .await;
+        assert_eq!(s.guest_received().len(), 2);
+        scroll(&mut s, p, FINGER, VERTICAL, 8, None).await; // 16 had it kept 8
+    }
+
+    /// A client without wheel steps, and a wheel, get the scroll as the
+    /// host sent it.
+    #[tokio::test]
+    async fn wheel_steps_leave_other_clients_and_wheels_alone() {
+        let wheel = wl_pointer::AXIS_SOURCE_WHEEL;
+        for (wheel_steps, source) in [(false, FINGER), (true, wheel)] {
+            let (mut s, p, _) = scrolling(wheel_steps).await;
+            scroll(&mut s, p, source, VERTICAL, 25, None).await;
+        }
     }
 }
