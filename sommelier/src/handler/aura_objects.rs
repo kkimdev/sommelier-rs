@@ -103,7 +103,7 @@ pub(crate) fn create(
     child: AuraChild,
     parent_host_id: HostId,
 ) -> Option<HostId> {
-    let shell = ctx.singletons.get(Singleton::AuraShell)?;
+    let shell = ctx.globals.singletons().get(Singleton::AuraShell)?;
     let child_host_id = ctx
         .shadow_table
         .create_host_only(child.interface, shell.version);

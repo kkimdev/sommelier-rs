@@ -113,7 +113,7 @@ fn valid_buffer_layout(
 
 impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
     fn on_format(ctx: &mut Context, sender: EventSender, format: u32) -> Action {
-        if ctx.singletons.host(Singleton::Shm) == Some(sender.host) {
+        if ctx.globals.singletons().host(Singleton::Shm) == Some(sender.host) {
             record_host_shm_wl_format(ctx, format);
             return Action::Drop;
         }

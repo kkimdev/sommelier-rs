@@ -26,7 +26,7 @@ use crate::protocols::Iface;
 /// A host global the proxy binds once per connection, for its own use.
 ///
 /// Every advertisement of one is a candidate
-/// (`Context::singleton_candidates`), and the registry binds one whenever
+/// (`handler::registry::Globals`), and the registry binds one whenever
 /// the proxy has none. A host may advertise one under a new name before it
 /// removes the old one; the new name is then bound when the old one
 /// retires, so the proxy keeps the capability.

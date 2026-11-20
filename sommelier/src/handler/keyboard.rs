@@ -281,7 +281,7 @@ fn held_keys(keys: &[u8]) -> Vec<u32> {
 /// an active TTL in `pending_key_acks_`; Exo will apply its default policy for
 /// those keys. This mirrors the behavior of the C sommelier reference.
 pub(crate) fn ensure_extended_keyboard_bound(ctx: &mut Context, host_keyboard_id: HostId) {
-    if let Some(extension_host_id) = ctx.singletons.host(Singleton::KeyboardExtension) {
+    if let Some(extension_host_id) = ctx.globals.singletons().host(Singleton::KeyboardExtension) {
         let bound = ctx
             .keys
             .keyboards()
@@ -341,7 +341,12 @@ fn send_ack_key(ctx: &mut Context, ack: Ack) {
         .get(host_keyboard_id)
         .and_then(|k| k.extended);
     let Some(host_extended_id) = extended else {
-        if ctx.singletons.get(Singleton::KeyboardExtension).is_some() {
+        if ctx
+            .globals
+            .singletons()
+            .get(Singleton::KeyboardExtension)
+            .is_some()
+        {
             log::debug!(
                 "ack_key: no extended keyboard bound yet for host_keyboard_id={}; \
                      key event arrived before on_enter? serial={}, handled={}",

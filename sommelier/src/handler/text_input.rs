@@ -443,8 +443,7 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for Handlers {
 /// `confirm_preedit`, which the IME core's Exo mirror reads (`docs/IME.md`
 /// E14).
 fn host_text_input_managers(ctx: &Context) -> Option<(HostId, HostId)> {
-    let manager = ctx.host_text_input_manager_v1_id?;
-    let ext_manager = ctx.host_text_input_extension_v1_id?;
+    let (manager, ext_manager) = ctx.globals.text_input_factories()?;
     ctx.shadow_table
         .host_object_version(ext_manager)
         .is_some_and(|version| version >= zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE)

@@ -712,7 +712,8 @@ pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: GuestId)
     }
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
     if ctx
-        .singletons
+        .globals
+        .singletons()
         .get(Singleton::AuraShell)
         .is_none_or(|shell| shell.version < PLACEMENT_SHELL_SINCE)
     {

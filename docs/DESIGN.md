@@ -239,8 +239,8 @@ one list it cannot check:
    arm in `on_global`'s `match` on the singleton; its bind
    (`Singleton::bind`) and its release
    (`reset_internal_binding_for_global`), each a `match` on the
-   singleton. Its binding is `Context::singletons`' entry, which other
-   modules read (`ctx.singletons.host(Singleton::Shm)`).
+   singleton. Its binding is an entry of `Context::globals`, which other
+   modules read (`ctx.globals.singletons().host(Singleton::Shm)`).
 
 Tests: `every_interface_has_one_global_policy`,
 `every_interface_resolves_by_its_name`.

@@ -458,28 +458,13 @@ impl Context {
         }
 
         // Registries.
-        let registries = self.registries.keys().chain(
-            self.pending_dmabuf_globals
-                .iter()
-                .map(|pending| &pending.registry_host_id),
-        );
-        for &registry in registries {
-            host("registry globals", registry, Iface::WlRegistry);
-        }
-        // A singleton candidate is a name a registry still lists, and so
-        // is an advertised global whose removal a registry has seen: it
-        // retires with the last registry that lists it.
-        for &name in self.singleton_candidates.keys() {
-            assert!(
-                registry::global_still_seen(self, name),
-                "singleton candidate {name} outlived every registry that lists it"
+        for pending in &self.pending_dmabuf_globals {
+            host(
+                "registry globals",
+                pending.registry_host_id,
+                Iface::WlRegistry,
             );
         }
-        for &name in self.host_globals.keys() {
-            assert!(
-                !self.removed_globals.contains(&name) || registry::global_still_seen(self, name),
-                "removed global {name} outlived every registry that lists it"
-            );
-        }
+        self.globals.assert_no_orphans(table);
     }
 }

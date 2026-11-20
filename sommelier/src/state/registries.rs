@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! What each host `wl_registry` has advertised: one [`RegistryRecord`] per
-//! registry, keyed by its host ID in `Context::registries`.
+//! registry, keyed by its host ID in `handler::registry::Globals`.
 //!
 //! A client may create several registries, and the compositor sends each
 //! the whole global list, so what a registry lists is its own. A record

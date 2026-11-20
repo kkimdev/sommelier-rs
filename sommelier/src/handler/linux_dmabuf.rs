@@ -113,7 +113,7 @@ pub(crate) fn capabilities_held(ctx: &Context, global: u32) -> bool {
 /// The name of the host linux-dmabuf global the proxy has bound, whose
 /// capabilities its binding collects.
 fn host_dmabuf_global(ctx: &Context) -> Option<u32> {
-    Some(ctx.singletons.get(Singleton::Dmabuf)?.name)
+    Some(ctx.globals.singletons().get(Singleton::Dmabuf)?.name)
 }
 
 fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(OwnedFd, u32)> {
@@ -322,7 +322,7 @@ pub(crate) fn complete_capability_discovery(ctx: &mut Context, global: u32) {
 ///
 /// Whether the sender is that binding.
 fn record_host_capability(ctx: &mut Context, sender: HostId, format: u32, modifier: u64) -> bool {
-    let Some(binding) = ctx.singletons.get(Singleton::Dmabuf) else {
+    let Some(binding) = ctx.globals.singletons().get(Singleton::Dmabuf) else {
         return false;
     };
     if sender != binding.host {

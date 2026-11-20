@@ -174,7 +174,8 @@ pub(super) fn select_shm_backing(
     // still accepted for applications that do not expose linux-dmabuf;
     // those buffers use the VirtWL shared-memory allocation below.
     let host_dmabuf_id = ctx
-        .singletons
+        .globals
+        .singletons()
         .host(Singleton::Dmabuf)
         .filter(|_| ctx.settings().gpu_accel);
     let virtwl_dmabuf = host_dmabuf_id.and_then(|host_dmabuf_id| {
@@ -281,7 +282,7 @@ pub(super) fn create_shared_buffer(
     } = request;
     // Check the capability before mapping the destination, so that a
     // missing wl_shm global fails before any work.
-    let Some(host_wl_shm_id) = ctx.singletons.host(Singleton::Shm) else {
+    let Some(host_wl_shm_id) = ctx.globals.singletons().host(Singleton::Shm) else {
         error!("wl_shm not available on host");
         return reject_buffer_creation(ctx, pool_id, "host wl_shm is unavailable");
     };
@@ -717,7 +718,7 @@ mod tests {
         // The proxy's own wl_shm binding has no guest ID to compare with.
         assert_eq!(
             Some(HostId::for_test(*host_shm)),
-            s.ctx().singletons.host(Singleton::Shm)
+            s.ctx().globals.singletons().host(Singleton::Shm)
         );
         assert_eq!(*size, stride * height);
         let pool_size = nix::sys::stat::fstat(fd).expect("fstat the pool").st_size;
@@ -806,7 +807,7 @@ mod tests {
         let pool = s.shm_pool(shm, shm_pool_file(&[0; 4096])).await;
         // Injects a fault no peer can cause: the proxy loses its host
         // wl_shm, which it has while the guest's is live.
-        s.ctx().singletons.unbind_for_test(Singleton::Shm);
+        s.ctx().globals.unbind_for_test(Singleton::Shm);
         let buffer = s.new_id();
         s.guest_fatal([wl_shm_pool::req::create_buffer(
             pool,

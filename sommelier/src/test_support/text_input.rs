@@ -93,8 +93,9 @@ pub(crate) fn insert(ctx: &mut Context, guest: GuestId, active: Active) {
         // A context without the host's extension names none, as no
         // request of the test's goes to it.
         manager: ctx
-            .host_text_input_extension_v1_id
-            .unwrap_or(HostId::for_test(0)),
+            .globals
+            .text_input_factories()
+            .map_or(HostId::for_test(0), |(_, extension)| extension),
     };
     let host = HostTi {
         v1: active.host,

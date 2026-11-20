@@ -372,9 +372,6 @@ pub struct Context {
     pub plane_fences_for_test: Option<PlaneFenceForTest>,
     /// This connection's VirtWL channel to the host, if it has one.
     virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
-    /// The proxy's binding of each host global it binds once per
-    /// connection, for its own use.
-    pub(crate) singletons: Singletons,
     /// Optional formats learned from the internal host wl_shm binding.
     /// Keeping the source separate lets a dmabuf global disappear without
     /// invalidating a format that the host's real wl_shm object still offers.
@@ -395,26 +392,8 @@ pub struct Context {
     /// its global retired or after it. They remain destroyable, but must not
     /// resize or create buffers through a replacement host binding.
     pub stale_shm_pools: BTreeSet<GuestId>,
-    pub host_text_input_manager_v1_id: Option<HostId>,
-    pub host_text_input_extension_v1_id: Option<HostId>,
-    /// Host globals visible to the guest, keyed by their unique numeric name.
-    pub host_globals: BTreeMap<u32, HostGlobal>,
-    /// Every host global the proxy may bind as a singleton, by name, with
-    /// the host's interface and version, while a registry lists it; see
-    /// `handler::registry::Singleton`.
-    pub(crate) singleton_candidates: BTreeMap<u32, HostGlobal>,
-    /// What each host registry has advertised, by host registry ID (see
-    /// [`RegistryRecord`]).
-    pub(crate) registries: BTreeMap<HostId, RegistryRecord>,
-    /// Every global name whose removal a registry has seen. A name is one
-    /// global for the connection's life, so it stays here: a global event
-    /// that names it again breaks the protocol
-    /// (`handler::registry::accept_global`). It outlives the registries
-    /// that saw the removal, which a guest may destroy before the last
-    /// registry that lists the global sees it. It grows by one name per
-    /// global removal, for the connection's life: negligible, and by
-    /// design, because libwayland never reuses a name.
-    pub removed_globals: BTreeSet<u32>,
+    /// The host's globals and the proxy's bindings of them.
+    pub(crate) globals: crate::handler::registry::Globals,
     pub pending_params: BTreeMap<GuestId, Vec<PendingParam>>,
     /// Guest linux-dmabuf params objects consumed by create/create_immed.
     ///
@@ -656,7 +635,7 @@ impl Context {
     /// protocol's version, as the registry would.
     #[cfg(test)]
     pub(crate) fn bind_aura_shell_for_test(&mut self, id: HostId) {
-        self.singletons.bind_for_test(Singleton::AuraShell, id);
+        self.globals.bind_for_test(Singleton::AuraShell, id);
     }
 
     /// Take the work deferred while dispatching the current message.
@@ -966,18 +945,12 @@ impl Context {
             #[cfg(test)]
             plane_fences_for_test: None,
             virtwayland_channel: virtwl,
-            singletons: Singletons::default(),
             host_wl_shm_formats: BTreeSet::new(),
             host_dmabuf_shm_formats: BTreeSet::new(),
             guest_shms: BTreeMap::new(),
             stale_shm_guest_objects: BTreeSet::new(),
             stale_shm_pools: BTreeSet::new(),
-            host_text_input_manager_v1_id: None,
-            host_text_input_extension_v1_id: None,
-            host_globals: BTreeMap::new(),
-            singleton_candidates: BTreeMap::new(),
-            registries: BTreeMap::new(),
-            removed_globals: BTreeSet::new(),
+            globals: Default::default(),
             pending_params: BTreeMap::new(),
             used_dmabuf_params: BTreeSet::new(),
             synthetic_feedback_objects: BTreeMap::new(),
