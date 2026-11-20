@@ -286,7 +286,7 @@ struct FocusedToplevel {
 
 /// Resolve the xdg_toplevel that `host_keyboard_id` focuses, if any.
 fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedToplevel> {
-    let guest_seat_id = ctx.keyboards.seat(host_keyboard_id)?;
+    let guest_seat_id = ctx.keys.keyboards().seat(host_keyboard_id)?;
     let wl_surface_guest_id = ctx.keyboard_focus.surface_for_seat(guest_seat_id)?;
     if !ctx
         .keyboard_focus
@@ -875,8 +875,7 @@ mod fixture {
         let seat = 11;
         ctx.shadow_table
             .insert_paired_for_test(KEYBOARD.guest, KEYBOARD.host, "wl_keyboard");
-        ctx.keyboards
-            .add_for_test(KEYBOARD.guest, KEYBOARD.host, seat);
+        crate::handler::keyboard::for_test::created(ctx, KEYBOARD.guest, KEYBOARD.host, seat);
         ctx.keyboard_focus
             .set_for_test(HostId(KEYBOARD.host), seat, SURFACE.guest, SURFACE.host);
     }

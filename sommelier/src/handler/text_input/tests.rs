@@ -18,6 +18,7 @@ use super::*;
 use crate::handler::callback::CallbackHandler;
 use crate::handler::keyboard::KeyboardHandler;
 use crate::ime::{map_v3_content_type, LinkState};
+use crate::keys::GuestKeyOwner;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
@@ -28,6 +29,7 @@ use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::ZwpTextInputV3H
 use crate::protocols::wayland::wl_callback::WlCallbackHandler;
 use crate::protocols::wayland::wl_display;
 use crate::protocols::wayland::wl_keyboard;
+use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
 use crate::protocols::wayland::{
     wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_touch,
 };
@@ -645,7 +647,7 @@ impl Field {
     /// The host answers the syncs the proxy sent with the recoveries
     /// of held keys that waited, the only requests it got: the `done`
     /// decides the one that still waits, if any, as an autorepeat's
-    /// ([`crate::handler::ime_keys::PendingRecovery`]).
+    /// (`crate::keys::recovery`).
     /// What the host received, with each surrounding text's barrier,
     /// the `wl_display.sync` right after it, answered as Exo's display
     /// answers it, and left out: the IME core's Exo mirror waits for
@@ -762,7 +764,7 @@ impl Field {
     fn repeat_owner(&mut self, key: u32) -> Option<u32> {
         let keyboard = HostId(self.keyboard.host);
         assert_eq!(key, BACKSPACE, "only Backspace is leased");
-        let lease = self.s.ctx().key_generations.backspace_lease(keyboard);
+        let lease = self.s.ctx().keys.backspace_lease(keyboard);
         lease.map(|ti| ti.0)
     }
 
@@ -770,7 +772,7 @@ impl Field {
     /// host keyboard, which no peer sees.
     fn owner(&mut self, key: u32) -> Option<GuestKeyOwner> {
         let keyboard = HostId(self.keyboard.host);
-        self.s.ctx().key_generations.guest_owner(keyboard, key)
+        self.s.ctx().keys.owner(keyboard, key)
     }
 
     /// The proxy's state of the text input, for state no peer sees.
@@ -805,7 +807,7 @@ impl Field {
     /// sees until the key's next event.
     fn held(&mut self, key: u32) -> bool {
         let keyboard = HostId(self.keyboard.host);
-        self.s.ctx().key_generations.physically_held(keyboard, key)
+        self.s.ctx().keys.held(keyboard, key)
     }
 }
 
@@ -3294,6 +3296,54 @@ async fn a_confirmation_before_a_handled_press_recovers_the_held_key() {
     assert_eq!(f.s.guest_received(), []);
 }
 
+/// A host event the guest gets that decides a waiting recovery reaches
+/// the guest after what the recovery sends, the held key's pair and the
+/// transaction that closes the confirmation: the press of a key no peek
+/// announced, and the modifiers after the peek of a new press.
+#[tokio::test]
+async fn a_recovery_reaches_the_guest_before_the_event_that_decides_it() {
+    let mut f = Field::typing().await;
+    let backspace = f.lease_backspace_repeat().await;
+    let a = Stroke {
+        key: 30,
+        state: PRESSED,
+        serial: 701,
+        time: 1_300,
+    };
+    f.s.host([f.confirm(), f.key(a)]).await;
+    let mut expected = f.recovered(backspace);
+    expected.push(f.guest_key(a));
+    assert_eq!(f.s.guest_received(), expected);
+    let host = f.host_received().await;
+    let callback = barrier(&host);
+    assert_eq!(host, [sync(callback), f.ack(701, true)]);
+    f.s.host([wl_callback::evt::done(callback, 0)]).await;
+    assert_eq!(f.s.guest_received(), []);
+
+    let mut f = Field::typing().await;
+    let backspace = f.lease_backspace_repeat().await;
+    let space = Stroke {
+        key: SPACE,
+        state: PRESSED,
+        serial: 702,
+        time: 1_400,
+    };
+    let shift = wl_keyboard::evt::modifiers(f.keyboard.host, 702, 1, 0, 0, 0);
+    f.s.host([f.confirm(), f.peek(space), shift]).await;
+    let mut expected = f.recovered(backspace);
+    let shift = wl_keyboard::Event::Modifiers {
+        serial: 702,
+        mods_depressed: 1,
+        mods_latched: 0,
+        mods_locked: 0,
+        group: 0,
+    };
+    expected.push((f.keyboard.id, shift.into()));
+    assert_eq!(f.s.guest_received(), expected);
+    f.answer_recovery_syncs().await;
+    assert_eq!(f.s.guest_received(), []);
+}
+
 /// Exo confirms as it detaches the input method on its own (E6), as
 /// when the input method's process restarts, then sends `leave` (H2).
 /// That confirmation is the detach's, not a repeat of the held Space,
@@ -3645,7 +3695,7 @@ async fn held_keys_repeat_through_confirmations_after_korean_input() {
     assert!(!f.held(SPACE));
     // No peer sees the peek a later confirmation could recover.
     let keyboard = HostId(f.keyboard.host);
-    assert_eq!(f.s.ctx().key_generations.peek(keyboard, SPACE), None);
+    assert_eq!(f.s.ctx().keys.peek(keyboard, SPACE), None);
 
     // Backspace held over a preedit the input method empties.
     let backspace = Stroke {
@@ -4070,7 +4120,7 @@ pub(in crate::handler) const HOST_SURFACE: u32 = 901;
 pub(in crate::handler) const KEYBOARD: u32 = 40;
 pub(in crate::handler) const HOST_KEYBOARD: HostId = HostId(41);
 pub(in crate::handler) const HOST_EXTENDED_KEYBOARD: u32 = 42;
-pub(in crate::handler) const BACKSPACE: u32 = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
+pub(in crate::handler) const BACKSPACE: u32 = crate::keys::EVDEV_KEY_BACKSPACE;
 pub(in crate::handler) const PRESSED: u32 = wl_keyboard::KEY_STATE_PRESSED;
 pub(in crate::handler) const RELEASED: u32 = wl_keyboard::KEY_STATE_RELEASED;
 
@@ -4136,17 +4186,31 @@ impl Ime {
         self.ctx
             .shadow_table
             .insert_paired_for_test(guest, host.0, "wl_keyboard");
-        self.ctx.keyboards.add_for_test(guest, host.0, SEAT);
+        crate::handler::keyboard::for_test::created(&mut self.ctx, guest, host.0, SEAT);
     }
 
     /// Give [`HOST_KEYBOARD`] its extended keyboard, which sends
     /// `peek_key`.
     pub(in crate::handler) fn with_extended_keyboard() -> Self {
         let mut ime = Self::with_keyboard();
-        let extended = HostId(HOST_EXTENDED_KEYBOARD);
-        let keyboard = ime.ctx.keyboards.get_mut(HOST_KEYBOARD).unwrap();
-        keyboard.extended = Some(extended);
+        ime.extended(HOST_KEYBOARD);
         ime
+    }
+
+    /// The extended keyboard of `keyboard`, bound now if it has none yet:
+    /// [`HOST_EXTENDED_KEYBOARD`] for [`HOST_KEYBOARD`], and the host
+    /// keyboard's ID plus 1000 for another.
+    fn extended(&mut self, keyboard: HostId) -> u32 {
+        let bound = self.ctx.keys.keyboards().extended_for_test(keyboard);
+        if let Some(extended) = bound {
+            return extended.0;
+        }
+        let extended = match keyboard {
+            HOST_KEYBOARD => HOST_EXTENDED_KEYBOARD,
+            other => other.0 + 1000,
+        };
+        crate::handler::keyboard::for_test::extended(&mut self.ctx, keyboard.0, extended);
+        extended
     }
 
     /// Give the seat's keyboard focus on the surface to `keyboard`.
@@ -4185,11 +4249,11 @@ impl Ime {
     /// The host input method's empty confirmation, then a host event
     /// that shows it to be an autorepeat's, such as the `done` of the
     /// sync the proxy sends with a recovery that waits
-    /// ([`crate::handler::ime_keys::PendingRecovery`]).
+    /// (`crate::keys::recovery`).
     pub(in crate::handler) fn confirm(&mut self) {
         self.ctx.last_sender_id = HOST_EXT;
         ExtendedTextInputV1Handler.on_confirm_preedit(&mut self.ctx, 0);
-        crate::handler::ime_keys::recover_pending(&mut self.ctx);
+        crate::handler::keyboard::before_host_event(&mut self.ctx, 0, None, 0, false);
     }
 
     pub(in crate::handler) fn peek(&mut self, key: u32, state: u32, serial: u32, time: u32) {
@@ -4198,7 +4262,8 @@ impl Ime {
     }
 
     /// Hold repeatable `key` on `keyboard`, whose press `peek_key`
-    /// reported with `serial` at `time`.
+    /// reported with `serial` at `time`, the keyboard's extended keyboard
+    /// bound for it.
     pub(in crate::handler) fn hold_peeked(
         &mut self,
         keyboard: HostId,
@@ -4206,35 +4271,39 @@ impl Ime {
         serial: u32,
         time: u32,
     ) {
-        self.ctx.key_generations.peek_key(
-            keyboard,
-            key,
-            crate::state::PeekInput::Press {
-                serial,
-                time,
-                guest_input: true,
-            },
-        );
         // The default keymap repeats every key the tests hold.
-        let keymap = self.ctx.keyboards.keymap_for_test(keyboard);
+        let keymap = self.ctx.keys.keyboards().keymap_for_test(keyboard);
         if keymap.is_none() {
-            self.ctx.keyboards.load_default_keymap_for_test(keyboard);
+            crate::handler::keyboard::for_test::default_keymap(&mut self.ctx, keyboard.0);
         }
+        self.ctx.last_sender_id = self.extended(keyboard);
+        KeyboardHandler::new().on_peek_key(&mut self.ctx, serial, time, key, PRESSED);
     }
 
     /// Hold Backspace on [`HOST_KEYBOARD`], with its IME repeat leased
-    /// to `text_input`.
+    /// to `text_input`, as an input method that empties a preedit leases
+    /// it.
     pub(in crate::handler) fn lease_backspace_repeat(&mut self, text_input: u32) {
-        let generations = &mut self.ctx.key_generations;
-        generations.observe_physical_state(HOST_KEYBOARD, BACKSPACE, 1);
-        generations.lease_for_test(HOST_KEYBOARD, text_input);
+        self.hold_peeked(HOST_KEYBOARD, BACKSPACE, 1, 1);
+        let lease = crate::ime::KeyEffect::Lease {
+            ti: TiId(text_input),
+            seat: SeatId(SEAT),
+            outcome: crate::ime::LeaseOutcome::ArmIfBackspaceHeld,
+        };
+        crate::handler::keyboard::keys(&mut self.ctx, crate::keys::KeyInput::Ime(lease));
+        let leased = self.ctx.keys.backspace_lease(HOST_KEYBOARD);
+        assert_eq!(leased, Some(TiId(text_input)));
+    }
+
+    /// A `wl_keyboard.key` of `key` in `state` on [`HOST_KEYBOARD`]; returns
+    /// what the handler does with it.
+    pub(in crate::handler) fn key(&mut self, key: u32, state: u32, serial: u32) -> Action {
+        self.ctx.last_sender_id = HOST_KEYBOARD.0;
+        KeyboardHandler::new().on_key(&mut self.ctx, serial, 1, key, state)
     }
 
     pub(in crate::handler) fn repeat_active(&self) -> bool {
-        self.ctx
-            .key_generations
-            .backspace_lease(HOST_KEYBOARD)
-            .is_some()
+        self.ctx.keys.backspace_lease(HOST_KEYBOARD).is_some()
     }
 
     /// The events queued for the guest since the last call.

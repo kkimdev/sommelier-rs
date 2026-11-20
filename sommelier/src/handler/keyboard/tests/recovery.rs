@@ -14,86 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::*;
+//! The recovery of an empty IME confirmation's held key, through the
+//! adapters (`crate::keys::recovery`).
+
 use crate::handler::text_input::tests::*;
+use crate::keys::KeyInput;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::Event as V3;
-use crate::state::GuestKeyOwner;
-
-/// The recovery's transition, for each host event it can meet in each
-/// of its states.
-#[test]
-fn a_waiting_recovery_is_decided_by_the_hosts_next_event() {
-    use HostSignal::{KeyPress, Modifiers, Other, PeekPress, TextInputLeave};
-    use RecoveryStep::{Drop, Recover, Wait};
-    use RecoveryWait::NextEvent;
-    let held = HeldRepeatKey {
-        guest_keyboard_id: 5,
-        host_keyboard_id: HostId(50),
-        key: 14,
-        serial: 7,
-        time: 70,
-    };
-    let (other_keyboard, key, serial) = (HostId(51), 30, 8);
-    let press = RecoveryWait::Press {
-        keyboard: other_keyboard,
-        key,
-        serial,
-    };
-    let peek = |keyboard, new| PeekPress {
-        keyboard,
-        key,
-        serial,
-        new,
-    };
-    let key_press = |keyboard, serial| KeyPress {
-        keyboard,
-        key,
-        serial,
-    };
-    for (wait, signal, step) in [
-        (NextEvent, Modifiers, Wait(NextEvent)),
-        (NextEvent, peek(Some(other_keyboard), true), Wait(press)),
-        (NextEvent, peek(Some(other_keyboard), false), Recover),
-        (NextEvent, peek(None, true), Recover),
-        (NextEvent, key_press(other_keyboard, serial), Recover),
-        (NextEvent, TextInputLeave { ti: Some(9) }, Drop),
-        (NextEvent, TextInputLeave { ti: Some(10) }, Recover),
-        (NextEvent, TextInputLeave { ti: None }, Recover),
-        (NextEvent, Other, Recover),
-        (press, key_press(other_keyboard, serial), Drop),
-        (press, key_press(other_keyboard, serial + 1), Recover),
-        (press, key_press(HostId(50), serial), Recover),
-        (press, Modifiers, Recover),
-        (press, peek(Some(other_keyboard), true), Recover),
-        (press, TextInputLeave { ti: Some(9) }, Drop),
-        (press, Other, Recover),
-    ] {
-        let pending = PendingRecovery {
-            ti: TiId(9),
-            seat: SeatId(1),
-            held,
-            wait,
-        };
-        assert_eq!(pending.decide(signal), step, "{wait:?} {signal:?}");
-    }
-}
-
-#[test]
-fn ending_one_keyboard_repeat_does_not_cancel_another_held_keyboard() {
-    let mut ime = Ime::with_keyboard();
-    let other = HostId(71);
-    ime.keyboard(44, other);
-    ime.lease_backspace_repeat(TI);
-    let generations = &mut ime.ctx.key_generations;
-    generations.observe_physical_state(other, BACKSPACE, 1);
-
-    lease(&mut ime.ctx, Some(SEAT), LeaseInput::FocusLost);
-
-    let generations = &ime.ctx.key_generations;
-    assert!(generations.backspace_repeat_cancelled(HOST_KEYBOARD));
-    assert!(!generations.backspace_repeat_cancelled(other));
-    assert!(generations.physically_held(other, BACKSPACE));
-}
+use crate::state::{HostId, KeyboardFocusUpdate};
 
 /// An IME edit, whether or not it reaches the guest, ends the
 /// held-Backspace fallback a confirmation leased.
@@ -115,22 +42,6 @@ fn ime_edits_end_a_stale_backspace_repeat() {
         event(&mut ime);
         assert!(!ime.repeat_active(), "{case}");
     }
-}
-
-#[test]
-fn input_mode_switch_boundary_clears_stale_repeat_before_empty_confirmation() {
-    let mut ime = Ime::with_keyboard();
-    ime.committed().surrounding_text_support = true;
-    ime.lease_backspace_repeat(TI);
-    lease(&mut ime.ctx, Some(SEAT), LeaseInput::FocusLost);
-
-    ime.confirm();
-    assert_eq!(
-        ime.events(),
-        [],
-        "a routine empty confirmation must not become a synthetic Backspace"
-    );
-    assert!(ime.committed().surrounding_text_support);
 }
 
 /// Exo consumes a held Backspace over committed text and confirms an
@@ -187,7 +98,7 @@ fn a_key_held_on_another_seats_keyboard_is_not_recovered() {
     ime.ctx
         .shadow_table
         .insert_paired_for_test(OTHER_GUEST, other.0, "wl_keyboard");
-    ime.ctx.keyboards.add_for_test(OTHER_GUEST, other.0, 9);
+    crate::handler::keyboard::for_test::created(&mut ime.ctx, OTHER_GUEST, other.0, 9);
     ime.hold_peeked(other, 57, 700, 100);
     ime.confirm();
     assert_eq!(ime.events(), []);
@@ -206,21 +117,11 @@ fn empty_confirmation_does_not_fall_back_from_newest_ineligible_key() {
     // Shift is newer but XKB does not mark it repeatable. The
     // confirmation belongs to that newest generation or to no
     // recoverable key; it must never synthesize the older held Space.
-    let generations = &mut ime.ctx.key_generations;
-    generations.peek_key(
-        HOST_KEYBOARD,
-        SHIFT,
-        crate::state::PeekInput::Press {
-            serial: 701,
-            time: 101,
-            guest_input: true,
-        },
-    );
+    ime.hold_peeked(HOST_KEYBOARD, SHIFT, 701, 101);
     ime.confirm();
     assert_eq!(ime.events(), []);
 
-    let generations = &mut ime.ctx.key_generations;
-    generations.observe_physical_state(HOST_KEYBOARD, SHIFT, 0);
+    ime.peek(SHIFT, RELEASED, 702, 102);
     ime.confirm();
     assert_eq!(
         ime.events(),
@@ -238,12 +139,16 @@ fn keys_held_since_enter_are_ordered_by_their_peeks() {
     const TAB: u32 = 15;
     const SPACE: u32 = 57;
     let mut ime = Ime::with_extended_keyboard();
-    let generations = &mut ime.ctx.key_generations;
-    generations.install_enter_snapshot(HOST_KEYBOARD, [TAB, SPACE]);
+    // The enter of a second keyboard on the seat's surface moves no
+    // focus.
+    let enter = KeyInput::Focus {
+        update: KeyboardFocusUpdate::default(),
+        enter: Some((HOST_KEYBOARD, vec![TAB, SPACE])),
+        keyboard: Vec::new(),
+    };
+    crate::handler::keyboard::keys(&mut ime.ctx, enter);
     // The default keymap repeats both.
-    ime.ctx
-        .keyboards
-        .load_default_keymap_for_test(HOST_KEYBOARD);
+    crate::handler::keyboard::for_test::default_keymap(&mut ime.ctx, HOST_KEYBOARD.0);
 
     ime.peek(SPACE, PRESSED, 700, 100);
     ime.peek(TAB, PRESSED, 701, 101);
@@ -311,7 +216,8 @@ fn emptied_preedit_enables_held_backspace_fallback_for_committed_text() {
         assert!(ime.committed().surrounding_text_support);
     }
 
-    lease(&mut ime.ctx, Some(SEAT), LeaseInput::FocusLost);
+    // Another key's press ends the lease for the rest of the hold.
+    assert_eq!(ime.key(15, PRESSED, 702), crate::wire::Action::Forward);
     ime.confirm();
     assert_eq!(ime.events(), []);
 }
@@ -323,9 +229,8 @@ fn emptied_preedit_enables_held_backspace_fallback_for_committed_text() {
 fn empty_confirmation_does_not_duplicate_forwarded_backspace() {
     let mut ime = Ime::with_keyboard();
     ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 1, 100);
-    assert!(ime
-        .ctx
-        .claim_guest_key(HOST_KEYBOARD, BACKSPACE, GuestKeyOwner::Physical));
+    let press = ime.key(BACKSPACE, PRESSED, 1);
+    assert_eq!(press, crate::wire::Action::Forward);
     ime.state().show_for_test("가");
     ime.committed().surrounding_text_support = true;
     ime.preedit("", "");

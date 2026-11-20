@@ -17,13 +17,10 @@ limitations under the License.
 use crate::warn_once::WarnOnce;
 
 use crate::handler::callback::{internal_sync, queue_internal_sync};
-use crate::handler::ime_keys::{
-    forget_held_keys_for_seat, forget_recovery_of_text_input, hold_recovery, lease,
-};
 use crate::ime::{
-    self, Edit, Env, HostExt, HostIme, HostOut, HostTi, Input, KeyEffect, Piece, SeatId, SurfaceId,
-    TiId,
+    self, Edit, Env, HostExt, HostIme, HostOut, HostTi, Input, Piece, SeatId, SurfaceId, TiId,
 };
+use crate::keys::KeyInput;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
@@ -31,12 +28,7 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::protocols::wayland::wl_seat;
-#[cfg(test)]
-use crate::state::GuestKeyOwner;
-use crate::state::{
-    Context, InternalCallback, KeyboardFocusRegistry, LeaseInput, Link, SeatFocusChange,
-    ShadowTable,
-};
+use crate::state::{Context, InternalCallback, KeyboardFocusRegistry, Link, ShadowTable};
 use crate::wire::{Action, IndexedString, Outgoing};
 
 /// The facts the IME core reads and does not own: the object table's and
@@ -113,27 +105,11 @@ pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
             }
         }
     }
+    // What the IME core asks of the keyboard core.
     for key in fx.keys {
-        apply_key_effect(ctx, key);
+        crate::handler::keyboard::keys(ctx, KeyInput::Ime(key));
     }
     fx.forward
-}
-
-/// The keyboard concern forwarded a key press to the guest on
-/// guest seat `seat`, which may edit its text where Exo does not see.
-pub(crate) fn guest_key(ctx: &mut Context, seat: u32) {
-    ime(ctx, Input::GuestKey(SeatId(seat)));
-}
-
-/// Apply what the IME core asks of the keyboard concern.
-fn apply_key_effect(ctx: &mut Context, effect: KeyEffect) {
-    match effect {
-        KeyEffect::Lease { ti, seat, outcome } => {
-            lease(ctx, Some(seat.0), LeaseInput::Ime { ti, outcome })
-        }
-        KeyEffect::RecoverHeldKey { ti, seat } => hold_recovery(ctx, ti, seat),
-        KeyEffect::InputMethodDetached { seat } => forget_held_keys_for_seat(ctx, seat.0),
-    }
 }
 
 pub struct TextInputManagerV1Handler;
@@ -199,7 +175,10 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     /// own; a `leave` that answers the proxy's `deactivate` arrives while
     /// draining and is ignored (H2').
     fn on_leave(&mut self, ctx: &mut Context) -> Action {
-        if let Some(ti) = v1_sender(ctx) {
+        let ti = v1_sender(ctx);
+        // A recovery that waits reads the leave first (E6).
+        crate::handler::keyboard::keys(ctx, KeyInput::TextInputLeave(ti));
+        if let Some(ti) = ti {
             ime(ctx, Input::HostLeave(ti));
         }
         Action::Drop
@@ -497,53 +476,13 @@ fn live_host_seat(table: &ShadowTable, guest_seat: u32) -> Option<u32> {
     }
 }
 
-/// Tell the IME core of each seat's keyboard focus change (F1), after the
-/// keyboard concern's own teardown: the seat's peek watermarks and its
-/// Backspace repeats end. `keyboard` is the guest's copy of the keyboard
-/// events that moved the focus, which the guest gets after the commit of a
-/// preedit the move ends, and before the text inputs' `leave` and `enter`,
-/// so their sender handler drops the originals. They go with the first
-/// change, the only one, as a keyboard belongs to one seat.
-pub(crate) fn apply_keyboard_focus_changes(
-    ctx: &mut Context,
-    changes: &[SeatFocusChange],
-    mut keyboard: Vec<Outgoing>,
-) {
-    // Keyboard events come from one keyboard, which belongs to one seat,
-    // so at most one seat's focus changes with them.
-    debug_assert!(
-        keyboard.is_empty()
-            || changes
-                .iter()
-                .filter(|c| c.previous_surface != c.current_surface)
-                .count()
-                <= 1,
-        "keyboard events moved the focus of several seats: {changes:?}"
-    );
-    for change in changes {
-        if change.previous_surface == change.current_surface {
-            continue;
-        }
-        ctx.key_generations
-            .clear_peek_watermarks_for_seat(change.guest_seat);
-        lease(ctx, Some(change.guest_seat), LeaseInput::FocusLost);
-        let focus = Input::FocusChanged {
-            seat: SeatId(change.guest_seat),
-            surface: change.current_surface.map(SurfaceId),
-            keyboard: std::mem::take(&mut keyboard),
-        };
-        ime(ctx, focus);
-    }
-    ctx.host_to_client_queue.extend(keyboard);
-}
-
 /// Forget guest `zwp_text_input_v3` `guest_id`, which ended (see
 /// `crate::state::lifecycle`): the IME core deactivates it and destroys
 /// its host extension (G10). Nothing goes to its v1 object once the host
 /// has deleted it (`host_deleted`, F6).
 pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: bool) {
     let ti = TiId(guest_id);
-    forget_recovery_of_text_input(ctx, ti);
+    crate::handler::keyboard::keys(ctx, KeyInput::TextInputEnded(ti));
     ime(ctx, Input::Destroy { ti, host_deleted });
 }
 

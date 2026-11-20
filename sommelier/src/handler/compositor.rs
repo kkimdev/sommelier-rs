@@ -452,8 +452,6 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
     crate::handler::buffer::retire_eligible_buffers(ctx);
     ctx.viewport_to_wl_surface
         .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
-    ctx.key_generations
-        .clear_peek_watermarks_for_surface(wl_surface_guest_id);
     ctx.pointer_focus.forget_surface(wl_surface_guest_id);
     // Surface destruction can race the host's wl_keyboard.leave event.
     // Transition the authoritative registry first, then emit the mandatory
@@ -465,14 +463,12 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
     let focus_update = ctx.keyboard_focus.destroy_surface(wl_surface_guest_id);
     let surface = crate::ime::SurfaceId(wl_surface_guest_id);
     crate::handler::text_input::ime(ctx, crate::ime::Input::SurfaceDestroyed(surface));
-    crate::handler::text_input::apply_keyboard_focus_changes(
-        ctx,
-        &focus_update.seat_changes,
-        Vec::new(),
-    );
-    for keyboard_id in focus_update.retired_keyboards {
-        ctx.key_generations.clear_keyboard(keyboard_id);
-    }
+    let focus = crate::keys::KeyInput::Focus {
+        update: focus_update,
+        enter: None,
+        keyboard: Vec::new(),
+    };
+    crate::handler::keyboard::keys(ctx, focus);
 }
 
 impl WlSurfaceHandler for CompositorHandler {
@@ -3804,49 +3800,41 @@ mod tests {
         let mut ctx = toplevel_ctx();
         let wl_surface_guest_id = 100u32;
         let host_keyboard_id = crate::state::HostId(700);
+        use crate::handler::keyboard::for_test::{created, default_keymap, extended, peek};
+        // Keyboard 700 of seat 1 on the surface, and keyboard 701 of seat 2
+        // on another.
+        created(&mut ctx, 700, 700, 1);
+        extended(&mut ctx, 700, 750);
+        default_keymap(&mut ctx, 700);
+        created(&mut ctx, 701, 701, 2);
+        extended(&mut ctx, 701, 751);
         ctx.keyboard_focus
             .set_for_test(host_keyboard_id, 1, wl_surface_guest_id, SURFACE.host);
-        let sequence = ctx
-            .key_generations
-            .peek_key(
-                host_keyboard_id,
-                14,
-                crate::state::PeekInput::Press {
-                    serial: 1,
-                    time: 123,
-                    guest_input: true,
-                },
-            )
-            .numbered
-            .expect("a new press is numbered");
-        ctx.key_generations.cancel_lease_for_test(host_keyboard_id);
-        ctx.keyboards.add_for_test(700, host_keyboard_id.0, 1);
-        ctx.keyboards.load_default_keymap_for_test(host_keyboard_id);
-        ctx.key_generations.record_latest_peek(
-            1,
-            Some(wl_surface_guest_id),
-            host_keyboard_id,
-            sequence,
-        );
-        ctx.key_generations
-            .record_latest_peek(2, Some(999), crate::state::HostId(701), 2);
-        assert!(ctx.claim_guest_key(
-            host_keyboard_id,
-            14,
-            crate::state::GuestKeyOwner::ImeRecovery
-        ));
-        // Key 30's guest press waits for its release beside a new press.
-        let keys = &mut ctx.key_generations;
-        keys.observe_physical_state(host_keyboard_id, 30, 1);
-        assert!(keys.claim_guest_owner(
-            host_keyboard_id,
-            30,
-            crate::state::GuestKeyOwner::Physical
-        ));
-        keys.observe_physical_event(host_keyboard_id, 30, 0, Some(2));
-        keys.observe_physical_state(host_keyboard_id, 30, 1);
         ctx.keyboard_focus
             .set_for_test(crate::state::HostId(701), 2, 999, 1999);
+        let key = |ctx: &mut Context, serial, key, state| {
+            ctx.last_sender_id = 700;
+            let mut keyboard = crate::handler::keyboard::KeyboardHandler::new();
+            WlKeyboardHandler::on_key(&mut keyboard, ctx, serial, serial, key, state)
+        };
+        // The input method takes Backspace and repeats it, until the press
+        // of key 30 ends the lease; key 30's guest press then waits for its
+        // release beside a new press.
+        peek(&mut ctx, 750, 1, 14, 1);
+        let lease = crate::ime::KeyEffect::Lease {
+            ti: crate::ime::TiId(1),
+            seat: crate::ime::SeatId(1),
+            outcome: crate::ime::LeaseOutcome::ArmIfBackspaceHeld,
+        };
+        crate::handler::keyboard::keys(&mut ctx, crate::keys::KeyInput::Ime(lease));
+        assert_eq!(key(&mut ctx, 1, 14, 1), Action::Drop);
+        assert_eq!(key(&mut ctx, 2, 30, 1), Action::Forward);
+        assert!(ctx.keys.backspace_repeat_cancelled(host_keyboard_id));
+        peek(&mut ctx, 750, 3, 30, 0);
+        peek(&mut ctx, 750, 4, 30, 1);
+        assert_eq!(ctx.keys.retired_release(host_keyboard_id, 30), Some(3));
+        // Seat 2's watermark.
+        peek(&mut ctx, 751, 5, 57, 1);
         ctx.last_sender_id = wl_surface_guest_id;
 
         let mut handler = CompositorHandler;
@@ -3861,35 +3849,32 @@ mod tests {
             "destroying a surface must retire per-keyboard focus"
         );
         assert!(
-            !ctx.key_generations.physically_held(host_keyboard_id, 14)
-                && !ctx
-                    .key_generations
-                    .backspace_repeat_cancelled(host_keyboard_id)
-                && ctx.key_generations.peek(host_keyboard_id, 14).is_none()
-                && ctx
-                    .key_generations
-                    .guest_owner(host_keyboard_id, 14)
-                    .is_none(),
+            !ctx.keys.held(host_keyboard_id, 14)
+                && !ctx.keys.backspace_repeat_cancelled(host_keyboard_id)
+                && ctx.keys.peek(host_keyboard_id, 14).is_none()
+                && ctx.keys.owner(host_keyboard_id, 14).is_none(),
             "destroying a surface must retire all per-keyboard input state"
         );
-        assert!(
-            !ctx.key_generations
-                .take_pending_physical_release(host_keyboard_id, 30, 2),
+        assert_eq!(
+            ctx.keys.retired_release(host_keyboard_id, 30),
+            None,
             "surface destruction must discard retired guest releases"
         );
         assert!(
-            ctx.keyboards.keymap_for_test(host_keyboard_id).is_some(),
+            ctx.keys
+                .keyboards()
+                .keymap_for_test(host_keyboard_id)
+                .is_some(),
             "surface focus teardown must preserve keymap-derived capabilities"
         );
         assert!(
-            ctx.key_generations
+            ctx.keys
                 .latest_peek_sequence(1, Some(wl_surface_guest_id))
                 .is_none(),
             "destroying a surface must retire its peek watermark"
         );
-        assert_eq!(
-            ctx.key_generations.latest_peek_sequence(2, Some(999)),
-            Some(2),
+        assert!(
+            ctx.keys.latest_peek_sequence(2, Some(999)).is_some(),
             "another live seat's watermark must remain intact"
         );
         assert_eq!(
@@ -3980,8 +3965,12 @@ mod tests {
         for ((guest_keyboard, host_keyboard), (guest_seat, _)) in keyboards.into_iter().zip(seats) {
             ctx.shadow_table
                 .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-            ctx.keyboards
-                .add_for_test(guest_keyboard, host_keyboard, guest_seat);
+            crate::handler::keyboard::for_test::created(
+                &mut ctx,
+                guest_keyboard,
+                host_keyboard,
+                guest_seat,
+            );
         }
         // Only the first is enabled: one text input on a connection can be.
         for (
@@ -4019,13 +4008,21 @@ mod tests {
             live_surface,
             live_host_surface,
         );
-        for (sequence, (guest_seat, surface, keyboard)) in [
-            (1, (1, destroyed_surface, crate::state::HostId(900))),
-            (2, (3, destroyed_surface, crate::state::HostId(901))),
-            (3, (5, live_surface, crate::state::HostId(902))),
+        // A peek of each keyboard on its focus.
+        for (serial, host_keyboard) in (1..).zip([900, 901, 902]) {
+            let extended = host_keyboard + 50;
+            crate::handler::keyboard::for_test::extended(&mut ctx, host_keyboard, extended);
+            crate::handler::keyboard::for_test::peek(&mut ctx, extended, serial, 30, 1);
+        }
+        for (guest_seat, surface) in [
+            (1, destroyed_surface),
+            (3, destroyed_surface),
+            (5, live_surface),
         ] {
-            ctx.key_generations
-                .record_latest_peek(guest_seat, Some(surface), keyboard, sequence);
+            assert!(ctx
+                .keys
+                .latest_peek_sequence(guest_seat, Some(surface))
+                .is_some());
         }
 
         let state = text_input::view(&ctx, 720);
@@ -4065,18 +4062,17 @@ mod tests {
             .iter()
             .all(|(message, _)| ![712, 722].contains(&msg_sender(message))));
         assert!(ctx
-            .key_generations
+            .keys
             .latest_peek_sequence(1, Some(destroyed_surface))
             .is_none());
         assert!(ctx
-            .key_generations
+            .keys
             .latest_peek_sequence(3, Some(destroyed_surface))
             .is_none());
-        assert_eq!(
-            ctx.key_generations
-                .latest_peek_sequence(5, Some(live_surface)),
-            Some(3)
-        );
+        assert!(ctx
+            .keys
+            .latest_peek_sequence(5, Some(live_surface))
+            .is_some());
         assert_eq!(ctx.keyboard_focus.surface_for_seat(5), Some(live_surface));
 
         let guest_queue_len = ctx.host_to_client_queue.len();
@@ -4146,24 +4142,10 @@ mod tests {
             );
             text_input::insert(&mut ctx, guest_text_input, state);
         }
-        ctx.key_generations.record_latest_peek(
-            seat_with_replacement,
-            Some(destroyed_surface),
-            crate::state::HostId(801),
-            1,
-        );
-        ctx.key_generations.record_latest_peek(
-            seat_with_replacement,
-            Some(replacement_surface),
-            crate::state::HostId(802),
-            2,
-        );
-        ctx.key_generations.record_latest_peek(
-            seat_without_owner,
-            Some(destroyed_surface),
-            crate::state::HostId(803),
-            3,
-        );
+        // A peek of the keyboard on the replacement surface.
+        crate::handler::keyboard::for_test::created(&mut ctx, 800, 900, seat_with_replacement);
+        crate::handler::keyboard::for_test::extended(&mut ctx, 900, 950);
+        crate::handler::keyboard::for_test::peek(&mut ctx, 950, 1, 30, 1);
         assert!(
             ctx.keyboard_focus
                 .surface_for_seat(seat_without_owner)
@@ -4207,18 +4189,9 @@ mod tests {
             .iter()
             .all(|(message, _)| ![712, 722].contains(&msg_sender(message))));
         assert!(ctx
-            .key_generations
-            .latest_peek_sequence(seat_with_replacement, Some(destroyed_surface))
-            .is_none());
-        assert!(ctx
-            .key_generations
-            .latest_peek_sequence(seat_without_owner, Some(destroyed_surface))
-            .is_none());
-        assert_eq!(
-            ctx.key_generations
-                .latest_peek_sequence(seat_with_replacement, Some(replacement_surface)),
-            Some(2)
-        );
+            .keys
+            .latest_peek_sequence(seat_with_replacement, Some(replacement_surface))
+            .is_some());
     }
 
     #[test]

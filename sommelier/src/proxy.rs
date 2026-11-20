@@ -133,7 +133,7 @@ fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
             xdg_toplevel,
         } => crate::handler::compositor::record_xdg_toplevel(ctx, xdg_surface, xdg_toplevel),
         PostDispatch::KeyboardCreated { keyboard, seat } => {
-            crate::handler::seat::keyboard_created(ctx, keyboard, seat)
+            crate::handler::keyboard::keyboard_created(ctx, keyboard, seat)
         }
     }
 }
@@ -596,13 +596,15 @@ impl Client {
                 // An empty IME confirmation's recovery of a held key waits
                 // for the host's next event, which may show that it was
                 // Exo's confirmation before a new press. What it sends the
-                // guest precedes this event's own forward.
-                crate::handler::ime_keys::before_host_event(
+                // guest precedes this event's own forward. The header
+                // names the event; its handler hands the keyboard core
+                // the few the recovery reads, decoded.
+                crate::handler::keyboard::before_host_event(
                     &mut self.ctx,
                     sender_id,
                     interface,
                     opcode,
-                    &packet[MessageHeader::LEN..],
+                    suppress_host_event,
                 );
                 let decided = self.ctx.take_effects();
                 debug_assert!(decided.end.is_none() && decided.wait.is_none());

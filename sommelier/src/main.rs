@@ -26,6 +26,7 @@ mod geometry;
 mod handler;
 mod ime;
 mod keymap;
+mod keys;
 mod placement_config;
 mod proxy;
 mod settings;

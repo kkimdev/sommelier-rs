@@ -1,0 +1,385 @@
+/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! The keyboard core, driven through its step.
+
+use super::*;
+use crate::accelerator::parse_accelerator;
+
+const KEYBOARD: HostId = HostId(100);
+const GUEST_KEYBOARD: u32 = 10;
+const EXTENDED: HostId = HostId(1000);
+/// Another keyboard of the seat, which focuses no surface.
+const OTHER: HostId = HostId(101);
+const OTHER_EXTENDED: HostId = HostId(1001);
+const SEAT: u32 = 1;
+const SURFACE: u32 = 20;
+const TI: TiId = TiId(40);
+const KEY_Q: u32 = 16;
+const KEY_A: u32 = 30;
+/// Mod1, Alt in the default keymap.
+const ALT: u32 = 1 << 3;
+
+/// The facts the core reads: [`KEYBOARD`] focuses `SURFACE` on its seat,
+/// `shortcuts` are bound, and the text input passes the gate if `gate`.
+struct TestEnv {
+    shortcuts: Vec<(Accelerator, BindingId)>,
+    gate: bool,
+}
+
+impl TestEnv {
+    fn new() -> Self {
+        Self {
+            shortcuts: Vec::new(),
+            gate: true,
+        }
+    }
+
+    /// `chord` bound to binding 0.
+    fn binding(chord: &str) -> Self {
+        let chord = parse_accelerator(chord).unwrap();
+        Self {
+            shortcuts: vec![(chord, BindingId::new(0))],
+            ..Self::new()
+        }
+    }
+}
+
+impl Env for TestEnv {
+    fn seat_focus(&self, seat: u32) -> Option<u32> {
+        (seat == SEAT).then_some(SURFACE)
+    }
+
+    fn focuses(&self, keyboard: HostId, surface: u32) -> bool {
+        keyboard == KEYBOARD && surface == SURFACE
+    }
+
+    fn shortcut(&self, chord: &Accelerator) -> Option<BindingId> {
+        let mut shortcuts = self.shortcuts.iter();
+        shortcuts.find_map(|(bound, binding)| (bound == chord).then_some(*binding))
+    }
+
+    fn admits_recovery(&self, _ti: TiId) -> bool {
+        self.gate
+    }
+}
+
+/// A core whose host keeps `accelerators`, with [`KEYBOARD`], then
+/// [`OTHER`], on [`SEAT`], their extended keyboards bound and the default
+/// keymap loaded.
+fn core(accelerators: &str, env: &TestEnv) -> KeyboardCore {
+    let accelerators = HostAccelerators::parse(accelerators).unwrap();
+    let mut core = KeyboardCore::new(accelerators);
+    let inputs = [
+        KeyInput::Created {
+            keyboard: KEYBOARD,
+            guest: GUEST_KEYBOARD,
+            seat: SEAT,
+        },
+        KeyInput::ExtendedBound {
+            keyboard: KEYBOARD,
+            extended: EXTENDED,
+        },
+        KeyInput::Keymap {
+            keyboard: KEYBOARD,
+            keymap: Some(crate::keymap::default_for_test()),
+        },
+        KeyInput::Created {
+            keyboard: OTHER,
+            guest: GUEST_KEYBOARD + 1,
+            seat: SEAT,
+        },
+        KeyInput::ExtendedBound {
+            keyboard: OTHER,
+            extended: OTHER_EXTENDED,
+        },
+        KeyInput::Keymap {
+            keyboard: OTHER,
+            keymap: Some(crate::keymap::default_for_test()),
+        },
+    ];
+    for input in inputs {
+        core.step(input, env);
+    }
+    core
+}
+
+fn key(key: u32, state: u32, serial: u32) -> KeyInput {
+    key_on(KEYBOARD, key, state, serial)
+}
+
+fn key_on(keyboard: HostId, key: u32, state: u32, serial: u32) -> KeyInput {
+    KeyInput::Key {
+        keyboard,
+        serial,
+        key,
+        state,
+    }
+}
+
+fn peek(key: u32, state: u32, serial: u32) -> KeyInput {
+    peek_on(EXTENDED, key, state, serial)
+}
+
+fn peek_on(extended: HostId, key: u32, state: u32, serial: u32) -> KeyInput {
+    KeyInput::Peek {
+        extended,
+        serial,
+        time: serial,
+        key,
+        state,
+    }
+}
+
+fn modifiers(depressed: u32) -> KeyInput {
+    let modifiers = KeyboardModifiers {
+        depressed,
+        ..KeyboardModifiers::default()
+    };
+    KeyInput::Modifiers {
+        keyboard: KEYBOARD,
+        modifiers,
+    }
+}
+
+fn ack(serial: u32, handled: bool) -> Option<Ack> {
+    Some(Ack {
+        keyboard: KEYBOARD,
+        serial,
+        handled,
+    })
+}
+
+/// A chord a shortcut binds is consumed, press and release, and its
+/// binding goes to the subscriber once, at the press; a host accelerator
+/// is the host's even if a shortcut binds its chord too.
+#[test]
+fn a_bound_chord_is_consumed_for_its_subscriber_and_an_accelerator_is_the_hosts() {
+    let env = TestEnv::binding("<Alt>q");
+    let mut keys = core("", &env);
+    keys.step(modifiers(ALT), &env);
+    let press = keys.step(key(KEY_Q, KEY_STATE_PRESSED, 1), &env);
+    let binding = BindingId::new(0);
+    let shortcut = Shortcut {
+        keyboard: KEYBOARD,
+        binding,
+    };
+    assert_eq!(press.shortcut, Some(shortcut));
+    assert_eq!((press.ack, press.deliver), (ack(1, true), false));
+    let release = keys.step(key(KEY_Q, KEY_STATE_RELEASED, 2), &env);
+    assert_eq!(release.shortcut, None);
+    assert_eq!((release.ack, release.deliver), (ack(2, true), false));
+
+    let mut keys = core("<Alt>q", &env);
+    keys.step(modifiers(ALT), &env);
+    let press = keys.step(key(KEY_Q, KEY_STATE_PRESSED, 1), &env);
+    assert_eq!(press.shortcut, None);
+    assert_eq!((press.ack, press.deliver), (ack(1, false), false));
+}
+
+/// A waiting recovery reads every host event the core handles before
+/// the event, once: the keyboard's modifiers leave it waiting, and a
+/// press of another key recovers the held key first, and is then
+/// delivered, so the adapter sends the recovery before the press.
+#[test]
+fn a_waiting_recovery_reads_each_host_event_before_it_is_handled() {
+    let env = TestEnv::new();
+    let mut keys = core("", &env);
+    keys.step(peek(EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 1), &env);
+    let seat = SeatId(SEAT);
+    let confirm = KeyEffect::RecoverHeldKey { ti: TI, seat };
+    assert!(keys.step(KeyInput::Ime(confirm), &env).sync);
+    assert!(keys.awaits_host_event());
+
+    let shift = keys.step(modifiers(1), &env);
+    assert!(shift.recovered.is_none() && shift.deliver);
+    assert!(keys.awaits_host_event());
+
+    let press = keys.step(key(KEY_A, KEY_STATE_PRESSED, 2), &env);
+    let Some(Recovered { ti, pair }) = press.recovered else {
+        panic!("the press recovers the held key first");
+    };
+    assert_eq!((ti, pair.len()), (TI, 2));
+    assert!(press.deliver);
+    assert!(!keys.awaits_host_event());
+}
+
+/// Whoever delivers a key generation to the guest first owns it, and a
+/// shortcut never acts on a key the guest already received: a chord the
+/// IME recovered, which a binding then binds, as a reload of the bindings
+/// between its peek and its `wl_keyboard.key` does, stays the recovery's.
+/// A peeked chord a shortcut binds is never a recovery candidate.
+#[test]
+fn a_chord_the_guest_already_received_stays_the_guests() {
+    let unbound = TestEnv::new();
+    let mut keys = core("", &unbound);
+    keys.step(modifiers(ALT), &unbound);
+    keys.step(peek(KEY_Q, KEY_STATE_PRESSED, 1), &unbound);
+    let seat = SeatId(SEAT);
+    let confirm = KeyEffect::RecoverHeldKey { ti: TI, seat };
+    keys.step(KeyInput::Ime(confirm), &unbound);
+    let recovered = keys.step(KeyInput::HostEvent, &unbound).recovered;
+    assert!(recovered.is_some_and(|recovered| recovered.pair.len() == 2));
+
+    let bound = TestEnv::binding("<Alt>q");
+    let press = keys.step(key(KEY_Q, KEY_STATE_PRESSED, 1), &bound);
+    assert_eq!(press.shortcut, None);
+    assert!(
+        !press.deliver,
+        "the physical channel must not duplicate the guest press"
+    );
+    assert_eq!(
+        keys.owner(KEYBOARD, KEY_Q),
+        Some(GuestKeyOwner::ImeRecovery)
+    );
+    // The recovered pair is already balanced.
+    let release = keys.step(key(KEY_Q, KEY_STATE_RELEASED, 2), &bound);
+    assert!(release.shortcut.is_none() && !release.deliver);
+}
+
+/// [`KEYBOARD`] holds Backspace, which the input method took and the IME
+/// core leased to [`TI`].
+fn leased_backspace(env: &TestEnv) -> KeyboardCore {
+    let mut keys = core("", env);
+    keys.step(peek(EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 1), env);
+    let lease = KeyEffect::Lease {
+        ti: TI,
+        seat: SeatId(SEAT),
+        outcome: LeaseOutcome::ArmIfBackspaceHeld,
+    };
+    keys.step(KeyInput::Ime(lease), env);
+    assert_eq!(keys.backspace_lease(KEYBOARD), Some(TI));
+    keys
+}
+
+/// An empty confirmation of [`TI`], which waits for the host's next event.
+fn confirm(keys: &mut KeyboardCore, env: &TestEnv) {
+    let seat = SeatId(SEAT);
+    let confirm = KeyEffect::RecoverHeldKey { ti: TI, seat };
+    assert!(keys.step(KeyInput::Ime(confirm), env).sync);
+}
+
+/// A Backspace release on any keyboard of the seat, on either channel,
+/// ends the seat's lease, and so does a move of the seat's focus.
+#[test]
+fn a_backspace_release_or_a_focus_change_ends_the_seats_lease() {
+    let env = TestEnv::new();
+    let release = |keys: &mut KeyboardCore, peeked: bool| {
+        let (press, release) = match peeked {
+            true => (
+                peek_on(OTHER_EXTENDED, EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 5),
+                peek_on(OTHER_EXTENDED, EVDEV_KEY_BACKSPACE, KEY_STATE_RELEASED, 6),
+            ),
+            false => (
+                key_on(OTHER, EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 5),
+                key_on(OTHER, EVDEV_KEY_BACKSPACE, KEY_STATE_RELEASED, 6),
+            ),
+        };
+        keys.step(press, &env);
+        assert_eq!(keys.backspace_lease(KEYBOARD), Some(TI), "peeked: {peeked}");
+        keys.step(release, &env);
+        assert_eq!(keys.backspace_lease(KEYBOARD), None, "peeked: {peeked}");
+        assert!(
+            keys.backspace_repeat_cancelled(KEYBOARD),
+            "peeked: {peeked}"
+        );
+    };
+    for peeked in [false, true] {
+        release(&mut leased_backspace(&env), peeked);
+    }
+
+    let mut keys = leased_backspace(&env);
+    let update = KeyboardFocusUpdate {
+        accepted: true,
+        seat_changes: vec![crate::state::SeatFocusChange {
+            guest_seat: SEAT,
+            previous_surface: Some(SURFACE),
+            current_surface: None,
+        }],
+        retired_keyboards: Vec::new(),
+    };
+    let focus = KeyInput::Focus {
+        update,
+        enter: None,
+        keyboard: Vec::new(),
+    };
+    keys.step(focus, &env);
+    assert_eq!(keys.backspace_lease(KEYBOARD), None);
+    assert!(keys.backspace_repeat_cancelled(KEYBOARD));
+}
+
+/// A move of a seat's focus ends its peek watermarks.
+#[test]
+fn a_focus_change_ends_the_seats_peek_watermarks() {
+    let env = TestEnv::new();
+    let mut keys = core("", &env);
+    keys.step(peek(KEY_A, KEY_STATE_PRESSED, 1), &env);
+    assert!(keys.latest_peek_sequence(SEAT, Some(SURFACE)).is_some());
+    let update = KeyboardFocusUpdate {
+        accepted: true,
+        seat_changes: vec![crate::state::SeatFocusChange {
+            guest_seat: SEAT,
+            previous_surface: Some(SURFACE),
+            current_surface: None,
+        }],
+        retired_keyboards: Vec::new(),
+    };
+    let focus = KeyInput::Focus {
+        update,
+        enter: None,
+        keyboard: Vec::new(),
+    };
+    keys.step(focus, &env);
+    assert_eq!(keys.latest_peek_sequence(SEAT, Some(SURFACE)), None);
+}
+
+/// A recovery the host event decides sends nothing once the text input
+/// no longer passes the gate, and ends the lease.
+#[test]
+fn a_recovery_sends_nothing_once_its_text_input_fails_the_gate() {
+    let open = TestEnv::new();
+    let mut keys = leased_backspace(&open);
+    confirm(&mut keys, &open);
+    let closed = TestEnv {
+        gate: false,
+        ..TestEnv::new()
+    };
+    let fx = keys.step(KeyInput::HostEvent, &closed);
+    assert!(fx.recovered.is_none());
+    assert!(!keys.awaits_host_event());
+    assert_eq!(keys.backspace_lease(KEYBOARD), None);
+}
+
+/// A key the proxy drops undecoded, of a keyboard the guest released, is
+/// the press a peek on that keyboard announced: the confirmation was that
+/// press's, and nothing is recovered. Another keyboard's is any other
+/// event.
+#[test]
+fn an_unhandled_key_of_the_announcing_keyboard_is_its_press() {
+    let env = TestEnv::new();
+    for (dropped_on, recovered) in [(OTHER, false), (KEYBOARD, true)] {
+        let mut keys = leased_backspace(&env);
+        confirm(&mut keys, &env);
+        keys.step(KeyInput::UnhandledModifiers, &env);
+        assert!(keys.awaits_host_event(), "modifiers leave it waiting");
+        keys.step(peek_on(OTHER_EXTENDED, KEY_A, KEY_STATE_PRESSED, 7), &env);
+        assert!(keys.awaits_host_event());
+        let keyboard = dropped_on;
+        let fx = keys.step(KeyInput::UnhandledKey { keyboard }, &env);
+        assert_eq!(fx.recovered.is_some(), recovered, "{dropped_on:?}");
+        assert!(!keys.awaits_host_event());
+    }
+}

@@ -808,14 +808,16 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   either that key's autorepeat or a new press's confirmation. The
   keyboard concern holds the recovery of the eligible held key, the one
   with the latest peek, numbered when its peek arrives
-  (`ime_keys::PendingRecovery`), and decides it before it handles the
+  (`keys::recovery::PendingRecovery`), and decides it before it handles the
   host's next event. Before any peek, `wl_keyboard.modifiers` leave it
   waiting, and so does the `peek_key` press of a key the keyboard does not
   hold, from any keyboard of the connection: Exo has one seat, which every
   guest `wl_seat` stands for, and sends each keyboard the press in turn.
   That key's `wl_keyboard.key` press on the same keyboard, with the peek's
   serial, drops it, as a confirmation that finds no held key, and so does
-  the text input's `leave`: Exo confirms as it detaches the input method
+  a key of that keyboard the proxy drops unread because the guest has
+  released the keyboard, and the text input's `leave`: Exo confirms as it
+  detaches the input method
   (E6). Any other host event recovers the key first, so that its pair and
   `done` precede that event.
   With a recovery that waits the proxy sends the host a `wl_display.sync`,
@@ -855,6 +857,9 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   as Backspace, would edit text, and a dropped autorepeat loses none.
   Tests: `a_confirmation_before_an_unhandled_press_recovers_no_held_key`,
   `a_confirmation_before_a_handled_press_recovers_the_held_key`,
+  `a_recovery_reaches_the_guest_before_the_event_that_decides_it`,
+  `a_press_dropped_with_its_released_keyboard_is_still_the_confirmations`,
+  `a_recovery_sends_nothing_once_its_text_input_fails_the_gate`,
   `a_press_on_another_seats_keyboard_keeps_a_recovery_waiting`,
   `a_waiting_recovery_ends_with_its_text_input_or_keyboard`,
   `an_input_method_detach_ends_the_recovery_of_held_keys`,

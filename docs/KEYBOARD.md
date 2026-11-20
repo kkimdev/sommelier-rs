@@ -15,9 +15,45 @@ key on `zcr_extended_keyboard_v1.peek_key` first, even one its input
 method consumes, so the proxy sees the key's physical life on two
 channels and its delivery on up to two.
 
+## The keyboard core
+
+The keyboard concern is a sans-IO state machine, the IME core's twin:
+`KeyboardCore` (`sommelier/src/keys/`, `Context::keys`). Every message
+that can change its state reaches it as one `KeyInput` through
+`KeyboardCore::step`, which returns the `KeyEffects` the adapter
+(`handler/keyboard.rs`) applies, in this order: a recovery the host
+event decided, a consumed shortcut's binding for its subscriber, the
+`ack_key`, the sync of a recovery that waits, the destroy of an ended
+keyboard's extended keyboard, whether the guest gets the event, guest
+events, and inputs of the IME core. It reads what it does
+not own through `keys::Env`: the keyboard focus, the shortcut bindings,
+and the IME core's gate. It owns:
+
+- one `Keyboard` record per host keyboard (`keys/keyboards.rs`): its
+  guest object and seat, its keymap, its modifiers and its extended
+  keyboard;
+- each key's generations, their delivery, the Backspace lease and the
+  peek watermarks (`keys/generations.rs`, below);
+- the recovery of an empty confirmation's held key (`keys/recovery.rs`,
+  [below](#the-recovery-decision));
+- the host accelerators (`SOMMELIER_ACCELERATORS`), whose chords the
+  host keeps. A chord is the host's, a shortcut's, or the guest's
+  (`KeyboardCore::classify`, which both key channels ask). A shortcut is
+  generic: the core asks `Env` for a chord's binding
+  (`accelerator::BindingId`), consumes its press and release, and hands
+  the binding to its subscriber, window placement, as
+  `KeyEffects::shortcut`.
+
+The core and the IME core talk only through typed messages: the IME
+core's requests (`ime::KeyEffect`) reach it as `KeyInput::Ime`, and it
+hands the IME core `ime::Input`s: `GuestKey`, `FocusChanged` and the
+recovered key (`HeldKeyRecovered`). Only the core changes its state; the
+registry's transitions below are private to it, and tests outside it
+drive it through its step or a whole session.
+
 ## State
 
-`KeyGenerationRegistry` (`sommelier/src/state/input.rs`) holds one
+`KeyGenerationRegistry` (`sommelier/src/keys/generations.rs`) holds one
 `KeyGeneration` per host keyboard and key, its current generation: the
 key's life from one press to the next. A key with no entry is idle. A
 generation has two independent parts: its phase, with the peek record
@@ -66,19 +102,19 @@ within each part, their illegal combinations cannot be written:
 
 ## Transitions
 
-Each input has one transition in the registry. The handler decodes the
-event, supplies the facts the registry cannot know (the chord under the
-keyboard's XKB state, focus), and applies the effects on the guest:
+Each input has one transition in the registry, which the core's step
+calls with the facts the registry cannot know (the chord under the
+keyboard's XKB state, focus):
 
-| Input | Transition | Handler |
+| Input | Transition | `KeyInput` |
 | --- | --- | --- |
-| `peek_key` press, release | `peek_key(PeekInput)` → `PeekOutcome` | `on_peek_key` |
-| `wl_keyboard.key` | `admit_key` (physical), then `transition_physical` (delivery) | `on_key` |
-| recovered pair | `recover` | `ime_keys::recover_pending` |
-| `wl_keyboard.enter` | `install_enter_snapshot`: every listed key `Held`, `Physical` | `on_enter` |
-| leave, keyboard end | `clear_keyboard` of each keyboard that lost its focus or ended | `on_leave`, `forget_keyboard` |
-| H2 detach | `mark_held_keys_stale` | `ime_keys::forget_held_keys_for_seat` |
-| Backspace lease | `lease(LeaseInput)` | `ime_keys::lease`, from `on_key`, `on_peek_key`, the IME core's `KeyEffect::Lease`, a recovery and a focus change |
+| `peek_key` press, release | `peek_key(PeekInput)` → `PeekOutcome` | `Peek` |
+| `wl_keyboard.key` | `admit_key` (physical), then `transition_physical` (delivery) | `Key` |
+| recovered pair | `recover` | the host event that decides the recovery |
+| `wl_keyboard.enter` | `install_enter_snapshot`: every listed key `Held`, `Physical` | `Focus` |
+| leave, keyboard end | `clear_keyboard` of each keyboard that lost its focus or ended | `Focus`, `Ended` |
+| H2 detach | `mark_held_keys_stale` | `Ime(KeyEffect::InputMethodDetached)` |
+| Backspace lease | `lease(LeaseInput)` | `Key`, `Peek`, `Ime(KeyEffect::Lease)`, a recovery and `Focus` |
 
 `wl_keyboard.key` has two steps, because only a press of the current
 generation needs its chord classified. `admit_key` settles the events
@@ -124,17 +160,34 @@ The phase moves:
 An empty confirmation at extension v11 is either a held key's autorepeat
 or the confirmation Exo sends before a press its input method does not
 handle (INVARIANTS: "An empty confirmation recovers a held key only once
-the host shows it repeated"). `ime_keys::PendingRecovery` holds the
-recovery, and `PendingRecovery::decide` is its transition for each host
-event, read as a `HostSignal`. No recovery starts while a keyboard of
-the seat holds a key `stale`, whose next press Exo may announce with the
-confirmation alone (`held_repeat_key_for_seat`).
+the host shows it repeated"). `keys::recovery::PendingRecovery` holds
+the recovery, and `PendingRecovery::decide` is its transition for each
+host event, read as a `HostSignal`. The core reads the signal off the
+input itself, decoded once, by the dispatcher: `Key`, `Modifiers`,
+`Peek` and `TextInputLeave` are their events, and the adapter hands the
+core `HostEvent` before any other host event while a recovery waits
+(`handler::keyboard::before_host_event`, which reads only the message
+header). A `wl_keyboard.key` or `modifiers` the proxy drops unhandled,
+of a keyboard the guest has released, reaches the core undecoded
+(`UnhandledKey`, `UnhandledModifiers`): Exo sends a key right after its
+peek, so such a key of the keyboard a waited-for peek came from is that
+press (test:
+`a_press_dropped_with_its_released_keyboard_is_still_the_confirmations`).
+Any other event the proxy drops is any other event. What the recovery
+sends precedes the
+event: the adapter sends a `wl_keyboard.key` or `modifiers` it decided
+after it, in place of the forward (test:
+`a_recovery_reaches_the_guest_before_the_event_that_decides_it`). No
+recovery starts while a keyboard of the seat holds a key `stale`, whose
+next press Exo may announce with the confirmation alone
+(`KeyboardCore::held_repeat_key`).
 
 | Waiting for | Event | Step |
 | --- | --- | --- |
 | `NextEvent` | `wl_keyboard.modifiers` | wait |
 | `NextEvent` | peek press, on a known host keyboard, of a key that keyboard does not hold, or holds stale | wait for that key's `Press` |
 | `Press` | that key's `wl_keyboard.key` press with the peek's serial | drop |
+| `Press` | a `wl_keyboard.key` of that keyboard the proxy drops undecoded, as the guest released the keyboard | drop |
 | any | the text input's `leave` (E6) | drop |
 | any | anything else | recover, then handle the event |
 
@@ -150,5 +203,25 @@ confirmation alone (`held_repeat_key_for_seat`).
   `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`.
 - The recovery's transition table. Test:
   `a_waiting_recovery_is_decided_by_the_hosts_next_event`.
-- The handler tests of `keyboard.rs`, `ime_keys.rs` and `text_input.rs`
-  (each in its `tests.rs`) and the DST pin the wire behaviour.
+- The core reads each host event before it handles it, and a recovery
+  the event decides comes with the event's own delivery. Test:
+  `a_waiting_recovery_reads_each_host_event_before_it_is_handled`.
+- A Backspace release on any keyboard of the seat, on either channel,
+  and a move of the seat's focus end its lease, and the move its peek
+  watermarks; a recovery sends nothing once its text input fails the
+  gate. Tests:
+  `a_backspace_release_or_a_focus_change_ends_the_seats_lease`,
+  `a_focus_change_ends_the_seats_peek_watermarks`,
+  `a_seats_peek_watermarks_end_with_its_focus`,
+  `a_recovery_sends_nothing_once_its_text_input_fails_the_gate`,
+  `an_unhandled_key_of_the_announcing_keyboard_is_its_press`.
+- A shortcut's chord is consumed for its subscriber, before its key is
+  acknowledged, an accelerator's is the host's, and a key the guest
+  already received stays the guest's.
+  Tests:
+  `a_bound_chord_is_consumed_for_its_subscriber_and_an_accelerator_is_the_hosts`,
+  `a_shortcut_places_before_its_key_is_acknowledged`,
+  `a_chord_the_guest_already_received_stays_the_guests`.
+- The handler tests of `keyboard.rs` and `text_input.rs` (each in its
+  `tests.rs`, the recovery's in `keyboard/tests/recovery.rs`) and the DST
+  pin the wire behaviour.

@@ -42,7 +42,7 @@ pub(crate) enum InternalCallback {
     TextInput { token: BarrierToken },
     /// The host has sent every event of the task that sent an empty IME
     /// confirmation, whose recovery of a held key waits
-    /// ([`crate::handler::ime_keys::PendingRecovery`]). The `done` decides
+    /// (`crate::keys::recovery`). The `done` decides
     /// it, as any host event that comes before it would.
     KeyRecovery,
     /// Exo has handled a placement step of the toplevel of this host

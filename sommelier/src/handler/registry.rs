@@ -2217,13 +2217,14 @@ mod tests {
         // Simulate the child created by get_extended_keyboard for an already
         // bound host wl_keyboard. The child owns its own destructor and must
         // outlive the manager global.
-        ctx.keyboards.add_for_test(41, 40, 42);
+        crate::handler::keyboard::for_test::created(&mut ctx, 41, 40, 42);
         crate::handler::keyboard::KeyboardHandler::ensure_extended_keyboard_bound(
             &mut ctx,
             HostId(40),
         );
         let child_id = ctx
-            .keyboards
+            .keys
+            .keyboards()
             .extended_for_test(HostId(40))
             .expect("extended keyboard child");
         assert_eq!(
@@ -2239,12 +2240,12 @@ mod tests {
             "global removal retires only the manager dispatch entry"
         );
         assert_eq!(
-            ctx.keyboards.extended_for_test(HostId(40)),
+            ctx.keys.keyboards().extended_for_test(HostId(40)),
             Some(child_id),
             "an existing child must remain mapped after manager removal"
         );
         assert_eq!(
-            ctx.keyboards.of_extended(child_id),
+            ctx.keys.keyboards().of_extended(child_id),
             Some(HostId(40)),
             "the reverse child mapping must remain routable"
         );

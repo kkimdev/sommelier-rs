@@ -209,7 +209,7 @@ text input before the gate, as each one changed Exo's text.
 | F2 | Surface destroyed (`compositor::forget_surface`) | A text input focused on that surface | as F1 | `leave(s)`, while `s` is still valid. **No commit**: the guest destroyed the window the text would go into. | The focus is projected again from `Env::keyboard_focus`, which the destroy has already moved off `s`. `forget_surface` sends F2 before the F1 of each seat whose keyboard focused `s`, so that F1, which would commit, finds the field reset. | INVARIANTS "Focus teardown…"; tests: `row_F2_a_destroyed_surface_is_left_while_it_is_valid`, `wl_surface_destroy_repairs_only_text_inputs_on_the_stale_surface` |
 | F3 | `wl_seat` bound under a guest ID (`registry.rs`) | The text inputs of that seat | Through the reconcile: the deferred `activate`, with its content type | none | | INVARIANTS Object lifetimes "Releasing a parent does not end its children"; test: `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type` |
 | F4 | Press: a `wl_pointer.button` press from a pointer whose `enter` named `s`, or a `wl_touch.down` on `s` (`pointer.rs` and `touch.rs`, through `text_input::end_composition_on_press`) | The enabled text input is focused on `s`; gate; `shown = Some(p)` | `zwp_text_input_v1.reset`, then a barrier (the fence) | `Txn{commit: p, preedit: none}`, then the press or down itself, re-sent by the core | `shown := none`; `fence := Some(f)`; the lease ends. A press whose commit does not fit changes nothing and is forwarded. A press leaves the pieces to their edit (B3). A release, another surface (subsurfaces included), no composition, or an open fence changes nothing, and the press is forwarded. | INVARIANTS "A press ends the composition on its surface" |
-| F5 | Key activity: a key press the keyboard concern forwards to the guest (`Input::GuestKey`, from `keyboard.rs`) | The text inputs of that seat | none | none | The guest may have edited its text where Exo does not see, so the mirror stops measuring until the guest states its text (INVARIANTS "Exo's deletes and regions are measured in the Exo mirror, or dropped"). Leases are keyboard state: the keyboard ends them on a non-Backspace press and on a Backspace release. | INVARIANTS "IME state is scoped to its keyboard or seat"; row test: `row_H9_after_a_forwarded_key_drops` |
+| F5 | Key activity: a key press the keyboard concern forwards to the guest (`Input::GuestKey`, from the keyboard core) | The text inputs of that seat | none | none | The guest may have edited its text where Exo does not see, so the mirror stops measuring until the guest states its text (INVARIANTS "Exo's deletes and regions are measured in the Exo mirror, or dropped"). Leases are keyboard state: the keyboard ends them on a non-Backspace press and on a Backspace release. | INVARIANTS "IME state is scoped to its keyboard or seat"; row test: `row_H9_after_a_forwarded_key_drops` |
 | F6 | Host `delete_id` of the v1 object while the guest object is live (`forget_object`, as `Input::Destroy` with `host_deleted`) | any | Nothing to v1; the extension is destroyed | `delete_id`, as in G10 | Link → `Detached` with no requests. | test: `a_host_destroyed_text_input_sends_nothing_to_its_host_object` |
 | R1 | **Abandon** (reconcile outcome): the target is inactive, the link is `Attached`, and `Env::host_seat` is `None` | none | none | none | Link → `Detached` locally; the composition is cleared; **the fence stays**. Exo keeps its input method attached until its own focus moves; HANDOVER covers the cost. | `ActivationStep::Abandon`; HANDOVER "A text input whose guest `wl_seat` goes away…" |
 | R2 | **Deferred activation** (reconcile outcome): the target is active, and the link is `Draining`, or `Detached` with no live seat | none | none | none | No change. The deferral is logged when it starts or changes its reason (`Deferral::Draining` or `NoSeat`), not at every step that finds it waiting. A missing seat warns once per text input. | `ime/host.rs`; `Warned` |
@@ -482,10 +482,11 @@ A step returns its `Effects`, each list in order:
   or dropped"); and `Destroy`, a destructor request, after which the
   adapter retires the host object it destroyed. Each carries its
   request, so the pairing holds by construction.
-- `keys`: `KeyEffect`s for the keyboard concern, applied after the
-  other two: a `Lease` outcome (`End` or `ArmIfBackspaceHeld`),
-  `RecoverHeldKey` (X2'), or `InputMethodDetached` (H2), which ends the
-  recovery of every key the seat holds.
+- `keys`: `KeyEffect`s for the keyboard core, applied after the other
+  two, each as its `keys::KeyInput::Ime`: a `Lease` outcome (`End` or
+  `ArmIfBackspaceHeld`), `RecoverHeldKey` (X2'), or
+  `InputMethodDetached` (H2), which ends the recovery of every key the
+  seat holds.
 - `forward`: whether the press of an `Input::Press` is forwarded, since
   it ended no composition. The core consumes every other input's
   message.
@@ -496,7 +497,8 @@ A step returns its `Effects`, each list in order:
 G10, the host's events H, X and W, and the cross-concern messages F1 to
 F5 and the recovered key of X2' (`Input::HeldKeyRecovered`).
 [DESIGN.md](DESIGN.md#keyboard-and-ime) lists the module that sends each
-one.
+one; the keyboard core's (`GuestKey`, `FocusChanged` and
+`HeldKeyRecovered`) are its effects ([KEYBOARD.md](KEYBOARD.md#the-keyboard-core)).
 
 **Why `Env` and not more inputs.** Seat liveness and surface pairing
 belong to the object table, and keyboard focus belongs to

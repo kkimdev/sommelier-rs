@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::protocols::wayland::wl_seat;
-use crate::state::{Context, HostId, Keyboard, PostDispatch};
+use crate::state::{Context, PostDispatch};
 use crate::wire::Action;
 
 pub struct SeatHandler;
@@ -42,27 +42,17 @@ impl wl_seat::WlSeatHandler for SeatHandler {
     }
 }
 
-/// `wl_seat.get_keyboard` of guest seat `seat` created guest keyboard
-/// `keyboard`, whose host keyboard its forward has just mapped: record it.
-pub(crate) fn keyboard_created(ctx: &mut Context, keyboard: u32, seat: u32) {
-    match ctx.shadow_table.get_host_id(keyboard) {
-        Some(host) => ctx
-            .keyboards
-            .insert(HostId(host), Keyboard::new(keyboard, seat)),
-        None => log::debug!("Guest keyboard {keyboard} has no host keyboard"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::GuestKeyOwner;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
     use crate::protocols::wayland::wl_keyboard::{self, WlKeyboardHandler};
     use crate::protocols::wayland::wl_seat::WlSeatHandler;
     use crate::protocols::wayland::{wl_compositor, wl_display};
     use crate::proxy::harness::{Object, Session, TextInput};
-    use crate::state::{Context, GuestKeyOwner, HostId};
+    use crate::state::{Context, HostId};
     use crate::wire::WL_DISPLAY_ID;
 
     /// A guest seat, a keyboard of it whose focus the host gives to a
@@ -151,24 +141,29 @@ mod tests {
             .insert_paired_for_test(guest_seat, 11, "wl_seat");
         ctx.shadow_table
             .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-        ctx.keyboards
-            .add_for_test(guest_keyboard, host_keyboard, guest_seat);
+        crate::handler::keyboard::for_test::created(
+            &mut ctx,
+            guest_keyboard,
+            host_keyboard,
+            guest_seat,
+        );
+        crate::handler::keyboard::for_test::extended(&mut ctx, host_keyboard, 31);
         ctx.keyboard_focus
             .set_for_test(HostId(host_keyboard), guest_seat, 40, 41);
-        ctx.key_generations
-            .observe_physical_state(HostId(host_keyboard), 14, 1);
+        crate::handler::keyboard::for_test::peek(&mut ctx, 31, 1, 14, 1);
         ctx.last_sender_id = guest_seat;
 
         assert_eq!(SeatHandler.on_release(&mut ctx), Action::Forward);
         assert_eq!(ctx.keyboard_focus.surface_for_seat(guest_seat), Some(40));
-        assert_eq!(ctx.keyboards.seat(HostId(host_keyboard)), Some(guest_seat));
+        assert_eq!(
+            ctx.keys.keyboards().seat(HostId(host_keyboard)),
+            Some(guest_seat)
+        );
         assert!(ctx
             .keyboard_focus
             .focus_for_keyboard(HostId(host_keyboard))
             .is_some());
-        assert!(ctx
-            .key_generations
-            .physically_held(HostId(host_keyboard), 14));
+        assert!(ctx.keys.held(HostId(host_keyboard), 14));
     }
 
     #[tokio::test]
@@ -257,8 +252,12 @@ mod tests {
             .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
         ctx.shadow_table
             .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-        ctx.keyboards
-            .add_for_test(guest_keyboard, host_keyboard, guest_seat);
+        crate::handler::keyboard::for_test::created(
+            &mut ctx,
+            guest_keyboard,
+            host_keyboard,
+            guest_seat,
+        );
 
         // The child press was forwarded while the seat was live. Its release
         // must remain paired even if the parent seat is released first.
@@ -276,7 +275,7 @@ mod tests {
             Action::Forward
         );
         assert_eq!(
-            ctx.key_generations.guest_owner(HostId(host_keyboard), key),
+            ctx.keys.owner(HostId(host_keyboard), key),
             Some(GuestKeyOwner::Physical)
         );
 
