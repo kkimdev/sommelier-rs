@@ -654,7 +654,7 @@ user actions.
 | File (`sommelier/src/sim/`) | Holds |
 |---|---|
 | `mod.rs` | `Case`, the run and its summary, and the two CI tests |
-| `sched.rs` | The `Choose` trait, the recorded `Choices`, the channels and the step loop (`World`) |
+| `sched.rs` | The `Choose` trait, the recorded `Choices`, the channels and the step loop (`World`); the fuzzer runs on its channels too |
 | `clock.rs` | `Micros`, the virtual clock's unit |
 | `exo.rs` | The Exo model, which the fuzzer imports too: there is one Exo model |
 | `engine.rs` | The asynchronous IME engine over `Composer` |

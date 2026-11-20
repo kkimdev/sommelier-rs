@@ -126,61 +126,75 @@ assert_eq!(
 ## Randomized tests
 
 `proxy::fuzz` feeds a whole proxy client random, protocol-shaped guest
-request streams built from the vendored XML, some of them damaged, over
-real sockets. Their strings are sometimes not UTF-8, and sometimes
+request streams built from the vendored XML, some of them damaged, in
+random pieces. Their strings are sometimes not UTF-8, and sometimes
 nearly as long as a message, so that replacing their invalid bytes can
-make a forward too long. Half the cases end like a client typing into text fields
-(`proxy::fuzz::typing`): it moves the focus between its surfaces, waits
-for each move with a roundtrip, and enables, edits and disables the
-field; now and then it releases its seat while the field is enabled,
-reuses the seat's ID for a surface once it is deleted, and disables the
-field, which the proxy can then no longer deactivate. A quarter of the
-cases run with window placement on, so every XDG toplevel gets a
-host-only Aura toplevel; the run reports how many were created. Each case must end
-without a panic or hang, close every descriptor, and send at most one
-`wl_display.error`, as its last event. A case whose framing is intact
-must also either answer the stream's closing `wl_display.sync` or send
-that error. The fake compositor behind the proxy also checks that every
-request it receives comes from a live host object, creates only fresh IDs
-and names live objects of the right interface; it deletes
-destroyed objects at once, so the proxy's host ID reuse is exercised,
-creates objects of its own (a data offer for each data device, a buffer
-for each asynchronous dma-buf create), as weston does, destroys a
-destroyed surface's pending frame callbacks without `done`, and gives the
-keyboard focus to each surface the proxy commits. In a quarter of the
-cases it also destroys the live objects of one interface on its own as
-it answers some syncs. After every batch that keeps the session, the proxy
+make a forward too long. Half the cases end like a client typing into
+text fields (`proxy::fuzz::typing`): it moves the focus between its
+surfaces, waits for each move with a roundtrip, and enables, edits and
+disables the field; now and then it releases its seat while the field
+is enabled, reuses the seat's ID for a surface once it is deleted, and
+disables the field, which the proxy can then no longer deactivate. A
+quarter of the cases run with window placement on, so every XDG
+toplevel gets a host-only Aura toplevel; the run reports how many were
+created.
+
+Each case runs on the DST's scheduler (`proxy::fuzz::world`, below): the
+pieces of the guest's stream, what the proxy sends each peer and the
+host's answers each arrive after a latency the seed draws, so a seed
+fixes a case's timing as well as its input, and a replay is exact; two
+cases in 50 run twice and must leave the same trace. The proxy is a
+`proxy::harness::Session`, so its two peers hold everything it sends
+to the protocol (`test_support::wire_peer`, above). The host is the
+display the DST plays too (`sim::display`), with the Exo model behind
+it (`sim::exo`): it advertises every global, and one more output that
+it removes at once, so a bind of it crosses the removal; answers each
+sync and destructor; creates objects of its own (a data offer for each
+data device, a buffer for each asynchronous dma-buf create), as weston
+does; destroys a destroyed surface's pending frame callbacks without
+`done`; and gives each new keyboard the keymap and each keyboard the
+seat's focus. Exo drops a content type while no input method is
+attached, spends a pending surrounding-text support on the next content
+type, keeps surrounding text and the cursor rectangle regardless, and
+sends `enter` and `leave` as an input method attaches and detaches. The
+seed picks the host's `zcr_text_input_extension_v1` version: the
+newest, or in a quarter of the cases one too old for the proxy to give
+a text input an input method. Around the display, the host gives the
+seat's focus to each surface the proxy commits; as it answers a sync,
+composes on the focused field, clicks and taps there, and now and then
+takes its input method away, as when its process restarts, so that the
+proxy must activate the field again; holds its answer to a text input's
+drain barrier until it answers anything else, so a transaction the guest
+sends meanwhile reaches the proxy first and the proxy defers the
+field's activation, unless the guest waited with a second roundtrip;
+and in a quarter of the cases ends the live objects of one interface on
+its own as it answers some syncs.
+
+Each case must end without a panic, close every descriptor, and send at
+most one `wl_display.error`, as its last event. A case whose framing is
+intact must also either answer the stream's closing `wl_display.sync`
+or send that error. After every batch that keeps the session, the proxy
 must hold no state for an object that has ended
-(`Context::assert_no_orphans`). When a case's
-requests are whole and undamaged, the guest checks that it receives what
-the proxy should send, which is stricter than what libwayland-client
-tolerates: every event comes from and names only objects it has, a
-`wl_display.delete_id` names only an object it destroyed, a frame
-callback the compositor cancelled, or an object the compositor destroyed
-on its own, once (and every cancelled callback
-gets one before the closing sync is answered), and each object the server
-creates gets a fresh ID from the server range.
+(`Context::assert_no_orphans`). The guest takes a `delete_id` of an
+object it did not destroy only for a frame callback the host cancelled
+with its surface, or an object of the interface the host ends on its
+own; when its requests are whole and undamaged, every cancelled
+callback must get one before the closing sync is answered. What
+Exo holds of a field at the end is the DST's to check (`sim`, below).
+The run reports how many input methods restarted, how many host
+activations had their seat end while active, and how many deactivates
+named a seat the host had ended.
 
-The compositor also models what Exo makes of the text-input requests
-(`sim::exo`, which cites the Chromium source of each rule): it
-drops a content type while no input method is attached, spends a pending
-surrounding-text support on the next content type, keeps surrounding
-text and the cursor rectangle regardless, and sends `enter` and `leave`
-as an input method attaches and detaches. Its input method also goes
-away now and then as it answers a sync, as when its process restarts,
-and the proxy must activate the field again. The seed picks the host's
-`zcr_text_input_extension_v1` version: the newest, or in a quarter of
-the cases one too old for the proxy to give a text input an input
-method. Whether an enable reaches the proxy before or after the
-previous activation has drained follows from the seed too: the
-compositor holds its answer to every drain barrier's sync until it
-answers anything else, and the guest sometimes waits with a second
-roundtrip, whose sync releases it. What Exo holds of a field at the end
-is the DST's to check (`sim`, below). The run reports how many input methods
-restarted, how many host activations had their seat end while active,
-and how many deactivates named a destroyed seat.
+A case that goes on for 100,000 deliveries hangs, and fails. One case
+in 30 also runs through `Client::run` over real sockets (test:
+`client_run_serves_guest_streams_over_sockets`), behind the same host,
+where the kernel decides the timing: its event loop must serve both
+sides until the guest leaves, keep the protocol with both, which the
+guest of an undamaged case checks as the session's guest does, and close
+every descriptor. A scheduled case has the proxy receive its bytes in
+pieces of a size its seed draws.
 
-The suite runs 5000 cases from seed 0; run more, from another seed,
+The suite runs 6000 cases from seed 0; run more, from another seed,
 after changing how the proxy reads guest requests or tracks objects:
 
 ```bash
@@ -188,12 +202,11 @@ SOMMELIER_FUZZ_CASES=200000 SOMMELIER_FUZZ_SEED=1000000 \
   cargo test -p sommelier --bins proxy::fuzz
 ```
 
-A failure names its seed; rerun that seed alone with
-`SOMMELIER_FUZZ_SEED=<seed> SOMMELIER_FUZZ_CASES=1`, and add `RUST_LOG=debug`
-to see the proxy's log. The test prints it with the failure; a replay
-that passes prints only its summary. The seed fixes the case's
-input, not its timing (how the pieces arrive, which side the proxy serves
-first), so replay a failing seed a few times before concluding it passes.
+A failure names its seed and prints the end of its trace
+(`SOMMELIER_FUZZ_TRACE_LINES` sets how much); rerun that seed alone with
+`SOMMELIER_FUZZ_SEED=<seed> SOMMELIER_FUZZ_CASES=1`, which replays it
+exactly, and add `RUST_LOG=debug` to see the proxy's log, which the test
+prints with the failure.
 
 ## Simulation test
 

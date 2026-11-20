@@ -63,6 +63,8 @@ pub(crate) struct Session {
     /// What the proxy cost while it dispatched, since [`Self::proxy_cost`]
     /// last took it.
     proxy_cost: Counts,
+    /// The most bytes the proxy receives at once ([`Self::receive_in`]).
+    piece: usize,
 }
 
 impl Session {
@@ -83,6 +85,7 @@ impl Session {
             compositor: None,
             text_input_manager: None,
             proxy_cost: Counts::default(),
+            piece: 4096,
         }
     }
 
@@ -242,6 +245,14 @@ impl Session {
         shadow_table.insert_paired_with_version_for_test(id, host, interface, version);
         self.guest.wire.adopt(id, interface, version);
         self.host.wire.adopt(host, interface, version);
+    }
+
+    /// Have the proxy receive what each peer sends `piece` bytes at a time,
+    /// rather than a whole receive's worth (4096), so that a message
+    /// reaches it in pieces.
+    pub(crate) fn receive_in(&mut self, piece: usize) {
+        assert!(piece > 0, "a piece of at least a byte");
+        self.piece = piece;
     }
 
     /// Let the proxy end on its own the guest objects for which
@@ -443,10 +454,10 @@ impl Session {
 /// The transport between each peer and the proxy.
 impl Session {
     /// Write `bytes` to the socket of the peer that sends in `direction`,
-    /// `fds` with their first byte, a receive's worth at a time, and have
-    /// the proxy receive each piece, as `Client::run` does, so that it
-    /// reads them through its own transport. Returns `false` if the proxy
-    /// refuses what it receives.
+    /// `fds` with their first byte, a piece at a time
+    /// ([`Self::receive_in`]), and have the proxy receive each piece, as
+    /// `Client::run` does, so that it reads them through its own
+    /// transport. Returns `false` if the proxy refuses what it receives.
     fn transmit(&mut self, direction: Direction, (bytes, fds): Outgoing) -> bool {
         use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
         use std::io::IoSlice;
@@ -469,7 +480,7 @@ impl Session {
             } else {
                 &[]
             };
-            let end = bytes.len().min(sent + 4096);
+            let end = bytes.len().min(sent + self.piece);
             let iov = [IoSlice::new(&bytes[sent..end])];
             sent += sendmsg::<()>(socket, &iov, cmsgs, MsgFlags::MSG_NOSIGNAL, None)
                 .expect("send to the proxy");

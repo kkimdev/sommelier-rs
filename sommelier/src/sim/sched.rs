@@ -72,7 +72,7 @@ use crate::test_support::{decode, Rng};
 use crate::wire::{Outgoing, WL_DISPLAY_ID};
 
 /// The source of a case's choices.
-pub(super) trait Choose {
+pub(crate) trait Choose {
     /// A choice below `n`.
     fn pick(&mut self, n: u32) -> u32;
 
@@ -92,7 +92,7 @@ impl<F: FnMut(u32) -> u32> Choose for F {
 
 /// A case's choices, drawn from a seed and recorded, or replayed from a
 /// recording, so that a shrinker can edit and replay them.
-pub(super) struct Choices {
+pub(crate) struct Choices {
     recorded: Vec<u32>,
     /// The choices to replay; draws past their end are 0.
     replay: Option<Vec<u32>>,
@@ -137,7 +137,7 @@ impl Choose for Choices {
 
 /// A FIFO channel whose messages each arrive after a drawn latency, but
 /// never before the message ahead of them.
-pub(super) struct Channel<T> {
+pub(crate) struct Channel<T> {
     /// The longest latency a message draws.
     latency: Micros,
     queue: VecDeque<(Micros, T)>,
@@ -177,7 +177,7 @@ impl<T> Channel<T> {
 /// Which of the sources, each ready at its time or idle (`None`), goes
 /// next: the earliest; of several ready at once, a choice among them in
 /// the sources' order, so choice 0 is the first.
-pub(super) fn earliest(sources: &[Option<Micros>], choices: &mut impl Choose) -> Option<usize> {
+pub(crate) fn earliest(sources: &[Option<Micros>], choices: &mut impl Choose) -> Option<usize> {
     let first = sources.iter().flatten().min()?;
     let tied: Vec<usize> = (0..sources.len())
         .filter(|&i| sources[i] == Some(*first))

@@ -59,8 +59,8 @@ impl Guest<'_> {
             bind_seat,
             bind_manager,
             request(seat, wl_seat::REQ_GET_KEYBOARD, &[keyboard]),
-            // For the compositor's presses ([`super::compositor`]), which
-            // end a composition.
+            // For the host's presses ([`super::world`]), which end a
+            // composition.
             request(seat, wl_seat::REQ_GET_POINTER, &[pointer]),
             request(seat, wl_seat::REQ_GET_TOUCH, &[touch]),
             request(
@@ -96,7 +96,7 @@ impl Guest<'_> {
             // Now and then the guest releases the seat of an enabled field,
             // which the proxy can then no longer deactivate. Its typing
             // ends there: Exo keeps the abandoned activation.
-            if enabled && seat_version >= wl_seat::REQ_RELEASE_SINCE && self.rng.one_in(4) {
+            if enabled && seat_version >= wl_seat::REQ_RELEASE_SINCE && self.rng.one_in(2) {
                 messages.extend(self.release_seat(
                     seat,
                     text_input,

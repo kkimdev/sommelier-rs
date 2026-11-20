@@ -664,8 +664,9 @@ pixels into or map a host copy, which the test binary counts per thread
 holds each to a budget. In the same way, a test in `ime::tests` holds
 typing in the IME core to the same allocations whatever the length of
 Exo's text (test: `typing_costs_the_same_whatever_the_length_of_exos_text`). Run them with `--nocapture` to see the numbers. Beyond
-unit tests, `proxy::fuzz` feeds whole clients random guest streams, `sim`
-types into simulated text-input clients through a whole client on a
+unit tests, `proxy::fuzz` feeds whole clients random guest streams on the
+DST's scheduler, behind the host display the DST plays (`sim::display`),
+`sim` types into simulated text-input clients through a whole client on a
 virtual clock and checks their text against the specification and the
 user's intent, and
 `sommelier/tests/weston_e2e.rs` runs

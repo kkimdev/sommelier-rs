@@ -26,7 +26,7 @@ use std::ops::Add;
 /// A time on the virtual clock, counted from the start of the case, or a
 /// span of it; in microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct Micros(pub u64);
+pub(crate) struct Micros(pub u64);
 
 impl Micros {
     /// A span of `ms` milliseconds.
