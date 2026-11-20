@@ -709,7 +709,12 @@ for user actions (U→E), and the mojo pipe between Exo and the engine
   confirmation (E13); a reset drops IMA's buffer (E5).
 - **Keys.** A key on the focused surface with an attached text input
   goes to the engine. **With no attached text input, the key goes raw
-  (E7)**: during a drain or before the first `activate`.
+  (E7)**: during a drain or before the first `activate`. The keyboard
+  passes a press only of a key it does not hold, so a key whose release
+  died with the input method gets only the confirmation of its next
+  press (E13), until the keyboard's next `enter`: `Keyboard::SetFocus`
+  takes the keys it holds from the seat, which the model's `enter`
+  lists as none.
 - **Engine results.** A preedit, a commit (`confirm_preedit` or
   `commit_string`, as E9 and the case's draw say), or a delete measured
   in the predicted text (E10). If IMA serves no text input, the text is

@@ -439,6 +439,34 @@ Regression {
     ],
     choices: &[2, 1, 0, 0, 0, 0, 0, 2310, 2829, 1770, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1598, 1830, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 886, 1521, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 755, 0, 0, 0, 0, 0, 0, 2, 1197, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1717, 0, 0, 0, 0, 913, 0, 0, 0, 0, 0, 0, 1131, 0, 0, 1477, 0, 0, 450, 0, 0, 0, 0, 0, 1430, 1619, 0, 0, 0, 0, 0, 0, 0, 1, 4, 0, 1435, 1943, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2315, 0, 118, 0, 1703, 0, 0, 1831, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1682, 1, 1041, 0, 0, 0, 1931, 0, 0, 0, 0, 2000, 0, 0, 1615, 0, 529, 1233, 0, 0, 0, 1408, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 435, 0, 0, 0, 0, 0, 918, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1042, 0, 0, 0, 0, 1, 9, 0, 0, 0, 0, 1],
 },
+// Seed 16710, shrunk again once the proxy recovered nothing while Space
+// was held across the restart. A click moves the focus before Space,
+// pressed again, reaches Exo's keyboard, which takes the keys it holds
+// from the seat as it enters the new surface (`Keyboard::SetFocus`), so
+// it announces that press with a peek: the model kept Space held, sent
+// only the confirmation, and the proxy, whose keyboard the leave cleared,
+// recovered Backspace for it.
+Regression {
+    name: "a keyboard enter forgets a key whose release died with the input method",
+    client: ClientKind::Chromium,
+    settled: false,
+    latin: false,
+    texts: &["0닭1닭2가a", "0가a12닭b"],
+    actions: &[
+        UserAction::Click { field: 1, at: Target::Start },
+        UserAction::Key(Key::Char('w')),
+        UserAction::Click { field: 0, at: Target::BeforeMarker(0) },
+        UserAction::KeyDown(Key::Char(' ')),
+        UserAction::KeyUp(Key::Char(' ')),
+        UserAction::Key(Key::Char('c')),
+        UserAction::RestartInputMethod,
+        UserAction::KeyDown(Key::Backspace),
+        UserAction::Key(Key::Char(' ')),
+        UserAction::KeyUp(Key::Backspace),
+        UserAction::Click { field: 1, at: Target::BeforeMarker(1) },
+    ],
+    choices: &[2, 1, 0, 0, 0, 0, 0, 2310, 2829, 1770, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2070, 0, 0, 0, 0, 2899, 0, 0, 0, 0, 0, 0, 0, 1154, 0, 0, 0, 0, 1280, 0, 0, 0, 0, 0, 0, 2254, 0, 0, 0, 0, 0, 0, 0, 0, 535, 0, 0, 0, 0, 0, 0, 0, 652, 0, 0, 0, 0, 0, 0, 0, 2063, 0, 0, 0, 0, 0, 0, 1061, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1809, 0, 0, 317, 0, 0, 66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13, 0, 0, 0, 0, 0, 0, 0, 193, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 853, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 776, 0, 0, 0, 0, 0, 1963, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 862, 0, 0, 0, 0, 2919, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 614, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 624, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 122, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 19, 0, 0, 0, 0, 0, 0, 1],
+},
 ];
 
 #[test]

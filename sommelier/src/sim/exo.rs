@@ -1634,7 +1634,12 @@ impl Exo {
     }
 
     /// `keyboard` enters `surface`, after the modifiers, as Exo sends them.
+    /// `Keyboard::SetFocus` takes the keys it holds from the seat's, which
+    /// the enter lists, here none: a key whose release died with the input
+    /// method ([`Exo::destroy_input_method`]) is no longer held, and its
+    /// next press gets its `peek_key` again.
     fn keyboard_enter(&mut self, keyboard: u32, surface: u32) {
+        self.pressed.clear();
         let serial = self.next_serial();
         let modifiers = self.modifiers;
         self.events.push(wl_keyboard::evt::modifiers(
