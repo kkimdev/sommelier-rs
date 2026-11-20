@@ -22,6 +22,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::virtwl::DMA_BUF_SYNC_READ;
+
 const DRM_DEVICE_ENV: &str = "SOMMELIER_DRM_DEVICE";
 const DRM_DEVICE_DIR: &str = "/dev/dri";
 const VIRTIO_GPU_DRIVER: &str = "virtio_gpu";
@@ -33,7 +35,6 @@ const VIRTGPU_PARAM_3D_FEATURES: u64 = 1;
 /// `VIRTGPU_WAIT_NOWAIT`: report a busy buffer as `EBUSY` instead of
 /// waiting for it.
 const VIRTGPU_WAIT_NOWAIT: u32 = 1;
-const DMA_BUF_SYNC_READ: u32 = 1;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]

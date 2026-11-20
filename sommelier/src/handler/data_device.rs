@@ -68,7 +68,7 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
 
             // Create a pipe where we read (so host must write to it)
             // VIRTWL_IOCTL_NEW_PIPE_READ creates a pipe that is readable via the returned FD.
-            let virtwl_pipe = match virtwl.create_pipe(true) {
+            let virtwl_pipe = match virtwl.create_read_pipe() {
                 Ok(p) => p,
                 Err(e) => {
                     error!("Failed to create virtwl pipe: {}", e);

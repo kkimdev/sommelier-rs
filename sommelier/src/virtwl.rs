@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 #![allow(non_camel_case_types)]
-#![allow(dead_code)]
 
 use nix::{ioctl_read, ioctl_readwrite, ioctl_write_ptr};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
@@ -28,9 +27,7 @@ pub const VIRTWL_IOCTL_BASE: u8 = b'w';
 pub const VIRTWL_IOCTL_NEW_CTX: u32 = 0;
 pub const VIRTWL_IOCTL_NEW_ALLOC: u32 = 1;
 pub const VIRTWL_IOCTL_NEW_PIPE_READ: u32 = 2;
-pub const VIRTWL_IOCTL_NEW_PIPE_WRITE: u32 = 3;
 pub const VIRTWL_IOCTL_NEW_DMABUF: u32 = 4;
-pub const VIRTWL_IOCTL_NEW_CTX_NAMED: u32 = 5;
 
 // Values from linux/dma-buf.h.  Keep them local instead of depending on a
 // userspace header: the VirtWL ioctl is part of the guest kernel ABI and the
@@ -113,14 +110,6 @@ impl virtwl_ioctl_new {
     pub fn new_pipe_read() -> Self {
         let mut s = Self::new_zeroed();
         s.type_ = VIRTWL_IOCTL_NEW_PIPE_READ;
-        s.fd = -1;
-        s.flags = 0;
-        s
-    }
-
-    pub fn new_pipe_write() -> Self {
-        let mut s = Self::new_zeroed();
-        s.type_ = VIRTWL_IOCTL_NEW_PIPE_WRITE;
         s.fd = -1;
         s.flags = 0;
         s

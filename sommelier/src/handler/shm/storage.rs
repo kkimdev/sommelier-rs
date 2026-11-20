@@ -204,7 +204,7 @@ pub(super) fn select_shm_backing(
             buffer_size
         );
         // `valid_buffer_layout` returns a positive size.
-        let (fd, _alloc_size) = match channel.allocate(buffer_size.unsigned_abs()) {
+        let fd = match channel.allocate(buffer_size.unsigned_abs()) {
             Ok(result) => result,
             Err(error) => {
                 error!(
