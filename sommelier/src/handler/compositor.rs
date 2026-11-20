@@ -767,12 +767,6 @@ impl WlSurfaceHandler for CompositorHandler {
         if let Some(problem) = viewport_problem {
             log_unenforced_viewport_rule(ctx, surface_id, problem, &mapping);
         }
-        if shown_buffer.is_some() {
-            // What placement sends for a shown window applies with this
-            // commit, so it goes first.
-            let size = mapping.surface_rect();
-            window_placement::surface_shown(ctx, surface_id, (size.width, size.height));
-        }
         // Damage and commit were built as one batch before local state was
         // finalized. Append them together, in order, only once every check
         // has passed, so the host never sees a partial transaction.
@@ -895,10 +889,6 @@ pub(crate) fn forget_viewport(ctx: &mut Context, viewport_id: u32) {
 impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHandler {
     fn on_get_xdg_surface(&mut self, ctx: &mut Context, id: u32, surface: u32) -> Action {
         ctx.xdg_roles.add_xdg_surface(id, surface);
-        // A placement backend may implement the xdg_surface itself.
-        if let Some(action) = window_placement::claim_xdg_surface(ctx, id, surface) {
-            return action;
-        }
         Action::Forward
     }
 }

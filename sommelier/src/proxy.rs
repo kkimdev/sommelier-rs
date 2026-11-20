@@ -139,7 +139,6 @@ struct SommelierHandler {
     compositor: crate::handler::compositor::CompositorHandler,
     output: crate::handler::output::OutputHandler,
     gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
-    remote_shell: crate::handler::window_placement::RemoteShellHandler,
     callback: crate::handler::callback::CallbackHandler,
     shm: crate::handler::shm::ShmHandler,
     buffer: crate::handler::buffer::BufferHandler,
@@ -165,7 +164,6 @@ impl SommelierHandler {
             compositor: crate::handler::compositor::CompositorHandler,
             output: crate::handler::output::OutputHandler,
             gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
-            remote_shell: crate::handler::window_placement::RemoteShellHandler,
             callback: crate::handler::callback::CallbackHandler,
             shm: crate::handler::shm::ShmHandler,
             buffer: crate::handler::buffer::BufferHandler,
@@ -439,22 +437,12 @@ impl Client {
         interface: &str,
         msg: &mut WireMessage,
     ) -> DispatchResult {
-        // XDG objects a placement backend implements never reach the host.
-        if let Some(result) =
-            crate::handler::window_placement::dispatch_facade_request(ctx, interface, msg)
-        {
-            return result;
-        }
         let Some(family) = protocols::classify_interface(interface) else {
             return Ok(None);
         };
 
-        // Aura and remote-shell objects are bound internally and have no
-        // guest request path.
-        if matches!(
-            family,
-            protocols::ProtocolFamily::AuraShell | protocols::ProtocolFamily::RemoteShellUnstableV2
-        ) {
+        // Aura objects are bound internally and have no guest request path.
+        if family == protocols::ProtocolFamily::AuraShell {
             return Ok(None);
         }
 
@@ -4204,14 +4192,6 @@ protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
     gtk_surface1: gtk_shell
 });
 impl protocols::gtk::ProtocolHandler for SommelierHandler {}
-
-// Host-only remote-shell objects of the remote-shell-v2 placement backend.
-// Guests never see the global, so only host events reach this handler.
-protocols::remote_shell_unstable_v2::impl_sommelier_delegates!(SommelierHandler, {
-    zcr_remote_shell_v2: remote_shell,
-    zcr_remote_surface_v2: remote_shell
-});
-impl protocols::remote_shell_unstable_v2::ProtocolHandler for SommelierHandler {}
 
 /// What every client connection needs from the proxy's configuration.
 struct ClientConfig {

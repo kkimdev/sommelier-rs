@@ -165,12 +165,7 @@ fn guest_streams_cannot_crash_hang_or_leak() {
         let dead_seat_deactivates = DEACTIVATES_OF_DESTROYED_SEATS.load(Ordering::Relaxed);
         let presses = COMPOSITIONS_ENDED_BY_PRESSES.load(Ordering::Relaxed);
         let press_restarts = RESTARTS_AFTER_PRESSES.load(Ordering::Relaxed);
-        let remote_surfaces = REMOTE_SURFACES.load(Ordering::Relaxed);
         if cases >= COVERAGE_CASES {
-            assert!(
-                remote_surfaces > 0,
-                "no case created a remote surface, so the remote-shell backend's facades went untested"
-            );
             assert!(
                 presses > 0,
                 "no press ended a composition, so the reset fence went untested"
@@ -210,8 +205,7 @@ fn guest_streams_cannot_crash_hang_or_leak() {
              {leaves} text-input leaves sent, {restarts} input methods restarted, \
              {seatless} activations outlived their seat, \
              {dead_seat_deactivates} deactivates named a destroyed seat, \
-             {presses} compositions ended by a press, {press_restarts} restarts after a press, \
-             {remote_surfaces} facade windows got a remote surface"
+             {presses} compositions ended by a press, {press_restarts} restarts after a press"
         );
     });
 }
@@ -295,10 +289,6 @@ struct Config {
     xdg_decoration: bool,
     /// The version of the host's `zcr_text_input_extension_v1`.
     text_input_extension: u32,
-    /// Whether placement uses the remote-shell-v2 backend, which binds the
-    /// compositor's `zcr_remote_shell_v2` and implements the guest's XDG
-    /// objects itself.
-    remote_shell: bool,
 }
 
 impl Config {
@@ -307,22 +297,12 @@ impl Config {
             gpu_accel: seed & 1 != 0,
             xdg_decoration: seed & 2 != 0,
             text_input_extension: TEXT_INPUT_EXTENSION_VERSIONS[(seed >> 2) as usize % 4],
-            // A quarter of the cases, independent of the bits above.
-            remote_shell: (seed >> 4) & 3 == 0,
         }
     }
 
     /// The proxy's context for a case.
     fn context(self) -> Context {
-        if !self.remote_shell {
-            return Context::new_for_test(self.gpu_accel, self.xdg_decoration, Vec::new());
-        }
-        let mut context = Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::remote_shell_for_test(""),
-        );
-        context.gpu_accel = self.gpu_accel;
-        context.xdg_decoration = self.xdg_decoration;
-        context
+        Context::new_for_test(self.gpu_accel, self.xdg_decoration, Vec::new())
     }
 }
 
@@ -1453,10 +1433,6 @@ fn read_until_closed(
 /// across all cases.
 static FRAME_CALLBACKS_CANCELLED: AtomicU64 = AtomicU64::new(0);
 
-/// `zcr_remote_surface_v2` objects the proxy created, one per facade window
-/// of the remote-shell-v2 backend, across all cases.
-static REMOTE_SURFACES: AtomicU64 = AtomicU64::new(0);
-
 /// Host object IDs the fake compositor saw created again after their
 /// `delete_id`, across all cases: evidence that the proxy's ID reuse runs.
 static HOST_IDS_REUSED: AtomicU64 = AtomicU64::new(0);
@@ -1594,9 +1570,6 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                 pointers.created(sender, id, &interface, version);
                 if deleted.remove(&id) {
                     HOST_IDS_REUSED.fetch_add(1, Ordering::Relaxed);
-                }
-                if interface == "zcr_remote_surface_v2" {
-                    REMOTE_SURFACES.fetch_add(1, Ordering::Relaxed);
                 }
                 zombies.remove(&id);
                 let previous = objects.insert(id, interface);

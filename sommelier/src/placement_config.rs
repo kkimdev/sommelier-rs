@@ -167,10 +167,8 @@ enum PlacementConfigError {
     ConflictingSources,
     #[error("{variable} is not valid UTF-8")]
     NotUnicode { variable: &'static str },
-    #[error("unknown {BACKEND_VARIABLE} {value:?}; expected `arc`, `remote-shell-v2` or `off`")]
+    #[error("unknown {BACKEND_VARIABLE} {value:?}; expected `arc` or `off`")]
     UnknownBackend { value: String },
-    #[error("{BACKEND_VARIABLE}={value} contradicts {ARC_BOUNDS_VARIABLE}")]
-    ConflictingBackends { value: String },
     #[error(
         "cannot check placement bindings: invalid {HOST_ACCELERATORS_VARIABLE} {value:?}: {source}"
     )]
@@ -235,8 +233,7 @@ impl PlacementEnvironment {
     ///
     /// # Errors
     ///
-    /// The setting is not UTF-8, names no backend, or names a backend other
-    /// than the one the gate, which is on, chooses. Placement is then off:
+    /// The setting is not UTF-8 or names no backend. Placement is then off:
     /// guessing which backend was meant could change every window's host
     /// behaviour.
     fn requested_backend(&self) -> Result<BackendChoice, PlacementConfigError> {
@@ -252,8 +249,6 @@ impl PlacementEnvironment {
         match value.as_str() {
             "arc" => Ok(BackendChoice::Backend(BackendRequest::Arc)),
             "off" => Ok(BackendChoice::Off),
-            "remote-shell-v2" if gate => Err(PlacementConfigError::ConflictingBackends { value }),
-            "remote-shell-v2" => Ok(BackendChoice::Backend(BackendRequest::RemoteShellV2)),
             _ => Err(PlacementConfigError::UnknownBackend { value }),
         }
     }
@@ -386,7 +381,6 @@ enum BackendChoice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BackendRequest {
     Arc,
-    RemoteShellV2,
 }
 
 /// The placement backend every connection of the process uses.
@@ -395,9 +389,6 @@ pub(crate) enum PlacementBackend {
     /// `zaura_toplevel.set_window_bounds` under an ARC policy identity
     /// from the process's reserved ARC task-ID block.
     Arc(&'static ArcIdAllocator),
-    /// Host `zcr_remote_surface_v2` roles placed with
-    /// `set_bounds_in_output`.
-    RemoteShellV2,
 }
 
 /// Process-wide window placement configuration.
@@ -479,9 +470,6 @@ impl PlacementConfig {
                 reserve_arc_ids().map(PlacementBackend::Arc),
                 "no ARC task-ID block could be reserved",
             ),
-            Ok(BackendChoice::Backend(BackendRequest::RemoteShellV2)) => {
-                (Some(PlacementBackend::RemoteShellV2), "")
-            }
         };
         let Some(backend) = backend else {
             if let Some(source) = &source {
@@ -890,7 +878,6 @@ impl PlacementConfig {
     pub(crate) fn arc_id_allocator(&self) -> Option<&'static ArcIdAllocator> {
         match self.backend()? {
             PlacementBackend::Arc(arc_ids) => Some(arc_ids),
-            PlacementBackend::RemoteShellV2 => None,
         }
     }
 
@@ -915,24 +902,6 @@ impl PlacementConfig {
             *slot = Some(OsString::from(value));
         }
         Self::resolve(&environment, shortcuts_file, || Some(arc_ids))
-    }
-
-    /// The remote-shell-v2 backend with
-    /// `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`-syntax bindings.
-    pub(crate) fn remote_shell_for_test(shortcuts: &str) -> Self {
-        let config = Self::resolve_for_test(
-            &[
-                (BACKEND_VARIABLE, "remote-shell-v2"),
-                (SHORTCUTS_VARIABLE, shortcuts),
-            ],
-            None,
-            ArcIdAllocator::block_for_test(),
-        );
-        assert!(matches!(
-            config.backend(),
-            Some(PlacementBackend::RemoteShellV2)
-        ));
-        config
     }
 
     /// The ARC bounds policy on, with a fresh test block and
@@ -1298,27 +1267,6 @@ action = "fullscreen"
         }
     }
 
-    /// The remote-shell-v2 backend needs no ARC block, and its bindings
-    /// are active.
-    #[test]
-    fn the_remote_shell_backend_needs_no_arc_block() {
-        let environment = PlacementEnvironment {
-            backend: Some(" Remote-Shell-V2 ".into()),
-            shortcuts: Some("<Alt>q=left".into()),
-            ..PlacementEnvironment::default()
-        };
-        let (config, reserved) = resolve(&environment, None, block());
-        assert!(!reserved);
-        assert!(matches!(
-            config.backend(),
-            Some(PlacementBackend::RemoteShellV2)
-        ));
-        assert_eq!(
-            config.action_for(&alt(xkb::keysyms::KEY_q)),
-            Some(WindowLayoutAction::Left)
-        );
-    }
-
     /// A blank backend setting is unset, not a request, and `off` is a
     /// choice, not a conflict with the gate.
     #[test]
@@ -1341,9 +1289,9 @@ action = "fullscreen"
         assert_eq!(choice(" OFF ", None), Some(BackendChoice::Off));
     }
 
-    /// A backend setting that is not UTF-8, names no backend, or
-    /// contradicts the legacy gate is a configuration problem: placement is
-    /// off, no ARC block is reserved, and no binding source is read.
+    /// A backend setting that is not UTF-8 or names no backend is a
+    /// configuration problem: placement is off, no ARC block is reserved,
+    /// and no binding source is read.
     #[test]
     fn an_unusable_backend_setting_turns_placement_off() {
         let shortcuts = Some(OsString::from("<Alt>q=left"));
@@ -1354,11 +1302,6 @@ action = "fullscreen"
             },
             PlacementEnvironment {
                 backend: Some(OsString::from_vec(vec![b'a', b'r', b'c', 0xff])),
-                ..PlacementEnvironment::default()
-            },
-            PlacementEnvironment {
-                backend: Some("remote-shell-v2".into()),
-                arc_bounds: Some("yes".into()),
                 ..PlacementEnvironment::default()
             },
         ] {

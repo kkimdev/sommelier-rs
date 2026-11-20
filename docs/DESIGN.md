@@ -274,22 +274,10 @@ contract is in
   per-connection state (`state/window_placement/<backend>.rs`), its host
   objects and its requests (`handler/window_placement/<backend>.rs`) are
   reachable only through its variant, so another backend, or placement
-  off, cannot touch them. There are two backends:
-  - `arc`: an ARC policy identity, a host-only `zaura_toplevel` and
-    `set_window_bounds`.
-  - `remote_shell`: a host-only `zcr_remote_surface_v2` role from a
-    `zcr_remote_shell_v2` bound like the other singletons, and
-    `set_bounds_in_output`. Exo gives a surface one shell role, so the
-    guest's XDG objects become local objects ("facades",
-    [Synthetic objects](#synthetic-objects)): the compositor handler lets
-    the boundary claim a new `xdg_surface`, and `Client::dispatch_request`
-    lets it dispatch their requests, and the decoration manager's, whose
-    decoration for a facade could not name it on the host. They keep
-    their links in `XdgRoles`, so target resolution and the lifecycle
-    hooks treat them as any XDG role.
-- **What a backend needs from the host.** Both need `zaura_shell` for the
-  work area (`shell_bound`, `output_bound`); `remote_shell` also needs its
-  manager global (`wants_remote_shell` and the registry's `Singleton`).
+  off, cannot touch them. The one backend is `arc`: an ARC policy
+  identity, a host-only `zaura_toplevel` and `set_window_bounds`.
+- **What a backend needs from the host.** It needs `zaura_shell` for the
+  work area (`shell_bound`, `output_bound`).
 - **Lifecycle through the boundary.** A backend's per-object state ends
   through the boundary's `release_toplevel` and `forget_surface`, which
   the owners' `forget_*` functions call from `forget_object` (see
@@ -426,9 +414,7 @@ Some guest objects have no host counterpart and are implemented inside the
 proxy: `wl_shm` and its pools, `zwp_text_input_manager_v3` and its
 children, and an inert `wl_output` whose bind crossed its global's removal,
 with any `zxdg_output_v1` created for it (see
-[Registry globals](INVARIANTS.md#registry-globals)), and, under the
-remote-shell-v2 placement backend, the guest's `xdg_surface`,
-`xdg_toplevel` and `xdg_popup` (see [Window placement](#window-placement)).
+[Registry globals](INVARIANTS.md#registry-globals)).
 They follow the
 guest lifecycle locally, including the `delete_id` a real compositor would
 send.
