@@ -95,6 +95,7 @@ use crate::protocols::aura_shell::zaura_toplevel::{
     self, EVT_ORIGIN_CHANGE_SINCE, REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE,
 };
 use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
+use crate::state::Singleton;
 use crate::state::{
     Context, GuestId, HostId, InternalCallback, OutputState, Placement, PlacementStep, Point,
 };
@@ -714,7 +715,8 @@ pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> 
     }
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
     if ctx
-        .host_zaura_shell
+        .singletons
+        .get(Singleton::AuraShell)
         .is_none_or(|shell| shell.version < PLACEMENT_SHELL_SINCE)
     {
         return None;
@@ -1200,6 +1202,7 @@ mod tests {
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::xdg_shell::xdg_wm_base;
     use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::state::Singleton;
     use crate::test_support::queued_headers;
     use crate::wire::{Action, WL_DISPLAY_ID};
 
@@ -1747,10 +1750,8 @@ mod tests {
             (EVT_INSETS_SINCE, true),
         ] {
             let mut ctx = placement_ctx();
-            ctx.host_zaura_shell
-                .as_mut()
-                .expect("bound zaura_shell")
-                .version = shell_version;
+            ctx.singletons
+                .set_version_for_test(Singleton::AuraShell, shell_version);
             let attached = attach_toplevel(&mut ctx, TOPLEVEL.guest);
             assert_eq!(attached.is_some(), expect_toplevel, "v{shell_version}");
             assert_eq!(
@@ -1767,10 +1768,8 @@ mod tests {
     #[test]
     fn aura_toplevel_without_release_is_retired_silently() {
         let mut ctx = placement_ctx();
-        ctx.host_zaura_shell
-            .as_mut()
-            .expect("bound zaura_shell")
-            .version = zaura_toplevel::REQ_RELEASE_SINCE - 1;
+        ctx.singletons
+            .set_version_for_test(Singleton::AuraShell, zaura_toplevel::REQ_RELEASE_SINCE - 1);
         let aura_id = aura_toplevel(&mut ctx);
         ctx.client_to_host_queue.clear();
 

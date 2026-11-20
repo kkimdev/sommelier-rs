@@ -1026,6 +1026,7 @@ mod tests {
     use crate::protocols::AnyRequest;
     use crate::protocols::Iface;
     use crate::proxy::harness::Session;
+    use crate::state::Singleton;
     use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
     use crate::test_support::text_input::{self, Host};
     use crate::test_support::{
@@ -1723,7 +1724,7 @@ mod tests {
     #[test]
     fn set_app_id_noop_when_no_zaura_shell() {
         let mut ctx = toplevel_ctx();
-        ctx.host_zaura_shell = None;
+        ctx.singletons.unbind_for_test(Singleton::AuraShell);
         assert_eq!(
             set_test_app_id(&mut ctx, TOPLEVEL.guest, "no_shell"),
             [(
@@ -4143,10 +4144,8 @@ mod tests {
     #[test]
     fn old_aura_surface_stays_reserved_without_release_request() {
         let mut ctx = toplevel_ctx();
-        ctx.host_zaura_shell
-            .as_mut()
-            .expect("bound zaura_shell")
-            .version = 37;
+        ctx.singletons
+            .set_version_for_test(Singleton::AuraShell, 37);
         ctx.last_sender_id = TOPLEVEL.guest;
 
         Handlers::on_set_app_id(&mut ctx, &"legacy".to_string());

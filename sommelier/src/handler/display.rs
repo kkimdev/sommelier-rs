@@ -141,6 +141,7 @@ impl wl_display::WlDisplayHandler for Handlers {
 mod tests {
     use super::*;
     use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
+    use crate::state::Singleton;
     use crate::state::{Context, HostId};
     use crate::test_support::{protocol_error, queued_headers, raw_dispatch};
     use crate::wire::{ProtocolError, WireMessage};
@@ -213,7 +214,8 @@ mod tests {
         ctx.shadow_table.insert_paired_for_test(SEAT, 11, "wl_seat");
         ctx.shadow_table
             .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
-        ctx.host_keyboard_extension_id = Some(HostId(EXTENSION));
+        ctx.singletons
+            .bind_for_test(Singleton::KeyboardExtension, EXTENSION);
         let host = ctx.shadow_table.create_paired(20, Iface::WlKeyboard, 1, 1);
         crate::handler::keyboard::for_test::created(&mut ctx, 20, host, SEAT);
         crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
@@ -263,7 +265,8 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table
             .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
-        ctx.host_keyboard_extension_id = Some(HostId(EXTENSION));
+        ctx.singletons
+            .bind_for_test(Singleton::KeyboardExtension, EXTENSION);
         let host = ctx.shadow_table.create_paired(20, Iface::WlKeyboard, 1, 1);
         crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
         ctx.guest_destroyed(20);

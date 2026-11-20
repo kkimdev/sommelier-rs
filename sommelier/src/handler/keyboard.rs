@@ -45,6 +45,7 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
 use crate::protocols::AnyEvent;
 use crate::protocols::Iface;
+use crate::state::Singleton;
 use crate::state::{
     Context, HostId, InternalCallback, KeyboardFocus, KeyboardFocusRegistry, KeyboardModifiers,
 };
@@ -283,7 +284,11 @@ fn held_keys(keys: &[u8]) -> Vec<u32> {
 /// an active TTL in `pending_key_acks_`; Exo will apply its default policy for
 /// those keys. This mirrors the behavior of the C sommelier reference.
 pub(crate) fn ensure_extended_keyboard_bound(ctx: &mut Context, host_keyboard_id: HostId) {
-    if let Some(extension_host_id) = ctx.host_keyboard_extension_id {
+    if let Some(extension_host_id) = ctx
+        .singletons
+        .host(Singleton::KeyboardExtension)
+        .map(HostId)
+    {
         let bound = ctx
             .keys
             .keyboards()
@@ -347,7 +352,7 @@ fn send_ack_key(ctx: &mut Context, ack: Ack) {
         .get(host_keyboard_id)
         .and_then(|k| k.extended);
     let Some(host_extended_id) = extended else {
-        if ctx.host_keyboard_extension_id.is_some() {
+        if ctx.singletons.get(Singleton::KeyboardExtension).is_some() {
             log::debug!(
                 "ack_key: no extended keyboard bound yet for host_keyboard_id={}; \
                      key event arrived before on_enter? serial={}, handled={}",

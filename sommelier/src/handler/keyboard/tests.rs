@@ -42,6 +42,7 @@ use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
 use crate::state::OutputState;
+use crate::state::Singleton;
 use crate::test_support::text_input::{self, Host};
 use crate::test_support::{decode, msg_opcode, msg_sender, shm_pool_file};
 use crate::window_layout::NormalizedRect;
@@ -1053,7 +1054,10 @@ fn a_skipped_placement_still_consumes_its_chord() {
     let sliver_binding =
         b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.0001, 0.0, 0.9999, 1.0]\n";
     let mut no_shell = placeable_shortcut();
-    no_shell.ctx.host_zaura_shell = None;
+    no_shell
+        .ctx
+        .singletons
+        .unbind_for_test(Singleton::AuraShell);
     let cases = [
         (
             no_toplevel,
@@ -1599,12 +1603,16 @@ fn a_host_without_the_keyboard_extension_warns_once_per_process() {
             let mut p = Proxy::new();
             // The host has the extension, but no enter has bound the
             // keyboard's extended keyboard yet.
-            p.ctx.host_keyboard_extension_id = Some(HostId(500));
+            p.ctx
+                .singletons
+                .bind_for_test(Singleton::KeyboardExtension, 500);
             p.key(KEYBOARD, 1, 1, KEY_A, PRESSED);
             assert!(p.ctx.client_to_host_queue.is_empty());
             assert!(!NO_KEYBOARD_EXTENSION_WARNED.logged());
 
-            p.ctx.host_keyboard_extension_id = None;
+            p.ctx
+                .singletons
+                .unbind_for_test(Singleton::KeyboardExtension);
             p.key(KEYBOARD, 2, 2, KEY_A, RELEASED);
             assert!(p.ctx.client_to_host_queue.is_empty());
             assert!(NO_KEYBOARD_EXTENSION_WARNED.logged());
@@ -2291,7 +2299,9 @@ fn enter_without_keyboard_route_has_no_extension_side_effects() {
         .shadow_table
         .insert_paired_for_test(KEYBOARD.guest, KEYBOARD.host, "wl_keyboard");
     p.surface(SURFACE.0, SURFACE.1);
-    p.ctx.host_keyboard_extension_id = Some(HostId(99));
+    p.ctx
+        .singletons
+        .bind_for_test(Singleton::KeyboardExtension, 99);
     p.ctx
         .shadow_table
         .insert_host_only_for_test(99, "zcr_keyboard_extension_v1", 2);

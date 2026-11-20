@@ -30,7 +30,7 @@ limitations under the License.
 
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
 use crate::protocols::Iface;
-use crate::state::{Context, HostAuraShell};
+use crate::state::{Binding, Context, Singleton};
 use crate::wire::{queue_or_drop, Outgoing};
 
 /// What the proxy needs to know about one kind of host Aura child.
@@ -99,12 +99,12 @@ fn live_child_version(ctx: &Context, child: AuraChild, child_host_id: u32) -> Op
 ///
 /// `None`, queueing nothing, when no `zaura_shell` is bound.
 pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -> Option<u32> {
-    let shell = ctx.host_zaura_shell?;
+    let shell = ctx.singletons.get(Singleton::AuraShell)?;
     let child_host_id = ctx
         .shadow_table
         .create_host_only(child.interface, shell.version);
     ctx.client_to_host_queue
-        .push((child.get)(shell.id, child_host_id, parent_host_id));
+        .push((child.get)(shell.host, child_host_id, parent_host_id));
     Some(child_host_id)
 }
 
@@ -132,10 +132,10 @@ pub(crate) fn release(ctx: &mut Context, child: AuraChild, child_host_id: u32) {
 
 /// Release the internal `zaura_shell` binding after its `global_remove`
 /// (see [`release_host_only`]). Its children stay usable.
-pub(crate) fn release_shell(ctx: &mut Context, shell: HostAuraShell) {
+pub(crate) fn release_shell(ctx: &mut Context, shell: Binding) {
     release_host_only(
         ctx,
-        shell.id,
+        shell.host,
         shell.version,
         zaura_shell::req::release,
         zaura_shell::REQ_RELEASE_SINCE,
@@ -277,11 +277,10 @@ mod tests {
 
     fn ctx_with_shell(version: u32) -> Context {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: SHELL_HOST,
-            global_name: SHELL_HOST,
-            version,
-        });
+        ctx.singletons
+            .bind_for_test(Singleton::AuraShell, SHELL_HOST);
+        ctx.singletons
+            .set_version_for_test(Singleton::AuraShell, version);
         ctx
     }
 

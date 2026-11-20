@@ -29,6 +29,7 @@ use crate::handler::Handlers;
 use crate::protocols;
 use crate::protocols::wayland::wl_shm;
 use crate::protocols::Iface;
+use crate::state::Singleton;
 use crate::state::{Context, ShmPool};
 use crate::wire::Action;
 use log::{debug, error, warn};
@@ -112,7 +113,7 @@ fn valid_buffer_layout(
 
 impl protocols::wayland::wl_shm::WlShmHandler for Handlers {
     fn on_format(ctx: &mut Context, format: u32) -> Action {
-        if ctx.host_shm_id == Some(ctx.last_sender_id) {
+        if ctx.singletons.host(Singleton::Shm) == Some(ctx.last_sender_id) {
             record_host_shm_wl_format(ctx, format);
             return Action::Drop;
         }
@@ -365,6 +366,7 @@ mod tests {
     use crate::protocols::wayland::{wl_display, wl_shm, wl_shm_pool};
     use crate::protocols::Iface;
     use crate::state::Context;
+    use crate::state::Singleton;
     use crate::test_support::{decoded, queued_headers, raw_dispatch, shm_pool_file};
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
     use std::fs::File;
@@ -677,7 +679,12 @@ mod tests {
             Handlers::on_global_remove(&mut ctx, 10);
         }
 
-        assert_eq!(ctx.host_shm_global_name, Some(11));
+        assert_eq!(
+            ctx.singletons
+                .get(Singleton::Shm)
+                .map(|binding| binding.name),
+            Some(11)
+        );
         assert!(ctx.stale_shm_guest_objects.contains(&20));
         assert!(ctx.stale_shm_pools.contains(&30));
         assert!(!ctx.stale_shm_guest_objects.contains(&21));
@@ -720,7 +727,12 @@ mod tests {
         ctx.last_sender_id = 1;
         Handlers::on_global(&mut ctx, 10, &shm, 1);
         Handlers::on_global(&mut ctx, 11, &shm, 1);
-        assert_eq!(ctx.host_shm_global_name, Some(10));
+        assert_eq!(
+            ctx.singletons
+                .get(Singleton::Shm)
+                .map(|binding| binding.name),
+            Some(10)
+        );
         Handlers::on_bind(&mut ctx, 11, &(shm.clone(), 1, 21));
 
         Handlers::on_global_remove(&mut ctx, 11);
@@ -769,7 +781,12 @@ mod tests {
             Handlers::on_global(&mut ctx, 10, &shm, 1);
             Handlers::on_global(&mut ctx, 11, &shm, 1);
         }
-        assert_eq!(ctx.host_shm_global_name, Some(10));
+        assert_eq!(
+            ctx.singletons
+                .get(Singleton::Shm)
+                .map(|binding| binding.name),
+            Some(10)
+        );
         bind(&mut ctx, 11, 21);
         create_pool(&mut ctx, 21, 31);
 

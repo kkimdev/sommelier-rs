@@ -164,6 +164,7 @@ mod tests {
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
     use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
     use crate::state::GtkShellState;
+    use crate::state::Singleton;
     use crate::test_support::{msg_opcode, msg_sender, queued_headers};
     use crate::wire::WireMessage;
 
@@ -326,7 +327,7 @@ mod tests {
         const REGISTRY: u32 = 1;
         const SHELL_NAME: u32 = 7;
         let mut ctx = setup_ctx();
-        ctx.host_zaura_shell = None;
+        ctx.singletons.unbind_for_test(Singleton::AuraShell);
         ctx.shadow_table
             .insert_paired_for_test(REGISTRY, REGISTRY, "wl_registry");
         let shell = "zaura_shell".to_string();
@@ -346,7 +347,7 @@ mod tests {
         ctx.last_sender_id = REGISTRY;
         Handlers::on_global(&mut ctx, SHELL_NAME, &shell, 38);
         Handlers::on_global_remove(&mut ctx, SHELL_NAME);
-        assert_eq!(ctx.host_zaura_shell, None);
+        assert_eq!(ctx.singletons.get(Singleton::AuraShell), None);
         ctx.last_sender_id = GTK_SHELL;
         Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
         set_application_id(&mut ctx);
@@ -354,7 +355,10 @@ mod tests {
 
         ctx.last_sender_id = REGISTRY;
         Handlers::on_global(&mut ctx, SHELL_NAME, &shell, 38);
-        let shell_host = ctx.host_zaura_shell.expect("rebound zaura_shell").id;
+        let shell_host = ctx
+            .singletons
+            .host(Singleton::AuraShell)
+            .expect("rebound zaura_shell");
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = GTK_SHELL;
         Handlers::on_set_startup_id(&mut ctx, &Some("launch-token".to_string()));

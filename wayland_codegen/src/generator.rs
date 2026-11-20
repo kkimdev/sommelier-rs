@@ -146,12 +146,10 @@ fn mark_byte_indexed_strings(protocol: &Protocol) -> Protocol {
 pub fn generate(protocol: &Protocol) -> String {
     let protocol = &mark_byte_indexed_strings(protocol);
     let mut parts = Vec::new();
-    let mut interface_names = Vec::new();
     let int_enums = int_enums(protocol);
 
     for item in &protocol.items {
         if let ProtocolItem::Interface(interface) = item {
-            interface_names.push(interface.name.clone());
             parts.push(generate_interface(interface, &int_enums));
         }
     }
@@ -175,10 +173,6 @@ pub fn generate(protocol: &Protocol) -> String {
             use crate::wire::{WireMessage, MessageBuilder, Action, Outgoing, ProtocolError};
             use crate::state::{Context, EventSender, Link, RequestSender};
             use crate::protocols::Iface;
-
-            pub const ALLOWED_INTERFACES: &[&str] = &[
-                #(#interface_names),*
-            ];
 
             #(#parts)*
         }

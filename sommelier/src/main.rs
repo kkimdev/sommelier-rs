@@ -46,41 +46,9 @@ mod protocols {
     // guards with early returns. Compact token-stream output can make Clippy
     // misread adjacent guards as a missing `else`.
     #![allow(clippy::possible_missing_else)]
-    #![allow(unused_macros)]
     // The generated encoders and forwarding are where messages are built.
     #![allow(clippy::disallowed_methods)]
-    include!(concat!(env!("OUT_DIR"), "/wayland_protocol.rs"));
-    include!(concat!(env!("OUT_DIR"), "/xdg_shell_protocol.rs"));
-    include!(concat!(env!("OUT_DIR"), "/linux_dmabuf_v1_protocol.rs"));
-    include!(concat!(env!("OUT_DIR"), "/viewporter_protocol.rs"));
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/text-input-unstable-v3_protocol.rs"
-    ));
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/text-input-unstable-v1_protocol.rs"
-    ));
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/text-input-extension-unstable-v1_protocol.rs"
-    ));
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/xdg_decoration_unstable_v1_protocol.rs"
-    ));
-    include!(concat!(env!("OUT_DIR"), "/fractional_scale_v1_protocol.rs"));
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/xdg_output_unstable_v1_protocol.rs"
-    ));
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/keyboard_extension_unstable_v1_protocol.rs"
-    ));
-    include!(concat!(env!("OUT_DIR"), "/gtk_shell_protocol.rs"));
-    include!(concat!(env!("OUT_DIR"), "/aura_shell_protocol.rs"));
-    include!(concat!(env!("OUT_DIR"), "/protocol_routing.rs"));
+    include!(concat!(env!("OUT_DIR"), "/protocols.rs"));
 }
 
 #[tokio::main(flavor = "current_thread")]

@@ -123,7 +123,9 @@ under [transport invariants](INVARIANTS.md#transport-and-file-descriptors).
 
 `wayland_codegen` turns the vendored XML in
 [`third_party/protocols/`](../third_party/protocols/README.md) into Rust at
-build time (`sommelier/build.rs`). For each protocol it generates:
+build time: `sommelier/build.rs` lists the protocols and writes one
+`protocols.rs`, which `main.rs` includes as `protocols`. For each protocol
+it generates:
 
 - Typed decoders and a handler trait per interface (`WlSurfaceHandler`)
   with one `on_*` function per message, which takes the connection's
@@ -160,8 +162,8 @@ build time (`sommelier/build.rs`). For each protocol it generates:
   caps, `wl_compositor` and `xdg_wm_base` are capped at the versions whose
   semantics the proxy implements, `wl_shm` is offered at v1, which the
   proxy implements itself, and `zaura_shell` has a v6 floor.
-  `forwarded_global_version` never offers a forwarded global above its
-  generated `VERSION`.
+  `offered_version` never offers a forwarded global above its generated
+  `VERSION`.
 - A `NAME` constant, the interface's name. Handlers name an interface
   by it, never by a copied literal.
 
@@ -191,6 +193,45 @@ Encoders and forwards size their `MessageBuilder` up front, from their
 arguments or the received payload, and it writes the payload after room
 for the header, which building fills in: a message is one allocation and
 is not copied again before it joins its peer's pending output.
+
+### Adding an interface or a global
+
+The compiler names every place that must change, and one test names the
+one list it cannot check:
+
+1. **A protocol.** Vendor its XML in `third_party/protocols/` and add its
+   path to `sommelier/build.rs`. Each of its interfaces becomes an `Iface`
+   variant, and the build stops at every exhaustive match until the
+   interface has a row in it:
+   - `handler::registry::policy`, the one table of host globals: whether
+     the proxy forwards a host global of the interface (and up to which
+     version), hides it, binds it for its own use, or advertises a global
+     of its own in its place. A forwarded global needs nothing more. An
+     interface that is no global is hidden.
+   - `state::lifecycle::forget_object`: whether its objects have state of
+     their own to forget when they end.
+   - `ProtocolHandlers`: `handler::Handlers` implements its handler
+     trait, either in the module that owns the interface or, if every
+     message forwards as it is, in the list in `handler/mod.rs`.
+2. **A handler.** Override the trait's `on_*` functions for the messages
+   whose meaning changes across the boundary, in the owning module, and
+   keep its per-object state with that module (see
+   [Object ends](#object-ends)).
+3. **A global the proxy binds for itself, once per connection.** A
+   `Singleton` variant (`state/singletons.rs`) and its interface
+   (`Singleton::interface`, a `match`); the variant in `Singleton::ALL`,
+   the order the proxy binds singletons in when several have none, which
+   `every_interface_has_one_global_policy` holds to the table; its
+   `BindInternal` row in `policy`; a `<global>_global` function in
+   `registry.rs` that decides what the guest sees in its place, and its
+   arm in `on_global`'s `match` on the singleton; its bind
+   (`Singleton::bind`) and its release
+   (`reset_internal_binding_for_global`), each a `match` on the
+   singleton. Its binding is `Context::singletons`' entry, which other
+   modules read (`ctx.singletons.host(Singleton::Shm)`).
+
+Tests: `every_interface_has_one_global_policy`,
+`every_interface_resolves_by_its_name`.
 
 ## Object translation
 
@@ -263,7 +304,7 @@ keymaps are compiled in belongs to the keyboard core
 
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
-| Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `InternalCallbacks` |
+| Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of host globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (keyboard and pointer focus); `sommelier/src/keys` (the keyboard core: one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |

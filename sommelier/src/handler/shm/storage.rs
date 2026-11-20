@@ -23,6 +23,7 @@ use super::formats::wl_shm_format_to_drm_format;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
 use crate::protocols::wayland::{wl_shm, wl_shm_pool};
 use crate::protocols::Iface;
+use crate::state::Singleton;
 use crate::state::{BufferState, Context, HostMapping, StalePixels};
 use crate::wire::Action;
 use log::{debug, error};
@@ -173,7 +174,10 @@ pub(super) fn select_shm_backing(
     // `--gpu-accel` changes only the output allocation.  Guest wl_shm is
     // still accepted for applications that do not expose linux-dmabuf;
     // those buffers use the VirtWL shared-memory allocation below.
-    let host_dmabuf_id = ctx.host_dmabuf_id.filter(|_| ctx.settings().gpu_accel);
+    let host_dmabuf_id = ctx
+        .singletons
+        .host(Singleton::Dmabuf)
+        .filter(|_| ctx.settings().gpu_accel);
     let virtwl_dmabuf = host_dmabuf_id.and_then(|host_dmabuf_id| {
         match allocate_virtwl_dmabuf(ctx, width, height, format) {
             Ok(allocation) => {
@@ -278,7 +282,7 @@ pub(super) fn create_shared_buffer(
     } = request;
     // Check the capability before mapping the destination, so that a
     // missing wl_shm global fails before any work.
-    let Some(host_wl_shm_id) = ctx.host_shm_id else {
+    let Some(host_wl_shm_id) = ctx.singletons.host(Singleton::Shm) else {
         error!("wl_shm not available on host");
         return reject_buffer_creation(ctx, pool_id, "host wl_shm is unavailable");
     };
@@ -501,6 +505,7 @@ mod tests {
     use crate::protocols::AnyRequest;
     use crate::protocols::Iface;
     use crate::proxy::harness::Session;
+    use crate::state::Singleton;
     use crate::state::{BufferState, Context, DamageRegion, ShmPool};
     use crate::test_support::counting::Counts;
     use crate::test_support::{decode, protocol_error_code, shm_pool_file};
@@ -525,7 +530,8 @@ mod tests {
     #[test]
     fn a_shared_host_copy_takes_each_plane_where_the_guest_layout_puts_it() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.host_shm_id = Some(ctx.shadow_table.create_host_only(Iface::WlShm, 1));
+        let host_shm = ctx.shadow_table.create_host_only(Iface::WlShm, 1);
+        ctx.singletons.bind_for_test(Singleton::Shm, host_shm);
         let host_copy = shm_pool_file(&[0; 12]);
         let request = ShmBufferRequest {
             id: 30,
@@ -689,7 +695,7 @@ mod tests {
         };
         let (host_buffer, _) = received[1].1.new_object().expect("a host buffer");
         // The proxy's own wl_shm binding has no guest ID to compare with.
-        assert_eq!(Some(*host_shm), s.ctx().host_shm_id);
+        assert_eq!(Some(*host_shm), s.ctx().singletons.host(Singleton::Shm));
         assert_eq!(*size, stride * height);
         let pool_size = nix::sys::stat::fstat(fd).expect("fstat the pool").st_size;
         assert_eq!(pool_size, i64::from(stride * height));

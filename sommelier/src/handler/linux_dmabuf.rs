@@ -21,6 +21,7 @@ use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
 use crate::protocols::wayland::{wl_display, wl_shm};
 use crate::protocols::Iface;
+use crate::state::Singleton;
 use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
 use crate::wire::{Action, MessageHeader, Outgoing, WL_DISPLAY_ID};
 use log::{debug, error};
@@ -521,7 +522,7 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
         if !is_supported_drm_format(format) {
             return Action::Drop;
         }
-        if let Some(internal_id) = ctx.host_dmabuf_id {
+        if let Some(internal_id) = ctx.singletons.host(Singleton::Dmabuf) {
             if ctx.last_sender_id == internal_id {
                 record_host_shm_drm_format(ctx, format);
                 let mut changed = false;
@@ -575,7 +576,7 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for Handlers {
         }
         // We forward supported modifiers to the guest. The modifier itself is
         // intentionally preserved; LINEAR (0) is a valid modifier.
-        if let Some(internal_id) = ctx.host_dmabuf_id {
+        if let Some(internal_id) = ctx.singletons.host(Singleton::Dmabuf) {
             if ctx.last_sender_id == internal_id {
                 record_host_shm_drm_format(ctx, format);
                 let mut changed = false;
