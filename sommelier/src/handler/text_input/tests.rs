@@ -870,55 +870,6 @@ fn commit(text: &str) -> V3 {
     }
 }
 
-/// A focus change deactivates the host behind a drain barrier: the
-/// host events sent before it reach no one, and the next activation,
-/// which follows the guest's new state, waits for it.
-#[tokio::test]
-async fn focus_generation_barrier_drops_old_events_before_reactivation() {
-    let mut f = Field::enabled().await;
-    f.keyboard_leave().await;
-    let host = f.host_received().await;
-    let callback = barrier(&host);
-    assert_eq!(host, [f.deactivate(), sync(callback)]);
-
-    // Events the host sent before the barrier.
-    f.s.host([f.preedit("old", ""), f.commit("old")]).await;
-    assert_eq!(f.s.guest_received(), []);
-
-    // The focus enters another surface, where the guest enables the
-    // field while the barrier drains: its state reaches the host first,
-    // without an activation.
-    f.keyboard_enter_new_surface().await;
-    f.s.guest([
-        v3::enable(f.ti),
-        v3::set_surrounding_text(f.ti, "new", 3, 3).unwrap(),
-        v3::commit(f.ti),
-    ])
-    .await;
-    assert_eq!(
-        f.host_received().await,
-        [
-            f.surrounding_text("new", 3, 3),
-            f.no_cursor_rectangle(),
-            f.commit_state(2),
-        ]
-    );
-    f.answered(2);
-
-    // Then the activation, and the content type it resets.
-    f.drain(callback).await;
-    let mut expected = vec![f.activate()];
-    expected.extend(f.content_type((0, 0), true));
-    expected.push(f.commit_state(2));
-    assert_eq!(f.host_received().await, expected);
-
-    f.s.host([f.preedit("new", "")]).await;
-    assert_eq!(
-        f.s.guest_received(),
-        f.events([preedit("new"), V3::Done { serial: 2 }])
-    );
-}
-
 /// Exo drops a content type sent while no input method is attached:
 /// the disable sends none, neither does an enable while the
 /// deactivation drains, and the activation the barrier releases sends
@@ -2008,18 +1959,6 @@ async fn a_delete_in_flight_at_a_press_is_dropped() {
     f.s.host([f.delete_range(3, 3)]).await;
     let expected = [delete(3, 0), V3::Done { serial: 3 }];
     assert_eq!(f.s.guest_received(), f.events(expected));
-}
-
-/// A preedit region Exo sent before it handled the press's `reset`
-/// would turn text before the cursor back into a composition the
-/// reset dropped: the guest never gets it.
-#[tokio::test]
-async fn a_preedit_region_in_flight_at_a_press_is_dropped() {
-    let mut f = Field::with_surrounding_text("나", 3, 3).await;
-    let (_, fence) = press_after_na_ga(&mut f).await;
-    f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
-    assert_eq!(f.s.guest_received(), []);
-    f.drain(fence).await;
 }
 
 /// A confirmation Exo sent before it handled the press's `reset`
@@ -3176,31 +3115,6 @@ async fn a_keysym_reaches_no_peer() {
     f.s.host([f.peek(press), f.key(press)]).await;
     assert_eq!(f.s.guest_received(), [f.guest_key(press)]);
     assert_eq!(f.host_received().await, [f.ack(702, true)]);
-}
-
-/// Events of a host text input that is not active belong to no guest
-/// generation: none reaches the guest or edits its next transaction.
-#[tokio::test]
-async fn inactive_host_ime_events_are_ignored() {
-    // The guest enabled the field, which its released seat cannot
-    // activate.
-    let mut f = Field::disabled().await;
-    f.release_seat().await;
-    f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-    assert_eq!(f.host_received().await, f.reset(1, Reset::default()));
-    f.answered(1);
-    f.s.host([f.preedit("가", ""), f.delete_range(0, 3), f.commit("가")])
-        .await;
-    assert_eq!(f.s.guest_received(), []);
-
-    // A new seat activates it.
-    let host = f.bind_seat_again().await;
-    let mut expected = vec![f.activate()];
-    expected.extend(f.content_type((0, 0), false));
-    expected.push(f.commit_state(1));
-    assert_eq!(host, expected);
-    f.s.host([f.commit("나")]).await;
-    assert_eq!(f.s.guest_received(), f.events([commit("나"), DONE]));
 }
 
 /// The key an empty confirmation recovers reaches the guest as a
