@@ -15,3 +15,9 @@
 [workspace]
 members = ["wayland_codegen", "sommelier", "sommelier_test_app"]
 resolver = "2"
+
+# The generated dispatch code is large and crosses crates; whole-crate
+# codegen and thin LTO let it inline. Release builds only.
+[profile.release]
+lto = "thin"
+codegen-units = 1

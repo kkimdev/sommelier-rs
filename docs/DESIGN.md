@@ -57,7 +57,9 @@ handler intercepts the ones whose meaning changes across the boundary.
   [process invariants](INVARIANTS.md#process)).
 - The host side is VirtWL (`virtwl_channel.rs`, ioctls in `virtwl.rs`) or,
   for debugging only, a local compositor socket (`--local-compositor`).
-  `connection.rs` hides the difference behind `WaylandConnection`.
+  `connection.rs` hides the difference behind `WaylandConnection`, which
+  lends every receive and send one buffer of its own, a Unix socket's
+  control buffer or a VirtWL `Transaction`, so neither allocates.
   `wire::MessageHeader::frame` cuts the received byte stream into messages,
   both for `Client::handle_msgs` and for the connection's readiness check.
 
@@ -71,13 +73,30 @@ preferred side so bytes still in the kernel queue are not starved. A
 client that streams render requests would otherwise hold keyboard and IME
 events behind several frames on the single thread. A parked guest stream
 (see [Message effects](#message-effects)) is never offered.
-32 messages still amortize a send while bounding the wait to about one
-frame. Translated messages of one batch are sent in as few transport
+32 messages bound the wait to about one frame.
+
+A batch costs no send of its own. `Client` keeps what the batches
+produce for each peer (`to_host`, `to_guest`), appended in the order a
+send per batch would have sent it, and sends it in as few transport
 submissions as the 28-descriptor and VirtWL transaction-size limits
-allow, usually one, each ending at a message boundary; per-message
-VirtWL ioctls would add latency without changing the byte and descriptor
-order (see
+allow, each ending at a message boundary: a submission once a later
+message no longer fits it, the rest (`Client::flush`) before a batch in
+the other direction, before a fifth batch in the same one
+(`MAX_BATCHES_PER_FLUSH`), before `run` waits, and when the session
+ends. Each submission is a synchronous VirtWL round trip, so a burst in
+one direction costs about one per 3,980 bytes rather than one per batch;
+per-message VirtWL ioctls would add latency without changing the byte
+and descriptor order (see
 [transport invariants](INVARIANTS.md#transport-and-file-descriptors)).
+A batch's output therefore waits behind no batch in the other direction,
+so a host key event goes out before the next guest batch, as fair
+dispatch intends, and behind at most three more batches in its own. A
+long one-way stream still awaits a send every four batches, where it
+awaited one every batch; as before, Tokio's cooperative budget decides
+when such an await lets another client run. Interleaved directions send
+once per switch, as one send per batch did. `proxy::harness::Session`
+dispatches what one peer sent and then flushes, so tests of the
+interleaving drive `Client::handle_msgs` directly.
 
 ### Descriptors
 
@@ -140,10 +159,18 @@ build time (`sommelier/build.rs`). For each protocol it generates:
 - A `NAME` constant, the interface's name. Handlers name an interface
   by it, never by a copied literal.
 
-`generate_routing` derives the interface-to-protocol routing table, and
-`interface_version`, each interface's `VERSION` by name, from the same
-list, so the proxy never restates which protocol owns an interface or how
-new it is.
+`generate_routing` derives the interface-to-protocol routing table,
+`interface_version`, each interface's `VERSION` by name, and
+`interface_name`, its `NAME`, from the same list, so the proxy never
+restates which protocol owns an interface or how new it is. The object
+table keeps each object's interface as that `&'static str`, so routing a
+message or creating an object copies no name; a `wl_registry.bind`, whose
+interface is a string on the wire, goes through `interface_name`.
+
+Encoders and forwards size their `MessageBuilder` up front, from their
+arguments or the received payload, and it writes the payload after room
+for the header, which building fills in: a message is one allocation and
+is not copied again before it joins its peer's pending output.
 
 ## Object translation
 
@@ -323,9 +350,10 @@ or host error wins over an internal failure. After dispatch,
 `Client::handle_msgs` takes the message's `state::Effects` once
 (`Context::take_effects`):
 
-- If the message did not end the session, it sends the forward, then the
-  output in the same direction, and, once the batch ends, the output back
-  toward the message's source.
+- If the message did not end the session, it queues the forward, then the
+  output in the same direction, and the output back toward the message's
+  source, each for its peer ([Fair dispatch](#fair-dispatch) says when it
+  is sent).
 - If it did, it drops the forward and every effect, which closes their
   descriptors, and ends the batch. After the batch's earlier, valid
   messages, `handler::display::session_error` encodes the session's one

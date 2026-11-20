@@ -240,6 +240,7 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
     let mut special_event_arms = Vec::new();
     let mut consume_event_arms = Vec::new();
     let mut version_arms = Vec::new();
+    let mut name_arms = Vec::new();
     let mut any_variants = Vec::new();
     // The proxy routes and versions an object by its interface name alone.
     let mut routed_interfaces = HashSet::new();
@@ -300,6 +301,9 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
             version_arms.push(quote! {
                 #name => Some(#protocol_name::#interface::VERSION),
             });
+            name_arms.push(quote! {
+                #name => Some(#protocol_name::#interface::NAME),
+            });
             any_variants.push((
                 name.clone(),
                 format_ident!("{}", snake_to_camel(name)),
@@ -339,6 +343,16 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
         pub fn classify_interface(interface: &str) -> Option<ProtocolFamily> {
             match interface {
                 #(#classify_arms)*
+                _ => None,
+            }
+        }
+
+        /// `interface` as its generated `NAME`, the `'static` name the
+        /// object table keeps, or `None` for an interface no vendored
+        /// protocol defines.
+        pub fn interface_name(interface: &str) -> Option<&'static str> {
+            match interface {
+                #(#name_arms)*
                 _ => None,
             }
         }
@@ -671,11 +685,20 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                         ));
                                     });
                                 } else {
+                                    // The table keeps the generated name;
+                                    // an interface no vendored protocol
+                                    // defines cannot be routed.
                                     mapping_and_writing.push(quote! {
                                         builder.write_string(&#name.0);
                                         builder.write_u32(#name.1);
                                         builder.write_u32(
-                                            ctx.shadow_table.create_paired(#name.2, &#name.0, #name.1, #name.1),
+                                            ctx.shadow_table.create_paired(
+                                                #name.2,
+                                                crate::protocols::interface_name(&#name.0)
+                                                    .ok_or(ProtocolError::InvalidObjectId(#name.2))?,
+                                                #name.1,
+                                                #name.1,
+                                            ),
                                         );
                                     });
                                 }
@@ -724,8 +747,10 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 return Ok(None);
                             };
                             #(#local_object_checks)*
+                            // Translating IDs keeps the length; only a
+                            // string with replaced bytes grows.
                             #[allow(unused_mut)]
-                            let mut builder = MessageBuilder::new();
+                            let mut builder = MessageBuilder::with_capacity(msg.payload.len());
                             #(#mapping_and_writing)*
                             let outgoing = builder.try_build(host_sender_id, #req_idx)?;
                             #destructor_cleanup
@@ -892,7 +917,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             };
                             #(#unmapped_object_checks)*
                             #[allow(unused_mut)]
-                            let mut builder = MessageBuilder::new();
+                            let mut builder = MessageBuilder::with_capacity(msg.payload.len());
                             #(#mapping_and_writing)*
                             let outgoing = builder.try_build(guest_sender_id, #evt_idx)?;
                             #destructor_cleanup
@@ -1218,9 +1243,30 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
     let mut writes = Vec::new();
     let mut fds = Vec::new();
     let mut fallible = false;
+    // The payload's length, or, with strings and arrays, at least it, so
+    // the builder allocates once: four bytes per word, and a string or
+    // array's bytes padded to a word.
+    let mut words = 0usize;
+    let mut variable = Vec::new();
     for arg in args(&message.items) {
         let arg_name = sanitize_ident(&arg.name);
         let nullable = arg.allow_null.unwrap_or(false);
+        words += match arg.typ.as_str() {
+            "fd" => 0,
+            "new_id" if arg.interface.is_none() => 3,
+            _ => 1,
+        };
+        match arg.typ.as_str() {
+            "new_id" if arg.interface.is_none() => {
+                variable.push(quote! { interface.len() + 4 });
+            }
+            "string" if nullable => {
+                variable.push(quote! { #arg_name.map_or(0, |string| string.len() + 4) });
+            }
+            "string" => variable.push(quote! { #arg_name.len() + 4 }),
+            "array" => variable.push(quote! { #arg_name.len() + 3 }),
+            _ => {}
+        }
         // Encoders are for messages the proxy builds itself, whose IDs it
         // chose, so a null required object is a proxy bug. Host data is not
         // checked here: forwarding translates and validates it on its own
@@ -1282,6 +1328,7 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
             ),
         }
     }
+    let fixed_bytes = 4 * words;
     let fds = if fds.is_empty() {
         quote! { Vec::new() }
     } else {
@@ -1305,7 +1352,7 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
         #[must_use = "a message that is not queued is never sent"]
         pub fn #name(sender_id: u32, #(#params),*) -> #output {
             #[allow(unused_mut)]
-            let mut builder = MessageBuilder::new();
+            let mut builder = MessageBuilder::with_capacity(#fixed_bytes #(+ #variable)*);
             #(#writes)*
             #message
         }

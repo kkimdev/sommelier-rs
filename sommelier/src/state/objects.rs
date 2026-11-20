@@ -55,19 +55,18 @@ pub enum Link {
     Local,
 }
 
-/// The interface and negotiated version of an object on one side.
+/// The interface and negotiated version of an object on one side. The
+/// name is a generated `NAME`, which every object of a vendored interface
+/// has, so recording or looking one up allocates nothing.
 #[derive(Debug)]
 struct Interface {
-    name: String,
+    name: &'static str,
     version: u32,
 }
 
 impl Interface {
-    fn new(name: &str, version: u32) -> Self {
-        Self {
-            name: name.to_string(),
-            version,
-        }
+    fn new(name: &'static str, version: u32) -> Self {
+        Self { name, version }
     }
 }
 
@@ -265,7 +264,7 @@ impl ShadowTable {
     pub fn create_paired(
         &mut self,
         guest_id: u32,
-        interface: &str,
+        interface: &'static str,
         version: u32,
         host_version: u32,
     ) -> u32 {
@@ -278,9 +277,9 @@ impl ShadowTable {
     pub fn create_bridged(
         &mut self,
         guest_id: u32,
-        interface: &str,
+        interface: &'static str,
         version: u32,
-        host_interface: &str,
+        host_interface: &'static str,
         host_version: u32,
     ) -> u32 {
         let host = self.allocate_host_id();
@@ -300,7 +299,12 @@ impl ShadowTable {
     /// # Returns
     ///
     /// The guest object's ID.
-    pub fn adopt_host_created(&mut self, host_id: u32, interface: &str, version: u32) -> u32 {
+    pub fn adopt_host_created(
+        &mut self,
+        host_id: u32,
+        interface: &'static str,
+        version: u32,
+    ) -> u32 {
         let guest = self.allocate_guest_server_id();
         let interface = || Interface::new(interface, version);
         self.insert_pair(guest, interface(), HostId(host_id), interface());
@@ -311,7 +315,7 @@ impl ShadowTable {
     /// it has no host object, and its handlers consume its requests (the
     /// SHM shim, the v3 text-input manager, or an inert `wl_output` whose
     /// bind crossed its global's removal).
-    pub fn create_local(&mut self, guest_id: u32, interface: &str, version: u32) {
+    pub fn create_local(&mut self, guest_id: u32, interface: &'static str, version: u32) {
         let local = GuestObject::Local(Interface::new(interface, version));
         let previous = self.guests.insert(GuestId(guest_id), local);
         debug_assert!(previous.is_none(), "guest ID {guest_id} is in use");
@@ -322,7 +326,7 @@ impl ShadowTable {
     /// # Returns
     ///
     /// Its ID, newly allocated.
-    pub fn create_host_only(&mut self, interface: &str, version: u32) -> u32 {
+    pub fn create_host_only(&mut self, interface: &'static str, version: u32) -> u32 {
         let host = self.allocate_host_id();
         let object = HostObject::HostOnly(Interface::new(interface, version));
         self.hosts.insert(host, object);
@@ -467,14 +471,14 @@ impl ShadowTable {
     }
 
     /// The guest object's interface.
-    pub fn get_interface(&self, guest_id: u32) -> Option<&str> {
-        Some(&self.guests.get(&GuestId(guest_id))?.interface().name)
+    pub fn get_interface(&self, guest_id: u32) -> Option<&'static str> {
+        Some(self.guests.get(&GuestId(guest_id))?.interface().name)
     }
 
     /// The interface of a live host object, which events from it are
     /// dispatched by.
-    pub fn get_host_interface(&self, host_id: u32) -> Option<&str> {
-        Some(&self.hosts.get(&HostId(host_id))?.interface()?.name)
+    pub fn get_host_interface(&self, host_id: u32) -> Option<&'static str> {
+        Some(self.hosts.get(&HostId(host_id))?.interface()?.name)
     }
 
     /// Return whether `guest_id` belongs to the range reserved for objects
@@ -763,7 +767,12 @@ impl ShadowTable {
     ///
     /// When either ID is already in use.
     #[cfg(test)]
-    pub(crate) fn insert_paired_for_test(&mut self, guest_id: u32, host_id: u32, interface: &str) {
+    pub(crate) fn insert_paired_for_test(
+        &mut self,
+        guest_id: u32,
+        host_id: u32,
+        interface: &'static str,
+    ) {
         self.insert_bridged_for_test(guest_id, host_id, interface, interface);
     }
 
@@ -773,7 +782,7 @@ impl ShadowTable {
         &mut self,
         guest_id: u32,
         host_id: u32,
-        interface: &str,
+        interface: &'static str,
         version: u32,
     ) {
         self.reserve_for_test(guest_id, host_id);
@@ -788,12 +797,12 @@ impl ShadowTable {
         &mut self,
         guest_id: u32,
         host_id: u32,
-        interface: &str,
-        host_interface: &str,
+        interface: &'static str,
+        host_interface: &'static str,
     ) {
         self.reserve_for_test(guest_id, host_id);
         // Each side at the newest version its protocol file defines.
-        let newest = |name: &str| {
+        let newest = |name: &'static str| {
             let version = crate::protocols::interface_version(name)
                 .unwrap_or_else(|| panic!("{name} is a vendored interface"));
             Interface::new(name, version)
@@ -816,7 +825,7 @@ impl ShadowTable {
     pub(crate) fn insert_host_only_for_test(
         &mut self,
         host_id: u32,
-        interface: &str,
+        interface: &'static str,
         version: u32,
     ) {
         self.reserve_host_id_for_test(host_id);

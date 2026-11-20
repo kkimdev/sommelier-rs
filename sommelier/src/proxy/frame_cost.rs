@@ -16,15 +16,16 @@ limitations under the License.
 
 //! What one frame costs the proxy: its heap allocations, and the system
 //! calls that copy pixels into, or map, a host copy
-//! ([`Counts`]). Each test drives a steady stream of frames through a
-//! whole [`Session`], measures the proxy's share alone, and holds it to a
-//! budget, so a change that makes frames dearer fails here. Run with
-//! `--nocapture` to see the numbers.
+//! ([`Counts`]); and what forwarding one message costs, measured on the
+//! commonest one, a pointer motion. Each test drives a steady stream of
+//! frames or messages through a whole [`Session`], measures the proxy's
+//! share alone, and holds it to a budget, so a change that makes frames or
+//! messages dearer fails here. Run with `--nocapture` to see the numbers.
 
 use super::harness::{Object, Session};
 use crate::handler::shm::{copy_shm_damage, ShmCopyLayout};
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
-use crate::protocols::wayland::{wl_buffer, wl_shm, wl_surface};
+use crate::protocols::wayland::{wl_buffer, wl_pointer, wl_seat, wl_shm, wl_surface};
 use crate::state::{BufferRect, Context, DamageRegion, PlaneFenceForTest};
 use crate::test_support::counting::Counts;
 use crate::test_support::{host_mapping, shm_pool_file};
@@ -134,7 +135,7 @@ async fn a_partial_width_shm_frame_costs_one_read() {
     let cost = shm_frame_cost("SHM, partial-width damage", PARTIAL_WIDTH).await;
     assert_eq!(cost.pool_reads, 1);
     assert_eq!(cost.host_maps, 0);
-    assert!(cost.allocations <= 28, "{cost:?}");
+    assert!(cost.allocations <= 13, "{cost:?}");
 }
 
 /// A frame that damages the whole of a buffer laid out like its host copy
@@ -144,7 +145,7 @@ async fn a_full_shm_frame_costs_one_read() {
     let cost = shm_frame_cost("SHM, full damage", FULL).await;
     assert_eq!(cost.pool_reads, 1);
     assert_eq!(cost.host_maps, 0);
-    assert!(cost.allocations <= 28, "{cost:?}");
+    assert!(cost.allocations <= 13, "{cost:?}");
 }
 
 /// A host copy whose rows are longer than the guest's, as a VirtWL dma-buf
@@ -245,5 +246,47 @@ async fn a_native_frame_reads_no_pixels() {
     println!("frame cost, native dma-buf: {cost:?}");
     assert_eq!(cost.pool_reads, 0);
     assert_eq!(cost.host_maps, 0);
-    assert!(cost.allocations <= 24, "{cost:?}");
+    assert!(cost.allocations <= 9, "{cost:?}");
+}
+
+/// The motions the message test measures, after the warm-up ones that
+/// grow the proxy's buffers to their working size.
+const MOTIONS: u64 = 1_000;
+const WARM_UP_MOTIONS: u64 = 10;
+
+/// Each `wl_pointer.motion` the host sends in its own receive, as a moving
+/// pointer does, reaches the guest. Forwarding one costs the proxy at most
+/// its budget of allocations.
+#[tokio::test]
+async fn a_forwarded_pointer_motion_costs_at_most_its_budget() {
+    let mut s = Session::new();
+    let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+    let surface = s.surface().await;
+    let pointer = s.pointer_on(seat.id, surface).await;
+    let motions = async |s: &mut Session, count: u64| {
+        for time in 0..count as u32 {
+            s.host([wl_pointer::evt::motion(pointer.host, time, 256, 512)])
+                .await;
+            let motion = wl_pointer::Event::Motion {
+                time,
+                surface_x: 256,
+                surface_y: 512,
+            };
+            assert_eq!(s.guest_received(), [(pointer.id, motion.into())]);
+        }
+    };
+    motions(&mut s, WARM_UP_MOTIONS).await;
+    s.proxy_cost();
+    let started = super::tests::thread_cpu_time();
+    motions(&mut s, MOTIONS).await;
+    let cpu = super::tests::thread_cpu_time() - started;
+    let total = s.proxy_cost();
+    println!(
+        "message cost, pointer motion: {} allocations per motion; {:?} of CPU per motion, \
+         the test's own work included",
+        total.allocations as f64 / MOTIONS as f64,
+        cpu / MOTIONS as u32
+    );
+    let cost = total.per(MOTIONS);
+    assert!(cost.allocations <= 1, "{cost:?}");
 }

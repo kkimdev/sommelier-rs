@@ -27,7 +27,7 @@ the data that exists in them:
 
 - `phase: KeyPhase`, what the host has shown of the key:
   - `Unseen`: a claim or a suppression came before any physical event,
-    which only the registry's tests make;
+    which only tests make;
   - `Held { peek, lease, stale }`: `lease` is the IME's Backspace repeat
     lease (`RepeatLease::Free`, `Leased { text_input }` or `Cancelled`
     for the rest of the hold); `stale` marks a key held across the input
@@ -50,9 +50,9 @@ previous press of it, the retired generation's release waits beside the
 new one (`retired_guest_releases`), at most one per key.
 
 Phase and guest delivery are independent because the channels race: a
-`wl_keyboard` press can come after its peek release. The registry's model test (see [Tests](#tests)) keeps
-each generation as independent flags; within each part, their illegal
-combinations cannot be written:
+`wl_keyboard` press can come after its peek release. The registry's model
+test (see [Tests](#tests)) keeps each generation as independent flags;
+within each part, their illegal combinations cannot be written:
 
 | Model flag | State |
 | --- | --- |

@@ -48,6 +48,11 @@
   buffers`). If it does, recycle released host storage by layout and
   move its `StalePixels` relation with it, which rewrites the INVARIANTS
   rule that a new buffer copies in full.
+- Unconfirmed on a host: coalescing the output of consecutive fairness
+  batches into full submissions (`Client::flush`) pays off as much as
+  `VIRTWL_IOCTL_SEND` waits for crosvm, which the code review recalled
+  but nobody has measured. `strace -T -e ioctl` on a live proxy while a
+  client scrolls shows each send's time.
 - A late owed `wl_buffer.release` can mark a buffer released while the
   host holds it, which skips its damage-only copies until the next attach;
   see [Surfaces, damage and SHM](docs/INVARIANTS.md#surfaces-damage-and-shm).

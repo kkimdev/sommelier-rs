@@ -203,8 +203,9 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         _modifiers: u32,
     ) -> Action {
         static LOGGED: AtomicBool = AtomicBool::new(false);
+        // At the default level, so a host that does send keysyms shows it.
         if !LOGGED.swap(true, Ordering::Relaxed) {
-            log::debug!(
+            log::info!(
                 "Dropping zwp_text_input_v1.keysym {sym:#x} (state {state}), which Exo is not \
                  known to send; later ones are dropped unlogged"
             );

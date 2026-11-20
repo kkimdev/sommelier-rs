@@ -461,25 +461,43 @@ impl<'a> WireMessage<'a> {
 ///
 /// Production code builds messages only through the generated `req::` and
 /// `evt::` encoders, which check each message against its XML.
-/// `sommelier/clippy.toml` rejects `MessageBuilder::new` everywhere else,
-/// and the private fields leave no other way to make a builder. A test
-/// module that needs frames no encoder makes, such as malformed ones,
-/// allows `clippy::disallowed_methods` itself.
+/// `sommelier/clippy.toml` rejects `MessageBuilder::new` and
+/// `MessageBuilder::with_capacity` everywhere else, and the private fields
+/// leave no other way to make a builder. A test module that needs frames
+/// no encoder makes, such as malformed ones, allows
+/// `clippy::disallowed_methods` itself.
+///
+/// It writes the payload after room for the header, which building fills
+/// in, so a message is one allocation and is never copied.
 pub struct MessageBuilder {
-    payload: Vec<u8>,
+    /// The header's room, then the payload written so far.
+    message: Vec<u8>,
     fds: Vec<OwnedFd>,
 }
 
 impl MessageBuilder {
+    /// A builder for a test's own frames, such as malformed ones.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
-            payload: Vec::new(),
+            message: vec![0; MessageHeader::LEN],
+            fds: Vec::new(),
+        }
+    }
+
+    /// A builder with room for a payload of `payload` bytes, so writing
+    /// that much allocates once.
+    pub fn with_capacity(payload: usize) -> Self {
+        let mut message = Vec::with_capacity(MessageHeader::LEN + payload);
+        message.extend_from_slice(&[0; MessageHeader::LEN]);
+        Self {
+            message,
             fds: Vec::new(),
         }
     }
 
     pub fn write_u32(&mut self, val: u32) {
-        self.payload.extend_from_slice(&val.to_ne_bytes());
+        self.message.extend_from_slice(&val.to_ne_bytes());
     }
 
     pub fn write_i32(&mut self, val: i32) {
@@ -501,14 +519,14 @@ impl MessageBuilder {
         let len = val.len() as u32 + 1; // +1 for null terminator
         self.write_u32(len);
 
-        self.payload.extend_from_slice(val);
-        self.payload.push(0); // null terminator
+        self.message.extend_from_slice(val);
+        self.message.push(0); // null terminator
 
         // padding
         let padded_len = (len + 3) & !3;
         let padding = padded_len - len;
-        self.payload
-            .resize(self.payload.len() + padding as usize, 0);
+        self.message
+            .resize(self.message.len() + padding as usize, 0);
     }
 
     pub fn write_nullable_string(&mut self, val: Option<&str>) {
@@ -534,12 +552,12 @@ impl MessageBuilder {
         let len = val.len() as u32;
         self.write_u32(len);
 
-        self.payload.extend_from_slice(val);
+        self.message.extend_from_slice(val);
 
         let padded_len = (len + 3) & !3;
         let padding = padded_len - len;
-        self.payload
-            .resize(self.payload.len() + padding as usize, 0);
+        self.message
+            .resize(self.message.len() + padding as usize, 0);
     }
 
     pub fn write_fd(&mut self, fd: OwnedFd) {
@@ -550,44 +568,47 @@ impl MessageBuilder {
 impl MessageBuilder {
     /// Assemble a complete Wayland wire message, returning an error instead
     /// of building one longer than [`MessageHeader::MAX_LEN`].
-    pub fn try_build_message(&self, sender_id: u32, opcode: u16) -> Result<Vec<u8>, ProtocolError> {
-        let len = self
-            .payload
-            .len()
-            .checked_add(MessageHeader::LEN)
-            .ok_or(ProtocolError::MessageTooLarge(usize::MAX))?;
+    pub fn try_build_message(self, sender_id: u32, opcode: u16) -> Result<Vec<u8>, ProtocolError> {
+        let Self { mut message, fds } = self;
+        debug_assert!(
+            fds.is_empty(),
+            "try_build_message would close the descriptors; use try_build"
+        );
         let header = MessageHeader {
             sender_id,
             opcode,
-            len,
+            len: message.len(),
         }
         .encode()?;
-        let mut msg = Vec::with_capacity(len);
-        msg.extend_from_slice(&header);
-        msg.extend_from_slice(&self.payload);
-        Ok(msg)
+        message[..MessageHeader::LEN].copy_from_slice(&header);
+        Ok(message)
     }
 
     /// Assemble the message together with the descriptors written with
     /// [`Self::write_fd`], as generated forwarding sends it.
-    pub fn try_build(self, sender_id: u32, opcode: u16) -> Result<Outgoing, ProtocolError> {
+    pub fn try_build(mut self, sender_id: u32, opcode: u16) -> Result<Outgoing, ProtocolError> {
+        let fds = std::mem::take(&mut self.fds);
         let message = self.try_build_message(sender_id, opcode)?;
-        Ok((message, self.fds))
+        Ok((message, fds))
     }
 
     /// A builder that continues `payload`, for tests that edit raw frames.
     #[cfg(test)]
     pub fn from_payload(payload: Vec<u8>) -> Self {
+        let mut message = Vec::with_capacity(MessageHeader::LEN + payload.len());
+        message.extend_from_slice(&[0; MessageHeader::LEN]);
+        message.extend_from_slice(&payload);
         Self {
-            payload,
+            message,
             fds: Vec::new(),
         }
     }
 
     /// The payload written so far, for tests that edit or decode it.
     #[cfg(test)]
-    pub fn into_payload(self) -> Vec<u8> {
-        self.payload
+    pub fn into_payload(mut self) -> Vec<u8> {
+        self.message.drain(..MessageHeader::LEN);
+        self.message
     }
 
     /// Assemble a complete Wayland wire message into a `Vec<u8>`, consuming `self`.
@@ -703,7 +724,8 @@ mod tests {
             builder.write_string(&text);
             builder.write_array(&array);
             builder.write_nullable_string(None);
-            let mut message = WireMessage::new(1, 0, &builder.payload);
+            let payload = builder.into_payload();
+            let mut message = WireMessage::new(1, 0, &payload);
             assert_eq!(message.read_u32(), Ok(value));
             assert_eq!(message.read_string(), Ok(text));
             assert_eq!(message.read_array(), Ok(array));
@@ -1163,7 +1185,7 @@ mod tests {
         let mut forwarded = MessageBuilder::new();
         forwarded.write_fixed(decoded);
 
-        assert_eq!(forwarded.payload, raw.to_ne_bytes());
+        assert_eq!(forwarded.into_payload(), raw.to_ne_bytes());
     }
 
     #[test]
@@ -1178,19 +1200,18 @@ mod tests {
     #[test]
     #[should_panic(expected = "Wayland message is too large")]
     fn builder_rejects_oversized_wire_message() {
-        let mut builder = MessageBuilder::new();
-        builder.payload.resize(4_092, 0);
-        let _ = builder.build_message(1, 0);
+        let _ = MessageBuilder::from_payload(vec![0; 4_092]).build_message(1, 0);
     }
 
     #[test]
     fn try_builder_reports_oversized_wire_message() {
-        let mut builder = MessageBuilder::new();
-        builder.payload.resize(4_088, 0);
-        assert_eq!(builder.try_build_message(1, 0).map(|m| m.len()), Ok(4_096));
-        builder.payload.resize(4_092, 0);
+        let payload = |len| MessageBuilder::from_payload(vec![0; len]);
         assert_eq!(
-            builder.try_build_message(1, 0),
+            payload(4_088).try_build_message(1, 0).map(|m| m.len()),
+            Ok(4_096)
+        );
+        assert_eq!(
+            payload(4_092).try_build_message(1, 0),
             Err(ProtocolError::MessageTooLarge(4_100)),
             "libwayland refuses a message over 4096 bytes"
         );
@@ -1198,10 +1219,8 @@ mod tests {
 
     #[test]
     fn try_builder_rejects_unaligned_wire_message_length() {
-        let mut builder = MessageBuilder::new();
-        builder.payload.push(0);
         assert_eq!(
-            builder.try_build_message(1, 0),
+            MessageBuilder::from_payload(vec![0]).try_build_message(1, 0),
             Err(ProtocolError::InvalidMessageLength(9)),
             "Wayland message lengths must be 4-byte aligned"
         );

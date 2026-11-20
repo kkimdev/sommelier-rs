@@ -393,7 +393,8 @@ mod tests {
             "forwarding moves the descriptor into the outgoing message"
         );
         // The generated module allows clippy::disallowed_methods for
-        // MessageBuilder::new, which also silences the descriptor guard.
+        // MessageBuilder::with_capacity, which also silences the
+        // descriptor guard.
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let protocols = manifest_dir.join("../third_party/protocols");
         for entry in std::fs::read_dir(protocols).expect("read the vendored protocols") {
