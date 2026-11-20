@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Check that every test the design documents cite still exists.
+"""Check that every test the documentation cites still exists.
 
-docs/INVARIANTS.md and docs/DESIGN.md cite the tests that pin a rule in
-"Test:" and "Tests:" clauses. A clause runs to the end of its sentence,
-its paragraph or the parenthesis it sits in, and every backticked name in
-it must be a test: a function under a test attribute in a tracked Rust
-file. A renamed or removed test must take its citation with it.
+The repository's Markdown documents, outside third_party/, cite the tests
+that pin a rule in "Test:" and "Tests:" clauses ("Row tests:" too). A
+clause runs to the end of its sentence, its paragraph, the parenthesis
+it sits in or its table cell, and every backticked name in it must be a
+test: a function under a test attribute in a tracked Rust file. A
+renamed or removed test must take its citation with it. The name must be
+the only test of that name, and not a test of the DST's models or harness
+in sommelier/src/sim/, which pins those rather than the proxy; the DST's
+runs and its regressions may be cited.
 
 Usage: python3 -I scripts/check-cited-tests.py
 """
@@ -16,16 +20,24 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DOCS = [ROOT / "docs" / "INVARIANTS.md", ROOT / "docs" / "DESIGN.md"]
 CLAUSE = re.compile(r"\b[Tt]ests?:")
-NAME = re.compile(r"[a-z_][a-z0-9_]*")
-# A function under `#[test]` or `#[tokio::test(...)]`, past any other
-# attributes and doc comments.
+NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A function under `#[test]` or `#[tokio::test(...)]` at the start of a
+# line, not in a comment, past any other attributes and doc comments.
 TEST = re.compile(
-    r"#\[(?:tokio::)?test\b[^\]]*\]"
+    r"^[ \t]*#\[(?:tokio::)?test\b[^\]]*\]"
     r"\s*(?:(?:#\[[^\]]*\]|///[^\n]*)\s*)*"
-    r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)",
+    re.MULTILINE,
 )
+# The DST lives here; the tests of its models and harness pin those, not
+# the proxy, so a document cites only the DST's runs and its regressions.
+MODELS = "sommelier/src/sim/"
+DST = {
+    "ime_reaches_the_specified_text",
+    "ime_reaches_the_intended_text",
+    "every_regression_passes_the_oracle",
+}
 PARAGRAPH_END = re.compile(r"\n\s*(?:\n|- )")
 
 
@@ -44,7 +56,8 @@ def clause_names(text: str, start: int) -> list[str]:
         at_sentence_end = character == "." and (
             position + 1 == len(text) or text[position + 1].isspace()
         )
-        if at_sentence_end or PARAGRAPH_END.match(text, position):
+        at_cell_end = character == "|"
+        if at_sentence_end or at_cell_end or PARAGRAPH_END.match(text, position):
             break
         if character == "(":
             depth += 1
@@ -65,26 +78,31 @@ def cited_names(doc: pathlib.Path) -> list[str]:
     ]
 
 
-def defined_tests() -> set[str]:
+def tracked(*pathspecs: str) -> list[pathlib.Path]:
     files = subprocess.run(
-        ["git", "ls-files", "*.rs"],
+        ["git", "ls-files", "-z", "--", *pathspecs],
         cwd=ROOT,
         check=True,
         capture_output=True,
         text=True,
-    ).stdout.split()
-    return {
-        name
-        for file in files
-        for name in TEST.findall((ROOT / file).read_text(encoding="utf-8"))
-    }
+    ).stdout.split("\0")
+    return [ROOT / file for file in files if file]
+
+
+def defined_tests() -> dict[str, list[str]]:
+    """Each test's name, with the files that define a test of that name."""
+    tests: dict[str, list[str]] = {}
+    for file in tracked("*.rs"):
+        for name in TEST.findall(file.read_text(encoding="utf-8")):
+            tests.setdefault(name, []).append(file.relative_to(ROOT).as_posix())
+    return tests
 
 
 def main() -> int:
     tests = defined_tests()
     failed = False
     total = 0
-    for doc in DOCS:
+    for doc in tracked("*.md", ":(exclude)third_party"):
         relative = doc.relative_to(ROOT)
         for name in cited_names(doc):
             total += 1
@@ -93,6 +111,14 @@ def main() -> int:
                 failed = True
             elif name not in tests:
                 print(f"{relative} cites `{name}`, which no Rust test defines")
+                failed = True
+            elif len(tests[name]) > 1:
+                files = ", ".join(tests[name])
+                print(f"{relative} cites `{name}`, which more than one test defines: {files}")
+                failed = True
+            elif tests[name][0].startswith(MODELS) and name not in DST:
+                what = "the DST's models or harness, not the proxy"
+                print(f"{relative} cites `{name}`, which tests {what}")
                 failed = True
     if total == 0:
         print("The documents cite no tests; the check is broken")

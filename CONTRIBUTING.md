@@ -90,9 +90,10 @@ assert_eq!(
   (`text_input::tests`) and need no other setup.
 - Use `MessageBuilder` only for frames no encoder builds, such as
   malformed ones.
-- [INVARIANTS.md](docs/INVARIANTS.md) and [DESIGN.md](docs/DESIGN.md)
-  cite tests by name in "Test:" and "Tests:" clauses;
-  `scripts/check-cited-tests.py` checks that each names a test.
+- The documentation cites tests by name in "Test:" and "Tests:" clauses.
+  `scripts/check-cited-tests.py` checks, in every tracked Markdown file
+  outside `third_party/`, that each names one test, and not a test of a
+  DST model, which pins the model rather than the proxy.
 
 ## Randomized tests
 
@@ -174,16 +175,16 @@ a whole proxy client (`proxy::harness::Session`), with a model of Exo
 and its Korean input method behind it. Every message travels a FIFO
 channel with a drawn latency on one virtual clock, so a seed fixes the
 whole case, timing included; [docs/IME.md](docs/IME.md#4-the-dst-harness)
-describes it. `ime_reaches_the_specified_text` holds the proxy to the
-specification (section 2 of that document), whatever the timing:
-after every message the proxy handles, the transactions the guest gets
-and what it then shows, the preedit's cursor included, and the
-activations and resets the proxy asks of the host.
-`ime_reaches_the_intended_text` also holds the client to the user's
-intent, in cases that settle around every click, tap, focus
-move and restart of the input method, and after a key the input method
-passes while it takes the engine to compose, whose confirmation then
-resets the engine. Exo's deletes and preedit regions must reach the
+describes it. One test holds the proxy to the specification (section 2
+of that document), whatever the timing: after every message the proxy
+handles, the transactions the guest gets and what it then shows, the
+preedit's cursor included, and the activations and resets the proxy asks
+of the host (test: `ime_reaches_the_specified_text`). The other also
+holds the client to the user's intent, in cases that settle around every
+click, tap, focus move and restart of the input method, and after a key
+the input method passes while it takes the engine to compose, whose
+confirmation then resets the engine (test:
+`ime_reaches_the_intended_text`). Exo's deletes and preedit regions must reach the
 guest as the specification measures them in the simulated Exo's text,
 or not at all; the summary counts the proxy's drops by cause
 (`Counts::drops`) and those of a guest that held Exo's text
@@ -244,8 +245,8 @@ x86_64 and sets `SOMMELIER_E2E_REQUIRED=1` so a missing one fails.
 
 Unit tests reach the VirtWL channel only through the functions that
 handle what an ioctl returned; the ioctls themselves need a real
-`virtio_wl` device. `virtwl_channel`'s
-`live_try_recv_eagain_then_async_recv_wakes` drives one: it opens a
+`virtio_wl` device. A test of `virtwl_channel` drives one (test:
+`live_try_recv_eagain_then_async_recv_wakes`): it opens a
 VirtWL context, checks that a receive on the empty context returns at
 once and that an asynchronous receive waits, then sends a
 `wl_display.sync` and waits up to five seconds for the host compositor's

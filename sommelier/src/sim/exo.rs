@@ -2252,7 +2252,7 @@ mod tests {
     /// even a report of the prediction resets it (`ResetInternal`), and
     /// one of the state before a later edit undoes that edit.
     #[test]
-    fn cancel_empties_the_history() {
+    fn a_cancel_empties_the_trackers_history() {
         let mut tracker = Tracker::default();
         tracker.update("ab".to_owned(), 1, 1);
         tracker.set_composition("x", Selection::caret(1));

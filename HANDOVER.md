@@ -136,7 +136,7 @@
     region over a shown preedit that deletes bytes beyond it leaves them
     in Chromium's text as well as in the new preedit, and the guest is
     out of step: the next
-    region is dropped until the guest reports (#85,
+    region is dropped until the guest reports (#85; test:
     `a_region_over_a_region_drops`). Ending the old preedit with a `done`
     of its own first would serve Chromium, but the report Chromium
     answers it with lacks the preedit, so Exo would drop its composition
