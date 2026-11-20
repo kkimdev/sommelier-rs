@@ -573,16 +573,8 @@ impl Client {
             let suppress_host_event = matches!(direction, Direction::HostToClient)
                 && pending_host_event_is_stale(&self.ctx, sender_id, opcode);
             let interface = match direction {
-                Direction::ClientToHost => self
-                    .ctx
-                    .shadow_table
-                    .get_interface(sender_id)
-                    .map(str::to_string),
-                Direction::HostToClient => self
-                    .ctx
-                    .shadow_table
-                    .get_host_interface(sender_id)
-                    .map(str::to_string),
+                Direction::ClientToHost => self.ctx.shadow_table.get_interface(sender_id),
+                Direction::HostToClient => self.ctx.shadow_table.get_host_interface(sender_id),
             };
 
             if direction == Direction::HostToClient {
@@ -593,7 +585,7 @@ impl Client {
                 crate::handler::ime_keys::before_host_event(
                     &mut self.ctx,
                     sender_id,
-                    interface.as_deref(),
+                    interface,
                     opcode,
                     &packet[MessageHeader::LEN..],
                 );
@@ -621,7 +613,7 @@ impl Client {
                     Direction::ClientToHost => Self::dispatch_request(
                         &mut self.handler,
                         &mut self.ctx,
-                        &interface,
+                        interface,
                         &mut msg,
                     ),
                     Direction::HostToClient if suppress_host_event => {
@@ -629,10 +621,10 @@ impl Client {
                         // object. Decode the queued event so its payload and
                         // ordered SCM_RIGHTS descriptors are consumed, but do
                         // not invoke handlers or expose it to the guest.
-                        Self::consume_event(&interface, &mut msg).map(|()| None)
+                        Self::consume_event(interface, &mut msg).map(|()| None)
                     }
                     Direction::HostToClient => {
-                        Self::dispatch_event(&mut self.handler, &mut self.ctx, &interface, &mut msg)
+                        Self::dispatch_event(&mut self.handler, &mut self.ctx, interface, &mut msg)
                     }
                 };
                 let res = msg.check_consumed(res);

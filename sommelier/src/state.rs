@@ -139,10 +139,12 @@ pub(crate) const INTERNAL_END_TARGET: &str = "sommelier::internal_end";
 
 /// What dispatching one message produced besides its forward
 /// ([`Context::take_effects`]). The proxy commits it whole, or, when the
-/// message ends the session, sends none of it.
-pub(crate) struct Effects {
-    pub(crate) to_host: Vec<Outgoing>,
-    pub(crate) to_guest: Vec<Outgoing>,
+/// message ends the session, sends none of it. The output drains the
+/// context's queues, which keep their capacity for the next message;
+/// dropping what it has not yielded closes its descriptors.
+pub(crate) struct Effects<'a> {
+    pub(crate) to_host: std::vec::Drain<'a, Outgoing>,
+    pub(crate) to_guest: std::vec::Drain<'a, Outgoing>,
     pub(crate) end: Option<SessionEnd>,
     /// The fence the message waits for before it can be dispatched again;
     /// see [`Context::wait_for_fence`].
@@ -619,10 +621,10 @@ impl Context {
     }
 
     /// Take what the message just dispatched produced (see [`Effects`]).
-    pub(crate) fn take_effects(&mut self) -> Effects {
+    pub(crate) fn take_effects(&mut self) -> Effects<'_> {
         Effects {
-            to_host: std::mem::take(&mut self.client_to_host_queue),
-            to_guest: std::mem::take(&mut self.host_to_client_queue),
+            to_host: self.client_to_host_queue.drain(..),
+            to_guest: self.host_to_client_queue.drain(..),
             end: self.session_end.take(),
             wait: self.fence_wait.take(),
         }

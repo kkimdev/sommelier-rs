@@ -1376,10 +1376,13 @@ mod tests {
         let before = ctx.surfaces[&TEST_SURFACE].clone();
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        let effects = ctx.take_effects();
-        assert!(effects.end.is_none());
-        assert!(effects.to_host.is_empty() && effects.to_guest.is_empty());
-        let wait = effects.wait.expect("the commit waits for its fence");
+        let wait = {
+            let effects = ctx.take_effects();
+            assert!(effects.end.is_none());
+            assert!(effects.to_host.as_slice().is_empty());
+            assert!(effects.to_guest.as_slice().is_empty());
+            effects.wait.expect("the commit waits for its fence")
+        };
         assert_eq!(wait.timeout, crate::allocator::SYNC_FILE_TIMEOUT);
         assert_eq!(
             ctx.surfaces[&TEST_SURFACE], before,
@@ -1391,7 +1394,7 @@ mod tests {
         let effects = ctx.take_effects();
         assert!(effects.end.is_none() && effects.wait.is_none());
         assert_eq!(
-            queued_headers(&effects.to_host).last(),
+            queued_headers(effects.to_host.as_slice()).last(),
             Some(&(SURFACE.host, REQ_COMMIT))
         );
     }

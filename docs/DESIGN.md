@@ -149,10 +149,18 @@ build time (`sommelier/build.rs`). For each protocol it generates:
 - A `NAME` constant, the interface's name. Handlers name an interface
   by it, never by a copied literal.
 
-`generate_routing` derives the interface-to-protocol routing table, and
-`interface_version`, each interface's `VERSION` by name, from the same
-list, so the proxy never restates which protocol owns an interface or how
-new it is.
+`generate_routing` derives the interface-to-protocol routing table,
+`interface_version`, each interface's `VERSION` by name, and
+`interface_name`, its `NAME`, from the same list, so the proxy never
+restates which protocol owns an interface or how new it is. The object
+table keeps each object's interface as that `&'static str`, so routing a
+message or creating an object copies no name; a `wl_registry.bind`, whose
+interface is a string on the wire, goes through `interface_name`.
+
+Encoders and forwards size their `MessageBuilder` up front, from their
+arguments or the received payload, and it writes the payload after room
+for the header, which building fills in: a message is one allocation and
+is not copied again before it joins its peer's pending output.
 
 ## Object translation
 

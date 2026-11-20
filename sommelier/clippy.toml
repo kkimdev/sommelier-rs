@@ -1,6 +1,8 @@
 # Production code builds every message with a generated encoder; see
 # "Wire messages" in docs/INVARIANTS.md. The generated protocol module
 # allows it, and so does each test module that hand-builds frames.
+# `MessageBuilder::new` exists only in tests, so outside them its path
+# names nothing (`allow-invalid`).
 #
 # Every descriptor is one OwnedFd from its receive to its send; see
 # "Transport and file descriptors" in docs/INVARIANTS.md. Only the kernel
@@ -23,7 +25,8 @@
 # item that needs it: a module-wide allow (the generated protocols, the
 # fuzzer, test modules) also lets blocking calls through.
 disallowed-methods = [
-    { path = "sommelier::wire::MessageBuilder::new", reason = "build messages with the generated req:: and evt:: encoders" },
+    { path = "sommelier::wire::MessageBuilder::new", reason = "build messages with the generated req:: and evt:: encoders", allow-invalid = true },
+    { path = "sommelier::wire::MessageBuilder::with_capacity", reason = "build messages with the generated req:: and evt:: encoders" },
     { path = "libc::close", reason = "an OwnedFd closes its descriptor when it drops" },
     { path = "nix::unistd::close", reason = "an OwnedFd closes its descriptor when it drops" },
     { path = "std::os::fd::FromRawFd::from_raw_fd", reason = "only a kernel or device boundary may take over a raw descriptor" },

@@ -1255,11 +1255,17 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
     fn on_bind(&mut self, ctx: &mut Context, name: u32, id: &(String, u32, u32)) -> Action {
         // id is (interface, version, new_id)
-        let (interface, version, guest_new_id) = id;
+        let (requested, version, guest_new_id) = id;
 
-        let generation = match admit_guest_bind(ctx, name, interface, *version) {
-            Some(BindAdmission::Live { generation }) => generation,
-            Some(BindAdmission::Inert) => {
+        // The object table keeps the interface's generated name. One no
+        // vendored protocol defines is never advertised, so it is no global
+        // the guest may bind either.
+        let admission = crate::protocols::interface_name(requested).and_then(|interface| {
+            Some((interface, admit_guest_bind(ctx, name, interface, *version)?))
+        });
+        let (interface, generation) = match admission {
+            Some((interface, BindAdmission::Live { generation })) => (interface, generation),
+            Some((interface, BindAdmission::Inert)) => {
                 log::debug!(
                     "Bind of removed global {}:{} v{} crossed its removal; guest object {} is inert",
                     name,
@@ -1276,14 +1282,14 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             None => {
                 error!(
                     "Rejecting bind for unadvertised, unsupported, or too-new global {}:{} v{}",
-                    name, interface, version
+                    name, requested, version
                 );
                 return ctx.reject(
                     ctx.last_sender_id,
                     wl_display::ERROR_INVALID_OBJECT,
                     format!(
                         "invalid bind for global {} (interface {}, version {})",
-                        name, interface, version
+                        name, requested, version
                     ),
                 );
             }

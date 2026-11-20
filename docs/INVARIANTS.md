@@ -136,8 +136,8 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `<interface>::evt::<event>`, which takes the arguments in XML order and
   type, and names protocol values with the generated enum constants.
   `MessageBuilder` is for generated code: `sommelier/clippy.toml` rejects
-  `MessageBuilder::new` everywhere else, and its private fields leave no
-  other way to make one. A test module that needs frames no encoder makes,
+  `MessageBuilder::new` and `MessageBuilder::with_capacity` everywhere
+  else, and its private fields leave no other way to make one. A test module that needs frames no encoder makes,
   such as malformed ones, allows `clippy::disallowed_methods` itself.
   Tests: `encoders_match_hand_built_scalar_messages`,
   `encoded_messages_decode_to_the_same_arguments`.
