@@ -71,11 +71,18 @@ service your apps use (`wayland-2`; see
 with one app that connects to it alone. In the Crostini terminal, from a
 checkout of this repository:
 
-1. Build the proxy, and the sample GUI if you will type into it:
+1. Build the proxy:
 
    ```bash
-   cargo build --locked --release -p sommelier -p sommelier-test-gui
+   cargo build --locked --release -p sommelier
    ```
+
+   Build it inside the Nix development shell if you can. A proxy built
+   outside it, against a Nix-provided libxkbcommon, needs that library's
+   lib directory on `LD_LIBRARY_PATH` when it starts, as in
+   `LD_LIBRARY_PATH="$(nix build nixpkgs#libxkbcommon --no-link
+   --print-out-paths)/lib"`. The sample GUI of step 3 does not run outside
+   the shell at all.
 
 2. Start the recording proxy on `wayland-9`, with recording on, no render
    node, no placement bindings, no host accelerators and no wheel steps,
@@ -98,20 +105,35 @@ checkout of this repository:
 
 3. In a second terminal, start one app on `wayland-9` that draws in
    software (the proxy has no render node) and starts a process of its
-   own, not a window of an app already running:
+   own, not a window of an app already running: gedit, a GTK3 app, in a
+   standalone, empty window:
 
    ```bash
+   WAYLAND_DISPLAY=wayland-9 GDK_BACKEND=wayland gedit --standalone
+   ```
+
+   Open no document in it: a trace holds the text of the field typed into.
+   `nix build nixpkgs#gedit --out-link gedit` builds one if the guest has
+   none; `--out-link` keeps the result out of the garbage collector's
+   reach.
+
+   The sample GUI instead works only inside the Nix development shell: a
+   GUI built outside it fails at startup with winit's `NoWaylandLib`,
+   since winit cannot find libwayland-client there. Build it there, then
+   run it as:
+
+   ```bash
+   cargo build --locked --release -p sommelier-test-gui
    WAYLAND_DISPLAY=wayland-9 LIBGL_ALWAYS_SOFTWARE=1 \
      ./target/release/sommelier-test-gui
    ```
 
-   A GTK3 app works too (`WAYLAND_DISPLAY=wayland-9 GDK_BACKEND=wayland
-   gedit --standalone`), but open no document in it. The proxy logs the
-   file it records the app in: `~/sommelier-traces/<time>-<pid>-<n>.trace`.
+   The proxy logs the file it records the app in:
+   `~/sommelier-traces/<time>-<pid>-<n>.trace`.
 
-4. In the empty field, type the scenario, and only that: for example,
-   with the Korean input method, type 가 and hold Space. Keep it short;
-   one scenario a trace.
+4. In the empty field of the app, type the scenario, and only that: for
+   example, with the Korean input method, type 가 and hold Space. Keep it
+   short; one scenario a trace.
 
 5. Close the app, so its connection ends and its trace is complete, then
    stop the proxy with Ctrl-C.
