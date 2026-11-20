@@ -771,8 +771,10 @@ violation fails the case:
   does not repeat, and `leave` names the entered surface;
 - every event names an object the model holds, and a surface it has;
 - every string is UTF-8;
-- a delete fits one of the surrounding texts the client sent since it
-  last enabled (`TextModel::delete_range`).
+- a delete fits one of the surrounding texts the client sent, or held to
+  send behind C1's gate, since it last enabled
+  (`TextModel::delete_range`): a client in step with Exo holds Exo's
+  text, which H9 measures in, before it may send it.
 
 The models never hold a selection, because `TextModel` has none. The
 proxy's selection rules (H9's drop while the guest has a selection, C5,

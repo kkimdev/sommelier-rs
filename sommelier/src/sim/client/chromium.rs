@@ -296,7 +296,11 @@ impl Chromium {
             return Vec::new();
         }
         self.pending.surrounding = surrounding;
-        self.flush()
+        let out = self.flush();
+        if let Some((text, cursor)) = &self.pending.surrounding {
+            self.protocol.held(text, *cursor);
+        }
+        out
     }
 
     /// A focused window reports its caret, then its text if that changed,
@@ -821,6 +825,28 @@ mod tests {
         };
         let drops = [dropped(at, part, DropReason::DeleteWhileComposing)];
         assert_eq!(chromium.drops(), drops);
+    }
+
+    #[test]
+    fn c1_a_delete_may_count_in_the_text_the_gate_holds() {
+        let mut chromium = entered(&["0가d"]);
+        let t0 = Micros(0);
+        let serial = chromium.commits;
+        // A suggestion replaces "가d" in two transactions under one serial:
+        // the first's report closes the gate, which holds the second's.
+        let out = send(&mut chromium, t0, [delete(4, 0), done(serial)]);
+        assert_eq!(out, [surrounding("0", 1), Request::Commit {}]);
+        let out = send(&mut chromium, t0, [commit("가d~"), done(serial)]);
+        assert_eq!(out, []);
+        // The next suggestion deletes "d~" of the text the gate holds,
+        // which is Exo's: it fits no text sent, but it is no violation.
+        send(
+            &mut chromium,
+            t0,
+            [delete(2, 0), commit("가d~"), done(serial)],
+        );
+        assert_eq!(chromium.fields()[0].model, model("0가가d~", 9, ""));
+        assert_eq!(chromium.drops(), []);
     }
 
     #[test]
