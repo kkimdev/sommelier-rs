@@ -273,6 +273,7 @@ binds no chord of its own. The contract is in
   `a_new_file_is_read_once_written`,
   `a_file_being_written_is_not_read_for_another_event`,
   `the_watcher_follows_the_target_of_a_link`,
+  `the_watcher_follows_a_link_in_a_directory_it_cannot_write`,
   `a_chain_follows_each_link_on_the_path`,
   `load_and_watch_reloads_on_the_event_loop`,
   `a_bindings_file_edit_takes_effect_on_the_next_press`,

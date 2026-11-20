@@ -213,6 +213,9 @@
   `Context`'s: the keyboard core reads it through `keys::Env` and hears of
   each change as `KeyInput::Focus`. Moving it into the core would make the
   core the one owner of every keyboard fact.
+- The bindings watcher removes the watches of an arming attempt that
+  started over (because a directory appeared while it armed), but no test
+  reaches that race.
 - Each empty confirmation while a taken key is held sends the host a
   `wl_display.sync` (about 30 a second).
 - The mirror assumes Exo reads a report and its glued sync in one read;

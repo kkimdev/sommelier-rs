@@ -33,10 +33,15 @@ limitations under the License.
 //! * that directory's parent, for the directory's own entry, which an
 //!   activation can swap as a whole link.
 //!
+//! And each link of the chain is watched in the directory that holds it,
+//! for its own entry, which an activation swaps, even a directory the
+//! proxy cannot write, as NixOS's `/etc` holds `/etc/static`.
+//!
 //! Only the directory that holds the file reports writes; the others
 //! report only their entries' changes, so writes elsewhere, such as a
 //! shell's history in the home directory, do not wake the proxy. A
-//! directory the proxy cannot write, such as the Nix store, is not watched
+//! directory the proxy cannot write that holds no link of the chain, such
+//! as the Nix store, which holds the file a chain ends at, is not watched
 //! on a link's path: nothing in it changes but by the system's hand, and
 //! a swap of the link into it is seen where the link is.
 //!
@@ -126,14 +131,31 @@ pub(crate) fn load_and_watch(settings: &Rc<Settings>) -> PlacementConfig {
     config
 }
 
-/// The configured path, then each path a symbolic link on the one before
-/// leads to: the link's target, with the rest of the path below the link.
-/// At most [`MAX_LINKS`] links are followed.
-fn chain(path: &Path) -> Vec<PathBuf> {
-    let mut chain = vec![path.to_path_buf()];
-    while chain.len() <= MAX_LINKS {
-        match through_first_link(chain.last().expect("the chain has the path")) {
-            Some(next) if !chain.contains(&next) => chain.push(next),
+/// The paths a configured path leads to, and the links that lead there.
+#[derive(Debug, PartialEq)]
+struct Chain {
+    /// The configured path, then each path a symbolic link on the one
+    /// before leads to: the link's target, with the rest of the path below
+    /// the link.
+    paths: Vec<PathBuf>,
+    /// The link each path but the first goes through, in order.
+    links: Vec<PathBuf>,
+}
+
+/// The [`Chain`] of `path`. At most [`MAX_LINKS`] links are followed.
+fn chain(path: &Path) -> Chain {
+    let mut chain = Chain {
+        paths: vec![path.to_path_buf()],
+        links: Vec::new(),
+    };
+    let mut last = path.to_path_buf();
+    while chain.links.len() < MAX_LINKS {
+        match through_first_link(&last) {
+            Some((link, next)) if !chain.paths.contains(&next) => {
+                chain.links.push(link);
+                chain.paths.push(next.clone());
+                last = next;
+            }
             _ => break,
         }
     }
@@ -141,8 +163,8 @@ fn chain(path: &Path) -> Vec<PathBuf> {
 }
 
 /// `path` through its first symbolic link, counted from the root, if it
-/// has one that can be read.
-fn through_first_link(path: &Path) -> Option<PathBuf> {
+/// has one that can be read: the link, and the path through it.
+fn through_first_link(path: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut link = PathBuf::new();
     let mut components = path.components();
     while let Some(component) = components.next() {
@@ -152,7 +174,8 @@ fn through_first_link(path: &Path) -> Option<PathBuf> {
             // No link precedes this one, so its directory holds none, and
             // a `..` of the target can go up from it by name.
             let directory = link.parent().unwrap_or(Path::new("/"));
-            return Some(lexical(&directory.join(target).join(components.as_path())));
+            let next = lexical(&directory.join(target).join(components.as_path()));
+            return Some((link, next));
         }
     }
     None
@@ -200,6 +223,24 @@ struct Armed {
     directories: usize,
     /// A failure other than a missing or unwatchable directory.
     error: Option<Errno>,
+}
+
+/// What [`Watcher::add`] made of a watch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Added {
+    /// A watch new to the arming.
+    New,
+    /// The arming's watch of the same inode, which now reports these
+    /// events too.
+    Joined,
+    /// No watch: the path is missing, unreachable or unreadable.
+    Missing,
+}
+
+impl Added {
+    fn watched(self) -> bool {
+        self != Self::Missing
+    }
 }
 
 /// The inotify instance, as `AsyncFd` takes it.
@@ -324,9 +365,11 @@ impl Watcher {
     }
 
     /// Watch, on every path of the [`chain`] as it is now, the file, the
-    /// deepest directory that exists and that directory's parent, and
-    /// nothing else. A directory on a path that appears while this arms
-    /// makes it start over.
+    /// deepest directory that exists and that directory's parent, and each
+    /// link of the chain where it is, and nothing else. A directory on a
+    /// path that appears while this arms makes it start over; the watches
+    /// of an attempt that starts over are removed unless the last one
+    /// keeps them.
     ///
     /// # Errors
     ///
@@ -334,12 +377,20 @@ impl Watcher {
     /// and no directory is watched: then no change could be seen. Each
     /// such failure is logged once.
     fn arm(&mut self) -> io::Result<()> {
+        // Every watch this instance may hold: the last arming's, and each
+        // attempt's of this one.
+        let mut made: BTreeSet<WatchDescriptor> = self.watches.keys().copied().collect();
         let mut armed = Armed::default();
         for _ in 0..MAX_ARMS {
+            made.extend(armed.watches.keys().copied());
             armed = Armed::default();
+            let chain = chain(&self.path);
             let mut settled = true;
-            for (hop, path) in chain(&self.path).iter().enumerate() {
+            for (hop, path) in chain.paths.iter().enumerate() {
                 settled &= self.arm_path(&mut armed, path, hop > 0);
+            }
+            for link in &chain.links {
+                self.arm_link(&mut armed, link);
             }
             if settled {
                 break;
@@ -361,7 +412,7 @@ impl Watcher {
             }
         }
         let inotify = &self.inotify.get_ref().0;
-        for &watch in self.watches.keys() {
+        for watch in made {
             if !armed.watches.contains_key(&watch) {
                 // The inode may be gone, which removed the watch already.
                 let _ = inotify.rm_watch(watch);
@@ -386,7 +437,8 @@ impl Watcher {
     /// deepest watched directory appeared while this armed, so that the
     /// watch that would see it changing was not made.
     fn arm_path(&self, armed: &mut Armed, path: &Path, linked: bool) -> bool {
-        let file_watched = self.add(armed, path, FILE_EVENTS, Watch::File) == Ok(true);
+        let file = self.add(armed, path, FILE_EVENTS, Watch::File);
+        let file_watched = file.is_ok_and(Added::watched);
         let mut entry = path;
         let mut directories = 0;
         let mut settled = true;
@@ -409,9 +461,9 @@ impl Watcher {
                 path: entry.to_path_buf(),
             }]);
             match self.add(armed, directory, events, watch_for) {
-                Ok(true) => {}
+                Ok(Added::New | Added::Joined) => {}
                 // Missing, or no directory: try the one above it.
-                Ok(false) if directories == 0 => {
+                Ok(Added::Missing) if directories == 0 => {
                     entry = directory;
                     continue;
                 }
@@ -436,13 +488,34 @@ impl Watcher {
         settled
     }
 
+    /// Watch the directory that holds `link`, a link of the chain, for
+    /// the link's entry into `armed`, whether or not the proxy can write
+    /// the directory: a swap of the link changes the entry.
+    fn arm_link(&self, armed: &mut Armed, link: &Path) {
+        let (Some(directory), Some(name)) = (link.parent(), link.file_name()) else {
+            return;
+        };
+        let watch_for = Watch::Directory(vec![Entry {
+            name: name.to_os_string(),
+            path: link.to_path_buf(),
+        }]);
+        if self.add(armed, directory, ENTRY_EVENTS, watch_for) == Ok(Added::New) {
+            armed.directories += 1;
+        }
+    }
+
     /// Watch `path` for `events` as `watch_for`, joining a watch of the
     /// same inode that `armed` holds.
     ///
+    /// A join adds its events to the watch's (`IN_MASK_ADD`), so the watch
+    /// never loses one this arming asked for, even for an instant; a watch
+    /// new to this arming takes exactly its events, which drops those an
+    /// earlier arming asked of the inode.
+    ///
     /// # Returns
     ///
-    /// Whether the watch was made, `false` for a missing, unreachable or
-    /// unreadable path.
+    /// Whether the watch was made, new or joined, or not, for a missing,
+    /// unreachable or unreadable path.
     ///
     /// # Errors
     ///
@@ -454,9 +527,12 @@ impl Watcher {
         path: &Path,
         events: AddWatchFlags,
         watch_for: Watch,
-    ) -> Result<bool, Errno> {
+    ) -> Result<Added, Errno> {
         let inotify = &self.inotify.get_ref().0;
-        let added = inotify.add_watch(path, events).and_then(|watch| {
+        // `nix` names no `IN_MASK_ADD`.
+        let mask_add = AddWatchFlags::from_bits_retain(libc::IN_MASK_ADD);
+        let joining = events | mask_add;
+        let added = inotify.add_watch(path, joining).and_then(|watch| {
             match armed.watches.get_mut(&watch) {
                 Some((mask, existing)) => {
                     *mask |= events;
@@ -465,18 +541,20 @@ impl Watcher {
                     {
                         entries.extend(more);
                     }
-                    // Without IN_MASK_ADD, a watch takes the latest mask.
-                    inotify.add_watch(path, *mask).map(drop)
+                    Ok(Added::Joined)
                 }
                 None => {
+                    inotify.add_watch(path, events)?;
                     armed.watches.insert(watch, (events, watch_for));
-                    Ok(())
+                    Ok(Added::New)
                 }
             }
         });
         match added {
-            Ok(()) => Ok(true),
-            Err(Errno::ENOENT | Errno::ENOTDIR | Errno::EACCES | Errno::ELOOP) => Ok(false),
+            Ok(added) => Ok(added),
+            Err(Errno::ENOENT | Errno::ENOTDIR | Errno::EACCES | Errno::ELOOP) => {
+                Ok(Added::Missing)
+            }
             Err(error) => {
                 armed.error = Some(error);
                 Err(error)
@@ -524,6 +602,15 @@ mod tests {
 
     fn bind_alt_q(action: &str) -> String {
         one_binding(&format!("action = \"{action}\""))
+    }
+
+    /// Assert that every watch the kernel holds for `watcher`'s inotify
+    /// instance is one the watcher keeps, and the reverse.
+    fn assert_no_stray_watch(watcher: &Watcher) {
+        let fd = watcher.inotify.get_ref().as_raw_fd();
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+        let held = info.lines().filter(|line| line.starts_with("inotify wd:"));
+        assert_eq!(held.count(), watcher.watches.len(), "{info}");
     }
 
     /// Every way a file comes, changes and goes reaches the bindings with
@@ -687,9 +774,59 @@ mod tests {
         swap_link(&dir, &path, &dotfiles.join("current/window-placement.toml"));
         assert_eq!(reload(&mut watcher, &mut file).await, Refresh::Loaded);
         assert_eq!(alt_q(&config), preset("top"));
+        assert_no_stray_watch(&watcher);
         swap_link(&dir, &dotfiles.join("current"), &dotfiles.join("v2"));
         assert_eq!(reload(&mut watcher, &mut file).await, Refresh::Loaded);
         assert_eq!(alt_q(&config), preset("bottom"));
+        assert_no_stray_watch(&watcher);
+    }
+
+    /// A link of the chain in a directory the proxy cannot write, as
+    /// NixOS's `/etc` holds `/etc/static`, is watched where it is: the
+    /// system's swap of it reaches the bindings. The store it links into,
+    /// which holds only the file, is not watched.
+    #[tokio::test]
+    async fn the_watcher_follows_a_link_in_a_directory_it_cannot_write() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = TempDir::new("watch-read-only-link");
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let store = dir.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        for (name, action) in [("old.toml", "left"), ("new.toml", "right")] {
+            std::fs::write(store.join(name), bind_alt_q(action)).unwrap();
+        }
+        let etc = dir.path().join("etc");
+        std::fs::create_dir(&etc).unwrap();
+        let link = etc.join("window-placement.toml");
+        symlink(store.join("old.toml"), &link).unwrap();
+        std::fs::create_dir(dir.path().join("sommelier-rs")).unwrap();
+        symlink(&link, dir.path().join("sommelier-rs/window-placement.toml")).unwrap();
+        mode(&store, 0o555);
+        mode(&etc, 0o555);
+        // Writable again as the test ends, so that its directory can be
+        // removed.
+        struct Writable(Vec<PathBuf>);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
+        let _writable = Writable(vec![store.clone(), etc.clone()]);
+        let (mut watcher, mut file, config) = watched(dir.path());
+        assert_eq!(alt_q(&config), preset("left"));
+        assert_no_stray_watch(&watcher);
+
+        // The system swaps the link.
+        mode(&etc, 0o755);
+        swap_link(&dir, &link, &store.join("new.toml"));
+        mode(&etc, 0o555);
+        assert_eq!(reload(&mut watcher, &mut file).await, Refresh::Loaded);
+        assert_eq!(alt_q(&config), preset("right"));
+        assert_no_stray_watch(&watcher);
     }
 
     /// The chain of a path: each link, of a directory or the file, adds
@@ -704,14 +841,18 @@ mod tests {
         std::os::unix::fs::symlink("v1/file", root.join("real/link")).unwrap();
         assert_eq!(
             chain(&root.join("config/link")),
-            [
-                root.join("config/link"),
-                root.join("real/link"),
-                root.join("real/v1/file"),
-            ]
+            Chain {
+                paths: vec![
+                    root.join("config/link"),
+                    root.join("real/link"),
+                    root.join("real/v1/file"),
+                ],
+                links: vec![root.join("config"), root.join("real/link")],
+            }
         );
         std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
-        assert_eq!(chain(&root.join("loop")), [root.join("loop")]);
+        let loop_chain = chain(&root.join("loop"));
+        assert_eq!(loop_chain.paths, [root.join("loop")]);
     }
 
     /// The watch runs as a task of the event loop: an edit reaches the

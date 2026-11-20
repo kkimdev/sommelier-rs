@@ -384,11 +384,17 @@ watches:
 - that directory's parent, for the directory's own entry, which a Home
   Manager activation can swap as a whole link.
 
+Each link on the way is also watched in the directory that holds it, for
+its own entry, even where the proxy cannot write, as NixOS's `/etc` holds
+`/etc/static`: a system activation swaps it.
+
 Only the directory that holds the file reports writes; the others report
 only their entries' changes, so writes elsewhere in the home directory do
-not wake the proxy. On a link's path a directory the proxy cannot write,
-such as the Nix store, is not watched: only the system changes it, and a
-swap of the link into it is seen where the link is.
+not wake the proxy. On a link's path a directory the proxy cannot write
+that holds no link on the way, such as the Nix store, which holds the
+file the links end at, is not watched: only the system changes it, and a
+swap of the link into it is seen where the link is. Each arming removes
+every watch it does not keep, also those of an attempt it started over.
 
 Each event that concerns a path arms these watches again, since the files
 behind the paths may have changed, and reloads the file. A regular file
