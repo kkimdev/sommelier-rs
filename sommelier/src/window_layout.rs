@@ -24,14 +24,13 @@ limitations under the License.
 //!   the nine named presets) or a rectangle. Every placement goes through
 //!   [`NormalizedRect::to_work_area_bounds`], so there is exactly one
 //!   rounding rule.
-//! * [`Rect`] - an integer rectangle in logical screen coordinates: the work
-//!   area a placement maps into and the window bounds it produces.
 //!
-//! The module depends on nothing else in the crate. The configuration
-//! parser (`placement_config`) builds the rectangles; `Context` and the
-//! keyboard handler pass them on; the output registry (`state::outputs`) returns
-//! work areas as [`Rect`]; and the placement handler
-//! (`handler::window_placement`) maps one into the other.
+//! It maps a [`NormalizedRect`] into a work area, a [`Rect`] in logical
+//! screen coordinates (`crate::geometry`, which the output registry
+//! returns work areas in too), and depends on nothing else in the crate.
+//! The configuration parser (`placement_config`) builds the rectangles,
+//! and the placement handler (`handler::window_placement`) maps one into
+//! the other.
 //!
 //! # Rules
 //!
@@ -42,6 +41,8 @@ limitations under the License.
 //! tests below are the code side of that contract.
 
 use thiserror::Error;
+
+use crate::geometry::Rect;
 
 /// Distance within which an edge fraction is a work-area border (the edge
 /// band; see the module rules).
@@ -54,32 +55,6 @@ const EDGE_TOLERANCE: f64 = 1e-9;
 /// bias: only an edge less than `1e-6` px below a pixel boundary lands on
 /// the next pixel.
 const PIXEL_BIAS: f64 = 1e-6;
-
-/// An integer rectangle in logical screen coordinates.
-///
-/// It is the output work area a placement maps into and the window bounds
-/// the mapping produces. It is plain data: a value with a non-positive
-/// extent is representable, and [`NormalizedRect::to_work_area_bounds`]
-/// rejects it as a work area.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-}
-
-impl Rect {
-    /// Build a rectangle from its origin and extent.
-    pub(crate) const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-}
 
 /// Reasons a rectangle is not a valid normalized work-area rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

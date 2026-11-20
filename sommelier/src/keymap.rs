@@ -109,17 +109,6 @@ impl Keymap {
         !syms.is_empty() && syms.iter().all(|&sym| is_modifier_keysym(sym.raw()))
     }
 
-    /// The default XKB keymap under no modifiers, as a host keyboard of a
-    /// test has once its keymap loaded.
-    #[cfg(test)]
-    pub(crate) fn default_for_test() -> Self {
-        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let flags = xkb::KEYMAP_COMPILE_NO_FLAGS;
-        let keymap = xkb::Keymap::new_from_names(&context, "", "", "", "", None, flags)
-            .expect("the default keymap");
-        Self::new(&keymap, KeyboardModifiers::default())
-    }
-
     /// The XKB state, for tests that read it.
     #[cfg(test)]
     pub(crate) fn state(&self) -> &xkb::State {
@@ -131,6 +120,14 @@ impl Keymap {
     pub(crate) fn repeatable(&self) -> &BTreeSet<u32> {
         &self.repeatable
     }
+}
+
+/// The default XKB keymap, as a host keyboard of a test sends it.
+#[cfg(test)]
+pub(crate) fn default_for_test() -> xkb::Keymap {
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let flags = xkb::KEYMAP_COMPILE_NO_FLAGS;
+    xkb::Keymap::new_from_names(&context, "", "", "", "", None, flags).expect("the default keymap")
 }
 
 /// X11's `IsModifierKey`: Shift to Hyper, the ISO lock and level keys,

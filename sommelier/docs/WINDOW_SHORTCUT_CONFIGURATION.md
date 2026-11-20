@@ -384,11 +384,17 @@ watches:
 - that directory's parent, for the directory's own entry, which a Home
   Manager activation can swap as a whole link.
 
+Each link on the way is also watched in the directory that holds it, for
+its own entry, even where the proxy cannot write, as NixOS's `/etc` holds
+`/etc/static`: a system activation swaps it.
+
 Only the directory that holds the file reports writes; the others report
 only their entries' changes, so writes elsewhere in the home directory do
-not wake the proxy. On a link's path a directory the proxy cannot write,
-such as the Nix store, is not watched: only the system changes it, and a
-swap of the link into it is seen where the link is.
+not wake the proxy. On a link's path a directory the proxy cannot write
+that holds no link on the way, such as the Nix store, which holds the
+file the links end at, is not watched: only the system changes it, and a
+swap of the link into it is seen where the link is. Each arming removes
+every watch it does not keep, also those of an attempt it started over.
 
 Each event that concerns a path arms these watches again, since the files
 behind the paths may have changed, and reloads the file. A regular file
@@ -498,15 +504,15 @@ correctly, with no warning in the log.
 | `sommelier/src/settings.rs` | `Settings`: the bindings file's path and the parsed `SOMMELIER_ACCELERATORS`, resolved once. |
 | `sommelier/src/placement_config.rs` | `Bindings` (one validated version of the file), `PlacementConfig` (the current version, which every connection shares), `BindingsFile` (the identity check that reloads the file and publishes the result), the hardened file read, and the one validator (which takes the host accelerators as an input). |
 | `sommelier/src/placement_config/watch.rs` | `load_and_watch`: the chain of paths through the bindings file's links, the inotify watches on them, and the event-loop task that reloads the file. |
-| `sommelier/src/window_layout.rs` | `NormalizedRect`: the named presets and their parser, validation, and the rounding rule that maps a rectangle from a work-area `Rect` to window bounds. |
-| `sommelier/src/accelerator.rs` | Chord types and parsing only. |
-| `sommelier/src/state.rs` | `Context` holds the connection's owners below and its `host_zaura_shell` binding; `Context::new` decides whether the connection has placement; `placement_rect_for` asks the shared `PlacementConfig`, `is_host_accelerator` the settings, and `placement` and `placement_mut` give the placement state while placement is on. |
+| `sommelier/src/window_layout.rs` | `NormalizedRect`: the named presets and their parser, validation, and the rounding rule that maps a rectangle into a work area (a `Rect` of `sommelier/src/geometry.rs`, which the output registry shares) as window bounds. |
+| `sommelier/src/accelerator.rs` | Chord types and parsing, and `BindingId`, the binding of a chord the keyboard consumes as a shortcut. |
+| `sommelier/src/state.rs` | `Context` holds the connection's owners below and its `host_zaura_shell` binding; `Context::new` decides whether the connection has placement; `placement_rect` asks the shared `PlacementConfig` for a binding's rectangle, `step_keys` hands the keyboard core the binding of a chord (`handler::keyboard::CtxEnv`), and `placement` and `placement_mut` give the placement state while placement is on. |
 | `sommelier/src/state/window_placement.rs` | `WindowPlacement` (present only while placement is on) and `PlacementState`: each toplevel's Aura toplevel, its last reported origin, the states and serial of its newest configure, and the placement in flight, keyed by typed guest and host IDs. |
 | `sommelier/src/state/aura_surfaces.rs` | `AuraSurfaces`: the one host Aura surface of each `wl_surface`, shared by XDG and GTK metadata and placement. |
 | `sommelier/src/state/xdg_roles.rs` | `XdgRoles`: which `wl_surface` each `xdg_surface` and `xdg_toplevel` belongs to; placement finds the focused toplevel here. |
 | `sommelier/src/state/internal_callbacks.rs` | `InternalCallbacks`: what each proxy-issued `wl_display.sync` waits for, including the placement barrier. |
 | `sommelier/src/state/outputs.rs` | `OutputRegistry`: live outputs, their committed metadata, and the output a surface is placed on; `OutputState::work_area`. |
-| `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |
+| `sommelier/src/keys/mod.rs` | `KeyboardCore::classify` turns a chord into host accelerator, shortcut (a `BindingId`), or guest input; a consumed shortcut's binding comes back as `KeyEffects::shortcut`, which `handler/keyboard.rs` hands to `window_placement::shortcut`, placement being the keyboard's one shortcut subscriber. |
 | `sommelier/src/handler/window_placement.rs` | Placement: the focused toplevel, its output and the bounds, the three steps and their origin math, the Aura toplevel of each XDG toplevel, and the translation of its configures; one entry point per protocol event, listed in its module docs. |
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), sends the shelf application ID, and releases the `zaura_shell` binding. |
 | `sommelier/src/handler/callback.rs` | `queue_internal_sync` issues the placement barrier, and `wl_callback.done` dispatches it to `window_placement::complete_barrier`. |

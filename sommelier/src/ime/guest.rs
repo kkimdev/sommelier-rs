@@ -60,7 +60,7 @@ pub(super) struct GuestTxn {
 pub(super) struct TooLong;
 
 impl GuestTxn {
-    /// The only builder of `zwp_text_input_v3` `preedit_string`,
+    /// The only builder, with [`Self::bare`], of `zwp_text_input_v3` `preedit_string`,
     /// `delete_surrounding_text`, `commit_string` and `done`, in mutter's
     /// and KWin's order:
     ///
@@ -107,6 +107,18 @@ impl GuestTxn {
         }
         events.push(evt::done(ti, serial.get()));
         Ok(events)
+    }
+
+    /// The transaction that commits and shows nothing, as [`Self::encode`]
+    /// builds it for `GuestTxn::default()`: an empty `preedit_string` that
+    /// clears the preedit the guest shows (`shown_before`), then `done`.
+    /// It cannot fail: `done` has no string, and an empty string fits any
+    /// message, so the clear is always built.
+    pub(super) fn bare(ti: TiId, shown_before: bool, serial: Serial) -> Vec<Outgoing> {
+        use zwp_text_input_v3::evt;
+        let clear = shown_before.then(|| evt::preedit_string(ti.0, Some(""), 0, 0));
+        let clear = clear.into_iter().flatten();
+        clear.chain([evt::done(ti.0, serial.get())]).collect()
     }
 }
 

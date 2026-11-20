@@ -17,12 +17,15 @@ limitations under the License.
 //! The host keyboards of a connection, one [`Keyboard`] record each, which
 //! holds every fact of the keyboard itself: its guest object and seat, its
 //! keymap, its modifiers and its extended keyboard. Its keys' generations
-//! are the key registry's, and its focus the focus registry's.
+//! are the key registry's (`super::generations`), and its focus the focus
+//! registry's (`crate::state::KeyboardFocusRegistry`). Only
+//! [`super::KeyboardCore`] changes a record; the rest of the proxy reads
+//! them.
 
 use std::collections::BTreeMap;
 
-use super::HostId;
 use crate::keymap::{KeyboardModifiers, Keymap};
+use crate::state::HostId;
 
 /// One host `wl_keyboard`, from its guest's `wl_seat.get_keyboard` to its
 /// end.
@@ -45,7 +48,7 @@ pub(crate) struct Keyboard {
 }
 
 impl Keyboard {
-    pub(crate) fn new(guest: u32, seat: u32) -> Self {
+    pub(super) fn new(guest: u32, seat: u32) -> Self {
         Self {
             guest,
             seat,
@@ -61,12 +64,12 @@ impl Keyboard {
 pub(crate) struct Keyboards(BTreeMap<HostId, Keyboard>);
 
 impl Keyboards {
-    pub(crate) fn insert(&mut self, host: HostId, keyboard: Keyboard) {
+    pub(super) fn insert(&mut self, host: HostId, keyboard: Keyboard) {
         let replaced = self.0.insert(host, keyboard);
         debug_assert!(replaced.is_none(), "host keyboard {} exists", host.0);
     }
 
-    pub(crate) fn remove(&mut self, host: HostId) -> Option<Keyboard> {
+    pub(super) fn remove(&mut self, host: HostId) -> Option<Keyboard> {
         self.0.remove(&host)
     }
 
@@ -74,7 +77,7 @@ impl Keyboards {
         self.0.get(&host)
     }
 
-    pub(crate) fn get_mut(&mut self, host: HostId) -> Option<&mut Keyboard> {
+    pub(super) fn get_mut(&mut self, host: HostId) -> Option<&mut Keyboard> {
         self.0.get_mut(&host)
     }
 
@@ -110,15 +113,9 @@ impl Keyboards {
     }
 }
 
-/// What tests set up and read of the keyboards, as no peer can.
+/// What tests read of the keyboards, as no peer can.
 #[cfg(test)]
 impl Keyboards {
-    /// Record host keyboard `host` of guest keyboard `guest` and guest seat
-    /// `seat`, as `wl_seat.get_keyboard` does once its forward paired them.
-    pub(crate) fn add_for_test(&mut self, guest: u32, host: u32, seat: u32) {
-        self.insert(HostId(host), Keyboard::new(guest, seat));
-    }
-
     /// The keymap of host keyboard `host`, if it has one.
     pub(crate) fn keymap_for_test(&self, host: HostId) -> Option<&Keymap> {
         self.get(host).and_then(|keyboard| keyboard.keymap.as_ref())
@@ -127,12 +124,6 @@ impl Keyboards {
     /// The extended keyboard of host keyboard `host`, once bound.
     pub(crate) fn extended_for_test(&self, host: HostId) -> Option<HostId> {
         self.get(host).and_then(|keyboard| keyboard.extended)
-    }
-
-    /// Give host keyboard `host` the default keymap.
-    pub(crate) fn load_default_keymap_for_test(&mut self, host: HostId) {
-        let keyboard = self.get_mut(host).expect("a recorded keyboard");
-        keyboard.keymap = Some(Keymap::default_for_test());
     }
 
     pub(crate) fn is_empty(&self) -> bool {

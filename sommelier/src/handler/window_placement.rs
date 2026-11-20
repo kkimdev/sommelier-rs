@@ -17,7 +17,8 @@ limitations under the License.
 //! Window placement: moving the focused XDG toplevel to the bounds that a
 //! placement chord names.
 //!
-//! The keyboard handler decides that a chord is a placement shortcut;
+//! Window placement subscribes to the keyboard's shortcuts: the keyboard
+//! consumes a chord it binds, and hands [`shortcut`] the binding;
 //! [`place_focused`] resolves the target (the toplevel the keyboard
 //! focuses, the output it entered last, and the bounds the bound rectangle
 //! maps to in that output's work area) and starts moving the window.
@@ -68,7 +69,7 @@ limitations under the License.
 //!
 //! | Caller | Entry point |
 //! | :--- | :--- |
-//! | consumed placement chord (`wl_keyboard.key`) | [`place_focused`] |
+//! | a shortcut the keyboard consumed (`wl_keyboard.key`) | [`shortcut`] |
 //! | `zaura_shell` bound (`wl_registry.global`) | [`shell_bound`] |
 //! | guest `wl_output` bound | [`output_bound`] |
 //! | `xdg_surface.get_toplevel`, after dispatch | [`attach_toplevel`] |
@@ -81,6 +82,8 @@ limitations under the License.
 //! The host Aura surface is shared ([`crate::state::AuraSurfaces`]), and
 //! `crate::handler::aura_objects` creates and releases every Aura object.
 
+use crate::accelerator::BindingId;
+use crate::geometry::Rect;
 use crate::handler::aura_objects::{self, ensure_host_zaura_surface, AuraChild};
 use crate::handler::callback::queue_internal_sync;
 use crate::protocols::aura_shell::zaura_output::EVT_INSETS_SINCE;
@@ -96,7 +99,7 @@ use crate::state::{
     Context, GuestId, HostId, InternalCallback, OutputState, Placement, PlacementStep, Point,
 };
 use crate::warn_once::WarnOnce;
-use crate::window_layout::{NormalizedRect, Rect};
+use crate::window_layout::NormalizedRect;
 use crate::wire::queue_or_drop;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -283,7 +286,7 @@ struct FocusedToplevel {
 
 /// Resolve the xdg_toplevel that `host_keyboard_id` focuses, if any.
 fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedToplevel> {
-    let guest_seat_id = ctx.keyboards.seat(host_keyboard_id)?;
+    let guest_seat_id = ctx.keys.keyboards().seat(host_keyboard_id)?;
     let wl_surface_guest_id = ctx.keyboard_focus.surface_for_seat(guest_seat_id)?;
     if !ctx
         .keyboard_focus
@@ -345,6 +348,32 @@ fn resolve_target(
     })
 }
 
+/// The keyboard `host_keyboard_id` consumed the chord of shortcut
+/// `binding`: place the focused toplevel where the binding says.
+///
+/// The keyboard consumes the chord whether or not the window can move
+/// now, so a skip, which is logged, never leaks the key to the guest.
+pub(crate) fn shortcut(ctx: &mut Context, host_keyboard_id: HostId, binding: BindingId) {
+    // The bindings change only between two messages, so the binding the
+    // keyboard read for this key is still current.
+    let Some(rect) = ctx.placement_rect(binding) else {
+        log::debug!(
+            "shortcut {binding:?} of keyboard {} is unbound",
+            host_keyboard_id.0
+        );
+        return;
+    };
+    if let Err(reason) = place_focused(ctx, host_keyboard_id, rect) {
+        log::log!(
+            reason.log_level(),
+            "window layout {:?} skipped for keyboard {}: {:?}",
+            rect,
+            host_keyboard_id.0,
+            reason
+        );
+    }
+}
+
 /// Start placing the focused toplevel for one consumed placement chord.
 ///
 /// Resolves the target (see [`resolve_target`]), attaches the toplevel's
@@ -361,8 +390,8 @@ fn resolve_target(
 /// # Errors
 ///
 /// A [`PlacementSkip`] names why the window was not moved. The chord stays
-/// consumed either way (see `KeyboardHandler::on_key`); a skip queues no
-/// placement request.
+/// consumed either way (see [`shortcut`]); a skip queues no placement
+/// request.
 pub(crate) fn place_focused(
     ctx: &mut Context,
     host_keyboard_id: HostId,
@@ -370,7 +399,7 @@ pub(crate) fn place_focused(
 ) -> Result<(), PlacementSkip> {
     debug_assert!(
         ctx.placement().is_some(),
-        "classify_key yields placement actions only while placement is on"
+        "the keyboard binds shortcuts only while placement is on"
     );
     let PlacementTarget {
         xdg_toplevel_guest_id,
@@ -846,8 +875,7 @@ mod fixture {
         let seat = 11;
         ctx.shadow_table
             .insert_paired_for_test(KEYBOARD.guest, KEYBOARD.host, "wl_keyboard");
-        ctx.keyboards
-            .add_for_test(KEYBOARD.guest, KEYBOARD.host, seat);
+        crate::handler::keyboard::for_test::created(ctx, KEYBOARD.guest, KEYBOARD.host, seat);
         ctx.keyboard_focus
             .set_for_test(HostId(KEYBOARD.host), seat, SURFACE.guest, SURFACE.host);
     }

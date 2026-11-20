@@ -329,8 +329,7 @@ impl TextInput {
             if let Some(composition) = self.composition_mut() {
                 composition.shown = None;
             }
-            let done = GuestTxn::default().encode(ti, false, serial);
-            done.expect("a bare done has no string")
+            GuestTxn::bare(ti, false, serial)
         })
     }
 

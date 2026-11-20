@@ -236,7 +236,7 @@ encode wire bytes ad hoc.
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs`, `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `ime_keys.rs` (held-key recovery, Backspace leases), `seat.rs` | `keyboards.rs` (`Keyboard`, one record per host keyboard: its guest object and seat, keymap, modifiers and extended keyboard), `input.rs` (focus, key generations); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
+| Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (keyboard and pointer focus); `sommelier/src/keys` (the keyboard core: one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
@@ -273,6 +273,7 @@ binds no chord of its own. The contract is in
   `a_new_file_is_read_once_written`,
   `a_file_being_written_is_not_read_for_another_event`,
   `the_watcher_follows_the_target_of_a_link`,
+  `the_watcher_follows_a_link_in_a_directory_it_cannot_write`,
   `a_chain_follows_each_link_on_the_path`,
   `load_and_watch_reloads_on_the_event_loop`,
   `a_bindings_file_edit_takes_effect_on_the_next_press`,
@@ -280,6 +281,11 @@ binds no chord of its own. The contract is in
   `reload_follows_a_link_to_files_of_the_same_mtime`,
   `a_connection_takes_placement_from_the_file_when_it_starts`).
 
+- **Shortcuts.** The keyboard knows no placement: it asks for a chord's
+  binding (`accelerator::BindingId`), consumes the chord of one as a
+  shortcut, and hands the binding to its subscriber,
+  `window_placement::shortcut`, which resolves the binding's rectangle and
+  places the focused window.
 - **One module.** `handler/window_placement.rs` is the only placement
   code the protocol handlers call, one entry point per event; the table
   in its module docs is the one list of them. Each does nothing while
@@ -545,8 +551,8 @@ end, the events of the host's `zwp_text_input_v1` and its extension, the
 keyboard focus change (`keyboard.rs`), a surface's end (`compositor.rs`),
 a `wl_seat` bind (`registry.rs`) and a pointer press or touch-down
 (`pointer.rs`, `touch.rs`), each key press the keyboard concern
-forwards to the guest (`keyboard.rs`), and the held key it recovers for
-an empty confirmation (`ime_keys.rs`). Nothing outside
+forwards to the guest, and the held key it recovers for an empty
+confirmation, each an input the keyboard core hands it. Nothing outside
 `ime` changes a text input, and only `ime/guest.rs` builds the v3
 transaction events.
 
@@ -590,20 +596,29 @@ returns, the field's host composition events are dropped, because Exo
 sent them for the composition the press committed. The rules are under
 [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 
+The keyboard core (`sommelier/src/keys`, `Context::keys`) is the IME
+core's twin: a sans-IO state machine that owns every fact of the host
+keyboards and their keys, takes one `keys::KeyInput` through
+`KeyboardCore::step`, returns `keys::KeyEffects`, and reads the keyboard
+focus, the shortcut bindings and the IME core's gate through `keys::Env`.
+`handler/keyboard.rs` is its adapter. The two cores talk only through
+typed messages: the IME core's `ime::KeyEffect`s are keyboard inputs, and
+the keyboard core hands the IME core `ime::Input`s.
 Keys can reach the guest twice: as a `wl_keyboard.key` and as the press
 and release the proxy recovers for an empty IME confirmation; the host's
-text-input keysyms are dropped. `state/input.rs` assigns each physical
+text-input keysyms are dropped. The keyboard core assigns each physical
 key a generation and an owner (guest keyboard, IME recovery, or a
-compositor shortcut), so a press is released through the path that
+shortcut), so a press is released through the path that
 delivered it, and never twice. Once the key is pressed again, only one
 older generation still waits for its release; see
 [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
-[KEYBOARD.md](KEYBOARD.md) describes each key's states and the one
-transition each input makes. Keymaps are compiled locally with
+[KEYBOARD.md](KEYBOARD.md) describes the core, each key's states and the
+one transition each input makes. Keymaps are compiled locally with
 xkbcommon (`keymap.rs`) to classify chords, which `Accelerator::of_key`
-computes; chords listed in
-`SOMMELIER_ACCELERATORS` are acknowledged as not handled through
-`zcr_extended_keyboard_v1.ack_key`, so Exo keeps them as accelerators.
+computes; the keyboard core owns the host accelerators,
+`SOMMELIER_ACCELERATORS`, whose chords are acknowledged as not handled
+through `zcr_extended_keyboard_v1.ack_key`, so Exo keeps them as
+accelerators.
 
 ## ChromeOS integration
 

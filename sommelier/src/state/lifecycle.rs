@@ -161,7 +161,7 @@ fn forget_object(
     match (interface, host) {
         (wl_registry::NAME, Some(host)) => registry::forget_registry(ctx, host),
         (wl_output::NAME, Some(host)) => output::forget_output(ctx, host),
-        (wl_keyboard::NAME, Some(host)) => keyboard::forget_keyboard(ctx, guest, HostId(host)),
+        (wl_keyboard::NAME, Some(host)) => keyboard::forget_keyboard(ctx, HostId(host)),
         (wl_pointer::NAME, Some(host)) => pointer::forget_pointer(ctx, HostId(host)),
         (wl_surface::NAME, Some(host)) => compositor::forget_surface(ctx, guest, host),
         (wp_viewport::NAME, _) => compositor::forget_viewport(ctx, guest),
@@ -270,7 +270,7 @@ impl Context {
         // A keyboard's record holds everything of the keyboard itself, so
         // its host object and the guest one paired with it are all there is
         // to check; its extended keyboard is host-only.
-        for (keyboard, record) in self.keyboards.iter() {
+        for (keyboard, record) in self.keys.keyboards().iter() {
             host("keyboard record", keyboard.0, "wl_keyboard");
             assert_eq!(
                 table.get_guest_id(keyboard.0),
@@ -282,7 +282,7 @@ impl Context {
                 host_only("extended keyboard", extended.0, "zcr_extended_keyboard_v1");
             }
         }
-        for keyboard in self.key_generations.keyboards_for_test() {
+        for keyboard in self.keys.key_state_keyboards() {
             host("key generations", keyboard.0, "wl_keyboard");
         }
         // A seat reference names the guest wl_seat that its keyboard or
@@ -291,7 +291,7 @@ impl Context {
         // lifetimes"). So a keyboard's seat and a text input's seat are not
         // checked against the table, and every copy of a keyboard's seat
         // must name it.
-        let keyboard_seat = |keyboard: HostId| self.keyboards.seat(keyboard);
+        let keyboard_seat = |keyboard: HostId| self.keys.keyboards().seat(keyboard);
         for (keyboard, focus) in self.keyboard_focus.focuses_for_test() {
             host("keyboard focus", keyboard.0, "wl_keyboard");
             guest("keyboard focus", focus.guest_surface, "wl_surface");
@@ -302,7 +302,7 @@ impl Context {
                 keyboard.0
             );
         }
-        for (seat, surface, keyboard) in self.key_generations.peek_watermarks_for_test() {
+        for (seat, surface, keyboard) in self.keys.peek_watermarks() {
             if let Some(surface) = surface {
                 guest("peek watermark", surface, "wl_surface");
             }
@@ -313,8 +313,7 @@ impl Context {
                 keyboard.0
             );
         }
-        if let Some(pending) = self.pending_recovery {
-            let (text_input, keyboard, host_keyboard) = pending.objects_for_test();
+        if let Some((text_input, keyboard, host_keyboard)) = self.keys.recovery_objects() {
             guest("pending recovery", text_input, "zwp_text_input_v3");
             guest("pending recovery", keyboard, "wl_keyboard");
             host("pending recovery", host_keyboard.0, "wl_keyboard");

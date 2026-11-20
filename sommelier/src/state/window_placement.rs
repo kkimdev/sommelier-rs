@@ -35,10 +35,11 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
-use crate::accelerator::Accelerator;
+use crate::accelerator::{Accelerator, BindingId};
+use crate::geometry::Rect;
 use crate::placement_config::PlacementConfig;
 use crate::state::{GuestId, HostId};
-use crate::window_layout::{NormalizedRect, Rect};
+use crate::window_layout::NormalizedRect;
 
 /// One connection's window placement, while it is on.
 #[derive(Debug)]
@@ -58,9 +59,15 @@ impl WindowPlacement {
         })
     }
 
-    /// Where `chord` places the focused window under the current bindings.
-    pub(crate) fn rect_for(&self, chord: &Accelerator) -> Option<NormalizedRect> {
-        self.bindings.rect_for(chord)
+    /// The binding of `chord` under the current bindings: the placement
+    /// subscribes to the keyboard's shortcuts.
+    pub(crate) fn binding_for(&self, chord: &Accelerator) -> Option<BindingId> {
+        self.bindings.binding_for(chord)
+    }
+
+    /// Where binding `binding` places the focused window.
+    pub(crate) fn rect(&self, binding: BindingId) -> Option<NormalizedRect> {
+        self.bindings.rect(binding)
     }
 }
 

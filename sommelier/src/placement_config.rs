@@ -49,7 +49,7 @@ use std::rc::Rc;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::accelerator::{parse_accelerator, Accelerator, HostAccelerators, ParseError};
+use crate::accelerator::{parse_accelerator, Accelerator, BindingId, HostAccelerators, ParseError};
 use crate::settings::Settings;
 use crate::window_layout::{NormalizedRect, RectError};
 
@@ -78,12 +78,15 @@ struct PlacementBinding {
 pub(crate) struct Bindings(Vec<PlacementBinding>);
 
 impl Bindings {
-    /// Where `chord` places the focused window, if it is bound.
-    pub(crate) fn rect_for(&self, chord: &Accelerator) -> Option<NormalizedRect> {
-        self.0
-            .iter()
-            .find(|binding| binding.chord == *chord)
-            .map(|binding| binding.rect)
+    /// The binding of `chord`, if one binds it.
+    pub(crate) fn binding_for(&self, chord: &Accelerator) -> Option<BindingId> {
+        let position = self.0.iter().position(|binding| binding.chord == *chord);
+        position.map(BindingId::new)
+    }
+
+    /// Where binding `binding` places the focused window.
+    pub(crate) fn rect(&self, binding: BindingId) -> Option<NormalizedRect> {
+        self.0.get(binding.index()).map(|binding| binding.rect)
     }
 
     fn len(&self) -> usize {
@@ -224,10 +227,22 @@ impl PlacementConfig {
         self.0.borrow().is_some()
     }
 
-    /// Where `chord` places the focused window under the current bindings;
-    /// always `None` while placement is off.
+    /// The binding of `chord` under the current bindings; always `None`
+    /// while placement is off.
+    pub(crate) fn binding_for(&self, chord: &Accelerator) -> Option<BindingId> {
+        self.0.borrow().as_ref()?.binding_for(chord)
+    }
+
+    /// Where binding `binding` of the current bindings places the focused
+    /// window.
+    pub(crate) fn rect(&self, binding: BindingId) -> Option<NormalizedRect> {
+        self.0.borrow().as_ref()?.rect(binding)
+    }
+
+    /// Where `chord` places the focused window under the current bindings.
+    #[cfg(test)]
     pub(crate) fn rect_for(&self, chord: &Accelerator) -> Option<NormalizedRect> {
-        self.0.borrow().as_ref()?.rect_for(chord)
+        self.rect(self.binding_for(chord)?)
     }
 
     /// Make `bindings` the current version, or turn placement off.

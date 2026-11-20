@@ -19,7 +19,6 @@ mod host_mapping;
 mod id_allocator;
 mod input;
 mod internal_callbacks;
-mod keyboards;
 mod lifecycle;
 mod objects;
 mod outputs;
@@ -44,14 +43,12 @@ use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Outgoing};
 use log::{debug, error, warn};
 
-#[allow(unused_imports)]
+#[cfg(test)]
+pub(crate) use self::input::SeatFocusChange;
 pub(crate) use self::input::{
-    ChordClass, GuestKeyOwner, KeyAdmission, KeyGenerationRegistry, KeyVerdict, KeyboardFocus,
-    KeyboardFocusRegistry, KeyboardFocusUpdate, LeaseInput, PeekInput, PeekKeyProvenance,
-    PeekOutcome, PhysicalKey, PointerFocus, SeatFocusChange, EVDEV_KEY_BACKSPACE,
+    KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PointerFocus,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
-pub(crate) use self::keyboards::{Keyboard, Keyboards};
 pub use self::objects::{DeletedHostId, Link, ShadowTable};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
@@ -363,8 +360,9 @@ pub struct Context {
     /// reaches them in that order (INVARIANTS "Nothing the proxy sends
     /// depends on hash order").
     pub ime: crate::ime::ImeCore,
-    /// Every host keyboard, one record each.
-    pub(crate) keyboards: Keyboards,
+    /// The keyboard core: every host keyboard, one record each, and its
+    /// keys.
+    pub(crate) keys: crate::keys::KeyboardCore,
     pub keyboard_focus: KeyboardFocusRegistry,
     pub pointer_focus: PointerFocus,
     /// Wheel steps from touchpad scrolling, which the client gets if
@@ -435,13 +433,6 @@ pub struct Context {
     pub host_text_input_extension_v1_id: Option<u32>,
     /// Host-side zcr_keyboard_extension_v1 object ID (bound internally on startup).
     pub host_keyboard_extension_id: Option<HostId>,
-    /// Physical, peek, repeat-recovery, and guest-delivery state for every
-    /// keyboard/key generation.
-    pub key_generations: KeyGenerationRegistry,
-    /// X2': an empty IME confirmation's recovery of a held key, which waits
-    /// for the host's next event to show whether the confirmation was an
-    /// autorepeat or Exo's before a new press (E13).
-    pub(crate) pending_recovery: Option<crate::handler::ime_keys::PendingRecovery>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
@@ -906,22 +897,6 @@ impl Context {
             .is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
     }
 
-    /// Claim delivery ownership for a key that currently has no guest owner.
-    ///
-    /// Returning `false` leaves the existing owner untouched. Callers can
-    /// therefore reject duplicate presses without accidentally changing which
-    /// event source must close or suppress the eventual release.
-    #[cfg(test)]
-    pub(crate) fn claim_guest_key(
-        &mut self,
-        host_keyboard_id: HostId,
-        key: u32,
-        owner: GuestKeyOwner,
-    ) -> bool {
-        self.key_generations
-            .claim_guest_owner(host_keyboard_id, key, owner)
-    }
-
     /// Create the state of one client connection.
     ///
     /// # Arguments
@@ -945,7 +920,7 @@ impl Context {
             pending_native_creates: BTreeMap::new(),
             surfaces: BTreeMap::new(),
             ime: crate::ime::ImeCore::default(),
-            keyboards: Keyboards::default(),
+            keys: crate::keys::KeyboardCore::new(settings.host_accelerators.clone()),
             keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),
             wheel_steps: crate::handler::pointer::WheelSteps::new(wheel),
@@ -975,8 +950,6 @@ impl Context {
             host_text_input_manager_v1_id: None,
             host_text_input_extension_v1_id: None,
             host_keyboard_extension_id: None,
-            key_generations: KeyGenerationRegistry::default(),
-            pending_recovery: None,
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
             registries: BTreeMap::new(),
@@ -1056,23 +1029,50 @@ impl Context {
         self.virtwayland_channel.as_ref()
     }
 
-    /// Return whether the host keeps this chord (`SOMMELIER_ACCELERATORS`).
-    pub(crate) fn is_host_accelerator(&self, chord: &crate::accelerator::Accelerator) -> bool {
-        self.settings.host_accelerators.contains(chord)
+    /// Step the keyboard core with `input`, reading the facts it does not
+    /// own from this context ([`crate::handler::keyboard::CtxEnv`]).
+    pub(crate) fn step_keys(&mut self, input: crate::keys::KeyInput) -> crate::keys::KeyEffects {
+        let env = crate::handler::keyboard::CtxEnv::new(
+            &self.keyboard_focus,
+            self.window_placement.as_ref(),
+            &self.ime,
+        );
+        self.keys.step(input, &env)
+    }
+
+    /// Where shortcut binding `binding` places the focused window, while
+    /// placement is on.
+    pub(crate) fn placement_rect(
+        &self,
+        binding: crate::accelerator::BindingId,
+    ) -> Option<crate::window_layout::NormalizedRect> {
+        self.window_placement.as_ref()?.rect(binding)
+    }
+
+    /// Who owns `key` of host keyboard `keyboard` under its state now
+    /// ([`crate::keys::KeyboardCore::classify`]).
+    #[cfg(test)]
+    pub(crate) fn classify_key_for_test(
+        &self,
+        keyboard: HostId,
+        key: u32,
+    ) -> crate::keys::KeyClass {
+        let env = crate::handler::keyboard::CtxEnv::new(
+            &self.keyboard_focus,
+            self.window_placement.as_ref(),
+            &self.ime,
+        );
+        self.keys.classify(keyboard, key, &env)
     }
 
     /// Where the placement bound to `chord` puts the focused window.
-    ///
-    /// `None` unless placement is on for this connection and the current
-    /// bindings bind the chord. A reload of the bindings file replaces them
-    /// between two messages, so one message sees one version. Keys already
-    /// captured as compositor shortcuts are tracked by key ownership, not
-    /// by binding, so a dropped binding cannot strand a held key.
+    #[cfg(test)]
     pub(crate) fn placement_rect_for(
         &self,
         chord: &crate::accelerator::Accelerator,
     ) -> Option<crate::window_layout::NormalizedRect> {
-        self.window_placement.as_ref()?.rect_for(chord)
+        let binding = self.window_placement.as_ref()?.binding_for(chord)?;
+        self.placement_rect(binding)
     }
 
     /// This connection's placement state, while placement is on for it.

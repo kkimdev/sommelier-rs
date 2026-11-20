@@ -29,9 +29,11 @@ limitations under the License.
 //!
 //! This module parses chords and computes the chord a key forms under a
 //! keyboard's XKB state ([`Accelerator::of_key`]). [`HostAccelerators`]
-//! is the parsed `SOMMELIER_ACCELERATORS`, which `crate::settings` reads;
-//! the keyboard decides what a host accelerator means, and
-//! `crate::placement_config` what a placement binding does.
+//! is the parsed `SOMMELIER_ACCELERATORS`, which `crate::settings` reads,
+//! and a [`BindingId`] names a chord a shortcut binds. The keyboard decides
+//! what a host accelerator and a shortcut mean, and the shortcut's
+//! subscriber, window placement (`crate::placement_config`), what a
+//! binding does.
 
 use xkbcommon::xkb;
 
@@ -217,6 +219,23 @@ impl HostAccelerators {
     /// Return whether the host keeps `chord`.
     pub(crate) fn contains(&self, chord: &Accelerator) -> bool {
         self.0.contains(chord)
+    }
+}
+
+/// A chord a shortcut binds: the index of its binding among its
+/// subscriber's current bindings. Bindings change only between two
+/// messages, so the ID the keyboard reads as it handles a key names the
+/// same binding while the key's message is handled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BindingId(usize);
+
+impl BindingId {
+    pub(crate) fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self.0
     }
 }
 

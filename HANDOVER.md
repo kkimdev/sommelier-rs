@@ -30,6 +30,12 @@
   [`docs/IME.md`](docs/IME.md) holds the behaviour table, the facts about
   Exo and the clients, and the deterministic simulation test (DST);
   [`docs/KEYBOARD.md`](docs/KEYBOARD.md) holds the key states.
+- The keyboard core (`sommelier/src/keys`) is the IME core's twin: every
+  keyboard input goes through `KeyboardCore::step`, which owns the host
+  keyboards' records, their keys' generations, the Backspace lease, the
+  held-key recovery and the host accelerators, and `handler/keyboard.rs`
+  is its adapter. The two cores talk only through typed inputs and
+  effects ([`docs/KEYBOARD.md`](docs/KEYBOARD.md#the-keyboard-core)).
 
 ## Known issues and debt
 
@@ -203,6 +209,13 @@
   ignores `stale`).
 - `on_peek_key`'s owed release of a stale press can reach the guest
   before a waiting recovery's pair.
+- The keyboard focus registry (`state::KeyboardFocusRegistry`) is still
+  `Context`'s: the keyboard core reads it through `keys::Env` and hears of
+  each change as `KeyInput::Focus`. Moving it into the core would make the
+  core the one owner of every keyboard fact.
+- The bindings watcher removes the watches of an arming attempt that
+  started over (because a directory appeared while it armed), but no test
+  reaches that race.
 - Each empty confirmation while a taken key is held sends the host a
   `wl_display.sync` (about 30 a second).
 - The mirror assumes Exo reads a report and its glued sync in one read;

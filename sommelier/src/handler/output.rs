@@ -345,7 +345,7 @@ pub(crate) mod fixture {
     pub(crate) fn placement_area(
         ctx: &Context,
         host_surface: u32,
-    ) -> Option<(u32, crate::window_layout::Rect)> {
+    ) -> Option<(u32, crate::geometry::Rect)> {
         let (output, state) = ctx.outputs.for_surface(host_surface)?;
         Some((output, state.work_area()?))
     }
@@ -354,13 +354,13 @@ pub(crate) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Rect;
     use crate::protocols::aura_shell::zaura_output::{
         REQ_RELEASE as REQ_RELEASE_AURA_OUTPUT, REQ_RELEASE_SINCE as REQ_RELEASE_AURA_OUTPUT_SINCE,
     };
     use crate::protocols::wayland::wl_output::WlOutputHandler;
     use crate::state::{GlobalBinding, OutputState};
     use crate::test_support::queued_headers;
-    use crate::window_layout::Rect;
 
     const OUTPUT_HOST: u32 = 20;
     const AURA_OUTPUT_HOST: u32 = 21;
