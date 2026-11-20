@@ -16,19 +16,16 @@ limitations under the License.
 
 //! Window placement configuration, shared by the whole process.
 //!
-//! [`PlacementConfig`] is the single owner of every placement setting:
+//! [`PlacementConfig`] owns the placement bindings, from one file,
+//! `$XDG_CONFIG_HOME/sommelier-rs/window-placement.toml`: where it is
+//! ([`config_path`], which `crate::settings` resolves once), when it
+//! changed ([`PlacementConfig::refresh`]), and what it binds (parse and
+//! validation). The validator takes the host accelerators, which the
+//! settings own, as an input.
 //!
-//! * the host accelerators from `SOMMELIER_ACCELERATORS`, read once;
-//! * the placement bindings, from one file,
-//!   `$XDG_CONFIG_HOME/sommelier-rs/window-placement.toml`: where it is
-//!   ([`config_path`], resolved once), when it changed
-//!   ([`PlacementConfig::refresh`]), and what it binds (parse and
-//!   validation).
-//!
-//! `main` builds it once with [`PlacementConfig::from_environment`] and
-//! every connection's `Context` shares it, so no other code reads these
-//! settings and every warning is logged once per process. There are no
-//! built-in bindings: placement is on exactly while the file holds a valid
+//! The proxy builds it once and every connection's `Context` shares it,
+//! so every warning is logged once per process. There are no built-in
+//! bindings: placement is on exactly while the file holds a valid
 //! configuration.
 //!
 //! The configuration contract (location, failure policy, reload,
@@ -45,11 +42,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::accelerator::{parse_accelerator, parse_accelerators, Accelerator, ParseError};
+use crate::accelerator::{parse_accelerator, Accelerator, HostAccelerators, ParseError};
 use crate::window_layout::{NormalizedRect, RectError, WindowLayoutAction};
 
-/// Keys the host compositor handles.
-const HOST_ACCELERATORS_VARIABLE: &str = "SOMMELIER_ACCELERATORS";
 /// The bindings file, relative to the XDG configuration directory.
 const CONFIG_FILE: &str = "sommelier-rs/window-placement.toml";
 
@@ -101,7 +96,7 @@ pub(crate) enum BindingsError {
         first: usize,
         chord: String,
     },
-    #[error("bindings[{index}]: chord {chord:?} conflicts with {HOST_ACCELERATORS_VARIABLE}")]
+    #[error("bindings[{index}]: chord {chord:?} conflicts with SOMMELIER_ACCELERATORS")]
     HostAcceleratorConflict { index: usize, chord: String },
     #[error("bindings[{index}]: unsupported action {action:?}")]
     UnknownAction { index: usize, action: String },
@@ -126,7 +121,10 @@ pub(crate) enum BindingsError {
 /// # Returns
 ///
 /// `None` when neither variable names an absolute directory.
-fn config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+pub(crate) fn config_path(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
     fn absolute(value: Option<&OsStr>) -> Option<&Path> {
         value.map(Path::new).filter(|path| path.is_absolute())
     }
@@ -135,26 +133,6 @@ fn config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<
         None => absolute(home)?.join(".config"),
     };
     Some(config_home.join(CONFIG_FILE))
-}
-
-/// Parse `SOMMELIER_ACCELERATORS`; unset or blank is an empty list.
-///
-/// A malformed list must not stop the proxy: it degrades to no filtering,
-/// logged once, and so binds no chord out of reach of a binding either.
-fn host_accelerators(value: Option<&OsStr>) -> Vec<Accelerator> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    value
-        .to_str()
-        .ok_or_else(|| "it is not UTF-8".to_string())
-        .and_then(|text| parse_accelerators(text).map_err(|error| format!("{text:?}: {error}")))
-        .unwrap_or_else(|error| {
-            log::warn!(
-                "Invalid {HOST_ACCELERATORS_VARIABLE}, {error}. Accelerator filtering is disabled."
-            );
-            Vec::new()
-        })
 }
 
 /// What identifies one version of the bindings file, as `stat` sees it
@@ -216,8 +194,8 @@ pub(crate) enum Refresh {
 /// Process-wide window placement configuration.
 #[derive(Debug)]
 pub(crate) struct PlacementConfig {
-    /// Parsed `SOMMELIER_ACCELERATORS`: chords the host keeps.
-    host_accelerators: Vec<Accelerator>,
+    /// The chords the host keeps, which no binding may use.
+    host_accelerators: HostAccelerators,
     /// The bindings file; `None` when no path resolved, which leaves
     /// placement off for good.
     path: Option<PathBuf>,
@@ -225,33 +203,13 @@ pub(crate) struct PlacementConfig {
 }
 
 impl PlacementConfig {
-    /// Resolve the configuration from the process environment and load the
-    /// bindings file.
+    /// The configuration of the bindings file at `path`, if any, which
+    /// may not bind one of `host_accelerators`, loaded once.
     ///
-    /// Reads `SOMMELIER_ACCELERATORS`, `XDG_CONFIG_HOME` and `HOME`, once.
-    /// This never fails: every problem is logged and leaves placement off
-    /// or key filtering disabled, because the proxy serves every app in the
-    /// container. The rules are specified in
-    /// `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`.
-    pub(crate) fn from_environment() -> Self {
-        let host_accelerators =
-            host_accelerators(std::env::var_os(HOST_ACCELERATORS_VARIABLE).as_deref());
-        let path = config_path(
-            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-            std::env::var_os("HOME").as_deref(),
-        );
-        if path.is_none() {
-            log::debug!(
-                "Neither XDG_CONFIG_HOME nor HOME names an absolute directory, so there is no \
-                 window placement configuration"
-            );
-        }
-        Self::with_file(host_accelerators, path)
-    }
-
-    /// The configuration of `host_accelerators` and the bindings file at
-    /// `path`, if any, loaded once.
-    fn with_file(host_accelerators: Vec<Accelerator>, path: Option<PathBuf>) -> Self {
+    /// This never fails: every problem is logged and leaves placement off,
+    /// because the proxy serves every app in the container. The rules are
+    /// specified in `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`.
+    pub(crate) fn new(path: Option<PathBuf>, host_accelerators: HostAccelerators) -> Self {
         let config = Self {
             host_accelerators,
             path,
@@ -334,11 +292,6 @@ impl PlacementConfig {
         }
     }
 
-    /// Return whether the host keeps this chord (`SOMMELIER_ACCELERATORS`).
-    pub(crate) fn is_host_accelerator(&self, chord: &Accelerator) -> bool {
-        self.host_accelerators.contains(chord)
-    }
-
     /// Return the action bound to a chord, as of the last
     /// [`refresh`](Self::refresh); always `None` while placement is off.
     pub(crate) fn action_for(&self, chord: &Accelerator) -> Option<WindowLayoutAction> {
@@ -381,7 +334,7 @@ struct RawBinding {
 /// invalid rectangle. Nothing is partially accepted.
 fn validate_bindings(
     raw: Vec<RawBinding>,
-    host_accelerators: &[Accelerator],
+    host_accelerators: &HostAccelerators,
 ) -> Result<Vec<PlacementBinding>, BindingsError> {
     if raw.len() > MAX_BINDINGS {
         return Err(BindingsError::TooManyBindings { count: raw.len() });
@@ -466,7 +419,7 @@ struct RawConfig {
 /// [`validate_bindings`] error.
 fn parse_shortcut_config(
     text: &str,
-    host_accelerators: &[Accelerator],
+    host_accelerators: &HostAccelerators,
 ) -> Result<Vec<PlacementBinding>, BindingsError> {
     let VersionProbe { version } = toml::from_str(text)?;
     if version != CONFIG_VERSION {
@@ -522,27 +475,27 @@ fn read_config_text(path: &Path) -> Result<String, BindingsError> {
 /// the decision to keep a previous generation.
 fn load_shortcut_config(
     path: &Path,
-    host_accelerators: &[Accelerator],
+    host_accelerators: &HostAccelerators,
 ) -> Result<Vec<PlacementBinding>, BindingsError> {
     parse_shortcut_config(&read_config_text(path)?, host_accelerators)
 }
 
 #[cfg(test)]
 impl PlacementConfig {
-    /// Placement off, with the given host accelerators.
-    pub(crate) fn for_test(host_accelerators: Vec<Accelerator>) -> Self {
-        Self::with_file(host_accelerators, None)
+    /// Placement off.
+    pub(crate) fn for_test() -> Self {
+        Self::new(None, HostAccelerators::default())
     }
 
     /// Placement on, with `bindings` (chord, named action), which may be
     /// none, and no file.
     pub(crate) fn active_for_test(bindings: &[(&str, &str)]) -> Self {
-        Self::loaded_for_test(Vec::new(), bindings)
+        Self::loaded_for_test(HostAccelerators::default(), bindings)
     }
 
     /// [`active_for_test`](Self::active_for_test) with host accelerators.
     pub(crate) fn loaded_for_test(
-        host_accelerators: Vec<Accelerator>,
+        host_accelerators: HostAccelerators,
         bindings: &[(&str, &str)],
     ) -> Self {
         let raw = bindings
@@ -555,7 +508,7 @@ impl PlacementConfig {
             .collect();
         let bindings = validate_bindings(raw, &host_accelerators)
             .unwrap_or_else(|error| panic!("invalid test bindings {bindings:?}: {error}"));
-        let config = Self::for_test(host_accelerators);
+        let config = Self::new(None, host_accelerators);
         config.file().bindings = Some(bindings);
         config
     }
@@ -563,7 +516,7 @@ impl PlacementConfig {
     /// The configuration of the bindings file at `path`, loaded once, as
     /// `main` builds it.
     pub(crate) fn file_for_test(path: &Path) -> Self {
-        Self::with_file(Vec::new(), Some(path.to_path_buf()))
+        Self::new(Some(path.to_path_buf()), HostAccelerators::default())
     }
 }
 
@@ -587,8 +540,12 @@ chord = "<Alt>s"
 action = "fullscreen"
 "#;
 
+    fn none() -> HostAccelerators {
+        HostAccelerators::default()
+    }
+
     fn parse(text: &str) -> Result<Vec<PlacementBinding>, BindingsError> {
-        parse_shortcut_config(text, &[])
+        parse_shortcut_config(text, &HostAccelerators::default())
     }
 
     fn one_binding(fields: &str) -> String {
@@ -631,7 +588,7 @@ action = "fullscreen"
 
     #[test]
     fn rejects_host_accelerator_conflicts() {
-        let host = vec![parse_accelerator("<Alt>q").unwrap()];
+        let host = HostAccelerators::parse("<Alt>q").unwrap();
         assert!(matches!(
             parse_shortcut_config(&one_binding("action = \"left\""), &host),
             Err(BindingsError::HostAcceleratorConflict { index: 0, .. })
@@ -748,24 +705,24 @@ action = "fullscreen"
         let dir = TempDir::new("shortcut-load");
         let oversized = dir.write("big.toml", &vec![b'#'; MAX_CONFIG_BYTES as usize + 1]);
         assert!(matches!(
-            load_shortcut_config(&oversized, &[]),
+            load_shortcut_config(&oversized, &none()),
             Err(BindingsError::TooLarge)
         ));
         let mut at_limit = b"version = 1\n".to_vec();
         at_limit.resize(MAX_CONFIG_BYTES as usize, b' ');
         let at_limit = dir.write("limit.toml", &at_limit);
-        assert!(load_shortcut_config(&at_limit, &[]).unwrap().is_empty());
+        assert!(load_shortcut_config(&at_limit, &none()).unwrap().is_empty());
         let binary = dir.write("binary.toml", b"version = 1\n# \xff\n");
         assert!(matches!(
-            load_shortcut_config(&binary, &[]),
+            load_shortcut_config(&binary, &none()),
             Err(BindingsError::NotUtf8)
         ));
         assert!(matches!(
-            load_shortcut_config(&dir.path().join("missing.toml"), &[]),
+            load_shortcut_config(&dir.path().join("missing.toml"), &none()),
             Err(BindingsError::Open(_))
         ));
         assert!(matches!(
-            load_shortcut_config(dir.path(), &[]),
+            load_shortcut_config(dir.path(), &none()),
             Err(BindingsError::NotRegularFile)
         ));
         let fifo = dir.path().join("fifo.toml");
@@ -776,7 +733,7 @@ action = "fullscreen"
         .expect("create test FIFO");
         assert!(
             matches!(
-                load_shortcut_config(&fifo, &[]),
+                load_shortcut_config(&fifo, &none()),
                 Err(BindingsError::NotRegularFile)
             ),
             "a FIFO must be rejected without blocking on a writer"
@@ -808,22 +765,6 @@ action = "fullscreen"
         }
     }
 
-    #[test]
-    fn host_accelerators_are_unset_valid_or_ignored() {
-        let os = |text: &'static str| Some(OsStr::from_bytes(text.as_bytes()));
-        assert_eq!(host_accelerators(None), Vec::new());
-        assert_eq!(host_accelerators(os("  ")), Vec::new());
-        assert_eq!(
-            host_accelerators(os("<Alt>a")),
-            vec![parse_accelerator("<Alt>a").unwrap()]
-        );
-        assert_eq!(host_accelerators(os("<Hyper>a")), Vec::new());
-        assert_eq!(
-            host_accelerators(Some(OsStr::from_bytes(b"\xff"))),
-            Vec::new()
-        );
-    }
-
     // ── Loading and reloading ─────────────────────────────────────────
 
     /// No file, or no path at all, is placement off, and costs no warning.
@@ -835,7 +776,7 @@ action = "fullscreen"
         assert_eq!(alt_q(&config), None);
         assert_eq!(config.refresh(), Refresh::Unchanged);
 
-        let config = PlacementConfig::with_file(Vec::new(), None);
+        let config = PlacementConfig::for_test();
         assert!(!config.is_active());
         assert_eq!(config.refresh(), Refresh::Unchanged);
     }
@@ -862,8 +803,8 @@ action = "fullscreen"
             "window-placement.toml",
             &one_binding("action = \"left\""),
         );
-        let host = vec![parse_accelerator("<Alt>q").unwrap()];
-        let config = PlacementConfig::with_file(host, Some(path));
+        let host = HostAccelerators::parse("<Alt>q").unwrap();
+        let config = PlacementConfig::new(Some(path), host);
         assert!(!config.is_active(), "a host accelerator cannot be bound");
     }
 

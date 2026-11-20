@@ -24,23 +24,28 @@ handler intercepts the ones whose meaning changes across the boundary.
 
 ## Process and connections
 
-- `main.rs` parses the command line, raises the open-file soft limit
-  (`raise_open_file_limit`), and resolves every process-wide setting
-  once, before the first client connects: the VM
-  identifier (`state::vm_identifier_from_environment`), the virtio-gpu
-  render node (`VirtGpuNode::from_environment`, which reads
-  `SOMMELIER_DRM_DEVICE`; the node opens when a client first needs it,
-  and one that fails to open is tried again for the next client until it
-  opens; test: `a_render_node_that_fails_to_open_is_tried_again_then_kept`),
-  the placement configuration (`PlacementConfig::from_environment`, which
-  finds and loads the bindings file, which connections then refresh) and
-  which clients get wheel steps for touchpad scrolling
-  (`client_kind::WheelFromTouchpad::from_environment`).
-  Connections receive the results; `client_kind.rs`, the one owner of
-  whether a client is Wine, decides that per client from its process when
-  it connects ([pointer scrolling](INVARIANTS.md#pointer-scrolling)).
-  `Context::new` and the test constructors read no environment
-  (test: `test_contexts_read_no_environment`).
+- `main.rs` is the only code that reads the command line and the
+  environment. It hands both to `Settings::resolve` (`settings.rs`, the
+  one list of the variables the proxy reads and of what a value that
+  cannot be used falls back to), raises the open-file soft limit
+  (`raise_open_file_limit`), and passes the immutable `Settings` to
+  `proxy::run` (test: `only_main_reads_the_environment`). The host is one
+  `HostTransport`, a VirtWL device or, for debugging, a local
+  compositor socket; the command line rejects both at once
+  (test: `the_host_is_one_transport`).
+- `proxy::run` builds what every connection shares (`Shared`): the
+  settings behind an `Rc`, the virtio-gpu render node (`VirtGpuNode`;
+  the node opens when a client first needs it, and one that fails to
+  open is tried again for the next client until it opens; test:
+  `a_render_node_that_fails_to_open_is_tried_again_then_kept`) and the
+  placement configuration. Each connection's `Context::new` takes the
+  settings and its `ConnectionFacts`: its VirtWL channel, the render
+  node, whether its client gets wheel steps (`client_kind.rs`, the one
+  owner of whether a client is Wine, starts deciding that from the
+  client's process when it connects;
+  [pointer scrolling](INVARIANTS.md#pointer-scrolling)) and the
+  placement configuration. A `Context` is whole when it is built; no
+  setting of it changes later.
 - `proxy::run` claims the socket through its lock file, then `serve`
   accepts guest clients and gives each a `Client` with its own guest
   connection, host connection and `Context`. All clients run on one

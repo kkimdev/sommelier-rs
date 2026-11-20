@@ -1942,7 +1942,7 @@ mod tests {
         use crate::protocols::xdg_shell::xdg_wm_base;
         use crate::proxy::harness::Session;
 
-        let placement = PlacementConfig::for_test(Vec::new());
+        let placement = PlacementConfig::for_test();
         let mut s = Session::with_context(Context::with_placement_for_test(placement));
         let registry = s.registry().await;
 

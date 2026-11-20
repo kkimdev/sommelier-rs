@@ -16,10 +16,11 @@ restating it.
 | `SOMMELIER_ACCELERATORS` | Chords the host compositor keeps. A binding may not use one of them. |
 
 Sommelier has no built-in bindings and creates no file: with no valid
-file, placement is off. There is no other switch. `main` resolves the path
-once, from `XDG_CONFIG_HOME` (unless it is empty or relative, which the XDG
-base directory specification says to ignore) or else an absolute `HOME`;
-with neither, placement stays off. `SOMMELIER_ACCELERATORS` is read once,
+file, placement is off. There is no other switch. The settings
+(`sommelier/src/settings.rs`) resolve the path once, from
+`XDG_CONFIG_HOME` (unless it is empty or relative, which the XDG base
+directory specification says to ignore) or else an absolute `HOME`; with
+neither, placement stays off. `SOMMELIER_ACCELERATORS` is read once,
 at startup, too. The earlier `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`,
 `--window-shortcuts-config`, `SOMMELIER_WINDOW_PLACEMENT_BACKEND` and
 `SOMMELIER_WINDOW_BOUNDS_AS_ARC` are gone. `SIGHUP` no longer reloads the
@@ -460,10 +461,11 @@ correctly, with no warning in the log.
 
 | File | Role |
 | --- | --- |
-| `sommelier/src/placement_config.rs` | `PlacementConfig`: the host accelerators, the bindings file's path, the identity check that reloads it, the hardened file read, the one validator, and the current bindings. |
+| `sommelier/src/settings.rs` | `Settings`: the bindings file's path and the parsed `SOMMELIER_ACCELERATORS`, resolved once. |
+| `sommelier/src/placement_config.rs` | `PlacementConfig`: the identity check that reloads the bindings file, the hardened file read, the one validator (which takes the host accelerators as an input), and the current bindings. |
 | `sommelier/src/window_layout.rs` | `WindowLayoutAction` (named presets plus a configured rect) and its name parser; `NormalizedRect` validation and the rounding rule that maps it from a work-area `Rect` to window bounds. |
 | `sommelier/src/accelerator.rs` | Chord types and parsing only. |
-| `sommelier/src/state.rs` | `Context` holds the connection's owners below and its `host_zaura_shell` binding; `Context::new` decides whether the connection has placement; `refresh_placement_bindings`, `placement_action_for` and `is_host_accelerator` ask the shared `PlacementConfig`. |
+| `sommelier/src/state.rs` | `Context` holds the connection's owners below and its `host_zaura_shell` binding; `Context::new` decides whether the connection has placement; `refresh_placement_bindings` and `placement_action_for` ask the shared `PlacementConfig`, and `is_host_accelerator` the settings. |
 | `sommelier/src/state/window_placement.rs` | `WindowPlacementState` (`Off` holds nothing) and `PlacementState`: each toplevel's Aura toplevel, its last reported origin, the states and serial of its newest configure, and the placement in flight. |
 | `sommelier/src/state/aura_surfaces.rs` | `AuraSurfaces`: the one host Aura surface of each `wl_surface`, shared by XDG and GTK metadata and placement. |
 | `sommelier/src/state/xdg_roles.rs` | `XdgRoles`: which `wl_surface` each `xdg_surface` and `xdg_toplevel` belongs to; placement finds the focused toplevel here. |
@@ -473,7 +475,7 @@ correctly, with no warning in the log.
 | `sommelier/src/handler/window_placement.rs` | Placement: the focused toplevel, its output and the bounds, the three steps and their origin math, the Aura toplevel of each XDG toplevel, and the translation of its configures; one entry point per protocol event, listed in its module docs. |
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), sends the shelf application ID, and releases the `zaura_shell` binding. |
 | `sommelier/src/handler/callback.rs` | `queue_internal_sync` issues the placement barrier, and `wl_callback.done` dispatches it to `window_placement::complete_barrier`. |
-| `sommelier/src/main.rs` and `sommelier/src/proxy.rs` | Build the configuration once and share it with every connection. |
+| `sommelier/src/proxy.rs` | `Shared` builds the configuration once and shares it with every connection. |
 
 ## Not carried over from the earlier draft
 

@@ -146,7 +146,7 @@ fn forwards_host_global(ctx: &Context, interface: &str) -> bool {
     FORWARDED_PROTOCOLS
         .iter()
         .any(|interfaces| interfaces.contains(&interface))
-        || (XDG_DECORATION_ALLOWED.contains(&interface) && ctx.xdg_decoration)
+        || (XDG_DECORATION_ALLOWED.contains(&interface) && ctx.settings().xdg_decoration)
 }
 
 /// The version the guest is offered of a host global of `interface` that
@@ -760,7 +760,7 @@ fn can_synthesize_dmabuf_feedback(ctx: &Context, version: u32) -> bool {
     if version < LINUX_DMABUF_CAPABILITY_VERSION {
         return false;
     }
-    if ctx.virtgpu.is_some() {
+    if ctx.virtgpu().is_some() {
         return true;
     }
     #[cfg(test)]
@@ -937,10 +937,9 @@ fn dmabuf_global(ctx: &mut Context, name: u32, version: u32) -> Action {
         .copied()
         .unwrap_or_default();
     let virtwl_supports_dmabuf = ctx
-        .virtwayland_channel
-        .as_ref()
+        .virtwayland_channel()
         .is_some_and(|channel| channel.supports_dmabuf());
-    if !should_bind_internal_dmabuf(ctx.gpu_accel, virtwl_supports_dmabuf) {
+    if !should_bind_internal_dmabuf(ctx.settings().gpu_accel, virtwl_supports_dmabuf) {
         record_registry_global_visibility(ctx, name, false);
         return Action::Drop;
     }
@@ -951,7 +950,7 @@ fn dmabuf_global(ctx: &mut Context, name: u32, version: u32) -> Action {
     let client_version = if can_synthesize_feedback {
         GUEST_DMABUF_VERSION
     } else {
-        if version >= LINUX_DMABUF_CAPABILITY_VERSION && ctx.virtgpu.is_none() {
+        if version >= LINUX_DMABUF_CAPABILITY_VERSION && ctx.virtgpu().is_none() {
             log::warn!(
                 "No virtio-gpu render node; exposing linux-dmabuf v3 without synthetic \
                  device feedback"
@@ -960,7 +959,7 @@ fn dmabuf_global(ctx: &mut Context, name: u32, version: u32) -> Action {
         version.min(LINUX_DMABUF_CAPABILITY_VERSION)
     };
     add_candidate(ctx, Singleton::Dmabuf, name, version);
-    if ctx.gpu_accel {
+    if ctx.settings().gpu_accel {
         // One host dmabuf object is shared for capability discovery,
         // and a guest global for it waits until the binding of its
         // own generation has the capabilities.
@@ -3046,8 +3045,7 @@ mod tests {
 
     #[test]
     fn every_forwarded_global_is_capped_at_its_xml_version() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.xdg_decoration = true;
+        let ctx = Context::new_for_test(false, true, vec![]);
         let forwarded = FORWARDED_PROTOCOLS
             .into_iter()
             .chain([XDG_DECORATION_ALLOWED])

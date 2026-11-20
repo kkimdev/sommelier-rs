@@ -349,15 +349,16 @@ impl Config {
 
     /// The proxy's context for a case.
     fn context(self) -> Context {
-        if !self.placement {
-            return Context::new_for_test(self.gpu_accel, self.xdg_decoration, Vec::new());
+        let settings = crate::settings::Settings {
+            gpu_accel: self.gpu_accel,
+            xdg_decoration: self.xdg_decoration,
+            ..crate::settings::Settings::for_test()
+        };
+        let mut facts = crate::state::ConnectionFacts::for_test();
+        if self.placement {
+            facts.placement = crate::placement_config::PlacementConfig::active_for_test(&[]).into();
         }
-        let mut context = Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::active_for_test(&[]),
-        );
-        context.gpu_accel = self.gpu_accel;
-        context.xdg_decoration = self.xdg_decoration;
-        context
+        Context::new(std::rc::Rc::new(settings), facts)
     }
 }
 

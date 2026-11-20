@@ -1834,8 +1834,10 @@ mod tests {
     #[test]
     fn chord_classification_follows_the_configuration() {
         use WindowLayoutAction::*;
-        let active =
-            |bindings: &[(&str, &str)]| Arc::new(PlacementConfig::active_for_test(bindings));
+        let none = crate::accelerator::HostAccelerators::default;
+        let active = |bindings: &[(&str, &str)]| {
+            (none(), Arc::new(PlacementConfig::active_for_test(bindings)))
+        };
         let nine = active(&[
             ("<Alt>q", "top-left"),
             ("<Alt>w", "top"),
@@ -1850,11 +1852,15 @@ mod tests {
         let alt_q = active(&[("<Alt>q", "top-left")]);
         let control_q = active(&[("<Control>q", "top-left")]);
         // Placement is off, so nothing is bound.
-        let off = Arc::new(PlacementConfig::for_test(Vec::new()));
-        let both = Arc::new(PlacementConfig::loaded_for_test(
-            vec![crate::accelerator::parse_accelerator("<Control>a").unwrap()],
-            &[("<Control>q", "top-left")],
-        ));
+        let off = (none(), Arc::new(PlacementConfig::for_test()));
+        let host = crate::accelerator::HostAccelerators::parse("<Control>a").unwrap();
+        let both = (
+            host.clone(),
+            Arc::new(PlacementConfig::loaded_for_test(
+                host,
+                &[("<Control>q", "top-left")],
+            )),
+        );
         let cases = [
             (&nine, ALT, KEY_Q, KeyClass::Placement(TopLeft)),
             (&nine, ALT, KEY_W, KeyClass::Placement(Top)),
@@ -1874,8 +1880,12 @@ mod tests {
             (&both, CONTROL, KEY_Q, KeyClass::Placement(TopLeft)),
             (&both, CONTROL, KEY_Z, KeyClass::Guest),
         ];
-        for (placement, modifiers, key, class) in cases {
-            let mut p = Proxy::with(Context::with_placement_for_test(Arc::clone(placement)));
+        for ((host_accelerators, placement), modifiers, key, class) in cases {
+            let settings = crate::settings::Settings {
+                host_accelerators: host_accelerators.clone(),
+                ..crate::settings::Settings::for_test()
+            };
+            let mut p = Proxy::with(Context::for_test(settings, Arc::clone(placement)));
             p.keymap(KEYBOARD);
             p.modifiers(KEYBOARD, modifiers);
             assert_eq!(

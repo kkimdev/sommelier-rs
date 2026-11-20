@@ -27,8 +27,10 @@ limitations under the License.
 //! file format in `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`;
 //! [`parse_accelerator`] implements that list.
 //!
-//! This module only parses; `crate::placement_config` decides what the
-//! parsed chords mean (host accelerators or placement bindings).
+//! This module only parses. [`HostAccelerators`] is the parsed
+//! `SOMMELIER_ACCELERATORS`, which `crate::settings` reads; the keyboard
+//! decides what a host accelerator means, and `crate::placement_config`
+//! what a placement binding does.
 
 use xkbcommon::xkb;
 
@@ -140,6 +142,29 @@ pub fn parse_accelerators(s: &str) -> Result<Vec<Accelerator>, ParseError> {
         result.push(parse_accelerator(token)?);
     }
     Ok(result)
+}
+
+/// The chords the host compositor keeps (`SOMMELIER_ACCELERATORS`): a key
+/// that makes one is the host's, and no placement binding may use one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HostAccelerators(Vec<Accelerator>);
+
+impl HostAccelerators {
+    /// Parse a comma-separated chord list (see [`parse_accelerators`]).
+    pub(crate) fn parse(list: &str) -> Result<Self, ParseError> {
+        parse_accelerators(list).map(Self)
+    }
+
+    /// Return whether the host keeps `chord`.
+    pub(crate) fn contains(&self, chord: &Accelerator) -> bool {
+        self.0.contains(chord)
+    }
+}
+
+impl From<Vec<Accelerator>> for HostAccelerators {
+    fn from(chords: Vec<Accelerator>) -> Self {
+        Self(chords)
+    }
 }
 
 #[cfg(test)]

@@ -323,7 +323,7 @@ impl Context {
             host("pointer focus", pointer.0, "wl_pointer");
             guest("pointer focus", surface, "wl_surface");
         }
-        for pointer in self.wheel_steps.iter().flat_map(|s| s.pointers_for_test()) {
+        for pointer in self.wheel_steps.pointers_for_test() {
             host("wheel steps", pointer.0, "wl_pointer");
         }
         for (text_input, t) in self.ime.iter() {

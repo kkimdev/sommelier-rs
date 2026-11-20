@@ -213,18 +213,21 @@ test uses `/dev/wl0`.
 
 ## Configuration
 
+Sommelier reads the command line and the variables once, at startup.
+
 | Setting | Purpose |
 | --- | --- |
-| `XDG_RUNTIME_DIR` | Directory where the proxy creates its Wayland socket; required. |
-| `WAYLAND_DISPLAY` | Display socket used by guest clients. |
+| The positional argument (`[DISPLAY]` in `--help`) | Name of the Wayland socket the proxy serves, under `XDG_RUNTIME_DIR`; defaults to `wayland-proxy-0`. An absolute path is the socket's path itself, as libwayland clients read an absolute `WAYLAND_DISPLAY`. Guest clients connect with `WAYLAND_DISPLAY` set to it; the proxy itself does not read `WAYLAND_DISPLAY`. |
+| `XDG_RUNTIME_DIR` | Directory where the proxy creates its Wayland socket; required, and not empty. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated chords, such as `Super_L` or `<Alt>tab`, that the host compositor keeps. See [keyboard shortcut inhibition](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md#the-sommelier_accelerators-environment-variable). |
 | `SOMMELIER_WHEEL_FROM_TOUCHPAD` | Which clients get mouse-wheel steps (`wl_pointer.axis_discrete`) for touchpad scrolling, which Wine apps such as KakaoTalk need to scroll: `auto` (the default) Wine clients, `all` every client, `off` none. With `all`, a client that scrolls on both the steps and the smooth `axis`, as GTK, Qt and Firefox may, can scroll twice as far. See [the rule](docs/INVARIANTS.md#pointer-scrolling). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
-| `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
+| `--virtio-wl PATH` | VirtWL device to reach the host compositor through; defaults to `/dev/wl0`. |
+| `--local-compositor PATH` | Reach a compositor socket on this machine instead, for debugging. It cannot be combined with `--virtio-wl`. |
+| `--gpu-accel` | Copy guest `wl_shm` buffers into host dma-bufs when VirtWL can allocate them (see [Scope and limitations](#scope-and-limitations)). |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
-| `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
 | `$XDG_CONFIG_HOME/sommelier-rs/window-placement.toml` | Optional TOML file of placement bindings (named actions or work-area rects); `~/.config/sommelier-rs/window-placement.toml` when `XDG_CONFIG_HOME` is unset. A valid file turns window placement on for apps that connect from then on. In an app that connected while placement was on, an edit takes effect on the next key press; an app that connected before the file existed is placed once it reconnects. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 
 Window placement is opt-in and experimental. Sommelier binds no chord of

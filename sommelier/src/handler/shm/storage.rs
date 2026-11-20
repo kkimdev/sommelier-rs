@@ -166,13 +166,13 @@ pub(super) fn select_shm_backing(
     } = *request;
     debug!(
         "VirtWayland channel present={}",
-        ctx.virtwayland_channel.is_some()
+        ctx.virtwayland_channel().is_some()
     );
 
     // `--gpu-accel` changes only the output allocation.  Guest wl_shm is
     // still accepted for applications that do not expose linux-dmabuf;
     // those buffers use the VirtWL shared-memory allocation below.
-    let host_dmabuf_id = ctx.host_dmabuf_id.filter(|_| ctx.gpu_accel);
+    let host_dmabuf_id = ctx.host_dmabuf_id.filter(|_| ctx.settings().gpu_accel);
     let virtwl_dmabuf = host_dmabuf_id.and_then(|host_dmabuf_id| {
         match allocate_virtwl_dmabuf(ctx, width, height, format) {
             Ok(allocation) => {
@@ -198,7 +198,7 @@ pub(super) fn select_shm_backing(
 
     let backing = if let Some(backing) = virtwl_dmabuf {
         backing
-    } else if let Some(channel) = &ctx.virtwayland_channel {
+    } else if let Some(channel) = ctx.virtwayland_channel() {
         debug!(
             "Allocating VirtWayland shared-memory buffer: size={}",
             buffer_size
