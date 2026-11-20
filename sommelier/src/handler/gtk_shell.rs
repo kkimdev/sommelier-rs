@@ -368,13 +368,7 @@ mod tests {
         g.s.guest([terminal(gtk_surface)]).await;
         assert_eq!(g.s.host_received(), []);
 
-        g.s.global(
-            registry,
-            g.gtk.name,
-            zaura_shell::NAME,
-            zaura_shell::VERSION,
-        )
-        .await;
+        g.s.advertise(zaura_shell::NAME, zaura_shell::VERSION).await;
         g.s.guest_received();
         let host = g.s.host_received();
         let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { ref id, .. }))] = host[..]

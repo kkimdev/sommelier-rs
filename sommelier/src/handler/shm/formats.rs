@@ -414,8 +414,8 @@ mod tests {
     }
 
     /// A guest `wl_shm` bound from a removed global gets no format the
-    /// host reports for the global advertised anew under its name; the one
-    /// bound from the new global does.
+    /// host reports for the global that replaces it; the one bound from the
+    /// new global does.
     #[tokio::test]
     async fn replacement_shm_capability_does_not_reach_stale_guest_object() {
         let mut s = Session::new();
@@ -429,7 +429,9 @@ mod tests {
         assert_eq!(s.guest_received(), [(registry.id, removal.into())]);
         assert_eq!(s.host_received(), [], "a wl_shm v1 has no destructor");
 
-        let global = wl_registry::evt::global(registry.host, name, wl_shm::NAME, wl_shm::VERSION);
+        let replacement = name + 1;
+        let global =
+            wl_registry::evt::global(registry.host, replacement, wl_shm::NAME, wl_shm::VERSION);
         s.host([global.unwrap()]).await;
         let received = s.host_received();
         let [(
@@ -443,7 +445,7 @@ mod tests {
             panic!("the proxy did not bind the new wl_shm: {received:?}");
         };
         s.guest_received();
-        let new_guest_shm = bind_shm(&mut s, registry.id, name).await;
+        let new_guest_shm = bind_shm(&mut s, registry.id, replacement).await;
 
         s.host([wl_shm::evt::format(host_shm, RGB565)]).await;
         assert_eq!(

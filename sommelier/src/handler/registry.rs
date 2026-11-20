@@ -27,8 +27,8 @@ use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry, wl_shm, wl_su
 use crate::protocols::Iface;
 use crate::settings::Settings;
 use crate::state::{
-    Binding, Context, GlobalBinding, GtkShellState, HostGlobal, InternalCallback,
-    PendingDmabufGlobal, Singleton, INERT_BIND_INTERFACE,
+    Binding, Context, GtkShellState, HostGlobal, InternalCallback, PendingDmabufGlobal, Singleton,
+    INERT_BIND_INTERFACE,
 };
 use crate::wire::{queue_or_drop, Action};
 use log::error;
@@ -271,37 +271,30 @@ fn should_bind_internal_dmabuf(gpu_accel: bool, virtwl_supports_dmabuf: bool) ->
     gpu_accel || virtwl_supports_dmabuf
 }
 
-/// Whether a registry still lists global `name` at `generation`: it has not
-/// seen that advertisement's `global_remove` yet.
-pub(crate) fn global_still_seen(ctx: &Context, name: u32, generation: Option<u64>) -> bool {
-    registry_listing(ctx, name, generation).is_some()
+/// Whether a registry still lists global `name`: it has not seen its
+/// `global_remove` yet.
+pub(crate) fn global_still_seen(ctx: &Context, name: u32) -> bool {
+    registry_listing(ctx, name).is_some()
 }
 
-/// The lowest host registry that still lists global `name` at
-/// `generation`, if any (see [`global_still_seen`]).
-fn registry_listing(ctx: &Context, name: u32, generation: Option<u64>) -> Option<u32> {
+/// The lowest host registry that still lists global `name`, if any (see
+/// [`global_still_seen`]).
+fn registry_listing(ctx: &Context, name: u32) -> Option<u32> {
     ctx.registries
         .iter()
-        .filter(|(_, record)| {
-            record
-                .listed_generation(name)
-                .is_some_and(|listed| Some(listed) == generation)
-        })
+        .filter(|(_, record)| record.lists(name))
         .map(|(&registry, _)| registry)
         .min()
 }
 
-/// Whether the host removed global `name` at `generation`, its current
-/// advertisement, as a registry has seen.
-fn global_removal_seen(ctx: &Context, name: u32, generation: u64) -> bool {
-    ctx.removed_global_generations.get(&name) == Some(&generation)
-        && ctx.global_generations.get(&name) == Some(&generation)
+/// Whether the host removed global `name`, as a registry has seen.
+fn global_removal_seen(ctx: &Context, name: u32) -> bool {
+    ctx.removed_globals.contains(&name)
 }
 
-/// Retire global `name`, whose current advertisement the host removed,
-/// once no registry still lists it ([`global_still_seen`]): reset the
-/// internal binding it backed, and drop its connection-wide metadata,
-/// whose absence refuses new binds.
+/// Retire global `name`, which the host removed, once no registry still
+/// lists it ([`global_still_seen`]): reset the internal binding it backed,
+/// and drop its connection-wide metadata, whose absence refuses new binds.
 ///
 /// `wl_registry.global_remove` invalidates only the *global name*. Any
 /// object that was already bound remains valid until its own destructor
@@ -309,7 +302,6 @@ fn global_removal_seen(ctx: &Context, name: u32, generation: u64) -> bool {
 /// object keeps its ID and singleton state reserved, and queued host events
 /// cannot be routed to a later object that happens to reuse the ID.
 fn retire_unseen_global(ctx: &mut Context, name: u32) {
-    ctx.removed_global_generations.remove(&name);
     reset_internal_binding_for_global(ctx, name);
     crate::handler::shm::retire_guest_shms(ctx, name);
     ctx.singleton_candidates.remove(&name);
@@ -319,56 +311,6 @@ fn retire_unseen_global(ctx: &mut Context, name: u32) {
         // result says; the message's handler cannot do more.
         debug_assert!(ctx.is_fatal());
     }
-}
-
-fn next_global_generation(ctx: &mut Context) -> u64 {
-    let generation = ctx.next_global_generation.max(1);
-    ctx.next_global_generation = generation.wrapping_add(1).max(1);
-    generation
-}
-
-fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
-    let registry_id = ctx.last_sender_id;
-    let current_generation = ctx.global_generations.get(&name).copied();
-    let previous_generation = ctx
-        .registries
-        .get(&registry_id)
-        .and_then(|record| record.generation(name));
-    let already_seen = ctx
-        .registries
-        .get(&registry_id)
-        .is_some_and(|record| record.lists(name));
-
-    if already_seen && previous_generation == current_generation {
-        return false;
-    }
-
-    let registry_removed = ctx
-        .registries
-        .get(&registry_id)
-        .is_some_and(|record| record.is_removed(name));
-    let generation = match (current_generation, registry_removed, previous_generation) {
-        (None, _, _) => {
-            let new_generation = next_global_generation(ctx);
-            ctx.global_generations.insert(name, new_generation);
-            new_generation
-        }
-        (Some(current), true, Some(previous)) if previous == current => {
-            // This registry removed the current generation and is now seeing
-            // the replacement first. Advance the shared generation; other
-            // registries that still report the old generation will adopt this
-            // generation when their replacement event arrives.
-            let new_generation = next_global_generation(ctx);
-            ctx.global_generations.insert(name, new_generation);
-            new_generation
-        }
-        (Some(current), _, _) => current,
-    };
-    ctx.registries
-        .entry(registry_id)
-        .or_default()
-        .list(name, generation);
-    true
 }
 
 fn queue_synthetic_global(ctx: &mut Context, name: u32, interface: &str, version: u32) -> bool {
@@ -398,13 +340,11 @@ fn defer_synthetic_dmabuf_global(
     registry_host_id: u32,
     name: u32,
     version: u32,
-    generation: u64,
 ) {
     let pending = PendingDmabufGlobal {
         registry_host_id,
         name,
         version,
-        generation,
     };
     if !ctx.pending_dmabuf_globals.contains(&pending) {
         ctx.pending_dmabuf_globals.push(pending);
@@ -412,11 +352,13 @@ fn defer_synthetic_dmabuf_global(
     set_registry_global_visibility(ctx, registry_host_id, name, false);
 }
 
-pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64) {
-    let can_publish = crate::handler::linux_dmabuf::has_synthetic_feedback_formats(ctx, generation);
+/// Publish the guest globals that wait for the capabilities of host
+/// linux-dmabuf global `name`, which have arrived.
+pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, name: u32) {
+    let can_publish = crate::handler::linux_dmabuf::has_synthetic_feedback_formats(ctx, name);
     let mut matching = Vec::new();
     ctx.pending_dmabuf_globals.retain(|pending| {
-        if pending.generation == generation {
+        if pending.name == name {
             matching.push(pending.clone());
             false
         } else {
@@ -425,21 +367,16 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64)
     });
 
     if !can_publish {
-        log::warn!(
-            "Hiding linux-dmabuf generation {} because the host advertised no supported formats",
-            generation
-        );
+        log::warn!("Hiding linux-dmabuf {name} because the host advertised no supported formats");
         return;
     }
 
     for pending in matching {
-        let is_current = ctx
+        let listed = ctx
             .registries
             .get(&pending.registry_host_id)
-            .and_then(|record| record.listed_generation(pending.name))
-            == Some(generation)
-            && ctx.global_generations.get(&pending.name) == Some(&generation);
-        if !is_current {
+            .is_some_and(|record| record.lists(pending.name));
+        if !listed {
             continue;
         }
 
@@ -517,11 +454,6 @@ impl Singleton {
         let interface = self.interface();
         match self {
             Self::Dmabuf => {
-                let generation = ctx
-                    .global_generations
-                    .get(&name)
-                    .copied()
-                    .unwrap_or_default();
                 // Bind at v3 when available so the proxy can collect legacy
                 // format/modifier pairs and synthesize the v4 feedback
                 // object. v2 still keeps create_immed available on older
@@ -531,8 +463,7 @@ impl Singleton {
                 let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
                 ctx.singletons
                     .bind(self, binding(host_id, name, bound_version));
-                ctx.host_dmabuf_generation = Some(generation);
-                ctx.dmabuf_capabilities.entry(generation).or_default();
+                ctx.dmabuf_capabilities.entry(name).or_default();
                 bind_internally(
                     ctx,
                     registry_host_id,
@@ -542,7 +473,7 @@ impl Singleton {
                     host_id,
                 )?;
                 if can_synthesize_dmabuf_feedback(ctx, version) {
-                    queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { generation });
+                    queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { global: name });
                 }
             }
             Self::KeyboardExtension => {
@@ -643,11 +574,10 @@ fn ensure_bound(ctx: &mut Context, singleton: Singleton) -> Result<(), Action> {
         .iter()
         .filter(|(_, global)| global.interface == singleton.interface().name())
         .filter_map(|(&name, global)| {
-            let generation = *ctx.global_generations.get(&name)?;
-            if global_removal_seen(ctx, name, generation) {
+            if global_removal_seen(ctx, name) {
                 return None;
             }
-            let registry_host_id = registry_listing(ctx, name, Some(generation))?;
+            let registry_host_id = registry_listing(ctx, name)?;
             Some((name, registry_host_id, global.version))
         })
         .min();
@@ -670,9 +600,8 @@ fn ensure_all_bound(ctx: &mut Context) -> Result<(), Action> {
 /// Release the binding that host global `name` backs, if one does.
 ///
 /// ChromiumOS destroys the internally bound proxy when its host registry
-/// global disappears. Keeping the old object registered would let a
-/// re-advertised global reuse stale capability/state and route events to an
-/// object that no longer represents the current host global.
+/// global disappears, and so does the proxy, which binds a replacement
+/// global, if one is advertised, under a name of its own.
 ///
 /// The text-input managers have no destructor, and text inputs still
 /// create children from them after their globals go, so they are never
@@ -683,7 +612,6 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
     };
     match singleton {
         Singleton::Dmabuf => {
-            let generation = ctx.host_dmabuf_generation.take();
             // A registry global removal invalidates the name, not objects
             // already bound from it. Explicitly destroy our hidden binding
             // so the host does not retain a proxy until connection
@@ -692,9 +620,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
                 .push(zwp_linux_dmabuf_v1::req::destroy(binding.host));
             ctx.retire_destroyed_host_object(binding.host);
             clear_host_shm_dmabuf_formats(ctx);
-            if let Some(generation) = generation {
-                crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
-            }
+            crate::handler::linux_dmabuf::maybe_reclaim_capabilities(ctx, name);
         }
         Singleton::Shm => {
             ctx.shadow_table.retire_host(binding.host);
@@ -726,21 +652,6 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
             crate::handler::aura_objects::release_shell(ctx, binding);
         }
     }
-}
-
-/// Remove advertisement metadata left by the previous generation of a
-/// re-used numeric global name.
-///
-/// A Wayland global name identifies the current advertisement, not a
-/// permanent interface slot. Once this registry has observed the old
-/// generation's removal and receives a replacement, any visible/hidden record
-/// for the old interface must be discarded before the replacement is handled.
-/// Bound child objects remain in their own maps; only connection-wide global
-/// advertisement classification is replaced here.
-fn replace_global_metadata_for_generation(ctx: &mut Context, name: u32) {
-    ctx.removed_global_generations.remove(&name);
-    ctx.singleton_candidates.remove(&name);
-    ctx.host_globals.remove(&name);
 }
 
 /// Advertise host global `name` to the guest on the sending registry as
@@ -801,10 +712,8 @@ fn can_synthesize_dmabuf_feedback(ctx: &Context, version: u32) -> bool {
 /// How the proxy serves an admitted guest bind.
 #[derive(Debug, PartialEq, Eq)]
 enum BindAdmission {
-    /// Bind the host global of this advertisement generation. Bound
-    /// objects record the generation so that a delayed `global_remove` of
-    /// an older advertisement cannot retire a binding of its replacement.
-    Live { generation: u64 },
+    /// Bind the host global.
+    Live,
     /// The registry advertised the global and then removed it, and the
     /// bind crossed the removal on the wire. libwayland-server makes this
     /// race harmless, so the proxy creates an inert guest object instead
@@ -817,9 +726,7 @@ enum BindAdmission {
 ///
 /// # Returns
 ///
-/// How to serve the bind, or `None` to reject it as a protocol error. A
-/// registry that has seen the name must agree with the connection-wide
-/// generation (checked below), so that generation is the one bound.
+/// How to serve the bind, or `None` to reject it as a protocol error.
 fn admit_guest_bind(
     ctx: &Context,
     name: u32,
@@ -834,10 +741,10 @@ fn admit_guest_bind(
         .get_host_id(ctx.last_sender_id)
         .unwrap_or(ctx.last_sender_id);
     // Once one registry has observed global_remove, a bind through it never
-    // reaches the host, even while another registry is still receiving the
-    // old generation. A bind through a registry that has not seen it yet is
-    // forwarded below: that relies on the host keeping a removed global
-    // bindable until wl_global_destroy, as Exo does by deferring it after
+    // reaches the host, even while another registry still lists the global.
+    // A bind through a registry that has not seen it yet is forwarded
+    // below: that relies on the host keeping a removed global bindable
+    // until wl_global_destroy, as Exo does by deferring it after
     // wl_global_remove. A host that destroyed it at once would answer the
     // bind with INVALID_OBJECT, as it would a native client's.
     if let Some(removal) = ctx
@@ -857,9 +764,6 @@ fn admit_guest_bind(
         if !record.lists(name) {
             return None;
         }
-        if record.generation(name) != ctx.global_generations.get(&name).copied() {
-            return None;
-        }
     }
 
     // The v3 manager is a synthetic global backed by the host v1 manager.
@@ -869,24 +773,21 @@ fn admit_guest_bind(
     let version_is_advertised = global.interface == interface
         && requested_version > 0
         && requested_version <= global.version;
-    if !version_is_advertised {
-        return None;
-    }
-    // `note_registry_global` records a generation before any name enters
-    // `host_globals`, and generations are never removed, so this lookup
-    // cannot fail for an advertised name.
-    let generation = *ctx.global_generations.get(&name)?;
-    Some(BindAdmission::Live { generation })
+    version_is_advertised.then_some(BindAdmission::Live)
 }
 
-/// Record the sending registry's advertisement of host global `name`,
-/// and, if it starts a new generation of the name, replace the old one's
-/// metadata.
+/// Record the sending registry's advertisement of host global `name`.
+///
+/// A name is one global for the connection's life: libwayland-server
+/// numbers each global anew and never reuses a name, and sends a registry
+/// each global once. A name the registry has advertised already, or one
+/// whose removal any registry has seen, breaks the protocol, and ends the
+/// session.
 ///
 /// # Returns
 ///
 /// The action for the event if the proxy handles it no further: `Drop`
-/// for a malformed or duplicate advertisement, or the session's end.
+/// for a malformed advertisement, or the session's end.
 fn accept_global(
     ctx: &mut Context,
     name: u32,
@@ -894,15 +795,6 @@ fn accept_global(
     version: u32,
 ) -> Result<(), Action> {
     let registry_id = ctx.last_sender_id;
-    let previous_generation = ctx.global_generations.get(&name).copied();
-    let registry_previous_generation = ctx
-        .registries
-        .get(&registry_id)
-        .and_then(|record| record.generation(name));
-    let registry_removed = ctx
-        .registries
-        .get(&registry_id)
-        .is_some_and(|record| record.is_removed(name));
     if version == 0 {
         log::warn!(
             "Ignoring malformed Wayland global {}:{} with version 0",
@@ -911,32 +803,17 @@ fn accept_global(
         );
         return Err(Action::Drop);
     }
-    if !note_registry_global(ctx, name) {
-        log::warn!(
-            "Ignoring duplicate Wayland global name {} in registry {} (interface {})",
-            name,
-            ctx.last_sender_id,
-            interface
-        );
-        return Err(Action::Drop);
+    let advertised = ctx
+        .registries
+        .get(&registry_id)
+        .is_some_and(|record| record.advertised(name));
+    if advertised || global_removal_seen(ctx, name) {
+        return Err(ctx.fail(format_args!(
+            "The host advertised global name {name} ({interface}) again in registry \
+             {registry_id}, which breaks the protocol"
+        )));
     }
-    let generation_changed = previous_generation
-        .zip(ctx.global_generations.get(&name).copied())
-        .is_some_and(|(previous, current)| previous != current);
-    let starts_new_generation = generation_changed
-        && registry_removed
-        && registry_previous_generation == previous_generation;
-    if generation_changed {
-        if starts_new_generation {
-            reset_internal_binding_for_global(ctx, name);
-        }
-        // The old generation of the name has retired.
-        crate::handler::shm::retire_guest_shms(ctx, name);
-        replace_global_metadata_for_generation(ctx, name);
-        // The name may now be another interface's, so a singleton
-        // whose binding it was needs another candidate.
-        ensure_all_bound(ctx)?;
-    }
+    ctx.registries.entry(registry_id).or_default().list(name);
     Ok(())
 }
 
@@ -950,11 +827,6 @@ fn dropped(bound: Result<(), Action>) -> Action {
 /// binding and, with GPU access, the guest's dma-buf global.
 fn dmabuf_global(ctx: &mut Context, name: u32, version: u32) -> Action {
     let interface = zwp_linux_dmabuf_v1::NAME;
-    let generation = ctx
-        .global_generations
-        .get(&name)
-        .copied()
-        .unwrap_or_default();
     let virtwl_supports_dmabuf = ctx
         .virtwayland_channel()
         .is_some_and(|channel| channel.supports_dmabuf());
@@ -981,21 +853,15 @@ fn dmabuf_global(ctx: &mut Context, name: u32, version: u32) -> Action {
     if ctx.settings().gpu_accel {
         // One host dmabuf object is shared for capability discovery,
         // and a guest global for it waits until the binding of its
-        // own generation has the capabilities.
+        // own name has the capabilities.
         let capability_ready = ctx
             .dmabuf_capabilities
-            .get(&generation)
+            .get(&name)
             .is_some_and(|capabilities| capabilities.ready);
         if can_synthesize_feedback && !capability_ready {
-            defer_synthetic_dmabuf_global(
-                ctx,
-                ctx.last_sender_id,
-                name,
-                client_version,
-                generation,
-            );
+            defer_synthetic_dmabuf_global(ctx, ctx.last_sender_id, name, client_version);
         } else if !can_synthesize_feedback
-            || crate::handler::linux_dmabuf::has_synthetic_feedback_formats(ctx, generation)
+            || crate::handler::linux_dmabuf::has_synthetic_feedback_formats(ctx, name)
         {
             advertise_synthetic_global(ctx, name, interface, client_version);
         } else {
@@ -1178,63 +1044,43 @@ impl wl_registry::WlRegistryHandler for Handlers {
         let Some(record) = ctx.registries.get(&registry_id) else {
             return Action::Drop;
         };
-        let Some(removed_generation) = record.listed_generation(name) else {
+        if !record.lists(name) {
             return Action::Drop;
-        };
+        }
         let was_visible = record
             .visibility(name)
             .unwrap_or_else(|| ctx.host_globals.contains_key(&name));
-        ctx.pending_dmabuf_globals.retain(|pending| {
-            !(pending.registry_host_id == registry_id
-                && pending.name == name
-                && pending.generation == removed_generation)
-        });
+        ctx.pending_dmabuf_globals
+            .retain(|pending| !(pending.registry_host_id == registry_id && pending.name == name));
         // A bound wl_output remains a valid Wayland object after its global
         // advertisement disappears, but it must stop feeding
         // compositor-owned placement, and its host-only zaura_output is
-        // released now (see `OutputRegistry::remove_global`). Match the
-        // exact advertisement generation so a delayed remove cannot retire a
-        // replacement.
-        for aura_output in ctx.outputs.remove_global(GlobalBinding {
-            name,
-            generation: removed_generation,
-        }) {
+        // released now (see `OutputRegistry::remove_global`).
+        for aura_output in ctx.outputs.remove_global(name) {
             crate::handler::aura_objects::release(
                 ctx,
                 crate::handler::aura_objects::AuraChild::OUTPUT,
                 aura_output,
             );
         }
-        crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, removed_generation);
-        // Host registries are independent Wayland objects and their events can
-        // be interleaved. A global name may be removed from one registry and
-        // re-advertised there before another registry delivers the old remove.
-        // Do not retire the connection-wide metadata until every registry
-        // has observed the removal; otherwise that stale remove invalidates a
-        // newly advertised generation.
-        let current_generation = ctx.global_generations.get(&name).copied();
-        let removes_current_generation = Some(removed_generation) == current_generation;
+        crate::handler::linux_dmabuf::maybe_reclaim_capabilities(ctx, name);
         // Keep the version of a removed output the guest saw, so a bind that
         // crossed this removal is told apart from a bind of a name it never
-        // saw. `host_globals` describes only the current generation.
+        // saw.
         let inert_bind_version = ctx
             .host_globals
             .get(&name)
-            .filter(|global| {
-                was_visible
-                    && removes_current_generation
-                    && global.interface == INERT_BIND_INTERFACE
-            })
+            .filter(|global| was_visible && global.interface == INERT_BIND_INTERFACE)
             .map(|global| global.version);
         if let Some(record) = ctx.registries.get_mut(&registry_id) {
             record.remove(name, inert_bind_version);
         }
-        if removes_current_generation {
-            ctx.removed_global_generations
-                .insert(name, removed_generation);
-            if !global_still_seen(ctx, name, current_generation) {
-                retire_unseen_global(ctx, name);
-            }
+        // Host registries are independent Wayland objects, and each gets
+        // its own global_remove. The connection-wide metadata stays until
+        // every registry that lists the global has seen it.
+        ctx.removed_globals.insert(name);
+        if !global_still_seen(ctx, name) {
+            retire_unseen_global(ctx, name);
         }
         // Only globals previously exposed to the guest should generate a
         // matching removal event. Hidden/internal globals were never sent to
@@ -1262,8 +1108,8 @@ impl wl_registry::WlRegistryHandler for Handlers {
                 admit_guest_bind(ctx, name, interface.name(), *version)?,
             ))
         });
-        let (interface, generation) = match admission {
-            Some((interface, BindAdmission::Live { generation })) => (interface, generation),
+        let interface = match admission {
+            Some((interface, BindAdmission::Live)) => interface,
             Some((interface, BindAdmission::Inert)) => {
                 log::debug!(
                     "Bind of removed global {}:{} v{} crossed its removal; guest object {} is inert",
@@ -1377,18 +1223,13 @@ impl wl_registry::WlRegistryHandler for Handlers {
         if interface == Iface::WlOutput {
             // Register the output only once its bind is queued, so the
             // failure paths above have no output state to undo.
-            ctx.outputs.bind(
-                host_new_id,
-                bind_version,
-                GlobalBinding { name, generation },
-            );
+            ctx.outputs.bind(host_new_id, bind_version, name);
             // Placement's host-only Aura output metadata (scale factors and
             // insets).
             crate::handler::window_placement::output_bound(ctx, host_new_id);
         }
         if interface == Iface::ZwpLinuxDmabufV1 {
-            ctx.dmabuf_guest_generations
-                .insert(*guest_new_id, generation);
+            ctx.dmabuf_factories.insert(*guest_new_id, name);
         }
         if interface == Iface::WlSeat {
             // A text input whose seat had no host object can activate now.
@@ -1400,7 +1241,7 @@ impl wl_registry::WlRegistryHandler for Handlers {
 
 /// Forget host registry `registry_host_id`, which ended (see
 /// `crate::state::lifecycle`): what it was advertised, and its hold on
-/// capability generations.
+/// dma-buf capabilities.
 ///
 /// A global whose removal another registry has seen waits for every
 /// registry that still lists it (see `on_global_remove`). If this was the
@@ -1409,23 +1250,20 @@ pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
     let record = ctx.registries.remove(&registry_host_id).unwrap_or_default();
     ctx.pending_dmabuf_globals
         .retain(|pending| pending.registry_host_id != registry_host_id);
-    for (name, generation) in record.listed() {
-        if global_removal_seen(ctx, name, generation)
-            && !global_still_seen(ctx, name, Some(generation))
-        {
+    for name in record.listed() {
+        if global_removal_seen(ctx, name) && !global_still_seen(ctx, name) {
             retire_unseen_global(ctx, name);
         }
     }
-    let generations: std::collections::BTreeSet<_> = record.generations().collect();
-    for generation in generations {
-        crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+    for name in record.names() {
+        crate::handler::linux_dmabuf::maybe_reclaim_capabilities(ctx, name);
     }
     // A candidate no registry lists any more can never be bound.
     let unlisted: Vec<u32> = ctx
         .singleton_candidates
         .keys()
         .copied()
-        .filter(|&name| !global_still_seen(ctx, name, ctx.global_generations.get(&name).copied()))
+        .filter(|&name| !global_still_seen(ctx, name))
         .collect();
     for name in unlisted {
         ctx.singleton_candidates.remove(&name);
@@ -1466,7 +1304,7 @@ mod tests {
     };
     use crate::protocols::{AnyEvent, AnyRequest, Iface};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{Context, HostGlobal, Singleton};
+    use crate::state::{Context, Singleton};
     use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
 
     /// How many IDs the guest skips before its first object. The proxy
@@ -1991,15 +1829,54 @@ mod tests {
         r.bind_fatal(r.a, 10, "wl_seat", 1).await;
     }
 
-    /// A second global under a name a registry lists is a duplicate; the
-    /// proxy drops it and keeps the first.
+    /// A name is one global for the connection's life: libwayland-server
+    /// numbers each global anew, advertises it to a registry once, and
+    /// advertises no global it removed. A host that advertises a name
+    /// again breaks the protocol, which ends the session.
     #[tokio::test]
-    async fn a_duplicate_global_name_is_dropped() {
-        let mut r = Registries::new().await;
-        r.global(A, 11, "wl_seat", 5).await;
-        r.global(A, 11, "wl_output", 3).await;
-        assert_eq!(r.s.guest_received(), [(r.a.id, global(11, "wl_seat", 5))]);
-        r.bind_paired(r.a, 11, "wl_seat", 5).await;
+    async fn a_name_advertised_again_ends_the_session() {
+        for (case, setup) in [
+            ("listed by the registry", &[Global(A, 7, "wl_seat", 5)][..]),
+            (
+                "removed from the registry",
+                &[Global(A, 7, "wl_seat", 5), Remove(A, 7)],
+            ),
+            (
+                "removed from a registry that alone listed it",
+                &[Global(B, 7, "wl_seat", 5), Remove(B, 7)],
+            ),
+            (
+                "removed from a registry, while another lists it",
+                &[
+                    Global(B, 7, "wl_seat", 5),
+                    Global(A, 7, "wl_seat", 5),
+                    Remove(B, 7),
+                ],
+            ),
+            (
+                "of a global the proxy drops, removed",
+                &[Global(B, 7, "zz_unknown_v1", 1), Remove(B, 7)],
+            ),
+            (
+                "of a singleton the proxy bound, removed",
+                &[Global(B, 7, "wl_shm", 1), Remove(B, 7)],
+            ),
+        ] {
+            let mut r = Registries::new().await;
+            for &step in setup {
+                r.run(step).await;
+            }
+            r.s.guest_received();
+
+            let again = wl_registry::evt::global(r.a.host, 7, "wl_seat", 5).unwrap();
+            r.s.host_fatal([again]).await;
+            assert_eq!(
+                r.s.guest_received_and_error(),
+                (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)),
+                "{case}"
+            );
+            assert_eq!(r.s.host_received(), [], "{case}");
+        }
     }
 
     /// A removed output is forgotten and its `zaura_output` released at
@@ -2087,8 +1964,6 @@ mod tests {
         struct Case {
             name: &'static str,
             setup: &'static [Step],
-            /// Injects a fault no peer can cause, after `setup`.
-            fault: Option<fn(&mut Context)>,
             /// The registry the guest binds through.
             through: Registry,
             bind: (u32, &'static str, u32),
@@ -2097,14 +1972,12 @@ mod tests {
             Case {
                 name: "a global of another interface",
                 setup: &[Global(A, 7, "wl_compositor", 1)],
-                fault: None,
                 through: A,
                 bind: (7, "wl_seat", 1),
             },
             Case {
                 name: "a name never advertised",
                 setup: &[],
-                fault: None,
                 through: A,
                 bind: (42, "wl_seat", 5),
             },
@@ -2114,21 +1987,18 @@ mod tests {
             Case {
                 name: "an interface the proxy does not forward",
                 setup: &[],
-                fault: None,
                 through: A,
                 bind: (42, "zcr_text_input_extension_v1", 1),
             },
             Case {
                 name: "a global hidden without GPU access",
                 setup: &[Global(A, 42, "zwp_linux_dmabuf_v1", 5)],
-                fault: None,
                 through: A,
                 bind: (42, "zwp_linux_dmabuf_v1", 5),
             },
             Case {
                 name: "a version above the advertised one",
                 setup: &[Global(A, 10, "wl_seat", 3)],
-                fault: None,
                 through: A,
                 bind: (10, "wl_seat", 4),
             },
@@ -2139,7 +2009,6 @@ mod tests {
                 // dropped.
                 name: "a removed seat",
                 setup: &[Global(A, 10, "wl_seat", 5), Remove(A, 99), Remove(A, 10)],
-                fault: None,
                 through: A,
                 bind: (10, "wl_seat", 5),
             },
@@ -2148,14 +2017,12 @@ mod tests {
                 // the output it was.
                 name: "a removed output bound as another interface",
                 setup: &[Global(A, 10, "wl_output", 3), Remove(A, 10)],
-                fault: None,
                 through: A,
                 bind: (10, "wl_seat", 3),
             },
             Case {
                 name: "a live global the binding registry never listed",
                 setup: &[Global(A, 10, "wl_output", 3), Global(B, 11, "wl_seat", 5)],
-                fault: None,
                 through: B,
                 bind: (10, "wl_output", 3),
             },
@@ -2164,26 +2031,8 @@ mod tests {
                 // global its removal from A completed can refuse the bind.
                 name: "a retired global bound through a registry that listed nothing",
                 setup: &[Global(A, 10, "wl_seat", 5), Remove(A, 10)],
-                fault: None,
                 through: B,
                 bind: (10, "wl_seat", 5),
-            },
-            Case {
-                // Reachable only through a proxy bookkeeping bug, not a
-                // guest error: a name in `host_globals` whose advertisement
-                // generation was never recorded. Registry B lists nothing,
-                // so only the generation can refuse the bind.
-                name: "a global without an advertisement generation",
-                setup: &[],
-                fault: Some(|ctx| {
-                    let output = HostGlobal {
-                        interface: "wl_output".to_string(),
-                        version: 3,
-                    };
-                    ctx.host_globals.insert(10, output);
-                }),
-                through: B,
-                bind: (10, "wl_output", 3),
             },
         ] {
             let mut r = Registries::new().await;
@@ -2191,9 +2040,6 @@ mod tests {
                 r.run(step).await;
             }
             r.s.guest_received();
-            if let Some(fault) = case.fault {
-                fault(r.s.ctx());
-            }
 
             let (name, interface, version) = case.bind;
             let through = r.of(case.through);
@@ -2468,7 +2314,7 @@ mod tests {
 
     /// Removing the global a singleton is bound to retires the binding: its
     /// host ID stays reserved, the host object is destroyed if its
-    /// interface has a destructor, and the name's next advertisement is
+    /// interface has a destructor, and the next global of its interface is
     /// bound afresh.
     #[tokio::test]
     async fn removing_a_bound_singleton_global_retires_its_binding() {
@@ -2532,16 +2378,17 @@ mod tests {
             let interface = singleton.interface().name();
             let mut r = Registries::gpu(true).await;
             let a = r.a;
-            let advertise = || {
+            let advertise = |name| {
                 Vec::from_iter(
-                    advertised.map(|(advertised, version)| (a.id, global(10, advertised, version))),
+                    advertised
+                        .map(|(advertised, version)| (a.id, global(name, advertised, version))),
                 )
             };
-            // The proxy binds the global as `version`, and asks for its
+            // The proxy binds global `name` as `version`, and asks for its
             // capabilities if it has some; returns the binding.
-            let binding = |host: Vec<(u32, AnyRequest)>| {
+            let binding = |name, host: Vec<(u32, AnyRequest)>| {
                 let binding = bound(&host[0]);
-                let expected = bind_request(10, interface, bound_version, binding);
+                let expected = bind_request(name, interface, bound_version, binding);
                 let sync = capability_sync.then(|| {
                     let callback = host[1].1.new_object().expect("a callback").0;
                     sync(callback)
@@ -2554,8 +2401,8 @@ mod tests {
                 binding
             };
             r.global(A, 10, interface, version).await;
-            let old = binding(r.s.host_received());
-            assert_eq!(r.s.guest_received(), advertise(), "{interface}");
+            let old = binding(10, r.s.host_received());
+            assert_eq!(r.s.guest_received(), advertise(10), "{interface}");
 
             r.remove(A, 10).await;
             assert_eq!(
@@ -2572,10 +2419,10 @@ mod tests {
             // for the binding's capabilities, which no registry lists now.
             assert!(r.s.ctx().pending_dmabuf_globals.is_empty(), "{interface}");
 
-            r.global(A, 10, interface, version).await;
-            let new = binding(r.s.host_received());
+            r.global(A, 11, interface, version).await;
+            let new = binding(11, r.s.host_received());
             assert_ne!(new, old, "{interface}");
-            assert_eq!(r.s.guest_received(), advertise(), "{interface}");
+            assert_eq!(r.s.guest_received(), advertise(11), "{interface}");
         }
     }
 
@@ -2776,10 +2623,8 @@ mod tests {
     }
 
     /// When the proxy's `wl_shm` binding retires, it binds the lowest name
-    /// (possibly the same name at a new generation) that a registry still
-    /// lists and whose removal no registry has seen, through the lowest
-    /// registry that lists it. A registry lists a name only at the
-    /// generation it last saw advertised.
+    /// that a registry still lists and whose removal no registry has seen,
+    /// through the lowest registry that lists it.
     #[tokio::test]
     async fn a_singleton_binding_moves_to_the_lowest_live_candidate() {
         struct Case {
@@ -2803,29 +2648,6 @@ mod tests {
                 bound: Some(11),
                 binds: &[(A, 11)],
                 candidates: &[11, 12],
-            },
-            Case {
-                // Before every registry has seen the bound name removed, one
-                // that has may see it advertised for another interface.
-                name: "a bound name reused by another interface hands the binding on",
-                listings: &[(A, &[10, 11]), (B, &[10])],
-                steps: &[Remove(A, 10), Global(A, 10, "wl_output", 3)],
-                bound: Some(11),
-                binds: &[(A, 11)],
-                candidates: &[11],
-            },
-            Case {
-                name: "a candidate name reused by another interface is no candidate",
-                listings: &[(A, &[10, 11]), (B, &[10, 11])],
-                steps: &[
-                    Remove(A, 11),
-                    Global(A, 11, "wl_output", 3),
-                    Remove(A, 10),
-                    Remove(B, 10),
-                ],
-                bound: None,
-                binds: &[],
-                candidates: &[],
             },
             Case {
                 // A compositor may destroy a global as soon as it removes
@@ -2853,62 +2675,6 @@ mod tests {
                 bound: None,
                 binds: &[],
                 candidates: &[],
-            },
-            Case {
-                // Registry A lists only the old generation of name 10, so
-                // it cannot carry the bind of the new one.
-                name: "a name advertised anew is bound through a registry that lists it anew",
-                listings: &[(A, &[10]), (B, &[10])],
-                steps: &[Remove(B, 10), Global(B, 10, "wl_shm", 1)],
-                bound: Some(10),
-                binds: &[(B, 10)],
-                candidates: &[10],
-            },
-            Case {
-                // Registry A still lists name 10, but only its old
-                // generation, so the removal of the new one retires it. A
-                // registry that lists the current generation keeps it, as
-                // in "a binding another registry lists stays" and the two
-                // rows below.
-                name: "a name advertised anew retires when only its old generation is listed",
-                listings: &[(A, &[10]), (B, &[10])],
-                steps: &[Remove(B, 10), Global(B, 10, "wl_shm", 1), Remove(B, 10)],
-                bound: None,
-                binds: &[(B, 10)],
-                candidates: &[],
-            },
-            Case {
-                // A registry that still lists the name and sees it again
-                // after another registry advanced its generation adopts
-                // that generation, so it keeps the name alive.
-                name: "a registry listing a name anew adopts its new generation",
-                listings: &[(A, &[10]), (B, &[10])],
-                steps: &[
-                    Remove(B, 10),
-                    Global(B, 10, "wl_shm", 1),
-                    Global(A, 10, "wl_shm", 1),
-                    Remove(B, 10),
-                ],
-                bound: Some(10),
-                binds: &[(B, 10)],
-                candidates: &[10],
-            },
-            Case {
-                // Registry B saw the old generation removed, but A already
-                // advanced it; B's replacement joins A's generation rather
-                // than advancing it again, so A keeps the name alive.
-                name: "a lagging registry joins the generation another advanced",
-                listings: &[(A, &[10]), (B, &[10])],
-                steps: &[
-                    Remove(A, 10),
-                    Global(A, 10, "wl_shm", 1),
-                    Remove(B, 10),
-                    Global(B, 10, "wl_shm", 1),
-                    Remove(B, 10),
-                ],
-                bound: Some(10),
-                binds: &[(A, 10)],
-                candidates: &[10],
             },
             Case {
                 name: "a binding another registry lists stays",
@@ -3050,25 +2816,6 @@ mod tests {
         r
     }
 
-    /// The removal of a global the proxy neither advertises nor binds is
-    /// on record too, and waits for every registry that lists it. The
-    /// session's check that no state outlives its object pins that the
-    /// proxy drops the record once no registry lists the global.
-    #[tokio::test]
-    async fn the_removal_of_a_dropped_global_waits_for_every_registry() {
-        let mut r = Registries::new().await;
-        for registry in [A, B] {
-            r.global(registry, 7, "zz_unknown_v1", 1).await;
-        }
-        r.remove(A, 7).await;
-        assert_eq!(r.s.guest_received(), []);
-        // Reads state no peer can observe: the removal of a global the
-        // proxy uses for nothing.
-        assert!(r.s.ctx().removed_global_generations.contains_key(&7));
-
-        assert_eq!(r.destroy(B).await, []);
-    }
-
     /// O3: a global removed from one registry waits for every registry that
     /// still lists it. Destroying the last of those through `wl_fixes`
     /// means it never sees the removal, so the global is retired then: a
@@ -3111,142 +2858,6 @@ mod tests {
 
         // Registry B, which has listed nothing yet, may still bind it.
         r.bind_paired(r.b, 7, "wl_seat", 5).await;
-    }
-
-    #[tokio::test]
-    async fn stale_remove_cannot_invalidate_a_re_advertised_global_generation() {
-        let mut r = Registries::new().await;
-        r.global(A, 7, "wl_seat", 5).await;
-        r.global(B, 7, "wl_seat", 5).await;
-
-        // Registry A observes removal and receives a replacement with the
-        // same numeric name before registry B delivers the old remove.
-        r.remove(A, 7).await;
-        r.global(A, 7, "wl_seat", 5).await;
-
-        // B's delayed remove belongs to generation 1. It must be forwarded to
-        // B, but must not retire generation 2 advertised to A.
-        r.remove(B, 7).await;
-        assert_eq!(
-            r.s.guest_received(),
-            [
-                (r.a.id, global(7, "wl_seat", 5)),
-                (r.b.id, global(7, "wl_seat", 5)),
-                (r.a.id, global_remove(7)),
-                (r.a.id, global(7, "wl_seat", 5)),
-                (r.b.id, global_remove(7)),
-            ]
-        );
-
-        // An old registry remove must not invalidate the replacement.
-        r.bind_paired(r.a, 7, "wl_seat", 5).await;
-    }
-
-    #[tokio::test]
-    async fn re_advertised_name_replaces_visible_metadata_before_hidden_global() {
-        let mut r = Registries::new().await;
-        let keyboard_extension = zcr_keyboard_extension_v1::NAME;
-        r.global(A, 7, "wl_seat", 5).await;
-        r.remove(A, 7).await;
-
-        // The host reused name 7 for a hidden singleton. The old visible
-        // wl_seat metadata must not survive and authorize a stale bind.
-        r.global(A, 7, keyboard_extension, 2).await;
-        assert_eq!(
-            r.s.guest_received(),
-            [
-                (r.a.id, global(7, "wl_seat", 5)),
-                (r.a.id, global_remove(7))
-            ]
-        );
-        let host = r.s.host_received();
-        let [binding] = &host[..] else {
-            panic!("the host got {host:?}, not one bind");
-        };
-        let binding = bound(binding);
-        assert_eq!(
-            host,
-            [(r.a.host, bind_request(7, keyboard_extension, 2, binding))],
-            "the replacement hidden global must own the numeric name"
-        );
-
-        r.bind_fatal(r.a, 7, "wl_seat", 5).await;
-    }
-
-    #[tokio::test]
-    async fn re_advertised_hidden_name_replaces_hidden_metadata_before_visible_global() {
-        let mut r = Registries::new().await;
-        r.global(A, 7, zcr_keyboard_extension_v1::NAME, 2).await;
-        assert_eq!(r.s.host_received().len(), 1, "the proxy binds it");
-        r.remove(A, 7).await;
-        assert_eq!(r.s.guest_received(), []);
-
-        // Name 7 is now a normal visible global. A stale hidden marker would
-        // make its later global_remove disappear instead of reaching the guest.
-        r.global(A, 7, "wl_seat", 5).await;
-        assert_eq!(r.s.guest_received(), [(r.a.id, global(7, "wl_seat", 5))]);
-        r.bind_paired(r.a, 7, "wl_seat", 5).await;
-        r.remove(A, 7).await;
-        assert_eq!(
-            r.s.guest_received(),
-            [(r.a.id, global_remove(7))],
-            "the visible replacement must forward its own removal"
-        );
-    }
-
-    #[tokio::test]
-    async fn delayed_remove_does_not_reset_replacement_internal_binding() {
-        let mut r = Registries::new().await;
-        let keyboard_extension = zcr_keyboard_extension_v1::NAME;
-        for registry in [A, B] {
-            r.global(registry, 7, keyboard_extension, 2).await;
-        }
-        let host = r.s.host_received();
-        let [old] = &host[..] else {
-            panic!("the host got {host:?}, not one bind");
-        };
-        let old = bound(old);
-
-        // Registry A sees the host generation disappear and immediately sees
-        // the replacement. The old internal object is retired and a fresh
-        // binding is created for the new generation.
-        r.remove(A, 7).await;
-        r.global(A, 7, keyboard_extension, 2).await;
-        let host = r.s.host_received();
-        let [replacement] = &host[..] else {
-            panic!("the host got {host:?}, not one bind");
-        };
-        let replacement = bound(replacement);
-        assert_ne!(replacement, old);
-        assert_eq!(
-            host,
-            [(
-                r.a.host,
-                bind_request(7, keyboard_extension, 2, replacement)
-            )]
-        );
-
-        // Registry B's queued remove belongs to generation 1. It must not
-        // tear down the generation-2 internal object that is now active:
-        // a keyboard's first enter binds its extended keyboard from it.
-        r.remove(B, 7).await;
-        assert_eq!(r.s.host_received(), []);
-        assert_eq!(r.s.guest_received(), []);
-        let (_, keyboard) = r.s.keyboard().await;
-        let surface = r.s.surface().await;
-        r.s.host([wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap()])
-            .await;
-        assert_eq!(r.s.guest_received().len(), 2, "the enter and its modifiers");
-        let host = r.s.host_received();
-        assert!(
-            matches!(
-                &host[..],
-                [(sender, AnyRequest::ZcrKeyboardExtensionV1(
-                    zcr_keyboard_extension_v1::Request::GetExtendedKeyboard { .. }
-                ))] if *sender == replacement
-            ),
-            "the host got {host:?}, not an extended keyboard of the replacement"
-        );
     }
 
     #[tokio::test]

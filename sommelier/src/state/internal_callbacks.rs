@@ -31,8 +31,8 @@ use crate::ime::BarrierToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InternalCallback {
     /// Every legacy format/modifier event of the internal linux-dmabuf
-    /// binding of this capability `generation` has arrived.
-    DmabufCapabilities { generation: u64 },
+    /// binding of host global `global` has arrived.
+    DmabufCapabilities { global: u32 },
     /// The internal `zaura_shell` bind has reached the compositor, so the
     /// synthetic `gtk_shell1` (guest ID) may announce its capabilities.
     GtkShellCapabilities { gtk_shell: u32 },
@@ -78,12 +78,12 @@ impl InternalCallbacks {
         self.by_callback.remove(&callback)
     }
 
-    /// Whether a pending callback still collects this dmabuf capability
-    /// generation, which therefore must not be reclaimed.
-    pub(crate) fn awaits_dmabuf_generation(&self, generation: u64) -> bool {
+    /// Whether a pending callback still collects the capabilities of host
+    /// linux-dmabuf global `global`, which therefore must not be reclaimed.
+    pub(crate) fn awaits_dmabuf_capabilities(&self, global: u32) -> bool {
         self.by_callback
             .values()
-            .any(|waits_for| *waits_for == InternalCallback::DmabufCapabilities { generation })
+            .any(|waits_for| *waits_for == InternalCallback::DmabufCapabilities { global })
     }
 
     /// The pending callback that waits for `waits_for`, if any.
@@ -112,15 +112,15 @@ mod tests {
     #[test]
     fn a_callback_is_pending_from_register_until_complete() {
         let mut callbacks = InternalCallbacks::default();
-        let waits_for = InternalCallback::DmabufCapabilities { generation: 7 };
+        let waits_for = InternalCallback::DmabufCapabilities { global: 7 };
         callbacks.register(HostId(40), waits_for);
         assert_eq!(callbacks.get(HostId(40)), Some(waits_for));
-        assert!(callbacks.awaits_dmabuf_generation(7));
-        assert!(!callbacks.awaits_dmabuf_generation(8));
+        assert!(callbacks.awaits_dmabuf_capabilities(7));
+        assert!(!callbacks.awaits_dmabuf_capabilities(8));
 
         assert_eq!(callbacks.complete(HostId(40)), Some(waits_for));
         assert_eq!(callbacks.complete(HostId(40)), None, "done is terminal");
-        assert!(!callbacks.awaits_dmabuf_generation(7));
+        assert!(!callbacks.awaits_dmabuf_capabilities(7));
         assert_eq!(callbacks.count(), 0);
     }
 }

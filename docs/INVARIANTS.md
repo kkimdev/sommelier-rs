@@ -440,7 +440,6 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `removed_host_shm_creates_only_inert_pools_and_buffers`,
   `only_objects_bound_from_a_retired_shm_global_go_inert`,
   `a_guest_shm_bound_from_an_unbound_name_goes_inert_when_it_retires`,
-  `a_re_advertised_shm_name_retires_only_its_old_generation`,
   `removed_host_shm_ignores_requests_from_existing_pool_until_destroy`,
   `attaching_an_inert_buffer_detaches_the_surface`.
 - **Releasing a parent does not end its children.** `wl_seat.release`
@@ -502,18 +501,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   still be sent its own; then the metadata goes, and a new bind of the
   name is refused through any registry. A registry destroyed through
   `wl_fixes` before it sees the removal no longer counts, and if it was
-  the last, its destruction retires the global. The removal is on record
-  connection-wide from the first `global_remove` until the global is
-  retired or advertised anew, so this holds even when every registry that
-  saw it was destroyed first.
+  the last, its destruction retires the global. The removal stays on
+  record for the connection from the first `global_remove`, so this holds
+  even when every registry that saw it was destroyed first.
   A registry destroyed while the global is still advertised retires
-  nothing. Only a registry that lists the current advertisement keeps it
-  alive; one that still lists an older advertisement of a re-advertised
-  name neither delays retirement nor receives the proxy's bind of the
-  replacement. A guest bind through such a registry is currently a
-  protocol error; whether it should be is an open question, unpinned
-  because libwayland-server never reuses a name (see the name-reuse item
-  in HANDOVER.md). A guest bind through a registry that has not yet seen
+  nothing. A guest bind through a registry that has not yet seen
   the removal is forwarded. That relies on the host keeping a removed
   global bindable until `wl_global_destroy`, as Exo does: it calls
   `wl_global_remove` and defers `wl_global_destroy`. A host that destroyed
@@ -522,26 +514,23 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `destroying_the_last_registry_to_list_a_removed_global_retires_it`,
   `a_removal_outlives_the_registry_that_saw_it`,
   `an_invalid_bind_is_a_protocol_error`,
-  `the_removal_of_a_dropped_global_waits_for_every_registry`,
   `destroying_a_registry_keeps_a_global_no_registry_saw_removed`,
   `a_singleton_binding_moves_to_the_lowest_live_candidate`.
-- **A re-advertised name replaces its old generation.** When the host
-  re-advertises a global under a previously removed numeric name, the
-  connection-wide metadata for that name MUST be replaced before the new
-  interface is processed, so stale entries cannot route a bind to the old
-  interface or misclassify the replacement's `global_remove`. Live children
-  of the old generation are not invalidated.
-  Tests: `re_advertised_name_replaces_visible_metadata_before_hidden_global`,
-  `re_advertised_hidden_name_replaces_hidden_metadata_before_visible_global`,
-  `stale_remove_cannot_invalidate_a_re_advertised_global_generation`.
+- **A global name is one global for the connection's life.**
+  libwayland-server numbers each global anew, advertises it to each
+  registry once, and never advertises a global it removed, so the proxy
+  identifies a global by its name alone. A `global` event for a name the
+  registry has already advertised, or for a name whose removal any
+  registry has seen, breaks the protocol, and ends the session as an
+  internal failure.
+  Test: `a_name_advertised_again_ends_the_session`.
 - **A singleton binding moves to its replacement.** The proxy binds
   `wl_shm`, `zwp_linux_dmabuf_v1`, `zcr_keyboard_extension_v1` and
   `zaura_shell` once per connection for its own use. A host may advertise
   one under a new name while the old name is bound; when the old one
-  retires, the proxy binds the lowest name (possibly the same name at a
-  new generation) that a registry still lists and that no registry has
-  seen removed, since a compositor may destroy a global as soon as it
-  removes it.
+  retires, the proxy binds the lowest name that a registry still lists
+  and that no registry has seen removed, since a compositor may destroy a
+  global as soon as it removes it.
   Tests: `a_singleton_advertised_anew_is_bound_when_the_old_name_retires`,
   `a_singleton_binding_moves_to_the_lowest_live_candidate`,
   `a_promoted_dmabuf_publishes_its_deferred_guest_global`.
@@ -560,7 +549,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   cannot make the guest send requests the proxy cannot decode. A child
   object takes its parent's version, and a request is sent to a host
   object only if that object's version has it: an Aura surface keeps the
-  version of the shell generation that created it. A version the proxy
+  version of the shell binding that created it. A version the proxy
   cannot find fails closed: no child gets a guessed one, and a feature
   gated on a version is off.
   Tests: `child_objects_inherit_their_manager_versions`,

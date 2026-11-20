@@ -52,9 +52,7 @@ pub(crate) use self::input::{
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::objects::{DeletedHostId, EventSender, Link, RequestSender, ShadowTable};
 pub use self::outputs::OutputState;
-pub(crate) use self::outputs::{
-    is_valid_transform, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
-};
+pub(crate) use self::outputs::{is_valid_transform, OutputRegistry, INERT_BIND_INTERFACE};
 pub(crate) use self::registries::RegistryRecord;
 #[cfg(test)]
 pub(crate) use self::render::SurfacePending;
@@ -190,14 +188,12 @@ pub struct HostGlobal {
 /// discovery to complete.
 ///
 /// The host registry object is retained because each guest registry needs its
-/// own `global` event. The generation prevents a delayed capability callback
-/// from publishing a replacement or already-removed global.
+/// own `global` event; the registry's removal of the global drops it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDmabufGlobal {
     pub registry_host_id: u32,
     pub name: u32,
     pub version: u32,
-    pub generation: u64,
 }
 
 /// The most clipboard transfers one connection may have in flight.
@@ -422,14 +418,13 @@ pub struct Context {
     /// What each host registry has advertised, by host registry ID (see
     /// [`RegistryRecord`]).
     pub(crate) registries: BTreeMap<u32, RegistryRecord>,
-    pub global_generations: BTreeMap<u32, u64>,
-    pub next_global_generation: u64,
-    /// The generation of each global whose current advertisement the host
-    /// removed, from the first registry's `global_remove` until the global
-    /// is retired or advertised anew. It outlives the registries that saw
-    /// the removal, which a guest may destroy before the last registry that
-    /// lists the global sees it.
-    pub removed_global_generations: BTreeMap<u32, u64>,
+    /// Every global name whose removal a registry has seen. A name is one
+    /// global for the connection's life, so it stays here: a global event
+    /// that names it again breaks the protocol
+    /// (`handler::registry::accept_global`). It outlives the registries
+    /// that saw the removal, which a guest may destroy before the last
+    /// registry that lists the global sees it.
+    pub removed_globals: BTreeSet<u32>,
     pub pending_params: BTreeMap<u32, Vec<PendingParam>>,
     /// Guest linux-dmabuf params objects consumed by create/create_immed.
     ///
@@ -438,32 +433,32 @@ pub struct Context {
     /// confused with an object that was never tracked.
     pub used_dmabuf_params: BTreeSet<u32>,
     /// Guest feedback objects synthesized locally from the host's legacy
-    /// linux-dmabuf format/modifier events, keyed by guest feedback ID. The
-    /// generation keeps an object created from an old, still-bound factory
-    /// isolated from a replacement global's capabilities. Ordered, because
-    /// completed capabilities reach the objects in that order.
-    pub synthetic_feedback_objects: BTreeMap<u32, u64>,
+    /// linux-dmabuf format/modifier events, keyed by guest feedback ID,
+    /// with the host global whose capabilities they carry, so an object
+    /// created from an old, still-bound factory stays isolated from a
+    /// replacement global's capabilities. Ordered, because completed
+    /// capabilities reach the objects in that order.
+    pub synthetic_feedback_objects: BTreeMap<u32, u32>,
     /// Avoid queuing one complete feedback sequence for every legacy
     /// format/modifier event. A host can advertise hundreds of pairs in a
     /// single roundtrip; sending one memfd per event can overflow the
     /// receiver's SCM_RIGHTS batch and desynchronize the Wayland FD stream.
     /// The proxy clears this set after each dispatch batch.
     pub synthetic_feedback_refresh_pending: BTreeSet<u32>,
-    /// Capability snapshots for every host dmabuf global generation referenced
-    /// by a live guest object. A completed snapshot is immutable except for a
-    /// defensive refresh if a non-conforming host sends a late unique pair.
-    pub dmabuf_capabilities: BTreeMap<u64, DmabufCapabilityState>,
-    /// Generation collected by the current internal host dmabuf binding.
-    pub host_dmabuf_generation: Option<u64>,
+    /// Capability snapshots for every host dmabuf global, by name, that
+    /// anything holds (`handler::linux_dmabuf::capabilities_held`). A
+    /// completed snapshot is immutable except for a defensive refresh if a
+    /// non-conforming host sends a late unique pair.
+    pub dmabuf_capabilities: BTreeMap<u32, DmabufCapabilityState>,
     /// Host-only wl_callback barriers the proxy issued for itself, and what
     /// each one waits for.
     pub(crate) internal_callbacks: InternalCallbacks,
     /// Guest-facing v4 globals withheld until the internal v3 binding has
     /// delivered its complete legacy format/modifier capability set.
     pub pending_dmabuf_globals: Vec<PendingDmabufGlobal>,
-    /// Guest dmabuf factory ID to the host-global generation from which it was
-    /// bound. Global removal does not invalidate an already-bound factory.
-    pub dmabuf_guest_generations: BTreeMap<u32, u64>,
+    /// Guest dmabuf factory ID to the name of the host global it was bound
+    /// from. Global removal does not invalidate an already-bound factory.
+    pub dmabuf_factories: BTreeMap<u32, u32>,
     /// This connection's window placement, while it is on (see
     /// [`WindowPlacement`] for what it owns); decided as it connects.
     window_placement: Option<WindowPlacement>,
@@ -902,18 +897,15 @@ impl Context {
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
             registries: BTreeMap::new(),
-            global_generations: BTreeMap::new(),
-            next_global_generation: 1,
-            removed_global_generations: BTreeMap::new(),
+            removed_globals: BTreeSet::new(),
             pending_params: BTreeMap::new(),
             used_dmabuf_params: BTreeSet::new(),
             synthetic_feedback_objects: BTreeMap::new(),
             synthetic_feedback_refresh_pending: BTreeSet::new(),
             dmabuf_capabilities: BTreeMap::new(),
-            host_dmabuf_generation: None,
             internal_callbacks: InternalCallbacks::default(),
             pending_dmabuf_globals: Vec::new(),
-            dmabuf_guest_generations: BTreeMap::new(),
+            dmabuf_factories: BTreeMap::new(),
             window_placement: WindowPlacement::connect(placement),
             outputs: OutputRegistry::default(),
             gtk_shells: BTreeMap::new(),

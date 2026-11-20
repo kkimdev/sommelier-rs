@@ -787,56 +787,6 @@ mod tests {
         assert!(!buffer_of(&mut s, pool).await.1, "the pool is inert");
     }
 
-    /// A registry that saw a `wl_shm` name removed may see it advertised
-    /// anew while another registry still lists the old generation: the old
-    /// generation's objects go inert then, and the new one's stay live,
-    /// even when the other registry's removal arrives late.
-    #[tokio::test]
-    async fn a_re_advertised_shm_name_retires_only_its_old_generation() {
-        let mut s = Session::new();
-        let registry = s.registry().await;
-        let other = second_registry(&mut s).await;
-        s.host([
-            shm_global_event(registry.host, 10),
-            shm_global_event(registry.host, 11),
-            shm_global_event(other.host, 10),
-            shm_global_event(other.host, 11),
-        ])
-        .await;
-        let received = s.host_received();
-        let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { name: 10, .. }))] =
-            received[..]
-        else {
-            panic!("the proxy did not bind wl_shm 10: {received:?}");
-        };
-        s.guest_received();
-        let old_shm = bind_shm(&mut s, registry.id, 11).await;
-        let old_pool = pool_of(&mut s, old_shm).await;
-
-        s.host([removal(registry.host, 11)]).await;
-        s.guest_received();
-        assert!(buffer_of(&mut s, old_pool).await.1, "registry 2 lists 11");
-        s.host([shm_global_event(registry.host, 11)]).await;
-        s.guest_received();
-        assert!(
-            !buffer_of(&mut s, old_pool).await.1,
-            "the old generation's pool is inert"
-        );
-
-        let shm = bind_shm(&mut s, registry.id, 11).await;
-        let pool = pool_of(&mut s, shm).await;
-        assert!(buffer_of(&mut s, pool).await.1);
-        s.host([removal(other.host, 11)]).await;
-        s.guest_received();
-        assert!(
-            buffer_of(&mut s, pool).await.1,
-            "a late removal of the old generation"
-        );
-        let new_pool = pool_of(&mut s, shm).await;
-        assert!(buffer_of(&mut s, new_pool).await.1);
-        assert_eq!(s.host_received(), []);
-    }
-
     /// A pool whose host `wl_shm` is gone ignores every request but its
     /// destructor, even once another `wl_shm` replaces it: its resize past
     /// the end of its file, which would be `invalid_fd`, changes nothing,

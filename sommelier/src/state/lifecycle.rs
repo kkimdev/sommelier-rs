@@ -442,7 +442,7 @@ impl Context {
         for &params in self.pending_params.keys().chain(&self.used_dmabuf_params) {
             guest("dma-buf params", params, Iface::ZwpLinuxBufferParamsV1);
         }
-        for &factory in self.dmabuf_guest_generations.keys() {
+        for &factory in self.dmabuf_factories.keys() {
             guest("dma-buf factory", factory, Iface::ZwpLinuxDmabufV1);
         }
         for &feedback in self.synthetic_feedback_objects.keys() {
@@ -452,10 +452,10 @@ impl Context {
                 Iface::ZwpLinuxDmabufFeedbackV1,
             );
         }
-        for &generation in self.dmabuf_capabilities.keys() {
+        for &global in self.dmabuf_capabilities.keys() {
             assert!(
-                linux_dmabuf::capability_generation_held(self, generation),
-                "dma-buf capabilities outlived every hold on generation {generation}"
+                linux_dmabuf::capabilities_held(self, global),
+                "dma-buf capabilities outlived every hold on global {global}"
             );
         }
 
@@ -468,29 +468,19 @@ impl Context {
         for &registry in registries {
             host("registry globals", registry, Iface::WlRegistry);
         }
-        // A singleton candidate is a name a registry still lists.
+        // A singleton candidate is a name a registry still lists, and so
+        // is an advertised global whose removal a registry has seen: it
+        // retires with the last registry that lists it.
         for &name in self.singleton_candidates.keys() {
             assert!(
-                registry::global_still_seen(
-                    self,
-                    name,
-                    self.global_generations.get(&name).copied()
-                ),
+                registry::global_still_seen(self, name),
                 "singleton candidate {name} outlived every registry that lists it"
             );
         }
-        // A removal on record is of the global's current generation, and
-        // waits for a registry that still lists it; a global the proxy
-        // drops is in no registry's record.
-        for (&name, &generation) in &self.removed_global_generations {
-            assert_eq!(
-                self.global_generations.get(&name),
-                Some(&generation),
-                "removal of global {name} outlived its generation {generation}"
-            );
+        for &name in self.host_globals.keys() {
             assert!(
-                registry::global_still_seen(self, name, Some(generation)),
-                "removal of global {name} outlived every registry that lists it"
+                !self.removed_globals.contains(&name) || registry::global_still_seen(self, name),
+                "removed global {name} outlived every registry that lists it"
             );
         }
     }

@@ -55,11 +55,9 @@ impl WlCallbackHandler for Handlers {
             // any duplicate event undispatchable immediately.
             ctx.retire_destroyed_host_object(host_id);
             match waits_for {
-                InternalCallback::DmabufCapabilities { generation } => {
-                    crate::handler::linux_dmabuf::complete_capability_discovery(ctx, generation);
-                    crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(
-                        ctx, generation,
-                    );
+                InternalCallback::DmabufCapabilities { global } => {
+                    crate::handler::linux_dmabuf::complete_capability_discovery(ctx, global);
+                    crate::handler::linux_dmabuf::maybe_reclaim_capabilities(ctx, global);
                 }
                 InternalCallback::GtkShellCapabilities { gtk_shell } => {
                     crate::handler::gtk_shell::announce_capabilities(ctx, gtk_shell);
@@ -161,12 +159,11 @@ mod tests {
         assert_eq!(s.surface().await.host, callback, "freed by its delete_id");
     }
 
-    /// The `done` of a linux-dmabuf capability sync completes the
-    /// generation the sync was for: the `done` of a retired binding's sync
-    /// does not complete its replacement's, whose guest global waits for
-    /// its own.
+    /// The `done` of a linux-dmabuf capability sync completes the global
+    /// the sync was for: the `done` of a retired binding's sync does not
+    /// complete its replacement's, whose guest global waits for its own.
     #[tokio::test]
-    async fn internal_dmabuf_callback_completes_exact_generation() {
+    async fn internal_dmabuf_callback_completes_its_own_global() {
         let dmabuf = zwp_linux_dmabuf_v1::NAME;
         let mut ctx = Context::new_for_test(true, false, vec![]);
         // Stands in for a virtio-gpu render node, which the proxy
@@ -199,7 +196,7 @@ mod tests {
             wl_display::evt::delete_id(WL_DISPLAY_ID, old_callback),
         ])
         .await;
-        assert_eq!(s.guest_received(), [], "the old generation completes");
+        assert_eq!(s.guest_received(), [], "the old global completes");
 
         let xrgb8888 = 0x3432_5258;
         s.host([

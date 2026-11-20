@@ -152,22 +152,13 @@ impl OutputState {
     }
 }
 
-/// The registry advertisement that an output object was bound from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GlobalBinding {
-    /// Global name from `wl_registry.global`.
-    pub(crate) name: u32,
-    /// Advertisement generation of that name. A delayed `global_remove` of
-    /// an older advertisement must not retire a binding of its replacement.
-    pub(crate) generation: u64,
-}
-
 /// One live host `wl_output`.
 #[derive(Debug)]
 struct OutputRecord {
     /// The host `wl_output` ID.
     output: u32,
-    global: GlobalBinding,
+    /// The name of the global it was bound from.
+    global: u32,
     /// Outputs with `wl_output.done` batch events until it arrives. Older
     /// outputs have no event group barrier, so each event applies at once.
     batches_until_done: bool,
@@ -222,8 +213,8 @@ impl OutputRegistry {
     /// * `output` - the new host `wl_output` ID.
     /// * `version` - the bound protocol version; it decides whether events
     ///   wait for `wl_output.done`.
-    /// * `global` - the advertisement it was bound from.
-    pub(crate) fn bind(&mut self, output: u32, version: u32, global: GlobalBinding) {
+    /// * `global` - the name of the global it was bound from.
+    pub(crate) fn bind(&mut self, output: u32, version: u32, global: u32) {
         // Host IDs are not reused before the release that removes the
         // record, so a second bind is a bookkeeping bug. Release builds keep
         // the existing record rather than listing the output twice.
@@ -266,7 +257,7 @@ impl OutputRegistry {
     /// Their `zaura_output`s, which the caller must release now: nothing
     /// reads them again, and a `wl_output` older than version 3 has no
     /// release request that could free them later.
-    pub(crate) fn remove_global(&mut self, global: GlobalBinding) -> Vec<u32> {
+    pub(crate) fn remove_global(&mut self, global: u32) -> Vec<u32> {
         let removed: Vec<u32> = self
             .records
             .iter()
@@ -396,17 +387,10 @@ impl OutputRegistry {
 /// through the wire-event methods above.
 #[cfg(test)]
 impl OutputRegistry {
-    /// Bind a version-3 output from its own one-generation global and
-    /// commit `committed` as its metadata.
+    /// Bind a version-3 output from a global of its own, named as it is,
+    /// and commit `committed` as its metadata.
     pub(crate) fn bind_for_test(&mut self, output: u32, committed: OutputState) {
-        self.bind(
-            output,
-            3,
-            GlobalBinding {
-                name: output,
-                generation: 1,
-            },
-        );
+        self.bind(output, 3, output);
         self.update(output, |state| *state = committed);
         self.commit(output);
     }
@@ -592,11 +576,7 @@ mod tests {
     fn events_batch_until_done_from_version_two() {
         for (version, published_at_once) in [(1, true), (2, false), (3, false)] {
             let mut outputs = OutputRegistry::default();
-            let global = GlobalBinding {
-                name: 1,
-                generation: 1,
-            };
-            outputs.bind(20, version, global);
+            outputs.bind(20, version, 1);
             assert!(outputs.update(20, |state| *state = usable_state()));
             assert_eq!(
                 outputs.primary().is_some(),
@@ -609,27 +589,16 @@ mod tests {
     }
 
     #[test]
-    fn removal_matches_the_exact_global_generation() {
+    fn removal_forgets_only_the_outputs_of_its_global() {
         let mut outputs = OutputRegistry::default();
-        let old = GlobalBinding {
-            name: 7,
-            generation: 1,
-        };
-        let replacement = GlobalBinding {
-            name: 7,
-            generation: 2,
-        };
-        outputs.bind(20, 3, old);
-        outputs.bind(30, 3, replacement);
+        outputs.bind(20, 3, 7);
+        outputs.bind(30, 3, 8);
         outputs.surface_entered(100, 20);
         outputs.surface_entered(101, 30);
 
-        assert!(outputs.remove_global(old).is_empty(), "no Aura output");
+        assert!(outputs.remove_global(7).is_empty(), "no Aura output");
         assert!(!outputs.is_live(20));
-        assert!(
-            outputs.is_live(30),
-            "a delayed remove must spare the replacement"
-        );
+        assert!(outputs.is_live(30), "another global's output stays");
         assert_eq!(outputs.entered_for_test(100), None);
         assert_eq!(outputs.entered_for_test(101), Some(30));
         assert!(!outputs.update(20, |state| state.mode_width = 1));
@@ -648,11 +617,7 @@ mod tests {
         assert_eq!(outputs.aura_event_target(21), Some(20));
         assert_eq!(outputs.aura_event_target(22), None);
 
-        let global = GlobalBinding {
-            name: 20,
-            generation: 1,
-        };
-        assert_eq!(outputs.remove_global(global), [21]);
+        assert_eq!(outputs.remove_global(20), [21]);
         assert_eq!(outputs.aura_event_target(21), None);
         assert_eq!(outputs.aura_output(20), None);
         assert!(!outputs.is_live(20), "a removed output gets no new one");
