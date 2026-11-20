@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 
+pub(crate) mod counting;
 pub(crate) mod text_input;
 
 /// A message's bytes and its descriptors' numbers.

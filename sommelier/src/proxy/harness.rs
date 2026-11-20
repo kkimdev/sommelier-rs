@@ -33,6 +33,7 @@ use crate::connection::WaylandConnection;
 use crate::protocols::wayland::{wl_compositor, wl_display, wl_registry};
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::state::Context;
+use crate::test_support::counting::Counts;
 use crate::test_support::decode;
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage, WL_DISPLAY_ID};
 use std::collections::{BTreeMap, VecDeque};
@@ -56,6 +57,9 @@ pub(crate) struct Session {
     registry: Option<Object>,
     compositor: Option<u32>,
     text_input_manager: Option<u32>,
+    /// What the proxy cost while it dispatched, since [`Self::proxy_cost`]
+    /// last took it.
+    proxy_cost: Counts,
 }
 
 impl Session {
@@ -75,6 +79,7 @@ impl Session {
             registry: None,
             compositor: None,
             text_input_manager: None,
+            proxy_cost: Counts::default(),
         }
     }
 
@@ -154,6 +159,13 @@ impl Session {
         assert!(self.parked(), "no guest request waits for a fence");
         ParkedRequest::due(self.client.parked.as_ref()).await;
         self.guest([]).await;
+    }
+
+    /// What the proxy itself cost on this thread while it dispatched the
+    /// messages either peer sent, since the last call: not the test's
+    /// encoding of them, nor the peers' decoding of what the proxy sent.
+    pub(crate) fn proxy_cost(&mut self) -> Counts {
+        std::mem::take(&mut self.proxy_cost)
     }
 
     /// What the proxy sent the host since the last call, with the sender of
@@ -363,7 +375,9 @@ impl Session {
             connection.read_fds.extend(fds);
         }
         loop {
+            let before = Counts::now();
             let goes_on = self.client.handle_msgs(direction).await;
+            self.proxy_cost += Counts::now() - before;
             self.guest.receive();
             self.host.receive();
             let parked = direction == Direction::ClientToHost && self.client.parked.is_some();

@@ -40,6 +40,14 @@
   `--gpu-accel` and the fork do not cover.
 - Upstream review and eventual rebase/cherry-pick coordination remain
   separate from this fork's `virtwl` branch.
+- Unconfirmed on a host: a GTK3 client may draw each frame into a new SHM
+  buffer, since Exo releases a buffer only once it is detached, and each
+  new buffer costs a VirtWL allocation and a full copy. With
+  `RUST_LOG=debug` the proxy logs, at most once a second per surface,
+  how many new SHM buffers the surface showed (`showed N new SHM
+  buffers`). If it does, recycle released host storage by layout and
+  move its `StalePixels` relation with it, which rewrites the INVARIANTS
+  rule that a new buffer copies in full.
 - A late owed `wl_buffer.release` can mark a buffer released while the
   host holds it, which skips its damage-only copies until the next attach;
   see [Surfaces, damage and SHM](docs/INVARIANTS.md#surfaces-damage-and-shm).

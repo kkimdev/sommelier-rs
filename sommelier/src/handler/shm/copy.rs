@@ -15,12 +15,12 @@ limitations under the License.
 */
 
 //! Copying the damaged pixels of a guest SHM buffer from its pool, with
-//! `pread`, into the buffer's host storage.
+//! `pread` and `preadv`, into the buffer's host storage.
 
 use super::damage::{clipped_damage, coalesce_damage_rects};
 use super::formats::format_bytes_per_pixel;
 use crate::protocols::wayland::wl_shm;
-use crate::state::{BufferRect, BufferSpace, BufferState, DamageRegion, HostMapping};
+use crate::state::{BufferRect, BufferSpace, BufferState, DamageRegion, HostMapping, Rows};
 use std::fs::File;
 use std::io;
 
@@ -248,41 +248,28 @@ pub(crate) fn copy_shm_damage(
     // way does leave it partly updated; the caller then stales the whole
     // host copy, or ends the session. An empty list is a valid no-op.
     for plane in spans {
-        // A full-width span with matching strides is one contiguous range in
-        // both the pool file and the destination, which one read copies.
-        // That is the common case, and avoids a syscall per row of a 4K
-        // buffer.
-        let (chunk_bytes, chunks) =
-            if plane.row_bytes == plane.src_stride && plane.row_bytes == plane.dst_stride {
-                (plane.row_bytes * plane.rows, 1)
-            } else {
-                (plane.row_bytes, plane.rows)
-            };
-        for chunk in 0..chunks {
-            let src_offset = plane.src_offset + chunk * plane.src_stride;
-            let dst_offset = plane.dst_offset + chunk * plane.dst_stride;
-            debug_assert!(
-                dst_offset + chunk_bytes <= dest_size,
-                "valid_plane_copy admitted a chunk past the destination"
-            );
-            // The read fails, instead of raising SIGBUS like a mapping
-            // would, if the client truncated the pool file. EFAULT is the
-            // destination mapping's fault, not the client's; it is also how
-            // the mapping refuses a range outside it, which valid_plane_copy
-            // already excluded. (A FUSE-backed pool could also return
-            // EFAULT; it is then treated as a host storage failure, which
-            // only drops the commit.)
-            destination
-                .pread_into(
-                    dst_offset..dst_offset + chunk_bytes,
-                    source,
-                    src_offset as u64,
-                )
-                .map_err(|error| match error.raw_os_error() {
-                    Some(libc::EFAULT) => ShmCopyError::Destination,
-                    _ => ShmCopyError::Source(error),
-                })?;
-        }
+        // The read fails, instead of raising SIGBUS like a mapping would,
+        // if the client truncated the pool file. EFAULT is the destination
+        // mapping's fault, not the client's; it is also how the mapping
+        // refuses a range outside it, which valid_plane_copy already
+        // excluded. (A FUSE-backed pool could also return EFAULT; it is
+        // then treated as a host storage failure, which only drops the
+        // commit.) Only the span's own bytes reach the destination, however
+        // few reads copy them.
+        let rows = Rows {
+            src_offset: plane.src_offset as u64,
+            src_stride: plane.src_stride,
+            dst_start: plane.dst_offset,
+            dst_stride: plane.dst_stride,
+            row_bytes: plane.row_bytes,
+            rows: plane.rows,
+        };
+        destination
+            .pread_rows_into(rows, source)
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EFAULT) => ShmCopyError::Destination,
+                _ => ShmCopyError::Source(error),
+            })?;
     }
     Ok(())
 }

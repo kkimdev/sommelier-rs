@@ -554,7 +554,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `copy_into_an_unwritable_destination_blames_the_host_storage`,
   `destroyed_pending_shm_attach_survives_until_commit`.
 - **Pools are read, never mapped, and must be regular files.** The proxy
-  reads pool pixels with `pread`, because a mapping read past a truncated
+  reads pool pixels with `pread` and `preadv`, because a mapping read past a truncated
   file's end raises SIGBUS and kills every guest GUI app. A pool fd MUST be
   a regular file, such as a memfd, tmpfs or `shm_open` file, of at least
   the declared size; any other is rejected with `wl_shm.invalid_fd` at
@@ -562,6 +562,15 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `pool_backing_must_be_a_long_enough_regular_file`,
   `create_pool_rejects_a_pipe_or_a_short_file_as_invalid_fd`,
   `a_pool_resize_must_keep_or_grow_its_size_within_its_file`.
+- **A copy writes only the damaged bytes.** The host may sample a host copy
+  while the proxy writes it, so the copy writes no byte outside the
+  damage. To save a system call per row, one `preadv` reads up to 512
+  damaged rows whose pool rows are at most 1 KiB apart, and reads the
+  bytes between them into scratch memory, never into the host copy; rows
+  further apart take a `pread` each.
+  Tests: `pread_rows_into_writes_exactly_the_rows`,
+  `pread_rows_into_reads_many_rows_at_once`,
+  `a_partial_width_shm_frame_costs_one_read`.
 - **Without VirtWL, guest SHM is a memfd.** With no VirtWL channel
   (`--local-compositor`), each guest `wl_buffer` gets a memfd of its size,
   which the host imports as a `wl_shm` pool, with or without

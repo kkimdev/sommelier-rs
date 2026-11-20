@@ -34,7 +34,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 
 pub(crate) use self::aura_surfaces::AuraSurfaces;
-pub(crate) use self::host_mapping::HostMapping;
+pub(crate) use self::host_mapping::{HostMapping, Rows};
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::MAX_PENDING_DAMAGE_RECTS;
@@ -710,6 +710,11 @@ impl Context {
         &self,
     ) -> impl Iterator<Item = (HostId, RenderBufferLifecycle)> + '_ {
         self.render_buffers.lifecycles()
+    }
+
+    /// Whether any buffer the guest destroyed waits to be retired.
+    pub(crate) fn has_guest_destroyed_buffers(&self) -> bool {
+        self.render_buffers.has_guest_destroyed()
     }
 
     #[cfg(test)]
@@ -1457,6 +1462,7 @@ mod tests {
                 })),
             },
             logged_viewport_rule: false,
+            new_host_copies: Default::default(),
         };
         surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
 
@@ -1513,6 +1519,7 @@ mod tests {
                 viewport: Some(None),
             },
             logged_viewport_rule: false,
+            new_host_copies: Default::default(),
         };
         surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
         let before = surface.clone();
@@ -1853,6 +1860,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Whether a destroyed buffer waits to be retired follows every way an
+    /// entry enters and leaves `GuestDestroyed`, so retiring returns early
+    /// only when nothing waits.
+    #[test]
+    fn render_buffer_registry_knows_whether_a_destroyed_buffer_waits() {
+        let (first, second) = (HostId(40), HostId(41));
+        let mut registry = RenderBufferRegistry::default();
+        assert!(registry.register_native(first, (1, 1), Vec::new()));
+        assert!(registry.register_native(second, (1, 1), Vec::new()));
+        assert!(!registry.has_guest_destroyed());
+
+        assert!(registry.mark_guest_destroyed(first));
+        assert!(!registry.mark_guest_destroyed(first));
+        assert!(registry.has_guest_destroyed());
+        assert!(registry.mark_host_destroy_queued(first));
+        assert!(!registry.has_guest_destroyed());
+
+        assert!(registry.mark_guest_destroyed(second));
+        assert!(registry.has_guest_destroyed());
+        assert!(registry.remove(second));
+        assert!(!registry.has_guest_destroyed());
+        assert!(registry.remove(first));
+        assert!(!registry.has_guest_destroyed());
     }
 
     #[test]

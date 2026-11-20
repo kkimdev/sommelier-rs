@@ -26,9 +26,12 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 /// A VirtWL dma-buf allocation for a guest SHM buffer.
 ///
 /// VirtWL allocates a single object, so both planes of an NV12 buffer are in
-/// the one dma-buf `fd`, which the copy path maps for both.
+/// the one dma-buf `fd`, which `host_copy` maps for both.
 pub(super) struct DmabufAllocation {
     pub(super) fd: OwnedFd,
+    /// The mapping of `fd` that the copy writes, made once, when the
+    /// allocation proves it can be mapped.
+    pub(super) host_copy: HostMapping,
     pub(super) layout: DmabufLayout,
     pub(super) modifier: u64,
     pub(super) dmabuf_sync: bool,
@@ -115,19 +118,20 @@ pub(super) fn allocate_virtwl_dmabuf(
         metadata.offsets,
     )
     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid VirtWL dma-buf layout"))?;
-    // Probe the exact mapping that the copy path will use while the allocation
-    // is still owned by this function.  A VirtWL driver may expose the ioctl
-    // but return metadata that cannot be mmaped (for example a non-page-aligned
-    // plane-0 offset); treat that as an allocation failure so the caller can
-    // fall back to ordinary VirtWL shared memory.
-    if map_dmabuf(fd.as_fd(), layout).is_none() {
+    // Map it for the copy path while the allocation is still owned by this
+    // function. A VirtWL driver may expose the ioctl but return metadata
+    // that cannot be mmaped (for example a non-page-aligned plane-0
+    // offset); treat that as an allocation failure so the caller can fall
+    // back to ordinary VirtWL shared memory.
+    let Some(host_copy) = map_dmabuf(fd.as_fd(), layout) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "VirtWL dma-buf cannot be mapped",
         ));
-    }
+    };
     Ok(DmabufAllocation {
         fd,
+        host_copy,
         layout,
         modifier: 0,
         dmabuf_sync: true,

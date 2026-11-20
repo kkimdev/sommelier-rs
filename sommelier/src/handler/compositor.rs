@@ -28,8 +28,8 @@ use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler};
 use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
     is_valid_transform, BufferRect, BufferSpace, BufferState, Context, DamageRegion, FenceWait,
-    HostMapping, PostDispatch, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect,
-    SurfaceState, ViewportState,
+    HostMapping, PostDispatch, RenderBufferUse, SurfaceAttachment, SurfaceCommit, SurfaceMapping,
+    SurfaceRect, SurfaceState, ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{queue_or_drop, Action, Outgoing};
@@ -235,6 +235,36 @@ fn log_unenforced_viewport_rule(
     }
 }
 
+/// The size of `buffer_id`'s host copy if it is a SHM buffer shown for the
+/// first time, which its commit copies in full, or `None`. Only counted
+/// while the debug log is on.
+fn new_host_copy_size(ctx: &Context, buffer_id: u32) -> Option<u64> {
+    if !log::log_enabled!(log::Level::Debug)
+        || ctx.host_buffer_use(buffer_id) != Some(RenderBufferUse::NeverSubmitted)
+    {
+        return None;
+    }
+    let host_copy = ctx.local_buffer(buffer_id)?.host_copy.as_ref()?;
+    Some(host_copy.len() as u64)
+}
+
+/// Count a new host copy of `bytes` that `surface_id` showed, and log the
+/// count at most once a second (see `NewHostCopies`).
+fn log_new_host_copy(ctx: &mut Context, surface_id: u32, bytes: u64) {
+    let Some(surface) = ctx.surfaces.get_mut(&surface_id) else {
+        return;
+    };
+    if let Some((count, bytes, elapsed)) = surface
+        .new_host_copies
+        .record(bytes, std::time::Instant::now())
+    {
+        log::debug!(
+            "wl_surface {surface_id} showed {count} new SHM buffers in {elapsed:.1?}, \
+             each a new host allocation copied in full: {bytes} bytes"
+        );
+    }
+}
+
 /// Build the host damage requests and the commit for one guest commit, or
 /// `None` when the surface has no host object. The host takes surface-local
 /// damage only, so buffer damage goes through `mapping`.
@@ -309,11 +339,11 @@ fn copy_surface_buffer(
     // Nothing to copy needs no dma-buf sync either. Skipping it also keeps
     // a commit without damage, such as one that acknowledges a configure,
     // from being dropped when the host storage misbehaves.
-    if !damage_reaches_buffer(&damage, buffer) {
+    if !damage_reaches_buffer(damage, buffer) {
         buffer.stale.copied_on(surface_id);
         return Ok(());
     }
-    let result = copy_to_host_storage(buffer, resources.channel, &damage);
+    let result = copy_to_host_storage(buffer, resources.channel, damage);
     match &result {
         Ok(()) => {
             buffer.stale.copied_on(surface_id);
@@ -343,7 +373,7 @@ fn copy_surface_buffer(
 /// Copy `damage` from `buffer`'s pool into its host storage, inside the
 /// VirtWL dma-buf CPU-write interval when the storage needs one.
 fn copy_to_host_storage(
-    buffer: &mut BufferState,
+    buffer: &BufferState,
     channel: Option<&Arc<VirtWaylandChannel>>,
     damage: &DamageRegion<BufferSpace>,
 ) -> Result<(), ShmCopyError> {
@@ -700,6 +730,8 @@ impl WlSurfaceHandler for CompositorHandler {
             // edges before appending any host message. The registry
             // validates both generations before changing either one, so a
             // failed replacement remains completely rollback-safe.
+            let new_host_copy =
+                next_buffer.and_then(|buffer_id| new_host_copy_size(ctx, buffer_id));
             let snapshot_updated = match next_buffer {
                 Some(buffer_id) => {
                     let dimensions = ctx.buffer_dimensions(buffer_id);
@@ -726,6 +758,9 @@ impl WlSurfaceHandler for CompositorHandler {
                     snapshot_updated,
                 );
                 return ctx.fail(why);
+            }
+            if let Some(bytes) = new_host_copy {
+                log_new_host_copy(ctx, surface_id, bytes);
             }
         }
 

@@ -15,12 +15,14 @@ limitations under the License.
 */
 
 use crate::protocols::wayland::wl_output;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::marker::PhantomData;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::outputs::transformed_extent;
 use super::HostId;
@@ -105,11 +107,12 @@ impl StalePixels {
     }
 
     /// The region to copy before the buffer is shown on `surface`.
-    pub fn to_copy_on(&self, surface: u32) -> DamageRegion<BufferSpace> {
+    pub fn to_copy_on(&self, surface: u32) -> &DamageRegion<BufferSpace> {
+        static FULL: DamageRegion<BufferSpace> = DamageRegion::Full;
         if self.surface == Some(surface) {
-            self.damage.clone()
+            &self.damage
         } else {
-            DamageRegion::Full
+            &FULL
         }
     }
 
@@ -584,6 +587,45 @@ pub struct SurfaceState {
     /// Whether the proxy has logged a viewport rule it leaves unenforced,
     /// which it does once per surface rather than every frame.
     pub logged_viewport_rule: bool,
+    /// The host copies this surface has shown for the first time, for the
+    /// debug log.
+    pub new_host_copies: NewHostCopies,
+}
+
+/// The SHM host copies one surface showed for the first time, which a
+/// debug log reports at most once a second.
+///
+/// Each guest SHM buffer gets host storage of its own, which its first
+/// commit copies in full. A client that draws each frame into a new buffer,
+/// as GTK3 does while the host still holds its last one (and Exo holds it
+/// until it is detached), pays a host allocation and a full copy every
+/// frame. The log shows whether a client does.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NewHostCopies {
+    count: u32,
+    bytes: u64,
+    since: Option<Instant>,
+}
+
+impl NewHostCopies {
+    /// Count a new host copy of `bytes`, shown at `now`. Once a second has
+    /// passed since the count began, returns the count, the bytes and that
+    /// time, and begins a new count.
+    pub fn record(&mut self, bytes: u64, now: Instant) -> Option<(u32, u64, Duration)> {
+        let since = *self.since.get_or_insert(now);
+        self.count += 1;
+        self.bytes += bytes;
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < Duration::from_secs(1) {
+            return None;
+        }
+        let report = (self.count, self.bytes, elapsed);
+        *self = Self {
+            since: Some(now),
+            ..Self::default()
+        };
+        Some(report)
+    }
 }
 
 /// Everything a `wl_surface` request sets for the next commit, which
@@ -665,19 +707,27 @@ impl SurfaceCommit {
     /// Buffer damage is already in buffer pixels. Surface damage maps to them
     /// through `mapping` (see [`SurfaceMapping::to_buffer`]); a transform,
     /// or an attach offset, falls back to the whole buffer.
-    pub fn buffer_copy_damage(&self, mapping: &SurfaceMapping) -> DamageRegion<BufferSpace> {
+    pub fn buffer_copy_damage(
+        &self,
+        mapping: &SurfaceMapping,
+    ) -> Cow<'_, DamageRegion<BufferSpace>> {
         let Some(surface_damage) = self.surface_damage.rects() else {
-            return DamageRegion::Full;
+            return Cow::Owned(DamageRegion::Full);
         };
+        // Without surface damage, the buffer damage is all there is, and is
+        // not copied.
+        if surface_damage.is_empty() {
+            return Cow::Borrowed(&self.buffer_damage);
+        }
         // Full buffer damage stays full: pushing to it adds nothing.
         let mut damage = self.buffer_damage.clone();
         for &rect in surface_damage {
             match mapping.to_buffer(rect).filter(|_| !self.moves_buffer()) {
                 Some(rect) => damage.push(rect),
-                None => return DamageRegion::Full,
+                None => return Cow::Owned(DamageRegion::Full),
             }
         }
-        damage
+        Cow::Owned(damage)
     }
 
     pub fn has_invalid_fractional_viewport(&self) -> bool {
@@ -692,6 +742,8 @@ impl SurfaceCommit {
 
     pub fn rollback(self, surface: &mut SurfaceState) {
         *surface = self.previous;
+        surface.pending.surface_damage = self.surface_damage;
+        surface.pending.buffer_damage = self.buffer_damage;
     }
 }
 
@@ -782,13 +834,18 @@ impl SurfaceState {
 
     /// Apply and consume all state pending for the next surface commit.
     pub fn prepare_commit(&mut self) -> SurfaceCommit {
+        // The damage moves into the commit, not into a copy in the
+        // snapshot, and `rollback` puts it back: copying it would allocate
+        // on every commit.
+        let surface_damage = std::mem::take(&mut self.pending.surface_damage);
+        let buffer_damage = std::mem::take(&mut self.pending.buffer_damage);
         let previous = self.clone();
         // Name every field: one the commit never applies is then an unused
         // variable (see docs/DESIGN.md, "Double-buffered state").
         let SurfacePending {
             attachment,
-            surface_damage,
-            buffer_damage,
+            surface_damage: _,
+            buffer_damage: _,
             buffer_scale,
             buffer_transform,
             attach_offset,
@@ -831,6 +888,7 @@ impl Default for SurfaceState {
             viewport: None,
             pending: SurfacePending::default(),
             logged_viewport_rule: false,
+            new_host_copies: NewHostCopies::default(),
         }
     }
 }
@@ -979,6 +1037,9 @@ impl RenderBuffer {
 #[derive(Default)]
 pub(super) struct RenderBufferRegistry {
     entries: BTreeMap<HostId, RenderBuffer>,
+    /// How many entries are `GuestDestroyed`: the buffers that wait to be
+    /// retired, which every attach, commit and release looks for.
+    guest_destroyed: usize,
 }
 
 impl RenderBufferRegistry {
@@ -1118,10 +1179,22 @@ impl RenderBufferRegistry {
     }
 
     pub(super) fn lifecycles(&self) -> impl Iterator<Item = (HostId, RenderBufferLifecycle)> + '_ {
-        self.entries.keys().filter_map(|&host_id| {
-            self.lifecycle(host_id)
-                .map(|lifecycle| (host_id, lifecycle))
-        })
+        self.entries
+            .iter()
+            .map(|(&host_id, buffer)| (host_id, buffer.lifecycle()))
+    }
+
+    /// Whether any buffer the guest destroyed waits to be retired.
+    pub(super) fn has_guest_destroyed(&self) -> bool {
+        debug_assert_eq!(
+            self.guest_destroyed,
+            self.entries
+                .values()
+                .filter(|buffer| matches!(buffer, RenderBuffer::GuestDestroyed(_)))
+                .count(),
+            "the guest-destroyed count diverged from the entries"
+        );
+        self.guest_destroyed > 0
     }
 
     /// Every guest wl_surface a host copy is relative to.
@@ -1141,7 +1214,11 @@ impl RenderBufferRegistry {
     }
 
     pub(super) fn remove(&mut self, host_id: HostId) -> bool {
-        self.entries.remove(&host_id).is_some()
+        let removed = self.entries.remove(&host_id);
+        if matches!(removed, Some(RenderBuffer::GuestDestroyed(_))) {
+            self.guest_destroyed -= 1;
+        }
+        removed.is_some()
     }
 
     fn can_submit(&self, host_id: HostId) -> bool {
@@ -1284,6 +1361,7 @@ impl RenderBufferRegistry {
             unreachable!("guest-alive state checked above");
         };
         *buffer = RenderBuffer::GuestDestroyed(active);
+        self.guest_destroyed += 1;
         true
     }
 
@@ -1294,6 +1372,9 @@ impl RenderBufferRegistry {
         if matches!(buffer, RenderBuffer::HostDestroyQueued) {
             return false;
         }
+        if matches!(buffer, RenderBuffer::GuestDestroyed(_)) {
+            self.guest_destroyed -= 1;
+        }
         *buffer = RenderBuffer::HostDestroyQueued;
         true
     }
@@ -1302,6 +1383,28 @@ impl RenderBufferRegistry {
 #[cfg(test)]
 mod tests {
     use super::{BufferRect, SurfaceMapping, SurfaceRect, SurfaceState, ViewportState};
+
+    /// New host copies are counted for a second, then reported together,
+    /// and the next second's count begins.
+    #[test]
+    fn new_host_copies_are_reported_at_most_once_a_second() {
+        use super::NewHostCopies;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+        let mut copies = NewHostCopies::default();
+        assert_eq!(copies.record(100, at(0)), None);
+        assert_eq!(copies.record(100, at(500)), None);
+        assert_eq!(
+            copies.record(100, at(1000)),
+            Some((3, 300, Duration::from_secs(1)))
+        );
+        assert_eq!(copies.record(7, at(1999)), None);
+        assert_eq!(
+            copies.record(7, at(2500)),
+            Some((2, 14, Duration::from_millis(1500)))
+        );
+    }
 
     #[test]
     fn scaling_damage_clamps_to_non_negative_i32_edges() {

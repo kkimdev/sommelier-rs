@@ -19,9 +19,9 @@ limitations under the License.
 //! done with it.
 
 use crate::protocols;
-use crate::state::{Context, HostId};
+use crate::state::{Context, HostId, SurfaceState};
 use crate::wire::Action;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 /// The `wl_buffer` handler: the guest's SHM and native buffers alike.
 pub struct BufferHandler;
@@ -58,38 +58,39 @@ fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: u32, host_id: Ho
     }
 }
 
-/// Canonical snapshot of every current and pending surface→buffer edge.
+/// Every current and pending surface→buffer edge, read in place.
 ///
 /// Pending attaches are kept distinct because they have already reached the
-/// host but do not begin a compositor-use interval until commit. Computing the
-/// two sets together prevents SHM and native collectors from drifting into
-/// subtly different definitions of "referenced".
-struct SurfaceBufferReferences {
-    current: BTreeSet<u32>,
-    pending: BTreeSet<u32>,
+/// host but do not begin a compositor-use interval until commit. Answering
+/// both from one place prevents SHM and native collectors from drifting
+/// into subtly different definitions of "referenced". Each answer scans the
+/// surfaces, which allocates nothing: an attach, commit and release each
+/// ask, every frame.
+struct SurfaceBufferReferences<'a> {
+    surfaces: &'a BTreeMap<u32, SurfaceState>,
 }
 
-impl SurfaceBufferReferences {
-    fn collect(ctx: &Context) -> Self {
-        let mut current = BTreeSet::new();
-        let mut pending = BTreeSet::new();
-        for surface in ctx.surfaces.values() {
-            current.extend(surface.current_buffer_id());
-            pending.extend(surface.pending.attachment.buffer_id());
+impl<'a> SurfaceBufferReferences<'a> {
+    fn of(ctx: &'a Context) -> Self {
+        Self {
+            surfaces: &ctx.surfaces,
         }
-        Self { current, pending }
     }
 
     fn contains(&self, guest_id: u32) -> bool {
-        self.current.contains(&guest_id) || self.pending.contains(&guest_id)
+        self.has_current(guest_id) || self.has_pending(guest_id)
     }
 
     fn has_current(&self, guest_id: u32) -> bool {
-        self.current.contains(&guest_id)
+        self.surfaces
+            .values()
+            .any(|surface| surface.current_buffer_id() == Some(guest_id))
     }
 
     fn has_pending(&self, guest_id: u32) -> bool {
-        self.pending.contains(&guest_id)
+        self.surfaces
+            .values()
+            .any(|surface| surface.pending.attachment.buffer_id() == Some(guest_id))
     }
 }
 
@@ -110,7 +111,11 @@ fn can_retire_deferred_buffer(
 /// surface-destroy proofs have identical lifetime meaning and therefore must
 /// not be evaluated by separate condition trees.
 pub(crate) fn retire_eligible_buffers(ctx: &mut Context) {
-    let references = SurfaceBufferReferences::collect(ctx);
+    // Almost always the case, so the common frame scans nothing.
+    if !ctx.has_guest_destroyed_buffers() {
+        return;
+    }
+    let references = SurfaceBufferReferences::of(ctx);
     let candidates: Vec<(u32, HostId)> = ctx
         .render_buffer_lifecycles()
         .filter_map(|(host_id, lifecycle)| {
@@ -146,9 +151,9 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
     let Some(guest_id) = destroyed_surface_buffer else {
         return;
     };
-    let references = SurfaceBufferReferences::collect(ctx);
+    let has_other_current = SurfaceBufferReferences::of(ctx).has_current(guest_id);
     if ctx.host_buffer_use(guest_id).is_some()
-        && !ctx.finish_surface_destroy_use(guest_id, references.has_current(guest_id))
+        && !ctx.finish_surface_destroy_use(guest_id, has_other_current)
     {
         // Deep in surface teardown: the session ends, and the loop drops this
         // message's effects whatever its handler returns.
@@ -167,7 +172,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for BufferHandler {
         // client is allowed to destroy the wl_buffer in that interval; the
         // host surface still owns the attached host buffer and needs its local
         // SHM backing through the pending commit.
-        let references = SurfaceBufferReferences::collect(ctx);
+        let references = SurfaceBufferReferences::of(ctx);
         let uncommitted_attach = references.has_pending(guest_id);
         let still_referenced = ctx.buffer_is_submitted(guest_id) || references.contains(guest_id);
 
@@ -200,7 +205,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for BufferHandler {
         let Some(guest_id) = ctx.shadow_table.get_guest_id(host_id) else {
             return Action::Drop;
         };
-        let pending_attach = SurfaceBufferReferences::collect(ctx).has_pending(guest_id);
+        let pending_attach = SurfaceBufferReferences::of(ctx).has_pending(guest_id);
 
         if ctx.host_buffer_is_guest_destroyed(host_id) {
             if pending_attach {
