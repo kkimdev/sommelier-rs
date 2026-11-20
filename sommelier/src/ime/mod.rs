@@ -46,7 +46,7 @@ pub(crate) use exo_view::take_divergences_for_test;
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
 #[cfg(test)]
-pub(crate) use state::{LinkState, TextInput, V3Committed, V3Pending};
+pub(crate) use state::{LinkState, TextInput, V3Pending};
 #[cfg(test)]
 pub(crate) use step::{take_drops_for_test, Drops};
 

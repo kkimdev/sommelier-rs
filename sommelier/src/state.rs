@@ -1010,22 +1010,6 @@ impl Context {
         self.window_placement.as_ref()?.rect(binding)
     }
 
-    /// Who owns `key` of host keyboard `keyboard` under its state now
-    /// ([`crate::keys::KeyboardCore::classify`]).
-    #[cfg(test)]
-    pub(crate) fn classify_key_for_test(
-        &self,
-        keyboard: HostId,
-        key: u32,
-    ) -> crate::keys::KeyClass {
-        let env = crate::handler::keyboard::CtxEnv::new(
-            &self.keyboard_focus,
-            self.window_placement.as_ref(),
-            &self.ime,
-        );
-        self.keys.classify(keyboard, key, &env)
-    }
-
     /// Where the placement bound to `chord` puts the focused window.
     #[cfg(test)]
     pub(crate) fn placement_rect_for(

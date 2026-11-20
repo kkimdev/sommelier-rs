@@ -674,13 +674,6 @@ impl KeyGenerationRegistry {
             })
     }
 
-    /// The serial of the release a retired generation of `key` owes the
-    /// guest, if any.
-    #[cfg(test)]
-    pub(super) fn retired_release(&self, keyboard: HostId, key: u32) -> Option<u32> {
-        self.retired_guest_releases.get(&(keyboard, key)).copied()
-    }
-
     /// Take the release a retired generation of `key` owes the guest, if
     /// it is the one under `serial`.
     pub(super) fn take_pending_physical_release(

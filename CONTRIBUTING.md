@@ -110,8 +110,8 @@ assert_eq!(
   `test_support::text_input`, so that a change of the IME core's storage
   rewrites one module. It sets up only states the core can reach, which
   the core's invariants check.
-  The tests in `handler/keyboard/tests/recovery.rs` share the `text_input`
-  test fixture (`text_input::tests`) and need no other setup.
+  The tests in `handler/keyboard/tests/recovery.rs` share the session
+  fixture of the keyboard's tests, `Kb`.
 - A test outside the keyboard core (`sommelier/src/keys`) sets its state
   up through the core's step, as the guest's and the host's messages
   would (`handler::keyboard::for_test`), never through its transitions,

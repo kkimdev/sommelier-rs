@@ -16,19 +16,13 @@ limitations under the License.
 
 use super::*;
 use crate::handler::Handlers;
-use crate::ime::{map_v3_content_type, LinkState};
+use crate::ime::map_v3_content_type;
 use crate::keys::GuestKeyOwner;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
-use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
-use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler;
-use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
-use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::ZwpTextInputV3Handler;
-use crate::protocols::wayland::wl_callback::WlCallbackHandler;
 use crate::protocols::wayland::wl_display;
 use crate::protocols::wayland::wl_keyboard;
-use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
 use crate::protocols::wayland::{
     wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_touch,
 };
@@ -36,7 +30,7 @@ use crate::protocols::Iface;
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
 use crate::state::HostId;
-use crate::test_support::{decoded, respell};
+use crate::test_support::respell;
 use crate::wire::WL_DISPLAY_ID;
 use std::os::fd::OwnedFd;
 use zcr_extended_text_input_v1::{evt as ext, Request as Ext};
@@ -1564,24 +1558,65 @@ fn a_dropped_keysym_is_logged_once() {
 
 /// An extension whose version the proxy cannot find gives no input
 /// method: the v11 check fails closed instead of passing.
-#[test]
-fn an_extension_of_unknown_version_gives_no_input_method() {
-    let mut ctx = Context::new_for_test(false, false, Vec::new());
-    let since = zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE;
-    let manager = ctx
-        .shadow_table
-        .create_host_only(Iface::ZwpTextInputManagerV1, 1);
-    let extension = ctx
-        .shadow_table
-        .create_host_only(Iface::ZcrTextInputExtensionV1, since);
-    ctx.host_text_input_manager_v1_id = Some(manager);
-    ctx.host_text_input_extension_v1_id = Some(extension);
-    assert_eq!(host_text_input_managers(&ctx), Some((manager, extension)));
+#[tokio::test]
+async fn an_extension_of_unknown_version_gives_no_input_method() {
+    let mut s = Session::new();
+    let (seat, _) = s.keyboard().await;
+    let version = zwp_text_input_manager_v1::VERSION;
+    let manager = s.bind("zwp_text_input_manager_v1", version).await;
+    let version = zcr_text_input_extension_v1::VERSION;
+    s.advertise(zcr_text_input_extension_v1::NAME, version)
+        .await;
+    // The proxy binds it for itself.
+    let host = s.host_received();
+    let [(
+        _,
+        AnyRequest::WlRegistry(wl_registry::Request::Bind {
+            id: (_, _, extension),
+            ..
+        }),
+    )] = host[..]
+    else {
+        panic!("the proxy did not bind the extension: {host:?}");
+    };
+    // With its version, the extension gives a text input an input method.
+    let ti = s.new_id();
+    let get_text_input = zwp_text_input_manager_v3::req::get_text_input;
+    s.guest([get_text_input(manager, ti, seat)]).await;
+    let host = s.host_received();
+    assert!(
+        matches!(
+            host[..],
+            [
+                (
+                    _,
+                    AnyRequest::ZwpTextInputManagerV1(V1Manager::CreateTextInput { .. })
+                ),
+                (
+                    _,
+                    AnyRequest::ZcrTextInputExtensionV1(ExtManager::GetExtendedTextInput { .. })
+                ),
+            ]
+        ),
+        "{host:?}"
+    );
 
-    // No peer can make the proxy lose a bound extension's version;
-    // retiring its object stands in for that bookkeeping fault.
-    ctx.shadow_table.retire_host(extension);
-    assert_eq!(host_text_input_managers(&ctx), None);
+    // Injects a fault no peer can cause: no peer can make the proxy lose
+    // a bound extension's version; retiring its object stands in for
+    // that bookkeeping fault.
+    s.ctx().shadow_table.retire_host(extension);
+    let ti = s.new_id();
+    s.guest([
+        get_text_input(manager, ti, seat),
+        v3::enable(ti),
+        v3::set_content_type(ti, 0, 0),
+        v3::commit(ti),
+        v3::destroy(ti),
+    ])
+    .await;
+    assert_eq!(s.host_received(), []);
+    let delete_id = wl_display::Event::DeleteId { id: ti };
+    assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
 }
 
 /// A leave is a hard boundary: what the guest requests until the next
@@ -2499,9 +2534,9 @@ async fn host_ime_events_become_v3_transactions() {
         (
             // Each 0xff becomes the three bytes of U+FFFD, too long for
             // the guest's message. The cursor position it takes with it
-            // reaches no guest event; the state test
+            // reaches no guest event here;
             // `oversized_host_text_does_not_partially_advance_state`
-            // reads it.
+            // shows it in the next edit.
             "a commit too long once replaced is dropped",
             |f| {
                 let text = "x".repeat(4_000);
@@ -4020,230 +4055,12 @@ async fn each_keyboard_focus_is_entered_and_left_once() {
     assert_eq!(f.s.guest_received(), [left(a, 9, surface)]);
 }
 
-/// The fixture's guest text input, its host text input and extension.
-pub(in crate::handler) const TI: u32 = 20;
-pub(in crate::handler) const HOST: u32 = 10;
-pub(in crate::handler) const HOST_EXT: u32 = 30;
-/// The fixture's guest seat and focused surface, and their host objects.
-pub(in crate::handler) const SEAT: u32 = 5;
-pub(in crate::handler) const SURFACE: u32 = 900;
-pub(in crate::handler) const HOST_SEAT: u32 = 6;
-pub(in crate::handler) const HOST_SURFACE: u32 = 901;
-/// The guest keyboard [`Ime::with_keyboard`] adds, its host keyboard
-/// and that keyboard's extended keyboard.
-pub(in crate::handler) const KEYBOARD: u32 = 40;
-pub(in crate::handler) const HOST_KEYBOARD: HostId = HostId(41);
-pub(in crate::handler) const HOST_EXTENDED_KEYBOARD: u32 = 42;
-pub(in crate::handler) const BACKSPACE: u32 = crate::keys::EVDEV_KEY_BACKSPACE;
-pub(in crate::handler) const PRESSED: u32 = wl_keyboard::KEY_STATE_PRESSED;
-pub(in crate::handler) const RELEASED: u32 = wl_keyboard::KEY_STATE_RELEASED;
+const BACKSPACE: u32 = crate::keys::EVDEV_KEY_BACKSPACE;
+const PRESSED: u32 = wl_keyboard::KEY_STATE_PRESSED;
+const RELEASED: u32 = wl_keyboard::KEY_STATE_RELEASED;
 
-/// Handler tests of key and IME state that the peers of a [`Session`]
-/// cannot set up exactly: the guest text input [`TI`] of seat [`SEAT`]
-/// is enabled and its host active on surface [`SURFACE`].
-pub(in crate::handler) struct Ime {
-    pub(in crate::handler) ctx: Context,
-}
-
-impl Ime {
-    pub(in crate::handler) fn new() -> Self {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let table = &mut ctx.shadow_table;
-        table.insert_paired_for_test(SEAT, HOST_SEAT, "wl_seat");
-        table.insert_paired_for_test(SURFACE, HOST_SURFACE, "wl_surface");
-        ctx.shadow_table.insert_bridged_for_test(
-            TI,
-            HOST,
-            "zwp_text_input_v3",
-            "zwp_text_input_v1",
-        );
-        let interface = "zcr_extended_text_input_v1";
-        let version = zcr_extended_text_input_v1::VERSION;
-        ctx.shadow_table
-            .insert_host_only_for_test(HOST_EXT, interface, version);
-        let host = HostTi {
-            v1: HOST,
-            ext: HostExt {
-                id: HOST_EXT,
-                manager: 0,
-            },
-        };
-        let ti = TiId(TI);
-        ctx.ime
-            .insert_for_test(ti, SeatId(SEAT), host, Some(SurfaceId(SURFACE)));
-        let mut ime = Self { ctx };
-        ime.committed().enabled = true;
-        ime.settle();
-        ime
-    }
-
-    /// Attach the host text input with the content type the field
-    /// calls for, as the reconcile of the guest commit that set its
-    /// state would. A host event reconciles every text input, and
-    /// would send it otherwise.
-    pub(in crate::handler) fn settle(&mut self) {
-        let env = CtxEnv::new(&self.ctx.shadow_table, &self.ctx.keyboard_focus);
-        let t = self.ctx.ime.get_mut(TiId(TI)).expect("the text input");
-        t.attach_for_test(&env);
-    }
-
-    /// The fixture with guest keyboard [`KEYBOARD`] on the seat.
-    pub(in crate::handler) fn with_keyboard() -> Self {
-        let mut ime = Self::new();
-        ime.keyboard(KEYBOARD, HOST_KEYBOARD);
-        ime
-    }
-
-    /// Add guest keyboard `guest`, whose host keyboard is `host`, to the
-    /// seat.
-    pub(in crate::handler) fn keyboard(&mut self, guest: u32, host: HostId) {
-        self.ctx
-            .shadow_table
-            .insert_paired_for_test(guest, host.0, "wl_keyboard");
-        crate::handler::keyboard::for_test::created(&mut self.ctx, guest, host.0, SEAT);
-    }
-
-    /// Give [`HOST_KEYBOARD`] its extended keyboard, which sends
-    /// `peek_key`.
-    pub(in crate::handler) fn with_extended_keyboard() -> Self {
-        let mut ime = Self::with_keyboard();
-        ime.extended(HOST_KEYBOARD);
-        ime
-    }
-
-    /// The extended keyboard of `keyboard`, bound now if it has none yet:
-    /// [`HOST_EXTENDED_KEYBOARD`] for [`HOST_KEYBOARD`], and the host
-    /// keyboard's ID plus 1000 for another.
-    fn extended(&mut self, keyboard: HostId) -> u32 {
-        let bound = self.ctx.keys.keyboards().extended_for_test(keyboard);
-        if let Some(extended) = bound {
-            return extended.0;
-        }
-        let extended = match keyboard {
-            HOST_KEYBOARD => HOST_EXTENDED_KEYBOARD,
-            other => other.0 + 1000,
-        };
-        crate::handler::keyboard::for_test::extended(&mut self.ctx, keyboard.0, extended);
-        extended
-    }
-
-    /// Give the seat's keyboard focus on the surface to `keyboard`.
-    pub(in crate::handler) fn focus(&mut self, keyboard: HostId) {
-        self.ctx
-            .keyboard_focus
-            .set_for_test(keyboard, SEAT, SURFACE, HOST_SURFACE);
-    }
-
-    pub(in crate::handler) fn state(&mut self) -> &mut crate::ime::TextInput {
-        self.ctx.ime.get_mut(TiId(TI)).expect("the text input")
-    }
-
-    /// The committed state of the field, which is focused.
-    pub(in crate::handler) fn committed(&mut self) -> &mut crate::ime::V3Committed {
-        let state = self.state();
-        state.committed_mut_for_test().expect("a focused field")
-    }
-
-    pub(in crate::handler) fn preedit(&mut self, text: &str, commit: &str) {
-        self.ctx.last_sender_id = HOST;
-        let (text, commit) = (IndexedString::from(text), commit.to_string());
-        <Handlers as ZwpTextInputV1Handler>::on_preedit_string(&mut self.ctx, 0, &text, &commit);
-    }
-
-    pub(in crate::handler) fn commit(&mut self, text: &str) {
-        self.ctx.last_sender_id = HOST;
-        <Handlers as ZwpTextInputV1Handler>::on_commit_string(&mut self.ctx, 0, &text.to_string());
-    }
-
-    pub(in crate::handler) fn preedit_region(&mut self, index: i32, length: u32) {
-        self.ctx.last_sender_id = HOST_EXT;
-        Handlers::on_set_preedit_region(&mut self.ctx, index, length);
-    }
-
-    /// The host input method's empty confirmation, then a host event
-    /// that shows it to be an autorepeat's, such as the `done` of the
-    /// sync the proxy sends with a recovery that waits
-    /// (`crate::keys::recovery`).
-    pub(in crate::handler) fn confirm(&mut self) {
-        self.ctx.last_sender_id = HOST_EXT;
-        Handlers::on_confirm_preedit(&mut self.ctx, 0);
-        crate::handler::keyboard::before_host_event(&mut self.ctx, 0, None, false);
-    }
-
-    pub(in crate::handler) fn peek(&mut self, key: u32, state: u32, serial: u32, time: u32) {
-        self.ctx.last_sender_id = HOST_EXTENDED_KEYBOARD;
-        Handlers::on_peek_key(&mut self.ctx, serial, time, key, state);
-    }
-
-    /// Hold repeatable `key` on `keyboard`, whose press `peek_key`
-    /// reported with `serial` at `time`, the keyboard's extended keyboard
-    /// bound for it.
-    pub(in crate::handler) fn hold_peeked(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        serial: u32,
-        time: u32,
-    ) {
-        // The default keymap repeats every key the tests hold.
-        let keymap = self.ctx.keys.keyboards().keymap_for_test(keyboard);
-        if keymap.is_none() {
-            crate::handler::keyboard::for_test::default_keymap(&mut self.ctx, keyboard.0);
-        }
-        self.ctx.last_sender_id = self.extended(keyboard);
-        Handlers::on_peek_key(&mut self.ctx, serial, time, key, PRESSED);
-    }
-
-    /// Hold Backspace on [`HOST_KEYBOARD`], with its IME repeat leased
-    /// to `text_input`, as an input method that empties a preedit leases
-    /// it.
-    pub(in crate::handler) fn lease_backspace_repeat(&mut self, text_input: u32) {
-        self.hold_peeked(HOST_KEYBOARD, BACKSPACE, 1, 1);
-        let lease = crate::ime::KeyEffect::Lease {
-            ti: TiId(text_input),
-            seat: SeatId(SEAT),
-            outcome: crate::ime::LeaseOutcome::ArmIfBackspaceHeld,
-        };
-        crate::handler::keyboard::keys(&mut self.ctx, crate::keys::KeyInput::Ime(lease));
-        let leased = self.ctx.keys.backspace_lease(HOST_KEYBOARD);
-        assert_eq!(leased, Some(TiId(text_input)));
-    }
-
-    /// A `wl_keyboard.key` of `key` in `state` on [`HOST_KEYBOARD`]; returns
-    /// what the handler does with it.
-    pub(in crate::handler) fn key(&mut self, key: u32, state: u32, serial: u32) -> Action {
-        self.ctx.last_sender_id = HOST_KEYBOARD.0;
-        Handlers::on_key(&mut self.ctx, serial, 1, key, state)
-    }
-
-    pub(in crate::handler) fn repeat_active(&self) -> bool {
-        self.ctx.keys.backspace_lease(HOST_KEYBOARD).is_some()
-    }
-
-    /// The events queued for the guest since the last call.
-    pub(in crate::handler) fn events(&mut self) -> Vec<(u32, AnyEvent)> {
-        let queue = std::mem::take(&mut self.ctx.host_to_client_queue);
-        let table = &self.ctx.shadow_table;
-        queue
-            .iter()
-            .map(|(message, _)| {
-                crate::test_support::decode(message, &mut Default::default(), |msg| {
-                    let interface = table.get_interface(msg.sender_id).expect("a sender");
-                    AnyEvent::from_wire(interface.name(), msg)
-                })
-                .expect("a queued event decodes")
-            })
-            .collect()
-    }
-}
-
-pub(in crate::handler) fn key(
-    keyboard: u32,
-    key: u32,
-    state: u32,
-    serial: u32,
-    time: u32,
-) -> (u32, AnyEvent) {
+/// Guest keyboard `keyboard`'s `key` event of `key` in `state`.
+fn key(keyboard: u32, key: u32, state: u32, serial: u32, time: u32) -> (u32, AnyEvent) {
     let event = wl_keyboard::Event::Key {
         serial,
         time,
@@ -4253,21 +4070,25 @@ pub(in crate::handler) fn key(
     (keyboard, event.into())
 }
 
-/// The fixture's `done`, before any guest commit.
-pub(in crate::handler) fn uncommitted_done() -> (u32, AnyEvent) {
-    (TI, V3::Done { serial: 0 }.into())
-}
-
 /// A report and its barrier are one entry of the host queue, which a
-/// submission never splits (`connection::OutgoingMessages`).
-#[test]
-fn a_reports_barrier_is_glued_into_its_entry() {
-    let mut ime = Ime::new();
-    ime.ctx.last_sender_id = TI;
-    let text = IndexedString::from("ab");
-    <Handlers as ZwpTextInputV3Handler>::on_set_surrounding_text(&mut ime.ctx, &text, 2, 2);
-    Handlers::on_commit(&mut ime.ctx);
-    let report = ime.ctx.client_to_host_queue.iter().find(|(bytes, _)| {
+/// submission never splits (`connection::OutgoingMessages`); the host
+/// gets them as one stream either way.
+#[tokio::test]
+async fn a_reports_barrier_is_glued_into_its_entry() {
+    let mut f = Field::enabled().await;
+    // Dispatches the guest's report and commit as their requests would,
+    // and reads state no peer can observe: how the host queue holds them
+    // before the proxy sends them.
+    let ti = TiId(f.ti);
+    let ctx = f.s.ctx();
+    super::ime(
+        ctx,
+        Input::SurroundingText(ti, IndexedString::from("ab"), 2, 2),
+    );
+    super::ime(ctx, Input::Commit(ti));
+    let queue = std::mem::take(&mut ctx.client_to_host_queue);
+    ctx.host_to_client_queue.clear();
+    let report = queue.iter().find(|(bytes, _)| {
         crate::test_support::msg_header(bytes).opcode == zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT
     });
     let (bytes, _) = report.expect("a report");
@@ -4285,47 +4106,65 @@ fn a_reports_barrier_is_glued_into_its_entry() {
 /// Host text too long for a message is dropped whole: the guest gets
 /// nothing, and the text input and its repeat lease stay as they were,
 /// except that the event takes the pieces Exo sent before it, as every
-/// edit does (B3). Otherwise the next one would apply them. (A
-/// region is measured only in step with the Exo mirror, which state set
-/// up directly is not.) Only host
+/// edit does (B3). Otherwise the next one would apply them. Only host
 /// text the proxy lengthened by replacing invalid UTF-8 fits the host's
 /// message but not the guest's (`host_ime_events_become_v3_transactions`
-/// sends such a commit); this test reaches every such drop directly.
-#[test]
-fn oversized_host_text_does_not_partially_advance_state() {
-    let oversized = "x".repeat(4_084);
-    type Event = fn(&mut Ime, &str);
+/// sends such a commit); a confirmation commits a shown preedit, which
+/// no host can make too long, so the test shows it one.
+#[tokio::test]
+async fn oversized_host_text_does_not_partially_advance_state() {
+    // Each 0xff becomes the three bytes of U+FFFD.
+    let latin1 = "x".repeat(4_000);
+    type Event = fn(&Field, &str) -> Outgoing;
     let cases: [(&str, Event); 3] = [
-        ("preedit", |ime, text| ime.preedit(text, "")),
-        ("commit", |ime, text| ime.commit(text)),
-        ("confirm", |ime, _| ime.confirm()),
+        ("preedit", |f, text| {
+            respell(f.preedit(text, ""), text, &[0xff; 4_000])
+        }),
+        ("commit", |f, text| {
+            respell(f.commit(text), text, &[0xff; 4_000])
+        }),
+        ("confirm", |f, _| f.confirm()),
     ];
     for (case, event) in cases {
-        let mut ime = Ime::with_keyboard();
-        ime.committed().surrounding_text_support = true;
-        ime.settle();
-        let state = ime.state();
-        state.show_for_test(&oversized);
-        state.set_pieces_for_test(crate::ime::V1Pieces {
-            cursor: Some(1),
-            styling: vec![(0, 1, zwp_text_input_v1::PREEDIT_STYLE_SELECTION)],
-            cursor_position: Some((1, 1)),
-        });
-        ime.lease_backspace_repeat(TI);
-        let mut expected = ime.state().clone();
-        expected.set_pieces_for_test(crate::ime::V1Pieces::default());
-
-        event(&mut ime, &oversized);
-        assert_eq!(ime.events(), [], "{case}");
-        // The Exo mirror takes every event, whatever becomes of it.
-        expected.copy_exo_for_test(ime.state());
-        assert_eq!(ime.state(), &expected, "{case}");
-        assert!(ime.repeat_active(), "{case}");
+        let mut f = Field::typing().await;
+        let press = f.lease_backspace_repeat().await;
+        if case == "confirm" {
+            // Injects a state no peer can cause: a shown preedit too long
+            // to commit.
+            let ti = TiId(f.ti);
+            let state = f.s.ctx().ime.get_mut(ti).expect("the text input");
+            state.show_for_test(&"x".repeat(4_084));
+        }
+        // Exo sends the pieces of an edit before it.
+        let selection = zwp_text_input_v1::PREEDIT_STYLE_SELECTION;
+        f.s.host([
+            v1::preedit_cursor(f.host, 1),
+            v1::preedit_styling(f.host, 0, 1, selection),
+            v1::cursor_position(f.host, 1, 1),
+            event(&f, &latin1),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), [], "{case}");
+        assert_eq!(f.host_received().await, [], "{case}");
+        // The repeat stays leased: its tombstone takes Backspace's press.
+        f.s.host([f.key(press)]).await;
+        assert_eq!(
+            f.host_received().await,
+            [f.ack(press.serial, false)],
+            "{case}"
+        );
+        assert_eq!(f.s.guest_received(), [], "{case}");
+        // The dropped event took the pieces, which the next edit lacks.
+        f.s.host([f.preedit("나", "")]).await;
+        let expected = f.events([preedit("나"), DONE]);
+        assert_eq!(f.s.guest_received(), expected, "{case}");
     }
 }
 
 #[test]
 fn child_objects_inherit_their_manager_versions() {
+    // Built by hand: the proxy binds no version above the generated
+    // one, so no session can tell a child's inherited version from it.
     let mut ctx = Context::new_for_test(false, false, vec![]);
     ctx.host_text_input_manager_v1_id = Some(2);
     ctx.host_text_input_extension_v1_id = Some(3);
@@ -4354,95 +4193,85 @@ fn child_objects_inherit_their_manager_versions() {
 /// destroyed the text input and reused its ID for one with another
 /// host text input, enabled and not yet active, as it waits for a
 /// drain of its own, which the old barrier must not end.
-#[test]
-fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
-    let mut ime = Ime::new();
-    ime.focus(HOST_KEYBOARD);
-    let ti = TiId(TI);
-    forget_text_input(&mut ime.ctx, TI, false);
+#[tokio::test]
+async fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
+    let mut f = Field::enabled().await;
+    f.s.guest([v3::destroy(f.ti)]).await;
+    let host = f.host_received().await;
+    let callback = barrier(&host);
     // The deactivate, its drain barrier, then the extension's destroy.
-    let queue = std::mem::take(&mut ime.ctx.client_to_host_queue);
-    let [(_, wl_display::Request::Sync { callback })] =
-        decoded(&queue[1..2], wl_display::Request::from_wire)[..]
-    else {
-        panic!("the destroy drains behind a barrier");
-    };
-    let replacement = HostTi {
-        v1: 11,
-        ext: HostExt { id: 12, manager: 0 },
-    };
-    let create = Input::Create {
-        ti,
-        seat: SeatId(SEAT),
-        host: replacement,
-        manager: 2,
-    };
-    // It activates, deactivates, and is enabled again while it drains.
-    for input in [
-        create,
-        Input::Enable(ti),
-        Input::Commit(ti),
-        Input::Disable(ti),
-        Input::Commit(ti),
-        Input::Enable(ti),
-        Input::Commit(ti),
-    ] {
-        super::ime(&mut ime.ctx, input);
-    }
-    assert!(matches!(ime.state().link(), LinkState::Draining { .. }));
-    ime.ctx.client_to_host_queue.clear();
+    assert_eq!(
+        host,
+        [f.deactivate(), sync(callback), f.ext(Ext::Destroy {})]
+    );
+    let deleted = wl_display::Event::DeleteId { id: f.ti };
+    assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
 
-    ime.ctx.last_sender_id = callback;
-    <Handlers as WlCallbackHandler>::on_done(&mut ime.ctx, 0);
-    assert!(!ime.state().is_attached());
-    assert!(ime.ctx.client_to_host_queue.is_empty());
+    // It activates, deactivates, and is enabled again while it drains.
+    f.create_text_input(f.ti).await;
+    f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+    assert_eq!(f.host_received().await, f.enable_requests(1));
+    f.answered(1);
+    f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+    let host = f.host_received().await;
+    let own = barrier(&host);
+    assert_eq!(host, f.disable_requests(own, 2));
+    f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+    let host = f.host_received().await;
+    assert!(
+        !host.contains(&f.activate()),
+        "not while it drains: {host:?}"
+    );
+    f.answered(3);
+
+    f.drain(callback).await;
+    assert_eq!(f.host_received().await, []);
+    assert_eq!(f.s.guest_received(), []);
+    // Its own barrier activates it.
+    f.drain(own).await;
+    let host = f.host_received().await;
+    assert_eq!(host.first(), Some(&f.activate()), "{host:?}");
 }
 
-#[test]
-fn guest_commit_serial_wraps_and_is_forwarded_unchanged() {
-    let mut ime = Ime::new();
-    let state = ime.state();
+/// The guest's commit count wraps, and the host gets it as it is.
+#[tokio::test]
+async fn guest_commit_serial_wraps_and_is_forwarded_unchanged() {
+    let mut f = Field::disabled().await;
+    // Injects a state no peer can reach in a test's time: 2^32 - 1
+    // commits.
+    let ti = TiId(f.ti);
+    let state = f.s.ctx().ime.get_mut(ti).expect("the text input");
     state.set_commits_for_test(u32::MAX);
-    state.set_link_for_test(LinkState::Detached);
-    ime.ctx.last_sender_id = TI;
-    Handlers::on_commit(&mut ime.ctx);
-
-    assert_eq!(ime.state().serial().get(), 0);
-    let queue = std::mem::take(&mut ime.ctx.client_to_host_queue);
-    let (activate, extension, commit_state) = (&queue[..1], &queue[1..3], &queue[3..]);
-    let activate = decoded(activate, V1::from_wire);
-    assert_eq!(
-        activate,
-        [(
-            HOST,
-            V1::Activate {
-                seat: HOST_SEAT,
-                surface: HOST_SURFACE
-            }
-        )]
-    );
-    let extension = decoded(extension, Ext::from_wire);
-    assert!(extension.iter().all(|(sender, _)| *sender == HOST_EXT));
-    let commit_state = decoded(commit_state, V1::from_wire);
-    assert_eq!(commit_state, [(HOST, V1::CommitState { serial: 0 })]);
+    f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+    assert_eq!(f.host_received().await, f.enable_requests(0));
+    f.answered(0);
 }
 
 /// Without a host v1 manager the text input has no input method,
 /// like one without the extension.
-#[test]
-fn text_input_creation_without_host_manager_does_not_create_broken_state() {
-    let mut ctx = Context::new_for_test(false, false, vec![]);
-    let manager = 5;
-    ctx.shadow_table.create_local(
-        manager,
-        Iface::ZwpTextInputManagerV3,
-        zwp_text_input_manager_v3::VERSION,
-    );
-    ctx.last_sender_id = manager;
-
-    assert_eq!(Handlers::on_get_text_input(&mut ctx, 20, 7), Action::Drop);
-    assert!(!ctx.is_fatal());
-    assert!(ctx.ime.get(TiId(20)).is_none());
-    assert!(ctx.shadow_table.is_local(20));
-    assert!(ctx.client_to_host_queue.is_empty());
+#[tokio::test]
+async fn text_input_creation_without_host_manager_does_not_create_broken_state() {
+    let mut s = Session::new();
+    let (seat, _) = s.keyboard().await;
+    let version = zwp_text_input_manager_v1::VERSION;
+    let manager = s.bind("zwp_text_input_manager_v1", version).await;
+    let version = zcr_text_input_extension_v1::VERSION;
+    s.advertise(zcr_text_input_extension_v1::NAME, version)
+        .await;
+    // The proxy binds it for itself.
+    s.host_received();
+    // Injects a fault no peer can cause: the proxy has no host manager
+    // for the guest's, which it advertises only with one.
+    s.ctx().host_text_input_manager_v1_id = None;
+    let ti = s.new_id();
+    s.guest([
+        zwp_text_input_manager_v3::req::get_text_input(manager, ti, seat),
+        v3::enable(ti),
+        v3::commit(ti),
+        v3::destroy(ti),
+    ])
+    .await;
+    assert_eq!(s.host_received(), []);
+    let delete_id = wl_display::Event::DeleteId { id: ti };
+    assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
 }

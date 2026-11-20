@@ -731,20 +731,9 @@ impl KeyboardCore {
         self.generations.backspace_repeat_cancelled(keyboard)
     }
 
-    /// Whether a host accelerator's press suppressed `keyboard`'s `key`.
-    pub(crate) fn accelerator_suppressed(&self, keyboard: HostId, key: u32) -> bool {
-        self.generations.host_accelerator_suppressed(keyboard, key)
-    }
-
     /// The sequence of the latest peek of guest seat `seat` on `surface`.
     pub(crate) fn latest_peek_sequence(&self, seat: u32, surface: Option<u32>) -> Option<u64> {
         self.generations.latest_peek_sequence(seat, surface)
-    }
-
-    /// The serial of the release a retired generation of `keyboard`'s `key`
-    /// still owes the guest.
-    pub(crate) fn retired_release(&self, keyboard: HostId, key: u32) -> Option<u32> {
-        self.generations.retired_release(keyboard, key)
     }
 
     /// Every host keyboard the key state names.
