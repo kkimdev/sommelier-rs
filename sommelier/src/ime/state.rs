@@ -142,8 +142,6 @@ pub(crate) struct Assembly {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Warned {
     seat_missing: bool,
-    /// Exo's deletes and regions are dropped for want of a mirror.
-    no_mirror: bool,
     /// The deferral last logged.
     deferral: Option<Deferral>,
 }
@@ -167,7 +165,7 @@ impl TextInput {
             field: Field::focused_on(surface),
             link: LinkState::Detached,
             fence: None,
-            exo: ExoView::new(host.ext.map(|ext| ext.version)),
+            exo: ExoView::new(),
             composition: Composition::default(),
             warned: Warned::default(),
         }
@@ -306,7 +304,8 @@ impl TextInput {
                 ti.0
             );
             self.composition.shown = None;
-            vec![bare_done(ti, serial)]
+            let done = GuestTxn::default().encode(ti, false, serial);
+            done.expect("a bare done has no string")
         })
     }
 
@@ -435,12 +434,6 @@ impl TextInput {
         !std::mem::replace(&mut self.warned.seat_missing, true)
     }
 
-    /// Whether a delete or region dropped for want of a mirror is warned
-    /// of now: once per text input.
-    pub(super) fn first_no_mirror_warning(&mut self) -> bool {
-        !std::mem::replace(&mut self.warned.no_mirror, true)
-    }
-
     /// The barriers this text input waits for: its drain and its fence.
     #[cfg(test)]
     pub(crate) fn barriers(&self) -> impl Iterator<Item = BarrierToken> {
@@ -551,10 +544,9 @@ impl TextInput {
         self.exo = other.exo.clone();
     }
 
-    /// Whether it warned of a missing seat, and of a delete or region
-    /// dropped for want of a mirror.
-    pub(crate) fn warned_for_test(&self) -> (bool, bool) {
-        (self.warned.seat_missing, self.warned.no_mirror)
+    /// Whether it warned of a missing seat.
+    pub(crate) fn warned_for_test(&self) -> bool {
+        self.warned.seat_missing
     }
 }
 
@@ -568,15 +560,6 @@ impl Field {
             None => Self::Unfocused,
         }
     }
-}
-
-/// A lone `done`: the transaction of a recovered key (X2').
-fn bare_done(ti: TiId, serial: Serial) -> Outgoing {
-    let mut txn = GuestTxn::default()
-        .encode(ti, false, serial)
-        .expect("a bare done has no string");
-    debug_assert_eq!(txn.len(), 1);
-    txn.remove(0)
 }
 
 /// Proof that a text input's composition is current (the gate of
@@ -634,17 +617,9 @@ impl<'a> Current<'a> {
         }
     }
 
-    /// H7. A cleared preedit with a commit text is Exo's reset commit.
-    pub(super) fn preedit(self, text: String, commit: String, assembly: Assembly) -> Planned<'a> {
-        let shown = self.shown().is_some();
-        if text.is_empty() && shown && !commit.is_empty() {
-            let txn = GuestTxn {
-                commit: Some(commit),
-                ..GuestTxn::default()
-            };
-            return self.plan(txn, LeaseOutcome::End);
-        }
-        let lease = match text.is_empty() && shown {
+    /// H7. Exo's commit text is always the preedit's, so it is not read.
+    pub(super) fn preedit(self, text: String, assembly: Assembly) -> Planned<'a> {
+        let lease = match text.is_empty() && self.shown().is_some() {
             true => LeaseOutcome::ArmIfBackspaceHeld,
             false => LeaseOutcome::End,
         };

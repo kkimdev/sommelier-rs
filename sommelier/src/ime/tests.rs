@@ -63,11 +63,10 @@ fn ext_id(ti: TiId) -> u32 {
 fn hosts(ti: TiId) -> HostTi {
     HostTi {
         v1: v1(ti),
-        ext: Some(HostExt {
+        ext: HostExt {
             id: ext_id(ti),
-            version: ext::VERSION,
             manager: 3,
-        }),
+        },
     }
 }
 
@@ -161,21 +160,22 @@ fn guest_events(queue: &[Outgoing]) -> Vec<(u32, AnyEvent)> {
 }
 
 fn decode(fx: Effects) -> Out {
+    let req = |request| {
+        let [(id, request)] = decoded(&[request], |m| {
+            AnyRequest::from_wire(interface(m.sender_id), m)
+        })
+        .try_into()
+        .unwrap();
+        Host::Req(id, request)
+    };
     let host = fx
         .to_host
         .into_iter()
-        .map(|out| match out {
-            HostOut::Request(request) => {
-                let [(id, request)] = decoded(&[request], |m| {
-                    AnyRequest::from_wire(interface(m.sender_id), m)
-                })
-                .try_into()
-                .unwrap();
-                Host::Req(id, request)
-            }
-            HostOut::Barrier(token) => Host::Barrier(token),
-            HostOut::GluedBarrier(token) => Host::GluedBarrier(token),
-            HostOut::Retire(id) => Host::Retire(id),
+        .flat_map(|out| match out {
+            HostOut::Request(request) => vec![req(request)],
+            HostOut::Barrier(token) => vec![Host::Barrier(token)],
+            HostOut::Glued { request, barrier } => vec![req(request), Host::GluedBarrier(barrier)],
+            HostOut::Destroy { request, id } => vec![req(request), Host::Retire(id)],
         })
         .collect();
     let keys = fx
@@ -649,22 +649,9 @@ fn row_G1_create_makes_the_host_objects_and_enters_the_focus() {
     );
     assert_eq!(out.guest, [v3(TI, V3::Enter { surface: SURFACE.0 })]);
 
-    // Without the extension or a keyboard focus, there is neither.
+    // Without a keyboard focus, there is no enter.
     ime.world.focus.clear();
-    let out = ime.step(Input::Create {
-        ti: TI2,
-        seat: SEAT,
-        host: HostTi {
-            v1: v1(TI2),
-            ext: None,
-        },
-        manager: MANAGER,
-    });
-    assert_eq!(
-        out.host,
-        [req(2, V1Manager::CreateTextInput { id: v1(TI2) })]
-    );
-    assert_eq!(out.guest, []);
+    assert_eq!(ime.create(TI2).guest, []);
 }
 
 #[test]
@@ -973,7 +960,7 @@ fn reconcile_reaches_every_target_with_only_needed_requests() {
     let content_types: Vec<_> = [(1, 2), (3, 4)]
         .into_iter()
         .flat_map(|content_type| {
-            [None, Some(false), Some(true)].map(|surrounding_text_support| HostContentType {
+            [false, true].map(|surrounding_text_support| HostContentType {
                 content_type,
                 surrounding_text_support,
             })
@@ -1115,74 +1102,6 @@ fn row_G10_destroy_of_the_enabled_input_lets_another_enable() {
     assert_eq!(out.guest, [v3(TI2, V3::Done { serial: 1 })]);
 }
 
-/// G7 for each extension version: one request per way of sending a
-/// content type (INVARIANTS "`set_input_type` replaces v1
-/// `set_content_type`").
-#[test]
-fn content_type_takes_one_host_request_per_extension_version() {
-    use zwp_text_input_v3::CONTENT_PURPOSE_PIN as PIN;
-    let (hint, purpose, input_type, input_mode, input_flags, learning_mode) =
-        map_v3_content_type(0, PIN);
-    for version in [None, Some(1), Some(7), Some(8), Some(9)] {
-        let mut ime = Ime::new();
-        let ext = version.map(|version| HostExt {
-            id: ext_id(TI),
-            version,
-            manager: 3,
-        });
-        ime.step(Input::Create {
-            ti: TI,
-            seat: SEAT,
-            host: HostTi { v1: v1(TI), ext },
-            manager: MANAGER,
-        });
-        ime.step(Input::Enable(TI));
-        ime.step(Input::ContentType(TI, (0, PIN)));
-        let out = ime.step(Input::Commit(TI));
-        let set_content_type = req(v1(TI), V1::SetContentType { hint, purpose });
-        let deprecated = req(
-            ext_id(TI),
-            Ext::DeprecatedSetInputType {
-                input_type,
-                input_mode,
-                input_flags,
-                learning_mode,
-            },
-        );
-        let support = req(
-            ext_id(TI),
-            Ext::SetSurroundingTextSupport {
-                support: ext::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
-            },
-        );
-        let set_input_type = || {
-            req(
-                ext_id(TI),
-                Ext::SetInputType {
-                    input_type,
-                    input_mode,
-                    input_flags,
-                    learning_mode,
-                    inline_composition_support: ext::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
-                },
-            )
-        };
-        let content_type = match version {
-            None | Some(1) => vec![set_content_type],
-            Some(7) => vec![set_content_type, deprecated],
-            Some(8) => vec![set_input_type()],
-            _ => vec![support, set_input_type()],
-        };
-        // The activation's other requests surround the content type's.
-        let mut around = activation(TI, 1);
-        let tail = around.split_off(around.len() - 2);
-        around.truncate(2);
-        around.extend(content_type);
-        let expected: Vec<Host> = around.into_iter().chain(tail).collect();
-        assert_eq!(out.host, expected, "{version:?}");
-    }
-}
-
 /// A commit's pending state belongs to its field: a refocus drops it.
 #[test]
 fn row_G9c_a_refocus_drops_the_pending_enable() {
@@ -1201,9 +1120,8 @@ fn row_G9c_a_refocus_drops_the_pending_enable() {
 
 // 2.2 Host events.
 
-/// Exo's detach confirms only a composition it tracks below v11 of the
-/// extension (E6), and a report it could not match drops that (E4): the
-/// guest commits the preedit nothing confirmed.
+/// A preedit Exo's detach did not confirm (E6), the guest commits at the
+/// `leave`.
 #[test]
 fn row_H2_an_exo_detach_commits_the_preedit_and_activates_again() {
     let mut ime = Ime::enabled();
@@ -1236,7 +1154,7 @@ fn row_H2_a_confirmed_composition_is_committed_once() {
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
     let out = ime.step(Input::HostLeave(TI));
     assert!(out.guest.is_empty() && out.keys.is_empty());
-    // Below v11, the confirmation is a commit of the composition.
+    // So does a commit of the composition.
     let mut ime = Ime::enabled();
     ime.compose("가");
     ime.v1(HostIme::Commit {
@@ -1326,29 +1244,6 @@ fn row_H7_a_preedit_shows_and_its_clear_arms_the_lease() {
     let out = ime.compose("");
     assert_eq!(out.guest, [done(1)]);
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
-}
-
-/// H7: a preedit the host clears with a reset commit reaches the guest
-/// as that commit.
-#[test]
-fn a_reset_commit_waits_for_the_guest_to_report_it() {
-    let mut ime = Ime::enabled();
-    ime.report("ab", 2);
-    ime.compose("가");
-    let out = ime.v1(HostIme::Preedit {
-        serial: 0,
-        text: "".into(),
-        commit: "가".into(),
-    });
-    assert_eq!(out.guest, [no_preedit(), commit("가"), done(2)]);
-    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
-    // Exo never sends one, as its commit text is always the preedit's, so
-    // the mirror cannot follow it, and drops Exo's deletes.
-    let delete = HostIme::Delete {
-        index: 1,
-        length: 1,
-    };
-    assert_eq!(ime.v1(delete).guest, []);
 }
 
 #[test]
@@ -2253,72 +2148,14 @@ fn row_R2_an_activation_waits_for_a_live_seat() {
     assert_eq!(ime.compose("가").guest, []);
 }
 
-// The Exo mirror: from v11 of the extension, H9 and
-// X1 are measured in the Exo mirror while the guest is in step with it, and
-// dropped otherwise; below v11 they are
-// dropped.
+// The Exo mirror: H9 and X1 are measured in the Exo mirror while the
+// guest is in step with it, and dropped otherwise.
 
 impl Ime {
-    /// [`Self::enabled`] with a host whose text-input extension is
-    /// `version`, if any.
-    fn enabled_at(version: Option<u32>) -> Self {
-        let mut ime = Self::new();
-        let ext = version.map(|version| HostExt {
-            id: ext_id(TI),
-            version,
-            manager: 3,
-        });
-        let host = HostTi { v1: v1(TI), ext };
-        ime.step(Input::Create {
-            ti: TI,
-            seat: SEAT,
-            host,
-            manager: MANAGER,
-        });
-        ime.enable(TI);
-        ime
-    }
-
     /// [`TI`]'s Exo mirror.
     fn mirror(&self) -> &mirror::ExoMirror {
-        let exo = self.core.get(TI).expect("a text input").exo();
-        exo.mirror().expect("a mirror")
+        self.core.get(TI).expect("a text input").exo().mirror()
     }
-}
-
-#[test]
-fn row_G1_a_text_input_has_a_mirror_from_v11() {
-    let mirrored = |version| {
-        let ime = Ime::enabled_at(version);
-        let exo = ime.core.get(TI).expect("a text input").exo();
-        exo.mirror().is_some()
-    };
-    assert!(mirrored(Some(11)));
-    assert!(!mirrored(Some(10)));
-    assert!(!mirrored(None));
-}
-
-/// Below v11 of the extension the text input has no mirror: Exo's deletes
-/// and regions are dropped, which warns once, and every report goes out;
-/// typing does not need the mirror.
-#[test]
-fn row_H9_X1_below_v11_deletes_and_regions_are_dropped() {
-    let mut ime = Ime::enabled_at(Some(10));
-    let out = ime.report("ab", 2);
-    assert_eq!(out.host[0], surrounding(TI, "ab", 2));
-    let warned = |ime: &Ime| ime.core.get(TI).expect("a text input").warned_for_test().1;
-    assert!(!warned(&ime));
-    assert_eq!(ime.delete(1, 1).guest, []);
-    assert!(warned(&ime));
-    assert_eq!(ime.region(-1, 1).guest, []);
-    assert_eq!(ime.compose("가").guest, [preedit("가"), done(2)]);
-    let out = ime.report("ab", 2);
-    assert_eq!(out.host, [surrounding(TI, "ab", 2), commit_state(TI, 3)]);
-    let out = ime.ext(HostIme::Confirm {
-        keep_selection: true,
-    });
-    assert_eq!(out.guest, [no_preedit(), commit("가"), done(3)]);
-    assert_eq!(ime.host_commit("나").guest, [commit("나"), done(3)]);
 }
 
 /// The mirror takes a report at its barrier, which reaches Exo with it.
@@ -2448,8 +2285,7 @@ fn row_G9c_an_exact_report_goes_out_unchanged() {
 }
 
 /// A report that names no state, even with the composition the guest
-/// shows inline, goes out, and Exo resets to the guest's text; so does
-/// every report below v11 of the extension, which has no mirror.
+/// shows inline, goes out, and Exo resets to the guest's text.
 #[test]
 fn row_G9c_an_unmatched_report_goes_out_unchanged() {
     let mut ime = Ime::enabled();
@@ -2458,12 +2294,6 @@ fn row_G9c_an_unmatched_report_goes_out_unchanged() {
     let out = ime.report("a", 0);
     assert_eq!(out.host, [surrounding(TI, "a", 0), commit_state(TI, 3)]);
     assert!(ime.mirror().predicted().composition.is_empty());
-
-    let mut ime = Ime::enabled_at(Some(10));
-    ime.report("ab", 2);
-    ime.compose("b");
-    let out = ime.report("a", 1);
-    assert_eq!(out.host, [surrounding(TI, "a", 1), commit_state(TI, 3)]);
 }
 
 #[test]
@@ -2655,26 +2485,20 @@ fn row_H9_after_a_forwarded_key_drops() {
 
 /// Exo ends its composition at an empty region, and leaves it as text,
 /// whether or not the mirror can measure the region. So an empty region
-/// the core drops, below v11 or after a key the guest has not stated,
-/// commits the preedit the guest shows: if Exo had kept it as well, the
-/// text doubles, where sending nothing would lose it to the next preedit,
-/// which replaces it.
+/// the core drops, after a key the guest has not stated, commits the
+/// preedit the guest shows: if Exo had kept it as well, the text doubles,
+/// where sending nothing would lose it to the next preedit, which
+/// replaces it.
 #[test]
 fn an_unmeasured_empty_region_commits_the_shown_preedit() {
-    for version in [Some(10), Some(11)] {
-        let mut ime = Ime::enabled_at(version);
-        ime.report("ab", 2);
-        ime.compose("가");
-        ime.step(Input::GuestKey(SEAT));
-        let out = ime.region(0, 0);
-        assert_eq!(
-            out.guest,
-            [no_preedit(), commit("가"), done(2)],
-            "{version:?}"
-        );
-        assert_eq!(out.keys, [lease(LeaseOutcome::End)], "{version:?}");
-        assert_eq!(ime.compose("나").guest, [preedit("나"), done(2)]);
-    }
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.compose("가");
+    ime.step(Input::GuestKey(SEAT));
+    let out = ime.region(0, 0);
+    assert_eq!(out.guest, [no_preedit(), commit("가"), done(2)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    assert_eq!(ime.compose("나").guest, [preedit("나"), done(2)]);
 }
 
 /// Exo edited its text at a delete or a region the core drops, so either

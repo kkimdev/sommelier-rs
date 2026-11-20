@@ -24,8 +24,9 @@
   [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
 - The IME core (`sommelier/src/ime`) bridges a guest's text-input-v3 to
   Exo's text-input-v1. Every IME input goes through `ImeCore::step`, and
-  `handler/text_input.rs` is its adapter. From v11 of the text-input
-  extension, the Exo mirror is the one model of Exo's text.
+  `handler/text_input.rs` is its adapter. The Exo mirror is the one
+  model of Exo's text; a host without the text-input extension at v11
+  gives text inputs no input method.
   [`docs/IME.md`](docs/IME.md) holds the behaviour table, the facts about
   Exo and the clients, and the deterministic simulation test (DST);
   [`docs/KEYBOARD.md`](docs/KEYBOARD.md) holds the key states.
@@ -96,8 +97,7 @@
   held across an input-method restart stops repeating until its next
   press.
 - Exo's deletes and preedit regions that the Exo mirror cannot measure
-  are dropped, and below v11 of the extension all of them are
-  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A drop
+  are dropped ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A drop
   never deletes or loses text, but the input method goes on as if it
   applied, so its next commit doubles text once (`word word~`, 한국韓國)
   until the guest's next report resets Exo. The mirror's gaps:
@@ -183,9 +183,6 @@
 - A guest's own reset (`set_text_change_cause`, G6) never resets Exo;
   only a press does (C6, Q3 of
   [IME.md](docs/IME.md#53-open-design-questions)).
-- Re-enabling an enabled field with a changed content type keeps the
-  guest's preedit but re-sends the type, which before v8 can reset Exo's
-  composition.
 - A focus-loss commit too long for one message loses the preedit (Exo's
   confirmation is dropped while the link drains).
 - The keysym channel is unproven (U1): no release follows a keysym
@@ -205,6 +202,17 @@
 - Chromium's IMA keeps composing after a composition empties (ㄱ then
   Backspace), so an earlier key's text can be lost; host behaviour, not
   mitigated.
+- The v11-only DST fails 8 free cases in a 20,000-case release soak
+  (seeds from 0). Base `43962c5` fails the same seeds when its extension
+  draw is forced to v11, so these bugs predate the change; their fixes
+  are pending:
+  - Report suppression (G9c) withholds a report that Exo's tracker does
+    not hold with the shown composition: seeds 4372, 13346, 14054, 16626
+    and 19984.
+  - A held key is recovered for Exo's confirmation before another key's
+    press (`recoveries_before_a_press`): seeds 13104 and 16710.
+  - The guest's preedit is neither what Exo tracks nor what its engine
+    composes: seed 14452.
 - The DST models only Chromium, GTK3 and GTK4 (no selection, one text
   input), and nothing checks independently that a real autorepeat is
   never dropped (`SpecText::decide_recovery`).

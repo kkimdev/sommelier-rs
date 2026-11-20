@@ -26,6 +26,7 @@ use crate::handler::text_input::CtxEnv;
 use crate::ime::{
     Assembly, HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId, V3Pending,
 };
+use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::state::{Context, HostId, InternalCallback};
 
 /// A text input the guest committed, enabled unless [`Active::enabled`]
@@ -35,7 +36,8 @@ use crate::state::{Context, HostId, InternalCallback};
 pub(crate) struct Active<'a> {
     /// The host `zwp_text_input_v1` behind it.
     pub(crate) host: u32,
-    /// The host `zcr_extended_text_input_v1` behind it, if any.
+    /// The host `zcr_extended_text_input_v1` behind it, if the test names
+    /// one; otherwise [`insert`] creates one.
     pub(crate) ext: Option<u32>,
     /// The guest `wl_seat` it was created for.
     pub(crate) seat: u32,
@@ -83,11 +85,15 @@ impl Active<'_> {
 /// be one the IME core can reach, which its invariants check: one text
 /// input on the connection is enabled at a time.
 pub(crate) fn insert(ctx: &mut Context, guest: u32, active: Active) {
-    let ext = active.ext.map(|id| HostExt {
-        id,
-        version: ctx.shadow_table.host_object_version_or_unknown(id),
-        manager: ctx.host_text_input_extension_v1_id.unwrap_or_default(),
+    let id = active.ext.unwrap_or_else(|| {
+        let version = zcr_extended_text_input_v1::VERSION;
+        ctx.shadow_table
+            .create_host_only(zcr_extended_text_input_v1::NAME, version)
     });
+    let ext = HostExt {
+        id,
+        manager: ctx.host_text_input_extension_v1_id.unwrap_or_default(),
+    };
     let host = HostTi {
         v1: active.host,
         ext,

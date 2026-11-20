@@ -69,17 +69,14 @@ pub struct BarrierToken(u64);
 pub struct HostTi {
     /// The host `zwp_text_input_v1`.
     pub v1: u32,
-    /// The host `zcr_extended_text_input_v1`, if the host has the extension.
-    pub ext: Option<HostExt>,
+    /// The host `zcr_extended_text_input_v1`, at v11 or later: the adapter
+    /// creates no text input without one.
+    pub ext: HostExt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostExt {
     pub id: u32,
-    /// Its version, cached when the extension is created and never
-    /// updated. An unknown one is the largest, which allows every
-    /// request.
-    pub version: u32,
     /// The host `zcr_text_input_extension_v1` it is created from.
     pub manager: u32,
 }
@@ -209,12 +206,19 @@ pub enum HostOut {
     /// Queue a host `wl_display.sync` here. Its `done` comes back as
     /// [`Input::BarrierDone`].
     Barrier(BarrierToken),
-    /// A [`Self::Barrier`] that the previous request and it reach the host
-    /// in one submission, which Exo dispatches in one read, so that no
-    /// event of Exo's falls between them.
-    GluedBarrier(BarrierToken),
-    /// Retire the host object the previous request destroyed.
-    Retire(u32),
+    /// `request`, then a [`Self::Barrier`], which reach the host in one
+    /// submission, which Exo dispatches in one read, so that no event of
+    /// Exo's falls between them.
+    Glued {
+        request: Outgoing,
+        barrier: BarrierToken,
+    },
+    /// `request`, the destructor of host object `id`, which is then
+    /// retired.
+    Destroy {
+        request: Outgoing,
+        id: u32,
+    },
 }
 
 /// What becomes of the Backspace repeat leased to a text input.
@@ -271,9 +275,6 @@ pub trait Env {
 #[derive(Debug, Default)]
 pub struct ImeCore {
     inputs: BTreeMap<TiId, state::TextInput>,
-    /// Each extension object's text input. Only `Create` and removal
-    /// change it.
-    by_ext: BTreeMap<u32, TiId>,
     next_barrier: u64,
 }
 
@@ -281,25 +282,17 @@ impl ImeCore {
     /// G1: text input `ti` of `seat`, with the host objects `host`, focused
     /// on `surface`, if any.
     fn insert(&mut self, ti: TiId, seat: SeatId, host: HostTi, surface: Option<SurfaceId>) {
-        // The guest cannot reuse a live text input's ID. Should one be
-        // replaced anyway, its extension goes with it, so that `by_ext`
-        // names only live text inputs (I4).
-        let replaced = self.forget(ti);
-        debug_assert!(replaced.is_none(), "{ti:?} exists already");
-        if let Some(ext) = host.ext {
-            self.by_ext.insert(ext.id, ti);
-        }
-        self.inputs
+        // The guest cannot reuse a live text input's ID.
+        let replaced = self
+            .inputs
             .insert(ti, state::TextInput::new(seat, host, surface));
+        debug_assert!(replaced.is_none(), "{ti:?} exists already");
     }
 
-    /// Forget text input `ti`, and its extension.
-    fn forget(&mut self, ti: TiId) -> Option<state::TextInput> {
-        let t = self.inputs.remove(&ti)?;
-        if let Some(ext) = t.host().ext {
-            self.by_ext.remove(&ext.id);
-        }
-        Some(t)
+    /// The text input whose host extension is `ext`.
+    fn by_ext(&self, ext: u32) -> Option<TiId> {
+        let mut inputs = self.inputs.iter();
+        inputs.find_map(|(&ti, t)| (t.host().ext.id == ext).then_some(ti))
     }
 }
 
@@ -349,7 +342,7 @@ impl ImeCore {
         history: &[StateForTest],
     ) -> Option<String> {
         let t = self.inputs.values().find(|t| t.host().v1 == v1)?;
-        let mirror = t.exo().mirror()?;
+        let mirror = t.exo().mirror();
         let exact = mirror.exact()?;
         let state = |(text, (start, end), composition): &StateForTest| mirror::ExoState {
             text: text.clone(),
@@ -404,7 +397,7 @@ impl ImeCore {
         Some(input.answer(ti))
     }
 
-    /// Check the invariants of design 3.1 (I1a to I4) that hold between
+    /// Check the invariants of design 3.1 (I1a to I3) that hold between
     /// steps, and that every pending barrier is one the core numbered,
     /// once. I5 is the adapter's. Test-only, so that a panicking check
     /// cannot be wired into production.
@@ -428,11 +421,5 @@ impl ImeCore {
             barriers.iter().all(|b| b.0 < self.next_barrier),
             "{barriers:?} holds a barrier the core never numbered"
         );
-        let extensions: BTreeMap<u32, TiId> = self
-            .inputs
-            .iter()
-            .filter_map(|(&ti, t)| Some((t.host().ext?.id, ti)))
-            .collect();
-        assert_eq!(self.by_ext, extensions, "I4");
     }
 }

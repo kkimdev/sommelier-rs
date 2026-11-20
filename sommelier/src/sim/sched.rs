@@ -251,8 +251,6 @@ pub(super) struct Setup<'a> {
     pub client: ClientKind,
     /// The input method is a Latin layout, which has no engine.
     pub latin: bool,
-    /// The text-input extension's version, if the host has one.
-    pub extension: Option<u32>,
     pub lag: Lag,
     /// The guest releases its keyboard and binds a new one once its text
     /// input is active, so the new one hears of the next focus move after
@@ -359,7 +357,7 @@ impl<'t> World<'t> {
             client: None,
             exo,
             engine: Engine::new(setup.lag),
-            display: Display::new(setup.extension, surfaces.clone()),
+            display: Display::new(surfaces.clone()),
             c_to_p: Channel::new(GUEST_LATENCY),
             p_to_c: Channel::new(GUEST_LATENCY),
             p_to_e: Channel::new(HOST_LATENCY),
@@ -430,7 +428,7 @@ impl<'t> World<'t> {
             ClientKind::Gtk4 => Box::new(Gtk::new(true, text_input, fields)),
         });
         let spec = SpecText::new(world.surfaces.clone(), setup.texts);
-        world.spec = Some(spec.at_extension(setup.extension));
+        world.spec = Some(spec);
         world.shadow = Some(Shadow::new(world.surfaces.clone(), setup.texts));
         world.act(UserAction::Focus(0));
         world.run(&[]).await;
@@ -816,7 +814,7 @@ impl<'t> World<'t> {
     /// What the proxy sent goes out on P→E and P→C. A surrounding text or a
     /// `reset` and the barrier right after it go together, as one
     /// submission, which Exo's display dispatches in one read
-    /// (`HostOut::GluedBarrier`).
+    /// (`HostOut::Glued`).
     fn send_proxy_output(&mut self, goes_on: bool) {
         let mut batch: Vec<(u32, AnyRequest)> = Vec::new();
         for (sender, request) in self.session.host_received() {

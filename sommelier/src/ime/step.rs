@@ -102,8 +102,8 @@ impl ImeCore {
             Input::Destroy { ti, host_deleted } => ending = self.destroy(ti, host_deleted, &mut fx),
             Input::HostLeave(ti) => self.host_leave(ti, &mut fx),
             Input::V1(ti, event) => self.host_event(ti, event, &mut fx),
-            Input::Ext { ext, event } => match self.by_ext.get(&ext) {
-                Some(&ti) => self.host_event(ti, event, &mut fx),
+            Input::Ext { ext, event } => match self.by_ext(ext) {
+                Some(ti) => self.host_event(ti, event, &mut fx),
                 None => log::debug!("Ignoring an event of retired extension {ext}"),
             },
             // W1 and W2: a token is one text input's drain or fence, or a
@@ -152,15 +152,13 @@ impl ImeCore {
         fx.to_host.push(HostOut::Request(
             zwp_text_input_manager_v1::req::create_text_input(manager, host.v1),
         ));
-        if let Some(ext) = host.ext {
-            fx.to_host.push(HostOut::Request(
-                zcr_text_input_extension_v1::req::get_extended_text_input(
-                    ext.manager,
-                    ext.id,
-                    host.v1,
-                ),
-            ));
-        }
+        fx.to_host.push(HostOut::Request(
+            zcr_text_input_extension_v1::req::get_extended_text_input(
+                host.ext.manager,
+                host.ext.id,
+                host.v1,
+            ),
+        ));
         // A text input created after the seat's keyboard took its focus
         // still needs that `enter`, or the client would wait for one.
         let surface = env.keyboard_focus(seat);
@@ -281,13 +279,13 @@ impl ImeCore {
 
     /// The end of G10: forget the text input and destroy its extension.
     fn remove(&mut self, ti: TiId, fx: &mut Effects) {
-        let Some(ext) = self.forget(ti).and_then(|t| t.host().ext) else {
+        let Some(ext) = self.inputs.remove(&ti).map(|t| t.host().ext) else {
             return;
         };
-        fx.to_host.extend([
-            HostOut::Request(zcr_extended_text_input_v1::req::destroy(ext.id)),
-            HostOut::Retire(ext.id),
-        ]);
+        fx.to_host.push(HostOut::Destroy {
+            request: zcr_extended_text_input_v1::req::destroy(ext.id),
+            id: ext.id,
+        });
     }
 
     /// H2 and H2'.
@@ -295,10 +293,9 @@ impl ImeCore {
         let Some(t) = self.inputs.get_mut(&ti) else {
             return;
         };
-        // Exo's detach confirmed the composition it tracked before its
-        // `leave` (E6), which committed the preedit the guest shows. One
-        // it still shows Exo no longer tracked (E4), below v11 of the
-        // extension, so the guest commits it here.
+        // Exo's detach confirmed before its `leave` (E6), which committed
+        // the preedit the guest shows. One it still shows that
+        // confirmation did not commit, so the guest commits it here.
         commit_shown(ti, t, fx);
         let Some(shown) = t.exo_detached() else {
             log::debug!("Text input {}: a leave answers our deactivate", ti.0);
@@ -419,10 +416,10 @@ impl ImeCore {
                     fx.to_guest.extend(events);
                     fx.to_guest.push(resend);
                     // Glued, as the mirror applies the reset at its fence.
-                    fx.to_host.extend([
-                        HostOut::Request(zwp_text_input_v1::req::reset(t.host().v1)),
-                        HostOut::GluedBarrier(fence),
-                    ]);
+                    fx.to_host.push(HostOut::Glued {
+                        request: zwp_text_input_v1::req::reset(t.host().v1),
+                        barrier: fence,
+                    });
                     t.exo_mut().cancel_sent(fence);
                     fx.keys.push(lease);
                 }
@@ -522,13 +519,11 @@ impl ImeCore {
                 let barrier = BarrierToken(self.next_barrier);
                 self.next_barrier += 1;
                 let one_read = request.0.len() + SYNC_LEN <= MAX_BYTES_PER_SEND;
-                fx.to_host
-                    .extend([HostOut::Request(request), HostOut::GluedBarrier(barrier)]);
+                fx.to_host.push(HostOut::Glued { request, barrier });
                 t.exo_mut().report_sent(barrier, report, one_read, stated);
             }
             if let Some(content_type) = steps.content_type {
-                let ext = host.ext.map(|e| (e.id, e.version));
-                let requests = host::content_type_requests(host.v1, ext, content_type);
+                let requests = host::content_type_requests(host.ext.id, content_type);
                 fx.to_host
                     .extend(requests.into_iter().map(HostOut::Request));
                 t.content_type_sent(content_type);
@@ -576,11 +571,7 @@ fn composition_event(
     // A region dropped, whose empty range commits the shown preedit.
     let mut dropped = None;
     let (planned, takes) = match event {
-        HostIme::Preedit {
-            serial,
-            text,
-            commit,
-        } => {
+        HostIme::Preedit { serial, text, .. } => {
             log_host_serial(serial, count);
             let assembly = cur.take_assembly();
             // The assembly's offsets index the text, which replacing
@@ -589,7 +580,7 @@ fn composition_event(
                 log::debug!("Ignoring a host preedit that is not UTF-8");
                 return None;
             };
-            (cur.preedit(text, commit, assembly), Takes::Before)
+            (cur.preedit(text, assembly), Takes::Before)
         }
         HostIme::Commit { serial, text } => {
             log_host_serial(serial, count);
@@ -611,7 +602,7 @@ fn composition_event(
                 // Exo is.
                 Err(DeleteDrop::Empty) => return Some(Edit::default()),
                 Err(drop) => {
-                    log_delete_drop(ti, t, index, length, drop);
+                    log_delete_drop(ti, index, length, drop);
                     // Exo edited its text, unless the range was empty.
                     if length > 0 {
                         fx.keys.push(lease(ti, t, LeaseOutcome::End));
@@ -636,7 +627,7 @@ fn composition_event(
                     (cur.commit_shown(), Takes::Before)
                 }
                 Err(drop) => {
-                    log_region_drop(ti, t, index, length, drop);
+                    log_region_drop(ti, index, length, drop);
                     // Exo edited its composition all the same.
                     fx.keys.push(lease(ti, t, LeaseOutcome::End));
                     return None;
@@ -657,7 +648,7 @@ fn composition_event(
     let edit = planned.edit();
     let applied = planned.apply();
     if let Some((index, length, drop)) = dropped {
-        log_region_drop(ti, t, index, length, drop);
+        log_region_drop(ti, index, length, drop);
     }
     let take = match takes {
         Takes::Before => false,
@@ -685,29 +676,14 @@ fn composition_event(
 
 /// The core drops a host `what`, a delete or a region, as the Exo mirror
 /// cannot measure it, for `why`. The event did not reach the guest, which
-/// is then out of step with Exo until its next report. The first drop for
-/// want of a mirror warns, as it is the host's limit.
-fn log_unmeasured(ti: TiId, t: &mut TextInput, what: &str, why: Unmeasured) {
+/// is then out of step with Exo until its next report.
+fn log_unmeasured(ti: TiId, what: &str, why: Unmeasured) {
     #[cfg(test)]
     DROPS.with(|drops| {
         let mut counted = drops.get();
         counted.count(why);
         drops.set(counted);
     });
-    if why == Unmeasured::NoMirror && t.first_no_mirror_warning() {
-        match t.host().ext {
-            Some(ext) => log::warn!(
-                "Host text-input extension v{} < 11: Exo's deletes and regions of text input {} \
-                 are dropped",
-                ext.version,
-                ti.0
-            ),
-            None => log::warn!(
-                "Host has no text-input extension: Exo's deletes of text input {} are dropped",
-                ti.0
-            ),
-        }
-    }
     log::debug!("Dropping Exo's {what} of text input {}: {why:?}", ti.0);
 }
 
@@ -716,7 +692,6 @@ fn log_unmeasured(ti: TiId, t: &mut TextInput, what: &str, why: Unmeasured) {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Drops {
-    pub(crate) no_mirror: u64,
     pub(crate) unsure: u64,
     pub(crate) unseen: u64,
     pub(crate) crossing: u64,
@@ -727,7 +702,6 @@ pub(crate) struct Drops {
 impl Drops {
     fn count(&mut self, why: Unmeasured) {
         *match why {
-            Unmeasured::NoMirror => &mut self.no_mirror,
             Unmeasured::Unsure => &mut self.unsure,
             Unmeasured::Unseen => &mut self.unseen,
             Unmeasured::Crossing => &mut self.crossing,
@@ -735,8 +709,8 @@ impl Drops {
         } += 1;
     }
 
-    /// The drops of a text input with a mirror: every cause but its want.
-    pub(crate) fn mirrored(&self) -> u64 {
+    /// Every drop.
+    pub(crate) fn total(&self) -> u64 {
         self.unsure + self.unseen + self.crossing + self.out_of_step
     }
 }
@@ -744,7 +718,6 @@ impl Drops {
 #[cfg(test)]
 impl std::ops::AddAssign for Drops {
     fn add_assign(&mut self, other: Self) {
-        self.no_mirror += other.no_mirror;
         self.unsure += other.unsure;
         self.unseen += other.unseen;
         self.crossing += other.crossing;
@@ -822,9 +795,9 @@ fn log_host_serial(serial: u32, count: u32) {
 
 /// X1's drops. One around no cursor is one Exo could not have sent, which
 /// warns.
-fn log_region_drop(ti: TiId, t: &mut TextInput, index: i32, length: u32, drop: RegionDrop) {
+fn log_region_drop(ti: TiId, index: i32, length: u32, drop: RegionDrop) {
     match drop {
-        RegionDrop::Unmeasured(why) => log_unmeasured(ti, t, "region", why),
+        RegionDrop::Unmeasured(why) => log_unmeasured(ti, "region", why),
         RegionDrop::Uncovered => log::debug!(
             "Ignoring a preedit region {index}+{length} of text input {}: {drop:?}",
             ti.0
@@ -838,9 +811,9 @@ fn log_region_drop(ti: TiId, t: &mut TextInput, index: i32, length: u32, drop: R
 
 /// H9's drops. A range around no cursor is one Exo could not have sent,
 /// which the mirror's divergence already warned of.
-fn log_delete_drop(ti: TiId, t: &mut TextInput, index: i32, length: u32, drop: DeleteDrop) {
+fn log_delete_drop(ti: TiId, index: i32, length: u32, drop: DeleteDrop) {
     if let DeleteDrop::Unmeasured(why) = drop {
-        return log_unmeasured(ti, t, "delete", why);
+        return log_unmeasured(ti, "delete", why);
     }
     log::debug!(
         "Ignoring v1 delete range {index}+{length} of text input {}: {drop:?}",

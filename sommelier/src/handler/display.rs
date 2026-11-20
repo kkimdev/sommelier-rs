@@ -342,9 +342,7 @@ mod tests {
     /// its extension is a host object of its own, which it still destroys.
     #[tokio::test]
     async fn a_host_destroyed_text_input_sends_nothing_to_its_host_object() {
-        use crate::protocols::text_input_extension_unstable_v1::{
-            zcr_extended_text_input_v1, zcr_text_input_extension_v1,
-        };
+        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
         use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
         use crate::protocols::wayland::wl_keyboard;
         use crate::proxy::harness::Session;
@@ -355,15 +353,8 @@ mod tests {
         s.host([wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap()])
             .await;
         assert_eq!(s.guest_received().len(), 2, "the enter and its modifiers");
-        s.advertise(
-            "zcr_text_input_extension_v1",
-            zcr_text_input_extension_v1::VERSION,
-        )
-        .await;
-        // The proxy binds the extension for itself.
-        s.host_received();
         let text_input = s.text_input(seat).await;
-        let extension = text_input.ext.expect("an extended text input");
+        let extension = text_input.ext;
         let enter = zwp_text_input_v3::Event::Enter {
             surface: surface.id,
         };

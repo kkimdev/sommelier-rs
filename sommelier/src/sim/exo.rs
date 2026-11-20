@@ -19,9 +19,10 @@ limitations under the License.
 //! Exo, the ChromeOS compositor, applies a text-input request against state
 //! the proxy cannot see: it drops a content type while no input method is
 //! attached, and spends a pending surrounding-text support on the next
-//! content type. A generic compositor exposes none of that, so the fuzzer's
-//! compositor keeps this model of each host `zwp_text_input_v1` to compare
-//! with what the guest committed, and plays the rest of the host itself.
+//! content type. A generic compositor exposes none of that, so the DST
+//! holds the guest's committed fields to this model of each host
+//! `zwp_text_input_v1`, and the fuzzer's compositor plays the rest of the
+//! host itself around it.
 //!
 //! The simulation also gives the model the seat's keyboard, the user's
 //! keys and the answers of the input method engine ([`super::engine`]), and
@@ -33,8 +34,7 @@ limitations under the License.
 //! unhandled one after, confirms the composition before an unhandled press
 //! and when the text input it serves changes or detaches, and drops the
 //! buffer on a reset. A key goes raw while IMA serves no text input. The
-//! extension's version is the one the proxy binds; a case draws the one
-//! the host advertises ([`draw_extension_version`]). Answers that belong to
+//! extension's version is the one the proxy binds. Answers that belong to
 //! the display, a sync's `done` and the `delete_id` of a destroyed object,
 //! are left to whoever plays it, as is the keyboard's focus in the fuzzer.
 //! The model is a test oracle, not a reimplementation: it keeps only the
@@ -83,7 +83,6 @@ use super::clock::Micros;
 use super::engine::{EngineIn, EngineOut, Request, TextAction};
 use super::hangul::Key;
 use super::keymap;
-use super::sched::Choose;
 use crate::protocols::keyboard_extension_unstable_v1::{
     zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
 };
@@ -99,7 +98,7 @@ use std::ops::Range;
 
 /// What one Exo `TextInput` holds for its field.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Field {
+pub(super) struct Field {
     /// Whether an input method is attached (`input_method_` is set).
     pub attached: bool,
     pub content_type: ContentType,
@@ -112,7 +111,7 @@ pub(crate) struct Field {
 /// A content type as `SetTypeModeFlags` takes it, in the extension's wire
 /// values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ContentType {
+pub(super) struct ContentType {
     pub input_type: u32,
     pub input_mode: u32,
     pub flags: u32,
@@ -123,7 +122,7 @@ pub(crate) struct ContentType {
 /// The content type `text_input_set_content_type` makes of a v1 `hint`
 /// and `purpose`, with each `ui::` value written as the extension's value
 /// of the same name.
-pub(crate) fn v1_content_type(hint: u32, purpose: u32) -> ContentType {
+pub(super) fn v1_content_type(hint: u32, purpose: u32) -> ContentType {
     use zwp_text_input_v1 as v1;
     let hint_flags = [
         (
@@ -493,15 +492,6 @@ impl TextInput {
     }
 }
 
-/// The `zcr_text_input_extension_v1` version a case's host advertises, if
-/// any. Exo advertises v14, which the proxy binds at v11, its newest, so 11
-/// comes first and stands for Exo; the older versions and none test that
-/// the proxy copes with other hosts, one for each way it sends a content
-/// type or a confirmation.
-pub(super) fn draw_extension_version(choices: &mut impl Choose) -> Option<u32> {
-    [Some(11), None, Some(7), Some(10)][choices.pick(4) as usize]
-}
-
 /// The seat's `wl_keyboard`. A case has one, as a client binds one.
 #[derive(Clone, Copy)]
 struct Keyboard {
@@ -617,9 +607,6 @@ pub(crate) struct Exo {
     region_outcome: Option<RegionOutcome>,
     /// The seat's observers registered so far (E12).
     observers: u64,
-    /// The ranges IMA held for a key and sent after that key's commit, so
-    /// that they compose the committed text.
-    pub(super) regions_stale: u64,
     /// Each text input's tracker when the display answered a
     /// `wl_display.sync`, with the sync's callback, in order
     /// ([`Exo::snapshot_trackers`]).
@@ -1132,7 +1119,7 @@ impl Exo {
     }
 
     /// The fields of the text inputs active on the focused surface.
-    pub(crate) fn focused_fields(&self) -> Vec<Field> {
+    pub(super) fn focused_fields(&self) -> Vec<Field> {
         self.text_inputs
             .values()
             .filter(|text_input| self.focus.is_some() && text_input.surface == self.focus)
@@ -1370,7 +1357,6 @@ impl Exo {
         }
         let region = self.ima.region.take();
         if let Some((before, after)) = region {
-            self.regions_stale += u64::from(commit.is_some());
             self.ima.composing |= self.set_composition_from_existing_text(id, before, after);
         }
         commit.is_some() || composition.is_some() || region.is_some()
@@ -1664,7 +1650,8 @@ impl Exo {
     /// (`SupportsConfirmPreedit`).
     fn confirming_extension(&self, id: u32) -> Option<u32> {
         let extension = self.extension_of(id)?;
-        (self.extension_version >= Some(11)).then_some(extension)
+        let since = extended::EVT_CONFIRM_PREEDIT_SINCE;
+        (self.extension_version >= Some(since)).then_some(extension)
     }
 
     /// The extension of text input `id`, if it has one.
@@ -1753,8 +1740,8 @@ mod tests {
     const TI2: u32 = 40;
     const REGISTRY: u32 = 6;
     /// Extension versions with `confirm_preedit` and without it.
-    const V11: u32 = 11;
-    const V10: u32 = 10;
+    const V11: u32 = extended::EVT_CONFIRM_PREEDIT_SINCE;
+    const V10: u32 = V11 - 1;
     /// The time of every key, and its milliseconds.
     const NOW: Micros = Micros(7_000);
     const MS: u32 = 7;
@@ -2590,7 +2577,6 @@ mod tests {
             handled: true,
         });
         events(&mut exo);
-        assert_eq!(exo.regions_stale, 1);
         // While IMA takes the engine to compose, a delete is dropped.
         exo.ask(Request::AcceptSuggestion);
         exo.take_engine();
@@ -3058,12 +3044,6 @@ mod tests {
         };
         let expected = [modifiers(KEYBOARD2, 1, 0), (KEYBOARD2, enter.into())];
         assert_eq!(events(&mut exo), expected);
-    }
-
-    #[test]
-    fn a_case_draws_the_extension_version() {
-        let versions = [0, 1, 2, 3].map(|choice| draw_extension_version(&mut |_| choice));
-        assert_eq!(versions, [Some(V11), None, Some(7), Some(V10)]);
     }
 
     #[test]
