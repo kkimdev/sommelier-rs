@@ -115,6 +115,7 @@ impl ImeCore {
                 .values_mut()
                 .filter(|t| t.seat() == seat)
                 .for_each(|t| t.exo_mut().guest_edited()),
+            Input::HeldKeyRecovered { ti, pair } => self.held_key_recovered(ti, pair, &mut fx),
         }
         self.reconcile_all(commit, env, &mut fx);
         if let Some(t) = handled.and_then(|ti| self.inputs.get_mut(&ti)) {
@@ -294,6 +295,8 @@ impl ImeCore {
             return;
         };
         log::info!("Exo detached the input method of text input {}", ti.0);
+        fx.keys
+            .push(KeyEffect::InputMethodDetached { seat: t.seat() });
         // Only a preedit whose commit does not fit a message is left.
         if shown {
             let clear = GuestTxn::default().encode(ti, true, t.serial());
@@ -320,6 +323,20 @@ impl ImeCore {
         let measuring = t.exo().measuring(&frame);
         let reached = composition_event(ti, t, edit, &pieces, measuring, fx);
         t.exo_after(frame.as_ref().ok(), reached);
+    }
+
+    /// X2': the guest gets the recovered key's `pair`, then G9c's answer,
+    /// if the text input still passes the gate, which the keyboard concern
+    /// checked before it recovered the key.
+    fn held_key_recovered(&mut self, ti: TiId, pair: Vec<Outgoing>, fx: &mut Effects) {
+        let Some(t) = self.inputs.get_mut(&ti).filter(|t| t.is_current()) else {
+            log::debug!("Text input {} no longer admits its recovered key", ti.0);
+            return;
+        };
+        // The key may edit the guest's text.
+        t.exo_mut().guest_edited();
+        fx.to_guest.extend(pair);
+        fx.to_guest.extend(t.answer(ti));
     }
 
     /// F1, per text input of the seat, in `TiId` order. The field the

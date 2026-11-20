@@ -33,7 +33,7 @@ use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1::Request as V1Manager;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::{self, Request as V1};
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{self, Event as V3};
-use crate::protocols::wayland::wl_pointer;
+use crate::protocols::wayland::{wl_keyboard, wl_pointer};
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::test_support::decoded;
 
@@ -47,6 +47,8 @@ const OTHER: SurfaceId = SurfaceId(21);
 const HOST_OTHER: u32 = 121;
 /// The guest pointer whose press [`Ime::press`] re-sends.
 const POINTER: u32 = 40;
+/// The guest keyboard of a recovered key.
+const KEYBOARD: u32 = 41;
 /// The host `zwp_text_input_manager_v1`; the extension's manager is 3.
 const MANAGER: u32 = 2;
 
@@ -78,6 +80,7 @@ fn interface(id: u32) -> &'static str {
         200..300 => "zwp_text_input_v1",
         300..400 => "zcr_extended_text_input_v1",
         POINTER => "wl_pointer",
+        KEYBOARD => "wl_keyboard",
         _ => "zwp_text_input_v3",
     }
 }
@@ -118,6 +121,8 @@ enum Host {
 enum Key {
     Lease(TiId, LeaseOutcome),
     Recover(TiId),
+    /// H2 on the seat of every test.
+    Detached,
 }
 
 /// The effects of one step, decoded.
@@ -189,6 +194,10 @@ fn decode(fx: Effects) -> Out {
             KeyEffect::RecoverHeldKey { ti, seat } => {
                 assert_eq!(seat, SEAT);
                 Key::Recover(ti)
+            }
+            KeyEffect::InputMethodDetached { seat } => {
+                assert_eq!(seat, SEAT);
+                Key::Detached
             }
         })
         .collect();
@@ -1141,7 +1150,7 @@ fn row_H2_an_exo_detach_commits_the_preedit_and_activates_again() {
     ime.compose("가");
     let out = ime.step(Input::HostLeave(TI));
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
-    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End), Key::Detached]);
     let mut host = vec![req(
         v1(TI),
         V1::Activate {
@@ -1166,7 +1175,8 @@ fn row_H2_a_confirmed_composition_is_committed_once() {
     });
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
     let out = ime.step(Input::HostLeave(TI));
-    assert!(out.guest.is_empty() && out.keys.is_empty());
+    assert!(out.guest.is_empty());
+    assert_eq!(out.keys, [Key::Detached]);
     // So does a commit of the composition.
     let mut ime = Ime::enabled();
     ime.compose("가");
@@ -1175,7 +1185,21 @@ fn row_H2_a_confirmed_composition_is_committed_once() {
         text: "가".into(),
     });
     let out = ime.step(Input::HostLeave(TI));
-    assert!(out.guest.is_empty() && out.keys.is_empty());
+    assert!(out.guest.is_empty());
+    assert_eq!(out.keys, [Key::Detached]);
+}
+
+/// Exo's own detach ends the recovery of the seat's held keys whatever
+/// the fence: a press's reset fence closes the gate, not the link.
+#[test]
+fn row_H2_an_exo_detach_behind_a_press_fence_forgets_the_held_keys() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let fence = ime.press(SURFACE).barriers();
+    assert_eq!(fence.len(), 1);
+    let out = ime.step(Input::HostLeave(TI));
+    assert!(out.guest.is_empty());
+    assert_eq!(out.keys, [Key::Detached]);
 }
 
 #[test]
@@ -1183,12 +1207,12 @@ fn row_H2prime_a_leave_that_answers_a_deactivate_is_ignored() {
     let mut ime = Ime::new();
     ime.create(TI);
     let out = ime.step(Input::HostLeave(TI));
-    assert!(out.host.is_empty() && out.guest.is_empty());
+    assert!(out.host.is_empty() && out.guest.is_empty() && out.keys.is_empty());
     ime.enable(TI);
     ime.step(Input::Disable(TI));
     ime.step(Input::Commit(TI));
     let out = ime.step(Input::HostLeave(TI));
-    assert!(out.host.is_empty() && out.guest.is_empty());
+    assert!(out.host.is_empty() && out.guest.is_empty() && out.keys.is_empty());
 }
 
 #[test]
@@ -1397,21 +1421,6 @@ fn row_H9_a_delete_that_cannot_be_measured_is_dropped() {
         let ended = (length > 0).then_some(lease(LeaseOutcome::End));
         assert_eq!(out.keys, Vec::from_iter(ended), "{case}");
     }
-}
-
-#[test]
-fn an_attached_input_has_its_seat_whatever_its_fence() {
-    let mut ime = Ime::new();
-    ime.create(TI);
-    assert_eq!(ime.core.attached_seat(TI), None);
-    ime.enable(TI);
-    assert_eq!(ime.core.attached_seat(TI), Some(SEAT));
-    ime.compose("가");
-    ime.press(SURFACE);
-    assert_eq!(ime.core.attached_seat(TI), Some(SEAT));
-    ime.step(Input::Disable(TI));
-    ime.step(Input::Commit(TI));
-    assert_eq!(ime.core.attached_seat(TI), None);
 }
 
 #[test]
@@ -1630,25 +1639,37 @@ fn row_X2prime_an_empty_confirmation_recovers_the_held_key() {
 
 /// X2': the keyboard concern recovers the held key at the host's next
 /// event, after guest requests the core has handled since the
-/// confirmation. The transaction that follows the key is the guest's state
-/// under the serial of then; with the gate closed there is none.
+/// confirmation. The key's pair, then the guest's state under the serial
+/// of then, follow; with the gate closed, which the core admits no
+/// recovery behind, nothing does.
 #[test]
 fn row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery() {
     let mut ime = Ime::enabled();
     ime.ext(Edit::Confirm {
         keep_selection: true,
     });
-    let done_now = |ime: &mut Ime| {
-        let done = ime.core.recovery_done(TI);
-        done.map(|done| guest_events(&done))
+    let key = |state| wl_keyboard::evt::key(KEYBOARD, 7, 8, 30, state);
+    let recovered = |ime: &mut Ime, pair: Vec<Outgoing>| {
+        let admitted = ime.core.admits_recovery(TI);
+        let out = ime.step(Input::HeldKeyRecovered { ti: TI, pair });
+        assert!(out.host.is_empty() && out.keys.is_empty());
+        admitted.then_some(out.guest)
     };
-    assert_eq!(done_now(&mut ime), Some(vec![done(1)]));
+    let pair = vec![key(1), key(0)];
+    let mut expected = guest_events(&pair);
+    expected.push(done(1));
+    assert_eq!(recovered(&mut ime, pair), Some(expected));
     ime.report("ab", 1);
-    assert_eq!(done_now(&mut ime), Some(vec![done(2)]));
+    assert_eq!(recovered(&mut ime, Vec::new()), Some(vec![done(2)]));
+    // The guest states the key's effect in its next report.
     ime.step(Input::Disable(TI));
     ime.step(Input::Commit(TI));
-    assert_eq!(done_now(&mut ime), None);
-    assert!(ime.core.recovery_done(TiId(TI.0 + 1)).is_none());
+    assert!(!ime.core.admits_recovery(TI));
+    assert!(!ime.core.admits_recovery(TiId(TI.0 + 1)));
+    // The core checks the gate again: a pair behind it reaches no guest.
+    let pair = vec![key(1), key(0)];
+    let out = ime.step(Input::HeldKeyRecovered { ti: TI, pair });
+    assert!(out.guest.is_empty() && out.host.is_empty() && out.keys.is_empty());
 }
 
 /// B3: a region takes the highlight Exo sent before it, so the next

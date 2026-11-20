@@ -20,6 +20,7 @@ use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
 use crate::state::{Context, HostId, InternalCallback, ShadowTable};
+use crate::wire::Outgoing;
 use std::collections::BTreeMap;
 
 /// Return whether the repeat fallback belongs to this physical host
@@ -222,13 +223,13 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
     })
 }
 
-/// Send the guest a press and a release of the held key the host input
-/// method consumed, unless another channel already delivered it.
+/// The press and the release of the held key the host input method
+/// consumed, for the guest, unless another channel already delivered it.
 ///
 /// Both carry the serial and time of the key's latest `peek_key`, which
 /// are those of the `wl_keyboard.key` Exo would have sent; see
 /// INVARIANTS "A recovered key carries the host's serial".
-pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> bool {
+fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> Vec<Outgoing> {
     if !ctx.key_generations.recover(held.host_keyboard_id, held.key) {
         // The normal wl_keyboard path already delivered this physical
         // generation to the guest. The confirmation still closes a
@@ -238,21 +239,22 @@ pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepe
             held.key,
             held.host_keyboard_id.0
         );
-        return false;
+        return Vec::new();
     }
-    for state in [
+    [
         wl_keyboard::KEY_STATE_PRESSED,
         wl_keyboard::KEY_STATE_RELEASED,
-    ] {
-        ctx.host_to_client_queue.push(wl_keyboard::evt::key(
+    ]
+    .map(|state| {
+        wl_keyboard::evt::key(
             held.guest_keyboard_id,
             held.serial,
             held.time,
             held.key,
             state,
-        ));
-    }
-    true
+        )
+    })
+    .into()
 }
 
 /// X2': an empty confirmation's recovery of a held key, which waits until
@@ -551,8 +553,7 @@ pub(crate) fn recover_pending(ctx: &mut Context) {
         && ctx
             .key_generations
             .physically_held(held.host_keyboard_id, held.key);
-    let done = keyboard_held.then(|| ctx.ime.recovery_done(ti)).flatten();
-    let Some(done) = done else {
+    if !(keyboard_held && ctx.ime.admits_recovery(ti)) {
         end_backspace_repeat_for_text_input(ctx, seat.0, ti.0);
         log::debug!(
             "Dropping the recovery of held key {} for text input {}, which no longer \
@@ -561,9 +562,10 @@ pub(crate) fn recover_pending(ctx: &mut Context) {
             ti.0
         );
         return;
-    };
+    }
     let backspace = held.key == crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
-    if synthesize_ime_consumed_key_pair(ctx, held) {
+    let pair = synthesize_ime_consumed_key_pair(ctx, held);
+    if !pair.is_empty() {
         if backspace {
             // A press since the confirmation may have cancelled the repeat,
             // as it would have right after an immediate recovery.
@@ -582,8 +584,8 @@ pub(crate) fn recover_pending(ctx: &mut Context) {
     // GTK waits for the matching text-input transaction to finish before
     // applying a key that passed through the active IME. A v1 confirm with
     // no preedit has no text mutation, so its v3 equivalent is the guest's
-    // state again.
-    ctx.host_to_client_queue.extend(done);
+    // state again, which the IME core sends after the pair.
+    crate::handler::text_input::ime(ctx, crate::ime::Input::HeldKeyRecovered { ti, pair });
 }
 
 /// H2: the input method detached text input on its own, as when its

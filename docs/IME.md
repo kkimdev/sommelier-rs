@@ -182,7 +182,7 @@ text input before the gate, as each one changed Exo's text.
 | ID | Event | Precondition | Guest events | Next state / notes | On encode failure | Sources |
 |---|---|---|---|---|---|---|
 | H1 | v1 `enter(surface)` | any | none | No change. While attached, it answers the proxy's own `activate`. | n/a | INVARIANTS "The host gets each content type…" |
-| H2 | v1 `leave` | `Attached` | If `shown = Some(p)`: `Txn{commit: p, preedit: none}`. Exo's detach confirms first (E6), which commits the shown preedit (X2). So a preedit still shown is one that confirmation did not commit, which the DST reaches only in rare races; the guest commits it, so a restart of the input method keeps the user's text. Nothing is committed twice. | Link → `Detached` (Exo's own detach). The commit, as at X2, ends the lease. The composition is cleared. The fence stays. The reconcile then activates again if the field still wants input. | A commit that does not fit only clears the preedit. | INVARIANTS same rule; Exo `TextInput::OnSurfaceFocused`, `OnSurfaceDestroying` and `OnInputMethodDestroyed` [F]; tests: `row_H2_an_exo_detach_commits_the_preedit_and_activates_again`, `row_H2_a_confirmed_composition_is_committed_once`, `an_exo_detach_commits_the_guest_preedit` |
+| H2 | v1 `leave` | `Attached` | If `shown = Some(p)`: `Txn{commit: p, preedit: none}`. Exo's detach confirms first (E6), which commits the shown preedit (X2). So a preedit still shown is one that confirmation did not commit, which the DST reaches only in rare races; the guest commits it, so a restart of the input method keeps the user's text. Nothing is committed twice. | Link → `Detached` (Exo's own detach). The commit, as at X2, ends the lease. The composition is cleared. The fence stays. `KeyEffect::InputMethodDetached` tells the keyboard concern that the seat's held keys are recovered no more (INVARIANTS "An empty confirmation recovers a held key only once the host shows it repeated"). The reconcile then activates again if the field still wants input. | A commit that does not fit only clears the preedit. | INVARIANTS same rule; Exo `TextInput::OnSurfaceFocused`, `OnSurfaceDestroying` and `OnInputMethodDestroyed` [F]; tests: `row_H2_an_exo_detach_commits_the_preedit_and_activates_again`, `row_H2_a_confirmed_composition_is_committed_once`, `an_exo_detach_commits_the_guest_preedit` |
 | H2' | v1 `leave` | `Draining` or `Detached` | none | Ignored: it answers the proxy's own `deactivate`. | n/a | same |
 | H3 | `modifiers_map`, `input_panel_state`, `language`, `text_direction` | any | none | Ignored. | n/a | the adapter's handlers of the same names |
 | H4 | `preedit_styling(i, l, style)` | any | none | Recorded among the pieces (B3). The next preedit or region shows the last span of style `SELECTION` as its cursor; the mirror reads the `HIGHLIGHT` spans. | n/a | row test: `row_H4_a_selection_style_becomes_the_preedit_cursor` |
@@ -196,7 +196,7 @@ text input before the gate, as each one changed Exo's text.
 | X1 | ext `set_preedit_region(index, length)` | Gate; measured as H9 is | `Txn{delete: (before, after), preedit: (region, cursor)}` | Measured in the mirror's state before the event, under H9's conditions. `G` is the region from Exo's selection end, in Exo's text, which holds its composition inline (E4). An empty `G` commits the composition Exo holds, which the guest shows (`Txn{commit: p, preedit: none}`), or else edits nothing. A `G` that covers the composition, or Exo's cursor with none, gives `Txn{delete: (H.start − G.start, G.end − H.end), preedit: G}`, with the preedit cursor from the pieces or Exo's cursor. It deletes only the bytes beyond the composition on each side, which the guest has, and shows them with it. A region over a region is the case where the composition is the last region. `shown := G`, or none; the lease ends. A `G` that does not cover the composition, one short on either side included, is dropped with a debug log: Exo would leave the rest of the composition as text. A dropped region, measured or not, ends the lease, as Exo edited; and Exo ends its composition at an empty one whether or not the core can measure it, so a dropped empty region with a preedit shown commits it as an empty `G` does (`Txn{commit: shown}`), which may double text but never loses it. Row tests: `row_X1_a_preedit_region_turns_text_into_the_preedit`, `an_unmeasured_empty_region_commits_the_shown_preedit`, `row_H9_X1_a_dropped_delete_or_region_ends_the_lease`, `row_X1_a_region_after_an_unreported_commit_is_measured_in_exos_text`, `row_X1_a_region_after_an_e4_drop_holds_no_preedit`, `row_X1_a_region_made_before_a_report_is_measured_before_it`, `row_X1_a_region_crossing_a_guest_edit_drops`, `row_X1_a_mirror_that_is_not_exact_drops`, `row_X1_a_mirror_that_diverges_warns_once`, `row_X1_after_a_confirm_inside_the_composition_drops`. | Dropped. | Exo's region is cursor-relative [F]; `SurroundingTextTracker::OnSetCompositionFromExistingText` keeps an empty composition [F]; tests: `on_set_preedit_region_translates_correctly`, `a_region_over_a_region_drops`, `a_region_over_a_host_preedit_is_measured_from_exos_cursor`, `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`, `a_region_that_does_not_cover_a_host_preedit_is_dropped`, `a_region_that_does_not_cover_the_shown_one_is_dropped`, `an_empty_region_over_a_held_preedit_commits_it`, `an_answer_that_cannot_repeat_the_preedit_forgets_it` |
 | X1' | ext `set_preedit_region` | any other case | none | Dropped, as H9 drops. | n/a | same |
 | X2 | ext `confirm_preedit` | Gate; `shown = Some(p)` | `Txn{commit: p, preedit: none}` | `shown := none`; the lease ends. | Dropped. (`p` was encoded once, so this cannot happen in practice.) | Exo confirms instead of committing [F] |
-| X2' | ext `confirm_preedit` | Gate; `shown = None` | Through the keyboard concern, if the seat has an eligible held key and the host's next event shows the confirmation to be that key's autorepeat, not Exo's confirmation before a new press (E13, E8). Then the key's press and release go, unless another channel already delivered it, then the G9c answer under the serial of then (`ImeCore::recovery_done`), if the text input still passes the gate and the key is held. Otherwise nothing is sent. **The `done` goes whenever the key is recovered, even when its pair is skipped.** | `KeyEffect::RecoverHeldKey`. [KEYBOARD.md](KEYBOARD.md#the-recovery-decision) owns the decision, and INVARIANTS "An empty confirmation recovers a held key only once the host shows it repeated" its rule, Exo's own detach (H2) included. **Lease:** armed if a held Backspace's pair is sent; ended if a held Backspace's pair is skipped, if another held key's pair is sent, or if no key is held; left alone if another held key's pair is skipped. The eligible key is the held key with the latest peek. | n/a | INVARIANTS "A recovered key carries the host's serial"; row test: `row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery`; tests: `a_key_held_across_a_detach_is_typed_and_recovered_again`, `keys_held_since_enter_are_ordered_by_their_peeks` |
+| X2' | ext `confirm_preedit` | Gate; `shown = None` | Through the keyboard concern, if the seat has an eligible held key and the host's next event shows the confirmation to be that key's autorepeat, not Exo's confirmation before a new press (E13, E8). Then, if the key is held and the text input still passes the gate (`ImeCore::admits_recovery`), the keyboard concern hands the core the key's press and release, empty if another channel already delivered it, as `Input::HeldKeyRecovered`; the core sends them, then the G9c answer under the serial of then. Otherwise nothing is sent. **The `done` goes whenever the key is recovered, even when its pair is skipped.** | `KeyEffect::RecoverHeldKey`. [KEYBOARD.md](KEYBOARD.md#the-recovery-decision) owns the decision, and INVARIANTS "An empty confirmation recovers a held key only once the host shows it repeated" its rule, Exo's own detach (H2) included. **Lease:** armed if a held Backspace's pair is sent; ended if a held Backspace's pair is skipped, if another held key's pair is sent, or if no key is held; left alone if another held key's pair is skipped. The eligible key is the held key with the latest peek. | n/a | INVARIANTS "A recovered key carries the host's serial"; row test: `row_X2prime_a_recovered_key_is_closed_under_the_serial_of_its_recovery`; tests: `a_key_held_across_a_detach_is_typed_and_recovered_again`, `keys_held_since_enter_are_ordered_by_their_peeks` |
 | X3 | ext grammar, autocorrect and occluded-bounds events | any | none | Ignored. | n/a | the adapter's handlers of the same names |
 | W1 | `wl_callback.done` of a drain barrier | `Draining{b}` | none | Link → `Detached`. The final reconcile then activates if the field wants input. | n/a | |
 | W2 | `wl_callback.done` of a reset fence | `fence = Some(f)` | none | `fence := None`, **in any link state**: the fence lives beside the link. | n/a | INVARIANTS press rule ("A focus change or the text input's end does not end it early") |
@@ -281,7 +281,7 @@ invariants, and how each guarantee is enforced.
 
 | File | Holds |
 |---|---|
-| `mod.rs` | The public API: `ImeCore` (`step`, `attached_seat`, `recovery_done`, `assert_invariants`), `Input`, `HostIme` (a `Piece` or an `Edit`), `V1Pieces`, `Effects`, `HostOut`, `KeyEffect`, `LeaseOutcome`, `Env` and the ID newtypes |
+| `mod.rs` | The public API: `ImeCore` (`step`, `admits_recovery`, `assert_invariants`), `Input`, `HostIme` (a `Piece` or an `Edit`), `V1Pieces`, `Effects`, `HostOut`, `KeyEffect`, `LeaseOutcome`, `Env` and the ID newtypes |
 | `state.rs` | `TextInput` and its parts (`Field`, `LinkState`, `Composition`, `Warned`), `V3Pending`, `V3Committed`, and the gate (`Current`, `Planned`). The fields are private to this file, and every transition is a named method of `TextInput`. |
 | `serial.rs` | `CommitCount` and `Serial`: no public constructor, and one bump |
 | `step.rs` | `step`: one exhaustive match on `Input`, the end-of-step reconcile, removals and the trace log |
@@ -450,14 +450,15 @@ seat's end is the one exception (2.3, after R2).
 - The G9c answer is a `GuestTxn` of the shown preedit alone, encoded
   with `shown_before` false: it sends no clear, and it repeats the shown
   preedit even when unchanged. The transaction after a recovered key
-  (X2', `ImeCore::recovery_done`) is the same answer; with nothing shown
-  it is the bare `done` of the same encoder.
+  (X2', `Input::HeldKeyRecovered`) is the same answer; with nothing
+  shown it is the bare `done` of the same encoder.
 
 A step returns its `Effects`, each list in order:
 
 - `to_guest`: guest events. Every IME transaction ends with its `done`.
   A press that ended a composition (F4) is re-sent here, after its
-  transaction, and so are the keyboard events of a focus change (F1).
+  transaction, and so are the keyboard events of a focus change (F1) and
+  the pair of a recovered key (X2').
 - `to_host`: `HostOut`s. A `Request`; a `Barrier`, a host
   `wl_display.sync` whose `done` comes back as `Input::BarrierDone`; a
   `Glued`, a request and a barrier that go out in one submission
@@ -466,8 +467,9 @@ A step returns its `Effects`, each list in order:
   adapter retires the host object it destroyed. Each carries its
   request, so the pairing holds by construction.
 - `keys`: `KeyEffect`s for the keyboard concern, applied after the
-  other two: a `Lease` outcome (`End` or `ArmIfBackspaceHeld`), or
-  `RecoverHeldKey` (X2').
+  other two: a `Lease` outcome (`End` or `ArmIfBackspaceHeld`),
+  `RecoverHeldKey` (X2'), or `InputMethodDetached` (H2), which ends the
+  recovery of every key the seat holds.
 - `forward`: whether the press of an `Input::Press` is forwarded, since
   it ended no composition. The core consumes every other input's
   message.
@@ -476,8 +478,9 @@ A step returns its `Effects`, each list in order:
 
 `ime::Input` has one variant per trigger. The guest's requests are G1 to
 G10, the host's events H, X and W, and the cross-concern messages F1 to
-F5. [DESIGN.md](DESIGN.md#keyboard-and-ime) lists the module that sends
-each one.
+F5 and the recovered key of X2' (`Input::HeldKeyRecovered`).
+[DESIGN.md](DESIGN.md#keyboard-and-ime) lists the module that sends each
+one.
 
 **Why `Env` and not more inputs.** Seat liveness and surface pairing
 belong to the object table, and keyboard focus belongs to

@@ -544,8 +544,9 @@ end, the events of the host's `zwp_text_input_v1` and its extension, the
 `done` of the core's drain barriers and reset fences, each seat's
 keyboard focus change (`keyboard.rs`), a surface's end (`compositor.rs`),
 a `wl_seat` bind (`registry.rs`) and a pointer press or touch-down
-(`pointer.rs`, `touch.rs`), and each key press the keyboard concern
-forwards to the guest (`keyboard.rs`, `ime_keys.rs`). Nothing outside
+(`pointer.rs`, `touch.rs`), each key press the keyboard concern
+forwards to the guest (`keyboard.rs`), and the held key it recovers for
+an empty confirmation (`ime_keys.rs`). Nothing outside
 `ime` changes a text input, and only `ime/guest.rs` builds the v3
 transaction events.
 

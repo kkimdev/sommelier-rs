@@ -130,6 +130,7 @@ fn apply_key_effect(ctx: &mut Context, effect: KeyEffect) {
     match effect {
         KeyEffect::Lease { ti, seat, outcome } => apply_lease(ctx, ti, seat, outcome),
         KeyEffect::RecoverHeldKey { ti, seat } => hold_recovery(ctx, ti, seat),
+        KeyEffect::InputMethodDetached { seat } => forget_held_keys_for_seat(ctx, seat.0),
     }
 }
 
@@ -217,11 +218,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     /// draining and is ignored (H2').
     fn on_leave(&mut self, ctx: &mut Context) -> Action {
         if let Some(ti) = v1_sender(ctx) {
-            let detached = ctx.ime.attached_seat(ti);
             ime(ctx, Input::HostLeave(ti));
-            if let Some(seat) = detached {
-                forget_held_keys_for_seat(ctx, seat.0);
-            }
         }
         Action::Drop
     }

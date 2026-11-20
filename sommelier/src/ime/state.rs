@@ -340,14 +340,17 @@ impl TextInput {
         std::mem::take(&mut self.pieces)
     }
 
-    /// The gate of every host composition event and press: the link is
-    /// attached, no fence is pending, and the field is focused. The only
-    /// constructor of [`Current`].
+    /// Whether the text input passes the gate of every host composition
+    /// event and press: the link is attached, no fence is pending, and the
+    /// field is focused.
+    pub(super) fn is_current(&self) -> bool {
+        self.is_attached() && self.fence.is_none() && matches!(self.field, Field::Focused(_))
+    }
+
+    /// The gate ([`Self::is_current`]); the only constructor of
+    /// [`Current`].
     pub(super) fn current(&mut self, ti: TiId) -> Option<Current<'_>> {
-        if !self.is_attached() || self.fence.is_some() {
-            return None;
-        }
-        if matches!(self.field, Field::Unfocused) {
+        if !self.is_current() {
             return None;
         }
         Some(Current {

@@ -118,7 +118,7 @@ pub enum Input {
     },
     BarrierDone(BarrierToken),
 
-    // Cross-concern messages (F1 to F4).
+    // Cross-concern messages (F1 to F5, and X2's recovery).
     /// F1: the seat's keyboard focus moved to `surface`, or to none. The
     /// keyboard concern sends one per seat whose focused surface changed.
     /// `keyboard` is the guest's copy of the keyboard events that moved it,
@@ -145,6 +145,16 @@ pub enum Input {
     /// The keyboard concern forwarded a key press or repeat to the guest on
     /// this seat, which may edit the guest's text where Exo does not see.
     GuestKey(SeatId),
+    /// X2': the keyboard concern recovered the held key of `ti`'s empty
+    /// confirmation ([`KeyEffect::RecoverHeldKey`]), once
+    /// [`ImeCore::admits_recovery`] admitted it. `pair` is the key's press
+    /// and release, empty if another channel already delivered the key;
+    /// the guest gets it, then G9c's answer, the transaction that closes
+    /// the confirmation under the serial of now.
+    HeldKeyRecovered {
+        ti: TiId,
+        pair: Vec<Outgoing>,
+    },
 }
 
 /// A host input-method event of a text input, from its v1 object or its
@@ -300,9 +310,11 @@ pub enum KeyEffect {
     /// method took, if the confirmation turns out to be its autorepeat and
     /// not Exo's confirmation before a new press (E13). The keyboard
     /// concern decides at the host's next event; if it recovers the key,
-    /// it sends its press and release unless another channel already
-    /// delivered it, then the transaction of [`ImeCore::recovery_done`],
-    /// whether or not the pair went. The lease:
+    /// and the text input still passes the gate
+    /// ([`ImeCore::admits_recovery`]), it hands the core the key's press
+    /// and release, unless another channel already delivered it, as
+    /// [`Input::HeldKeyRecovered`], whose transaction follows them whether
+    /// or not the pair went. The lease:
     /// - a held Backspace whose pair is sent arms it;
     /// - a held Backspace whose pair is skipped ends it;
     /// - another held key whose pair is sent ends it;
@@ -310,6 +322,10 @@ pub enum KeyEffect {
     /// - with no held key, or a new press's confirmation, it ends, and
     ///   nothing is sent.
     RecoverHeldKey { ti: TiId, seat: SeatId },
+    /// H2: Exo detached the input method of a text input of `seat` on its
+    /// own, and the key events in flight died with it: no key the seat
+    /// holds now is recovered again.
+    InputMethodDetached { seat: SeatId },
 }
 
 /// Read-only facts the core needs and does not own. The adapter answers
@@ -434,26 +450,14 @@ impl ImeCore {
 pub(crate) type StateForTest = (String, (usize, usize), std::ops::Range<usize>);
 
 impl ImeCore {
-    /// The seat of text input `ti` while Exo's input method is attached
-    /// to it, whatever its fence.
-    pub fn attached_seat(&self, ti: TiId) -> Option<SeatId> {
+    /// X2': whether text input `ti` still passes the gate, so that the held
+    /// key its empty confirmation stood for may be recovered
+    /// ([`Input::HeldKeyRecovered`]). The keyboard concern asks before it
+    /// recovers the key, as nothing is sent otherwise.
+    pub fn admits_recovery(&self, ti: TiId) -> bool {
         self.inputs
             .get(&ti)
-            .filter(|t| t.is_attached())
-            .map(|t| t.seat())
-    }
-
-    /// X2': the transaction that closes text input `ti`'s empty
-    /// confirmation once the keyboard concern has recovered the held key
-    /// it stood for ([`KeyEffect::RecoverHeldKey`]): G9c's answer, what the
-    /// guest shows under the current serial. `None` if the text input no
-    /// longer passes the gate, in which case nothing is recovered.
-    pub fn recovery_done(&mut self, ti: TiId) -> Option<Vec<Outgoing>> {
-        let input = self.inputs.get_mut(&ti)?;
-        input.current(ti)?;
-        // The key may edit the guest's text.
-        input.exo_mut().guest_edited();
-        Some(input.answer(ti))
+            .is_some_and(state::TextInput::is_current)
     }
 
     /// Check the invariants of design 3.1 (I1a to I3) that hold between
