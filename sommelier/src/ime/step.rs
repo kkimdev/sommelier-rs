@@ -299,9 +299,7 @@ impl ImeCore {
             .push(KeyEffect::InputMethodDetached { seat: t.seat() });
         // Only a preedit whose commit does not fit a message is left.
         if shown {
-            let clear = GuestTxn::default().encode(ti, true, t.serial());
-            fx.to_guest
-                .extend(clear.expect("an empty preedit fits a message"));
+            fx.to_guest.extend(GuestTxn::bare(ti, true, t.serial()));
         }
     }
 

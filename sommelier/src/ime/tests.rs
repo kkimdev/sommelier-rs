@@ -532,6 +532,12 @@ fn guest_txn_encodes_in_canonical_order() {
             assert_eq!(guest_events(&encoded.unwrap()), events, "{case:?}");
         }
     }
+    // The transaction of nothing, which cannot fail, is the empty one's.
+    for shown in [false, true] {
+        let empty = GuestTxn::default().encode(TI, shown, serial).unwrap();
+        let bare = GuestTxn::bare(TI, shown, serial);
+        assert_eq!(guest_events(&bare), guest_events(&empty), "shown: {shown}");
+    }
     // An empty preedit is none, and its cursor is (0, 0).
     assert_eq!(Preedit::new(String::new(), (3, 3)), None);
     assert_eq!(guest::resolve_preedit_cursor("", None, Some(3)), (0, 0));

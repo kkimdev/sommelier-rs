@@ -457,10 +457,16 @@ seat's end is the one exception (2.3, after R2).
 - `GuestTxn::encode(ti, shown_before, serial)` is the only builder of
   `zwp_text_input_v3` `preedit_string`, `delete_surrounding_text`,
   `commit_string` and `done`, in the order INVARIANTS "A v3
-  transaction's events go in one order" gives.
+  transaction's events go in one order" gives. A string of a
+  transaction can be too long for a message; its special case
+  `GuestTxn::bare`, the transaction of nothing (a `done`, after the
+  clear of a shown preedit), has no string that can, and cannot fail, so
+  the answer that forgets a preedit too long to repeat and the clear
+  after Exo's own detach need no escape.
   A test pins all 16 combinations of a shown preedit, a delete, a commit
-  and a new preedit, and that empty commits and `(0, 0)` deletes send
-  nothing. Test: `guest_txn_encodes_in_canonical_order`.
+  and a new preedit, that empty commits and `(0, 0)` deletes send
+  nothing, and that `bare` is the empty transaction. Test:
+  `guest_txn_encodes_in_canonical_order`.
 - `Serial` comes only from `CommitCount`, so a `done` cannot carry
   another number.
 - The G9c answer is a `GuestTxn` of the shown preedit alone, encoded

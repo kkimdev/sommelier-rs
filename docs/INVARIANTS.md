@@ -1144,8 +1144,9 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
     `gtk_text_view_commit_text`, `gtk/gtktextview.c` 8779). Chromium
     skips an empty commit (`zwp_text_input_v3.cc` 452).
 
-  One encoder, `ime::GuestTxn::encode`, builds every such transaction,
-  and nothing else in the crate builds these four events.
+  One encoder, `ime::GuestTxn::encode`, with its infallible special case
+  for the transaction of nothing (`GuestTxn::bare`), builds every such
+  transaction, and nothing else in the crate builds these four events.
   Tests: `guest_txn_encodes_in_canonical_order`, `ime_is_isolated`,
   `host_ime_events_become_v3_transactions`,
   `on_set_preedit_region_translates_correctly`,
