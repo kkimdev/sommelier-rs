@@ -4166,7 +4166,6 @@ async fn serve(
 async fn start_client(stream: UnixStream, config: &ClientConfig) -> io::Result<()> {
     // The peer's process, as it was when it connected.
     let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
-    let wheel_steps = config.wheel_from_touchpad.applies_to(pid);
     let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
     let (host_conn, virtwayland_channel) = connect_host(config).await?;
     let mut client = Client::new(
@@ -4181,8 +4180,12 @@ async fn start_client(stream: UnixStream, config: &ClientConfig) -> io::Result<(
         ),
     );
     client.ctx.virtwayland_channel = virtwayland_channel;
-    client.ctx.wheel_steps = wheel_steps.then(Default::default);
+    let wheel_from_touchpad = config.wheel_from_touchpad;
     tokio::task::spawn_local(async move {
+        // Off the accept loop, and before the client handles its first
+        // message, so before any pointer event.
+        let wheel_steps = wheel_from_touchpad.applies_to(pid).await;
+        client.ctx.wheel_steps = wheel_steps.then(Default::default);
         client.run().await;
         log::info!("Client disconnected");
     });

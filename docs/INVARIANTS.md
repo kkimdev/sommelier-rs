@@ -1524,12 +1524,15 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `client_kind::WheelFromTouchpad` chooses when it connects
   (`SOMMELIER_WHEEL_FROM_TOUCHPAD`; by default a Wine process, by its
   executable or its loader's environment through `SO_PEERCRED` and
-  `/proc`) gets one `axis_discrete` step, signed like the scroll, per 10
-  units of finger or continuous scrolling on an axis, just before the
-  `axis` that crosses it, as the protocol orders them. 10 is Exo's
-  distance for one wheel notch (`kWaylandScrollUnit`). The rest carries
-  over until that axis's `axis_stop`, the pointer's `enter` or `leave`,
-  or its end. Every other client, and every wheel scroll, which comes
+  `/proc`, read on a detached thread that the client's task waits for,
+  before it handles a message, at most 100 ms (`DETECTION_TIMEOUT`); a
+  client whose read takes longer is not taken for Wine, so a hung read
+  stalls no client) gets one `axis_discrete` step, signed like the
+  scroll, per 10 units of finger or continuous scrolling on an axis,
+  just before the `axis` that crosses it, as the protocol orders them.
+  10 is Exo's distance for one wheel notch (`kWaylandScrollUnit`). The
+  rest carries over until that axis's `axis_stop`, the pointer's `enter`
+  or `leave`, or its end. Every other client, and every wheel scroll, which comes
   with Exo's own `axis_discrete`, gets the events as the host sent them.
   A source, and so a step, reaches only a pointer of v5 or later, which
   has `axis_discrete`: the dispatcher rejects a newer event for an older
@@ -1538,6 +1541,7 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `wheel_steps_leave_other_clients_and_wheels_alone`,
   `wine_is_recognised_by_its_executable_or_its_loader_environment`,
   `the_setting_chooses_wine_every_client_or_none`,
+  `a_detection_that_does_not_answer_in_time_is_not_wine`,
   `event_since_guard_rejects_a_newer_event_for_an_old_host_object`.
 
 ## Process
