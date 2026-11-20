@@ -258,6 +258,17 @@
   which has not been checked against a Home Manager activation on a host
   yet; the unit tests swap links the way an activation does.
 
+- The host display the DST and the fuzzer share (`sim::display`) does
+  not answer the destroy of a `zcr_extended_keyboard_v1` with its
+  `delete_id` in the DST (`Display::unanswered`), as libwayland-server
+  would: answering it shifts every DST schedule, and the shrunk
+  regressions in `sim/regressions.rs` replay theirs, so they need
+  deriving again with it. Its pointers send no `wl_pointer.frame`, which
+  Exo sends a v5 pointer, for the same reason.
+- Tests that drive `Client::handle_msgs` directly, rather than through
+  `proxy::harness::Session`, bypass the peers' protocol checks
+  (`test_support::wire_peer`); they move to `Session` with the handler
+  tests.
 - Wheel steps for touchpad scrolling in Wine apps
   ([pointer scrolling](docs/INVARIANTS.md#pointer-scrolling)) have not
   been checked with KakaoTalk on a host yet; a scroll that feels too fast

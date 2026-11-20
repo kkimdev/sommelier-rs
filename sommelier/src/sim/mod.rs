@@ -39,8 +39,8 @@ limitations under the License.
 //! [`proxy::harness::Session`]: crate::proxy::harness::Session
 
 mod client;
-mod clock;
-mod display;
+pub(crate) mod clock;
+pub(crate) mod display;
 mod editor;
 mod engine;
 pub(crate) mod exo;
@@ -48,7 +48,7 @@ mod hangul;
 mod keymap;
 mod oracle;
 mod regressions;
-mod sched;
+pub(crate) mod sched;
 mod shrink;
 mod surfaces;
 mod user;

@@ -651,6 +651,11 @@ impl Exo {
         self.focus
     }
 
+    /// The seat's keyboard the model plays, the last one bound.
+    pub(crate) fn keyboard(&self) -> Option<u32> {
+        self.keyboard.map(|keyboard| keyboard.id)
+    }
+
     /// Move the seat's focus, as Alt-Tab or a click on another window does:
     /// the keyboard leaves the old surface and enters the new one, and then
     /// the text inputs follow as in [`Exo::set_text_input_focus`]. The seat

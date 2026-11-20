@@ -50,15 +50,16 @@ use super::client::chromium::Chromium;
 use super::client::gtk::Gtk;
 use super::client::{Client, Field, PressKind};
 use super::clock::Micros;
-use super::display::Display;
+use super::display::{self, Display};
 use super::editor::{Target, TextModel, UserAction};
 use super::engine::{Engine, EngineIn, Lag, Request};
 use super::exo::{Answer, Exo, Predicted, RegionOutcome, RegionTruth};
 use super::hangul::Key;
 use super::keymap;
 use super::oracle::{self, Origin, Seen, Shadow, SpecText};
-use super::surfaces::Surfaces;
+use super::surfaces::{Surfaces, Windows};
 use super::ClientKind;
+use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1 as extended;
 use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use crate::protocols::wayland::{
@@ -71,7 +72,7 @@ use crate::test_support::{decode, Rng};
 use crate::wire::{Outgoing, WL_DISPLAY_ID};
 
 /// The source of a case's choices.
-pub(super) trait Choose {
+pub(crate) trait Choose {
     /// A choice below `n`.
     fn pick(&mut self, n: u32) -> u32;
 
@@ -91,7 +92,7 @@ impl<F: FnMut(u32) -> u32> Choose for F {
 
 /// A case's choices, drawn from a seed and recorded, or replayed from a
 /// recording, so that a shrinker can edit and replay them.
-pub(super) struct Choices {
+pub(crate) struct Choices {
     recorded: Vec<u32>,
     /// The choices to replay; draws past their end are 0.
     replay: Option<Vec<u32>>,
@@ -136,7 +137,7 @@ impl Choose for Choices {
 
 /// A FIFO channel whose messages each arrive after a drawn latency, but
 /// never before the message ahead of them.
-pub(super) struct Channel<T> {
+pub(crate) struct Channel<T> {
     /// The longest latency a message draws.
     latency: Micros,
     queue: VecDeque<(Micros, T)>,
@@ -176,7 +177,7 @@ impl<T> Channel<T> {
 /// Which of the sources, each ready at its time or idle (`None`), goes
 /// next: the earliest; of several ready at once, a choice among them in
 /// the sources' order, so choice 0 is the first.
-pub(super) fn earliest(sources: &[Option<Micros>], choices: &mut impl Choose) -> Option<usize> {
+pub(crate) fn earliest(sources: &[Option<Micros>], choices: &mut impl Choose) -> Option<usize> {
     let first = sources.iter().flatten().min()?;
     let tied: Vec<usize> = (0..sources.len())
         .filter(|&i| sources[i] == Some(*first))
@@ -319,13 +320,15 @@ pub(super) struct World<'t> {
     pub exo: Exo,
     engine: Engine,
     display: Display,
+    /// The fields' windows on the host.
+    windows: Windows,
     /// Each guest request, with the edits the guest had got when it sent
     /// it.
     c_to_p: Channel<(Outgoing, u64)>,
     /// Each event to the guest, the press it is, if it is one: where the
     /// guest's pointer or finger is on which of its surfaces; and whether
     /// it is a key that reaches no window ([`World::keyboard_gone`]).
-    p_to_c: Channel<(u32, AnyEvent, Option<Press>, bool)>,
+    p_to_c: Channel<(AnyEvent, Option<Press>, bool)>,
     /// Each run of requests Exo's display dispatches in one read: one
     /// request, or a surrounding text or a `reset` and the barrier glued
     /// to it.
@@ -361,7 +364,7 @@ pub(super) struct World<'t> {
     /// The guest's text input and compositor.
     text_input: u32,
     compositor: u32,
-    /// Which field each surface is, shared with the display, the
+    /// Which field each surface is, shared with the windows, the
     /// specification and the shadow.
     surfaces: Surfaces,
     /// The oracle's two readers, from the end of the setup.
@@ -398,7 +401,9 @@ impl<'t> World<'t> {
             client: None,
             exo,
             engine: Engine::new(setup.lag),
-            display: Display::new(surfaces.clone()),
+            display: Display::new(display::exo_globals())
+                .unanswered(&[zcr_extended_keyboard_v1::NAME]),
+            windows: Windows::new(surfaces.clone()),
             c_to_p: Channel::new(GUEST_LATENCY),
             p_to_c: Channel::new(GUEST_LATENCY),
             p_to_e: Channel::new(HOST_LATENCY),
@@ -536,12 +541,13 @@ impl<'t> World<'t> {
                     self.deliver_guest_request(request, edits).await;
                 }
                 Source::GuestEvents => {
-                    let (sender, event, press, gone) = self.p_to_c.take();
-                    self.deliver_to_guest(sender, event, press, gone);
+                    let (event, press, gone) = self.p_to_c.take();
+                    self.deliver_to_guest(event, press, gone);
                 }
                 Source::HostRequests => {
                     for (sender, request) in self.p_to_e.take() {
                         self.reports_got += u64::from(is_report(&request));
+                        self.windows.request(sender, &request, &mut self.exo);
                         let events = self.display.request(sender, &request, &mut self.exo);
                         self.host_sends(events, false);
                     }
@@ -669,8 +675,15 @@ impl<'t> World<'t> {
             self.exo.move_focus(Some(surface));
         }
         let presses = match action {
-            UserAction::Click { at, .. } => self.display.click(surface, at, time),
-            UserAction::Tap { at, .. } => self.display.tap(surface, at, time),
+            UserAction::Click { at, .. } => {
+                let pointer = *self.display.pointers().first().expect("a pointer");
+                self.display
+                    .click(pointer, surface, keymap::position(at), time)
+            }
+            UserAction::Tap { at, .. } => {
+                let touch = *self.display.touches().first().expect("a touch");
+                self.display.tap(touch, surface, keymap::position(at), time)
+            }
             _ => Vec::new(),
         };
         self.host_sends(presses, false);
@@ -683,7 +696,7 @@ impl<'t> World<'t> {
         let old = self.surfaces.guest(field);
         let new = self.session.new_id();
         let refocus = self.exo.focus().is_some() && self.exo.focus() == self.surfaces.host(field);
-        self.display.reopen(field, refocus);
+        self.windows.reopen(field, refocus);
         self.surfaces.add_guest(field, new);
         let now = self.now;
         let client = self.client.as_mut().expect("a client model");
@@ -812,7 +825,7 @@ impl<'t> World<'t> {
         truth: Option<RegionTruth>,
         reports: u64,
     ) {
-        let (sender, decoded) = self.display.decode(&event);
+        let (sender, decoded) = self.session.decode_host_event(&event);
         let region = matches!(
             decoded,
             AnyEvent::ZcrExtendedTextInputV1(extended::Event::SetPreeditRegion { .. })
@@ -919,7 +932,7 @@ impl<'t> World<'t> {
             let gone = self.keyboard_gone
                 && matches!(event, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }));
             self.p_to_c
-                .send(self.now, (sender, event, press, gone), &mut self.choices);
+                .send(self.now, (event, press, gone), &mut self.choices);
         }
         self.see(Seen::StepEnd);
         self.ended |= !goes_on;
@@ -967,7 +980,7 @@ impl<'t> World<'t> {
     /// If a key gone to no window reaches a client with the keyboard
     /// focus: the proxy kept from it the `leave` that came before the enter
     /// it dropped.
-    fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent, press: Option<Press>, gone: bool) {
+    fn deliver_to_guest(&mut self, event: AnyEvent, press: Option<Press>, gone: bool) {
         let now = self.now;
         self.edits.got.follow(&event);
         let key = matches!(event, AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. }));
@@ -995,7 +1008,7 @@ impl<'t> World<'t> {
             }
             (AnyEvent::WlPointer(wl_pointer::Event::Button { .. }), None)
             | (AnyEvent::WlTouch(wl_touch::Event::Up { .. }), None) => client.release(now, false),
-            (AnyEvent::ZwpTextInputV3(event), _) => client.event(now, sender, event),
+            (AnyEvent::ZwpTextInputV3(event), _) => client.event(now, event),
             (AnyEvent::WlDisplay(wl_display::Event::DeleteId { id }), _) => {
                 client.deleted(id);
                 Vec::new()

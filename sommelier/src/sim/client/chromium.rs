@@ -532,9 +532,8 @@ impl Client for Chromium {
 
     /// C2: `enter` and `leave` change which window may be enabled
     /// (`OnTextInputFocusChanged`). Other events wait for `done`.
-    fn event(&mut self, now: Micros, sender: u32, event: Event) -> Vec<Outgoing> {
-        self.protocol
-            .check(&self.fields, sender, &event, self.commits);
+    fn event(&mut self, now: Micros, event: Event) -> Vec<Outgoing> {
+        self.protocol.check(&event, self.commits);
         match event {
             Event::Enter { .. } | Event::Leave { .. } => return self.update_activation(now),
             Event::PreeditString {
@@ -613,7 +612,7 @@ impl Client for Chromium {
         if self.touch.is_some_and(|(touched, _)| touched == field) {
             self.touch = None;
         }
-        self.protocol.reopen(&mut self.fields[field], surface);
+        self.fields[field].surface = surface;
         self.windows[field] = Window {
             predicted: self.fields[field].model.clone(),
             ..Window::default()
@@ -920,16 +919,6 @@ mod tests {
         let out = answered(&mut chromium, Micros(1), [commit("나")]);
         assert_eq!(out, [surrounding("0가나", 7), Request::Commit {}]);
         assert_eq!(chromium.fields()[0].model, model("0가", 4, ""));
-    }
-
-    #[test]
-    #[should_panic(expected = "protocol violation: surface 20 has no field")]
-    fn an_enter_on_a_destroyed_surface_is_a_protocol_violation() {
-        let mut chromium = entered(&["0"]);
-        chromium.reopen(Micros(0), 0, 22);
-        send(&mut chromium, Micros(0), [leave(0)]);
-        chromium.deleted(SURFACES[0]);
-        send(&mut chromium, Micros(0), [enter(0)]);
     }
 
     #[test]

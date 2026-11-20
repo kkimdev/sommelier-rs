@@ -654,7 +654,9 @@ process (`warn_once::WarnOnce`, the one such flag, such as
 one. A test passes the function that reads it a `WarnOnce` of its own, or
 runs in its own process (`test_support::in_own_process`). `proxy::harness::Session` drives a whole
 `Client` as its guest and host, decoding what the proxy sends each into
-the generated message types; CONTRIBUTING says how to write a test with
+the generated message types and holding it to the protocol, as one end
+of a connection that follows its objects as libwayland does
+(`test_support::wire_peer`); CONTRIBUTING says how to write a test with
 it. `proxy::frame_cost` measures what a steady stream of frames costs a
 session's proxy, in heap allocations and in the system calls that copy
 pixels into or map a host copy, which the test binary counts per thread
@@ -662,8 +664,9 @@ pixels into or map a host copy, which the test binary counts per thread
 holds each to a budget. In the same way, a test in `ime::tests` holds
 typing in the IME core to the same allocations whatever the length of
 Exo's text (test: `typing_costs_the_same_whatever_the_length_of_exos_text`). Run them with `--nocapture` to see the numbers. Beyond
-unit tests, `proxy::fuzz` feeds whole clients random guest streams, `sim`
-types into simulated text-input clients through a whole client on a
+unit tests, `proxy::fuzz` feeds whole clients random guest streams on the
+DST's scheduler, behind the host display the DST plays (`sim::display`),
+`sim` types into simulated text-input clients through a whole client on a
 virtual clock and checks their text against the specification and the
 user's intent, and
 `sommelier/tests/weston_e2e.rs` runs

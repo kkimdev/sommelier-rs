@@ -2705,14 +2705,9 @@ mod tests {
             // A native buffer whose one plane the guest GPU is still
             // writing.
             let (plane, _signal) = crate::test_support::pipe();
+            s.pair_for_test(buffer, HOST_FENCED_BUFFER, "wl_buffer", 1);
             let ctx = s.ctx();
             ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
-            ctx.shadow_table.insert_paired_with_version_for_test(
-                buffer,
-                HOST_FENCED_BUFFER,
-                "wl_buffer",
-                1,
-            );
             assert!(ctx.register_native_buffer(HOST_FENCED_BUFFER, (1, 1), vec![plane]));
             s.guest([wl_surface::req::attach(surface.id, Some(buffer), 0, 0)])
                 .await;
@@ -2741,14 +2736,9 @@ mod tests {
         // `signal` is written.
         let (plane, signal) = crate::test_support::pipe();
         let fence = fd_identity(signal.as_raw_fd());
+        s.pair_for_test(buffer, HOST_FENCED_BUFFER, "wl_buffer", 1);
         let ctx = s.ctx();
         ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            buffer,
-            HOST_FENCED_BUFFER,
-            "wl_buffer",
-            1,
-        );
         assert!(ctx.register_native_buffer(HOST_FENCED_BUFFER, (1, 1), vec![plane]));
 
         s.guest([

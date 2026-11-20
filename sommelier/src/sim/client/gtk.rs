@@ -365,9 +365,8 @@ impl Client for Gtk {
     /// C7: `enter` enables the current context and `leave` disables it
     /// (`text_input_enter`, `text_input_leave`). Other events wait for
     /// `done`.
-    fn event(&mut self, now: Micros, sender: u32, event: Event) -> Vec<Outgoing> {
-        self.protocol
-            .check(&self.fields, sender, &event, self.commits);
+    fn event(&mut self, now: Micros, event: Event) -> Vec<Outgoing> {
+        self.protocol.check(&event, self.commits);
         let out = match event {
             Event::Enter { .. } if self.current.is_some() => self.enable(),
             Event::Leave { .. } if self.current.is_some() => self.disable(),
@@ -508,7 +507,7 @@ impl Client for Gtk {
         if self.press.is_some_and(|(pressed, _)| pressed == field) {
             self.press = None;
         }
-        self.protocol.reopen(&mut self.fields[field], surface);
+        self.fields[field].surface = surface;
         self.contexts[field] = Context {
             events: Events::default(),
             preedit: None,

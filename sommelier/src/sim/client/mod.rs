@@ -24,12 +24,13 @@ limitations under the License.
 //! it through [`TextModel::apply_txn`] as far as the client's rules allow,
 //! and logs every part of an event it drops, with the reason.
 //!
-//! A model panics on output no correct proxy sends, which fails the case:
+//! The session's guest (`proxy::harness::Session`) holds what the proxy
+//! sends to the protocol: each event comes from, and names, only objects
+//! the guest has, so an event that names a surface the client destroyed
+//! crossed the destroy, and goes nowhere, as libwayland gives the client a
+//! null surface. A model panics on the rest of the output no correct
+//! proxy sends, which fails the case:
 //!
-//! - an event from another object, or naming a surface it lacks: one of
-//!   another field's, or one it destroyed whose `delete_id` came (an
-//!   event that crossed the destroy goes nowhere, as libwayland gives the
-//!   client a null surface);
 //! - a string that is not UTF-8;
 //! - a `done` serial past the commits it made;
 //! - a delete that fits none of the surrounding texts it sent, or held to
@@ -50,8 +51,6 @@ limitations under the License.
 
 pub(super) mod chromium;
 pub(super) mod gtk;
-
-use std::collections::BTreeSet;
 
 use super::clock::Micros;
 use super::editor::{Target, TextModel, Txn};
@@ -150,8 +149,8 @@ pub(super) trait Client {
     /// surfaces (`wl_keyboard.enter` and `leave`).
     fn keyboard_focus(&mut self, now: Micros, surface: Option<u32>) -> Vec<Outgoing>;
 
-    /// A `zwp_text_input_v3` event from `sender`.
-    fn event(&mut self, now: Micros, sender: u32, event: Event) -> Vec<Outgoing>;
+    /// An event of its `zwp_text_input_v3`.
+    fn event(&mut self, now: Micros, event: Event) -> Vec<Outgoing>;
 
     /// A key the input method passed reached the keyboard focus.
     fn key(&mut self, now: Micros, key: Key) -> Vec<Outgoing>;
@@ -185,10 +184,6 @@ struct Protocol {
     text_input: u32,
     /// The surface the text input entered.
     entered: Option<u32>,
-    /// The surfaces the client destroyed whose `delete_id` has not come:
-    /// the proxy can name them in events it sent before it got the
-    /// destroy (F2).
-    closing: BTreeSet<u32>,
     /// The client closed the window that had the keyboard focus, and no
     /// window has had it since: a key the proxy sent before it heard of the
     /// close goes nowhere (F2).
@@ -204,30 +199,24 @@ impl Protocol {
         Self {
             text_input,
             entered: None,
-            closing: BTreeSet::new(),
             closed: false,
             sent: Vec::new(),
         }
     }
 
-    /// Checks `event` from `sender` for a client with `fields` that made
-    /// `commits` commits, and follows its `enter` and `leave`.
+    /// Checks `event` for a client that made `commits` commits, and
+    /// follows its `enter` and `leave`.
     ///
     /// # Panics
     ///
     /// On output no correct proxy sends (see the module's documentation).
-    fn check(&mut self, fields: &[Field], sender: u32, event: &Event, commits: u32) {
-        assert_eq!(
-            sender, self.text_input,
-            "protocol violation: {event:?} from {sender}, not the text input"
-        );
+    fn check(&mut self, event: &Event, commits: u32) {
         match *event {
             Event::Enter { surface } => {
                 assert_eq!(
                     self.entered, None,
                     "protocol violation: enter while entered"
                 );
-                self.field_on(fields, surface);
                 self.entered = Some(surface);
                 self.sent.clear();
             }
@@ -275,41 +264,22 @@ impl Protocol {
 
     /// The field on `surface`, or none if the client destroyed it and the
     /// proxy's event crossed the destroy, which then goes nowhere.
-    ///
-    /// # Panics
-    ///
-    /// If no field is on it and the client did not just destroy it: the
-    /// proxy named a surface the client lacks.
     fn field_on(&self, fields: &[Field], surface: u32) -> Option<usize> {
-        if self.closing.contains(&surface) {
-            return None;
-        }
-        let field = fields.iter().position(|field| field.surface == surface);
-        Some(field.unwrap_or_else(|| panic!("protocol violation: surface {surface} has no field")))
+        fields.iter().position(|field| field.surface == surface)
     }
 
-    /// `field`'s window opens again on `surface`, and the client destroys
-    /// the one it was on (F2).
-    fn reopen(&mut self, field: &mut Field, surface: u32) {
-        self.closing
-            .insert(std::mem::replace(&mut field.surface, surface));
-    }
-
-    /// The proxy's `delete_id` of `id`: if it is a surface the client
-    /// destroyed, the proxy names it no more.
+    /// The proxy's `delete_id` of `id`.
     ///
     /// # Panics
     ///
-    /// If the text input is still entered on it: the proxy did not leave
-    /// it while it was valid.
+    /// If the text input is still entered on it, a surface: the proxy did
+    /// not leave it while it was valid.
     fn deleted(&mut self, id: u32) {
-        if self.closing.remove(&id) {
-            assert_ne!(
-                self.entered,
-                Some(id),
-                "protocol violation: the text input is still entered on destroyed surface {id}"
-            );
-        }
+        assert_ne!(
+            self.entered,
+            Some(id),
+            "protocol violation: the text input is still entered on destroyed surface {id}"
+        );
     }
 
     /// Checks that `delete_surrounding_text(before, after)` fits a
@@ -438,7 +408,7 @@ mod script {
     ) -> Vec<Request> {
         let out = events
             .into_iter()
-            .flat_map(|event| client.event(now, TEXT_INPUT, event))
+            .flat_map(|event| client.event(now, event))
             .collect::<Vec<_>>();
         requests(out)
     }

@@ -16,13 +16,18 @@ limitations under the License.
 
 //! Which field a surface is. A field's window can close and open again on a
 //! new surface (F2), so a field has a surface per generation, on the guest
-//! and on the host. The world, the display, the specification and the
-//! shadow share one map ([`Surfaces`]) and look every surface up in it, so
-//! that a surface of an earlier generation still names its field.
+//! and on the host. The world, its host windows ([`Windows`]), the
+//! specification and the shadow share one map ([`Surfaces`]) and look
+//! every surface up in it, so that a surface of an earlier generation
+//! still names its field.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
+
+use super::exo::Exo;
+use crate::protocols::wayland::{wl_compositor, wl_surface};
+use crate::protocols::AnyRequest;
 
 /// The surfaces of each field, oldest first; cloning shares the map.
 #[derive(Clone, Debug, Default)]
@@ -154,6 +159,66 @@ impl Surfaces {
     }
 }
 
+/// The fields' windows on the host, as its window manager keeps them: each
+/// surface the proxy creates is a field's, and a window that opens again
+/// takes the seat's focus if it had it.
+pub(super) struct Windows {
+    surfaces: Surfaces,
+    /// The fields whose windows open again, in order, each with whether
+    /// it had the seat's focus, which the new surface then takes (F2).
+    reopening: VecDeque<(usize, bool)>,
+    /// The new surfaces that take the seat's focus once mapped.
+    mapping: Vec<u32>,
+}
+
+impl Windows {
+    /// The windows of the fields `surfaces` names.
+    pub fn new(surfaces: Surfaces) -> Self {
+        Self {
+            surfaces,
+            reopening: VecDeque::new(),
+            mapping: Vec::new(),
+        }
+    }
+
+    /// The window of `field` opens again (F2): the next surface the proxy
+    /// creates is its; if it had the seat's focus, `refocus`, the new one
+    /// takes it once mapped, as a window manager gives it to a new window.
+    ///
+    /// Exo maps a window at the commit that gives a surface with a shell
+    /// role its first buffer; the case has neither roles nor buffers, so
+    /// the new surface's first commit stands for that one.
+    pub fn reopen(&mut self, field: usize, refocus: bool) {
+        self.reopening.push_back((field, refocus));
+    }
+
+    /// The proxy sends the host `request` from host object `sender`, before
+    /// the display gets it: a new surface is a field's, and a mapped one
+    /// takes the seat's focus in `exo`.
+    pub fn request(&mut self, sender: u32, request: &AnyRequest, exo: &mut Exo) {
+        match *request {
+            AnyRequest::WlCompositor(wl_compositor::Request::CreateSurface { id }) => {
+                match self.reopening.pop_front() {
+                    Some((field, refocus)) => {
+                        self.surfaces.add_host(Some(field), id);
+                        if refocus {
+                            self.mapping.push(id);
+                        }
+                    }
+                    None => self.surfaces.add_host(None, id),
+                }
+            }
+            AnyRequest::WlSurface(wl_surface::Request::Commit {}) => {
+                if let Some(i) = self.mapping.iter().position(|&id| id == sender) {
+                    self.mapping.remove(i);
+                    exo.move_focus(Some(sender));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +251,48 @@ mod tests {
         assert!(!surfaces.host_destroyed(22));
         assert_eq!(surfaces.field_of_host(22), Some(0));
         assert_eq!(surfaces.host(0), Some(22));
+    }
+
+    /// The seat's focus after `windows`, then the display, get `request`
+    /// from `sender`: the display makes Exo forget a destroyed surface.
+    fn focus_after(
+        windows: &mut Windows,
+        exo: &mut Exo,
+        sender: u32,
+        request: AnyRequest,
+    ) -> Option<u32> {
+        windows.request(sender, &request, exo);
+        if let AnyRequest::WlSurface(wl_surface::Request::Destroy {}) = request {
+            exo.forget(|id| id != sender);
+        }
+        exo.focus()
+    }
+
+    #[test]
+    fn a_window_opens_again_on_a_new_surface_that_takes_its_focus() {
+        let surfaces = Surfaces::new(&[30, 31], &[]);
+        let windows = &mut Windows::new(surfaces.clone());
+        let exo = &mut Exo::default();
+        let create = |id| wl_compositor::Request::CreateSurface { id }.into();
+        let destroy = || wl_surface::Request::Destroy {}.into();
+        let commit = || wl_surface::Request::Commit {}.into();
+        focus_after(windows, exo, 3, create(7));
+        focus_after(windows, exo, 3, create(8));
+        assert_eq!((surfaces.host(0), surfaces.host(1)), (Some(7), Some(8)));
+        // F2: the focused window closes and opens again; its new surface
+        // takes the focus once mapped. An unfocused one leaves the focus
+        // where it is.
+        windows.reopen(0, true);
+        windows.reopen(1, false);
+        exo.set_text_input_focus(Some(7));
+        assert_eq!(focus_after(windows, exo, 7, destroy()), None);
+        assert_eq!(focus_after(windows, exo, 3, create(9)), None);
+        assert_eq!(focus_after(windows, exo, 9, commit()), Some(9));
+        assert_eq!(surfaces.host(0), Some(9));
+        assert_eq!(surfaces.field_of_host(7), Some(0));
+        assert_eq!(focus_after(windows, exo, 8, destroy()), Some(9));
+        assert_eq!(focus_after(windows, exo, 3, create(10)), Some(9));
+        assert_eq!(focus_after(windows, exo, 10, commit()), Some(9));
+        assert_eq!(surfaces.host(1), Some(10));
     }
 }
