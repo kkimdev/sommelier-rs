@@ -94,8 +94,9 @@ const WL_SHM_VERSION: u32 = 1;
 const WL_OUTPUT_VERSION: u32 = 3;
 /// The `wl_seat` ceiling; [`forwarded_global_version`] says why. The
 /// vendored XML is newer: v6 to v10 add touch shape and orientation,
-/// high-resolution scroll and scroll-direction events.
-const WL_SEAT_VERSION: u32 = 5;
+/// high-resolution scroll and scroll-direction events, and, at v10, the
+/// `repeated` key state.
+pub(crate) const WL_SEAT_VERSION: u32 = 5;
 /// The newest `zcr_keyboard_extension_v1` the proxy binds: the vendored
 /// XML's. The proxy handles all of it, including the v2 `peek_key` event
 /// that reports keys the IME consumed.

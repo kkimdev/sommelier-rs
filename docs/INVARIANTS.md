@@ -775,10 +775,11 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   never sends a keysym release, so a keysym delivered as a key would stay
   pressed in the guest. The keys the input method consumes reach the
   guest through the recovery of an empty confirmation (X2'). The first
-  keysym of a process is logged, at debug level. A `wl_keyboard.key` or
-  `peek_key` of any state but pressed or released, such as a repeat, is
-  dropped too, unacknowledged: `wl_keyboard` has no repeat before version
-  10, beyond the version 5 the proxy binds `wl_seat` at, and Exo's
+  keysym of a process is logged at info level, so a host that sends
+  keysyms shows it by default. A `wl_keyboard.key` or `peek_key` of any
+  state but pressed or released, such as a repeat, is dropped too,
+  unacknowledged: `wl_keyboard` has no repeat before version 10, beyond
+  the version 5 the proxy binds `wl_seat` at, and Exo's
   `Keyboard::OnKeyEvent` drops every repeat before either is sent.
   Tests: `a_keysym_reaches_no_peer`, `a_repeated_key_state_reaches_no_peer`.
 - **A recovered key carries the host's serial.** When an empty IME

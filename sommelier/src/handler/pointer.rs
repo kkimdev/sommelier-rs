@@ -44,6 +44,10 @@ pub(crate) struct WheelSteps(BTreeMap<HostId, Scroll>);
 // A source is known only on a pointer that has `axis_discrete`: the
 // dispatcher rejects an event newer than its object.
 const _: () = assert!(wl_pointer::EVT_AXIS_SOURCE_SINCE >= wl_pointer::EVT_AXIS_DISCRETE_SINCE);
+// The steps are `axis_discrete` events, which a pointer from v8 on, which
+// gets `axis_value120` instead, no longer takes: no guest seat is that new.
+const _: () =
+    assert!(crate::handler::registry::WL_SEAT_VERSION < wl_pointer::EVT_AXIS_VALUE120_SINCE);
 
 #[derive(Debug, Default)]
 struct Scroll {
