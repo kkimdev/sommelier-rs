@@ -134,7 +134,7 @@ async fn a_partial_width_shm_frame_costs_one_read() {
     let cost = shm_frame_cost("SHM, partial-width damage", PARTIAL_WIDTH).await;
     assert_eq!(cost.pool_reads, 1);
     assert_eq!(cost.host_maps, 0);
-    assert!(cost.allocations <= 36, "{cost:?}");
+    assert!(cost.allocations <= 28, "{cost:?}");
 }
 
 /// A frame that damages the whole of a buffer laid out like its host copy
@@ -144,7 +144,7 @@ async fn a_full_shm_frame_costs_one_read() {
     let cost = shm_frame_cost("SHM, full damage", FULL).await;
     assert_eq!(cost.pool_reads, 1);
     assert_eq!(cost.host_maps, 0);
-    assert!(cost.allocations <= 36, "{cost:?}");
+    assert!(cost.allocations <= 28, "{cost:?}");
 }
 
 /// A host copy whose rows are longer than the guest's, as a VirtWL dma-buf
@@ -245,5 +245,5 @@ async fn a_native_frame_reads_no_pixels() {
     println!("frame cost, native dma-buf: {cost:?}");
     assert_eq!(cost.pool_reads, 0);
     assert_eq!(cost.host_maps, 0);
-    assert!(cost.allocations <= 30, "{cost:?}");
+    assert!(cost.allocations <= 24, "{cost:?}");
 }

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::protocols::wayland::wl_output;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
@@ -105,11 +106,12 @@ impl StalePixels {
     }
 
     /// The region to copy before the buffer is shown on `surface`.
-    pub fn to_copy_on(&self, surface: u32) -> DamageRegion<BufferSpace> {
+    pub fn to_copy_on(&self, surface: u32) -> &DamageRegion<BufferSpace> {
+        static FULL: DamageRegion<BufferSpace> = DamageRegion::Full;
         if self.surface == Some(surface) {
-            self.damage.clone()
+            &self.damage
         } else {
-            DamageRegion::Full
+            &FULL
         }
     }
 
@@ -665,19 +667,27 @@ impl SurfaceCommit {
     /// Buffer damage is already in buffer pixels. Surface damage maps to them
     /// through `mapping` (see [`SurfaceMapping::to_buffer`]); a transform,
     /// or an attach offset, falls back to the whole buffer.
-    pub fn buffer_copy_damage(&self, mapping: &SurfaceMapping) -> DamageRegion<BufferSpace> {
+    pub fn buffer_copy_damage(
+        &self,
+        mapping: &SurfaceMapping,
+    ) -> Cow<'_, DamageRegion<BufferSpace>> {
         let Some(surface_damage) = self.surface_damage.rects() else {
-            return DamageRegion::Full;
+            return Cow::Owned(DamageRegion::Full);
         };
+        // Without surface damage, the buffer damage is all there is, and is
+        // not copied.
+        if surface_damage.is_empty() {
+            return Cow::Borrowed(&self.buffer_damage);
+        }
         // Full buffer damage stays full: pushing to it adds nothing.
         let mut damage = self.buffer_damage.clone();
         for &rect in surface_damage {
             match mapping.to_buffer(rect).filter(|_| !self.moves_buffer()) {
                 Some(rect) => damage.push(rect),
-                None => return DamageRegion::Full,
+                None => return Cow::Owned(DamageRegion::Full),
             }
         }
-        damage
+        Cow::Owned(damage)
     }
 
     pub fn has_invalid_fractional_viewport(&self) -> bool {
@@ -692,6 +702,8 @@ impl SurfaceCommit {
 
     pub fn rollback(self, surface: &mut SurfaceState) {
         *surface = self.previous;
+        surface.pending.surface_damage = self.surface_damage;
+        surface.pending.buffer_damage = self.buffer_damage;
     }
 }
 
@@ -782,13 +794,18 @@ impl SurfaceState {
 
     /// Apply and consume all state pending for the next surface commit.
     pub fn prepare_commit(&mut self) -> SurfaceCommit {
+        // The damage moves into the commit, not into a copy in the
+        // snapshot, and `rollback` puts it back: copying it would allocate
+        // on every commit.
+        let surface_damage = std::mem::take(&mut self.pending.surface_damage);
+        let buffer_damage = std::mem::take(&mut self.pending.buffer_damage);
         let previous = self.clone();
         // Name every field: one the commit never applies is then an unused
         // variable (see docs/DESIGN.md, "Double-buffered state").
         let SurfacePending {
             attachment,
-            surface_damage,
-            buffer_damage,
+            surface_damage: _,
+            buffer_damage: _,
             buffer_scale,
             buffer_transform,
             attach_offset,
@@ -979,6 +996,9 @@ impl RenderBuffer {
 #[derive(Default)]
 pub(super) struct RenderBufferRegistry {
     entries: BTreeMap<HostId, RenderBuffer>,
+    /// How many entries are `GuestDestroyed`: the buffers that wait to be
+    /// retired, which every attach, commit and release looks for.
+    guest_destroyed: usize,
 }
 
 impl RenderBufferRegistry {
@@ -1118,10 +1138,22 @@ impl RenderBufferRegistry {
     }
 
     pub(super) fn lifecycles(&self) -> impl Iterator<Item = (HostId, RenderBufferLifecycle)> + '_ {
-        self.entries.keys().filter_map(|&host_id| {
-            self.lifecycle(host_id)
-                .map(|lifecycle| (host_id, lifecycle))
-        })
+        self.entries
+            .iter()
+            .map(|(&host_id, buffer)| (host_id, buffer.lifecycle()))
+    }
+
+    /// Whether any buffer the guest destroyed waits to be retired.
+    pub(super) fn has_guest_destroyed(&self) -> bool {
+        debug_assert_eq!(
+            self.guest_destroyed,
+            self.entries
+                .values()
+                .filter(|buffer| matches!(buffer, RenderBuffer::GuestDestroyed(_)))
+                .count(),
+            "the guest-destroyed count diverged from the entries"
+        );
+        self.guest_destroyed > 0
     }
 
     /// Every guest wl_surface a host copy is relative to.
@@ -1141,7 +1173,11 @@ impl RenderBufferRegistry {
     }
 
     pub(super) fn remove(&mut self, host_id: HostId) -> bool {
-        self.entries.remove(&host_id).is_some()
+        let removed = self.entries.remove(&host_id);
+        if matches!(removed, Some(RenderBuffer::GuestDestroyed(_))) {
+            self.guest_destroyed -= 1;
+        }
+        removed.is_some()
     }
 
     fn can_submit(&self, host_id: HostId) -> bool {
@@ -1284,6 +1320,7 @@ impl RenderBufferRegistry {
             unreachable!("guest-alive state checked above");
         };
         *buffer = RenderBuffer::GuestDestroyed(active);
+        self.guest_destroyed += 1;
         true
     }
 
@@ -1293,6 +1330,9 @@ impl RenderBufferRegistry {
         };
         if matches!(buffer, RenderBuffer::HostDestroyQueued) {
             return false;
+        }
+        if matches!(buffer, RenderBuffer::GuestDestroyed(_)) {
+            self.guest_destroyed -= 1;
         }
         *buffer = RenderBuffer::HostDestroyQueued;
         true

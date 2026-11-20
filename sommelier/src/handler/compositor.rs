@@ -309,11 +309,11 @@ fn copy_surface_buffer(
     // Nothing to copy needs no dma-buf sync either. Skipping it also keeps
     // a commit without damage, such as one that acknowledges a configure,
     // from being dropped when the host storage misbehaves.
-    if !damage_reaches_buffer(&damage, buffer) {
+    if !damage_reaches_buffer(damage, buffer) {
         buffer.stale.copied_on(surface_id);
         return Ok(());
     }
-    let result = copy_to_host_storage(buffer, resources.channel, &damage);
+    let result = copy_to_host_storage(buffer, resources.channel, damage);
     match &result {
         Ok(()) => {
             buffer.stale.copied_on(surface_id);
@@ -343,7 +343,7 @@ fn copy_surface_buffer(
 /// Copy `damage` from `buffer`'s pool into its host storage, inside the
 /// VirtWL dma-buf CPU-write interval when the storage needs one.
 fn copy_to_host_storage(
-    buffer: &mut BufferState,
+    buffer: &BufferState,
     channel: Option<&Arc<VirtWaylandChannel>>,
     damage: &DamageRegion<BufferSpace>,
 ) -> Result<(), ShmCopyError> {

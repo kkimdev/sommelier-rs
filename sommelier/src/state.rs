@@ -712,6 +712,11 @@ impl Context {
         self.render_buffers.lifecycles()
     }
 
+    /// Whether any buffer the guest destroyed waits to be retired.
+    pub(crate) fn has_guest_destroyed_buffers(&self) -> bool {
+        self.render_buffers.has_guest_destroyed()
+    }
+
     #[cfg(test)]
     pub(crate) fn render_buffer_lifecycle_for_host(
         &self,
@@ -1853,6 +1858,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Whether a destroyed buffer waits to be retired follows every way an
+    /// entry enters and leaves `GuestDestroyed`, so retiring returns early
+    /// only when nothing waits.
+    #[test]
+    fn render_buffer_registry_knows_whether_a_destroyed_buffer_waits() {
+        let (first, second) = (HostId(40), HostId(41));
+        let mut registry = RenderBufferRegistry::default();
+        assert!(registry.register_native(first, (1, 1), Vec::new()));
+        assert!(registry.register_native(second, (1, 1), Vec::new()));
+        assert!(!registry.has_guest_destroyed());
+
+        assert!(registry.mark_guest_destroyed(first));
+        assert!(!registry.mark_guest_destroyed(first));
+        assert!(registry.has_guest_destroyed());
+        assert!(registry.mark_host_destroy_queued(first));
+        assert!(!registry.has_guest_destroyed());
+
+        assert!(registry.mark_guest_destroyed(second));
+        assert!(registry.has_guest_destroyed());
+        assert!(registry.remove(second));
+        assert!(!registry.has_guest_destroyed());
+        assert!(registry.remove(first));
+        assert!(!registry.has_guest_destroyed());
     }
 
     #[test]
