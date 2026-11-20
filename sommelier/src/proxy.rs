@@ -36,6 +36,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::time::Instant;
 
 #[cfg(test)]
+mod frame_cost;
+#[cfg(test)]
 mod fuzz;
 #[cfg(test)]
 pub(crate) mod harness;
@@ -797,7 +799,7 @@ impl Client {
         // that keeps it must leave no state behind an ended object.
         #[cfg(test)]
         if end.is_none() {
-            self.ctx.assert_no_orphans();
+            crate::test_support::counting::uncounted(|| self.ctx.assert_no_orphans());
         }
 
         // A send passes the peer copies of the descriptors. `out` and

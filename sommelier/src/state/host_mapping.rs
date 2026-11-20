@@ -66,6 +66,8 @@ impl HostMapping {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
         let offset = file_offset(offset)?;
+        #[cfg(test)]
+        crate::test_support::counting::count_host_map();
         // SAFETY: a new mapping, at an address the kernel chooses, aliases
         // no memory the program already uses.
         let ptr = unsafe {
@@ -104,6 +106,8 @@ impl HostMapping {
         let mut start = dst.start;
         while start < dst.end {
             let file_offset = file_offset(offset)?;
+            #[cfg(test)]
+            crate::test_support::counting::count_pool_read();
             // SAFETY: `start..dst.end` lies inside the mapping, which lives
             // as long as `self`. Only the kernel writes through the pointer.
             let read = unsafe {

@@ -599,7 +599,11 @@ it a flag of its own, or runs in its own process
 (`test_support::in_own_process`). `proxy::harness::Session` drives a whole
 `Client` as its guest and host, decoding what the proxy sends each into
 the generated message types; CONTRIBUTING says how to write a test with
-it. Beyond unit tests, `proxy::fuzz` feeds whole
+it. `proxy::frame_cost` measures what a steady stream of frames costs a
+session's proxy, in heap allocations and in the system calls that copy
+pixels into or map a host copy, which the test binary counts per thread
+(`test_support::counting`), and holds each to a budget; run it with
+`--nocapture` to see the numbers. Beyond unit tests, `proxy::fuzz` feeds whole
 clients random guest streams, `sim` types into simulated text-input
 clients through a whole client on a virtual clock and checks their text
 against the specification and the user's intent, and
