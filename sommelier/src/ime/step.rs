@@ -318,7 +318,7 @@ impl ImeCore {
         let Some(t) = self.inputs.get_mut(&ti) else {
             return;
         };
-        let frame = t.exo().frame(t.shown());
+        let frame = t.exo().frame(t.shown(), &event);
         t.exo_mut().observe(ti, &event);
         match event {
             HostIme::PreeditStyling {
@@ -353,8 +353,7 @@ impl ImeCore {
             | HostIme::PreeditRegion { .. }
             | HostIme::Confirm { .. } => {}
         }
-        let measuring = t.exo().measuring(frame.clone());
-        let measuring = measuring.as_ref().map_err(|&why| why);
+        let measuring = t.exo().measuring(&frame);
         let edit = composition_event(ti, t, event, measuring, fx);
         t.exo_after(frame.as_ref().ok(), edit);
     }
@@ -589,7 +588,7 @@ fn composition_event(
         HostIme::Delete { index, length } => {
             let lengths = measuring
                 .map_err(DeleteDrop::Unmeasured)
-                .and_then(|frame| frame.delete(index, length));
+                .and_then(Frame::delete);
             match lengths {
                 Ok(lengths) => {
                     let txn = GuestTxn {
@@ -615,7 +614,7 @@ fn composition_event(
             let assembly = cur.take_assembly();
             let txn = measuring
                 .map_err(RegionDrop::Unmeasured)
-                .and_then(|frame| frame.region(index, length, assembly));
+                .and_then(|frame| frame.region(assembly));
             match txn {
                 Ok(txn) => (cur.plan(txn, LeaseOutcome::End), Takes::Before),
                 // Exo ends its composition at an empty region, measured or

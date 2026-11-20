@@ -105,13 +105,21 @@ pub(super) struct Edit {
 }
 
 /// Exo's state before a host event, with the guest in step with it, in
-/// which the event is measured.
-#[derive(Clone, Debug)]
+/// which the event is measured. It holds of Exo's text only what the event
+/// reads, so that no event copies the whole text.
+#[derive(Debug)]
 pub(super) struct Frame {
-    state: ExoState,
     /// The composition Exo holds, which the guest shows as its preedit; or
     /// else empty, at Exo's cursor, which is the guest's.
     preedit: Range<usize>,
+    /// Exo's cursor, its selection's end.
+    cursor: usize,
+    /// The range of Exo's text a delete (H9) or a region (X1) names, if it
+    /// is one, on char boundaries.
+    range: Option<Range<usize>>,
+    /// What a region reads of Exo's text: its range's text, or else, for an
+    /// empty range, the preedit's. Empty for any other event.
+    region_text: String,
 }
 
 impl ExoView {
@@ -146,15 +154,42 @@ impl ExoView {
         self.warned
     }
 
-    /// The frame of the next host event, before the mirror takes it: Exo's
+    /// The frame of host event `event`, before the mirror takes it: Exo's
     /// state, if the mirror knows it exactly and a guest that shows `shown`
     /// can be in step with it.
-    pub(super) fn frame(&self, shown: Option<&Preedit>) -> Result<Frame, Unmeasured> {
+    pub(super) fn frame(
+        &self,
+        shown: Option<&Preedit>,
+        event: &HostIme,
+    ) -> Result<Frame, Unmeasured> {
         let state = self.mirror.exact().ok_or(Unmeasured::Unsure)?;
         let preedit = preedit_in(state, shown).ok_or(Unmeasured::OutOfStep)?;
+        let cursor = state.selection.end;
+        // The range from `start`, `length` long, if it is one of the text.
+        let named = |start: i64, length: u32| {
+            let start = usize::try_from(start).ok()?;
+            let range = start..start + length as usize;
+            state.text.get(range.clone()).map(|_| range)
+        };
+        // H9 measures from the text's start; X1 from Exo's cursor (ZTIM
+        // 248-268).
+        let (range, region_text) = match *event {
+            HostIme::Delete { index, length } => (named(index.into(), length), String::new()),
+            HostIme::PreeditRegion { index, length } => {
+                let range = named(cursor as i64 + i64::from(index), length);
+                let text = range.clone().map(|range| match range.is_empty() {
+                    true => &state.text[preedit.clone()],
+                    false => &state.text[range],
+                });
+                (range, text.unwrap_or_default().to_owned())
+            }
+            _ => (None, String::new()),
+        };
         Ok(Frame {
-            state: state.clone(),
             preedit,
+            cursor,
+            range,
+            region_text,
         })
     }
 
@@ -163,7 +198,10 @@ impl ExoView {
     /// it, the guest has stated every key and
     /// press, no report on its way to Exo crossed the event, and the guest
     /// was in step with the frame.
-    pub(super) fn measuring(&self, frame: Result<Frame, Unmeasured>) -> Result<Frame, Unmeasured> {
+    pub(super) fn measuring<'a>(
+        &self,
+        frame: &'a Result<Frame, Unmeasured>,
+    ) -> Result<&'a Frame, Unmeasured> {
         let mirror = &self.mirror;
         // An event can make a mirror that was unsure exact again.
         if mirror.health() != Health::Exact || frame.as_ref().err() == Some(&Unmeasured::Unsure) {
@@ -176,6 +214,7 @@ impl ExoView {
             return Err(Unmeasured::Crossing);
         }
         frame
+            .as_ref()
             .ok()
             .filter(|_| self.in_step)
             .ok_or(Unmeasured::OutOfStep)
@@ -407,30 +446,21 @@ impl Frame {
     /// region must cover the preedit Exo holds, or Exo's cursor: it deletes
     /// the rest, which the guest has, around the guest's cursor. An empty
     /// region leaves Exo's composition as text, which the guest commits.
-    pub(super) fn region(
-        &self,
-        index: i32,
-        length: u32,
-        assembly: Assembly,
-    ) -> Result<GuestTxn, RegionDrop> {
-        let state = &self.state;
-        let exo_cursor = state.selection.end;
-        let start = usize::try_from(exo_cursor as i64 + i64::from(index))
-            .map_err(|_| RegionDrop::NotAroundCursor)?;
-        let end = start + length as usize;
-        let text = state
-            .text
-            .get(start..end)
-            .ok_or(RegionDrop::NotAroundCursor)?;
+    ///
+    /// The frame must be the region's.
+    pub(super) fn region(&self, assembly: Assembly) -> Result<GuestTxn, RegionDrop> {
+        let exo_cursor = self.cursor;
+        let Range { start, end } = self.range.clone().ok_or(RegionDrop::NotAroundCursor)?;
+        let text = &self.region_text;
         let shown = &self.preedit;
-        if text.is_empty() {
+        if start == end {
             let txn = match shown.is_empty() {
                 true => GuestTxn {
                     delete: Some((0, 0)),
                     ..GuestTxn::default()
                 },
                 false => GuestTxn {
-                    commit: Some(state.text[shown.clone()].to_owned()),
+                    commit: Some(text.clone()),
                     ..GuestTxn::default()
                 },
             };
@@ -444,7 +474,7 @@ impl Frame {
         let before = exo_cursor.clamp(start, end) - start;
         let cursor = assembly.cursor.or(Some(before as i32));
         let cursor = resolve_preedit_cursor(text, assembly.selection, cursor);
-        let preedit = Preedit::new(text.to_owned(), cursor);
+        let preedit = Preedit::new(text.clone(), cursor);
         let txn = GuestTxn {
             delete: Some(delete),
             preedit,
@@ -456,12 +486,13 @@ impl Frame {
     /// H9: Exo deletes `length` bytes from `index` of its text, which holds
     /// no composition (IMA 1090-1102), around its cursor, the guest's.
     /// Returns the lengths before and after the cursor.
-    pub(super) fn delete(&self, index: i32, length: u32) -> Result<(u32, u32), DeleteDrop> {
+    ///
+    /// The frame must be the delete's.
+    pub(super) fn delete(&self) -> Result<(u32, u32), DeleteDrop> {
         let cursor = self.preedit.start;
-        let start = usize::try_from(index).map_err(|_| DeleteDrop::NotAroundCursor)?;
-        let end = start + length as usize;
+        let Range { start, end } = self.range.clone().ok_or(DeleteDrop::NotAroundCursor)?;
         let around = self.preedit.is_empty() && start <= cursor && cursor <= end;
-        if !around || self.state.text.get(start..end).is_none() {
+        if !around {
             return Err(DeleteDrop::NotAroundCursor);
         }
         match ((cursor - start) as u32, (end - cursor) as u32) {

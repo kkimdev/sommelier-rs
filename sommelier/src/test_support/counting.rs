@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! What the code on the current thread costs: heap allocations, and the
-//! system calls that copy pixels into, or map, a host copy.
+//! What the code on the current thread costs: heap allocations and their
+//! bytes, and the system calls that copy pixels into, or map, a host copy.
 //!
 //! The test binary's global allocator counts every allocation on the thread
 //! that makes it, and [`HostMapping`](crate::state::HostMapping) counts its
@@ -29,6 +29,7 @@ use std::ops::Sub;
 
 thread_local! {
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    static ALLOCATED_BYTES: Cell<u64> = const { Cell::new(0) };
     static POOL_READS: Cell<u64> = const { Cell::new(0) };
     static HOST_MAPS: Cell<u64> = const { Cell::new(0) };
 }
@@ -36,11 +37,22 @@ thread_local! {
 /// Add one to `counter`. A thread that is exiting may have lost its
 /// counters; its allocations are not counted.
 fn bump(counter: &'static std::thread::LocalKey<Cell<u64>>) {
-    let _ = counter.try_with(|count| count.set(count.get() + 1));
+    add(counter, 1);
+}
+
+/// Add `n` to `counter`, as [`bump`] does one.
+fn add(counter: &'static std::thread::LocalKey<Cell<u64>>, n: u64) {
+    let _ = counter.try_with(|count| count.set(count.get() + n));
+}
+
+/// Count one allocation or reallocation of `size` bytes.
+fn allocated(size: usize) {
+    bump(&ALLOCATIONS);
+    add(&ALLOCATED_BYTES, size as u64);
 }
 
 /// The system allocator, counting each allocation and reallocation on the
-/// thread that makes it.
+/// thread that makes it, and the bytes it asks for.
 pub struct CountingAllocator;
 
 // SAFETY: every method forwards to the system allocator unchanged. The
@@ -48,19 +60,19 @@ pub struct CountingAllocator;
 // counting neither allocates nor reenters the allocator.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        bump(&ALLOCATIONS);
+        allocated(layout.size());
         // SAFETY: the caller's contract is `System`'s.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        bump(&ALLOCATIONS);
+        allocated(layout.size());
         // SAFETY: the caller's contract is `System`'s.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        bump(&ALLOCATIONS);
+        allocated(new_size);
         // SAFETY: the caller's contract is `System`'s.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -91,6 +103,7 @@ pub fn uncounted<R>(checks: impl FnOnce() -> R) -> R {
     let before = Counts::now();
     let result = checks();
     ALLOCATIONS.with(|count| count.set(before.allocations));
+    ALLOCATED_BYTES.with(|count| count.set(before.allocated_bytes));
     POOL_READS.with(|count| count.set(before.pool_reads));
     HOST_MAPS.with(|count| count.set(before.host_maps));
     result
@@ -101,6 +114,9 @@ pub fn uncounted<R>(checks: impl FnOnce() -> R) -> R {
 pub struct Counts {
     /// Heap allocations and reallocations.
     pub allocations: u64,
+    /// The bytes they asked for: an allocation's size, and a
+    /// reallocation's new size.
+    pub allocated_bytes: u64,
     /// Read system calls into host copies.
     pub pool_reads: u64,
     /// Mappings of host copies.
@@ -112,6 +128,7 @@ impl Counts {
     pub fn now() -> Self {
         Self {
             allocations: ALLOCATIONS.with(Cell::get),
+            allocated_bytes: ALLOCATED_BYTES.with(Cell::get),
             pool_reads: POOL_READS.with(Cell::get),
             host_maps: HOST_MAPS.with(Cell::get),
         }
@@ -129,6 +146,7 @@ impl Counts {
     pub fn per(self, n: u64) -> Self {
         Self {
             allocations: self.allocations.div_ceil(n),
+            allocated_bytes: self.allocated_bytes.div_ceil(n),
             pool_reads: self.pool_reads.div_ceil(n),
             host_maps: self.host_maps.div_ceil(n),
         }
@@ -141,6 +159,7 @@ impl Sub for Counts {
     fn sub(self, earlier: Self) -> Self {
         Self {
             allocations: self.allocations - earlier.allocations,
+            allocated_bytes: self.allocated_bytes - earlier.allocated_bytes,
             pool_reads: self.pool_reads - earlier.pool_reads,
             host_maps: self.host_maps - earlier.host_maps,
         }
@@ -150,6 +169,7 @@ impl Sub for Counts {
 impl std::ops::AddAssign for Counts {
     fn add_assign(&mut self, other: Self) {
         self.allocations += other.allocations;
+        self.allocated_bytes += other.allocated_bytes;
         self.pool_reads += other.pool_reads;
         self.host_maps += other.host_maps;
     }
@@ -165,7 +185,7 @@ mod tests {
     #[test]
     fn counts_the_allocations_of_this_thread_only() {
         let (counts, boxed) = Counts::of(|| std::hint::black_box(Box::new(7u64)));
-        assert_eq!(counts.allocations, 1);
+        assert_eq!((counts.allocations, counts.allocated_bytes), (1, 8));
         drop(boxed);
         // Spawning a thread allocates on this one, but far less than the
         // hundred vectors the thread allocates on its own.
