@@ -20,6 +20,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::virtwl::DMA_BUF_SYNC_READ;
@@ -383,34 +384,85 @@ fn open_drm_device(path: &Path) -> io::Result<File> {
 /// the virtio-gpu plane-0 fixup, the fence check's virtio-gpu fallback and
 /// the synthetic dma-buf feedback's main device.
 ///
-/// The process opens it once, in `main`, and every client shares it. Each
-/// use imports and closes its GEM handle within one call, and all clients
-/// run on one thread, so no use sees another's handle.
+/// The process opens it once ([`VirtGpuNode`]) and every client shares it.
+/// Each use imports and closes its GEM handle within one call, and all
+/// clients run on one thread, so no use sees another's handle.
 pub struct VirtGpuDevice {
     device: File,
     drm_has_virtgpu_resource_info_type: bool,
 }
 
-impl VirtGpuDevice {
-    /// The process's render node, or `None`, with a warning, when there is
-    /// none: buffers then fall back to VirtWL or SHM.
-    pub fn from_environment() -> Option<Self> {
-        Self::open()
-            .inspect_err(|error| log::warn!("No virtio-gpu render node: {error}"))
-            .ok()
-    }
+/// The process's render node, opened when a client first needs it: one
+/// that fails to open, as early in boot before the node appears, is tried
+/// again for the next client, and one that opened is kept. The first
+/// failure warns; later ones log at debug level. Without the node,
+/// buffers fall back to VirtWL or SHM.
+pub struct VirtGpuNode {
+    device: std::cell::RefCell<Option<Arc<VirtGpuDevice>>>,
+    open: Box<dyn Fn() -> io::Result<VirtGpuDevice>>,
+    warned: std::cell::Cell<bool>,
+}
 
-    /// Open the render node.
-    ///
-    /// `SOMMELIER_DRM_DEVICE` can force a particular render node. Without it,
-    /// all `/dev/dri/renderD*` nodes are tried in numeric order, but only
-    /// nodes backed by the `virtio_gpu` DRM driver are accepted. This mirrors
-    /// ChromiumOS Sommelier's `open_virtgpu()` probe and avoids selecting a
-    /// software or secondary GPU node merely because it sorts first.
-    fn open() -> io::Result<Self> {
+impl VirtGpuNode {
+    /// The node `SOMMELIER_DRM_DEVICE` names, or else the first virtio-gpu
+    /// render node; `main` reads the variable once, here.
+    pub fn from_environment() -> Self {
         let configured = std::env::var_os(DRM_DEVICE_ENV)
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty());
+        Self::with_opener(move || VirtGpuDevice::open(configured.clone()))
+    }
+
+    fn with_opener(open: impl Fn() -> io::Result<VirtGpuDevice> + 'static) -> Self {
+        Self {
+            device: std::cell::RefCell::new(None),
+            open: Box::new(open),
+            warned: std::cell::Cell::new(false),
+        }
+    }
+
+    /// A node that never opens, for tests.
+    #[cfg(test)]
+    pub(crate) fn absent_for_test() -> Self {
+        Self::with_opener(|| Err(io::ErrorKind::NotFound.into()))
+    }
+
+    /// The render node, opened now unless an earlier call opened it.
+    pub fn get(&self) -> Option<Arc<VirtGpuDevice>> {
+        if let Some(device) = self.device.borrow().as_ref() {
+            return Some(Arc::clone(device));
+        }
+        match (self.open)() {
+            Ok(device) => {
+                let device = Arc::new(device);
+                *self.device.borrow_mut() = Some(Arc::clone(&device));
+                if self.warned.get() {
+                    log::info!("The virtio-gpu render node is available now");
+                }
+                Some(device)
+            }
+            Err(error) => {
+                if self.warned.replace(true) {
+                    log::debug!("Still no virtio-gpu render node: {error}");
+                } else {
+                    log::warn!(
+                        "No virtio-gpu render node: {error}; trying again for the next client"
+                    );
+                }
+                None
+            }
+        }
+    }
+}
+
+impl VirtGpuDevice {
+    /// Open the render node: `configured` (`SOMMELIER_DRM_DEVICE`) forces
+    /// a particular one. Without it, all `/dev/dri/renderD*` nodes are
+    /// tried in numeric order, but only nodes backed by the `virtio_gpu`
+    /// DRM driver are accepted. This mirrors ChromiumOS Sommelier's
+    /// `open_virtgpu()` probe and avoids selecting a software or secondary
+    /// GPU node merely because it sorts first.
+    fn open(configured: Option<PathBuf>) -> io::Result<Self> {
         let forced_device = configured.is_some();
         let candidates = drm_device_candidates(configured)?;
         if candidates.is_empty() {
@@ -706,7 +758,7 @@ mod tests {
         apply_dmabuf_plane0_fixup, dmabuf_fence, dmabuf_sync_capability_unavailable,
         drm_device_candidates, is_virtio_gpu_driver, open_drm_device, render_node_number,
         resource_info_type_supported, sorted_render_nodes, sync_file_fence, DmabufFence,
-        PendingFence, VirtGpuResourceInfo, VirtGpuResourceInfoProbe,
+        PendingFence, VirtGpuDevice, VirtGpuNode, VirtGpuResourceInfo, VirtGpuResourceInfoProbe,
         DRM_IOCTL_VIRTGPU_RESOURCE_INFO_CROS, DRM_IOCTL_VIRTGPU_RESOURCE_INFO_PROBE,
     };
     use std::ffi::OsStr;
@@ -715,6 +767,31 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// A render node missing when the process starts, as early in boot,
+    /// opens for a later client, and is then kept: the opener runs only
+    /// until it succeeds.
+    #[test]
+    fn a_render_node_that_fails_to_open_is_tried_again_then_kept() {
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let node = VirtGpuNode::with_opener({
+            let attempts = std::rc::Rc::clone(&attempts);
+            move || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    return Err(io::ErrorKind::NotFound.into());
+                }
+                Ok(VirtGpuDevice {
+                    device: std::fs::File::open("/dev/null")?,
+                    drm_has_virtgpu_resource_info_type: false,
+                })
+            }
+        });
+        assert!(node.get().is_none(), "the first open fails");
+        let opened = node.get().expect("the next client opens it");
+        let kept = node.get().expect("later clients share it");
+        assert!(std::sync::Arc::ptr_eq(&opened, &kept));
+        assert_eq!(attempts.get(), 2);
+    }
     #[test]
     fn parses_only_numeric_render_node_names() {
         assert_eq!(

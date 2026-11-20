@@ -1525,9 +1525,9 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   (`SOMMELIER_WHEEL_FROM_TOUCHPAD`; by default a Wine process, by its
   executable or its loader's environment through `SO_PEERCRED` and
   `/proc`, read on a detached thread that the client's task waits for,
-  before it handles a message, at most 100 ms (`DETECTION_TIMEOUT`); a
-  client whose read takes longer is not taken for Wine, so a hung read
-  stalls no client) gets one `axis_discrete` step, signed like the
+  before it handles a message, at most 500 ms (`DETECTION_TIMEOUT`); a
+  client whose read takes longer is not taken for Wine, with an info
+  log, so a hung read stalls no client) gets one `axis_discrete` step, signed like the
   scroll, per 10 units of finger or continuous scrolling on an axis,
   just before the `axis` that crosses it, as the protocol orders them.
   10 is Exo's distance for one wheel notch (`kWaylandScrollUnit`). The

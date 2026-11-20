@@ -30,10 +30,13 @@ handler intercepts the ones whose meaning changes across the boundary.
   raises the open-file soft limit (`prepare_process`), and resolves every
   process-wide setting once, before the first client connects: the VM
   identifier (`state::vm_identifier_from_environment`), the virtio-gpu
-  render node (`VirtGpuDevice::from_environment`, which reads
-  `SOMMELIER_DRM_DEVICE`), the placement configuration
-  (`PlacementConfig::from_environment`) and which clients get wheel steps
-  for touchpad scrolling (`client_kind::WheelFromTouchpad::from_environment`).
+  render node (`VirtGpuNode::from_environment`, which reads
+  `SOMMELIER_DRM_DEVICE`; the node opens when a client first needs it,
+  and one that fails to open is tried again for the next client until it
+  opens; test: `a_render_node_that_fails_to_open_is_tried_again_then_kept`),
+  the placement configuration (`PlacementConfig::from_environment`) and
+  which clients get wheel steps for touchpad scrolling
+  (`client_kind::WheelFromTouchpad::from_environment`).
   Connections receive the results; `client_kind.rs`, the one owner of
   whether a client is Wine, decides that per client from its process when
   it connects ([pointer scrolling](INVARIANTS.md#pointer-scrolling)).

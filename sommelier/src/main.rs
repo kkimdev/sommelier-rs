@@ -144,7 +144,7 @@ async fn main() {
         shortcuts_file,
     ));
     let vm_identifier = state::vm_identifier_from_environment();
-    let virtgpu = allocator::VirtGpuDevice::from_environment();
+    let virtgpu = allocator::VirtGpuNode::from_environment();
     let wheel_from_touchpad = client_kind::WheelFromTouchpad::from_environment();
 
     if local_compositor.is_none() && virtio_wl.is_none() {

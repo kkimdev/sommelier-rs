@@ -39,7 +39,8 @@ const WINE_ENVIRONMENT_MARKERS: [&[u8]; 2] = [b"WINESERVERSOCKET=", b"WINELOADER
 
 /// How long a client waits to learn whether it is Wine before it is
 /// taken not to be; a read of `/proc` takes microseconds unless it hangs.
-const DETECTION_TIMEOUT: Duration = Duration::from_millis(100);
+/// The wait delays only that client's first message.
+const DETECTION_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// `SOMMELIER_WHEEL_FROM_TOUCHPAD`: which clients get wheel steps.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -125,7 +126,7 @@ async fn await_detection(
     match tokio::time::timeout(timeout, wine).await {
         Ok(answer) => answer.unwrap_or(false),
         Err(_) => {
-            log::debug!(
+            log::info!(
                 "Reading client process {pid}'s /proc took over {timeout:?}; it is not taken for Wine"
             );
             false
@@ -200,7 +201,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_detection_that_does_not_answer_in_time_is_not_wine() {
         let (answer, wine) = tokio::sync::oneshot::channel();
+        let asked = tokio::time::Instant::now();
         assert!(!await_detection(1, wine, DETECTION_TIMEOUT).await);
+        assert_eq!(asked.elapsed(), Duration::from_millis(500));
         // A late answer changes nothing.
         assert_eq!(answer.send(true), Err(true));
 

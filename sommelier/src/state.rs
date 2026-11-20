@@ -971,7 +971,7 @@ impl Context {
     /// * `vm_identifier` - the VM namespace of application IDs (see
     ///   [`vm_identifier_from_environment`]).
     /// * `virtgpu` - the process's virtio-gpu render node, if it has one
-    ///   (see [`VirtGpuDevice::from_environment`]).
+    ///   (see [`crate::allocator::VirtGpuNode`]).
     /// * `placement` - the process-wide placement configuration; `Context`
     ///   never reads placement variables itself.
     pub fn new(
