@@ -91,7 +91,6 @@ pub(crate) struct TextInput {
     exo: ExoView,
     /// The pieces of Exo's next edit, which arrive whatever the link.
     pieces: V1Pieces,
-    composition: Composition,
     warned: Warned,
 }
 
@@ -113,7 +112,7 @@ struct FocusedField {
 /// host gets each content type once it can apply it, and only then").
 /// Only the transitions of [`TextInput`] change it, and only
 /// [`TextInput::leave_attached`] leaves `Attached`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LinkState {
     /// No input method is attached, and none is about to be.
     Detached,
@@ -121,16 +120,29 @@ pub(crate) enum LinkState {
     Attached {
         /// The content type the input method applied, `None` until sent.
         content_type: Option<HostContentType>,
+        /// What the guest shows of the input method's composition, which
+        /// exists only while it is attached (I2).
+        composition: Composition,
     },
     /// `deactivate` was sent, and `barrier` drains Exo's events from
     /// before it.
     Draining { barrier: BarrierToken },
 }
 
+impl LinkState {
+    /// The preedit the guest shows, which only an attached link has.
+    fn shown(&self) -> Option<&Preedit> {
+        match self {
+            Self::Attached { composition, .. } => composition.shown.as_ref(),
+            Self::Detached | Self::Draining { .. } => None,
+        }
+    }
+}
+
 /// What the guest shows. What Exo holds is the Exo mirror's
 /// ([`ExoView`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Composition {
+pub(crate) struct Composition {
     shown: Option<Preedit>,
 }
 
@@ -164,7 +176,6 @@ impl TextInput {
             fence: None,
             exo: ExoView::new(),
             pieces: V1Pieces::default(),
-            composition: Composition::default(),
             warned: Warned::default(),
         }
     }
@@ -181,8 +192,21 @@ impl TextInput {
         self.commits.serial()
     }
 
-    pub(crate) fn link(&self) -> LinkState {
-        self.link
+    pub(crate) fn link(&self) -> &LinkState {
+        &self.link
+    }
+
+    /// The preedit the guest shows, which only an attached link has.
+    fn shown(&self) -> Option<&Preedit> {
+        self.link.shown()
+    }
+
+    /// The composition, while the link is attached.
+    fn composition_mut(&mut self) -> Option<&mut Composition> {
+        match &mut self.link {
+            LinkState::Attached { composition, .. } => Some(composition),
+            LinkState::Detached | LinkState::Draining { .. } => None,
+        }
     }
 
     pub(crate) fn is_attached(&self) -> bool {
@@ -228,21 +252,18 @@ impl TextInput {
     /// Whether the core withholds the guest's report `report`
     /// (`ExoView::withholding`).
     pub(super) fn withholding(&self, report: &(String, u32, u32)) -> Option<Withheld> {
-        self.exo
-            .withholding(report, self.composition.shown.as_ref())
+        self.exo.withholding(report, self.shown())
     }
 
     /// The mirror takes host edit `edit`, with its `pieces`, before the
     /// gate (`ExoView::observe`).
     pub(super) fn observe(&mut self, ti: TiId, edit: &Edit, pieces: &V1Pieces) -> Observation {
-        self.exo
-            .observe(ti, edit, pieces, self.composition.shown.as_ref())
+        self.exo.observe(ti, edit, pieces, self.link.shown())
     }
 
     /// An edit the gate kept from the guest.
     pub(super) fn stale(&mut self, observation: Observation) {
-        self.exo
-            .finish(observation, None, self.composition.shown.as_ref());
+        self.exo.finish(observation, None, self.link.shown());
     }
 
     /// The pending state a commit consumes, or `None` while unfocused
@@ -297,7 +318,7 @@ impl TextInput {
         }
         let serial = self.serial();
         let txn = GuestTxn {
-            preedit: self.composition.shown.clone(),
+            preedit: self.shown().cloned(),
             ..GuestTxn::default()
         };
         txn.encode(ti, false, serial).unwrap_or_else(|TooLong| {
@@ -305,7 +326,9 @@ impl TextInput {
                 "Forgetting the preedit of text input {}: it no longer fits",
                 ti.0
             );
-            self.composition.shown = None;
+            if let Some(composition) = self.composition_mut() {
+                composition.shown = None;
+            }
             let done = GuestTxn::default().encode(ti, false, serial);
             done.expect("a bare done has no string")
         })
@@ -316,8 +339,9 @@ impl TextInput {
     /// answer that forgets one (G9c).
     #[cfg(test)]
     pub(super) fn replace_shown(&mut self, preedit: Preedit) {
-        assert!(self.composition.shown.is_some(), "a preedit shows");
-        self.composition.shown = Some(preedit);
+        let composition = self.composition_mut().expect("attached");
+        assert!(composition.shown.is_some(), "a preedit shows");
+        composition.shown = Some(preedit);
     }
 
     /// F1, F2 and G10: the field ends, and a new one starts on `surface`,
@@ -356,11 +380,15 @@ impl TextInput {
         if !self.is_current() {
             return None;
         }
+        // The composition, which only an attached link has.
+        let LinkState::Attached { composition, .. } = &mut self.link else {
+            return None;
+        };
         Some(Current {
             ti,
             seat: self.seat,
             serial: self.commits.serial(),
-            composition: &mut self.composition,
+            composition,
             fence: &mut self.fence,
             exo: &mut self.exo,
         })
@@ -368,14 +396,21 @@ impl TextInput {
 
     pub(super) fn activate_sent(&mut self) {
         debug_assert_eq!(self.link, LinkState::Detached);
-        self.link = LinkState::Attached { content_type: None };
+        self.link = LinkState::Attached {
+            content_type: None,
+            composition: Composition::default(),
+        };
     }
 
     pub(super) fn content_type_sent(&mut self, applied: HostContentType) {
-        debug_assert!(self.is_attached());
-        self.link = LinkState::Attached {
-            content_type: Some(applied),
-        };
+        if let LinkState::Attached { content_type, .. } = &mut self.link {
+            *content_type = Some(applied);
+        } else {
+            debug_assert!(
+                false,
+                "only an attached input method applies a content type"
+            );
+        }
     }
 
     /// The one way out of `Attached`, into `next`. It ends the composition
@@ -387,8 +422,10 @@ impl TextInput {
         if !self.is_attached() {
             return None;
         }
-        self.link = next;
-        Some(std::mem::take(&mut self.composition))
+        match std::mem::replace(&mut self.link, next) {
+            LinkState::Attached { composition, .. } => Some(composition),
+            LinkState::Detached | LinkState::Draining { .. } => None,
+        }
     }
 
     pub(super) fn deactivate_sent(&mut self, barrier: BarrierToken) {
@@ -460,13 +497,13 @@ impl TextInput {
         // activation waits for a live seat (R2), or while it is attached
         // with a dead seat.
         let target = host::target(self, env);
-        match (target.surface, self.link) {
+        match (target.surface, &self.link) {
             (_, LinkState::Draining { .. }) | (None, LinkState::Detached) => {}
             (Some(_), LinkState::Detached) => {
                 assert_eq!(target.seat, None, "I1b: {ti:?} can activate: {self:?}")
             }
-            (Some(_), LinkState::Attached { content_type }) => assert_eq!(
-                content_type,
+            (Some(_), LinkState::Attached { content_type, .. }) => assert_eq!(
+                *content_type,
                 Some(target.content_type),
                 "I1b: {ti:?} lacks its content type"
             ),
@@ -474,11 +511,7 @@ impl TextInput {
                 panic!("I1b: {ti:?} is attached with no target: {self:?}")
             }
         }
-        let Composition { shown } = &self.composition;
-        if shown.is_some() {
-            assert!(attached, "I2: {ti:?} composes while not attached");
-        }
-        if shown.is_some() {
+        if self.shown().is_some() {
             assert!(
                 self.fence.is_none(),
                 "I2: {ti:?} shows a preedit behind a fence"
@@ -517,19 +550,25 @@ impl TextInput {
     /// for, as the reconcile of the guest commit that set its state would.
     pub(crate) fn attach_for_test(&mut self, env: &impl Env) {
         let content_type = Some(host::target(self, env).content_type);
-        self.link = LinkState::Attached { content_type };
+        self.link = LinkState::Attached {
+            content_type,
+            composition: Composition::default(),
+        };
     }
 
     /// Show `text` with the cursor at its end, or show nothing for empty
     /// `text`.
     pub(crate) fn show_for_test(&mut self, text: &str) {
         let end = text.len() as i32;
-        self.composition.shown = Preedit::new(text.to_string(), (end, end));
+        let composition = self
+            .composition_mut()
+            .expect("only an attached link composes");
+        composition.shown = Preedit::new(text.to_string(), (end, end));
     }
 
     /// The text of the preedit the guest shows.
     pub(crate) fn shown_for_test(&self) -> Option<&str> {
-        self.composition.shown.as_ref().map(Preedit::text)
+        self.shown().map(Preedit::text)
     }
 
     pub(crate) fn pending_for_test(&self) -> &V3Pending {

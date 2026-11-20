@@ -177,7 +177,7 @@ pub(crate) fn view(ctx: &Context, guest: u32) -> View {
             LinkState::Attached { .. } => Host::Active,
             LinkState::Draining { barrier } => Host::Draining(
                 ctx.internal_callbacks
-                    .awaits(InternalCallback::TextInput { token: barrier })
+                    .awaits(InternalCallback::TextInput { token: *barrier })
                     .expect("a drain waits for its callback"),
             ),
         },

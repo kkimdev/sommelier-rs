@@ -977,7 +977,7 @@ fn only_an_enable_that_changes_the_field_closes_its_composition() {
 #[test]
 fn reconcile_reaches_every_target_with_only_needed_requests() {
     use super::host::HostContentType;
-    use super::state::LinkState;
+    use super::state::{Composition, LinkState};
     use host::{ActivationStep, HostSteps, HostTarget};
     let content_types: Vec<_> = [(1, 2), (3, 4)]
         .into_iter()
@@ -997,35 +997,39 @@ fn reconcile_reaches_every_target_with_only_needed_requests() {
             [None]
                 .into_iter()
                 .chain(content_types.iter().copied().map(Some))
-                .map(|content_type| LinkState::Attached { content_type }),
+                .map(|content_type| LinkState::Attached {
+                    content_type,
+                    composition: Composition::default(),
+                }),
         )
         .collect();
     // Apply `steps` to `link` as the host does.
-    let apply = |link: LinkState, steps: HostSteps| {
+    let attached = |content_type| LinkState::Attached {
+        content_type,
+        composition: Composition::default(),
+    };
+    let apply = |link: &LinkState, steps: HostSteps| {
         let mut next = match (steps.activation, link) {
-            (Some(ActivationStep::Activate { .. }), LinkState::Detached) => {
-                LinkState::Attached { content_type: None }
-            }
+            (Some(ActivationStep::Activate { .. }), LinkState::Detached) => attached(None),
             (Some(ActivationStep::Deactivate { .. }), LinkState::Attached { .. }) => {
                 LinkState::Draining {
                     barrier: BarrierToken(101),
                 }
             }
             (Some(ActivationStep::Abandon), LinkState::Attached { .. }) => LinkState::Detached,
-            (None, link) => link,
+            (None, link) => link.clone(),
             (step, link) => panic!("{step:?} is no transition from {link:?}"),
         };
         if let Some(content_type) = steps.content_type {
             let LinkState::Attached {
                 content_type: applied,
+                ..
             } = next
             else {
                 panic!("{steps:?} sends a content type no input method applies");
             };
             assert_ne!(applied, Some(content_type), "{steps:?} resends {applied:?}");
-            next = LinkState::Attached {
-                content_type: Some(content_type),
-            };
+            next = attached(Some(content_type));
         }
         next
     };
@@ -1037,14 +1041,12 @@ fn reconcile_reaches_every_target_with_only_needed_requests() {
                     seat,
                     content_type,
                 };
-                for &link in &links {
+                for link in &links {
                     let reached = apply(link, host::reconcile(&target, link));
-                    let attached = LinkState::Attached {
-                        content_type: Some(content_type),
-                    };
+                    let attached = attached(Some(content_type));
                     let expected = match (link, surface, seat) {
                         // The barrier's completion reconciles again.
-                        (LinkState::Draining { .. }, ..) => link,
+                        (LinkState::Draining { .. }, ..) => link.clone(),
                         (_, Some(_), Some(_)) => attached,
                         (LinkState::Attached { .. }, None, Some(_)) => LinkState::Draining {
                             barrier: BarrierToken(101),
@@ -1053,12 +1055,12 @@ fn reconcile_reaches_every_target_with_only_needed_requests() {
                         // A seat that cannot carry an activate keeps the
                         // link as it is, with the content type it can still
                         // take.
-                        (LinkState::Detached, Some(_), None) => link,
+                        (LinkState::Detached, Some(_), None) => link.clone(),
                         (LinkState::Attached { .. }, Some(_), None) => attached,
                     };
                     assert_eq!(reached, expected, "{target:?} from {link:?}");
                     assert_eq!(
-                        host::reconcile(&target, reached),
+                        host::reconcile(&target, &reached),
                         HostSteps::default(),
                         "{target:?} is reached from {link:?} in one reconcile"
                     );

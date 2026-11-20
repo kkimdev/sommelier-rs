@@ -319,9 +319,10 @@ when another changes:
 - `pending`: the requests since the guest's latest commit (`V3Pending`).
 - `link` (`LinkState`): what the host text input has applied.
   - `Detached`: no input method is attached, and none is about to be.
-  - `Attached { content_type }`: `activate` was sent. Exo attaches when
-    the surface has its focus (E1); a later v1 `leave` is Exo's own
-    detach (H2).
+  - `Attached { content_type, composition }`: `activate` was sent. Exo
+    attaches when the surface has its focus (E1); a later v1 `leave` is
+    Exo's own detach (H2). `composition` holds `shown`, the preedit the
+    guest shows, which exists only while attached (I2).
   - `Draining { barrier }`: `deactivate` was sent, and the barrier
     drains Exo's events from before it.
 - `fence`: the reset fence of a press (F4) until its `done` (W2). It
@@ -330,7 +331,6 @@ when another changes:
   whole life, so it lives beside the link too.
 - `pieces` (`V1Pieces`): the v1 pieces of Exo's next edit (B3), which
   arrive whatever the link, so they live beside it.
-- `composition`: `shown`, the preedit the guest shows.
 - `commits` (`CommitCount`), and `warned`, which only makes a warning
   once per text input and which the invariants ignore.
 
@@ -349,8 +349,8 @@ when another changes:
 
 `leave_attached` is private to `state.rs` and is the one writer of a
 non-`Attached` link from `Attached`; the four exits above call it. It
-ends the composition with the link. So a composition exists only while
-attached (I2), and one function holds that rule. A new field is never
+ends the composition with the link, which holds it, so the type keeps
+I2. A new field is never
 attached after its step, so it needs no transition of its own: a
 disable makes the reconcile leave `Attached`, and an enable, or a
 rejected one, starts from a link that was not attached (I1a). The same
@@ -358,12 +358,12 @@ holds for a refocus (F1, F2), which leaves the field disabled.
 
 **Composition transitions.**
 
-- `shown` changes in only four ways:
+- `shown` changes in only three ways:
   - through `Planned::apply` of a plan that `Current` made (H7 to X2,
     F1, H2, F4);
-  - through `leave_attached`, on any exit from `Attached`;
-  - through the reconcile's exit from `Attached` after a new field
-    (G9c) or a focus reset (F1, F2);
+  - with the link, on any exit from `Attached` (`leave_attached`),
+    among them the reconcile's after a new field (G9c) or a focus reset
+    (F1, F2);
   - through the answer forgetting a preedit that no longer fits (G9b,
     G9c).
 - The pieces change only through `record_piece` (H4 to H6) and
@@ -412,7 +412,9 @@ I3, I6 and I7 after every `step` in tests, and
 - **I1a.** `Attached` implies `Focused(f)` with `f.committed.enabled`.
   This holds between steps, because every step ends with a reconcile:
   a target that turned inactive has just been deactivated (`Draining`)
-  or abandoned (`Detached`).
+  or abandoned (`Detached`). Within a step it may not: a refocus or a
+  disable leaves the link attached until the reconcile, which needs the
+  step's barrier number and `Env`'s seat, so I1a is checked, not typed.
 - **I1b.** After a step, the link matches the target, except in three
   cases. It is checked by matching the target against the link, not by
   asking `reconcile` whether anything is left to send:
@@ -426,8 +428,8 @@ I3, I6 and I7 after every `step` in tests, and
     `release_does_not_end_child_text_input_focus`). `Attached` with no
     target cannot occur after a step, since the reconcile deactivates
     or abandons it (R1).
-- **I2.** `shown.is_some()` implies `Attached`.
-  `shown.is_some()` implies `fence.is_none()`.
+- **I2.** `shown.is_some()` implies `Attached`, which holds `shown`, so
+  the type keeps it. `shown.is_some()` implies `fence.is_none()`.
 - **I3.** At most one text input has `committed.enabled`.
 - **I5.** Every token in `Draining{b}` or in `fence` is pending in
   `InternalCallbacks` as `InternalCallback::TextInput { token }`. The
