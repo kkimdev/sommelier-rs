@@ -272,6 +272,14 @@ proxy or the models do there causes: find out why before shrinking it
 again, as a regression of the proxy shows here. A failure that does not
 replay from its choices, or a panic, is not shrunk.
 
+## Recorded host traces
+
+`traces/` holds wire traces recorded on a Chromebook, which
+`proxy::replay` replays through a `Session`;
+[traces/README.md](traces/README.md) says what a replay checks and how to
+record a trace. Run the replays with
+`cargo test -p sommelier --bins proxy::replay`.
+
 ## End-to-end test
 
 `sommelier/tests/weston_e2e.rs` runs real clients through
