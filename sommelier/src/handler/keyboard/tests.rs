@@ -18,6 +18,7 @@ use super::*;
 use crate::handler::window_placement::{
     attach_toplevel, place_focused, surface_configured, translate_aura_configure, PlacementSkip,
 };
+use crate::handler::Handlers;
 use crate::keymap::MAX_KEYMAP_SIZE;
 use crate::keys::{GuestKeyOwner, KeyClass, EVDEV_KEY_BACKSPACE};
 use crate::placement_config::PlacementConfig;
@@ -41,12 +42,14 @@ use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
 use crate::state::OutputState;
+use crate::state::Singleton;
 use crate::test_support::text_input::{self, Host};
 use crate::test_support::{decode, msg_opcode, msg_sender, shm_pool_file};
 use crate::window_layout::NormalizedRect;
 use crate::wire::WL_DISPLAY_ID;
 use std::os::fd::AsFd;
 use xkb::keysyms;
+use xkbcommon::xkb;
 use GuestKeyOwner::{ImeRecovery, Physical, Shortcut};
 
 /// The named preset `name`.
@@ -139,11 +142,9 @@ const TEXT_INPUT: MappedTextInput = MappedTextInput {
 /// A surface the tests focus that the guest never created.
 const UNCREATED_SURFACE: u32 = 900;
 
-/// The keyboard handler and the proxy state it works on. Each method
-/// dispatches one event as the generated dispatcher would, from the
-/// sender it names.
+/// The proxy state the keyboard handler works on. Each method dispatches
+/// one event as the generated dispatcher would, from the sender it names.
 struct Proxy {
-    handler: KeyboardHandler,
     ctx: Context,
 }
 
@@ -153,10 +154,7 @@ impl Proxy {
     }
 
     fn with(ctx: Context) -> Self {
-        Self {
-            handler: KeyboardHandler::new(),
-            ctx,
-        }
+        Self { ctx }
     }
 
     /// Pair keyboard `k` as `wl_seat.get_keyboard` and its first enter
@@ -233,8 +231,7 @@ impl Proxy {
         self.ctx.last_sender_id = k.host;
         // The memfd's offset stays at its end, as a host may leave it.
         let file = shm_pool_file(bytes);
-        self.handler
-            .on_keymap(&mut self.ctx, format, file.as_fd(), size)
+        Handlers::on_keymap(&mut self.ctx, format, file.as_fd(), size)
     }
 
     /// `k`'s host sends the default keymap, which loads.
@@ -255,34 +252,31 @@ impl Proxy {
     fn modifiers(&mut self, k: Mapped, depressed: u32) {
         self.created(k);
         self.ctx.last_sender_id = k.host;
-        let action = self
-            .handler
-            .on_modifiers(&mut self.ctx, 1, depressed, 0, 0, 0);
+        let action = Handlers::on_modifiers(&mut self.ctx, 1, depressed, 0, 0, 0);
         assert_eq!(action, Action::Forward);
     }
 
     fn key(&mut self, k: Mapped, serial: u32, time: u32, key: u32, state: u32) -> Action {
         self.ctx.last_sender_id = k.host;
-        self.handler.on_key(&mut self.ctx, serial, time, key, state)
+        Handlers::on_key(&mut self.ctx, serial, time, key, state)
     }
 
     fn peek(&mut self, k: Mapped, serial: u32, time: u32, key: u32, state: u32) -> Action {
         self.ctx.last_sender_id = k.extended;
-        self.handler
-            .on_peek_key(&mut self.ctx, serial, time, key, state)
+        Handlers::on_peek_key(&mut self.ctx, serial, time, key, state)
     }
 
     /// `k`'s host enters host surface `surface` with `keys` held.
     fn enter(&mut self, k: Mapped, surface: u32, keys: &[u32]) -> Action {
         self.ctx.last_sender_id = k.host;
         let keys: Vec<u8> = keys.iter().flat_map(|key| key.to_ne_bytes()).collect();
-        self.handler.on_enter(&mut self.ctx, 1, surface, &keys)
+        Handlers::on_enter(&mut self.ctx, 1, surface, &keys)
     }
 
     /// `k`'s host leaves host surface `surface`.
     fn leave(&mut self, k: Mapped, surface: u32) -> Action {
         self.ctx.last_sender_id = k.host;
-        self.handler.on_leave(&mut self.ctx, 1, surface)
+        Handlers::on_leave(&mut self.ctx, 1, surface)
     }
 
     /// The guest releases `k`, as the generated dispatcher does: the
@@ -290,14 +284,14 @@ impl Proxy {
     /// forgets its state.
     fn release(&mut self, k: Mapped) {
         self.ctx.last_sender_id = k.guest;
-        assert_eq!(self.handler.on_release(&mut self.ctx), Action::Forward);
+        assert_eq!(Handlers::on_release(&mut self.ctx), Action::Forward);
         self.ctx.guest_destroyed(k.guest);
     }
 
     /// The host input method of `t` confirms an empty composition.
     fn confirm(&mut self, t: MappedTextInput) -> Action {
         self.ctx.last_sender_id = t.extended;
-        crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut self.ctx, 0)
+        crate::handler::Handlers::on_confirm_preedit(&mut self.ctx, 0)
     }
 
     /// The IME core leases `k`'s held Backspace to text input `t`, as a
@@ -965,10 +959,7 @@ const TOP_LEFT_BOUNDS: (usize, Option<[i32; 4]>) = (1, Some([0, 0, 1920, 1080]))
 fn complete_callback(ctx: &mut Context, callback: HostId) {
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     ctx.last_sender_id = callback.0;
-    assert_eq!(
-        crate::handler::callback::CallbackHandler.on_done(ctx, 0),
-        Action::Drop
-    );
+    assert_eq!(crate::handler::Handlers::on_done(ctx, 0), Action::Drop);
 }
 
 /// `PLACED_TEXT_INPUT`, composing a preedit on the placed surface.
@@ -1063,7 +1054,10 @@ fn a_skipped_placement_still_consumes_its_chord() {
     let sliver_binding =
         b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.0001, 0.0, 0.9999, 1.0]\n";
     let mut no_shell = placeable_shortcut();
-    no_shell.ctx.host_zaura_shell = None;
+    no_shell
+        .ctx
+        .singletons
+        .unbind_for_test(Singleton::AuraShell);
     let cases = [
         (
             no_toplevel,
@@ -1416,9 +1410,8 @@ fn ime_focus_churn_inside_a_placement_barrier_keeps_both_barriers_separate() {
     assert_eq!(state.preedit, None);
     assert_eq!(p.enter(PLACING, PLACED_HOST_SURFACE, &[]), Action::Drop);
     p.ctx.last_sender_id = t.guest;
-    let mut v3 = crate::handler::text_input::TextInputV3Handler;
-    assert_eq!(v3.on_enable(&mut p.ctx), Action::Drop);
-    assert_eq!(v3.on_commit(&mut p.ctx), Action::Drop);
+    assert_eq!(Handlers::on_enable(&mut p.ctx), Action::Drop);
+    assert_eq!(Handlers::on_commit(&mut p.ctx), Action::Drop);
     assert_ne!(text_input::view(&p.ctx, t.guest).host, Host::Active);
 
     // The IME barrier reactivates text input without retiring the
@@ -1610,12 +1603,16 @@ fn a_host_without_the_keyboard_extension_warns_once_per_process() {
             let mut p = Proxy::new();
             // The host has the extension, but no enter has bound the
             // keyboard's extended keyboard yet.
-            p.ctx.host_keyboard_extension_id = Some(HostId(500));
+            p.ctx
+                .singletons
+                .bind_for_test(Singleton::KeyboardExtension, 500);
             p.key(KEYBOARD, 1, 1, KEY_A, PRESSED);
             assert!(p.ctx.client_to_host_queue.is_empty());
             assert!(!NO_KEYBOARD_EXTENSION_WARNED.logged());
 
-            p.ctx.host_keyboard_extension_id = None;
+            p.ctx
+                .singletons
+                .unbind_for_test(Singleton::KeyboardExtension);
             p.key(KEYBOARD, 2, 2, KEY_A, RELEASED);
             assert!(p.ctx.client_to_host_queue.is_empty());
             assert!(NO_KEYBOARD_EXTENSION_WARNED.logged());
@@ -2302,7 +2299,9 @@ fn enter_without_keyboard_route_has_no_extension_side_effects() {
         .shadow_table
         .insert_paired_for_test(KEYBOARD.guest, KEYBOARD.host, "wl_keyboard");
     p.surface(SURFACE.0, SURFACE.1);
-    p.ctx.host_keyboard_extension_id = Some(HostId(99));
+    p.ctx
+        .singletons
+        .bind_for_test(Singleton::KeyboardExtension, 99);
     p.ctx
         .shadow_table
         .insert_host_only_for_test(99, "zcr_keyboard_extension_v1", 2);

@@ -18,13 +18,11 @@ limitations under the License.
 //! the host's release, and retiring a destroyed buffer once the host is
 //! done with it.
 
+use crate::handler::Handlers;
 use crate::protocols;
 use crate::state::{Context, HostId, SurfaceState};
 use crate::wire::Action;
 use std::collections::BTreeMap;
-
-/// The `wl_buffer` handler: the guest's SHM and native buffers alike.
-pub struct BufferHandler;
 
 /// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
 pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) {
@@ -163,8 +161,8 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
     }
 }
 
-impl protocols::wayland::wl_buffer::WlBufferHandler for BufferHandler {
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
+impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
+    fn on_destroy(ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
         let host_id = ctx.shadow_table.get_host_id(guest_id);
         // wl_surface.attach is forwarded immediately, while the submitted
@@ -200,7 +198,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for BufferHandler {
         Action::Drop
     }
 
-    fn on_release(&mut self, ctx: &mut Context) -> Action {
+    fn on_release(ctx: &mut Context) -> Action {
         let host_id = ctx.last_sender_id;
         let Some(guest_id) = ctx.shadow_table.get_guest_id(host_id) else {
             return Action::Drop;
@@ -237,18 +235,22 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for BufferHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{retire_eligible_buffers, BufferHandler};
+    use super::retire_eligible_buffers;
     use crate::handler::test_support::{
         buffer_host_destroy_is_queued, buffer_is_guest_destroyed, mark_test_buffer_guest_destroyed,
     };
+    use crate::handler::Handlers;
     use crate::protocols::wayland::wl_buffer;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
+    use crate::protocols::Iface;
     use crate::state::{Context, HostId};
     use crate::test_support::{queued_headers, register_test_buffer, BufferKind, BUFFER_KINDS};
     use crate::wire::Action;
 
     fn register_test_server_native(ctx: &mut Context, host_id: u32) -> u32 {
-        let guest_id = ctx.shadow_table.adopt_host_created(host_id, "wl_buffer", 1);
+        let guest_id = ctx
+            .shadow_table
+            .adopt_host_created(host_id, Iface::WlBuffer, 1);
         assert!(ctx.register_native_buffer(host_id, (1, 1), Vec::new()));
         guest_id
     }
@@ -271,7 +273,7 @@ mod tests {
 
             ctx.last_sender_id = guest_buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut BufferHandler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
                 Action::Drop
             );
             assert!(buffer_is_guest_destroyed(&ctx, guest_buffer), "{case}");
@@ -293,7 +295,7 @@ mod tests {
 
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut BufferHandler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_release(&mut ctx),
                 Action::Drop
             );
             assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer), "{case}");
@@ -339,7 +341,7 @@ mod tests {
 
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut BufferHandler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_release(&mut ctx),
                 Action::Forward
             );
             assert!(ctx.buffer_is_released(guest_buffer), "{case}");
@@ -353,7 +355,7 @@ mod tests {
             }
             ctx.last_sender_id = guest_buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut BufferHandler, &mut ctx),
+                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
                 Action::Drop
             );
             assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer), "{case}");
@@ -380,11 +382,10 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
-        let mut handler = BufferHandler;
 
         ctx.last_sender_id = guest_buffer;
         assert_eq!(
-            WlBufferHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
@@ -416,11 +417,10 @@ mod tests {
         let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
-        let mut handler = BufferHandler;
 
         ctx.last_sender_id = guest_buffer;
         assert_eq!(
-            WlBufferHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(
@@ -433,7 +433,7 @@ mod tests {
 
         ctx.last_sender_id = host_buffer;
         assert_eq!(
-            WlBufferHandler::on_release(&mut handler, &mut ctx),
+            <Handlers as WlBufferHandler>::on_release(&mut ctx),
             Action::Drop
         );
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
@@ -450,18 +450,17 @@ mod tests {
         let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
-        let mut handler = BufferHandler;
 
         ctx.last_sender_id = host_buffer;
         assert_eq!(
-            WlBufferHandler::on_release(&mut handler, &mut ctx),
+            <Handlers as WlBufferHandler>::on_release(&mut ctx),
             Action::Forward
         );
         assert!(ctx.buffer_is_released(guest_buffer));
 
         ctx.last_sender_id = guest_buffer;
         assert_eq!(
-            WlBufferHandler::on_destroy(&mut handler, &mut ctx),
+            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);

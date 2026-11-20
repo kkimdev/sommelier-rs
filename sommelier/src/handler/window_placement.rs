@@ -95,6 +95,7 @@ use crate::protocols::aura_shell::zaura_toplevel::{
     self, EVT_ORIGIN_CHANGE_SINCE, REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE,
 };
 use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
+use crate::state::Singleton;
 use crate::state::{
     Context, GuestId, HostId, InternalCallback, OutputState, Placement, PlacementStep, Point,
 };
@@ -714,7 +715,8 @@ pub(crate) fn attach_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> 
     }
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
     if ctx
-        .host_zaura_shell
+        .singletons
+        .get(Singleton::AuraShell)
         .is_none_or(|shell| shell.version < PLACEMENT_SHELL_SINCE)
     {
         return None;
@@ -846,13 +848,14 @@ pub(crate) fn surface_configured(ctx: &mut Context, guest_xdg_surface_id: u32, s
 #[cfg(test)]
 mod fixture {
     use super::*;
-    use crate::handler::compositor::CompositorHandler;
+    use crate::handler::Handlers;
     use crate::placement_config::PlacementConfig;
     use crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler;
     use crate::protocols::aura_shell::{zaura_output, zaura_shell};
     use crate::protocols::wayland::{wl_keyboard, wl_output, wl_registry};
     use crate::protocols::xdg_shell::xdg_toplevel;
     use crate::protocols::xdg_shell::xdg_wm_base;
+    use crate::protocols::Iface;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
     use crate::state::OutputState;
@@ -923,9 +926,9 @@ mod fixture {
 
     /// Each message of `queue`, decoded as the interface `interface_of` its
     /// sender has. Panics if a message leaves a descriptor unread.
-    pub(super) fn decode_queue<'a, M>(
+    pub(super) fn decode_queue<M>(
         queue: &[Outgoing],
-        interface_of: impl Fn(u32) -> Option<&'a str>,
+        interface_of: impl Fn(u32) -> Option<Iface>,
         from_wire: fn(&str, &mut crate::wire::WireMessage) -> Result<M, crate::wire::ProtocolError>,
     ) -> Vec<(u32, M)> {
         queue
@@ -936,7 +939,7 @@ mod fixture {
                     .iter()
                     .map(|fd| fd.try_clone().expect("duplicate a queued descriptor"))
                     .collect();
-                let decoded = decode(message, &mut fds, |msg| from_wire(interface, msg))
+                let decoded = decode(message, &mut fds, |msg| from_wire(interface.name(), msg))
                     .expect("a whole message");
                 assert!(
                     fds.is_empty(),
@@ -952,7 +955,7 @@ mod fixture {
         let table = &ctx.shadow_table;
         // The fixtures do not pair the display.
         let interface_of = |id| match id {
-            WL_DISPLAY_ID => Some("wl_display"),
+            WL_DISPLAY_ID => Some(Iface::WlDisplay),
             id => table.get_host_interface(id),
         };
         decode_queue(
@@ -977,10 +980,7 @@ mod fixture {
         use crate::protocols::wayland::wl_callback::WlCallbackHandler;
 
         ctx.last_sender_id = callback.0;
-        assert_eq!(
-            crate::handler::callback::CallbackHandler.on_done(ctx, 0),
-            Action::Drop
-        );
+        assert_eq!(crate::handler::Handlers::on_done(ctx, 0), Action::Drop);
     }
 
     /// The host's `zaura_toplevel.configure` of `aura_toplevel`, at
@@ -993,14 +993,8 @@ mod fixture {
         states: &[u8],
     ) {
         ctx.last_sender_id = aura_toplevel;
-        let action = ZauraToplevelHandler::on_configure(
-            &mut CompositorHandler,
-            ctx,
-            origin.0,
-            origin.1,
-            size.0,
-            size.1,
-            states,
+        let action = <Handlers as ZauraToplevelHandler>::on_configure(
+            ctx, origin.0, origin.1, size.0, size.1, states,
         );
         assert_eq!(action, Action::Drop);
     }
@@ -1198,8 +1192,7 @@ mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
-    use crate::handler::compositor::CompositorHandler;
-    use crate::handler::display::DisplayHandler;
+    use crate::handler::Handlers;
     use crate::placement_config::PlacementConfig;
     use crate::protocols::aura_shell::zaura_shell;
     use crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler;
@@ -1209,6 +1202,7 @@ mod tests {
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::xdg_shell::xdg_wm_base;
     use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::state::Singleton;
     use crate::test_support::queued_headers;
     use crate::wire::{Action, WL_DISPLAY_ID};
 
@@ -1756,10 +1750,8 @@ mod tests {
             (EVT_INSETS_SINCE, true),
         ] {
             let mut ctx = placement_ctx();
-            ctx.host_zaura_shell
-                .as_mut()
-                .expect("bound zaura_shell")
-                .version = shell_version;
+            ctx.singletons
+                .set_version_for_test(Singleton::AuraShell, shell_version);
             let attached = attach_toplevel(&mut ctx, TOPLEVEL.guest);
             assert_eq!(attached.is_some(), expect_toplevel, "v{shell_version}");
             assert_eq!(
@@ -1776,10 +1768,8 @@ mod tests {
     #[test]
     fn aura_toplevel_without_release_is_retired_silently() {
         let mut ctx = placement_ctx();
-        ctx.host_zaura_shell
-            .as_mut()
-            .expect("bound zaura_shell")
-            .version = zaura_toplevel::REQ_RELEASE_SINCE - 1;
+        ctx.singletons
+            .set_version_for_test(Singleton::AuraShell, zaura_toplevel::REQ_RELEASE_SINCE - 1);
         let aura_id = aura_toplevel(&mut ctx);
         ctx.client_to_host_queue.clear();
 
@@ -1843,7 +1833,7 @@ mod tests {
 
         ctx.last_sender_id = SURFACE.guest;
         assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(
@@ -1864,7 +1854,7 @@ mod tests {
         ctx.last_sender_id = TOPLEVEL.guest;
 
         assert_eq!(
-            XdgToplevelHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            <Handlers as XdgToplevelHandler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(
@@ -1884,7 +1874,7 @@ mod tests {
         assert!(!ctx.shadow_table.is_host_id_available(aura_id));
 
         ctx.last_sender_id = WL_DISPLAY_ID;
-        assert_eq!(DisplayHandler.on_delete_id(&mut ctx, aura_id), Action::Drop);
+        assert_eq!(Handlers::on_delete_id(&mut ctx, aura_id), Action::Drop);
         assert!(!ctx.shadow_table.is_retired_host(aura_id));
         assert!(ctx.shadow_table.is_host_id_available(aura_id));
     }
@@ -1945,7 +1935,7 @@ mod tests {
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = aura_id;
         assert_eq!(
-            ZauraToplevelHandler::on_origin_change(&mut CompositorHandler, &mut ctx, 123, 456),
+            <Handlers as ZauraToplevelHandler>::on_origin_change(&mut ctx, 123, 456),
             Action::Drop
         );
         assert!(ctx.host_to_client_queue.is_empty());

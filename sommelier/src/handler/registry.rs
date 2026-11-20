@@ -19,29 +19,16 @@ use crate::handler::linux_dmabuf::GUEST_DMABUF_VERSION;
 use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
-use crate::protocols::aura_shell::zaura_shell;
-use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
-use crate::protocols::gtk::{gtk_shell1, ALLOWED_INTERFACES as GTK_ALLOWED};
-use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
-use crate::protocols::linux_dmabuf_v1::{
-    zwp_linux_dmabuf_v1, ALLOWED_INTERFACES as DMABUF_ALLOWED,
-};
-use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
-use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
-use crate::protocols::text_input_unstable_v3::{
-    zwp_text_input_manager_v3, ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED,
-};
-use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
-use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
-use crate::protocols::wayland::{
-    wl_compositor, wl_display, wl_fixes, wl_output, wl_registry, wl_seat, wl_shm, wl_surface,
-};
-use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
-use crate::protocols::xdg_output_unstable_v1::ALLOWED_INTERFACES as XDG_OUTPUT_ALLOWED;
-use crate::protocols::xdg_shell::{xdg_wm_base, ALLOWED_INTERFACES as XDG_ALLOWED};
+use crate::handler::Handlers;
+use crate::protocols::gtk::gtk_shell1;
+use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
+use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
+use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry, wl_shm, wl_surface};
+use crate::protocols::Iface;
+use crate::settings::Settings;
 use crate::state::{
-    Context, GlobalBinding, GtkShellState, HostAuraShell, HostGlobal, HostId, InternalCallback,
-    PendingDmabufGlobal, INERT_BIND_INTERFACE,
+    Binding, Context, GlobalBinding, GtkShellState, HostGlobal, InternalCallback,
+    PendingDmabufGlobal, Singleton, INERT_BIND_INTERFACE,
 };
 use crate::wire::{queue_or_drop, Action};
 use log::error;
@@ -88,10 +75,10 @@ const XDG_SHELL_VERSION: u32 = 3;
 /// The proxy implements the guest's `wl_shm` itself, as a v1 compatibility
 /// shim (`handler/shm/`), so a newer host or XML version is not offered.
 const WL_SHM_VERSION: u32 = 1;
-/// The `wl_output` ceiling; [`forwarded_global_version`] says why. The
+/// The `wl_output` ceiling; [`offered_version`] says why. The
 /// vendored XML is newer: v4 adds the `name` and `description` events.
 const WL_OUTPUT_VERSION: u32 = 3;
-/// The `wl_seat` ceiling; [`forwarded_global_version`] says why. The
+/// The `wl_seat` ceiling; [`offered_version`] says why. The
 /// vendored XML is newer: v6 to v10 add touch shape and orientation,
 /// high-resolution scroll and scroll-direction events, and, at v10, the
 /// `repeated` key state.
@@ -128,30 +115,126 @@ const _: () = assert!(
 /// let Exo send Aura events whose unknown opcodes end the client's session.
 const ZAURA_SHELL_MAX_VERSION: u32 = crate::protocols::aura_shell::zaura_shell::VERSION;
 
-/// The protocols whose host globals the proxy forwards, apart from
-/// `zxdg_decoration_manager_v1`, which only `--xdg-decoration` forwards.
-/// The globals it binds internally or replaces are handled before this.
-const FORWARDED_PROTOCOLS: [&[&str]; 7] = [
-    WL_ALLOWED,
-    XDG_ALLOWED,
-    DMABUF_ALLOWED,
-    VIEWPORTER_ALLOWED,
-    TEXT_INPUT_ALLOWED,
-    FRACTIONAL_SCALE_ALLOWED,
-    XDG_OUTPUT_ALLOWED,
-];
-
-/// Whether the proxy forwards a host global of `interface` to the guest.
-fn forwards_host_global(ctx: &Context, interface: &str) -> bool {
-    FORWARDED_PROTOCOLS
-        .iter()
-        .any(|interfaces| interfaces.contains(&interface))
-        || (XDG_DECORATION_ALLOWED.contains(&interface) && ctx.settings().xdg_decoration)
+/// What the proxy does with a host global, by its interface (see
+/// [`policy`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Policy {
+    /// Forward it to the guest while `enabled` says so, offered at the
+    /// host's version capped at `ceiling` ([`offered_version`]), and hide
+    /// it otherwise.
+    Forward {
+        ceiling: u32,
+        enabled: fn(&Settings) -> bool,
+    },
+    /// Keep it from the guest. An interface that is no global, which no
+    /// compositor advertises, is hidden too.
+    Hide,
+    /// Bind it for the proxy's own use; its handler decides what the guest
+    /// sees in its place.
+    BindInternal(Internal),
+    /// Keep it from the guest, which binds the proxy's own global of this
+    /// interface instead, advertised for another host global.
+    Synthetic,
 }
 
-/// The version the guest is offered of a host global of `interface` that
-/// the host advertises at `host_version`, or `None` if the proxy does not
-/// forward it.
+/// A host global the proxy binds for its own use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Internal {
+    /// Bound once per connection, and bound anew when the binding's global
+    /// retires (`Context::singletons`).
+    Singleton(Singleton),
+    /// The first `zwp_text_input_manager_v1`, kept for the connection: the
+    /// guest is offered a `zwp_text_input_manager_v3` under its name.
+    TextInputManager,
+    /// The first `zcr_text_input_extension_v1`, kept for the connection.
+    TextInputExtension,
+}
+
+/// A global forwarded whatever the settings, offered at most at `ceiling`.
+const fn forward(ceiling: u32) -> Policy {
+    Policy::Forward {
+        ceiling,
+        enabled: |_| true,
+    }
+}
+
+/// What the proxy does with a host global of `iface`: the one table of
+/// the globals it knows. Its `match` names every interface, so a new
+/// interface needs a row, and a forwarded global needs nothing more.
+///
+/// A forwarded global's ceiling is its generated `VERSION` unless a named
+/// constant above documents why it deliberately differs; no ceiling is
+/// above the XML (test: `every_interface_has_one_global_policy`).
+pub(crate) const fn policy(iface: Iface) -> Policy {
+    match iface {
+        Iface::WlCompositor => forward(WL_COMPOSITOR_VERSION),
+        Iface::WlSubcompositor => forward(Iface::WlSubcompositor.version()),
+        Iface::WlDataDeviceManager => forward(Iface::WlDataDeviceManager.version()),
+        Iface::WlShell => forward(Iface::WlShell.version()),
+        Iface::WlSeat => forward(WL_SEAT_VERSION),
+        Iface::WlOutput => forward(WL_OUTPUT_VERSION),
+        Iface::WlFixes => forward(Iface::WlFixes.version()),
+        Iface::XdgWmBase => forward(XDG_SHELL_VERSION),
+        Iface::WpViewporter => forward(Iface::WpViewporter.version()),
+        Iface::WpFractionalScaleManagerV1 => forward(Iface::WpFractionalScaleManagerV1.version()),
+        Iface::ZxdgOutputManagerV1 => forward(Iface::ZxdgOutputManagerV1.version()),
+        // A host's own v3 manager is offered too; the proxy serves the
+        // guest's bind of any (`on_bind`).
+        Iface::ZwpTextInputManagerV3 => forward(Iface::ZwpTextInputManagerV3.version()),
+        Iface::ZxdgDecorationManagerV1 => Policy::Forward {
+            ceiling: Iface::ZxdgDecorationManagerV1.version(),
+            enabled: |settings| settings.xdg_decoration,
+        },
+        Iface::WlShm => Policy::BindInternal(Internal::Singleton(Singleton::Shm)),
+        Iface::ZwpLinuxDmabufV1 => Policy::BindInternal(Internal::Singleton(Singleton::Dmabuf)),
+        Iface::ZcrKeyboardExtensionV1 => {
+            Policy::BindInternal(Internal::Singleton(Singleton::KeyboardExtension))
+        }
+        Iface::ZauraShell => Policy::BindInternal(Internal::Singleton(Singleton::AuraShell)),
+        Iface::ZwpTextInputManagerV1 => Policy::BindInternal(Internal::TextInputManager),
+        Iface::ZcrTextInputExtensionV1 => Policy::BindInternal(Internal::TextInputExtension),
+        // Advertised by the proxy for `zaura_shell`.
+        Iface::GtkShell1 => Policy::Synthetic,
+        // No globals.
+        Iface::WlDisplay
+        | Iface::WlRegistry
+        | Iface::WlCallback
+        | Iface::WlShmPool
+        | Iface::WlBuffer
+        | Iface::WlDataOffer
+        | Iface::WlDataSource
+        | Iface::WlDataDevice
+        | Iface::WlShellSurface
+        | Iface::WlSurface
+        | Iface::WlPointer
+        | Iface::WlKeyboard
+        | Iface::WlTouch
+        | Iface::WlRegion
+        | Iface::WlSubsurface
+        | Iface::XdgPositioner
+        | Iface::XdgSurface
+        | Iface::XdgToplevel
+        | Iface::XdgPopup
+        | Iface::ZwpLinuxBufferParamsV1
+        | Iface::ZwpLinuxDmabufFeedbackV1
+        | Iface::WpViewport
+        | Iface::ZwpTextInputV3
+        | Iface::ZwpTextInputV1
+        | Iface::ZcrExtendedTextInputV1
+        | Iface::ZxdgToplevelDecorationV1
+        | Iface::WpFractionalScaleV1
+        | Iface::ZxdgOutputV1
+        | Iface::ZcrExtendedKeyboardV1
+        | Iface::GtkSurface1
+        | Iface::ZauraSurface
+        | Iface::ZauraOutput
+        | Iface::ZauraToplevel
+        | Iface::ZauraPopup => Policy::Hide,
+    }
+}
+
+/// The version the guest is offered of a forwarded host global of `iface`
+/// that the host advertises at `host_version`, capped at `ceiling`.
 ///
 /// The offer is never newer than the vendored XML: the generated code knows
 /// no message added after it, so a newer global would let the guest send
@@ -166,29 +249,18 @@ fn forwards_host_global(ctx: &Context, interface: &str) -> bool {
 /// guest advertisement aligned with those ceilings so clients do not start
 /// using requests/events that this proxy merely forwards without the
 /// required coordinate/focus handling.
-fn forwarded_global_version(ctx: &Context, interface: &str, host_version: u32) -> Option<u32> {
-    if !forwards_host_global(ctx, interface) {
-        return None;
-    }
-    let xml_version = crate::protocols::interface_version(interface)?;
+fn offered_version(iface: Iface, ceiling: u32, host_version: u32) -> u32 {
     // ChromiumOS implements wl_surface.damage_buffer in terms of the legacy
     // damage request, so a v3 host compositor is offered as v4. Hosts below
     // v3 retain their original version; the proxy does not expose v5/v6
     // surface semantics.
-    let host_version =
-        if interface == wl_compositor::NAME && host_version >= WL_COMPOSITOR_HOST_VERSION {
-            WL_COMPOSITOR_VERSION
-        } else {
-            host_version
-        };
-    let ceiling = match interface {
-        wl_compositor::NAME => WL_COMPOSITOR_VERSION,
-        wl_output::NAME => WL_OUTPUT_VERSION,
-        wl_seat::NAME => WL_SEAT_VERSION,
-        xdg_wm_base::NAME => XDG_SHELL_VERSION,
-        _ => xml_version,
+    let host_version = if iface == Iface::WlCompositor && host_version >= WL_COMPOSITOR_HOST_VERSION
+    {
+        WL_COMPOSITOR_VERSION
+    } else {
+        host_version
     };
-    Some(host_version.min(ceiling).min(xml_version))
+    host_version.min(ceiling).min(iface.version())
 }
 
 fn keyboard_extension_version(host_version: u32) -> u32 {
@@ -396,13 +468,13 @@ fn queue_internal_bind(
     ctx: &mut Context,
     registry_host_id: u32,
     name: u32,
-    interface: &str,
+    interface: Iface,
     version: u32,
     host_id: u32,
 ) -> bool {
     queue_or_drop(
         &mut ctx.client_to_host_queue,
-        wl_registry::req::bind(registry_host_id, name, interface, version, host_id),
+        wl_registry::req::bind(registry_host_id, name, interface.name(), version, host_id),
         format_args!("internal bind {name}:{interface}"),
     )
 }
@@ -417,7 +489,7 @@ fn bind_internally(
     ctx: &mut Context,
     registry_host_id: u32,
     name: u32,
-    interface: &str,
+    interface: Iface,
     version: u32,
     host_id: u32,
 ) -> Result<(), Action> {
@@ -428,48 +500,7 @@ fn bind_internally(
     }
 }
 
-/// A host global the proxy binds once per connection, for its own use.
-///
-/// Every advertisement of one is a candidate
-/// (`Context::singleton_candidates`), and [`ensure_bound`] binds one
-/// whenever the proxy has none. A host may advertise one under a new name
-/// before it removes the old one; the new name is then bound when the old
-/// one retires, so the proxy keeps the capability.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Singleton {
-    Dmabuf,
-    KeyboardExtension,
-    AuraShell,
-    Shm,
-}
-
 impl Singleton {
-    const ALL: [Self; 4] = [
-        Self::Dmabuf,
-        Self::KeyboardExtension,
-        Self::AuraShell,
-        Self::Shm,
-    ];
-
-    fn interface(self) -> &'static str {
-        match self {
-            Self::Dmabuf => zwp_linux_dmabuf_v1::NAME,
-            Self::KeyboardExtension => zcr_keyboard_extension_v1::NAME,
-            Self::AuraShell => zaura_shell::NAME,
-            Self::Shm => wl_shm::NAME,
-        }
-    }
-
-    /// The name of the global the proxy bound, if it has a binding.
-    fn bound_name(self, ctx: &Context) -> Option<u32> {
-        match self {
-            Self::Dmabuf => ctx.host_dmabuf_global_name,
-            Self::KeyboardExtension => ctx.host_keyboard_extension_global_name,
-            Self::AuraShell => ctx.host_zaura_shell.map(|shell| shell.global_name),
-            Self::Shm => ctx.host_shm_global_name,
-        }
-    }
-
     /// Bind host global `name`, which the host advertises at `version`,
     /// through host registry `registry_host_id`, as the one binding.
     ///
@@ -498,8 +529,8 @@ impl Singleton {
                 // the dmabuf factory object after we bind it.
                 let bound_version = version.min(LINUX_DMABUF_CAPABILITY_VERSION);
                 let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-                ctx.host_dmabuf_id = Some(host_id);
-                ctx.host_dmabuf_global_name = Some(name);
+                ctx.singletons
+                    .bind(self, binding(host_id, name, bound_version));
                 ctx.host_dmabuf_generation = Some(generation);
                 ctx.dmabuf_capabilities.entry(generation).or_default();
                 bind_internally(
@@ -522,8 +553,8 @@ impl Singleton {
                 // get_extended_keyboard requests.
                 let bound_version = keyboard_extension_version(version);
                 let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-                ctx.host_keyboard_extension_id = Some(HostId(host_id));
-                ctx.host_keyboard_extension_global_name = Some(name);
+                ctx.singletons
+                    .bind(self, binding(host_id, name, bound_version));
                 bind_internally(
                     ctx,
                     registry_host_id,
@@ -540,11 +571,8 @@ impl Singleton {
                 // GTK startup IDs.
                 let bound_version = version.min(ZAURA_SHELL_MAX_VERSION);
                 let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-                ctx.host_zaura_shell = Some(HostAuraShell {
-                    id: host_id,
-                    global_name: name,
-                    version: bound_version,
-                });
+                ctx.singletons
+                    .bind(self, binding(host_id, name, bound_version));
                 bind_internally(
                     ctx,
                     registry_host_id,
@@ -562,8 +590,8 @@ impl Singleton {
                 // sends synthetic format events. The host's format events
                 // reach this binding, which records them (`shm::pool`).
                 let host_id = ctx.shadow_table.create_host_only(interface, WL_SHM_VERSION);
-                ctx.host_shm_id = Some(host_id);
-                ctx.host_shm_global_name = Some(name);
+                ctx.singletons
+                    .bind(self, binding(host_id, name, WL_SHM_VERSION));
                 bind_internally(
                     ctx,
                     registry_host_id,
@@ -578,13 +606,22 @@ impl Singleton {
     }
 }
 
+/// The binding of host object `host` from global `name` at `version`.
+fn binding(host: u32, name: u32, version: u32) -> Binding {
+    Binding {
+        host,
+        name,
+        version,
+    }
+}
+
 /// Record host global `name` of `singleton`, which the host advertises at
 /// `version`, as a candidate binding.
 fn add_candidate(ctx: &mut Context, singleton: Singleton, name: u32, version: u32) {
     ctx.singleton_candidates.insert(
         name,
         HostGlobal {
-            interface: singleton.interface().to_string(),
+            interface: singleton.interface().name().to_string(),
             version,
         },
     );
@@ -598,13 +635,13 @@ fn add_candidate(ctx: &mut Context, singleton: Singleton, name: u32, version: u3
 ///
 /// The session's end if the bind cannot be encoded.
 fn ensure_bound(ctx: &mut Context, singleton: Singleton) -> Result<(), Action> {
-    if singleton.bound_name(ctx).is_some() {
+    if ctx.singletons.get(singleton).is_some() {
         return Ok(());
     }
     let candidate = ctx
         .singleton_candidates
         .iter()
-        .filter(|(_, global)| global.interface == singleton.interface())
+        .filter(|(_, global)| global.interface == singleton.interface().name())
         .filter_map(|(&name, global)| {
             let generation = *ctx.global_generations.get(&name)?;
             if global_removal_seen(ctx, name, generation) {
@@ -630,76 +667,64 @@ fn ensure_all_bound(ctx: &mut Context) -> Result<(), Action> {
     Ok(())
 }
 
-fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
-    ctx.host_dmabuf_global_name == Some(name)
-        || ctx.host_shm_global_name == Some(name)
-        || ctx.host_keyboard_extension_global_name == Some(name)
-        || ctx
-            .host_zaura_shell
-            .is_some_and(|shell| shell.global_name == name)
-}
-
-/// Drop proxy state associated with one host global generation.
+/// Release the binding that host global `name` backs, if one does.
 ///
 /// ChromiumOS destroys the internally bound proxy when its host registry
 /// global disappears. Keeping the old object registered would let a
 /// re-advertised global reuse stale capability/state and route events to an
 /// object that no longer represents the current host global.
+///
+/// The text-input managers have no destructor, and text inputs still
+/// create children from them after their globals go, so they are never
+/// reset or rebound (see `text_input_manager_global`).
 fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
-    if ctx.host_dmabuf_global_name == Some(name) {
-        let generation = ctx.host_dmabuf_generation.take();
-        if let Some(host_id) = ctx.host_dmabuf_id.take() {
+    let Some((singleton, binding)) = ctx.singletons.release_named(name) else {
+        return;
+    };
+    match singleton {
+        Singleton::Dmabuf => {
+            let generation = ctx.host_dmabuf_generation.take();
             // A registry global removal invalidates the name, not objects
-            // already bound from it. Explicitly destroy our hidden binding so
-            // the host does not retain a proxy until connection teardown.
+            // already bound from it. Explicitly destroy our hidden binding
+            // so the host does not retain a proxy until connection
+            // teardown.
             ctx.client_to_host_queue
-                .push(zwp_linux_dmabuf_v1::req::destroy(host_id));
-            ctx.retire_destroyed_host_object(host_id);
+                .push(zwp_linux_dmabuf_v1::req::destroy(binding.host));
+            ctx.retire_destroyed_host_object(binding.host);
+            clear_host_shm_dmabuf_formats(ctx);
+            if let Some(generation) = generation {
+                crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+            }
         }
-        ctx.host_dmabuf_global_name = None;
-        clear_host_shm_dmabuf_formats(ctx);
-        if let Some(generation) = generation {
-            crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+        Singleton::Shm => {
+            ctx.shadow_table.retire_host(binding.host);
+            clear_host_shm_wl_formats(ctx);
         }
-    }
-    if ctx.host_shm_global_name == Some(name) {
-        if let Some(host_id) = ctx.host_shm_id.take() {
-            ctx.shadow_table.retire_host(host_id);
+        Singleton::KeyboardExtension => {
+            // `global_remove` invalidates only the manager global name. It
+            // does not destroy `zcr_extended_keyboard_v1` children that
+            // were already created with get_extended_keyboard; those
+            // children have their own destructor and remain usable until
+            // the corresponding wl_keyboard is released. Keep both maps and
+            // the child dispatch registrations so queued peek_key events
+            // remain routable after the manager disappears.
+            ctx.shadow_table.retire_host(binding.host);
         }
-        ctx.host_shm_global_name = None;
-        clear_host_shm_wl_formats(ctx);
-    }
-    // The text-input managers have no destructor, and text inputs still
-    // create children from them after their globals go, so they are never
-    // reset or rebound (see `text_input_manager_global`).
-    if ctx.host_keyboard_extension_global_name == Some(name) {
-        if let Some(host_id) = ctx.host_keyboard_extension_id.take() {
-            ctx.shadow_table.retire_host(host_id.0);
+        Singleton::AuraShell => {
+            // `global_remove` invalidates only the advertised global name.
+            // Already created `zaura_surface` children have their own
+            // protocol lifetime and remain usable until their owning
+            // wl_surface is destroyed. Keep their mappings and per-object
+            // version metadata so an existing surface can still receive
+            // set_application_id after the manager global disappears. This
+            // also avoids sending a release for a child that the host never
+            // asked us to destroy.
+            //
+            // Release only the internally bound manager, matching
+            // ChromiumOS' registry remover. New children cannot be created
+            // until a replacement shell global is advertised and rebound.
+            crate::handler::aura_objects::release_shell(ctx, binding);
         }
-        ctx.host_keyboard_extension_global_name = None;
-        // `global_remove` invalidates only the manager global name. It does
-        // not destroy `zcr_extended_keyboard_v1` children that were already
-        // created with get_extended_keyboard; those children have their own
-        // destructor and remain usable until the corresponding wl_keyboard
-        // is released. Keep both maps and the child dispatch registrations so
-        // queued peek_key events remain routable after the manager disappears.
-    }
-    if let Some(shell) = ctx
-        .host_zaura_shell
-        .take_if(|shell| shell.global_name == name)
-    {
-        // `global_remove` invalidates only the advertised global name. Already
-        // created `zaura_surface` children have their own protocol lifetime
-        // and remain usable until their owning wl_surface is destroyed. Keep
-        // their mappings and per-object version metadata so an existing
-        // surface can still receive set_application_id after the manager
-        // global disappears. This also avoids sending a release for a child
-        // that the host never asked us to destroy.
-        //
-        // Release only the internally bound manager, matching ChromiumOS'
-        // registry remover. New children cannot be created until a replacement
-        // shell global is advertised and rebound.
-        crate::handler::aura_objects::release_shell(ctx, shell);
     }
 }
 
@@ -801,12 +826,6 @@ fn admit_guest_bind(
     interface: &str,
     requested_version: u32,
 ) -> Option<BindAdmission> {
-    // gtk_shell1 is never a host global: the proxy advertises it for the
-    // host zaura_shell.
-    if !forwards_host_global(ctx, interface) && !GTK_ALLOWED.contains(&interface) {
-        return None;
-    }
-
     // A global is advertised independently on each wl_registry object.
     // Client→host requests carry the guest registry ID, whereas lifecycle
     // tracking is keyed by the paired host registry ID.
@@ -908,7 +927,7 @@ fn accept_global(
         && registry_removed
         && registry_previous_generation == previous_generation;
     if generation_changed {
-        if starts_new_generation && internal_binding_matches(ctx, name) {
+        if starts_new_generation {
             reset_internal_binding_for_global(ctx, name);
         }
         // The old generation of the name has retired.
@@ -1006,7 +1025,7 @@ fn text_input_manager_global(ctx: &mut Context, name: u32, version: u32) -> Acti
     if ctx.host_text_input_manager_v1_id.is_some() {
         return Action::Drop;
     }
-    let interface = zwp_text_input_manager_v1::NAME;
+    let interface = Iface::ZwpTextInputManagerV1;
     let bound_version = version.min(TEXT_INPUT_MANAGER_VERSION);
     // This object is internal: there is no guest-side pair.
     let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
@@ -1025,7 +1044,7 @@ fn text_input_manager_global(ctx: &mut Context, name: u32, version: u32) -> Acti
 /// A host `zcr_text_input_extension_v1` global, hidden from the guest; the
 /// proxy binds the first one for itself.
 fn text_input_extension_global(ctx: &mut Context, name: u32, version: u32) -> Action {
-    let interface = zcr_text_input_extension_v1::NAME;
+    let interface = Iface::ZcrTextInputExtensionV1;
     hide_global(ctx, name);
     if ctx.host_text_input_extension_v1_id.is_some() {
         return Action::Drop;
@@ -1087,24 +1106,24 @@ fn shm_global(ctx: &mut Context, name: u32, version: u32) -> Action {
     dropped(ensure_bound(ctx, Singleton::Shm))
 }
 
-/// Any other host global: forwarded at the version the proxy offers, if
-/// it offers one (see [`forwarded_global_version`]), and hidden otherwise.
-fn forwarded_global(ctx: &mut Context, name: u32, interface: &str, version: u32) -> Action {
-    let Some(advertised_version) = forwarded_global_version(ctx, interface, version) else {
-        if interface.contains(char::REPLACEMENT_CHARACTER) {
-            log::debug!("Hiding global {name}, whose interface name {interface:?} is not UTF-8");
-        }
-        record_registry_global_visibility(ctx, name, false);
-        return Action::Drop;
-    };
+/// A host global of `iface` the proxy forwards, at the version it offers
+/// ([`offered_version`]).
+fn forwarded_global(
+    ctx: &mut Context,
+    name: u32,
+    iface: Iface,
+    ceiling: u32,
+    version: u32,
+) -> Action {
+    let advertised_version = offered_version(iface, ceiling, version);
     if advertised_version != version {
-        advertise_synthetic_global(ctx, name, interface, advertised_version);
+        advertise_synthetic_global(ctx, name, iface.name(), advertised_version);
         return Action::Drop;
     }
     ctx.host_globals.insert(
         name,
         HostGlobal {
-            interface: interface.to_string(),
+            interface: iface.name().to_string(),
             version: advertised_version,
         },
     );
@@ -1112,34 +1131,49 @@ fn forwarded_global(ctx: &mut Context, name: u32, interface: &str, version: u32)
     Action::Forward
 }
 
-pub struct RegistryHandler;
+/// A host global the proxy keeps from the guest.
+fn hidden_global(ctx: &mut Context, name: u32, interface: &str) -> Action {
+    if interface.contains(char::REPLACEMENT_CHARACTER) {
+        log::debug!("Hiding global {name}, whose interface name {interface:?} is not UTF-8");
+    }
+    record_registry_global_visibility(ctx, name, false);
+    Action::Drop
+}
 
-impl wl_registry::WlRegistryHandler for RegistryHandler {
+impl wl_registry::WlRegistryHandler for Handlers {
     /// A host global: the proxy binds it for itself, advertises a global
     /// of its own in its place, forwards it, or hides it, by its
     /// interface.
-    fn on_global(
-        &mut self,
-        ctx: &mut Context,
-        name: u32,
-        interface: &String,
-        version: u32,
-    ) -> Action {
+    fn on_global(ctx: &mut Context, name: u32, interface: &String, version: u32) -> Action {
         if let Err(action) = accept_global(ctx, name, interface, version) {
             return action;
         }
-        match interface.as_str() {
-            zwp_linux_dmabuf_v1::NAME => dmabuf_global(ctx, name, version),
-            zwp_text_input_manager_v1::NAME => text_input_manager_global(ctx, name, version),
-            zcr_text_input_extension_v1::NAME => text_input_extension_global(ctx, name, version),
-            zcr_keyboard_extension_v1::NAME => keyboard_extension_global(ctx, name, version),
-            zaura_shell::NAME => aura_shell_global(ctx, name, version),
-            wl_shm::NAME => shm_global(ctx, name, version),
-            _ => forwarded_global(ctx, name, interface, version),
+        let Some(iface) = Iface::from_name(interface) else {
+            return hidden_global(ctx, name, interface);
+        };
+        match policy(iface) {
+            Policy::Forward { ceiling, enabled } if enabled(ctx.settings()) => {
+                forwarded_global(ctx, name, iface, ceiling, version)
+            }
+            Policy::Forward { .. } | Policy::Hide | Policy::Synthetic => {
+                hidden_global(ctx, name, interface)
+            }
+            Policy::BindInternal(Internal::Singleton(singleton)) => match singleton {
+                Singleton::Dmabuf => dmabuf_global(ctx, name, version),
+                Singleton::KeyboardExtension => keyboard_extension_global(ctx, name, version),
+                Singleton::AuraShell => aura_shell_global(ctx, name, version),
+                Singleton::Shm => shm_global(ctx, name, version),
+            },
+            Policy::BindInternal(Internal::TextInputManager) => {
+                text_input_manager_global(ctx, name, version)
+            }
+            Policy::BindInternal(Internal::TextInputExtension) => {
+                text_input_extension_global(ctx, name, version)
+            }
         }
     }
 
-    fn on_global_remove(&mut self, ctx: &mut Context, name: u32) -> Action {
+    fn on_global_remove(ctx: &mut Context, name: u32) -> Action {
         let registry_id = ctx.last_sender_id;
         let Some(record) = ctx.registries.get(&registry_id) else {
             return Action::Drop;
@@ -1212,15 +1246,21 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         }
     }
 
-    fn on_bind(&mut self, ctx: &mut Context, name: u32, id: &(String, u32, u32)) -> Action {
+    /// A guest bind, which only this handler knows how to serve: the
+    /// generated code forwards nothing for it
+    /// (`wayland_codegen::generator::HAND_WRITTEN_REQUESTS`).
+    fn on_bind(ctx: &mut Context, name: u32, id: &(String, u32, u32)) {
         // id is (interface, version, new_id)
         let (requested, version, guest_new_id) = id;
 
         // The object table keeps the interface's generated name. One no
         // vendored protocol defines is never advertised, so it is no global
         // the guest may bind either.
-        let admission = crate::protocols::interface_name(requested).and_then(|interface| {
-            Some((interface, admit_guest_bind(ctx, name, interface, *version)?))
+        let admission = Iface::from_name(requested).and_then(|interface| {
+            Some((
+                interface,
+                admit_guest_bind(ctx, name, interface.name(), *version)?,
+            ))
         });
         let (interface, generation) = match admission {
             Some((interface, BindAdmission::Live { generation })) => (interface, generation),
@@ -1236,14 +1276,14 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // destructor completes in the proxy.
                 ctx.shadow_table
                     .create_local(*guest_new_id, interface, *version);
-                return Action::Drop;
+                return;
             }
             None => {
                 error!(
                     "Rejecting bind for unadvertised, unsupported, or too-new global {}:{} v{}",
                     name, requested, version
                 );
-                return ctx.reject(
+                let _ = ctx.reject(
                     ctx.last_sender_id,
                     wl_display::ERROR_INVALID_OBJECT,
                     format!(
@@ -1251,10 +1291,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                         name, requested, version
                     ),
                 );
+                return;
             }
         };
 
-        if interface == wl_shm::NAME {
+        if interface == Iface::WlShm {
             // Do NOT forward wl_shm to host. We emulate it.
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
@@ -1268,8 +1309,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // The host-side wl_shm object was bound when the host global was
             // observed. Binding the synthetic guest global must not issue a
             // second host bind or create a guest→host alias.
-            return Action::Drop;
-        } else if interface == zwp_text_input_manager_v3::NAME {
+            return;
+        } else if interface == Iface::ZwpTextInputManagerV3 {
             // This is a synthetic guest-only manager. Every guest manager
             // shares the one internal host v1 manager, so mapping each guest
             // ID to that host ID would overwrite the previous manager's
@@ -1277,8 +1318,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // the shared host object.
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
-            return Action::Drop;
-        } else if interface == gtk_shell1::NAME {
+            return;
+        } else if interface == Iface::GtkShell1 {
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
             ctx.gtk_shells
@@ -1289,7 +1330,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     gtk_shell: *guest_new_id,
                 },
             );
-            return Action::Drop;
+            return;
         }
 
         // Every other global is paired with a host binding.
@@ -1299,9 +1340,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // guest metadata at v4 so feedback requests are accepted locally,
         // but clamp the paired host object to v3 so registry.bind does not
         // request an unsupported host version.
-        let host_version = if interface == zwp_linux_dmabuf_v1::NAME {
+        let host_version = if interface == Iface::ZwpLinuxDmabufV1 {
             (*version).min(LINUX_DMABUF_CAPABILITY_VERSION)
-        } else if interface == wl_compositor::NAME {
+        } else if interface == Iface::WlCompositor {
             // Every guest v4 request missing from host v3 is handled locally.
             (*version).min(WL_COMPOSITOR_HOST_VERSION)
         } else {
@@ -1313,7 +1354,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         let registry_guest_id = ctx.last_sender_id;
         let Some(registry_host_id) = ctx.shadow_table.get_host_id(registry_guest_id) else {
             error!("Registry not mapped! Guest ID: {}", registry_guest_id);
-            return Action::Drop;
+            return;
         };
         let host_new_id =
             ctx.shadow_table
@@ -1328,11 +1369,12 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             host_new_id,
         ) {
             ctx.abandon(*guest_new_id);
-            return ctx.fail(format_args!(
+            let _ = ctx.fail(format_args!(
                 "Failed to bind host {interface} for the guest"
             ));
+            return;
         }
-        if interface == wl_output::NAME {
+        if interface == Iface::WlOutput {
             // Register the output only once its bind is queued, so the
             // failure paths above have no output state to undo.
             ctx.outputs.bind(
@@ -1344,17 +1386,15 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // insets).
             crate::handler::window_placement::output_bound(ctx, host_new_id);
         }
-        if interface == zwp_linux_dmabuf_v1::NAME {
+        if interface == Iface::ZwpLinuxDmabufV1 {
             ctx.dmabuf_guest_generations
                 .insert(*guest_new_id, generation);
         }
-        if interface == wl_seat::NAME {
+        if interface == Iface::WlSeat {
             // A text input whose seat had no host object can activate now.
             let seat = crate::ime::SeatId(*guest_new_id);
             crate::handler::text_input::ime(ctx, crate::ime::Input::SeatBound(seat));
         }
-
-        Action::Drop
     }
 }
 
@@ -1392,8 +1432,8 @@ pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
     }
 }
 
-impl wl_fixes::WlFixesHandler for RegistryHandler {
-    fn on_destroy_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
+impl wl_fixes::WlFixesHandler for Handlers {
+    fn on_destroy_registry(ctx: &mut Context, registry: u32) -> Action {
         // wl_fixes destroys the registry passed as an object argument rather
         // than its own request sender. Reserve that guest/host mapping until
         // wl_display.delete_id acknowledges the host-side destruction.
@@ -1405,13 +1445,11 @@ impl wl_fixes::WlFixesHandler for RegistryHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        forwarded_global_version, keyboard_extension_version, should_bind_internal_dmabuf,
-        RegistryHandler, Singleton, FORWARDED_PROTOCOLS, KEYBOARD_EXTENSION_VERSION,
-        LINUX_DMABUF_CAPABILITY_VERSION, WL_SHM_VERSION, XDG_DECORATION_ALLOWED,
+        keyboard_extension_version, offered_version, policy, should_bind_internal_dmabuf, Internal,
+        Policy, KEYBOARD_EXTENSION_VERSION, LINUX_DMABUF_CAPABILITY_VERSION, WL_SHM_VERSION,
         ZAURA_SHELL_MIN_VERSION,
     };
-    use crate::handler::callback::CallbackHandler;
-    use crate::handler::linux_dmabuf::LinuxDmabufHandler;
+    use crate::handler::Handlers;
     use crate::placement_config::PlacementConfig;
     use crate::protocols::aura_shell::{zaura_output, zaura_shell};
     use crate::protocols::gtk::gtk_shell1;
@@ -1425,6 +1463,8 @@ mod tests {
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::{wl_display, wl_registry, wl_shm};
     use crate::protocols::AnyRequest;
+    use crate::protocols::Iface;
+    use crate::state::Singleton;
     use crate::state::{Context, HostGlobal, HostId, InternalCallback};
     use crate::test_support::{decode, decoded, protocol_error};
     use crate::wire::{Action, WL_DISPLAY_ID};
@@ -1451,32 +1491,25 @@ mod tests {
         /// The host advertises global `name` on this registry.
         fn global(self, ctx: &mut Context, name: u32, interface: &str, version: u32) -> Action {
             ctx.last_sender_id = self.host;
-            RegistryHandler.on_global(ctx, name, &interface.to_string(), version)
+            Handlers::on_global(ctx, name, &interface.to_string(), version)
         }
 
         /// The host removes global `name` from this registry.
         fn remove(self, ctx: &mut Context, name: u32) -> Action {
             ctx.last_sender_id = self.host;
-            RegistryHandler.on_global_remove(ctx, name)
+            Handlers::on_global_remove(ctx, name)
         }
 
         /// The guest binds global `name` as `interface` at `version`, as
         /// its new object `id`.
-        fn bind(
-            self,
-            ctx: &mut Context,
-            name: u32,
-            interface: &str,
-            version: u32,
-            id: u32,
-        ) -> Action {
+        fn bind(self, ctx: &mut Context, name: u32, interface: &str, version: u32, id: u32) {
             ctx.last_sender_id = self.guest;
-            RegistryHandler.on_bind(ctx, name, &(interface.to_string(), version, id))
+            Handlers::on_bind(ctx, name, &(interface.to_string(), version, id));
         }
 
         /// The guest destroys this registry through `wl_fixes`.
         fn destroy(self, ctx: &mut Context) -> Action {
-            RegistryHandler.on_destroy_registry(ctx, self.guest)
+            Handlers::on_destroy_registry(ctx, self.guest)
         }
     }
 
@@ -1555,12 +1588,12 @@ mod tests {
 
     /// The host ID of the proxy's binding of `singleton`.
     fn bound_host_id(singleton: Singleton, ctx: &Context) -> Option<u32> {
-        match singleton {
-            Singleton::Dmabuf => ctx.host_dmabuf_id,
-            Singleton::KeyboardExtension => ctx.host_keyboard_extension_id.map(|id| id.0),
-            Singleton::AuraShell => ctx.host_zaura_shell.map(|shell| shell.id),
-            Singleton::Shm => ctx.host_shm_id,
-        }
+        ctx.singletons.host(singleton)
+    }
+
+    /// The global name of the proxy's binding of `singleton`.
+    fn bound_name(singleton: Singleton, ctx: &Context) -> Option<u32> {
+        Some(ctx.singletons.get(singleton)?.name)
     }
 
     /// A format the proxy can offer in synthetic linux-dmabuf feedback:
@@ -1636,10 +1669,10 @@ mod tests {
                     "{interface} as {name_on_b} on B"
                 );
 
-                assert_eq!(B.bind(&mut ctx, name_on_b, advertised, 1, 20), Action::Drop);
+                B.bind(&mut ctx, name_on_b, advertised, 1, 20);
                 assert!(!ctx.is_fatal(), "{interface} as {name_on_b} on B");
                 assert_eq!(
-                    ctx.shadow_table.get_interface(20),
+                    ctx.shadow_table.get_interface(20).map(Iface::name),
                     Some(advertised),
                     "{interface} as {name_on_b} on B"
                 );
@@ -1657,7 +1690,7 @@ mod tests {
         guest_globals(&mut ctx);
         ctx.client_to_host_queue.clear();
 
-        assert_eq!(A.bind(&mut ctx, 7, "gtk_shell1", 1, 50), Action::Drop);
+        A.bind(&mut ctx, 7, "gtk_shell1", 1, 50);
         assert!(ctx.shadow_table.is_local(50));
         assert!(ctx.gtk_shells.contains_key(&50));
         assert_eq!(guest_globals(&mut ctx), []);
@@ -1673,7 +1706,7 @@ mod tests {
         );
 
         ctx.last_sender_id = callback;
-        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert_eq!(Handlers::on_done(&mut ctx, 0), Action::Drop);
         assert_eq!(
             decoded(&ctx.host_to_client_queue, gtk_shell1::Event::from_wire),
             [(50, gtk_shell1::Event::Capabilities { capabilities: 0 })]
@@ -1721,13 +1754,16 @@ mod tests {
         );
         assert_eq!(ctx.host_text_input_manager_v1_id, Some(2));
         assert_eq!(ctx.host_text_input_extension_v1_id, Some(3));
-        assert_eq!(ctx.host_keyboard_extension_id, Some(HostId(4)));
-        assert_eq!(ctx.host_shm_id, Some(5));
+        assert_eq!(ctx.singletons.host(Singleton::KeyboardExtension), Some(4));
+        assert_eq!(ctx.singletons.host(Singleton::Shm), Some(5));
         for (_, interface, version, id) in bindings {
-            assert_eq!(ctx.shadow_table.get_host_interface(id), Some(interface));
+            assert_eq!(
+                ctx.shadow_table.get_host_interface(id).map(Iface::name),
+                Some(interface)
+            );
             assert_eq!(ctx.shadow_table.host_object_version(id), Some(version));
         }
-        assert_eq!(ctx.shadow_table.create_host_only("wl_callback", 1), 6);
+        assert_eq!(ctx.shadow_table.create_host_only(Iface::WlCallback, 1), 6);
 
         // Offered at v1, each is bound at v1.
         for (_, interface, _, _) in bindings {
@@ -1752,7 +1788,10 @@ mod tests {
             let mut ctx = gpu_context(&[A]);
             assert_eq!(A.global(&mut ctx, 10, dmabuf, version), Action::Drop);
 
-            let host_id = ctx.host_dmabuf_id.expect("the internal binding");
+            let host_id = ctx
+                .singletons
+                .host(Singleton::Dmabuf)
+                .expect("the internal binding");
             assert_eq!(ctx.shadow_table.host_object_version(host_id), Some(3));
             assert_eq!(
                 host_requests(&mut ctx, &[]),
@@ -1795,7 +1834,7 @@ mod tests {
                 .expect("capability generation")
                 .format_modifiers
                 .extend_from_slice(formats);
-            LinuxDmabufHandler::complete_capability_discovery(&mut ctx, generation);
+            crate::handler::linux_dmabuf::complete_capability_discovery(&mut ctx, generation);
 
             assert!(ctx.pending_dmabuf_globals.is_empty());
             assert_eq!(
@@ -1852,7 +1891,7 @@ mod tests {
         let mut ctx = aura_placement_context();
         assert_eq!(A.global(&mut ctx, 11, "zaura_shell", 38), Action::Drop);
         assert_eq!(A.global(&mut ctx, 10, "wl_output", 2), Action::Forward);
-        assert_eq!(A.bind(&mut ctx, 10, "wl_output", 2, 20), Action::Drop);
+        A.bind(&mut ctx, 10, "wl_output", 2, 20);
         let output = ctx.shadow_table.get_host_id(20).expect("bound output");
         let aura_output = ctx.outputs.aura_output(output).expect("Aura output");
         ctx.client_to_host_queue.clear();
@@ -1878,10 +1917,7 @@ mod tests {
             guest: 12,
             host: 102,
         };
-        assert_eq!(
-            unmapped.bind(&mut ctx, 10, "wl_output", 3, 20),
-            Action::Drop
-        );
+        unmapped.bind(&mut ctx, 10, "wl_output", 3, 20);
         assert!(!ctx.is_fatal());
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
         assert_eq!(host_requests(&mut ctx, &[]), []);
@@ -1999,10 +2035,7 @@ mod tests {
             ctx.client_to_host_queue.clear();
 
             let (name, interface, version) = case.bind;
-            assert_eq!(
-                case.through.bind(&mut ctx, name, interface, version, 20),
-                Action::Drop
-            );
+            case.through.bind(&mut ctx, name, interface, version, 20);
             assert!(ctx.is_fatal(), "{} must end the session", case.name);
             assert_eq!(
                 protocol_error(&ctx),
@@ -2021,7 +2054,7 @@ mod tests {
     fn late_zaura_shell_binding_attaches_existing_outputs() {
         let mut ctx = aura_placement_context();
         assert_eq!(A.global(&mut ctx, 10, "wl_output", 3), Action::Forward);
-        assert_eq!(A.bind(&mut ctx, 10, "wl_output", 3, 20), Action::Drop);
+        A.bind(&mut ctx, 10, "wl_output", 3, 20);
         let output = ctx.shadow_table.get_host_id(20).expect("bound output");
         assert_eq!(
             ctx.outputs.aura_output(output),
@@ -2065,9 +2098,9 @@ mod tests {
         guest_globals(&mut ctx);
         ctx.client_to_host_queue.clear();
 
-        assert_eq!(A.bind(&mut ctx, 7, "wl_shm", 1, 20), Action::Drop);
+        A.bind(&mut ctx, 7, "wl_shm", 1, 20);
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert_eq!(ctx.shadow_table.get_interface(20), Some("wl_shm"));
+        assert_eq!(ctx.shadow_table.get_interface(20), Some(Iface::WlShm));
         assert_eq!(host_requests(&mut ctx, &[]), [], "no second host bind");
         assert_eq!(
             decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
@@ -2092,22 +2125,18 @@ mod tests {
             .host_text_input_manager_v1_id
             .expect("host manager binding");
         for id in [20, 21] {
-            assert_eq!(
-                A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, id),
-                Action::Drop
-            );
+            A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, id);
             assert_eq!(ctx.shadow_table.get_host_id(id), None);
         }
 
         ctx.last_sender_id = 20;
-        let mut manager_handler = crate::handler::text_input::TextInputManagerV3Handler;
         assert_eq!(
-            ZwpTextInputManagerV3Handler::on_destroy(&mut manager_handler, &mut ctx),
+            <Handlers as ZwpTextInputManagerV3Handler>::on_destroy(&mut ctx),
             Action::Drop
         );
         assert_eq!(
             ctx.shadow_table.get_host_interface(manager),
-            Some("zwp_text_input_manager_v1")
+            Some(Iface::ZwpTextInputManagerV1)
         );
         assert!(ctx.shadow_table.get_interface(21).is_some());
     }
@@ -2118,8 +2147,8 @@ mod tests {
         assert_eq!(A.global(&mut ctx, 10, "wl_seat", 5), Action::Forward);
         assert_eq!(A.global(&mut ctx, 11, "wl_seat", 5), Action::Forward);
 
-        assert_eq!(A.bind(&mut ctx, 10, "wl_seat", 5, 20), Action::Drop);
-        assert_eq!(A.bind(&mut ctx, 11, "wl_seat", 5, 21), Action::Drop);
+        A.bind(&mut ctx, 10, "wl_seat", 5, 20);
+        A.bind(&mut ctx, 11, "wl_seat", 5, 21);
         let host = |id| ctx.shadow_table.get_host_id(id).expect("a host seat");
         let expected = [
             (A.host, bind_request(10, "wl_seat", 5, host(20))),
@@ -2148,10 +2177,7 @@ mod tests {
 
         // The synthetic v3 global is advertised under the host manager's
         // numeric name. Bind a guest manager before removing the host globals.
-        assert_eq!(
-            A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, 20),
-            Action::Drop
-        );
+        A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, 20);
         assert_eq!(A.remove(&mut ctx, 9), Action::Forward);
         assert_eq!(A.remove(&mut ctx, 10), Action::Drop);
         assert_eq!(ctx.host_text_input_manager_v1_id, Some(manager));
@@ -2162,9 +2188,8 @@ mod tests {
         // text-input children must still be created through both retained
         // host-side factories.
         ctx.last_sender_id = 20;
-        let mut manager_handler = crate::handler::text_input::TextInputManagerV3Handler;
         assert_eq!(
-            ZwpTextInputManagerV3Handler::on_get_text_input(&mut manager_handler, &mut ctx, 21, 30),
+            <Handlers as ZwpTextInputManagerV3Handler>::on_get_text_input(&mut ctx, 21, 30),
             Action::Drop
         );
         let host = host_requests(
@@ -2211,17 +2236,16 @@ mod tests {
             Action::Drop
         );
         let manager_id = ctx
-            .host_keyboard_extension_id
+            .singletons
+            .host(Singleton::KeyboardExtension)
+            .map(HostId)
             .expect("keyboard extension binding");
 
         // Simulate the child created by get_extended_keyboard for an already
         // bound host wl_keyboard. The child owns its own destructor and must
         // outlive the manager global.
         crate::handler::keyboard::for_test::created(&mut ctx, 41, 40, 42);
-        crate::handler::keyboard::KeyboardHandler::ensure_extended_keyboard_bound(
-            &mut ctx,
-            HostId(40),
-        );
+        crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(40));
         let child_id = ctx
             .keys
             .keyboards()
@@ -2229,11 +2253,11 @@ mod tests {
             .expect("extended keyboard child");
         assert_eq!(
             ctx.shadow_table.get_host_interface(child_id.0),
-            Some("zcr_extended_keyboard_v1")
+            Some(Iface::ZcrExtendedKeyboardV1)
         );
 
         assert_eq!(A.remove(&mut ctx, 20), Action::Drop);
-        assert_eq!(ctx.host_keyboard_extension_id, None);
+        assert_eq!(ctx.singletons.get(Singleton::KeyboardExtension), None);
         assert_eq!(
             ctx.shadow_table.get_host_interface(manager_id.0),
             None,
@@ -2251,7 +2275,7 @@ mod tests {
         );
         assert_eq!(
             ctx.shadow_table.get_host_interface(child_id.0),
-            Some("zcr_extended_keyboard_v1"),
+            Some(Iface::ZcrExtendedKeyboardV1),
             "child dispatch metadata must survive global removal"
         );
     }
@@ -2326,7 +2350,7 @@ mod tests {
                 pending_guest_global: true,
             },
         ] {
-            let interface = singleton.interface();
+            let interface = singleton.interface().name();
             let mut ctx = gpu_context(&[A]);
             ctx.synthetic_feedback_available_for_test = true;
             assert_eq!(A.global(&mut ctx, 10, interface, version), Action::Drop);
@@ -2339,7 +2363,7 @@ mod tests {
             );
 
             assert_eq!(A.remove(&mut ctx, 10), removal, "{interface}");
-            assert_eq!(singleton.bound_name(&ctx), None);
+            assert_eq!(bound_name(singleton, &ctx), None);
             assert_eq!(bound_host_id(singleton, &ctx), None);
             assert_eq!(ctx.shadow_table.get_host_interface(old), None);
             assert_eq!(
@@ -2348,7 +2372,7 @@ mod tests {
                 "{interface}"
             );
             assert!(ctx.pending_dmabuf_globals.is_empty(), "{interface}");
-            assert_ne!(ctx.shadow_table.create_host_only("wl_callback", 1), old);
+            assert_ne!(ctx.shadow_table.create_host_only(Iface::WlCallback, 1), old);
 
             assert_eq!(A.global(&mut ctx, 10, interface, version), Action::Drop);
             let new = bound_host_id(singleton, &ctx).expect("a new binding");
@@ -2379,13 +2403,16 @@ mod tests {
         for (version, released) in [(38, true), (37, false)] {
             let mut ctx = context(&[A]);
             assert_eq!(A.global(&mut ctx, 10, "zaura_shell", version), Action::Drop);
-            let shell = ctx.host_zaura_shell.expect("aura shell binding").id;
-            let surface = ctx.shadow_table.create_host_only("zaura_surface", 38);
+            let shell = ctx
+                .singletons
+                .host(Singleton::AuraShell)
+                .expect("aura shell binding");
+            let surface = ctx.shadow_table.create_host_only(Iface::ZauraSurface, 38);
             ctx.aura_surfaces.remember(50, surface);
             ctx.client_to_host_queue.clear();
 
             assert_eq!(A.remove(&mut ctx, 10), Action::Forward);
-            assert_eq!(ctx.host_zaura_shell, None);
+            assert_eq!(ctx.singletons.get(Singleton::AuraShell), None);
             assert_eq!(ctx.shadow_table.get_host_interface(shell), None);
             assert_eq!(
                 host_requests(&mut ctx, &[(shell, "zaura_shell")]),
@@ -2395,11 +2422,11 @@ mod tests {
             assert_eq!(ctx.aura_surfaces.get(50), Some(surface));
             assert_eq!(
                 ctx.shadow_table.get_host_interface(surface),
-                Some("zaura_surface")
+                Some(Iface::ZauraSurface)
             );
             for reserved in [shell, surface] {
                 assert_ne!(
-                    ctx.shadow_table.create_host_only("wl_callback", 1),
+                    ctx.shadow_table.create_host_only(Iface::WlCallback, 1),
                     reserved
                 );
             }
@@ -2454,11 +2481,11 @@ mod tests {
             },
         ] {
             let mut ctx = gpu_context(&[A]);
-            let interface = singleton.interface();
+            let interface = singleton.interface().name();
             assert_eq!(A.global(&mut ctx, 10, interface, version), Action::Drop);
             let old = bound_host_id(singleton, &ctx).expect("a binding");
             assert_eq!(A.global(&mut ctx, 11, interface, version), Action::Drop);
-            assert_eq!(singleton.bound_name(&ctx), Some(10), "{interface}");
+            assert_eq!(bound_name(singleton, &ctx), Some(10), "{interface}");
             assert_eq!(bound_host_id(singleton, &ctx), Some(old));
             assert_eq!(
                 host_requests(&mut ctx, &[]),
@@ -2469,7 +2496,7 @@ mod tests {
             A.remove(&mut ctx, 10);
 
             assert!(!ctx.is_fatal());
-            assert_eq!(singleton.bound_name(&ctx), Some(11), "{interface}");
+            assert_eq!(bound_name(singleton, &ctx), Some(11), "{interface}");
             let new = bound_host_id(singleton, &ctx).expect("a new binding");
             let expected = destructor.map(|request| (old, request)).into_iter();
             assert_eq!(
@@ -2709,7 +2736,12 @@ mod tests {
                 ctx.assert_no_orphans();
             }
 
-            assert_eq!(Singleton::Shm.bound_name(&ctx), case.bound, "{}", case.name);
+            assert_eq!(
+                bound_name(Singleton::Shm, &ctx),
+                case.bound,
+                "{}",
+                case.name
+            );
             let binds = case.binds.iter().map(|bind| {
                 let request = bind_request(bind.name, "wl_shm", WL_SHM_VERSION, bind.id);
                 (bind.through.host, request)
@@ -2747,7 +2779,7 @@ mod tests {
             .expect("the replacement's capabilities")
             .format_modifiers
             .push(XRGB8888_LINEAR);
-        LinuxDmabufHandler::complete_capability_discovery(&mut ctx, replacement);
+        crate::handler::linux_dmabuf::complete_capability_discovery(&mut ctx, replacement);
 
         assert_eq!(
             ctx.host_globals.get(&11),
@@ -2775,15 +2807,18 @@ mod tests {
         assert_eq!(A.remove(&mut ctx, 10), Action::Forward);
         assert_eq!(B.global(&mut ctx, 11, "wl_seat", 5), Action::Forward);
 
-        assert_eq!(A.bind(&mut ctx, 10, "wl_output", 3, 20), Action::Drop);
+        A.bind(&mut ctx, 10, "wl_output", 3, 20);
         assert!(!ctx.is_fatal());
         assert_eq!(host_requests(&mut ctx, &[]), [], "nothing reaches the host");
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert!(ctx.shadow_table.request_object(20, "wl_output").is_some());
+        assert!(ctx
+            .shadow_table
+            .request_object(20, Iface::WlOutput)
+            .is_some());
         assert_eq!(ctx.shadow_table.guest_object_version(20), Some(3));
         assert!(ctx.outputs.is_empty_for_test());
 
-        assert_eq!(B.bind(&mut ctx, 10, "wl_output", 3, 21), Action::Drop);
+        B.bind(&mut ctx, 10, "wl_output", 3, 21);
         assert_eq!(
             protocol_error(&ctx),
             (B.guest, wl_display::ERROR_INVALID_OBJECT),
@@ -2887,11 +2922,7 @@ mod tests {
         );
         ctx.assert_no_orphans();
 
-        assert_eq!(
-            A.bind(&mut ctx, 7, "wl_seat", 5, 20),
-            Action::Drop,
-            "the replacement global must remain bindable from registry A"
-        );
+        A.bind(&mut ctx, 7, "wl_seat", 5, 20);
         assert!(ctx.shadow_table.get_host_id(20).is_some());
     }
 
@@ -2910,16 +2941,12 @@ mod tests {
             "reused name must not retain the old visible interface metadata"
         );
         assert_eq!(
-            ctx.host_keyboard_extension_global_name,
+            bound_name(Singleton::KeyboardExtension, &ctx),
             Some(7),
             "the replacement hidden global must own the numeric name"
         );
 
-        assert_eq!(
-            A.bind(&mut ctx, 7, "wl_seat", 5, 20),
-            Action::Drop,
-            "a bind for the previous interface must be rejected after name reuse"
-        );
+        A.bind(&mut ctx, 7, "wl_seat", 5, 20);
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
     }
 
@@ -2960,7 +2987,9 @@ mod tests {
             );
         }
         let old_id = ctx
-            .host_keyboard_extension_id
+            .singletons
+            .host(Singleton::KeyboardExtension)
+            .map(HostId)
             .expect("initial keyboard extension binding");
 
         // Registry A sees the host generation disappear and immediately sees
@@ -2969,21 +2998,26 @@ mod tests {
         assert_eq!(A.remove(&mut ctx, 7), Action::Drop);
         assert_eq!(A.global(&mut ctx, 7, keyboard_extension, 2), Action::Drop);
         let replacement_id = ctx
-            .host_keyboard_extension_id
+            .singletons
+            .host(Singleton::KeyboardExtension)
+            .map(HostId)
             .expect("replacement keyboard extension binding");
         assert_ne!(replacement_id, old_id);
         assert_eq!(
             ctx.shadow_table.get_host_interface(replacement_id.0),
-            Some(keyboard_extension)
+            Some(Iface::ZcrKeyboardExtensionV1)
         );
 
         // Registry B's queued remove belongs to generation 1. It must not
         // tear down the generation-2 internal object that is now active.
         assert_eq!(B.remove(&mut ctx, 7), Action::Drop);
-        assert_eq!(ctx.host_keyboard_extension_id, Some(replacement_id));
+        assert_eq!(
+            ctx.singletons.host(Singleton::KeyboardExtension),
+            Some(replacement_id.0)
+        );
         assert_eq!(
             ctx.shadow_table.get_host_interface(replacement_id.0),
-            Some(keyboard_extension)
+            Some(Iface::ZcrKeyboardExtensionV1)
         );
     }
 
@@ -3009,10 +3043,7 @@ mod tests {
                 .then(|| (A.guest, global_event(7, compositor, guest_version)));
             assert_eq!(guest_globals(&mut ctx), Vec::from_iter(advertised));
 
-            assert_eq!(
-                A.bind(&mut ctx, 7, compositor, guest_version, 20),
-                Action::Drop
-            );
+            A.bind(&mut ctx, 7, compositor, guest_version, 20);
             assert!(!ctx.is_fatal());
             let host_id = ctx
                 .shadow_table
@@ -3031,10 +3062,7 @@ mod tests {
                 [(A.host, bind_request(7, compositor, bound_version, host_id))]
             );
 
-            assert_eq!(
-                A.bind(&mut ctx, 7, compositor, guest_version + 1, 21),
-                Action::Drop
-            );
+            A.bind(&mut ctx, 7, compositor, guest_version + 1, 21);
             assert_eq!(
                 protocol_error(&ctx),
                 (A.guest, wl_display::ERROR_INVALID_OBJECT)
@@ -3044,24 +3072,52 @@ mod tests {
         }
     }
 
+    /// The version the guest is offered of a forwarded host `interface`
+    /// at `host_version`.
+    fn offered(interface: &str, host_version: u32) -> u32 {
+        let iface = Iface::from_name(interface).expect("a vendored interface");
+        let Policy::Forward { ceiling, .. } = policy(iface) else {
+            panic!("{interface} is not forwarded");
+        };
+        offered_version(iface, ceiling, host_version)
+    }
+
+    /// Every interface has one row in the table of globals (`policy`,
+    /// whose `match` the compiler holds to every interface): a forwarded
+    /// global is never offered above its XML, and each singleton is bound
+    /// from a global of its own interface. The singletons the table binds
+    /// are those `Singleton::ALL` lists, which the proxy binds anew when
+    /// one retires: a variant that is in neither is never constructed,
+    /// which the compiler rejects.
     #[test]
-    fn every_forwarded_global_is_capped_at_its_xml_version() {
-        let ctx = Context::new_for_test(false, true, vec![]);
-        let forwarded = FORWARDED_PROTOCOLS
-            .into_iter()
-            .chain([XDG_DECORATION_ALLOWED])
-            .flatten();
-        for &interface in forwarded {
-            let xml_version = crate::protocols::interface_version(interface)
-                .expect("a forwarded interface comes from the vendored XML");
-            let offered = forwarded_global_version(&ctx, interface, u32::MAX)
-                .expect("the interface is forwarded");
+    fn every_interface_has_one_global_policy() {
+        for iface in Iface::ALL {
+            match policy(iface) {
+                Policy::Forward { ceiling, .. } => assert!(
+                    ceiling <= iface.version(),
+                    "{iface} is offered up to v{ceiling}, newer than its XML's v{}",
+                    iface.version()
+                ),
+                Policy::BindInternal(Internal::Singleton(singleton)) => {
+                    assert_eq!(singleton.interface(), iface, "{singleton:?}");
+                    assert!(
+                        Singleton::ALL.contains(&singleton),
+                        "{singleton:?} is in Singleton::ALL"
+                    );
+                }
+                Policy::BindInternal(_) | Policy::Hide | Policy::Synthetic => {}
+            }
+        }
+        for singleton in Singleton::ALL {
             assert!(
-                offered <= xml_version,
-                "{interface} is offered at v{offered}, newer than its XML's v{xml_version}"
+                matches!(
+                    policy(singleton.interface()),
+                    Policy::BindInternal(Internal::Singleton(bound)) if bound == singleton
+                ),
+                "{singleton:?} has its row"
             );
         }
-        assert_eq!(forwarded_global_version(&ctx, "unknown_interface", 1), None);
+        assert_eq!(offered("wl_seat", u32::MAX), super::WL_SEAT_VERSION);
     }
 
     #[test]
@@ -3078,8 +3134,8 @@ mod tests {
             ("zxdg_output_manager_v1", 4, 3),
         ] {
             assert_eq!(
-                forwarded_global_version(&ctx, interface, host_version),
-                Some(offered),
+                super::tests::offered(interface, host_version),
+                offered,
                 "{interface} v{host_version}"
             );
         }

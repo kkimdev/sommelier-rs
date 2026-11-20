@@ -24,6 +24,7 @@ mod objects;
 mod outputs;
 mod registries;
 mod render;
+mod singletons;
 mod window_placement;
 mod xdg_roles;
 
@@ -49,7 +50,7 @@ pub(crate) use self::input::{
     KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PointerFocus,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
-pub use self::objects::{DeletedHostId, Link, ShadowTable};
+pub use self::objects::{DeletedHostId, EventSender, Link, RequestSender, ShadowTable};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
     is_valid_transform, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
@@ -62,6 +63,7 @@ pub(crate) use self::render::{
     RenderBufferUse, ShmPool, StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceMapping,
     SurfaceRect, SurfaceState, ViewportState,
 };
+pub(crate) use self::singletons::{Binding, Singleton, Singletons};
 pub(crate) use self::window_placement::{
     Placement, PlacementState, PlacementStep, Point, WindowPlacement,
 };
@@ -324,19 +326,6 @@ pub(crate) enum PostDispatch {
     KeyboardCreated { keyboard: u32, seat: u32 },
 }
 
-/// The proxy's internal host `zaura_shell` binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HostAuraShell {
-    pub(crate) id: u32,
-    /// The registry name of the global it was bound from, so its
-    /// `global_remove` releases exactly this binding.
-    pub(crate) global_name: u32,
-    /// The bound version, clamped by the `zaura_shell` bind in
-    /// `handler/registry.rs` (at least `ZAURA_SHELL_MIN_VERSION`). Every
-    /// Aura child created from this binding takes it.
-    pub(crate) version: u32,
-}
-
 /// A synthetic guest `wl_shm` object.
 #[derive(Debug, Default)]
 pub struct GuestShm {
@@ -399,16 +388,9 @@ pub struct Context {
     pub plane_fences_for_test: Option<PlaneFenceForTest>,
     /// This connection's VirtWL channel to the host, if it has one.
     virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
-    pub host_dmabuf_id: Option<u32>,
-    /// Global name that produced the currently bound internal dmabuf object.
-    pub host_dmabuf_global_name: Option<u32>,
-    pub host_shm_id: Option<u32>,
-    /// Global name that produced the currently bound internal wl_shm object.
-    pub host_shm_global_name: Option<u32>,
-    /// Global name that produced the internal keyboard extension binding,
-    /// so that registry removal resets exactly the binding that disappeared,
-    /// without tearing down a duplicate or a newer global generation.
-    pub host_keyboard_extension_global_name: Option<u32>,
+    /// The proxy's binding of each host global it binds once per
+    /// connection, for its own use.
+    pub(crate) singletons: Singletons,
     /// Optional formats learned from the internal host wl_shm binding.
     /// Keeping the source separate lets a dmabuf global disappear without
     /// invalidating a format that the host's real wl_shm object still offers.
@@ -431,8 +413,6 @@ pub struct Context {
     pub stale_shm_pools: BTreeSet<u32>,
     pub host_text_input_manager_v1_id: Option<u32>,
     pub host_text_input_extension_v1_id: Option<u32>,
-    /// Host-side zcr_keyboard_extension_v1 object ID (bound internally on startup).
-    pub host_keyboard_extension_id: Option<HostId>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
@@ -484,9 +464,6 @@ pub struct Context {
     /// Guest dmabuf factory ID to the host-global generation from which it was
     /// bound. Global removal does not invalidate an already-bound factory.
     pub dmabuf_guest_generations: BTreeMap<u32, u64>,
-    /// The internal host zaura_shell binding (not exposed to the guest), if
-    /// one is bound.
-    pub(crate) host_zaura_shell: Option<HostAuraShell>,
     /// This connection's window placement, while it is on (see
     /// [`WindowPlacement`] for what it owns); decided as it connects.
     window_placement: Option<WindowPlacement>,
@@ -607,11 +584,7 @@ impl Context {
     /// protocol's version, as the registry would.
     #[cfg(test)]
     pub(crate) fn bind_aura_shell_for_test(&mut self, id: u32) {
-        self.host_zaura_shell = Some(HostAuraShell {
-            id,
-            global_name: id,
-            version: crate::protocols::aura_shell::zaura_shell::VERSION,
-        });
+        self.singletons.bind_for_test(Singleton::AuraShell, id);
     }
 
     /// Take the work deferred while dispatching the current message.
@@ -937,11 +910,7 @@ impl Context {
             #[cfg(test)]
             plane_fences_for_test: None,
             virtwayland_channel: virtwl,
-            host_dmabuf_id: None,
-            host_dmabuf_global_name: None,
-            host_shm_id: None,
-            host_shm_global_name: None,
-            host_keyboard_extension_global_name: None,
+            singletons: Singletons::default(),
             host_wl_shm_formats: BTreeSet::new(),
             host_dmabuf_shm_formats: BTreeSet::new(),
             guest_shms: BTreeMap::new(),
@@ -949,7 +918,6 @@ impl Context {
             stale_shm_pools: BTreeSet::new(),
             host_text_input_manager_v1_id: None,
             host_text_input_extension_v1_id: None,
-            host_keyboard_extension_id: None,
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
             registries: BTreeMap::new(),
@@ -965,7 +933,6 @@ impl Context {
             internal_callbacks: InternalCallbacks::default(),
             pending_dmabuf_globals: Vec::new(),
             dmabuf_guest_generations: BTreeMap::new(),
-            host_zaura_shell: None,
             window_placement: WindowPlacement::connect(placement),
             outputs: OutputRegistry::default(),
             gtk_shells: BTreeMap::new(),
@@ -1117,6 +1084,7 @@ impl ConnectionFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::Iface;
     use std::os::fd::OwnedFd;
 
     fn alt_q() -> crate::accelerator::Accelerator {
@@ -1162,7 +1130,7 @@ mod tests {
     #[test]
     fn retiring_a_destroyed_host_object_requires_a_live_host_only_object() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let host_id = ctx.shadow_table.create_host_only("wl_shm_pool", 1);
+        let host_id = ctx.shadow_table.create_host_only(Iface::WlShmPool, 1);
         ctx.retire_destroyed_host_object(host_id);
         assert!(ctx.shadow_table.is_retired_host(host_id));
         assert!(!ctx.is_fatal());

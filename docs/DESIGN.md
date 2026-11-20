@@ -123,11 +123,19 @@ under [transport invariants](INVARIANTS.md#transport-and-file-descriptors).
 
 `wayland_codegen` turns the vendored XML in
 [`third_party/protocols/`](../third_party/protocols/README.md) into Rust at
-build time (`sommelier/build.rs`). For each protocol it generates:
+build time: `sommelier/build.rs` lists the protocols and writes one
+`protocols.rs`, which `main.rs` includes as `protocols`. For each protocol
+it generates:
 
-- Typed decoders and a `ProtocolHandler` trait with one `on_*` method per
-  message. A handler returns `Action::Forward` or `Action::Drop`; the
-  default forwards.
+- Typed decoders and a handler trait per interface (`WlSurfaceHandler`)
+  with one `on_*` function per message, which takes the connection's
+  `Context` and returns `Action::Forward` or `Action::Drop`; the default
+  forwards. A request in `HAND_WRITTEN_REQUESTS` has no default and
+  returns nothing, so the generated code never forwards it:
+  `wl_registry.bind`, whose `new_id` names no interface, so only its
+  handler knows what it creates. The generated code reaches the proxy
+  only through the object table (`ctx.shadow_table`) and the `Context`
+  lifecycle wrappers, never through a handler module.
 - Pre-dispatch validation: the sender, object and `new_id` arguments are
   resolved through the shadow table before the handler runs, so a
   repeated, null or reserved ID cannot overwrite an entry, and each
@@ -154,23 +162,76 @@ build time (`sommelier/build.rs`). For each protocol it generates:
   caps, `wl_compositor` and `xdg_wm_base` are capped at the versions whose
   semantics the proxy implements, `wl_shm` is offered at v1, which the
   proxy implements itself, and `zaura_shell` has a v6 floor.
-  `forwarded_global_version` never offers a forwarded global above its
-  generated `VERSION`.
+  `offered_version` never offers a forwarded global above its generated
+  `VERSION`.
 - A `NAME` constant, the interface's name. Handlers name an interface
   by it, never by a copied literal.
 
-`generate_routing` derives the interface-to-protocol routing table,
-`interface_version`, each interface's `VERSION` by name, and
-`interface_name`, its `NAME`, from the same list, so the proxy never
-restates which protocol owns an interface or how new it is. The object
-table keeps each object's interface as that `&'static str`, so routing a
-message or creating an object copies no name; a `wl_registry.bind`, whose
-interface is a string on the wire, goes through `interface_name`.
+`generate_routing` derives what spans every protocol from the same list,
+so the proxy never restates which protocol owns an interface or how new
+it is:
+
+- `protocols::Iface`, one variant per vendored interface, with its
+  `name()` (the `NAME`), its `version()` (the `VERSION`) and
+  `from_name`, for the interface names the wire carries (a host global, a
+  `wl_registry.bind`). The object table keeps each object's `Iface`, and
+  a `match` on one is exhaustive, so code that must treat every
+  interface, such as `state::lifecycle::forget_object`, names each.
+- `ProtocolHandlers`, every interface's handler trait, which
+  `handler::Handlers` implements.
+- The one flat dispatch: `dispatch_request`, by the resolved sender's
+  `Iface`, and `dispatch_event`, by the variant of the `AnyEvent` the
+  proxy decoded the host event into. `Client::handle_msgs` decodes a host
+  event whole, once (`AnyEvent::decode`), before anything reads it: the
+  keyboard core's recovery (`handler::keyboard::before_host_event`), the
+  stale-event filter, and then its handler. A host event that does not
+  decode ends the session before any of them sees it, unless only the
+  proxy uses its object (see
+  [Wire messages](INVARIANTS.md#wire-messages)).
 
 Encoders and forwards size their `MessageBuilder` up front, from their
 arguments or the received payload, and it writes the payload after room
 for the header, which building fills in: a message is one allocation and
 is not copied again before it joins its peer's pending output.
+
+### Adding an interface or a global
+
+The compiler names every place that must change, and one test names the
+one list it cannot check:
+
+1. **A protocol.** Vendor its XML in `third_party/protocols/` and add its
+   path to `sommelier/build.rs`. Each of its interfaces becomes an `Iface`
+   variant, and the build stops at every exhaustive match until the
+   interface has a row in it:
+   - `handler::registry::policy`, the one table of host globals: whether
+     the proxy forwards a host global of the interface (and up to which
+     version), hides it, binds it for its own use, or advertises a global
+     of its own in its place. A forwarded global needs nothing more. An
+     interface that is no global is hidden.
+   - `state::lifecycle::forget_object`: whether its objects have state of
+     their own to forget when they end.
+   - `ProtocolHandlers`: `handler::Handlers` implements its handler
+     trait, either in the module that owns the interface or, if every
+     message forwards as it is, in the list in `handler/mod.rs`.
+2. **A handler.** Override the trait's `on_*` functions for the messages
+   whose meaning changes across the boundary, in the owning module, and
+   keep its per-object state with that module (see
+   [Object ends](#object-ends)).
+3. **A global the proxy binds for itself, once per connection.** A
+   `Singleton` variant (`state/singletons.rs`) and its interface
+   (`Singleton::interface`, a `match`); the variant in `Singleton::ALL`,
+   the order the proxy binds singletons in when several have none, which
+   `every_interface_has_one_global_policy` holds to the table; its
+   `BindInternal` row in `policy`; a `<global>_global` function in
+   `registry.rs` that decides what the guest sees in its place, and its
+   arm in `on_global`'s `match` on the singleton; its bind
+   (`Singleton::bind`) and its release
+   (`reset_internal_binding_for_global`), each a `match` on the
+   singleton. Its binding is `Context::singletons`' entry, which other
+   modules read (`ctx.singletons.host(Singleton::Shm)`).
+
+Tests: `every_interface_has_one_global_policy`,
+`every_interface_resolves_by_its_name`.
 
 ## Object translation
 
@@ -202,9 +263,13 @@ The table's API keeps those entries consistent by construction:
   only in `state`; everything else ends one through its `Context` wrapper
   (see [Object ends](#object-ends)).
 - **Generated dispatch** resolves each sender and object argument once,
-  before the handler runs, which validates and translates it together:
-  `request_sender` and `request_object` return a `Link` (a host ID, or
-  local), and `event_object` returns the guest ID. An event that names a
+  before the handler runs, which validates and translates it together.
+  `resolve_request` and `resolve_event` resolve a message's sender before
+  anything of it is read, into a `RequestSender` or `EventSender`: its
+  `Iface`, version and paired object, which is all dispatch needs of it,
+  so a dispatcher cannot run for a sender that did not resolve.
+  `request_object` returns a `Link` (a host ID, or local), and
+  `event_object` returns the guest ID. An event that names a
   stale object is dropped; one that names an object of another interface
   is dropped too, and the first on a connection warns, since the host
   broke the protocol (test: `an_event_object_of_another_interface_is_warned_of`).
@@ -229,11 +294,17 @@ about the host ID and frees it (`Context::release_deleted_host_id`).
 ## Handlers and state
 
 Handlers translate wire events and delegate policy; policy modules never
-encode wire bytes ad hoc.
+encode wire bytes ad hoc. `handler::Handlers` is the one handler type: a
+unit struct that implements every interface's generated trait, each in
+the module that owns the interface, and lists the interfaces whose
+messages all forward as they are in `handler/mod.rs`. It holds no state,
+so a handler acts only on the `Context` it is given; the XKB context the
+keymaps are compiled in belongs to the keyboard core
+(`keymap::Compiler`), next to the keymaps compiled from it.
 
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
-| Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `InternalCallbacks` |
+| Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of host globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (keyboard and pointer focus); `sommelier/src/keys` (the keyboard core: one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
@@ -489,7 +560,7 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   (`NeverSubmitted`, `AwaitingRelease`, `ReleaseOwed`, `Released`), so
   `wl_buffer.release` reaches the guest exactly when the host is done,
   including after the surface that showed it is destroyed.
-  `BufferHandler` (`handler/buffer.rs`) handles every guest `wl_buffer`,
+  `handler/buffer.rs` handles every guest `wl_buffer`,
   SHM or dma-buf: its destroy and release, and its deferred retirement.
 
 `handler/shm.rs` holds a submodule per concern, and re-exports what other

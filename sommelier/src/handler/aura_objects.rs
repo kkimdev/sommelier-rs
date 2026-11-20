@@ -29,13 +29,14 @@ limitations under the License.
 //! | `zaura_output` | [`crate::state::OutputRegistry`] | placement metadata |
 
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
-use crate::state::{Context, HostAuraShell};
+use crate::protocols::Iface;
+use crate::state::{Binding, Context, Singleton};
 use crate::wire::{queue_or_drop, Outgoing};
 
 /// What the proxy needs to know about one kind of host Aura child.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AuraChild {
-    interface: &'static str,
+    interface: Iface,
     /// The `zaura_shell` request that creates the child, from the shell,
     /// the new child's ID and the object it extends.
     get: fn(u32, u32, u32) -> Outgoing,
@@ -46,19 +47,19 @@ pub(crate) struct AuraChild {
 
 impl AuraChild {
     pub(crate) const SURFACE: Self = Self {
-        interface: zaura_surface::NAME,
+        interface: Iface::ZauraSurface,
         get: zaura_shell::req::get_aura_surface,
         release: zaura_surface::req::release,
         release_since: zaura_surface::REQ_RELEASE_SINCE,
     };
     pub(crate) const TOPLEVEL: Self = Self {
-        interface: zaura_toplevel::NAME,
+        interface: Iface::ZauraToplevel,
         get: zaura_shell::req::get_aura_toplevel_for_xdg_toplevel,
         release: zaura_toplevel::req::release,
         release_since: zaura_toplevel::REQ_RELEASE_SINCE,
     };
     pub(crate) const OUTPUT: Self = Self {
-        interface: zaura_output::NAME,
+        interface: Iface::ZauraOutput,
         get: zaura_shell::req::get_aura_output,
         release: zaura_output::req::release,
         release_since: zaura_output::REQ_RELEASE_SINCE,
@@ -98,12 +99,12 @@ fn live_child_version(ctx: &Context, child: AuraChild, child_host_id: u32) -> Op
 ///
 /// `None`, queueing nothing, when no `zaura_shell` is bound.
 pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -> Option<u32> {
-    let shell = ctx.host_zaura_shell?;
+    let shell = ctx.singletons.get(Singleton::AuraShell)?;
     let child_host_id = ctx
         .shadow_table
         .create_host_only(child.interface, shell.version);
     ctx.client_to_host_queue
-        .push((child.get)(shell.id, child_host_id, parent_host_id));
+        .push((child.get)(shell.host, child_host_id, parent_host_id));
     Some(child_host_id)
 }
 
@@ -131,10 +132,10 @@ pub(crate) fn release(ctx: &mut Context, child: AuraChild, child_host_id: u32) {
 
 /// Release the internal `zaura_shell` binding after its `global_remove`
 /// (see [`release_host_only`]). Its children stay usable.
-pub(crate) fn release_shell(ctx: &mut Context, shell: HostAuraShell) {
+pub(crate) fn release_shell(ctx: &mut Context, shell: Binding) {
     release_host_only(
         ctx,
-        shell.id,
+        shell.host,
         shell.version,
         zaura_shell::req::release,
         zaura_shell::REQ_RELEASE_SINCE,
@@ -276,11 +277,10 @@ mod tests {
 
     fn ctx_with_shell(version: u32) -> Context {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: SHELL_HOST,
-            global_name: SHELL_HOST,
-            version,
-        });
+        ctx.singletons
+            .bind_for_test(Singleton::AuraShell, SHELL_HOST);
+        ctx.singletons
+            .set_version_for_test(Singleton::AuraShell, version);
         ctx
     }
 

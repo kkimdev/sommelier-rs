@@ -35,21 +35,23 @@ limitations under the License.
 
 use crate::accelerator::{Accelerator, BindingId};
 use crate::handler::callback::queue_internal_sync;
+use crate::handler::Handlers;
 use crate::ime::TiId;
-use crate::keymap;
 use crate::keys::{Ack, Env, KeyEffects, KeyInput, Recovered};
 use crate::protocols::keyboard_extension_unstable_v1::{
     zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
 };
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
+use crate::protocols::AnyEvent;
+use crate::protocols::Iface;
+use crate::state::Singleton;
 use crate::state::{
     Context, HostId, InternalCallback, KeyboardFocus, KeyboardFocusRegistry, KeyboardModifiers,
 };
 use crate::warn_once::WarnOnce;
 use crate::wire::{Action, Outgoing};
 use std::os::fd::BorrowedFd;
-use xkbcommon::xkb;
 
 /// Whether the proxy warned that the host has no
 /// `zcr_keyboard_extension_v1` to acknowledge keys through. Such a host
@@ -171,7 +173,7 @@ fn apply_before(ctx: &mut Context, fx: &mut KeyEffects) {
         crate::handler::window_placement::shortcut(ctx, shortcut.keyboard, shortcut.binding);
     }
     if let Some(ack) = fx.ack {
-        KeyboardHandler::send_ack_key(ctx, ack);
+        send_ack_key(ctx, ack);
     }
     if fx.sync {
         queue_internal_sync(ctx, InternalCallback::KeyRecovery);
@@ -199,46 +201,43 @@ fn apply_after(ctx: &mut Context, fx: KeyEffects) {
     }
 }
 
-/// The host event of `interface` (none for an untracked sender) with
-/// `opcode` is about to be handled: a waiting recovery reads it first
+/// Host event `event` (none for an untracked sender), which `sender`
+/// sent, is about to be handled: a waiting recovery reads it first
 /// ([`KeyInput::HostEvent`]), unless its handler hands the core the event
-/// itself, decoded ([`KeyInput::Key`], [`KeyInput::Modifiers`],
-/// [`KeyInput::Peek`], [`KeyInput::TextInputLeave`]). What the recovery
-/// sends the guest goes before the event.
+/// itself ([`KeyInput::Key`], [`KeyInput::Modifiers`], [`KeyInput::Peek`],
+/// [`KeyInput::TextInputLeave`]). What the recovery sends the guest goes
+/// before the event.
 ///
 /// A key or modifiers event the proxy drops unhandled (`suppressed`), of
-/// a keyboard the guest has released, comes undecoded, from `sender`
-/// ([`KeyInput::UnhandledKey`], [`KeyInput::UnhandledModifiers`]): the key
-/// may be the very press a waiting recovery waits for.
+/// a keyboard the guest has released, reaches no handler, so it comes
+/// here ([`KeyInput::UnhandledKey`], [`KeyInput::UnhandledModifiers`]):
+/// the key may be the very press a waiting recovery waits for.
 pub(crate) fn before_host_event(
     ctx: &mut Context,
     sender: u32,
-    interface: Option<&str>,
-    opcode: u16,
+    event: Option<&AnyEvent>,
     suppressed: bool,
 ) {
     if !ctx.keys.awaits_host_event() {
         return;
     }
-    let keyboard_event = |event| interface == Some(wl_keyboard::NAME) && opcode == event;
-    if suppressed && keyboard_event(wl_keyboard::EVT_KEY) {
-        let keyboard = HostId(sender);
-        return keys(ctx, KeyInput::UnhandledKey { keyboard });
-    }
-    if suppressed && keyboard_event(wl_keyboard::EVT_MODIFIERS) {
-        return keys(ctx, KeyInput::UnhandledModifiers);
-    }
-    let decoded_by_its_handler = !suppressed
-        && matches!(
-            (interface, opcode),
-            (
-                Some(wl_keyboard::NAME),
-                wl_keyboard::EVT_KEY | wl_keyboard::EVT_MODIFIERS
-            ) | (
-                Some(zcr_extended_keyboard_v1::NAME),
-                zcr_extended_keyboard_v1::EVT_PEEK_KEY
-            ) | (Some(zwp_text_input_v1::NAME), zwp_text_input_v1::EVT_LEAVE)
-        );
+    let decoded_by_its_handler = match event {
+        Some(AnyEvent::WlKeyboard(wl_keyboard::Event::Key { .. })) if suppressed => {
+            let keyboard = HostId(sender);
+            return keys(ctx, KeyInput::UnhandledKey { keyboard });
+        }
+        Some(AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { .. })) if suppressed => {
+            return keys(ctx, KeyInput::UnhandledModifiers);
+        }
+        Some(
+            AnyEvent::WlKeyboard(
+                wl_keyboard::Event::Key { .. } | wl_keyboard::Event::Modifiers { .. },
+            )
+            | AnyEvent::ZcrExtendedKeyboardV1(zcr_extended_keyboard_v1::Event::PeekKey { .. })
+            | AnyEvent::ZwpTextInputV1(zwp_text_input_v1::Event::Leave {}),
+        ) => !suppressed,
+        _ => false,
+    };
     if !decoded_by_its_handler {
         keys(ctx, KeyInput::HostEvent);
     }
@@ -264,151 +263,130 @@ fn held_keys(keys: &[u8]) -> Vec<u32> {
     held
 }
 
-/// Keyboard handler that compiles each host keyboard's keymap for the
-/// keyboard core, and sends the core's `ack_key` responses to the host via
-/// `zcr_extended_keyboard_v1`.
-pub struct KeyboardHandler {
-    /// The XKB context keymaps are compiled in. It is `!Send` and `!Sync`,
-    /// like the keymaps and states compiled from it.
-    context: xkb::Context,
-}
-
-impl KeyboardHandler {
-    pub fn new() -> Self {
-        Self {
-            context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
-        }
-    }
-
-    /// Ensure the `zcr_extended_keyboard_v1` object is bound for this keyboard.
-    ///
-    /// This is idempotent: if the extended keyboard is already bound for
-    /// `host_keyboard_id`, this function is a no-op.
-    ///
-    /// This is called from `on_enter` (rather than `wl_seat.get_keyboard`) because
-    /// the host keyboard ID (`ctx.last_sender_id` in a host→client event) is only
-    /// known once we process a host event — `get_keyboard` is a client→host request
-    /// and at that point we only have the guest keyboard ID. `on_enter` is always
-    /// sent by the host before any `wl_keyboard.key` event, so this is safe:
-    /// the extended keyboard will be bound before the first key event.
-    ///
-    /// # Ordering invariant
-    /// `get_extended_keyboard` is sent via `client_to_host_queue` and will be
-    /// flushed in the same proxy loop iteration as the forwarded `wl_keyboard.enter`
-    /// event. Exo enables `SetNeedKeyboardKeyAcks(true)` upon processing
-    /// `get_extended_keyboard`. Any key events queued by the compositor *before*
-    /// this request is processed (e.g. a key already in flight) will not have
-    /// an active TTL in `pending_key_acks_`; Exo will apply its default policy for
-    /// those keys. This mirrors the behavior of the C sommelier reference.
-    pub(crate) fn ensure_extended_keyboard_bound(ctx: &mut Context, host_keyboard_id: HostId) {
-        if let Some(extension_host_id) = ctx.host_keyboard_extension_id {
-            let bound = ctx
-                .keys
-                .keyboards()
-                .get(host_keyboard_id)
-                .map(|k| k.extended.is_some());
-            if bound == Some(false) {
-                let Some(extended_version) =
-                    ctx.shadow_table.host_object_version(extension_host_id.0)
-                else {
-                    let _ = ctx.fail(format_args!(
-                        "keyboard extension {} has no version",
-                        extension_host_id.0
-                    ));
-                    return;
-                };
-                let host_extended_id = HostId(
-                    ctx.shadow_table
-                        .create_host_only(zcr_extended_keyboard_v1::NAME, extended_version),
-                );
-                let extended = host_extended_id;
-                keys(
-                    ctx,
-                    KeyInput::ExtendedBound {
-                        keyboard: host_keyboard_id,
-                        extended,
-                    },
-                );
-
-                ctx.client_to_host_queue.push(
-                    zcr_keyboard_extension_v1::req::get_extended_keyboard(
-                        extension_host_id.0,
-                        host_extended_id.0,
-                        host_keyboard_id.0,
-                    ),
-                );
-                log::debug!(
-                    "Bound extended keyboard: host_extended_id={} for host_keyboard_id={}",
-                    host_extended_id.0,
-                    host_keyboard_id.0
-                );
-            }
-        }
-    }
-
-    /// Send zcr_extended_keyboard_v1.ack_key to the host.
-    ///
-    /// The manager global may disappear after a child has been created. The
-    /// child has its own protocol lifetime, so route acknowledgements from the
-    /// child mapping directly and do not require the manager binding to remain.
-    /// If no child has been bound for this keyboard, no acknowledgement is
-    /// sent: either the key event arrived before `on_enter`, which the next
-    /// enter mends, or the host has no extension, which only the first such
-    /// key in the process warns about.
-    fn send_ack_key(ctx: &mut Context, ack: Ack) {
-        let Ack {
-            keyboard: host_keyboard_id,
-            serial,
-            handled,
-        } = ack;
-        let extended = ctx
+/// Ensure the `zcr_extended_keyboard_v1` object is bound for this keyboard.
+///
+/// This is idempotent: if the extended keyboard is already bound for
+/// `host_keyboard_id`, this function is a no-op.
+///
+/// This is called from `on_enter` (rather than `wl_seat.get_keyboard`) because
+/// the host keyboard ID (`ctx.last_sender_id` in a host→client event) is only
+/// known once we process a host event — `get_keyboard` is a client→host request
+/// and at that point we only have the guest keyboard ID. `on_enter` is always
+/// sent by the host before any `wl_keyboard.key` event, so this is safe:
+/// the extended keyboard will be bound before the first key event.
+///
+/// # Ordering invariant
+/// `get_extended_keyboard` is sent via `client_to_host_queue` and will be
+/// flushed in the same proxy loop iteration as the forwarded `wl_keyboard.enter`
+/// event. Exo enables `SetNeedKeyboardKeyAcks(true)` upon processing
+/// `get_extended_keyboard`. Any key events queued by the compositor *before*
+/// this request is processed (e.g. a key already in flight) will not have
+/// an active TTL in `pending_key_acks_`; Exo will apply its default policy for
+/// those keys. This mirrors the behavior of the C sommelier reference.
+pub(crate) fn ensure_extended_keyboard_bound(ctx: &mut Context, host_keyboard_id: HostId) {
+    if let Some(extension_host_id) = ctx
+        .singletons
+        .host(Singleton::KeyboardExtension)
+        .map(HostId)
+    {
+        let bound = ctx
             .keys
             .keyboards()
             .get(host_keyboard_id)
-            .and_then(|k| k.extended);
-        let Some(host_extended_id) = extended else {
-            if ctx.host_keyboard_extension_id.is_some() {
-                log::debug!(
-                    "ack_key: no extended keyboard bound yet for host_keyboard_id={}; \
-                     key event arrived before on_enter? serial={}, handled={}",
+            .map(|k| k.extended.is_some());
+        if bound == Some(false) {
+            let Some(extended_version) = ctx.shadow_table.host_object_version(extension_host_id.0)
+            else {
+                let _ = ctx.fail(format_args!(
+                    "keyboard extension {} has no version",
+                    extension_host_id.0
+                ));
+                return;
+            };
+            let host_extended_id = HostId(
+                ctx.shadow_table
+                    .create_host_only(Iface::ZcrExtendedKeyboardV1, extended_version),
+            );
+            let extended = host_extended_id;
+            keys(
+                ctx,
+                KeyInput::ExtendedBound {
+                    keyboard: host_keyboard_id,
+                    extended,
+                },
+            );
+
+            ctx.client_to_host_queue
+                .push(zcr_keyboard_extension_v1::req::get_extended_keyboard(
+                    extension_host_id.0,
+                    host_extended_id.0,
                     host_keyboard_id.0,
-                    serial,
-                    handled
-                );
-            } else {
-                log::log!(
-                    take_no_keyboard_extension_log_level(&NO_KEYBOARD_EXTENSION_WARNED),
-                    "ack_key: the host has no zcr_keyboard_extension_v1, so keys go \
+                ));
+            log::debug!(
+                "Bound extended keyboard: host_extended_id={} for host_keyboard_id={}",
+                host_extended_id.0,
+                host_keyboard_id.0
+            );
+        }
+    }
+}
+
+/// Send zcr_extended_keyboard_v1.ack_key to the host.
+///
+/// The manager global may disappear after a child has been created. The
+/// child has its own protocol lifetime, so route acknowledgements from the
+/// child mapping directly and do not require the manager binding to remain.
+/// If no child has been bound for this keyboard, no acknowledgement is
+/// sent: either the key event arrived before `on_enter`, which the next
+/// enter mends, or the host has no extension, which only the first such
+/// key in the process warns about.
+fn send_ack_key(ctx: &mut Context, ack: Ack) {
+    let Ack {
+        keyboard: host_keyboard_id,
+        serial,
+        handled,
+    } = ack;
+    let extended = ctx
+        .keys
+        .keyboards()
+        .get(host_keyboard_id)
+        .and_then(|k| k.extended);
+    let Some(host_extended_id) = extended else {
+        if ctx.singletons.get(Singleton::KeyboardExtension).is_some() {
+            log::debug!(
+                "ack_key: no extended keyboard bound yet for host_keyboard_id={}; \
+                     key event arrived before on_enter? serial={}, handled={}",
+                host_keyboard_id.0,
+                serial,
+                handled
+            );
+        } else {
+            log::log!(
+                take_no_keyboard_extension_log_level(&NO_KEYBOARD_EXTENSION_WARNED),
+                "ack_key: the host has no zcr_keyboard_extension_v1, so keys go \
                      unacknowledged (host_keyboard_id={}, serial={}, handled={}); \
                      later ones are logged at debug",
-                    host_keyboard_id.0,
-                    serial,
-                    handled
-                );
-            }
-            return;
-        };
-        let handled = if handled {
-            zcr_extended_keyboard_v1::HANDLED_STATE_HANDLED
-        } else {
-            zcr_extended_keyboard_v1::HANDLED_STATE_NOT_HANDLED
-        };
-        ctx.client_to_host_queue
-            .push(zcr_extended_keyboard_v1::req::ack_key(
-                host_extended_id.0,
+                host_keyboard_id.0,
                 serial,
-                handled,
-            ));
-    }
+                handled
+            );
+        }
+        return;
+    };
+    let handled = if handled {
+        zcr_extended_keyboard_v1::HANDLED_STATE_HANDLED
+    } else {
+        zcr_extended_keyboard_v1::HANDLED_STATE_NOT_HANDLED
+    };
+    ctx.client_to_host_queue
+        .push(zcr_extended_keyboard_v1::req::ack_key(
+            host_extended_id.0,
+            serial,
+            handled,
+        ));
 }
 
-impl Default for KeyboardHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
+impl wl_keyboard::WlKeyboardHandler for Handlers {
     /// Replace the keyboard's keymap, its XKB state and its repeat table
     /// with the one the host sent, or with none if the proxy cannot use it,
     /// and forward the event either way.
@@ -421,21 +399,14 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     /// guest that got their presses, and leave the guest with stuck keys,
     /// and ending a suppression would let the IME hand the accelerator's
     /// key to the guest.
-    fn on_keymap(
-        &mut self,
-        ctx: &mut Context,
-        format: u32,
-        fd: BorrowedFd<'_>,
-        size: u32,
-    ) -> Action {
+    fn on_keymap(ctx: &mut Context, format: u32, fd: BorrowedFd<'_>, size: u32) -> Action {
         let keyboard = HostId::from_event_sender(ctx);
-        let keymap = keymap::compile(&self.context, format, fd, size);
+        let keymap = ctx.keys.keymaps().compile(format, fd, size);
         keys(ctx, KeyInput::Keymap { keyboard, keymap });
         Action::Forward
     }
 
     fn on_enter(
-        &mut self,
         ctx: &mut Context,
         serial: u32,
         surface: u32, // Host ID
@@ -509,7 +480,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // Lazily bind the extended keyboard only after the event is known to
         // be deliverable. A malformed route must not allocate host objects or
         // queue extension requests before being rejected.
-        Self::ensure_extended_keyboard_bound(ctx, host_keyboard_id);
+        ensure_extended_keyboard_bound(ctx, host_keyboard_id);
 
         let focus_update = ctx.keyboard_focus.enter(host_keyboard_id, focus);
         // The protocol requires a modifiers event after every enter, but Exo
@@ -559,7 +530,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         Action::Drop
     }
 
-    fn on_leave(&mut self, ctx: &mut Context, serial: u32, surface: u32) -> Action {
+    fn on_leave(ctx: &mut Context, serial: u32, surface: u32) -> Action {
         // on_leave is a host→client event: last_sender_id is the host keyboard ID.
         let host_keyboard_id = HostId::from_event_sender(ctx);
         let guest_keyboard_id = ctx
@@ -602,14 +573,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
 
     /// Hand a key to the keyboard core, which decides its `ack_key` and
     /// whether the guest gets it.
-    fn on_key(
-        &mut self,
-        ctx: &mut Context,
-        serial: u32,
-        time: u32,
-        key: u32,
-        state: u32,
-    ) -> Action {
+    fn on_key(ctx: &mut Context, serial: u32, time: u32, key: u32, state: u32) -> Action {
         // on_key is a host→client event: last_sender_id is the host keyboard ID.
         let keyboard = HostId::from_event_sender(ctx);
         log::trace!(
@@ -636,7 +600,6 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     /// Track modifier state so the keyboard core resolves the correct
     /// keysym.
     fn on_modifiers(
-        &mut self,
         ctx: &mut Context,
         serial: u32,
         mods_depressed: u32,
@@ -707,14 +670,13 @@ pub(crate) fn forget_keyboard(ctx: &mut Context, host_keyboard_id: HostId) {
 /// `zcr_keyboard_extension_v1` handler — sommelier only sends requests to this
 /// interface (i.e. `get_extended_keyboard`); the host never sends events back to
 /// the factory object, so all event callbacks are empty stubs.
-impl crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1::ZcrKeyboardExtensionV1Handler for KeyboardHandler {}
+impl crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1::ZcrKeyboardExtensionV1Handler for Handlers {}
 
 /// `zcr_extended_keyboard_v1` handler. Version 2's `peek_key` reports physical
 /// press/release state even when the host IME consumes the corresponding key
 /// and therefore omits the normal `wl_keyboard.key` event.
-impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler for KeyboardHandler {
+impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler for Handlers {
     fn on_peek_key(
-        &mut self,
         ctx: &mut Context,
         serial: u32,
         time: u32,
@@ -747,6 +709,7 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
 #[cfg(test)]
 pub(crate) mod for_test {
     use super::*;
+    use crate::keymap;
 
     /// Record host keyboard `host` of guest keyboard `guest` on guest seat
     /// `seat`, as `wl_seat.get_keyboard` does once its forward paired them.

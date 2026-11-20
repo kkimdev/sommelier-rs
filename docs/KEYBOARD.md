@@ -166,8 +166,8 @@ host event, read as a `HostSignal`. The core reads the signal off the
 input itself, decoded once, by the dispatcher: `Key`, `Modifiers`,
 `Peek` and `TextInputLeave` are their events, and the adapter hands the
 core `HostEvent` before any other host event while a recovery waits
-(`handler::keyboard::before_host_event`, which reads only the message
-header). A `wl_keyboard.key` or `modifiers` the proxy drops unhandled,
+(`handler::keyboard::before_host_event`, which reads the `AnyEvent` the
+proxy decodes each host event into, once). A `wl_keyboard.key` or `modifiers` the proxy drops unhandled,
 of a keyboard the guest has released, reaches the core undecoded
 (`UnhandledKey`, `UnhandledModifiers`): Exo sends a key right after its
 peek, so such a key of the keyboard a waited-for peek came from is that

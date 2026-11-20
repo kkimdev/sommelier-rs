@@ -16,13 +16,13 @@ limitations under the License.
 
 use crate::handler::aura_objects::{self, ensure_host_zaura_surface};
 use crate::handler::compositor::native_wayland_app_id;
+use crate::handler::Handlers;
 use crate::protocols::aura_shell::zaura_surface;
 use crate::protocols::gtk::gtk_shell1::{self, GtkShell1Handler};
-use crate::protocols::gtk::gtk_surface1::{self, GtkSurface1Handler};
+use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
+use crate::protocols::Iface;
 use crate::state::{Context, GtkSurfaceState};
 use crate::wire::{queue_or_drop, Action};
-
-pub struct GtkShellHandler;
 
 /// Queue the GTK activation token to an Aura surface. Every Aura surface
 /// supports `set_startup_id`: the registry binds no older `zaura_shell`.
@@ -53,13 +53,8 @@ pub(crate) fn announce_capabilities(ctx: &mut Context, gtk_shell_id: u32) {
     ));
 }
 
-impl GtkShell1Handler for GtkShellHandler {
-    fn on_get_gtk_surface(
-        &mut self,
-        ctx: &mut Context,
-        gtk_surface_id: u32,
-        wl_surface_id: u32,
-    ) -> Action {
+impl GtkShell1Handler for Handlers {
+    fn on_get_gtk_surface(ctx: &mut Context, gtk_surface_id: u32, wl_surface_id: u32) -> Action {
         let shell_id = ctx.last_sender_id;
         let Some(startup_id) = ctx
             .gtk_shells
@@ -78,7 +73,7 @@ impl GtkShell1Handler for GtkShellHandler {
             return ctx.fail(format_args!("gtk_shell1 {shell_id} has no version"));
         };
         ctx.shadow_table
-            .create_local(gtk_surface_id, gtk_surface1::NAME, version);
+            .create_local(gtk_surface_id, Iface::GtkSurface1, version);
         ctx.gtk_surfaces.insert(
             gtk_surface_id,
             GtkSurfaceState {
@@ -92,7 +87,7 @@ impl GtkShell1Handler for GtkShellHandler {
         Action::Drop
     }
 
-    fn on_set_startup_id(&mut self, ctx: &mut Context, startup_id: &Option<String>) -> Action {
+    fn on_set_startup_id(ctx: &mut Context, startup_id: &Option<String>) -> Action {
         let shell_id = ctx.last_sender_id;
         let Some(shell) = ctx.gtk_shells.get_mut(&shell_id) else {
             log::warn!(
@@ -117,14 +112,13 @@ impl GtkShell1Handler for GtkShellHandler {
         Action::Drop
     }
 
-    fn on_system_bell(&mut self, _ctx: &mut Context, _surface: u32) -> Action {
+    fn on_system_bell(_ctx: &mut Context, _surface: u32) -> Action {
         Action::Drop
     }
 }
 
-impl GtkSurface1Handler for GtkShellHandler {
+impl GtkSurface1Handler for Handlers {
     fn on_set_dbus_properties(
-        &mut self,
         ctx: &mut Context,
         application_id: &Option<String>,
         _app_menu_path: &Option<String>,
@@ -148,15 +142,15 @@ impl GtkSurface1Handler for GtkShellHandler {
         Action::Drop
     }
 
-    fn on_set_modal(&mut self, _ctx: &mut Context) -> Action {
+    fn on_set_modal(_ctx: &mut Context) -> Action {
         Action::Drop
     }
 
-    fn on_unset_modal(&mut self, _ctx: &mut Context) -> Action {
+    fn on_unset_modal(_ctx: &mut Context) -> Action {
         Action::Drop
     }
 
-    fn on_present(&mut self, _ctx: &mut Context, _time: u32) -> Action {
+    fn on_present(_ctx: &mut Context, _time: u32) -> Action {
         Action::Drop
     }
 }
@@ -170,6 +164,7 @@ mod tests {
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
     use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
     use crate::state::GtkShellState;
+    use crate::state::Singleton;
     use crate::test_support::{msg_opcode, msg_sender, queued_headers};
     use crate::wire::WireMessage;
 
@@ -178,7 +173,8 @@ mod tests {
 
     /// Give `ctx` the gtk_shell1 [`GTK_SHELL`].
     fn add_gtk_shell(ctx: &mut Context) {
-        ctx.shadow_table.create_local(GTK_SHELL, "gtk_shell1", 1);
+        ctx.shadow_table
+            .create_local(GTK_SHELL, Iface::GtkShell1, 1);
         ctx.gtk_shells.insert(GTK_SHELL, GtkShellState::default());
     }
 
@@ -212,13 +208,12 @@ mod tests {
     fn new_gtk_surface_inherits_startup_id_on_shared_aura_surface() {
         let mut ctx = setup_ctx();
         ctx.last_sender_id = GTK_SHELL;
-        let mut handler = GtkShellHandler;
         assert_eq!(
-            handler.on_set_startup_id(&mut ctx, &Some("launch-token".to_string())),
+            Handlers::on_set_startup_id(&mut ctx, &Some("launch-token".to_string())),
             Action::Drop
         );
         assert_eq!(
-            handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest),
+            Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest),
             Action::Drop
         );
 
@@ -242,7 +237,7 @@ mod tests {
         ctx.shadow_table
             .set_guest_version_for_test(GTK_SHELL, shell_version);
         ctx.last_sender_id = GTK_SHELL;
-        GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
+        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
         assert_eq!(
             ctx.shadow_table.guest_object_version(GTK_SURFACE),
             Some(shell_version)
@@ -253,12 +248,11 @@ mod tests {
     fn startup_id_updates_and_clears_all_unique_aura_surfaces() {
         let mut ctx = setup_ctx();
         ctx.last_sender_id = GTK_SHELL;
-        let mut handler = GtkShellHandler;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE + 1, SURFACE.guest);
+        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
+        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE + 1, SURFACE.guest);
         ctx.client_to_host_queue.clear();
 
-        handler.on_set_startup_id(&mut ctx, &Some("next-token".to_string()));
+        Handlers::on_set_startup_id(&mut ctx, &Some("next-token".to_string()));
         assert_eq!(
             ctx.client_to_host_queue.len(),
             1,
@@ -270,7 +264,7 @@ mod tests {
         );
 
         ctx.client_to_host_queue.clear();
-        handler.on_set_startup_id(&mut ctx, &None);
+        Handlers::on_set_startup_id(&mut ctx, &None);
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert_eq!(nullable_string(&ctx.client_to_host_queue[0].0), None);
     }
@@ -287,13 +281,12 @@ mod tests {
             ("placement on", placed),
         ] {
             ctx.last_sender_id = GTK_SHELL;
-            let mut handler = GtkShellHandler;
-            handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
+            Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
             ctx.client_to_host_queue.clear();
             ctx.last_sender_id = GTK_SURFACE;
 
             assert_eq!(
-                handler.on_set_dbus_properties(
+                Handlers::on_set_dbus_properties(
                     &mut ctx,
                     &Some("com.example.Terminal".to_string()),
                     &None,
@@ -328,20 +321,19 @@ mod tests {
     /// while no shell was bound.
     #[test]
     fn gtk_requests_after_a_shell_rebind_reach_the_new_shell() {
-        use crate::handler::registry::RegistryHandler;
+        use crate::handler::Handlers;
         use crate::protocols::wayland::wl_registry::WlRegistryHandler;
 
         const REGISTRY: u32 = 1;
         const SHELL_NAME: u32 = 7;
         let mut ctx = setup_ctx();
-        ctx.host_zaura_shell = None;
+        ctx.singletons.unbind_for_test(Singleton::AuraShell);
         ctx.shadow_table
             .insert_paired_for_test(REGISTRY, REGISTRY, "wl_registry");
         let shell = "zaura_shell".to_string();
-        let mut handler = GtkShellHandler;
         let set_application_id = |ctx: &mut Context| {
             ctx.last_sender_id = GTK_SURFACE;
-            GtkShellHandler.on_set_dbus_properties(
+            Handlers::on_set_dbus_properties(
                 ctx,
                 &Some("com.example.Terminal".to_string()),
                 &None,
@@ -353,20 +345,23 @@ mod tests {
         };
 
         ctx.last_sender_id = REGISTRY;
-        RegistryHandler.on_global(&mut ctx, SHELL_NAME, &shell, 38);
-        RegistryHandler.on_global_remove(&mut ctx, SHELL_NAME);
-        assert_eq!(ctx.host_zaura_shell, None);
+        Handlers::on_global(&mut ctx, SHELL_NAME, &shell, 38);
+        Handlers::on_global_remove(&mut ctx, SHELL_NAME);
+        assert_eq!(ctx.singletons.get(Singleton::AuraShell), None);
         ctx.last_sender_id = GTK_SHELL;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
+        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
         set_application_id(&mut ctx);
         assert_eq!(ctx.aura_surfaces.get(SURFACE.host), None);
 
         ctx.last_sender_id = REGISTRY;
-        RegistryHandler.on_global(&mut ctx, SHELL_NAME, &shell, 38);
-        let shell_host = ctx.host_zaura_shell.expect("rebound zaura_shell").id;
+        Handlers::on_global(&mut ctx, SHELL_NAME, &shell, 38);
+        let shell_host = ctx
+            .singletons
+            .host(Singleton::AuraShell)
+            .expect("rebound zaura_shell");
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = GTK_SHELL;
-        handler.on_set_startup_id(&mut ctx, &Some("launch-token".to_string()));
+        Handlers::on_set_startup_id(&mut ctx, &Some("launch-token".to_string()));
         set_application_id(&mut ctx);
 
         let zaura_surface = ctx
@@ -390,13 +385,11 @@ mod tests {
 
         let mut ctx = setup_ctx();
         ctx.last_sender_id = GTK_SHELL;
-        let mut handler = GtkShellHandler;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
+        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
         assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
 
         ctx.last_sender_id = SURFACE.guest;
-        let mut compositor = crate::handler::compositor::CompositorHandler;
-        assert_eq!(compositor.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(Handlers::on_destroy(&mut ctx), Action::Drop);
         assert!(!ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
         assert!(
             ctx.shadow_table.is_local(GTK_SURFACE),

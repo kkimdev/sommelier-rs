@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::Handlers;
+use crate::protocols::Iface;
 use crate::warn_once::WarnOnce;
 
 use crate::handler::callback::{internal_sync, queue_internal_sync};
@@ -27,7 +29,6 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::protocols::wayland::wl_seat;
 use crate::state::{Context, InternalCallback, KeyboardFocusRegistry, Link, ShadowTable};
 use crate::wire::{Action, IndexedString, Outgoing};
 
@@ -112,16 +113,13 @@ pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
     fx.forward
 }
 
-pub struct TextInputManagerV1Handler;
-impl zwp_text_input_manager_v1::ZwpTextInputManagerV1Handler for TextInputManagerV1Handler {}
+impl zwp_text_input_manager_v1::ZwpTextInputManagerV1Handler for Handlers {}
 
-pub struct TextInputV1Handler;
-impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
+impl zwp_text_input_v1::ZwpTextInputV1Handler for Handlers {
     /// H7. The v1 `commit` argument is the text to commit if this preedit
     /// is reset, which Exo always sends equal to `text`: it is not text to
     /// insert alongside the preedit.
     fn on_preedit_string(
-        &mut self,
         ctx: &mut Context,
         serial: u32,
         text: &IndexedString,
@@ -136,7 +134,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     }
 
     /// H8.
-    fn on_commit_string(&mut self, ctx: &mut Context, serial: u32, text: &String) -> Action {
+    fn on_commit_string(ctx: &mut Context, serial: u32, text: &String) -> Action {
         let text = text.clone();
         host_v1_event(ctx, Edit::Commit { serial, text })
     }
@@ -147,7 +145,6 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     /// never sends a release, so a keysym delivered as a key would stay
     /// pressed in the guest. The first is logged.
     fn on_keysym(
-        &mut self,
         _ctx: &mut Context,
         _serial: u32,
         _time: u32,
@@ -163,7 +160,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     /// Exo attached the input method. While attached this answers the
     /// proxy's own `activate` ([`LinkState`]), and otherwise belongs to a
     /// link being drained, so it changes nothing.
-    fn on_enter(&mut self, ctx: &mut Context, surface: u32) -> Action {
+    fn on_enter(ctx: &mut Context, surface: u32) -> Action {
         log::debug!(
             ">>> on_enter: host_v1_id={}, surface={surface}",
             ctx.last_sender_id
@@ -174,7 +171,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     /// H2: Exo detached the input method. While attached Exo did so on its
     /// own; a `leave` that answers the proxy's `deactivate` arrives while
     /// draining and is ignored (H2').
-    fn on_leave(&mut self, ctx: &mut Context) -> Action {
+    fn on_leave(ctx: &mut Context) -> Action {
         let ti = v1_sender(ctx);
         // A recovery that waits reads the leave first (E6).
         crate::handler::keyboard::keys(ctx, KeyInput::TextInputLeave(ti));
@@ -184,24 +181,18 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         Action::Drop
     }
 
-    fn on_modifiers_map(&mut self, _ctx: &mut Context, _map: &[u8]) -> Action {
+    fn on_modifiers_map(_ctx: &mut Context, _map: &[u8]) -> Action {
         log::trace!(">>> on_modifiers_map: len={}", _map.len());
         Action::Drop
     }
 
-    fn on_input_panel_state(&mut self, _ctx: &mut Context, _state: u32) -> Action {
+    fn on_input_panel_state(_ctx: &mut Context, _state: u32) -> Action {
         log::trace!(">>> on_input_panel_state: state={}", _state);
         Action::Drop
     }
 
     /// H4.
-    fn on_preedit_styling(
-        &mut self,
-        ctx: &mut Context,
-        index: u32,
-        length: u32,
-        style: u32,
-    ) -> Action {
+    fn on_preedit_styling(ctx: &mut Context, index: u32, length: u32, style: u32) -> Action {
         let piece = Piece::Styling {
             index,
             length,
@@ -211,24 +202,24 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     }
 
     /// H5.
-    fn on_preedit_cursor(&mut self, ctx: &mut Context, index: i32) -> Action {
+    fn on_preedit_cursor(ctx: &mut Context, index: i32) -> Action {
         host_v1_event(ctx, Piece::Cursor(index))
     }
 
     /// H6: Exo sends it only right before a commit_string, which reads it
     /// as a selection; text-input-v3 has no cursor-position event.
-    fn on_cursor_position(&mut self, ctx: &mut Context, index: i32, anchor: i32) -> Action {
+    fn on_cursor_position(ctx: &mut Context, index: i32, anchor: i32) -> Action {
         host_v1_event(ctx, Piece::CursorPosition { index, anchor })
     }
 
     /// H9. Exo counts `index` from the start of the surrounding text,
     /// against the v1 XML (docs/INVARIANTS.md, "Exo's deletes are absolute
     /// and stand alone").
-    fn on_delete_surrounding_text(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
+    fn on_delete_surrounding_text(ctx: &mut Context, index: i32, length: u32) -> Action {
         host_v1_event(ctx, Edit::Delete { index, length })
     }
 
-    fn on_language(&mut self, ctx: &mut Context, serial: u32, _language: &String) -> Action {
+    fn on_language(ctx: &mut Context, serial: u32, _language: &String) -> Action {
         let host_id = ctx.last_sender_id;
         let guest_id = ctx.shadow_table.get_guest_id(host_id);
         log::trace!(
@@ -241,7 +232,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         Action::Drop
     }
 
-    fn on_text_direction(&mut self, ctx: &mut Context, serial: u32, _direction: u32) -> Action {
+    fn on_text_direction(ctx: &mut Context, serial: u32, _direction: u32) -> Action {
         let host_id = ctx.last_sender_id;
         let guest_id = ctx.shadow_table.get_guest_id(host_id);
         log::trace!(
@@ -270,16 +261,14 @@ fn host_v1_event(ctx: &mut Context, event: impl Into<HostIme>) -> Action {
     Action::Drop
 }
 
-pub struct TextInputExtensionV1Handler;
-impl zcr_text_input_extension_v1::ZcrTextInputExtensionV1Handler for TextInputExtensionV1Handler {}
+impl zcr_text_input_extension_v1::ZcrTextInputExtensionV1Handler for Handlers {}
 
-pub struct ExtendedTextInputV1Handler;
-impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextInputV1Handler {
+impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for Handlers {
     /// X1: Exo's cursor-relative region of its text becomes the preedit.
-    fn on_set_preedit_region(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
+    fn on_set_preedit_region(ctx: &mut Context, index: i32, length: u32) -> Action {
         host_ext_event(ctx, Edit::PreeditRegion { index, length })
     }
-    fn on_clear_grammar_fragments(&mut self, _ctx: &mut Context, _start: u32, _end: u32) -> Action {
+    fn on_clear_grammar_fragments(_ctx: &mut Context, _start: u32, _end: u32) -> Action {
         log::trace!(
             ">>> on_clear_grammar_fragments: start={}, end={}",
             _start,
@@ -288,7 +277,6 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         Action::Drop
     }
     fn on_add_grammar_fragment(
-        &mut self,
         _ctx: &mut Context,
         _start: u32,
         _end: u32,
@@ -302,7 +290,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         );
         Action::Drop
     }
-    fn on_set_autocorrect_range(&mut self, _ctx: &mut Context, _start: u32, _end: u32) -> Action {
+    fn on_set_autocorrect_range(_ctx: &mut Context, _start: u32, _end: u32) -> Action {
         log::trace!(
             ">>> on_set_autocorrect_range: start={}, end={}",
             _start,
@@ -311,7 +299,6 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         Action::Drop
     }
     fn on_set_virtual_keyboard_occluded_bounds(
-        &mut self,
         _ctx: &mut Context,
         _x: i32,
         _y: i32,
@@ -328,7 +315,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         Action::Drop
     }
     /// X2, and X2' with no preedit shown.
-    fn on_confirm_preedit(&mut self, ctx: &mut Context, selection_behavior: u32) -> Action {
+    fn on_confirm_preedit(ctx: &mut Context, selection_behavior: u32) -> Action {
         let keep_selection = selection_behavior
             == zcr_extended_text_input_v1::CONFIRM_PREEDIT_SELECTION_BEHAVIOR_UNCHANGED;
         host_ext_event(ctx, Edit::Confirm { keep_selection })
@@ -343,16 +330,15 @@ fn host_ext_event(ctx: &mut Context, event: Edit) -> Action {
     Action::Drop
 }
 
-pub struct TextInputManagerV3Handler;
-impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManagerV3Handler {
-    fn on_destroy(&mut self, _ctx: &mut Context) -> Action {
+impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for Handlers {
+    fn on_destroy(_ctx: &mut Context) -> Action {
         // This manager is synthetic and has no host-side object. The
         // generated local-only destructor path queues its guest delete_id
         // after this handler returns.
         Action::Drop
     }
 
-    fn on_get_text_input(&mut self, ctx: &mut Context, id: u32, seat: u32) -> Action {
+    fn on_get_text_input(ctx: &mut Context, id: u32, seat: u32) -> Action {
         // A new object takes its parent's version: the guest text input its
         // guest manager's, and each host object its host manager's.
         let guest_manager = ctx.last_sender_id;
@@ -368,7 +354,7 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             // object: one that has no input method.
             warn_no_input_method(&NO_INPUT_METHOD_WARNED);
             ctx.shadow_table
-                .create_local(id, zwp_text_input_v3::NAME, guest_manager_version);
+                .create_local(id, Iface::ZwpTextInputV3, guest_manager_version);
             return Action::Drop;
         };
         let versions = [host_manager_id, host_ext_manager_id]
@@ -381,14 +367,14 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
         };
         let host_v1_id = ctx.shadow_table.create_bridged(
             id,
-            zwp_text_input_v3::NAME,
+            Iface::ZwpTextInputV3,
             guest_manager_version,
-            zwp_text_input_v1::NAME,
+            Iface::ZwpTextInputV1,
             host_manager_version,
         );
         let host_ext_id = ctx
             .shadow_table
-            .create_host_only(zcr_extended_text_input_v1::NAME, host_ext_version);
+            .create_host_only(Iface::ZcrExtendedTextInputV1, host_ext_version);
         let create = Input::Create {
             ti: TiId(id),
             seat: SeatId(seat),
@@ -468,7 +454,7 @@ fn warn_no_input_method(warned: &WarnOnce) -> bool {
 /// seat awaiting its `delete_id` carries nothing either, and neither does
 /// an ID with no host object (ID 0 is a protocol error).
 fn live_host_seat(table: &ShadowTable, guest_seat: u32) -> Option<u32> {
-    let seat = table.request_object(guest_seat, wl_seat::NAME)?;
+    let seat = table.request_object(guest_seat, Iface::WlSeat)?;
     match seat {
         Link::Host(host_seat) => Some(host_seat),
         // The proxy implements no wl_seat itself.
@@ -526,9 +512,8 @@ fn guest_request(ctx: &mut Context, input: Input) -> Action {
     Action::Drop
 }
 
-pub struct TextInputV3Handler;
-impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
+impl zwp_text_input_v3::ZwpTextInputV3Handler for Handlers {
+    fn on_destroy(ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
         // A text input with no input method is local, and its destructor
         // completes in the proxy.
@@ -540,7 +525,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         // connection and the guest lifecycle completes locally. Ending the
         // object forgets its state (see `forget_text_input`).
         if ctx.guest_ended_host_kept(guest_id) {
-            crate::handler::display::queue_delete_id(ctx, guest_id);
+            ctx.queue_delete_id(guest_id);
         } else {
             log::debug!(
                 "Text input {} had already been retired before its destroy handler ran",
@@ -550,16 +535,15 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         Action::Drop
     }
 
-    fn on_enable(&mut self, ctx: &mut Context) -> Action {
+    fn on_enable(ctx: &mut Context) -> Action {
         guest_request(ctx, Input::Enable(sender(ctx)))
     }
 
-    fn on_disable(&mut self, ctx: &mut Context) -> Action {
+    fn on_disable(ctx: &mut Context) -> Action {
         guest_request(ctx, Input::Disable(sender(ctx)))
     }
 
     fn on_set_surrounding_text(
-        &mut self,
         ctx: &mut Context,
         text: &IndexedString,
         cursor: i32,
@@ -570,16 +554,15 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
     }
 
     /// The host's text-input-v1 has no text-change cause to forward it to.
-    fn on_set_text_change_cause(&mut self, _ctx: &mut Context, _cause: u32) -> Action {
+    fn on_set_text_change_cause(_ctx: &mut Context, _cause: u32) -> Action {
         Action::Drop
     }
 
-    fn on_set_content_type(&mut self, ctx: &mut Context, hint: u32, purpose: u32) -> Action {
+    fn on_set_content_type(ctx: &mut Context, hint: u32, purpose: u32) -> Action {
         guest_request(ctx, Input::ContentType(sender(ctx), (hint, purpose)))
     }
 
     fn on_set_cursor_rectangle(
-        &mut self,
         ctx: &mut Context,
         x: i32,
         y: i32,
@@ -590,7 +573,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         guest_request(ctx, input)
     }
 
-    fn on_commit(&mut self, ctx: &mut Context) -> Action {
+    fn on_commit(ctx: &mut Context) -> Action {
         guest_request(ctx, Input::Commit(sender(ctx)))
     }
 }

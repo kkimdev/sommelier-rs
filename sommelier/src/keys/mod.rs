@@ -237,6 +237,8 @@ impl KeyClass {
 pub(crate) struct KeyboardCore {
     /// The chords the host keeps (`SOMMELIER_ACCELERATORS`).
     accelerators: HostAccelerators,
+    /// What the keyboards' keymaps are compiled in.
+    keymaps: crate::keymap::Compiler,
     keyboards: Keyboards,
     generations: KeyGenerationRegistry,
     /// X2': an empty IME confirmation's recovery of a held key, which
@@ -250,10 +252,17 @@ impl KeyboardCore {
     pub(crate) fn new(accelerators: HostAccelerators) -> Self {
         Self {
             accelerators,
+            keymaps: crate::keymap::Compiler::default(),
             keyboards: Keyboards::default(),
             generations: KeyGenerationRegistry::default(),
             recovery: None,
         }
+    }
+
+    /// What a host keyboard's keymap is compiled in, before the core
+    /// takes it ([`KeyInput::Keymap`]).
+    pub(crate) fn keymaps(&self) -> &crate::keymap::Compiler {
+        &self.keymaps
     }
 
     /// The host keyboards' records.

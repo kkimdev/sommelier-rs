@@ -17,16 +17,17 @@ limitations under the License.
 use crate::allocator::{PendingFence, VirtGpuNode};
 use crate::client_kind;
 use crate::connection::{LastSubmission, OutgoingMessages, WaylandConnection};
+use crate::handler::Handlers;
 use crate::placement_config::{self, PlacementConfig};
 use crate::protocols;
-use crate::protocols::aura_shell::{zaura_output, zaura_toplevel};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::wayland::wl_buffer;
+use crate::protocols::{AnyEvent, Iface};
 use crate::settings::{HostTransport, Settings};
-use crate::state::{ConnectionFacts, Context, PostDispatch, SessionEnd};
+use crate::state::{ConnectionFacts, Context, EventSender, PostDispatch, SessionEnd};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::warn_once::WarnOnce;
-use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
+use crate::wire::{Framing, MessageHeader, ProtocolError, WireMessage};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
@@ -43,8 +44,6 @@ mod frame_cost;
 mod fuzz;
 #[cfg(test)]
 pub(crate) mod harness;
-
-type DispatchResult = Result<Option<Outgoing>, ProtocolError>;
 
 // A frame can generate many small Wayland requests (damage, attach, commit,
 // callbacks, and buffer bookkeeping).  Keep one client from processing an
@@ -92,25 +91,79 @@ enum Direction {
     HostToClient,
 }
 
-fn pending_host_event_is_stale(ctx: &Context, sender_id: u32, opcode: u16) -> bool {
-    let interface = ctx.shadow_table.get_host_interface(sender_id);
-    let allows_deferred_buffer_release = interface.is_some_and(|name| name == wl_buffer::NAME)
-        && opcode == protocols::wayland::wl_buffer::EVT_RELEASE
-        && ctx.host_buffer_is_guest_destroyed(sender_id);
-    // An asynchronous linux-dmabuf create can legally be followed by
-    // params.destroy before the compositor emits `created` or `failed`.
-    // The host still owns a newly-created wl_buffer in that case, so let
-    // the event reach the handler, which turns it into a host-only buffer
-    // and destroys it. Dropping `created` here would leak the host buffer
-    // because generated new_id mapping only runs when the event is
-    // forwarded.
-    let allows_orphan_dmabuf_result = interface
-        .is_some_and(|name| name == zwp_linux_buffer_params_v1::NAME)
-        && (opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED
-            || opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED);
-    ctx.shadow_table.is_pending_destroy_host(sender_id)
-        && !allows_deferred_buffer_release
-        && !allows_orphan_dmabuf_result
+/// Whether `event`, which `sender` sent, is stale: its guest object was
+/// destroyed, and the event reaches neither the guest nor a handler.
+///
+/// Two events still reach their handler. A buffer the host still shows
+/// when the guest destroys it is released later (`wl_buffer.release`). An
+/// asynchronous linux-dmabuf create can legally be followed by
+/// params.destroy before the compositor emits `created` or `failed`; the
+/// host still owns a newly created `wl_buffer` then, which the handler
+/// turns into a host-only buffer and destroys. Dropping `created` here
+/// would leak the host buffer, because the generated `new_id` mapping only
+/// runs when the event is forwarded.
+fn pending_host_event_is_stale(ctx: &Context, sender: &EventSender, event: &AnyEvent) -> bool {
+    if !sender.guest.is_some_and(|guest| guest.destroyed) {
+        return false;
+    }
+    match event {
+        AnyEvent::WlBuffer(wl_buffer::Event::Release {}) => {
+            !ctx.host_buffer_is_guest_destroyed(sender.id)
+        }
+        AnyEvent::ZwpLinuxBufferParamsV1(
+            zwp_linux_buffer_params_v1::Event::Created { .. }
+            | zwp_linux_buffer_params_v1::Event::Failed {},
+        ) => false,
+        _ => true,
+    }
+}
+
+/// What the proxy read of a host event.
+enum HostRead {
+    /// Its sender is no live host object the proxy tracks.
+    Untracked,
+    /// The event, whole.
+    Event(EventSender, AnyEvent),
+    /// An event the generated code cannot read: an unknown opcode, or
+    /// arguments that do not decode whole.
+    Unreadable(EventSender, ProtocolError),
+}
+
+/// Whether an event from an object only the proxy uses has failed to
+/// decode yet. Only the first warns.
+static UNREADABLE_INTERNAL_EVENT: WarnOnce = WarnOnce::new();
+
+/// Drop an event that `sender`, an object only the proxy uses (its own
+/// `zaura_shell` binding, say), sent with `opcode`, and that the proxy
+/// cannot read (`error`): it reaches no guest object, so the guest's
+/// session goes on, as it did when the proxy skipped the events of its
+/// own Aura objects unread.
+fn unreadable_internal_event(sender: EventSender, opcode: u16, error: &ProtocolError) {
+    log::log!(
+        UNREADABLE_INTERNAL_EVENT.level(),
+        "Dropping event {opcode} of host {} {}, which only the proxy uses: {error}",
+        sender.iface,
+        sender.id
+    );
+}
+
+/// `decoded`, the result of decoding `msg` from an object of `iface`,
+/// unless it left trailing bytes (see [`WireMessage::check_consumed`]),
+/// which are logged.
+fn whole<T>(
+    msg: &WireMessage,
+    iface: Iface,
+    decoded: Result<T, ProtocolError>,
+) -> Result<T, ProtocolError> {
+    let decoded = msg.check_consumed(decoded);
+    if decoded.as_ref().err() == Some(&ProtocolError::TrailingData) {
+        log::error!(
+            "Protocol message left {} trailing payload byte(s): interface={iface}, opcode={}",
+            msg.payload.len() - msg.offset,
+            msg.opcode
+        );
+    }
+    decoded
 }
 
 /// How a message the proxy cannot frame, decode or dispatch ends the
@@ -134,56 +187,6 @@ fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
         } => crate::handler::compositor::record_xdg_toplevel(ctx, xdg_surface, xdg_toplevel),
         PostDispatch::KeyboardCreated { keyboard, seat } => {
             crate::handler::keyboard::keyboard_created(ctx, keyboard, seat)
-        }
-    }
-}
-
-struct SommelierHandler {
-    display: crate::handler::display::DisplayHandler,
-    registry: crate::handler::registry::RegistryHandler,
-    compositor: crate::handler::compositor::CompositorHandler,
-    output: crate::handler::output::OutputHandler,
-    gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
-    callback: crate::handler::callback::CallbackHandler,
-    shm: crate::handler::shm::ShmHandler,
-    buffer: crate::handler::buffer::BufferHandler,
-    linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
-    data_device: crate::handler::data_device::DataDeviceHandler,
-    text_input_manager_v1: crate::handler::text_input::TextInputManagerV1Handler,
-    text_input_v1: crate::handler::text_input::TextInputV1Handler,
-    text_input_extension_v1: crate::handler::text_input::TextInputExtensionV1Handler,
-    extended_text_input_v1: crate::handler::text_input::ExtendedTextInputV1Handler,
-    text_input_manager_v3: crate::handler::text_input::TextInputManagerV3Handler,
-    text_input_v3: crate::handler::text_input::TextInputV3Handler,
-    keyboard: crate::handler::keyboard::KeyboardHandler,
-    pointer: crate::handler::pointer::PointerHandler,
-    seat: crate::handler::seat::SeatHandler,
-    touch: crate::handler::touch::TouchHandler,
-}
-
-impl SommelierHandler {
-    fn new() -> Self {
-        Self {
-            display: crate::handler::display::DisplayHandler,
-            registry: crate::handler::registry::RegistryHandler,
-            compositor: crate::handler::compositor::CompositorHandler,
-            output: crate::handler::output::OutputHandler,
-            gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
-            callback: crate::handler::callback::CallbackHandler,
-            shm: crate::handler::shm::ShmHandler,
-            buffer: crate::handler::buffer::BufferHandler,
-            linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
-            data_device: crate::handler::data_device::DataDeviceHandler,
-            text_input_manager_v1: crate::handler::text_input::TextInputManagerV1Handler,
-            text_input_v1: crate::handler::text_input::TextInputV1Handler,
-            text_input_extension_v1: crate::handler::text_input::TextInputExtensionV1Handler,
-            extended_text_input_v1: crate::handler::text_input::ExtendedTextInputV1Handler,
-            text_input_manager_v3: crate::handler::text_input::TextInputManagerV3Handler,
-            text_input_v3: crate::handler::text_input::TextInputV3Handler,
-            keyboard: crate::handler::keyboard::KeyboardHandler::new(),
-            pointer: crate::handler::pointer::PointerHandler,
-            seat: crate::handler::seat::SeatHandler,
-            touch: crate::handler::touch::TouchHandler,
         }
     }
 }
@@ -279,7 +282,6 @@ struct Client {
     client_conn: WaylandConnection,
     host_conn: WaylandConnection,
     ctx: Context,
-    handler: SommelierHandler,
     /// Whether a batch ended the session: one of its messages did, or a send
     /// failed. No later batch dispatches anything, so the guest gets at most
     /// one error. A failed receive or a closed peer stops `run` without it.
@@ -304,7 +306,6 @@ impl Client {
             client_conn,
             host_conn,
             ctx,
-            handler: SommelierHandler::new(),
             ended: false,
             parked: None,
             to_host: OutgoingMessages::default(),
@@ -435,74 +436,6 @@ impl Client {
         }
     }
 
-    fn dispatch_request(
-        handler: &mut SommelierHandler,
-        ctx: &mut Context,
-        interface: &str,
-        msg: &mut WireMessage,
-    ) -> DispatchResult {
-        let Some(family) = protocols::classify_interface(interface) else {
-            return Ok(None);
-        };
-
-        // Aura objects are bound internally and have no guest request path.
-        if family == protocols::ProtocolFamily::AuraShell {
-            return Ok(None);
-        }
-
-        protocols::dispatch_request(family, interface, msg, handler, ctx)
-    }
-
-    fn dispatch_event(
-        handler: &mut SommelierHandler,
-        ctx: &mut Context,
-        interface: &str,
-        msg: &mut WireMessage,
-    ) -> DispatchResult {
-        let Some(family) = protocols::classify_interface(interface) else {
-            return Ok(None);
-        };
-
-        if family == protocols::ProtocolFamily::AuraShell {
-            if interface == zaura_toplevel::NAME {
-                return protocols::aura_shell::zaura_toplevel::dispatch_event(
-                    msg,
-                    &mut handler.compositor,
-                    ctx,
-                );
-            }
-            if interface == zaura_output::NAME {
-                return protocols::aura_shell::zaura_output::dispatch_event(
-                    msg,
-                    &mut handler.output,
-                    ctx,
-                );
-            }
-
-            // Other Aura objects are bound internally and have no guest event
-            // path. Consume their payload so an event from one of these
-            // objects cannot tear down the client connection.
-            msg.offset = msg.payload.len();
-            return Ok(None);
-        }
-
-        protocols::dispatch_event(family, interface, msg, handler, ctx)
-    }
-
-    fn consume_event(interface: &str, msg: &mut WireMessage) -> Result<(), ProtocolError> {
-        let Some(family) = protocols::classify_interface(interface) else {
-            log::error!(
-                "Cannot consume event for unsupported interface {} (id={}, opcode={})",
-                interface,
-                msg.sender_id,
-                msg.opcode
-            );
-            return Err(ProtocolError::InvalidObjectId(msg.sender_id));
-        };
-
-        protocols::consume_event(family, interface, msg)
-    }
-
     async fn handle_msgs(&mut self, direction: Direction) -> bool {
         if self.ended {
             return false;
@@ -585,113 +518,138 @@ impl Client {
             let packet = &conn.read_buf[offset..message_end];
             let queued_fds = conn.read_fds.len();
 
-            let suppress_host_event = matches!(direction, Direction::HostToClient)
-                && pending_host_event_is_stale(&self.ctx, sender_id, opcode);
-            let interface = match direction {
-                Direction::ClientToHost => self.ctx.shadow_table.get_interface(sender_id),
-                Direction::HostToClient => self.ctx.shadow_table.get_host_interface(sender_id),
+            // The message takes its descriptors from the front of the
+            // queue; dropping it unforwarded closes them.
+            let msg = |fds| {
+                WireMessage::new(sender_id, opcode, &packet[MessageHeader::LEN..]).with_fds(fds)
             };
-
-            if direction == Direction::HostToClient {
-                // An empty IME confirmation's recovery of a held key waits
-                // for the host's next event, which may show that it was
-                // Exo's confirmation before a new press. What it sends the
-                // guest precedes this event's own forward. The header
-                // names the event; its handler hands the keyboard core
-                // the few the recovery reads, decoded.
-                crate::handler::keyboard::before_host_event(
-                    &mut self.ctx,
-                    sender_id,
-                    interface,
-                    opcode,
-                    suppress_host_event,
-                );
-                let decided = self.ctx.take_effects();
-                debug_assert!(decided.end.is_none() && decided.wait.is_none());
-                for message in decided.to_guest {
-                    out.push(message);
-                }
-                for message in decided.to_host {
-                    reverse_out.push(message);
-                }
-            }
-
-            let result = if let Some(interface) = interface {
-                // The message takes its descriptors from the front of the
-                // queue; dropping it unforwarded closes them.
-                let mut msg = WireMessage::new(sender_id, opcode, &packet[MessageHeader::LEN..])
-                    .with_fds(&mut conn.read_fds);
-
-                log::trace!("[{:?}] {}:{} (len={})", direction, interface, opcode, len);
-
-                self.ctx.last_sender_id = sender_id;
-
-                let res = match direction {
-                    Direction::ClientToHost => Self::dispatch_request(
-                        &mut self.handler,
-                        &mut self.ctx,
-                        interface,
-                        &mut msg,
-                    ),
-                    Direction::HostToClient if suppress_host_event => {
-                        // A destructor has already been forwarded for this
-                        // object. Decode the queued event so its payload and
-                        // ordered SCM_RIGHTS descriptors are consumed, but do
-                        // not invoke handlers or expose it to the guest.
-                        Self::consume_event(interface, &mut msg).map(|()| None)
+            let result = match direction {
+                Direction::ClientToHost => match self.ctx.shadow_table.resolve_request(sender_id) {
+                    Some(sender) => {
+                        log::trace!("[{direction:?}] {}:{opcode} (len={len})", sender.iface);
+                        self.ctx.last_sender_id = sender_id;
+                        let mut msg = msg(&mut conn.read_fds);
+                        let forward = protocols::dispatch_request::<Handlers>(
+                            sender,
+                            &mut msg,
+                            &mut self.ctx,
+                        );
+                        whole(&msg, sender.iface, forward)
                     }
-                    Direction::HostToClient => {
-                        Self::dispatch_event(&mut self.handler, &mut self.ctx, interface, &mut msg)
+                    // A guest request is only valid when its sender is a
+                    // live object owned by this connection. Unlike a stale
+                    // host event (which may have raced object teardown),
+                    // silently dropping an unknown client request makes the
+                    // client believe the request was accepted and can
+                    // desynchronize protocol state.
+                    None => Err(ProtocolError::InvalidSender(sender_id)),
+                },
+                Direction::HostToClient => {
+                    let read = match self.ctx.shadow_table.resolve_event(sender_id) {
+                        None => HostRead::Untracked,
+                        Some(sender) => {
+                            log::trace!("[{direction:?}] {}:{opcode} (len={len})", sender.iface);
+                            // Each host event is decoded once, whole, for
+                            // everything that reads it.
+                            let mut msg = msg(&mut conn.read_fds);
+                            let event = AnyEvent::decode(sender.iface, &mut msg);
+                            match msg.check_consumed(event) {
+                                Ok(event) => HostRead::Event(sender, event),
+                                Err(error) => HostRead::Unreadable(sender, error),
+                            }
+                        }
+                    };
+                    match read {
+                        // One that does not decode ends the session before
+                        // anything reads it, unless only the proxy uses its
+                        // object (below).
+                        HostRead::Unreadable(sender, error) if sender.guest.is_some() => Err(error),
+                        read => {
+                            let event = match &read {
+                                HostRead::Event(sender, event) => Some((sender, event)),
+                                _ => None,
+                            };
+                            // A destructor has already been forwarded for a
+                            // stale event's object: it reaches no handler
+                            // and not the guest.
+                            let stale = event.is_some_and(|(sender, event)| {
+                                pending_host_event_is_stale(&self.ctx, sender, event)
+                            });
+                            // An empty IME confirmation's recovery of a held
+                            // key waits for the host's next event, which may
+                            // show that it was Exo's confirmation before a
+                            // new press. What it sends the guest precedes
+                            // this event's own forward.
+                            crate::handler::keyboard::before_host_event(
+                                &mut self.ctx,
+                                sender_id,
+                                event.map(|(_, event)| event),
+                                stale,
+                            );
+                            {
+                                let decided = self.ctx.take_effects();
+                                debug_assert!(decided.end.is_none() && decided.wait.is_none());
+                                for message in decided.to_guest {
+                                    out.push(message);
+                                }
+                                for message in decided.to_host {
+                                    reverse_out.push(message);
+                                }
+                            }
+                            match read {
+                                HostRead::Event(..) if stale => {
+                                    self.ctx.last_sender_id = sender_id;
+                                    Ok(None)
+                                }
+                                HostRead::Event(sender, event) => {
+                                    self.ctx.last_sender_id = sender_id;
+                                    let forward = protocols::dispatch_event::<Handlers>(
+                                        sender,
+                                        event,
+                                        len - MessageHeader::LEN,
+                                        &mut self.ctx,
+                                    );
+                                    match forward {
+                                        Err(error @ ProtocolError::UnsupportedVersion { .. })
+                                            if sender.guest.is_none() =>
+                                        {
+                                            unreadable_internal_event(sender, opcode, &error);
+                                            Ok(None)
+                                        }
+                                        forward => forward,
+                                    }
+                                }
+                                read => {
+                                    if let HostRead::Unreadable(sender, error) = &read {
+                                        unreadable_internal_event(*sender, opcode, error);
+                                    } else {
+                                        log::debug!(
+                                            "[{direction:?}] untracked host id {sender_id} opcode {opcode} (len={len})"
+                                        );
+                                    }
+                                    // SCM_RIGHTS descriptors form an ordered
+                                    // stream independent of byte-buffer
+                                    // boundaries. A descriptor received
+                                    // alongside a complete message the proxy
+                                    // cannot read may belong to a later
+                                    // message whose bytes are still partial
+                                    // in this buffer. Do not terminate the
+                                    // connection merely because the unread
+                                    // message cannot tell us how many
+                                    // descriptors it consumes; leave the
+                                    // descriptor queued for the next
+                                    // complete message and let the
+                                    // connection close it if the peer goes
+                                    // away before that message arrives.
+                                    if !conn.read_fds.is_empty() {
+                                        conn.ambiguous_untracked_fd = true;
+                                    }
+                                    Ok(None)
+                                }
+                            }
+                        }
                     }
-                };
-                let res = msg.check_consumed(res);
-                if res.as_ref().err() == Some(&ProtocolError::TrailingData) {
-                    log::error!(
-                        "Protocol message left {} trailing payload byte(s): interface={}, opcode={}",
-                        msg.payload.len() - msg.offset,
-                        interface,
-                        opcode
-                    );
                 }
-                res
-            } else if matches!(direction, Direction::ClientToHost) {
-                // A guest request is only valid when its sender is a live
-                // object owned by this connection. Unlike a stale host event
-                // (which may have raced object teardown), silently dropping
-                // an unknown client request makes the client believe the
-                // request was accepted and can desynchronize protocol state.
-                Err(ProtocolError::InvalidSender(sender_id))
-            } else {
-                if self.ctx.shadow_table.get_guest_id(sender_id).is_some() {
-                    log::warn!(
-                        "[{:?}] unknown id {} opcode {} (len={})",
-                        direction,
-                        sender_id,
-                        opcode,
-                        len
-                    );
-                } else {
-                    log::debug!(
-                        "[{:?}] untracked host id {} opcode {} (len={})",
-                        direction,
-                        sender_id,
-                        opcode,
-                        len
-                    );
-                }
-                // SCM_RIGHTS descriptors form an ordered stream independent
-                // of byte-buffer boundaries. A descriptor received alongside
-                // a complete untracked message may belong to a later message
-                // whose bytes are still partial in this buffer. Do not
-                // terminate the connection merely because the unknown
-                // message cannot tell us how many descriptors it consumes;
-                // leave the descriptor queued for the next complete message
-                // and let the connection close it if the peer goes
-                // away before that message arrives.
-                if !conn.read_fds.is_empty() {
-                    conn.ambiguous_untracked_fd = true;
-                }
-                Ok(None)
             };
 
             let forward = match result {
@@ -702,10 +660,8 @@ impl Client {
                         Direction::HostToClient => self.ctx.shadow_table.get_guest_id(sender_id),
                     };
                     let interface = guest_id_for_log
-                        .and_then(|gid| {
-                            self.ctx.shadow_table.get_interface(gid).map(str::to_string)
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
+                        .and_then(|gid| self.ctx.shadow_table.get_interface(gid))
+                        .map_or("unknown", Iface::name);
                     log::error!("Protocol error: {} (direction={:?}, id={}, guest_id={:?}, interface={}, opcode={})", e, direction, sender_id, guest_id_for_log, interface, opcode);
                     self.ctx.end_session(rejection(direction, &e));
                     None
@@ -882,18 +838,218 @@ impl Client {
     }
 }
 
+/// What every client connection shares: the process's settings and the
+/// resources built from them once.
+struct Shared {
+    settings: Rc<Settings>,
+    virtgpu: VirtGpuNode,
+    placement: PlacementConfig,
+}
+
+impl Shared {
+    /// Build what the connections share from `settings`, and start
+    /// watching the placement bindings file on the current `LocalSet`.
+    fn new(settings: Settings) -> Self {
+        let settings = Rc::new(settings);
+        Self {
+            virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
+            placement: placement_config::load_and_watch(&settings),
+            settings,
+        }
+    }
+}
+
+/// Serve guest clients on `settings.socket` for the life of the process.
+///
+/// Exits the process when the host cannot be reached or the socket cannot
+/// be claimed, before any client connects.
+pub(crate) async fn run(settings: Settings) {
+    match &settings.host {
+        HostTransport::VirtWl(path) => {
+            if let Err(e) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
+                log::error!(
+                    "Failed to open virtio-wayland device {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+        HostTransport::Local(path) => {
+            if let Err(e) = std::os::unix::net::UnixStream::connect(path) {
+                log::error!(
+                    "Failed to connect to local compositor socket {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let display = settings.socket.clone();
+    // Held until the process exits, like the socket itself.
+    let _socket_lock = claim_display_socket(&display).unwrap_or_else(|error| {
+        log::error!(
+            "Cannot claim the Wayland socket {}: {error}",
+            display.display()
+        );
+        std::process::exit(1);
+    });
+    let listener = UnixListener::bind(&display).unwrap_or_else(|error| {
+        log::error!(
+            "Cannot bind the Wayland socket {}: {error}",
+            display.display()
+        );
+        std::process::exit(1);
+    });
+    log::info!("Listening on {}", display.display());
+
+    // Each client's Context holds xkb state, which is !Send. Keep each
+    // client task on this executor's thread instead of using `tokio::spawn`
+    // (whose Send bound would require an unsound manual Send implementation).
+    // `LocalSet::run_until` also makes the ownership requirement visible in
+    // this function's future type: callers cannot accidentally move the
+    // proxy's client tasks to another executor thread.
+    tokio::task::LocalSet::new()
+        .run_until(async move { serve(listener, Shared::new(settings)).await })
+        .await;
+}
+
+/// Claim the socket path `display` for this process, as libwayland claims
+/// its socket: take an exclusive lock on `<display>.lock` and, only while
+/// holding it, remove a socket a previous owner left behind.
+///
+/// The lock lasts as long as the returned value. Fails, leaving the socket
+/// alone, while another process holds the lock: that process is serving
+/// the socket, and removing it would cut its clients off from new
+/// connections.
+fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flock<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut lock_path = display.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o660)
+        .open(&lock_path)?;
+    let lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, errno)| match errno {
+            nix::errno::Errno::EWOULDBLOCK => io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "another process holds its lock and is serving it",
+            ),
+            errno => io::Error::from(errno),
+        })?;
+    match std::fs::remove_file(display) {
+        Ok(()) => log::info!("Removed the stale socket {}", display.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(lock)
+}
+
+/// Accept guest clients for the life of the process.
+///
+/// A failure concerning one client is logged and ends only that client.
+/// Must run inside a `LocalSet`, like the clients it spawns.
+async fn serve(listener: UnixListener, shared: Shared) {
+    // Log a run of failed accepts once, not every retry.
+    let mut accept_failing = false;
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                if std::mem::take(&mut accept_failing) {
+                    log::info!("Accepting clients again");
+                }
+                log::info!("New client connected");
+                if let Err(error) = start_client(stream, &shared).await {
+                    log::error!("Closing the new client: {error}");
+                }
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut accept_failing, true) {
+                    log::error!(
+                        "Accept error: {e}; retrying every {ACCEPT_RETRY_DELAY:?} until one succeeds"
+                    );
+                }
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+/// Pair an accepted guest connection with a new host connection and serve
+/// the pair on its own task.
+async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
+    // The peer's process, as it was when it connected.
+    let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
+    let (host_conn, virtwl) = connect_host(&shared.settings.host).await?;
+    let facts = ConnectionFacts {
+        virtwl,
+        virtgpu: shared.virtgpu.get(),
+        wheel: shared
+            .settings
+            .wheel_from_touchpad
+            .decide(pid, client_kind::is_wine_process),
+        placement: shared.placement.clone(),
+    };
+    let client = Client::new(
+        client_conn,
+        host_conn,
+        Context::new(Rc::clone(&shared.settings), facts),
+    );
+    tokio::task::spawn_local(async move {
+        client.run().await;
+        log::info!("Client disconnected");
+    });
+    Ok(())
+}
+
+/// Open this client's connection to the host compositor over `host`,
+/// with its VirtWL channel when there is one.
+async fn connect_host(
+    host: &HostTransport,
+) -> io::Result<(WaylandConnection, Option<Arc<VirtWaylandChannel>>)> {
+    match host {
+        HostTransport::VirtWl(path) => {
+            let channel = Arc::new(VirtWaylandChannel::new(path).map_err(|error| {
+                io::Error::other(format!(
+                    "cannot open a virtio-wayland channel at {}: {error}",
+                    path.display()
+                ))
+            })?);
+            let conn = WaylandConnection::new_virtwayland(Arc::clone(&channel));
+            Ok((conn, Some(channel)))
+        }
+        HostTransport::Local(path) => {
+            let stream = UnixStream::connect(path).await?;
+            Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::harness::Session;
     use super::*;
     use crate::handler::test_support::session_with_shm;
-    use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::protocols::AnyRequest;
     use crate::state::PlaneFenceForTest;
     use crate::test_support::{
         any_fd_has_identity, fd_identity, fds_with_identity, msg_header, raw_dispatch, respell,
         shm_pool_file, stream_headers,
     };
+    use crate::wire::Outgoing;
     use crate::wire::{MessageBuilder, WL_DISPLAY_ID};
     use std::fs;
     use std::io::Write;
@@ -909,25 +1065,21 @@ mod tests {
         }
     }
 
+    /// Every vendored interface has one `Iface`, which the wire names by
+    /// its `NAME` and versions by its `VERSION`.
     #[test]
-    fn generated_classifier_routes_each_protocol_family() {
+    fn every_interface_resolves_by_its_name() {
+        for iface in Iface::ALL {
+            assert_eq!(Iface::from_name(iface.name()), Some(iface));
+        }
+        use crate::protocols::wayland::wl_surface;
+        assert_eq!(Iface::from_name(wl_surface::NAME), Some(Iface::WlSurface));
+        assert_eq!(Iface::WlSurface.version(), wl_surface::VERSION);
         assert_eq!(
-            protocols::classify_interface("wl_surface"),
-            Some(protocols::ProtocolFamily::Wayland)
+            Iface::from_name(protocols::aura_shell::zaura_toplevel::NAME),
+            Some(Iface::ZauraToplevel)
         );
-        assert_eq!(
-            protocols::classify_interface("xdg_toplevel"),
-            Some(protocols::ProtocolFamily::XdgShell)
-        );
-        assert_eq!(
-            protocols::classify_interface("gtk_shell1"),
-            Some(protocols::ProtocolFamily::Gtk)
-        );
-        assert_eq!(
-            protocols::classify_interface("zaura_toplevel"),
-            Some(protocols::ProtocolFamily::AuraShell)
-        );
-        assert_eq!(protocols::classify_interface("unknown_interface"), None);
+        assert_eq!(Iface::from_name("unknown_interface"), None);
     }
 
     #[tokio::test]
@@ -3031,6 +3183,68 @@ mod tests {
         );
     }
 
+    /// An event the proxy cannot read, from an object only the proxy uses
+    /// (its own `zaura_shell`), is dropped with a warning: an unknown
+    /// opcode, an event newer than the binding, a truncated payload and
+    /// trailing bytes. Nothing reaches either peer, and the session goes on.
+    #[tokio::test]
+    async fn an_unreadable_event_of_a_host_only_object_is_dropped() {
+        use protocols::aura_shell::zaura_shell;
+        use protocols::wayland::wl_registry;
+        let mut s = Session::new();
+        // Bound at v11, the version of `layout_mode`.
+        s.advertise("zaura_shell", zaura_shell::EVT_LAYOUT_MODE_SINCE)
+            .await;
+        let shell = match &s.host_received()[..] {
+            [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))]
+                if id.0 == "zaura_shell" =>
+            {
+                id.2
+            }
+            other => panic!("the proxy did not bind zaura_shell alone: {other:?}"),
+        };
+        s.guest_received();
+        const { assert!(zaura_shell::EVT_BUG_FIX_SINCE > zaura_shell::EVT_LAYOUT_MODE_SINCE) };
+
+        s.host([
+            raw(shell, 99, &[]),
+            zaura_shell::evt::bug_fix(shell, 1),
+            raw(shell, zaura_shell::EVT_LAYOUT_MODE, &[]),
+            raw(shell, zaura_shell::EVT_LAYOUT_MODE, &[1, 2]),
+            zaura_shell::evt::layout_mode(shell, 1),
+        ])
+        .await;
+        assert!(UNREADABLE_INTERNAL_EVENT.logged(), "the first warns");
+        assert_eq!(s.guest_received(), []);
+        assert_eq!(s.host_received(), []);
+    }
+
+    /// The same events from a host object the guest has end the session.
+    #[tokio::test]
+    async fn an_unreadable_event_of_a_guest_visible_object_ends_the_session() {
+        use protocols::wayland::{wl_display, wl_output};
+        let output_version = wl_output::EVT_NAME_SINCE - 1;
+        let unreadable = |output: u32| {
+            [
+                raw(output, 99, &[]),
+                wl_output::evt::name(output, "too new").unwrap(),
+                raw(output, wl_output::EVT_SCALE, &[]),
+                raw(output, wl_output::EVT_SCALE, &[1, 2]),
+            ]
+        };
+        for event in 0..unreadable(0).len() {
+            let mut s = Session::new();
+            let output = s.bind_paired("wl_output", output_version).await;
+            let unreadable = unreadable(output.host).into_iter().nth(event);
+            s.host_fatal(unreadable).await;
+            assert_eq!(
+                s.guest_received_and_error(),
+                (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)),
+                "event {event}"
+            );
+        }
+    }
+
     /// A host event that breaks the protocol ends the session like a guest
     /// request does: the events before it still reach the guest, followed
     /// by one error.
@@ -3344,9 +3558,7 @@ mod tests {
     }
 
     fn dispatch_raw_request_result(
-        handler: &mut SommelierHandler,
         ctx: &mut Context,
-        interface: &str,
         message: Vec<u8>,
     ) -> Option<crate::wire::Outgoing> {
         let header = msg_header(&message);
@@ -3355,7 +3567,7 @@ mod tests {
             header.opcode,
             &message[MessageHeader::LEN..],
         );
-        let result = Client::dispatch_request(handler, ctx, interface, &mut wire)
+        let result = crate::test_support::dispatch_request(ctx, &mut wire)
             .expect("raw guest request must dispatch");
         assert!(
             wire.is_payload_consumed(),
@@ -3373,7 +3585,8 @@ mod tests {
         const AURA_SHELL: u32 = 240;
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.create_local(GTK_SHELL, "gtk_shell1", 1);
+        ctx.shadow_table
+            .create_local(GTK_SHELL, Iface::GtkShell1, 1);
         ctx.gtk_shells
             .insert(GTK_SHELL, crate::state::GtkShellState::default());
         register_raw_surface(&mut ctx, GUEST_SURFACE, HOST_SURFACE);
@@ -3386,10 +3599,7 @@ mod tests {
         let request =
             request.build_message(GTK_SHELL, protocols::gtk::gtk_shell1::REQ_GET_GTK_SURFACE);
 
-        let mut handler = SommelierHandler::new();
-        assert!(
-            dispatch_raw_request_result(&mut handler, &mut ctx, "gtk_shell1", request).is_none()
-        );
+        assert!(dispatch_raw_request_result(&mut ctx, request).is_none());
         assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
         assert_eq!(ctx.client_to_host_queue.len(), 2);
         assert_eq!(
@@ -3401,7 +3611,7 @@ mod tests {
         bell.write_u32(GTK_SURFACE);
         let bell = bell.build_message(GTK_SHELL, protocols::gtk::gtk_shell1::REQ_SYSTEM_BELL);
         assert!(
-            dispatch_raw_request_result(&mut handler, &mut ctx, "gtk_shell1", bell).is_none(),
+            dispatch_raw_request_result(&mut ctx, bell).is_none(),
             "a local gtk_surface object must be accepted by a local no-op request"
         );
     }
@@ -3420,8 +3630,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let guest_id = 20;
         ctx.shadow_table
-            .create_local(guest_id, "zwp_text_input_manager_v3", 1);
-        let mut handler = SommelierHandler::new();
+            .create_local(guest_id, Iface::ZwpTextInputManagerV3, 1);
 
         let mut destroy = WireMessage::new(
             guest_id,
@@ -3429,13 +3638,10 @@ mod tests {
             &[],
         );
         assert_eq!(
-            raw_dispatch(
-                protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request(
-                    &mut destroy,
-                    &mut handler,
-                    &mut ctx,
-                )
-            ),
+            raw_dispatch(crate::test_support::dispatch_request(
+                &mut ctx,
+                &mut destroy
+            )),
             Ok(None)
         );
         assert_eq!(ctx.shadow_table.get_interface(guest_id), None);
@@ -3451,13 +3657,10 @@ mod tests {
             &[],
         );
         assert_eq!(
-            raw_dispatch(
-                protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request(
-                    &mut duplicate_destroy,
-                    &mut handler,
-                    &mut ctx,
-                )
-            ),
+            raw_dispatch(crate::test_support::dispatch_request(
+                &mut ctx,
+                &mut duplicate_destroy
+            )),
             Err(ProtocolError::InvalidSender(guest_id))
         );
         assert_eq!(
@@ -3471,16 +3674,14 @@ mod tests {
     fn synthetic_shm_pool_destroy_emits_one_guest_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let guest_id = 21;
-        ctx.shadow_table.create_local(guest_id, "wl_shm_pool", 1);
-        let mut handler = SommelierHandler::new();
+        ctx.shadow_table.create_local(guest_id, Iface::WlShmPool, 1);
 
         let mut destroy =
             WireMessage::new(guest_id, protocols::wayland::wl_shm_pool::REQ_DESTROY, &[]);
         assert_eq!(
-            raw_dispatch(protocols::wayland::wl_shm_pool::dispatch_request(
-                &mut destroy,
-                &mut handler,
+            raw_dispatch(crate::test_support::dispatch_request(
                 &mut ctx,
+                &mut destroy
             )),
             Ok(None)
         );
@@ -3570,12 +3771,10 @@ mod tests {
             .insert_paired_with_version_for_test(1, 1, "wl_display", 1);
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
-        let mut handler = SommelierHandler::new();
 
         let mut destroy = WireMessage::new(10, protocols::wayland::wl_region::REQ_DESTROY, &[]);
-        let forwarded =
-            protocols::wayland::dispatch_request("wl_region", &mut destroy, &mut handler, &mut ctx)
-                .expect("destructor request should dispatch");
+        let forwarded = crate::test_support::dispatch_request(&mut ctx, &mut destroy)
+            .expect("destructor request should dispatch");
         assert!(forwarded.is_some());
         assert_eq!(
             ctx.shadow_table.get_guest_id(20),
@@ -3591,11 +3790,9 @@ mod tests {
         let mut delete_id =
             WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
         assert_eq!(
-            raw_dispatch(protocols::wayland::dispatch_event(
-                "wl_display",
-                &mut delete_id,
-                &mut handler,
-                &mut ctx
+            raw_dispatch(crate::test_support::dispatch_event(
+                &mut ctx,
+                &mut delete_id
             )),
             Ok(None)
         );
@@ -3617,7 +3814,6 @@ mod tests {
             .insert_paired_with_version_for_test(5, 15, "wl_fixes", 1);
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 20, "wl_registry", 1);
-        let mut handler = SommelierHandler::new();
 
         let payload = 10u32.to_ne_bytes();
         let mut destroy_registry = WireMessage::new(
@@ -3625,14 +3821,10 @@ mod tests {
             protocols::wayland::wl_fixes::REQ_DESTROY_REGISTRY,
             &payload,
         );
-        let (forwarded, fds) = protocols::wayland::dispatch_request(
-            "wl_fixes",
-            &mut destroy_registry,
-            &mut handler,
-            &mut ctx,
-        )
-        .expect("destroy_registry request should dispatch")
-        .expect("destroy_registry request should be forwarded");
+        let (forwarded, fds) =
+            crate::test_support::dispatch_request(&mut ctx, &mut destroy_registry)
+                .expect("destroy_registry request should dispatch")
+                .expect("destroy_registry request should be forwarded");
         assert!(fds.is_empty());
         assert_eq!(crate::test_support::msg_sender(&forwarded), 15);
         assert_eq!(
@@ -3651,11 +3843,9 @@ mod tests {
         let mut delete_id =
             WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
         assert_eq!(
-            raw_dispatch(protocols::wayland::dispatch_event(
-                "wl_display",
-                &mut delete_id,
-                &mut handler,
-                &mut ctx
+            raw_dispatch(crate::test_support::dispatch_event(
+                &mut ctx,
+                &mut delete_id
             )),
             Ok(None)
         );
@@ -3671,21 +3861,26 @@ mod tests {
     #[test]
     fn pending_destructor_host_events_are_suppressed_except_deferred_buffer_release() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let stale = |ctx: &Context, host: u32, event: AnyEvent| {
+            let sender = ctx
+                .shadow_table
+                .resolve_event(host)
+                .expect("a live host object");
+            pending_host_event_is_stale(ctx, &sender, &event)
+        };
+        let release = || AnyEvent::WlBuffer(wl_buffer::Event::Release {});
         ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
+            .insert_paired_with_version_for_test(10, 20, "wl_surface", 1);
         ctx.guest_destroyed(10);
-        assert!(pending_host_event_is_stale(&ctx, 20, 0));
+        let enter = protocols::wayland::wl_surface::Event::Enter { output: 30 };
+        assert!(stale(&ctx, 20, AnyEvent::WlSurface(enter)));
 
         ctx.shadow_table
             .insert_paired_with_version_for_test(11, 21, "wl_buffer", 1);
         assert!(ctx.register_local_buffer(11, 21, test_buffer_state()));
         assert!(ctx.mark_buffer_guest_destroyed(11));
         ctx.guest_destroyed_in_use(11);
-        assert!(!pending_host_event_is_stale(
-            &ctx,
-            21,
-            protocols::wayland::wl_buffer::EVT_RELEASE,
-        ));
+        assert!(!stale(&ctx, 21, release()));
 
         ctx.shadow_table
             .insert_paired_with_version_for_test(12, 22, "wl_buffer", 1);
@@ -3694,29 +3889,44 @@ mod tests {
         // object still dispatches wl_buffer.release.
         assert!(ctx.mark_buffer_guest_destroyed(12));
         ctx.guest_destroyed_in_use(12);
-        assert!(!pending_host_event_is_stale(
-            &ctx,
-            22,
-            protocols::wayland::wl_buffer::EVT_RELEASE,
-        ));
+        assert!(!stale(&ctx, 22, release()));
     }
 
     #[test]
     fn released_output_events_never_reach_the_output_handlers() {
-        use crate::protocols::wayland::wl_output::{
-            WlOutputHandler, EVT_DONE, EVT_GEOMETRY, EVT_MODE, EVT_SCALE,
-        };
+        use crate::protocols::wayland::wl_output::{Event, WlOutputHandler};
         // The wl_output handlers rely on this filter instead of checking for
         // a pending destructor themselves.
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 20, "wl_output", 3);
         ctx.last_sender_id = 10;
-        WlOutputHandler::on_release(&mut crate::handler::output::OutputHandler, &mut ctx);
-        for opcode in [EVT_GEOMETRY, EVT_MODE, EVT_DONE, EVT_SCALE] {
+        <Handlers as WlOutputHandler>::on_release(&mut ctx);
+        let sender = ctx
+            .shadow_table
+            .resolve_event(20)
+            .expect("a live host object");
+        let geometry = Event::Geometry {
+            x: 0,
+            y: 0,
+            physical_width: 0,
+            physical_height: 0,
+            subpixel: 0,
+            make: String::new(),
+            model: String::new(),
+            transform: 0,
+        };
+        let mode = Event::Mode {
+            flags: 0,
+            width: 1,
+            height: 1,
+            refresh: 60,
+        };
+        for event in [geometry, mode, Event::Done {}, Event::Scale { factor: 1 }] {
+            let event = AnyEvent::WlOutput(event);
             assert!(
-                pending_host_event_is_stale(&ctx, 20, opcode),
-                "opcode {opcode}"
+                pending_host_event_is_stale(&ctx, &sender, &event),
+                "{event:?}"
             );
         }
     }
@@ -3762,18 +3972,18 @@ mod tests {
     #[test]
     fn created_surface_keeps_separate_guest_and_host_versions() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let host_compositor = ctx.shadow_table.create_paired(10, "wl_compositor", 4, 3);
-        let mut handler = SommelierHandler::new();
+        let host_compositor = ctx
+            .shadow_table
+            .create_paired(10, Iface::WlCompositor, 4, 3);
         let payload = 30u32.to_ne_bytes();
         let mut msg = WireMessage::new(
             10,
             protocols::wayland::wl_compositor::REQ_CREATE_SURFACE,
             &payload,
         );
-        let (forwarded, fds) =
-            protocols::wayland::dispatch_request("wl_compositor", &mut msg, &mut handler, &mut ctx)
-                .expect("create_surface dispatch")
-                .expect("create_surface forwarded");
+        let (forwarded, fds) = crate::test_support::dispatch_request(&mut ctx, &mut msg)
+            .expect("create_surface dispatch")
+            .expect("create_surface forwarded");
         assert!(fds.is_empty());
         assert_eq!(crate::test_support::msg_sender(&forwarded), host_compositor);
         let host_surface = ctx.shadow_table.get_host_id(30).expect("host surface");
@@ -3802,13 +4012,7 @@ mod tests {
             protocols::xdg_shell::xdg_positioner::REQ_SET_REACTIVE,
             &payload,
         );
-        let mut handler = SommelierHandler::new();
-        let result = protocols::xdg_shell::dispatch_request(
-            "xdg_positioner",
-            &mut msg,
-            &mut handler,
-            &mut ctx,
-        );
+        let result = crate::test_support::dispatch_request(&mut ctx, &mut msg);
 
         assert_eq!(
             raw_dispatch(result),
@@ -3856,14 +4060,9 @@ mod tests {
             protocols::wayland::wl_subcompositor::REQ_GET_SUBSURFACE,
             &payload,
         );
-        let mut handler = SommelierHandler::new();
 
         assert_eq!(
-            raw_dispatch(protocols::wayland::wl_subcompositor::dispatch_request(
-                &mut msg,
-                &mut handler,
-                &mut ctx,
-            )),
+            raw_dispatch(crate::test_support::dispatch_request(&mut ctx, &mut msg)),
             Err(ProtocolError::InvalidObjectId(surface)),
             "requests must not retain a pending-destroy object through another argument"
         );
@@ -3886,9 +4085,7 @@ mod tests {
             protocols::xdg_shell::xdg_toplevel::EVT_CONFIGURE_BOUNDS,
             &payload,
         );
-        let mut handler = SommelierHandler::new();
-        let result =
-            protocols::xdg_shell::dispatch_event("xdg_toplevel", &mut msg, &mut handler, &mut ctx);
+        let result = crate::test_support::dispatch_event(&mut ctx, &mut msg);
 
         assert_eq!(
             raw_dispatch(result),
@@ -3910,313 +4107,11 @@ mod tests {
         builder.write_string(&"x".repeat(4_084));
         let payload = builder.into_payload();
         let mut msg = WireMessage::new(10, protocols::wayland::wl_data_source::REQ_OFFER, &payload);
-        let mut handler = SommelierHandler::new();
 
         assert_eq!(
-            raw_dispatch(protocols::wayland::wl_data_source::dispatch_request(
-                &mut msg,
-                &mut handler,
-                &mut ctx,
-            )),
+            raw_dispatch(crate::test_support::dispatch_request(&mut ctx, &mut msg)),
             Err(ProtocolError::MessageTooLarge(4_100)),
             "generated forwarding must not truncate the Wayland length field"
         );
-    }
-}
-
-// Wayland Protocol
-protocols::wayland::impl_sommelier_delegates!(SommelierHandler, {
-    wl_display: display,
-    wl_registry: registry,
-    wl_callback: callback,
-    wl_compositor: compositor,
-    wl_surface: compositor,
-    wl_subcompositor: compositor,
-    wl_subsurface: compositor,
-    wl_region: compositor,
-    wl_shm: shm,
-    wl_shm_pool: shm,
-    wl_buffer: buffer,
-    wl_data_device_manager: data_device,
-    wl_data_device: data_device,
-    wl_data_source: data_device,
-    wl_data_offer: data_device,
-    wl_keyboard: keyboard,
-    wl_pointer: pointer,
-    wl_touch: touch,
-    wl_seat: seat,
-    wl_output: output,
-    wl_fixes: registry
-});
-impl protocols::wayland::ProtocolHandler for SommelierHandler {}
-
-// XDG Shell Protocol
-protocols::xdg_shell::impl_sommelier_delegates!(SommelierHandler, {
-    xdg_wm_base: compositor,
-    xdg_surface: compositor,
-    xdg_toplevel: compositor
-});
-impl protocols::xdg_shell::ProtocolHandler for SommelierHandler {}
-
-// Linux DMABuf Protocol
-protocols::linux_dmabuf_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zwp_linux_dmabuf_v1: linux_dmabuf,
-    zwp_linux_buffer_params_v1: linux_dmabuf,
-    zwp_linux_dmabuf_feedback_v1: linux_dmabuf
-});
-impl protocols::linux_dmabuf_v1::ProtocolHandler for SommelierHandler {}
-
-// Text Input unstable v1 Protocol
-protocols::text_input_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zwp_text_input_manager_v1: text_input_manager_v1,
-    zwp_text_input_v1: text_input_v1
-});
-impl protocols::text_input_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// Text Input Extension unstable v1 Protocol
-protocols::text_input_extension_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zcr_text_input_extension_v1: text_input_extension_v1,
-    zcr_extended_text_input_v1: extended_text_input_v1
-});
-impl protocols::text_input_extension_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// Text Input unstable v3 Protocol
-protocols::text_input_unstable_v3::impl_sommelier_delegates!(SommelierHandler, {
-    zwp_text_input_manager_v3: text_input_manager_v3,
-    zwp_text_input_v3: text_input_v3
-});
-impl protocols::text_input_unstable_v3::ProtocolHandler for SommelierHandler {}
-
-// Viewporter Protocol
-protocols::viewporter::impl_sommelier_delegates!(SommelierHandler, {
-    wp_viewporter: compositor,
-    wp_viewport: compositor
-});
-impl protocols::viewporter::ProtocolHandler for SommelierHandler {}
-
-// XDG Decoration Protocol
-protocols::xdg_decoration_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {});
-impl protocols::xdg_decoration_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// Fractional Scale Protocol
-protocols::fractional_scale_v1::impl_sommelier_delegates!(SommelierHandler, {});
-impl protocols::fractional_scale_v1::ProtocolHandler for SommelierHandler {}
-
-// XDG Output Protocol
-protocols::xdg_output_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zxdg_output_manager_v1: output
-});
-impl protocols::xdg_output_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// Keyboard Extension Protocol (ChromeOS-specific)
-protocols::keyboard_extension_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
-    zcr_keyboard_extension_v1: keyboard,
-    zcr_extended_keyboard_v1: keyboard
-});
-impl protocols::keyboard_extension_unstable_v1::ProtocolHandler for SommelierHandler {}
-
-// GTK shell protocol, translated to ChromeOS Aura surface metadata.
-protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
-    gtk_shell1: gtk_shell,
-    gtk_surface1: gtk_shell
-});
-impl protocols::gtk::ProtocolHandler for SommelierHandler {}
-
-/// What every client connection shares: the process's settings and the
-/// resources built from them once.
-struct Shared {
-    settings: Rc<Settings>,
-    virtgpu: VirtGpuNode,
-    placement: PlacementConfig,
-}
-
-impl Shared {
-    /// Build what the connections share from `settings`, and start
-    /// watching the placement bindings file on the current `LocalSet`.
-    fn new(settings: Settings) -> Self {
-        let settings = Rc::new(settings);
-        Self {
-            virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
-            placement: placement_config::load_and_watch(&settings),
-            settings,
-        }
-    }
-}
-
-/// Serve guest clients on `settings.socket` for the life of the process.
-///
-/// Exits the process when the host cannot be reached or the socket cannot
-/// be claimed, before any client connects.
-pub(crate) async fn run(settings: Settings) {
-    match &settings.host {
-        HostTransport::VirtWl(path) => {
-            if let Err(e) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-            {
-                log::error!(
-                    "Failed to open virtio-wayland device {}: {}",
-                    path.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
-        HostTransport::Local(path) => {
-            if let Err(e) = std::os::unix::net::UnixStream::connect(path) {
-                log::error!(
-                    "Failed to connect to local compositor socket {}: {}",
-                    path.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let display = settings.socket.clone();
-    // Held until the process exits, like the socket itself.
-    let _socket_lock = claim_display_socket(&display).unwrap_or_else(|error| {
-        log::error!(
-            "Cannot claim the Wayland socket {}: {error}",
-            display.display()
-        );
-        std::process::exit(1);
-    });
-    let listener = UnixListener::bind(&display).unwrap_or_else(|error| {
-        log::error!(
-            "Cannot bind the Wayland socket {}: {error}",
-            display.display()
-        );
-        std::process::exit(1);
-    });
-    log::info!("Listening on {}", display.display());
-
-    // Each client's Context holds xkb state, which is !Send. Keep each
-    // client task on this executor's thread instead of using `tokio::spawn`
-    // (whose Send bound would require an unsound manual Send implementation).
-    // `LocalSet::run_until` also makes the ownership requirement visible in
-    // this function's future type: callers cannot accidentally move the
-    // proxy's client tasks to another executor thread.
-    tokio::task::LocalSet::new()
-        .run_until(async move { serve(listener, Shared::new(settings)).await })
-        .await;
-}
-
-/// Claim the socket path `display` for this process, as libwayland claims
-/// its socket: take an exclusive lock on `<display>.lock` and, only while
-/// holding it, remove a socket a previous owner left behind.
-///
-/// The lock lasts as long as the returned value. Fails, leaving the socket
-/// alone, while another process holds the lock: that process is serving
-/// the socket, and removing it would cut its clients off from new
-/// connections.
-fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flock<std::fs::File>> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut lock_path = display.as_os_str().to_owned();
-    lock_path.push(".lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o660)
-        .open(&lock_path)?;
-    let lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-        .map_err(|(_, errno)| match errno {
-            nix::errno::Errno::EWOULDBLOCK => io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "another process holds its lock and is serving it",
-            ),
-            errno => io::Error::from(errno),
-        })?;
-    match std::fs::remove_file(display) {
-        Ok(()) => log::info!("Removed the stale socket {}", display.display()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    Ok(lock)
-}
-
-/// Accept guest clients for the life of the process.
-///
-/// A failure concerning one client is logged and ends only that client.
-/// Must run inside a `LocalSet`, like the clients it spawns.
-async fn serve(listener: UnixListener, shared: Shared) {
-    // Log a run of failed accepts once, not every retry.
-    let mut accept_failing = false;
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                if std::mem::take(&mut accept_failing) {
-                    log::info!("Accepting clients again");
-                }
-                log::info!("New client connected");
-                if let Err(error) = start_client(stream, &shared).await {
-                    log::error!("Closing the new client: {error}");
-                }
-            }
-            Err(e) => {
-                if !std::mem::replace(&mut accept_failing, true) {
-                    log::error!(
-                        "Accept error: {e}; retrying every {ACCEPT_RETRY_DELAY:?} until one succeeds"
-                    );
-                }
-                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
-            }
-        }
-    }
-}
-
-/// Pair an accepted guest connection with a new host connection and serve
-/// the pair on its own task.
-async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
-    // The peer's process, as it was when it connected.
-    let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
-    let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
-    let (host_conn, virtwl) = connect_host(&shared.settings.host).await?;
-    let facts = ConnectionFacts {
-        virtwl,
-        virtgpu: shared.virtgpu.get(),
-        wheel: shared
-            .settings
-            .wheel_from_touchpad
-            .decide(pid, client_kind::is_wine_process),
-        placement: shared.placement.clone(),
-    };
-    let client = Client::new(
-        client_conn,
-        host_conn,
-        Context::new(Rc::clone(&shared.settings), facts),
-    );
-    tokio::task::spawn_local(async move {
-        client.run().await;
-        log::info!("Client disconnected");
-    });
-    Ok(())
-}
-
-/// Open this client's connection to the host compositor over `host`,
-/// with its VirtWL channel when there is one.
-async fn connect_host(
-    host: &HostTransport,
-) -> io::Result<(WaylandConnection, Option<Arc<VirtWaylandChannel>>)> {
-    match host {
-        HostTransport::VirtWl(path) => {
-            let channel = Arc::new(VirtWaylandChannel::new(path).map_err(|error| {
-                io::Error::other(format!(
-                    "cannot open a virtio-wayland channel at {}: {error}",
-                    path.display()
-                ))
-            })?);
-            let conn = WaylandConnection::new_virtwayland(Arc::clone(&channel));
-            Ok((conn, Some(channel)))
-        }
-        HostTransport::Local(path) => {
-            let stream = UnixStream::connect(path).await?;
-            Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
-        }
     }
 }

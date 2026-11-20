@@ -41,15 +41,9 @@ use super::{Context, DeletedHostId, HostId, Link};
 use crate::handler::{
     compositor, keyboard, linux_dmabuf, output, pointer, registry, shm, text_input,
 };
-use crate::protocols::linux_dmabuf_v1::{
-    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
-};
-use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::protocols::viewporter::wp_viewport;
-use crate::protocols::wayland::{
-    wl_keyboard, wl_output, wl_pointer, wl_registry, wl_shm, wl_shm_pool, wl_surface,
-};
-use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
+use crate::protocols::wayland::wl_display;
+use crate::protocols::Iface;
+use crate::wire::WL_DISPLAY_ID;
 
 impl Context {
     /// The guest destroyed guest object `guest_id`; see
@@ -80,14 +74,31 @@ impl Context {
         self.shadow_table.guest_ended_host_destroyed(guest_id);
     }
 
-    /// Local guest object `guest_id` ended; see
-    /// [`super::ShadowTable::local_destroyed`].
+    /// Local guest object `guest_id` ended: its destructor completed in the
+    /// proxy, which queues its `delete_id`, as its host would for a host
+    /// object; see [`super::ShadowTable::local_destroyed`].
+    ///
+    /// # Returns
+    ///
+    /// `false`, changing nothing, unless `guest_id` is a live local object.
     pub(crate) fn local_destroyed(&mut self, guest_id: u32) -> bool {
         if self.shadow_table.request_sender(guest_id) != Some(Link::Local) {
             return false;
         }
         self.forget(guest_id, None);
-        self.shadow_table.local_destroyed(guest_id)
+        let ended = self.shadow_table.local_destroyed(guest_id);
+        debug_assert!(ended, "a live local object ends");
+        self.queue_delete_id(guest_id);
+        true
+    }
+
+    /// Queue the `wl_display.delete_id` that ends guest object `guest_id`,
+    /// for an object whose host object cannot send it: one the proxy
+    /// implements, or one backed by a host object without a destructor.
+    /// The caller ends the object in the [`super::ShadowTable`] first.
+    pub(crate) fn queue_delete_id(&mut self, guest_id: u32) {
+        self.host_to_client_queue
+            .push(wl_display::evt::delete_id(WL_DISPLAY_ID, guest_id));
     }
 
     /// Guest object `guest_id` never reached the host; see
@@ -103,8 +114,7 @@ impl Context {
         let interface = self
             .shadow_table
             .get_guest_id(host_id)
-            .and_then(|guest| self.shadow_table.get_interface(guest))
-            .map(str::to_owned);
+            .and_then(|guest| self.shadow_table.get_interface(guest));
         let deleted = self.shadow_table.release_deleted_host_id(host_id);
         if let (
             DeletedHostId::Paired {
@@ -114,7 +124,7 @@ impl Context {
             Some(interface),
         ) = (deleted, interface)
         {
-            forget_object(self, &interface, guest, Some(host_id), true);
+            forget_object(self, interface, guest, Some(host_id), true);
         }
         if deleted != DeletedHostId::Ignored {
             forget_host_id(self, HostId(host_id));
@@ -134,8 +144,7 @@ impl Context {
     /// Forget live guest object `guest_id`, paired with `host_id` or local.
     fn forget(&mut self, guest_id: u32, host_id: Option<u32>) {
         if let Some(interface) = self.shadow_table.get_interface(guest_id) {
-            let interface = interface.to_owned();
-            forget_object(self, &interface, guest_id, host_id, false);
+            forget_object(self, interface, guest_id, host_id, false);
         }
     }
 }
@@ -148,32 +157,87 @@ impl Context {
 /// `deactivate`); the other arms send only to other objects, such as Aura
 /// children or an extended keyboard, which the host's delete leaves live.
 ///
-/// Every interface with per-object state has an arm. A `wl_buffer`'s state
-/// is its render buffer, keyed by host ID ([`forget_host_id`]), and an
-/// inert `wl_output` has none.
+/// The match names every interface, so a new one must say whether its
+/// objects have state of their own. A `wl_buffer`'s state is its render
+/// buffer, keyed by host ID ([`forget_host_id`]); an inert `wl_output`, a
+/// local one, has none.
 fn forget_object(
     ctx: &mut Context,
-    interface: &str,
+    interface: Iface,
     guest: u32,
     host: Option<u32>,
     host_deleted: bool,
 ) {
     match (interface, host) {
-        (wl_registry::NAME, Some(host)) => registry::forget_registry(ctx, host),
-        (wl_output::NAME, Some(host)) => output::forget_output(ctx, host),
-        (wl_keyboard::NAME, Some(host)) => keyboard::forget_keyboard(ctx, HostId(host)),
-        (wl_pointer::NAME, Some(host)) => pointer::forget_pointer(ctx, HostId(host)),
-        (wl_surface::NAME, Some(host)) => compositor::forget_surface(ctx, guest, host),
-        (wp_viewport::NAME, _) => compositor::forget_viewport(ctx, guest),
-        (xdg_surface::NAME, _) => compositor::forget_xdg_surface(ctx, guest),
-        (xdg_toplevel::NAME, _) => compositor::forget_xdg_toplevel(ctx, guest),
-        (wl_shm::NAME, _) => shm::forget_shm(ctx, guest),
-        (wl_shm_pool::NAME, _) => shm::forget_pool(ctx, guest),
-        (zwp_linux_dmabuf_v1::NAME, _) => linux_dmabuf::forget_factory(ctx, guest),
-        (zwp_linux_dmabuf_feedback_v1::NAME, _) => linux_dmabuf::forget_feedback(ctx, guest),
-        (zwp_linux_buffer_params_v1::NAME, _) => linux_dmabuf::forget_params(ctx, guest, host),
-        (zwp_text_input_v3::NAME, _) => text_input::forget_text_input(ctx, guest, host_deleted),
-        _ => {}
+        (Iface::WlRegistry, Some(host)) => registry::forget_registry(ctx, host),
+        (Iface::WlOutput, Some(host)) => output::forget_output(ctx, host),
+        (Iface::WlKeyboard, Some(host)) => keyboard::forget_keyboard(ctx, HostId(host)),
+        (Iface::WlPointer, Some(host)) => pointer::forget_pointer(ctx, HostId(host)),
+        (Iface::WlSurface, Some(host)) => compositor::forget_surface(ctx, guest, host),
+        // Local objects of these interfaces have no state.
+        (
+            Iface::WlRegistry
+            | Iface::WlOutput
+            | Iface::WlKeyboard
+            | Iface::WlPointer
+            | Iface::WlSurface,
+            None,
+        ) => {}
+        (Iface::WpViewport, _) => compositor::forget_viewport(ctx, guest),
+        (Iface::XdgSurface, _) => compositor::forget_xdg_surface(ctx, guest),
+        (Iface::XdgToplevel, _) => compositor::forget_xdg_toplevel(ctx, guest),
+        (Iface::WlShm, _) => shm::forget_shm(ctx, guest),
+        (Iface::WlShmPool, _) => shm::forget_pool(ctx, guest),
+        (Iface::ZwpLinuxDmabufV1, _) => linux_dmabuf::forget_factory(ctx, guest),
+        (Iface::ZwpLinuxDmabufFeedbackV1, _) => linux_dmabuf::forget_feedback(ctx, guest),
+        (Iface::ZwpLinuxBufferParamsV1, _) => linux_dmabuf::forget_params(ctx, guest, host),
+        (Iface::ZwpTextInputV3, _) => text_input::forget_text_input(ctx, guest, host_deleted),
+        // No state of their own, or none that ends here: a GTK surface's
+        // ends with its `wl_surface` (`compositor::forget_surface`), and a
+        // GTK shell, which the guest cannot destroy, lasts the connection.
+        (
+            Iface::WlDisplay
+            | Iface::WlCallback
+            | Iface::WlCompositor
+            | Iface::WlBuffer
+            | Iface::WlDataOffer
+            | Iface::WlDataSource
+            | Iface::WlDataDevice
+            | Iface::WlDataDeviceManager
+            | Iface::WlShell
+            | Iface::WlShellSurface
+            | Iface::WlSeat
+            | Iface::WlTouch
+            | Iface::WlRegion
+            | Iface::WlSubcompositor
+            | Iface::WlSubsurface
+            | Iface::WlFixes
+            | Iface::XdgWmBase
+            | Iface::XdgPositioner
+            | Iface::XdgPopup
+            | Iface::WpViewporter
+            | Iface::ZwpTextInputManagerV3
+            | Iface::ZwpTextInputV1
+            | Iface::ZwpTextInputManagerV1
+            | Iface::ZcrTextInputExtensionV1
+            | Iface::ZcrExtendedTextInputV1
+            | Iface::ZxdgDecorationManagerV1
+            | Iface::ZxdgToplevelDecorationV1
+            | Iface::WpFractionalScaleManagerV1
+            | Iface::WpFractionalScaleV1
+            | Iface::ZxdgOutputManagerV1
+            | Iface::ZxdgOutputV1
+            | Iface::ZcrKeyboardExtensionV1
+            | Iface::ZcrExtendedKeyboardV1
+            | Iface::GtkShell1
+            | Iface::GtkSurface1
+            | Iface::ZauraShell
+            | Iface::ZauraSurface
+            | Iface::ZauraOutput
+            | Iface::ZauraToplevel
+            | Iface::ZauraPopup,
+            _,
+        ) => {}
     }
 }
 
@@ -200,13 +264,13 @@ impl Context {
     /// are checked, against their keyboard's.
     pub(crate) fn assert_no_orphans(&self) {
         let table = &self.shadow_table;
-        let guest = |what: &str, id: u32, interface: &str| {
+        let guest = |what: &str, id: u32, interface: Iface| {
             assert!(
                 table.request_object(id, interface).is_some(),
                 "{what} outlived guest {interface} {id}"
             );
         };
-        let host = |what: &str, id: u32, interface: &str| {
+        let host = |what: &str, id: u32, interface: Iface| {
             assert!(
                 table
                     .get_guest_id(id)
@@ -214,7 +278,7 @@ impl Context {
                 "{what} outlived host {interface} {id}"
             );
         };
-        let host_only = |what: &str, id: u32, interface: &str| {
+        let host_only = |what: &str, id: u32, interface: Iface| {
             assert!(
                 table.get_host_interface(id) == Some(interface) && table.get_guest_id(id).is_none(),
                 "{what} outlived host-only {interface} {id}"
@@ -223,38 +287,38 @@ impl Context {
 
         // Surfaces, their roles and what they show.
         for &surface in self.surfaces.keys() {
-            guest("wl_surface state", surface, "wl_surface");
+            guest("wl_surface state", surface, Iface::WlSurface);
         }
         for (&viewport, &surface) in &self.viewport_to_wl_surface {
-            guest("viewport link", viewport, "wp_viewport");
-            guest("viewport link", surface, "wl_surface");
+            guest("viewport link", viewport, Iface::WpViewport);
+            guest("viewport link", surface, Iface::WlSurface);
         }
         for &gtk_shell in self.gtk_shells.keys() {
-            guest("GTK shell", gtk_shell, "gtk_shell1");
+            guest("GTK shell", gtk_shell, Iface::GtkShell1);
         }
         for (&gtk_surface, state) in &self.gtk_surfaces {
-            guest("GTK surface", gtk_surface, "gtk_surface1");
-            guest("GTK surface", state.wl_surface_id, "wl_surface");
+            guest("GTK surface", gtk_surface, Iface::GtkSurface1);
+            guest("GTK surface", state.wl_surface_id, Iface::WlSurface);
         }
         for (xdg_surface, wl_surface, toplevel) in self.xdg_roles.roles_for_test() {
-            guest("xdg role", xdg_surface, "xdg_surface");
-            guest("xdg role", wl_surface, "wl_surface");
+            guest("xdg role", xdg_surface, Iface::XdgSurface);
+            guest("xdg role", wl_surface, Iface::WlSurface);
             if let Some(toplevel) = toplevel {
-                guest("xdg role", toplevel, "xdg_toplevel");
+                guest("xdg role", toplevel, Iface::XdgToplevel);
             }
         }
         for surface in self.aura_surfaces.wl_surfaces_for_test() {
-            host("Aura surface", surface, "wl_surface");
+            host("Aura surface", surface, Iface::WlSurface);
         }
         for surface in self.render_buffers.copy_surfaces_for_test() {
-            guest("buffer copy", surface, "wl_surface");
+            guest("buffer copy", surface, Iface::WlSurface);
         }
         let outputs = self.outputs.live_outputs();
         for &output in &outputs {
-            host("output record", output, "wl_output");
+            host("output record", output, Iface::WlOutput);
         }
         for (surface, output) in self.outputs.surface_outputs_for_test() {
-            host("surface output", surface, "wl_surface");
+            host("surface output", surface, Iface::WlSurface);
             assert!(
                 outputs.contains(&output),
                 "surface output outlived output {output}"
@@ -271,7 +335,7 @@ impl Context {
         // its host object and the guest one paired with it are all there is
         // to check; its extended keyboard is host-only.
         for (keyboard, record) in self.keys.keyboards().iter() {
-            host("keyboard record", keyboard.0, "wl_keyboard");
+            host("keyboard record", keyboard.0, Iface::WlKeyboard);
             assert_eq!(
                 table.get_guest_id(keyboard.0),
                 Some(record.guest),
@@ -279,11 +343,15 @@ impl Context {
                 keyboard.0
             );
             if let Some(extended) = record.extended {
-                host_only("extended keyboard", extended.0, "zcr_extended_keyboard_v1");
+                host_only(
+                    "extended keyboard",
+                    extended.0,
+                    Iface::ZcrExtendedKeyboardV1,
+                );
             }
         }
         for keyboard in self.keys.key_state_keyboards() {
-            host("key generations", keyboard.0, "wl_keyboard");
+            host("key generations", keyboard.0, Iface::WlKeyboard);
         }
         // A seat reference names the guest wl_seat that its keyboard or
         // text input was created from, and outlives that seat, whose ID the
@@ -293,8 +361,8 @@ impl Context {
         // must name it.
         let keyboard_seat = |keyboard: HostId| self.keys.keyboards().seat(keyboard);
         for (keyboard, focus) in self.keyboard_focus.focuses_for_test() {
-            host("keyboard focus", keyboard.0, "wl_keyboard");
-            guest("keyboard focus", focus.guest_surface, "wl_surface");
+            host("keyboard focus", keyboard.0, Iface::WlKeyboard);
+            guest("keyboard focus", focus.guest_surface, Iface::WlSurface);
             assert_eq!(
                 keyboard_seat(keyboard),
                 Some(focus.guest_seat),
@@ -304,7 +372,7 @@ impl Context {
         }
         for (seat, surface, keyboard) in self.keys.peek_watermarks() {
             if let Some(surface) = surface {
-                guest("peek watermark", surface, "wl_surface");
+                guest("peek watermark", surface, Iface::WlSurface);
             }
             assert_eq!(
                 keyboard_seat(keyboard),
@@ -314,19 +382,19 @@ impl Context {
             );
         }
         if let Some((text_input, keyboard, host_keyboard)) = self.keys.recovery_objects() {
-            guest("pending recovery", text_input, "zwp_text_input_v3");
-            guest("pending recovery", keyboard, "wl_keyboard");
-            host("pending recovery", host_keyboard.0, "wl_keyboard");
+            guest("pending recovery", text_input, Iface::ZwpTextInputV3);
+            guest("pending recovery", keyboard, Iface::WlKeyboard);
+            host("pending recovery", host_keyboard.0, Iface::WlKeyboard);
         }
         for (pointer, surface) in self.pointer_focus.focuses_for_test() {
-            host("pointer focus", pointer.0, "wl_pointer");
-            guest("pointer focus", surface, "wl_surface");
+            host("pointer focus", pointer.0, Iface::WlPointer);
+            guest("pointer focus", surface, Iface::WlSurface);
         }
         for pointer in self.wheel_steps.pointers_for_test() {
-            host("wheel steps", pointer.0, "wl_pointer");
+            host("wheel steps", pointer.0, Iface::WlPointer);
         }
         for (text_input, t) in self.ime.iter() {
-            guest("text input state", text_input.0, "zwp_text_input_v3");
+            guest("text input state", text_input.0, Iface::ZwpTextInputV3);
             // I5: a drain or a fence that outlived its callback would drop
             // the field's composition events for good.
             for token in t.barriers() {
@@ -339,7 +407,7 @@ impl Context {
                 );
             }
             if let Some(surface) = t.focused_surface() {
-                guest("text input focus", surface.0, "wl_surface");
+                guest("text input focus", surface.0, Iface::WlSurface);
             }
         }
         self.ime
@@ -347,10 +415,10 @@ impl Context {
 
         // SHM and dma-buf.
         for &pool in self.pools.keys().chain(&self.stale_shm_pools) {
-            guest("SHM pool", pool, "wl_shm_pool");
+            guest("SHM pool", pool, Iface::WlShmPool);
         }
         for &shm in self.guest_shms.keys().chain(&self.stale_shm_guest_objects) {
-            guest("wl_shm state", shm, "wl_shm");
+            guest("wl_shm state", shm, Iface::WlShm);
         }
         for (buffer, _) in self.render_buffer_lifecycles() {
             assert!(
@@ -363,7 +431,7 @@ impl Context {
             assert_eq!(
                 table.event_object(
                     params.0,
-                    "zwp_linux_buffer_params_v1",
+                    Iface::ZwpLinuxBufferParamsV1,
                     "zwp_linux_buffer_params_v1.created"
                 ),
                 Some(create.guest_params_id),
@@ -372,13 +440,17 @@ impl Context {
             );
         }
         for &params in self.pending_params.keys().chain(&self.used_dmabuf_params) {
-            guest("dma-buf params", params, "zwp_linux_buffer_params_v1");
+            guest("dma-buf params", params, Iface::ZwpLinuxBufferParamsV1);
         }
         for &factory in self.dmabuf_guest_generations.keys() {
-            guest("dma-buf factory", factory, "zwp_linux_dmabuf_v1");
+            guest("dma-buf factory", factory, Iface::ZwpLinuxDmabufV1);
         }
         for &feedback in self.synthetic_feedback_objects.keys() {
-            guest("dma-buf feedback", feedback, "zwp_linux_dmabuf_feedback_v1");
+            guest(
+                "dma-buf feedback",
+                feedback,
+                Iface::ZwpLinuxDmabufFeedbackV1,
+            );
         }
         for &generation in self.dmabuf_capabilities.keys() {
             assert!(
@@ -394,7 +466,7 @@ impl Context {
                 .map(|pending| &pending.registry_host_id),
         );
         for &registry in registries {
-            host("registry globals", registry, "wl_registry");
+            host("registry globals", registry, Iface::WlRegistry);
         }
         // A singleton candidate is a name a registry still lists.
         for &name in self.singleton_candidates.keys() {
