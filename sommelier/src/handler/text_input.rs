@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::warn_once::WarnOnce;
 
-use crate::handler::callback::queue_internal_sync;
+use crate::handler::callback::{internal_sync, queue_internal_sync};
 use crate::handler::ime_keys::{
     end_backspace_repeat_for_seat, end_backspace_repeat_for_text_input, forget_held_keys_for_seat,
     forget_recovery_of_text_input, held_backspace_keyboard_for_seat, hold_recovery,
@@ -94,11 +94,18 @@ pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
             HostOut::Barrier(token) => {
                 queue_internal_sync(ctx, InternalCallback::TextInput { token });
             }
-            HostOut::Glued { request, barrier } => {
-                ctx.client_to_host_queue.push(request);
+            HostOut::Glued {
+                request: (mut bytes, mut fds),
+                barrier,
+            } => {
+                // One entry, which a submission never splits
+                // (`connection::OutgoingMessages`).
                 let token = barrier;
-                queue_internal_sync(ctx, InternalCallback::TextInput { token });
-                glue_last_two(&mut ctx.client_to_host_queue);
+                let (_, (sync, sync_fds)) =
+                    internal_sync(ctx, InternalCallback::TextInput { token });
+                bytes.extend_from_slice(&sync);
+                fds.extend(sync_fds);
+                ctx.client_to_host_queue.push((bytes, fds));
             }
             HostOut::Destroy { request, id } => {
                 ctx.client_to_host_queue.push(request);
@@ -112,16 +119,6 @@ pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
     fx.forward
 }
 
-/// Make the last two messages of `queue` one entry, which a submission
-/// never splits (`connection::OutgoingMessages`).
-fn glue_last_two(queue: &mut Vec<Outgoing>) {
-    let (Some((bytes, fds)), Some((into, into_fds))) = (queue.pop(), queue.last_mut()) else {
-        unreachable!("a glued barrier's sync follows its request");
-    };
-    into.extend_from_slice(&bytes);
-    into_fds.extend(fds);
-}
-
 /// The keyboard concern forwarded a key press to the guest on
 /// guest seat `seat`, which may edit its text where Exo does not see.
 pub(crate) fn guest_key(ctx: &mut Context, seat: u32) {
@@ -131,17 +128,14 @@ pub(crate) fn guest_key(ctx: &mut Context, seat: u32) {
 /// Apply what the IME core asks of the keyboard concern.
 fn apply_key_effect(ctx: &mut Context, effect: KeyEffect) {
     match effect {
-        KeyEffect::Lease { .. } => apply_lease(ctx, effect),
+        KeyEffect::Lease { ti, seat, outcome } => apply_lease(ctx, ti, seat, outcome),
         KeyEffect::RecoverHeldKey { ti, seat } => hold_recovery(ctx, ti, seat),
     }
 }
 
 /// Apply what the IME core asks of the Backspace repeat leased to a text
 /// input.
-fn apply_lease(ctx: &mut Context, effect: KeyEffect) {
-    let KeyEffect::Lease { ti, seat, outcome } = effect else {
-        unreachable!("a transaction ends with a lease");
-    };
+fn apply_lease(ctx: &mut Context, ti: TiId, seat: SeatId, outcome: LeaseOutcome) {
     let held = match outcome {
         LeaseOutcome::End => None,
         LeaseOutcome::ArmIfBackspaceHeld => held_backspace_keyboard_for_seat(ctx, seat.0),

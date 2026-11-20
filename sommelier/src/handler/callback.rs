@@ -17,7 +17,7 @@ limitations under the License.
 use crate::protocols::wayland::wl_callback::{self, WlCallbackHandler};
 use crate::protocols::wayland::wl_display;
 use crate::state::{Context, HostId, InternalCallback};
-use crate::wire::{Action, WL_DISPLAY_ID};
+use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
 use log::debug;
 
 pub struct CallbackHandler;
@@ -30,14 +30,20 @@ pub struct CallbackHandler;
 /// The callback's host ID, which stays reserved until the host's
 /// `wl_display.delete_id`.
 pub(crate) fn queue_internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> HostId {
+    let (callback, sync) = internal_sync(ctx, waits_for);
+    ctx.client_to_host_queue.push(sync);
+    callback
+}
+
+/// [`queue_internal_sync`]'s callback and its `wl_display.sync`, for the
+/// caller to send.
+pub(crate) fn internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> (HostId, Outgoing) {
     let callback = HostId(
         ctx.shadow_table
             .create_host_only(wl_callback::NAME, wl_callback::VERSION),
     );
     ctx.internal_callbacks.register(callback, waits_for);
-    ctx.client_to_host_queue
-        .push(wl_display::req::sync(WL_DISPLAY_ID, callback.0));
-    callback
+    (callback, wl_display::req::sync(WL_DISPLAY_ID, callback.0))
 }
 
 impl WlCallbackHandler for CallbackHandler {

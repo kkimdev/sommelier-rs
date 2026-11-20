@@ -44,69 +44,185 @@ struct PeekWatermark {
     sequence: u64,
 }
 
-/// Exclusive guest-side ownership of one evdev key generation.
-///
-/// A key can have at most one owner: either a real `wl_keyboard` press is
-/// awaiting its release, Sommelier consumed it as a shortcut, or IME
-/// recovery already emitted a balanced pair and later host events must be
-/// suppressed. Encoding these states as one enum prevents the parallel-set
-/// inconsistencies that previously caused duplicate and stuck keys.
+/// Who gave the guest a key generation's key. A key has at most one: two
+/// would deliver it twice, and none could leave it stuck.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub enum GuestKeyOwner {
+    /// A `wl_keyboard.key` press, or one the enter listed, awaits its
+    /// release.
     Physical,
-    /// Sommelier consumed an application window-layout shortcut. The
+    /// Sommelier consumed the key as a window-layout shortcut. The
     /// matching release is acknowledged as handled and never reaches the
     /// guest client.
     CompositorShortcut,
-    /// A balanced synthetic pair was delivered. This completed-generation
-    /// tombstone suppresses delayed duplicate channels and permits repeat
-    /// recovery without leaving an open guest press.
+    /// The guest got a balanced pair from an IME recovery. This
+    /// tombstone suppresses delayed duplicates on the other channels.
     ImeRecovery,
 }
 
-impl GuestKeyOwner {
-    /// The arbitration contract for compositor shortcuts; this is its only
-    /// definition.
-    ///
-    /// A compositor shortcut may own a key generation only while no channel
-    /// owns it (the first press, which also places the window) or while it
-    /// already owns it (a duplicate press of the consumed chord). A
-    /// generation that another channel delivered or recovered
-    /// belongs to that channel, and the chord is not acted on.
-    pub(crate) const fn admits_compositor_shortcut(owner: Option<Self>) -> bool {
-        matches!(owner, None | Some(Self::CompositorShortcut))
+/// What a key's chord makes of its press, under its keyboard's state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChordClass {
+    /// Ordinary guest input.
+    Guest,
+    /// Listed in `SOMMELIER_ACCELERATORS`: the host runs the accelerator.
+    HostAccelerator,
+    /// Bound to a placement action: Sommelier owns the chord.
+    Shortcut,
+}
+
+/// A `wl_keyboard.key` of its key's current generation
+/// ([`KeyGenerationRegistry::transition_physical`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalKey {
+    Press {
+        chord: ChordClass,
+        /// The keyboard's Backspace is leased to the IME's repeat, read
+        /// before the press moved its generation.
+        backspace_leased: bool,
+    },
+    Release,
+}
+
+/// What becomes of a `wl_keyboard.key`: how it is acknowledged through
+/// `ack_key`, and whether the guest gets it. A forwarded key is always
+/// acknowledged as handled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyVerdict {
+    /// Handled, and forwarded to the guest.
+    Forward,
+    /// Handled, and dropped: the guest has the key already, or a shortcut
+    /// consumed it.
+    Consume,
+    /// Not handled, and dropped: the host keeps the key, a host
+    /// accelerator's or one the input method took, or its release, or a
+    /// release of a key the guest never got.
+    Decline,
+    /// Handled, and dropped: the press claimed its generation for its
+    /// shortcut, which the caller runs.
+    Shortcut,
+}
+
+impl KeyVerdict {
+    /// The `ack_key` it makes.
+    pub fn handled(self) -> bool {
+        !matches!(self, Self::Decline)
+    }
+
+    pub fn forward(self) -> bool {
+        matches!(self, Self::Forward)
     }
 }
 
-/// Normalized guest-delivery input from every host key channel.
-///
-/// Handlers decode protocol-specific fields and provide policy facts, while
-/// the key-generation registry alone decides ownership, forwarding, and
-/// wl_keyboard ACK semantics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuestKeyEvent {
-    PhysicalPress {
-        host_accelerator: bool,
-        ime_repeat_active: bool,
-    },
-    PhysicalRelease,
-    CompositorShortcutPress,
-    CompositorShortcutRelease,
-    RecoverIme,
+/// What the guest got of one key generation: who delivered it, and
+/// whether a host accelerator took it. [`Self::physical`] and
+/// [`Self::recover`] are its only transitions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Delivery {
+    owner: Option<GuestKeyOwner>,
+    /// A `wl_keyboard` press of a generation no channel gave the guest was
+    /// a host accelerator: its release is dropped too, and no recovery may
+    /// deliver it. Only the generation's release, an `enter` or the
+    /// keyboard's end takes it. A shortcut's release leaves it.
+    accelerator_suppressed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuestKeyDelivery {
-    Drop,
-    Forward,
-    EmitBalancedPair,
-}
+impl Delivery {
+    /// A `wl_keyboard.key` of the generation.
+    ///
+    /// A generation a shortcut owns stays the shortcut's: its duplicate
+    /// press and its release are consumed. A shortcut claims only a
+    /// generation no channel owns; another channel's keeps it, and its
+    /// press is that channel's duplicate. An accelerator's press, or any
+    /// press of a suppressed generation, is declined and suppresses a
+    /// generation the guest does not hold. A press while the IME holds
+    /// the Backspace lease, of a generation the guest does not hold,
+    /// belongs to the input method's repeat and becomes its tombstone, as
+    /// does any press of a recovered generation.
+    fn physical(self, key: PhysicalKey) -> (Self, KeyVerdict) {
+        use GuestKeyOwner::{CompositorShortcut, ImeRecovery, Physical};
+        let Self {
+            owner,
+            accelerator_suppressed,
+        } = self;
+        match (owner, key) {
+            (Some(CompositorShortcut), PhysicalKey::Press { .. }) => (self, KeyVerdict::Consume),
+            (Some(CompositorShortcut), PhysicalKey::Release) => {
+                let owner = None;
+                (Self { owner, ..self }, KeyVerdict::Consume)
+            }
+            (
+                None,
+                PhysicalKey::Press {
+                    chord: ChordClass::Shortcut,
+                    ..
+                },
+            ) => {
+                let owner = Some(CompositorShortcut);
+                (Self { owner, ..self }, KeyVerdict::Shortcut)
+            }
+            (
+                _,
+                PhysicalKey::Press {
+                    chord,
+                    backspace_leased,
+                },
+            ) => {
+                let forwarded = owner == Some(Physical);
+                let for_ime = owner == Some(ImeRecovery) || (backspace_leased && !forwarded);
+                let owner = match (owner, for_ime) {
+                    (None, true) => Some(ImeRecovery),
+                    (owner, _) => owner,
+                };
+                if accelerator_suppressed || chord == ChordClass::HostAccelerator {
+                    let accelerator_suppressed = !forwarded || accelerator_suppressed;
+                    let next = Self {
+                        owner,
+                        accelerator_suppressed,
+                    };
+                    return (next, KeyVerdict::Decline);
+                }
+                let next = Self { owner, ..self };
+                match (for_ime, forwarded) {
+                    (true, _) => (next, KeyVerdict::Decline),
+                    // A duplicate press.
+                    (false, true) => (next, KeyVerdict::Consume),
+                    (false, false) => {
+                        let owner = Some(Physical);
+                        (Self { owner, ..next }, KeyVerdict::Forward)
+                    }
+                }
+            }
+            (_, PhysicalKey::Release) => {
+                let verdict = match (owner, accelerator_suppressed) {
+                    (Some(Physical), false) => KeyVerdict::Forward,
+                    (Some(Physical), true) => KeyVerdict::Consume,
+                    _ => KeyVerdict::Decline,
+                };
+                // A recovery's tombstone outlives the release.
+                let owner = owner.filter(|&owner| owner == ImeRecovery);
+                let next = Self {
+                    owner,
+                    accelerator_suppressed: false,
+                };
+                (next, verdict)
+            }
+        }
+    }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GuestKeyDecision {
-    pub delivery: GuestKeyDelivery,
-    /// Present only for real wl_keyboard events.
-    pub ack_handled: Option<bool>,
+    /// An IME recovery of the generation: whether the guest gets its
+    /// balanced pair. A generation the guest holds, or a shortcut
+    /// consumed, is not recovered: the guest would get the key twice, or
+    /// the chord's key after Sommelier acted on it.
+    fn recover(self) -> (Self, bool) {
+        match self.owner {
+            Some(GuestKeyOwner::Physical | GuestKeyOwner::CompositorShortcut) => (self, false),
+            None | Some(GuestKeyOwner::ImeRecovery) => {
+                let owner = Some(GuestKeyOwner::ImeRecovery);
+                (Self { owner, ..self }, true)
+            }
+        }
+    }
 }
 
 /// One `zcr_extended_keyboard_v1.peek_key` of a key
@@ -145,11 +261,13 @@ pub struct PeekOutcome {
 /// ([`KeyGenerationRegistry::admit_key`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyAdmission {
-    /// The event is settled without a delivery decision: acknowledge it
-    /// with `handled`, and forward it to the guest or not.
-    Settled { handled: bool, forward: bool },
+    /// The event belongs to another generation, which settles it:
+    /// [`KeyVerdict::Forward`] closes a retired generation's guest press,
+    /// and [`KeyVerdict::Decline`] drops an event the current generation
+    /// does not expect.
+    Settled(KeyVerdict),
     /// The event belongs to the key's current generation: its delivery is
-    /// decided by [`KeyGenerationRegistry::transition_guest_key`].
+    /// decided by [`KeyGenerationRegistry::transition_physical`].
     Current,
 }
 
@@ -288,46 +406,9 @@ impl KeyPhase {
     }
 }
 
-/// Which channel gave the guest the generation's key, if any. A key has
-/// at most one: two would deliver it twice, and none could leave it
-/// stuck.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum GuestPress {
-    #[default]
-    None,
-    /// A `wl_keyboard.key` press, or one the enter listed, awaits its
-    /// release.
-    Physical,
-    /// Sommelier consumed the key as a window-layout shortcut.
-    Shortcut,
-    /// The guest got a balanced pair from an IME recovery; this tombstone
-    /// suppresses later duplicates.
-    Recovered,
-}
-
-impl GuestPress {
-    fn of(owner: GuestKeyOwner) -> Self {
-        match owner {
-            GuestKeyOwner::Physical => Self::Physical,
-            GuestKeyOwner::CompositorShortcut => Self::Shortcut,
-            GuestKeyOwner::ImeRecovery => Self::Recovered,
-        }
-    }
-
-    fn owner(self) -> Option<GuestKeyOwner> {
-        match self {
-            Self::None => None,
-            Self::Physical => Some(GuestKeyOwner::Physical),
-            Self::Shortcut => Some(GuestKeyOwner::CompositorShortcut),
-            Self::Recovered => Some(GuestKeyOwner::ImeRecovery),
-        }
-    }
-}
-
 /// All state for one keyboard/key generation: what the host showed of the
-/// key ([`KeyPhase`]), what the guest got of it ([`GuestPress`]), and
-/// whether a host accelerator took it. docs/KEYBOARD.md describes the
-/// machine.
+/// key ([`KeyPhase`]), and what the guest got of it ([`Delivery`]).
+/// docs/KEYBOARD.md describes the machine.
 ///
 /// A generation is retained after physical release only while a delayed guest
 /// delivery channel still needs its ownership or suppression tombstone, or
@@ -336,12 +417,7 @@ impl GuestPress {
 struct KeyGeneration {
     id: u64,
     phase: KeyPhase,
-    guest: GuestPress,
-    /// A `wl_keyboard` press of a generation no channel gave the guest was
-    /// a host accelerator: its release is dropped too, and no recovery may
-    /// deliver it. Only the generation's release, an `enter` or the
-    /// keyboard's end takes it.
-    host_accelerator_suppressed: bool,
+    delivery: Delivery,
 }
 
 impl KeyGeneration {
@@ -349,8 +425,7 @@ impl KeyGeneration {
         Self {
             id,
             phase: KeyPhase::Unseen,
-            guest: GuestPress::None,
-            host_accelerator_suppressed: false,
+            delivery: Delivery::default(),
         }
     }
 
@@ -360,7 +435,7 @@ impl KeyGeneration {
             KeyPhase::Held { .. } => false,
             KeyPhase::Released { peek, .. } => peek.provenance().is_none(),
         };
-        phase_unreferenced && self.guest == GuestPress::None && !self.host_accelerator_suppressed
+        phase_unreferenced && self.delivery == Delivery::default()
     }
 }
 
@@ -399,7 +474,11 @@ impl KeyGeneration {
     }
 
     fn guest_owner(self) -> Option<GuestKeyOwner> {
-        self.guest.owner()
+        self.delivery.owner
+    }
+
+    fn host_accelerator_suppressed(self) -> bool {
+        self.delivery.accelerator_suppressed
     }
 
     fn stale(self) -> bool {
@@ -680,7 +759,9 @@ impl KeyGenerationRegistry {
         let KeyPhase::Released { release_serial, .. } = generation.phase else {
             return;
         };
-        if let (GuestPress::Physical, Some(release_serial)) = (generation.guest, release_serial) {
+        if let (Some(GuestKeyOwner::Physical), Some(release_serial)) =
+            (generation.delivery.owner, release_serial)
+        {
             // Replaces the key's older retired release, if any; see
             // `retired_guest_releases`.
             if let Some(replaced) = self
@@ -707,7 +788,7 @@ impl KeyGenerationRegistry {
         for key in keys {
             let generation = self.ensure_generation(keyboard, key);
             generation.phase = KeyPhase::HELD;
-            generation.guest = GuestPress::Physical;
+            generation.delivery.owner = Some(GuestKeyOwner::Physical);
         }
     }
 
@@ -843,12 +924,12 @@ impl KeyGenerationRegistry {
         if !self.held_key_is_stale(keyboard, key) {
             return false;
         }
-        let release = self.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease);
+        let release = self.transition_physical(keyboard, key, PhysicalKey::Release);
         if let Some(keys) = self.entries.get_mut(&keyboard) {
             keys.remove(&key);
         }
         self.prune_key(keyboard, key);
-        release.delivery == GuestKeyDelivery::Forward
+        release.forward()
     }
 
     /// The transition for one `peek_key` of `key` on `keyboard`; its
@@ -948,18 +1029,12 @@ impl KeyGenerationRegistry {
         match state {
             KEY_STATE_RELEASED => {
                 if self.take_pending_physical_release(keyboard, key, serial) {
-                    return KeyAdmission::Settled {
-                        handled: true,
-                        forward: true,
-                    };
+                    return KeyAdmission::Settled(KeyVerdict::Forward);
                 }
                 if peek_press_serial.is_some()
                     && self.physical_release_serial(keyboard, key) != Some(serial)
                 {
-                    return KeyAdmission::Settled {
-                        handled: false,
-                        forward: false,
-                    };
+                    return KeyAdmission::Settled(KeyVerdict::Decline);
                 }
                 self.observe_physical_event(keyboard, key, state, Some(serial));
             }
@@ -967,10 +1042,7 @@ impl KeyGenerationRegistry {
                 if self.physically_held(keyboard, key)
                     && peek_press_serial.is_some_and(|peek_serial| peek_serial != serial)
                 {
-                    return KeyAdmission::Settled {
-                        handled: false,
-                        forward: false,
-                    };
+                    return KeyAdmission::Settled(KeyVerdict::Decline);
                 }
                 let delayed_released_peek_press =
                     self.physical_released(keyboard, key) && peek_press_serial == Some(serial);
@@ -1056,12 +1128,71 @@ impl KeyGenerationRegistry {
     }
 
     pub(crate) fn guest_owner(&self, keyboard: HostId, key: u32) -> Option<GuestKeyOwner> {
-        self.entries
-            .get(&keyboard)
-            .and_then(|keys| keys.get(&key))
-            .and_then(|generation| generation.guest.owner())
+        self.generation(keyboard, key)
+            .and_then(|generation| generation.delivery.owner)
     }
 
+    pub(crate) fn host_accelerator_suppressed(&self, keyboard: HostId, key: u32) -> bool {
+        self.generation(keyboard, key)
+            .is_some_and(|generation| generation.delivery.accelerator_suppressed)
+    }
+
+    fn generation(&self, keyboard: HostId, key: u32) -> Option<&KeyGeneration> {
+        self.entries.get(&keyboard).and_then(|keys| keys.get(&key))
+    }
+
+    /// Move `key`'s delivery by `transition`, and prune the generation if
+    /// nothing refers to it any more.
+    fn deliver<T>(
+        &mut self,
+        keyboard: HostId,
+        key: u32,
+        transition: impl FnOnce(Delivery) -> (Delivery, T),
+    ) -> T {
+        let before = self
+            .generation(keyboard, key)
+            .map_or_else(Delivery::default, |generation| generation.delivery);
+        let (delivery, output) = transition(before);
+        if delivery != before {
+            self.ensure_generation(keyboard, key).delivery = delivery;
+            self.prune_key(keyboard, key);
+        }
+        output
+    }
+
+    /// The delivery transition of a `wl_keyboard.key` that
+    /// [`Self::admit_key`] found current ([`Delivery::physical`]). A press
+    /// of a shortcut's generation, or of a host accelerator's, is not
+    /// guest input, so its peek no longer makes it a recovery candidate,
+    /// if `peek_key` raced ahead of it.
+    pub(crate) fn transition_physical(
+        &mut self,
+        keyboard: HostId,
+        key: u32,
+        event: PhysicalKey,
+    ) -> KeyVerdict {
+        let verdict = self.deliver(keyboard, key, |delivery| delivery.physical(event));
+        if let PhysicalKey::Press { chord, .. } = event {
+            let shortcut =
+                self.guest_owner(keyboard, key) == Some(GuestKeyOwner::CompositorShortcut);
+            if shortcut || chord == ChordClass::HostAccelerator {
+                self.invalidate_peek(keyboard, key);
+            }
+        }
+        verdict
+    }
+
+    /// An IME recovery of `key` ([`Delivery::recover`]): whether the guest
+    /// gets its balanced pair.
+    pub(crate) fn recover(&mut self, keyboard: HostId, key: u32) -> bool {
+        self.deliver(keyboard, key, Delivery::recover)
+    }
+}
+
+/// The registry's states as the model test sets them, through no
+/// transition.
+#[cfg(test)]
+impl KeyGenerationRegistry {
     pub(crate) fn claim_guest_owner(
         &mut self,
         keyboard: HostId,
@@ -1069,224 +1200,40 @@ impl KeyGenerationRegistry {
         owner: GuestKeyOwner,
     ) -> bool {
         let generation = self.ensure_generation(keyboard, key);
-        if generation.guest != GuestPress::None {
+        if generation.delivery.owner.is_some() {
             return false;
         }
-        generation.guest = GuestPress::of(owner);
+        generation.delivery.owner = Some(owner);
         true
     }
 
-    pub(crate) fn take_guest_owner(&mut self, keyboard: HostId, key: u32) -> Option<GuestKeyOwner> {
-        let owner = self
-            .entries
-            .get_mut(&keyboard)
-            .and_then(|keys| keys.get_mut(&key))
-            .and_then(|generation| std::mem::take(&mut generation.guest).owner());
-        self.prune_key(keyboard, key);
-        owner
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_guest_owner_if(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        expected: GuestKeyOwner,
-    ) -> bool {
-        let matches = self
-            .entries
-            .get(&keyboard)
-            .and_then(|keys| keys.get(&key))
-            .is_some_and(|generation| generation.guest.owner() == Some(expected));
-        if !matches {
-            return false;
-        }
-        self.take_guest_owner(keyboard, key) == Some(expected)
+    fn take_guest_owner(&mut self, keyboard: HostId, key: u32) {
+        self.deliver(keyboard, key, |delivery| {
+            (
+                Delivery {
+                    owner: None,
+                    ..delivery
+                },
+                (),
+            )
+        });
     }
 
     pub(crate) fn suppress_host_accelerator(&mut self, keyboard: HostId, key: u32) {
         self.ensure_generation(keyboard, key)
-            .host_accelerator_suppressed = true;
+            .delivery
+            .accelerator_suppressed = true;
     }
 
-    pub(crate) fn take_host_accelerator_suppression(&mut self, keyboard: HostId, key: u32) -> bool {
-        let suppressed = self
-            .entries
-            .get_mut(&keyboard)
-            .and_then(|keys| keys.get_mut(&key))
-            .is_some_and(|generation| std::mem::take(&mut generation.host_accelerator_suppressed));
-        self.prune_key(keyboard, key);
-        suppressed
-    }
-
-    pub(crate) fn host_accelerator_suppressed(&self, keyboard: HostId, key: u32) -> bool {
-        self.entries
-            .get(&keyboard)
-            .and_then(|keys| keys.get(&key))
-            .is_some_and(|generation| generation.host_accelerator_suppressed)
-    }
-
-    /// Route a `wl_keyboard` event to the channel that owns its generation.
-    ///
-    /// This applies [`GuestKeyOwner::admits_compositor_shortcut`] inside the
-    /// reducer, so the reducer stays consistent even if a caller routes an
-    /// event to the wrong channel:
-    ///
-    /// * A physical press or release of a generation a compositor shortcut
-    ///   owns is the shortcut's duplicate press or its release.
-    /// * A shortcut press of a generation the contract does not admit is
-    ///   rejected and becomes the owner's duplicate physical press. A shortcut
-    ///   release of a generation the shortcut does not own is a physical
-    ///   release. Both rejections are logged, because the keyboard handler
-    ///   never routes them.
-    fn arbitrate(event: GuestKeyEvent, owner: Option<GuestKeyOwner>) -> GuestKeyEvent {
-        let shortcut_owned = owner == Some(GuestKeyOwner::CompositorShortcut);
-        match event {
-            GuestKeyEvent::PhysicalPress { .. } if shortcut_owned => {
-                GuestKeyEvent::CompositorShortcutPress
-            }
-            GuestKeyEvent::PhysicalRelease if shortcut_owned => {
-                GuestKeyEvent::CompositorShortcutRelease
-            }
-            GuestKeyEvent::CompositorShortcutPress
-                if !GuestKeyOwner::admits_compositor_shortcut(owner) =>
-            {
-                log::warn!("rejecting a compositor shortcut press of a key owned by {owner:?}");
-                GuestKeyEvent::PhysicalPress {
-                    host_accelerator: false,
-                    ime_repeat_active: false,
-                }
-            }
-            GuestKeyEvent::CompositorShortcutRelease if !shortcut_owned => {
-                log::warn!("rejecting a compositor shortcut release of a key owned by {owner:?}");
-                GuestKeyEvent::PhysicalRelease
-            }
-            event => event,
-        }
-    }
-
-    /// Apply the only guest-delivery ownership transition for one key event.
-    ///
-    /// Physical state and peek provenance are observed separately because they
-    /// can arrive even when no guest event is emitted. This reducer owns the
-    /// mutually exclusive delivery channels and returns all information the
-    /// protocol handlers need to encode their result.
-    pub(crate) fn transition_guest_key(
-        &mut self,
-        keyboard: HostId,
-        key: u32,
-        event: GuestKeyEvent,
-    ) -> GuestKeyDecision {
-        match Self::arbitrate(event, self.guest_owner(keyboard, key)) {
-            GuestKeyEvent::PhysicalPress {
-                host_accelerator,
-                ime_repeat_active,
-            } => {
-                let owner = self.guest_owner(keyboard, key);
-                let forwarded = owner == Some(GuestKeyOwner::Physical);
-                let ime_recovered = owner == Some(GuestKeyOwner::ImeRecovery);
-                let suppress_for_ime = ime_recovered || (ime_repeat_active && !forwarded);
-                if suppress_for_ime && owner.is_none() {
-                    let claimed = self.claim_guest_owner(keyboard, key, GuestKeyOwner::ImeRecovery);
-                    debug_assert!(claimed, "guest owner was checked above");
-                }
-
-                let accelerator_was_suppressed = self.host_accelerator_suppressed(keyboard, key);
-                if accelerator_was_suppressed || host_accelerator {
-                    if !forwarded {
-                        self.suppress_host_accelerator(keyboard, key);
-                    }
-                    return GuestKeyDecision {
-                        delivery: GuestKeyDelivery::Drop,
-                        ack_handled: Some(false),
-                    };
-                }
-                if suppress_for_ime {
-                    return GuestKeyDecision {
-                        delivery: GuestKeyDelivery::Drop,
-                        ack_handled: Some(false),
-                    };
-                }
-                if forwarded {
-                    // A duplicate press.
-                    return GuestKeyDecision {
-                        delivery: GuestKeyDelivery::Drop,
-                        ack_handled: Some(true),
-                    };
-                }
-
-                let claimed = self.claim_guest_owner(keyboard, key, GuestKeyOwner::Physical);
-                debug_assert!(claimed, "new physical delivery had no guest owner");
-                GuestKeyDecision {
-                    delivery: GuestKeyDelivery::Forward,
-                    ack_handled: Some(true),
-                }
-            }
-            GuestKeyEvent::PhysicalRelease => {
-                let accelerator_suppressed = self.take_host_accelerator_suppression(keyboard, key);
-                let owner = self.guest_owner(keyboard, key);
-                let ime_recovered = owner == Some(GuestKeyOwner::ImeRecovery);
-                let forwarded = owner == Some(GuestKeyOwner::Physical);
-                if !ime_recovered {
-                    self.take_guest_owner(keyboard, key);
-                }
-                GuestKeyDecision {
-                    delivery: if forwarded && !accelerator_suppressed && !ime_recovered {
-                        GuestKeyDelivery::Forward
-                    } else {
-                        GuestKeyDelivery::Drop
-                    },
-                    ack_handled: Some(forwarded),
-                }
-            }
-            GuestKeyEvent::CompositorShortcutPress => {
-                let owner = self.guest_owner(keyboard, key);
-                debug_assert!(
-                    GuestKeyOwner::admits_compositor_shortcut(owner),
-                    "arbitrate routes only admitted shortcut presses here"
-                );
-                if owner.is_none() {
-                    let claimed =
-                        self.claim_guest_owner(keyboard, key, GuestKeyOwner::CompositorShortcut);
-                    debug_assert!(claimed, "shortcut press had no guest owner");
-                }
-                GuestKeyDecision {
-                    delivery: GuestKeyDelivery::Drop,
-                    ack_handled: Some(true),
-                }
-            }
-            GuestKeyEvent::CompositorShortcutRelease => {
-                let taken = self.take_guest_owner(keyboard, key);
-                debug_assert_eq!(taken, Some(GuestKeyOwner::CompositorShortcut));
-                GuestKeyDecision {
-                    delivery: GuestKeyDelivery::Drop,
-                    ack_handled: Some(true),
-                }
-            }
-            GuestKeyEvent::RecoverIme => {
-                let owner = self.guest_owner(keyboard, key);
-                // A compositor shortcut consumed this physical generation;
-                // recovering it would deliver the chord's key to the guest
-                // after Sommelier already acted on it.
-                if matches!(
-                    owner,
-                    Some(GuestKeyOwner::Physical | GuestKeyOwner::CompositorShortcut)
-                ) {
-                    return GuestKeyDecision {
-                        delivery: GuestKeyDelivery::Drop,
-                        ack_handled: None,
-                    };
-                }
-                if owner.is_none() {
-                    let claimed = self.claim_guest_owner(keyboard, key, GuestKeyOwner::ImeRecovery);
-                    debug_assert!(claimed, "guest owner was checked above");
-                }
-                GuestKeyDecision {
-                    delivery: GuestKeyDelivery::EmitBalancedPair,
-                    ack_handled: None,
-                }
-            }
-        }
+    fn take_host_accelerator_suppression(&mut self, keyboard: HostId, key: u32) {
+        self.deliver(keyboard, key, |delivery| {
+            let accelerator_suppressed = false;
+            let next = Delivery {
+                accelerator_suppressed,
+                ..delivery
+            };
+            (next, ())
+        });
     }
 }
 
@@ -1959,117 +1906,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn guest_key_owner_matches_the_model_for_all_short_transition_sequences() {
-        #[derive(Clone, Copy)]
-        enum Operation {
-            Claim(GuestKeyOwner),
-            Take(GuestKeyOwner),
-        }
-
-        let operations = [
-            Operation::Claim(GuestKeyOwner::Physical),
-            Operation::Claim(GuestKeyOwner::ImeRecovery),
-            Operation::Claim(GuestKeyOwner::CompositorShortcut),
-            Operation::Take(GuestKeyOwner::Physical),
-            Operation::Take(GuestKeyOwner::ImeRecovery),
-            Operation::Take(GuestKeyOwner::CompositorShortcut),
-        ];
-        let sequence_len = 5;
-        let sequence_count = operations.len().pow(sequence_len);
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let keyboard = HostId(10);
-        let key = 57;
-
-        for mut encoded in 0..sequence_count {
-            ctx.key_generations.clear_keyboard(keyboard);
-            let mut model = None;
-
-            for _ in 0..sequence_len {
-                let operation = operations[encoded % operations.len()];
-                encoded /= operations.len();
-                match operation {
-                    Operation::Claim(owner) => {
-                        let expected = model.is_none();
-                        assert_eq!(ctx.claim_guest_key(keyboard, key, owner), expected);
-                        if expected {
-                            model = Some(owner);
-                        }
-                    }
-                    Operation::Take(owner) => {
-                        let expected = model == Some(owner);
-                        assert_eq!(ctx.take_guest_key_if(keyboard, key, owner), expected);
-                        if expected {
-                            model = None;
-                        }
-                    }
-                }
-                assert_eq!(ctx.key_generations.guest_owner(keyboard, key), model);
-            }
-        }
-    }
-
-    #[test]
-    fn compositor_shortcut_arbitration_admits_only_unowned_or_shortcut_keys() {
-        for (owner, admitted) in [
-            (None, true),
-            (Some(GuestKeyOwner::CompositorShortcut), true),
-            (Some(GuestKeyOwner::Physical), false),
-            (Some(GuestKeyOwner::ImeRecovery), false),
-        ] {
-            assert_eq!(
-                GuestKeyOwner::admits_compositor_shortcut(owner),
-                admitted,
-                "{owner:?}"
-            );
-        }
-    }
-
-    const PRESS: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
-        host_accelerator: false,
-        ime_repeat_active: false,
+    const PRESS: PhysicalKey = PhysicalKey::Press {
+        chord: ChordClass::Guest,
+        backspace_leased: false,
     };
-    const ACCELERATOR_PRESS: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
-        host_accelerator: true,
-        ime_repeat_active: false,
+    const ACCELERATOR_PRESS: PhysicalKey = PhysicalKey::Press {
+        chord: ChordClass::HostAccelerator,
+        backspace_leased: false,
+    };
+    const SHORTCUT_PRESS: PhysicalKey = PhysicalKey::Press {
+        chord: ChordClass::Shortcut,
+        backspace_leased: false,
     };
 
-    fn forwarded(ack_handled: Option<bool>) -> GuestKeyDecision {
-        GuestKeyDecision {
-            delivery: GuestKeyDelivery::Forward,
-            ack_handled,
-        }
-    }
-
-    fn dropped(ack_handled: Option<bool>) -> GuestKeyDecision {
-        GuestKeyDecision {
-            delivery: GuestKeyDelivery::Drop,
-            ack_handled,
-        }
-    }
-
-    /// Give `key` of keyboard A `event`, and check the reducer's decision.
-    fn assert_decision(
+    /// Give `key` of keyboard A each event of `steps` in turn, and check
+    /// each verdict.
+    fn assert_verdicts(
         registry: &mut KeyGenerationRegistry,
         key: u32,
-        event: GuestKeyEvent,
-        expected: GuestKeyDecision,
-    ) {
-        assert_eq!(
-            registry.transition_guest_key(KEYBOARD_A, key, event),
-            expected,
-            "{event:?} of key {key}"
-        );
-    }
-
-    /// [`assert_decision`] for each event of `steps` in turn.
-    fn assert_decisions(
-        registry: &mut KeyGenerationRegistry,
-        key: u32,
-        steps: &[(GuestKeyEvent, GuestKeyDecision)],
+        steps: &[(PhysicalKey, KeyVerdict)],
     ) {
         for &(event, expected) in steps {
-            assert_decision(registry, key, event, expected);
+            assert_eq!(
+                registry.transition_physical(KEYBOARD_A, key, event),
+                expected,
+                "{event:?} of key {key}"
+            );
         }
     }
 
@@ -2077,23 +1939,22 @@ mod tests {
     fn shortcut_consumed(key: u32) -> KeyGenerationRegistry {
         let mut registry = KeyGenerationRegistry::default();
         registry.observe_physical_state(KEYBOARD_A, key, 1);
-        assert_decision(
+        assert_verdicts(
             &mut registry,
             key,
-            GuestKeyEvent::CompositorShortcutPress,
-            dropped(Some(true)),
+            &[(SHORTCUT_PRESS, KeyVerdict::Shortcut)],
         );
         registry
     }
 
-    /// The reducer used to ack a shortcut press or release as handled
-    /// whatever owned the key. An event that breaks the arbitration contract
-    /// is now rejected: it is decided as the owner's physical event.
+    /// A shortcut claims only a generation no channel owns: a press of its
+    /// chord on a generation another channel owns is that channel's
+    /// duplicate press, and its release that channel's release.
     #[test]
-    fn compositor_shortcut_press_is_rejected_for_another_owner() {
+    fn a_shortcut_press_of_another_channels_key_is_that_channels() {
         let key = 16;
         for owner in [GuestKeyOwner::Physical, GuestKeyOwner::ImeRecovery] {
-            // `reference` gets the physical events the shortcut stands for.
+            // `reference` gets a guest press instead of the chord.
             let owned = || {
                 let mut registry = KeyGenerationRegistry::default();
                 registry.observe_physical_state(KEYBOARD_A, key, 1);
@@ -2101,38 +1962,18 @@ mod tests {
                 registry
             };
             let (mut registry, mut reference) = (owned(), owned());
-
-            let decision = registry.transition_guest_key(
-                KEYBOARD_A,
-                key,
-                GuestKeyEvent::CompositorShortcutPress,
-            );
+            let verdict = registry.transition_physical(KEYBOARD_A, key, SHORTCUT_PRESS);
             assert_eq!(
-                decision,
-                reference.transition_guest_key(KEYBOARD_A, key, PRESS),
+                verdict,
+                reference.transition_physical(KEYBOARD_A, key, PRESS),
                 "{owner:?}"
             );
-            assert_eq!(
-                decision,
-                dropped(Some(owner != GuestKeyOwner::ImeRecovery)),
-                "{owner:?}"
-            );
+            let duplicate = match owner {
+                GuestKeyOwner::ImeRecovery => KeyVerdict::Decline,
+                _ => KeyVerdict::Consume,
+            };
+            assert_eq!(verdict, duplicate, "{owner:?}");
             assert_eq!(registry.guest_owner(KEYBOARD_A, key), Some(owner));
-
-            // A shortcut release of that generation is a physical release.
-            assert_eq!(
-                registry.transition_guest_key(
-                    KEYBOARD_A,
-                    key,
-                    GuestKeyEvent::CompositorShortcutRelease
-                ),
-                reference.transition_guest_key(KEYBOARD_A, key, GuestKeyEvent::PhysicalRelease),
-                "{owner:?}"
-            );
-            assert_eq!(
-                registry.guest_owner(KEYBOARD_A, key),
-                reference.guest_owner(KEYBOARD_A, key)
-            );
         }
     }
 
@@ -2140,16 +1981,15 @@ mod tests {
     fn physical_events_of_a_consumed_shortcut_stay_with_the_shortcut() {
         let key = 16;
         let mut registry = shortcut_consumed(key);
-        assert_decision(&mut registry, key, PRESS, dropped(Some(true)));
+        assert_verdicts(&mut registry, key, &[(PRESS, KeyVerdict::Consume)]);
         assert_eq!(
             registry.guest_owner(KEYBOARD_A, key),
             Some(GuestKeyOwner::CompositorShortcut)
         );
-        assert_decision(
+        assert_verdicts(
             &mut registry,
             key,
-            GuestKeyEvent::PhysicalRelease,
-            dropped(Some(true)),
+            &[(PhysicalKey::Release, KeyVerdict::Consume)],
         );
         assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
     }
@@ -2161,16 +2001,15 @@ mod tests {
 
         // A consumed shortcut key must not reach the guest as a recovered
         // pair, and recovery must leave its ownership for the release.
-        assert_decision(&mut registry, key, GuestKeyEvent::RecoverIme, dropped(None));
+        assert!(!registry.recover(KEYBOARD_A, key));
         assert_eq!(
             registry.guest_owner(KEYBOARD_A, key),
             Some(GuestKeyOwner::CompositorShortcut)
         );
-        assert_decision(
+        assert_verdicts(
             &mut registry,
             key,
-            GuestKeyEvent::CompositorShortcutRelease,
-            dropped(Some(true)),
+            &[(PhysicalKey::Release, KeyVerdict::Consume)],
         );
         assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
     }
@@ -2180,60 +2019,52 @@ mod tests {
         let mut registry = KeyGenerationRegistry::default();
 
         let physical_key = 30;
-        assert_decisions(
+        assert_verdicts(
             &mut registry,
             physical_key,
             &[
-                (PRESS, forwarded(Some(true))),
-                (GuestKeyEvent::PhysicalRelease, forwarded(Some(true))),
-                (
-                    GuestKeyEvent::RecoverIme,
-                    GuestKeyDecision {
-                        delivery: GuestKeyDelivery::EmitBalancedPair,
-                        ack_handled: None,
-                    },
-                ),
-                // A delayed physical press cannot duplicate the recovered
-                // pair.
-                (
-                    GuestKeyEvent::PhysicalPress {
-                        host_accelerator: false,
-                        ime_repeat_active: true,
-                    },
-                    dropped(Some(false)),
-                ),
+                (PRESS, KeyVerdict::Forward),
+                (PhysicalKey::Release, KeyVerdict::Forward),
             ],
+        );
+        assert!(registry.recover(KEYBOARD_A, physical_key));
+        // A delayed physical press cannot duplicate the recovered pair.
+        let leased = PhysicalKey::Press {
+            chord: ChordClass::Guest,
+            backspace_leased: true,
+        };
+        assert_verdicts(
+            &mut registry,
+            physical_key,
+            &[(leased, KeyVerdict::Decline)],
         );
 
         // An accelerator release cannot escape without a guest press.
         let accelerator_key = 31;
-        assert_decisions(
+        assert_verdicts(
             &mut registry,
             accelerator_key,
             &[
-                (ACCELERATOR_PRESS, dropped(Some(false))),
-                (GuestKeyEvent::PhysicalRelease, dropped(Some(false))),
+                (ACCELERATOR_PRESS, KeyVerdict::Decline),
+                (PhysicalKey::Release, KeyVerdict::Decline),
             ],
         );
     }
 
     #[test]
     fn guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces() {
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, Debug)]
         enum Operation {
-            PhysicalPress,
-            PhysicalRelease,
+            Physical(PhysicalKey),
             Recover,
-            ShortcutPress,
-            ShortcutRelease,
         }
 
         let operations = [
-            Operation::PhysicalPress,
-            Operation::PhysicalRelease,
+            Operation::Physical(PRESS),
+            Operation::Physical(ACCELERATOR_PRESS),
+            Operation::Physical(SHORTCUT_PRESS),
+            Operation::Physical(PhysicalKey::Release),
             Operation::Recover,
-            Operation::ShortcutPress,
-            Operation::ShortcutRelease,
         ];
         let sequence_len = 6;
         let sequence_count = operations.len().pow(sequence_len);
@@ -2247,81 +2078,67 @@ mod tests {
             for _ in 0..sequence_len {
                 let operation = operations[encoded % operations.len()];
                 encoded /= operations.len();
-                let event = match operation {
-                    Operation::PhysicalPress => PRESS,
-                    Operation::PhysicalRelease => GuestKeyEvent::PhysicalRelease,
-                    Operation::Recover => GuestKeyEvent::RecoverIme,
-                    Operation::ShortcutPress => GuestKeyEvent::CompositorShortcutPress,
-                    Operation::ShortcutRelease => GuestKeyEvent::CompositorShortcutRelease,
-                };
                 let owner_before = registry.guest_owner(keyboard, key);
-                let decision = registry.transition_guest_key(keyboard, key, event);
-
+                let suppressed_before = registry.host_accelerator_suppressed(keyboard, key);
+                let event = match operation {
+                    Operation::Physical(event) => event,
+                    Operation::Recover => {
+                        let recovered = registry.recover(keyboard, key);
+                        assert!(
+                            !recovered || !guest_press_open,
+                            "recovery cannot overlap an owned guest press"
+                        );
+                        assert_eq!(
+                            registry.guest_owner(keyboard, key) == Some(GuestKeyOwner::Physical),
+                            guest_press_open
+                        );
+                        continue;
+                    }
+                };
+                let verdict = registry.transition_physical(keyboard, key, event);
+                let shortcut = owner_before == Some(GuestKeyOwner::CompositorShortcut);
+                let handled = match event {
+                    PhysicalKey::Press { chord, .. } => {
+                        shortcut
+                            || (owner_before.is_none() && chord == ChordClass::Shortcut)
+                            || (owner_before != Some(GuestKeyOwner::ImeRecovery)
+                                && !suppressed_before
+                                && chord != ChordClass::HostAccelerator)
+                    }
+                    PhysicalKey::Release => {
+                        shortcut || owner_before == Some(GuestKeyOwner::Physical)
+                    }
+                };
                 assert_eq!(
-                    decision.ack_handled,
-                    match operation {
-                        Operation::PhysicalPress => {
-                            Some(owner_before != Some(GuestKeyOwner::ImeRecovery))
-                        }
-                        // An admitted shortcut press is acked as handled; a
-                        // rejected one is the owner's duplicate press.
-                        Operation::ShortcutPress => {
-                            Some(owner_before != Some(GuestKeyOwner::ImeRecovery))
-                        }
-                        Operation::PhysicalRelease | Operation::ShortcutRelease => Some(matches!(
-                            owner_before,
-                            Some(GuestKeyOwner::Physical | GuestKeyOwner::CompositorShortcut)
-                        )),
-                        Operation::Recover => None,
-                    },
-                    "ACK policy must remain coupled to the generation owner"
+                    verdict.handled(),
+                    handled,
+                    "ACK policy must remain coupled to the generation owner: {event:?} \
+                     of {owner_before:?}"
                 );
-                match (operation, decision.delivery) {
-                    (Operation::PhysicalPress, GuestKeyDelivery::Forward) => {
+                match (event, verdict) {
+                    (PhysicalKey::Press { .. }, KeyVerdict::Forward) => {
                         assert!(!guest_press_open, "a second press cannot be forwarded");
                         guest_press_open = true;
                     }
-                    (
-                        Operation::PhysicalRelease | Operation::ShortcutRelease,
-                        GuestKeyDelivery::Forward,
-                    ) => {
+                    (PhysicalKey::Release, KeyVerdict::Forward) => {
                         assert!(
                             guest_press_open,
                             "release forwarding requires an open guest press"
                         );
                         guest_press_open = false;
                     }
-                    (_, GuestKeyDelivery::EmitBalancedPair) => {
-                        assert!(
-                            matches!(operation, Operation::Recover),
-                            "only IME recovery may emit a balanced pair"
-                        );
-                        assert!(
-                            !guest_press_open,
-                            "recovery cannot overlap an owned guest press"
-                        );
-                    }
-                    (_, GuestKeyDelivery::Drop) => {}
-                    _ => panic!("delivery kind does not match its normalized input event"),
-                }
-                match operation {
-                    Operation::ShortcutPress => assert_eq!(
-                        registry.guest_owner(keyboard, key),
-                        if GuestKeyOwner::admits_compositor_shortcut(owner_before) {
-                            Some(GuestKeyOwner::CompositorShortcut)
-                        } else {
-                            owner_before
+                    // Only a forwarded release closes the guest's press.
+                    (PhysicalKey::Release, _) => {}
+                    (
+                        PhysicalKey::Press {
+                            chord: ChordClass::Shortcut,
+                            ..
                         },
-                        "a shortcut claims only an admitted generation"
-                    ),
-                    Operation::ShortcutRelease
-                        if owner_before == Some(GuestKeyOwner::CompositorShortcut) =>
-                    {
-                        assert_eq!(registry.guest_owner(keyboard, key), None);
-                    }
-                    _ => {}
+                        KeyVerdict::Shortcut,
+                    ) => assert_eq!(owner_before, None, "a shortcut claims an unowned key"),
+                    (_, KeyVerdict::Shortcut) => panic!("only a shortcut press claims"),
+                    (PhysicalKey::Press { .. }, _) => {}
                 }
-
                 assert_eq!(
                     registry.guest_owner(keyboard, key) == Some(GuestKeyOwner::Physical),
                     guest_press_open,
@@ -2547,17 +2364,11 @@ mod tests {
                 let generation = self.keys.get(&key).copied();
                 let peek_press_serial =
                     generation.and_then(|generation| generation.peek_press_serial);
-                let dropped = KeyAdmission::Settled {
-                    handled: false,
-                    forward: false,
-                };
+                let dropped = KeyAdmission::Settled(KeyVerdict::Decline);
                 if state == 0 {
                     if self.retired_guest_releases.get(&key) == Some(&serial) {
                         self.retired_guest_releases.remove(&key);
-                        return KeyAdmission::Settled {
-                            handled: true,
-                            forward: true,
-                        };
+                        return KeyAdmission::Settled(KeyVerdict::Forward);
                     }
                     if peek_press_serial.is_some()
                         && generation.and_then(|generation| generation.physical_release_serial)
@@ -2867,7 +2678,7 @@ mod tests {
                         expected.stale && expected.physical_state == PhysicalKeyState::Held
                     );
                     assert_eq!(
-                        actual.host_accelerator_suppressed,
+                        actual.host_accelerator_suppressed(),
                         expected.host_accelerator_suppressed
                     );
                 }
@@ -2955,8 +2766,8 @@ mod tests {
         for generation in 1..=generations {
             let serial = 10 * generation;
             registry.observe_peek_press(KEYBOARD_A, key, serial, serial, true);
-            let decision = registry.transition_guest_key(KEYBOARD_A, key, PRESS);
-            assert_eq!(decision, forwarded(Some(true)));
+            let verdict = registry.transition_physical(KEYBOARD_A, key, PRESS);
+            assert_eq!(verdict, KeyVerdict::Forward);
             registry.observe_peek_release(KEYBOARD_A, key, serial + 1);
         }
         let next = 10 * (generations + 1);

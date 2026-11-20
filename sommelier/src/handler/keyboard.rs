@@ -40,8 +40,8 @@ use crate::protocols::wayland::wl_keyboard::{
     self, KEYMAP_FORMAT_NO_KEYMAP, KEYMAP_FORMAT_XKB_V1, KEY_STATE_PRESSED, KEY_STATE_RELEASED,
 };
 use crate::state::{
-    Context, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyAdmission, KeyboardFocus,
-    KeyboardModifiers, PeekInput,
+    ChordClass, Context, HostId, KeyAdmission, KeyVerdict, KeyboardFocus, KeyboardModifiers,
+    PeekInput, PhysicalKey,
 };
 use crate::warn_once::WarnOnce;
 use crate::window_layout::NormalizedRect;
@@ -82,6 +82,17 @@ enum KeyClass {
     Placement(NormalizedRect),
     /// Ordinary guest input.
     Guest,
+}
+
+impl KeyClass {
+    /// The class the key generations know: placement is the keyboard's.
+    fn chord(self) -> ChordClass {
+        match self {
+            Self::HostAccelerator => ChordClass::HostAccelerator,
+            Self::Placement(_) => ChordClass::Shortcut,
+            Self::Guest => ChordClass::Guest,
+        }
+    }
 }
 
 /// A private, read-only view of a keymap fd mapped into the process address space.
@@ -424,6 +435,14 @@ impl KeyboardHandler {
                     host_keyboard_id.0
                 );
             }
+        }
+    }
+
+    /// How a key of `verdict` is dispatched.
+    fn action(verdict: KeyVerdict) -> Action {
+        match verdict.forward() {
+            true => Action::Forward,
+            false => Action::Drop,
         }
     }
 
@@ -777,51 +796,15 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 ctx,
                 host_keyboard_id,
             );
-        if let KeyAdmission::Settled { handled, forward } =
+        if let KeyAdmission::Settled(verdict) =
             ctx.key_generations
                 .admit_key(host_keyboard_id, key, state, serial)
         {
-            Self::send_ack_key(ctx, host_keyboard_id, serial, handled);
-            return if forward {
-                Action::Forward
-            } else {
-                Action::Drop
-            };
+            Self::send_ack_key(ctx, host_keyboard_id, serial, verdict.handled());
+            return Self::action(verdict);
         }
 
-        let guest_owner = ctx.key_generations.guest_owner(host_keyboard_id, key);
-        let key_class = match state {
-            KEY_STATE_PRESSED => Self::classify_key(ctx, host_keyboard_id, key),
-            _ => KeyClass::Guest,
-        };
-        // Only the press that claims an unowned key generation for a
-        // placement chord is routed here, because it runs placement (a side
-        // effect) first. A duplicate press and a release are sent as
-        // physical events: the reducer's `arbitrate` routes them to the
-        // channel that owns the generation (see
-        // `GuestKeyOwner::admits_compositor_shortcut`).
-        let claims_shortcut = match (state, guest_owner, key_class) {
-            (KEY_STATE_PRESSED, None, KeyClass::Placement(action)) => {
-                // The policy owns every matched chord, so the chord is
-                // consumed whether or not the window can move now; a skip
-                // must not leak the key to the guest.
-                if let Err(reason) =
-                    crate::handler::window_placement::place_focused(ctx, host_keyboard_id, action)
-                {
-                    log::log!(
-                        reason.log_level(),
-                        "window layout {:?} skipped for keyboard {}: {:?}",
-                        action,
-                        host_keyboard_id.0,
-                        reason
-                    );
-                }
-                true
-            }
-            _ => false,
-        };
-
-        let decision = match state {
+        let (event, class) = match state {
             KEY_STATE_PRESSED => {
                 if key != EVDEV_KEY_BACKSPACE {
                     ctx.key_generations
@@ -830,40 +813,16 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                         crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
-                // A Sommelier-owned shortcut is not guest input, and neither
-                // is a host accelerator: neither may become an IME recovery
-                // candidate if peek_key raced ahead of this event.
-                let compositor_shortcut =
-                    claims_shortcut || guest_owner == Some(GuestKeyOwner::CompositorShortcut);
-                let host_accelerator =
-                    !compositor_shortcut && key_class == KeyClass::HostAccelerator;
-                if compositor_shortcut || host_accelerator {
-                    ctx.key_generations.invalidate_peek(host_keyboard_id, key);
-                }
-                let event = if claims_shortcut {
-                    GuestKeyEvent::CompositorShortcutPress
-                } else {
-                    GuestKeyEvent::PhysicalPress {
-                        host_accelerator,
-                        ime_repeat_active: backspace_repeat_active,
-                    }
-                };
-                ctx.key_generations
-                    .transition_guest_key(host_keyboard_id, key, event)
+                let class = Self::classify_key(ctx, host_keyboard_id, key);
+                (
+                    PhysicalKey::Press {
+                        chord: class.chord(),
+                        backspace_leased: backspace_repeat_active,
+                    },
+                    class,
+                )
             }
-            KEY_STATE_RELEASED => {
-                let decision = ctx.key_generations.transition_guest_key(
-                    host_keyboard_id,
-                    key,
-                    GuestKeyEvent::PhysicalRelease,
-                );
-                if key == EVDEV_KEY_BACKSPACE {
-                    if let Some(guest_seat) = guest_seat {
-                        crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
-                    }
-                }
-                decision
-            }
+            KEY_STATE_RELEASED => (PhysicalKey::Release, KeyClass::Guest),
             // Exo sends no repeats, and `wl_keyboard` has none before
             // version 10, beyond the version 5 the proxy binds `wl_seat` at.
             other => {
@@ -871,18 +830,32 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 return Action::Drop;
             }
         };
-
-        let handled = decision
-            .ack_handled
-            .expect("physical key decisions always carry an ACK");
-        Self::send_ack_key(ctx, host_keyboard_id, serial, handled);
-        let action = match decision.delivery {
-            GuestKeyDelivery::Forward => Action::Forward,
-            GuestKeyDelivery::Drop => Action::Drop,
-            GuestKeyDelivery::EmitBalancedPair => {
-                unreachable!("physical key events never emit synthetic pairs")
+        let verdict = ctx
+            .key_generations
+            .transition_physical(host_keyboard_id, key, event);
+        if let (KeyVerdict::Shortcut, KeyClass::Placement(action)) = (verdict, class) {
+            // The policy owns every matched chord, so the chord is
+            // consumed whether or not the window can move now; a skip
+            // must not leak the key to the guest.
+            if let Err(reason) =
+                crate::handler::window_placement::place_focused(ctx, host_keyboard_id, action)
+            {
+                log::log!(
+                    reason.log_level(),
+                    "window layout {:?} skipped for keyboard {}: {:?}",
+                    action,
+                    host_keyboard_id.0,
+                    reason
+                );
             }
-        };
+        }
+        if state == KEY_STATE_RELEASED && key == EVDEV_KEY_BACKSPACE {
+            if let Some(guest_seat) = guest_seat {
+                crate::handler::ime_keys::end_backspace_repeat_for_seat(ctx, guest_seat);
+            }
+        }
+        Self::send_ack_key(ctx, host_keyboard_id, serial, verdict.handled());
+        let action = Self::action(verdict);
 
         if action == Action::Forward
             && state != KEY_STATE_RELEASED
@@ -1123,7 +1096,7 @@ mod tests {
     use crate::protocols::xdg_shell::xdg_toplevel;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{GuestKeyEvent, OutputState};
+    use crate::state::{GuestKeyOwner, OutputState};
     use crate::test_support::text_input::{self, Host};
     use crate::test_support::{decode, msg_opcode, msg_sender, shm_pool_file};
     use crate::wire::WL_DISPLAY_ID;
@@ -1911,25 +1884,23 @@ mod tests {
         let key = 24;
         let mut ctx = Context::new_for_test(false, false, vec![]);
 
-        let press = ctx.key_generations.transition_guest_key(
-            keyboard,
-            key,
-            GuestKeyEvent::CompositorShortcutPress,
-        );
-        assert_eq!(press.delivery, GuestKeyDelivery::Drop);
-        assert_eq!(press.ack_handled, Some(true));
+        let press = PhysicalKey::Press {
+            chord: ChordClass::Shortcut,
+            backspace_leased: false,
+        };
+        let press = ctx
+            .key_generations
+            .transition_physical(keyboard, key, press);
+        assert_eq!(press, KeyVerdict::Shortcut);
         assert_eq!(
             ctx.key_generations.guest_owner(keyboard, key),
             Some(CompositorShortcut)
         );
 
-        let release = ctx.key_generations.transition_guest_key(
-            keyboard,
-            key,
-            GuestKeyEvent::CompositorShortcutRelease,
-        );
-        assert_eq!(release.delivery, GuestKeyDelivery::Drop);
-        assert_eq!(release.ack_handled, Some(true));
+        let release = ctx
+            .key_generations
+            .transition_physical(keyboard, key, PhysicalKey::Release);
+        assert_eq!(release, KeyVerdict::Consume);
         assert_eq!(ctx.key_generations.guest_owner(keyboard, key), None);
     }
 
@@ -2263,11 +2234,7 @@ mod tests {
     fn a_chord_the_guest_already_received_stays_the_guests() {
         let mut p = placeable_shortcut();
         let keyboard = HostId(PLACING.host);
-        let decision =
-            p.ctx
-                .key_generations
-                .transition_guest_key(keyboard, KEY_Q, GuestKeyEvent::RecoverIme);
-        assert_eq!(decision.delivery, GuestKeyDelivery::EmitBalancedPair);
+        assert!(p.ctx.key_generations.recover(keyboard, KEY_Q));
         assert_eq!(
             p.key(PLACING, 2, 100, KEY_Q, PRESSED),
             Action::Drop,
@@ -2384,12 +2351,8 @@ mod tests {
                 .is_some_and(|press| !press.eligible),
             "a consumed shortcut generation must not be recoverable"
         );
-        assert_eq!(
-            p.ctx
-                .key_generations
-                .transition_guest_key(keyboard, KEY_Q, GuestKeyEvent::RecoverIme)
-                .delivery,
-            GuestKeyDelivery::Drop,
+        assert!(
+            !p.ctx.key_generations.recover(keyboard, KEY_Q),
             "an empty IME confirmation must not replay the consumed key"
         );
 

@@ -19,9 +19,7 @@ use crate::ime::{SeatId, TiId};
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{
-    Context, GuestKeyDelivery, GuestKeyEvent, HostId, InternalCallback, ShadowTable,
-};
+use crate::state::{Context, HostId, InternalCallback, ShadowTable};
 use std::collections::BTreeMap;
 
 /// Return whether the repeat fallback belongs to this physical host
@@ -231,12 +229,7 @@ pub(super) fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option
 /// are those of the `wl_keyboard.key` Exo would have sent; see
 /// INVARIANTS "A recovered key carries the host's serial".
 pub(super) fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> bool {
-    let decision = ctx.key_generations.transition_guest_key(
-        held.host_keyboard_id,
-        held.key,
-        GuestKeyEvent::RecoverIme,
-    );
-    if decision.delivery != GuestKeyDelivery::EmitBalancedPair {
+    if !ctx.key_generations.recover(held.host_keyboard_id, held.key) {
         // The normal wl_keyboard path already delivered this physical
         // generation to the guest. The confirmation still closes a
         // text-input transaction, but another key pair would duplicate it.

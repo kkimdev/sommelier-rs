@@ -46,9 +46,9 @@ use xkbcommon::xkb;
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
-    GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, KeyAdmission,
-    KeyGenerationRegistry, KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PeekInput,
-    PeekKeyProvenance, PeekOutcome, PointerFocus, SeatFocusChange,
+    ChordClass, GuestKeyOwner, KeyAdmission, KeyGenerationRegistry, KeyVerdict, KeyboardFocus,
+    KeyboardFocusRegistry, KeyboardFocusUpdate, PeekInput, PeekKeyProvenance, PeekOutcome,
+    PhysicalKey, PointerFocus, SeatFocusChange,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::objects::{DeletedHostId, Link, ShadowTable};
@@ -948,18 +948,6 @@ impl Context {
     ) -> bool {
         self.key_generations
             .claim_guest_owner(host_keyboard_id, key, owner)
-    }
-
-    /// Release a key only when the expected source still owns it.
-    #[cfg(test)]
-    pub(crate) fn take_guest_key_if(
-        &mut self,
-        host_keyboard_id: HostId,
-        key: u32,
-        expected: GuestKeyOwner,
-    ) -> bool {
-        self.key_generations
-            .take_guest_owner_if(host_keyboard_id, key, expected)
     }
 
     /// Create the state of one client connection.
