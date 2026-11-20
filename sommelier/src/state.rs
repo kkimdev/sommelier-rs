@@ -1126,8 +1126,8 @@ mod tests {
         guest.set_nonblocking(true).unwrap();
         let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
 
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.clipboard_pumps.slot().unwrap().start(async move {
+        let mut pumps = ClipboardPumps::default();
+        pumps.slot().unwrap().start(async move {
             let pump = crate::handler::data_device::pump(src.into(), dst.into());
             pump.await.expect("the pump runs until it is stopped");
         });
@@ -1138,7 +1138,7 @@ mod tests {
         guest.read_exact(&mut first).await.unwrap();
         assert_eq!(&first, b"first");
 
-        ctx.clipboard_pumps.stop().await;
+        pumps.stop().await;
 
         assert!(!pump_ends.into_iter().any(any_fd_has_identity));
         assert_eq!(
@@ -1152,25 +1152,22 @@ mod tests {
     /// finishes makes room for another.
     #[tokio::test]
     async fn clipboard_pumps_are_capped_per_connection() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut pumps = ClipboardPumps::default();
         let mut releases = Vec::new();
         for _ in 0..MAX_CLIPBOARD_PUMPS {
             let (release, released) = tokio::sync::oneshot::channel::<()>();
-            let slot = ctx.clipboard_pumps.slot().expect("room under the cap");
+            let slot = pumps.slot().expect("room under the cap");
             slot.start(async {
                 let _ = released.await;
             });
             releases.push(release);
         }
-        assert!(
-            ctx.clipboard_pumps.slot().is_none(),
-            "no pump beyond the cap"
-        );
+        assert!(pumps.slot().is_none(), "no pump beyond the cap");
 
         drop(releases.pop());
         // Every ready task runs before this one resumes.
         tokio::task::yield_now().await;
-        assert!(ctx.clipboard_pumps.slot().is_some());
+        assert!(pumps.slot().is_some());
     }
 
     #[test]

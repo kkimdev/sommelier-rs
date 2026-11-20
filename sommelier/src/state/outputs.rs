@@ -411,16 +411,6 @@ impl OutputRegistry {
         self.commit(output);
     }
 
-    /// The committed metadata of a live output, usable or not.
-    pub(crate) fn committed_for_test(&self, output: u32) -> Option<OutputState> {
-        Some(self.record(output)?.committed)
-    }
-
-    /// Whether any output has uncommitted metadata.
-    pub(crate) fn has_pending_for_test(&self) -> bool {
-        self.records.iter().any(|record| record.pending.is_some())
-    }
-
     /// The output `surface` entered last.
     pub(crate) fn entered_for_test(&self, surface: u32) -> Option<u32> {
         self.surface_outputs.get(&surface).copied()

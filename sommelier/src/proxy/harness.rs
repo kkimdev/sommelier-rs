@@ -468,13 +468,20 @@ impl Session {
     /// `zaura_shell`. Neither peer's messages are kept.
     pub(crate) async fn aura_shell(&mut self) -> u32 {
         use crate::protocols::aura_shell::zaura_shell;
+        self.aura_shell_at(zaura_shell::VERSION).await
+    }
+
+    /// [`Self::aura_shell`] at `version`, for a test of what an older
+    /// shell gives.
+    pub(crate) async fn aura_shell_at(&mut self, version: u32) -> u32 {
+        use crate::protocols::aura_shell::zaura_shell;
         self.registry().await;
-        self.advertise(zaura_shell::NAME, zaura_shell::VERSION)
-            .await;
+        self.advertise(zaura_shell::NAME, version).await;
         let host = self.host_received();
         let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))] = &host[..] else {
             panic!("the proxy did not bind zaura_shell: {host:?}");
         };
+        assert_eq!(id.1, version, "the proxy binds the shell it is offered");
         let advertised = self.guest_received();
         assert!(
             matches!(

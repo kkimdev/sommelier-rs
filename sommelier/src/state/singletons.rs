@@ -114,16 +114,6 @@ impl Singletons {
         );
     }
 
-    /// Change the bound version of `singleton`, which is bound, for a test
-    /// of version-dependent behavior.
-    #[cfg(test)]
-    pub(crate) fn set_version_for_test(&mut self, singleton: Singleton, version: u32) {
-        self.0
-            .get_mut(&singleton)
-            .expect("a bound singleton")
-            .version = version;
-    }
-
     /// Forget `singleton`'s binding, for a test of a proxy that has none.
     #[cfg(test)]
     pub(crate) fn unbind_for_test(&mut self, singleton: Singleton) {

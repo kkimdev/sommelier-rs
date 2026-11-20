@@ -250,34 +250,39 @@ mod tests {
         assert_eq!(s.surface().await.host, host, "freed by its delete_id");
     }
 
-    #[test]
-    fn placement_barrier_completes_and_reserves_callback_until_delete_id() {
-        use crate::handler::Handlers;
-        use crate::protocols::wayland::wl_callback::WlCallbackHandler;
-        use crate::protocols::wayland::wl_display::WlDisplayHandler;
-        use crate::state::{HostId, InternalCallback};
-        use crate::wire::Action;
-        let callback_id = 40;
-        let mut ctx = Context::with_placement_for_test(
-            crate::placement_config::PlacementConfig::active_for_test(&[]),
-        );
-        ctx.shadow_table
-            .insert_host_only_for_test(callback_id, "wl_callback", 1);
-        ctx.internal_callbacks.register(
-            HostId(callback_id),
-            InternalCallback::PlacementBarrier { zaura_toplevel: 77 },
-        );
-        ctx.last_sender_id = callback_id;
+    /// A placement barrier's `done` completes it, reaches no peer, and
+    /// keeps its host ID reserved until the host's `delete_id`.
+    #[tokio::test]
+    async fn placement_barrier_completes_and_reserves_callback_until_delete_id() {
+        use crate::handler::window_placement::fixture::{Desk, Window};
+        use crate::placement_config::PlacementConfig;
+        use crate::protocols::xdg_shell::xdg_toplevel;
+        let mut d = Desk::new(PlacementConfig::active_for_test(&[("<Alt>q", "top-left")])).await;
+        let w = Window::new(&mut d).await;
+        w.configured(&mut d, (100, 100), 5).await;
+        d.focus().await;
+        d.chord(3).await;
+        let barrier = synced(d.s.host_received().last().expect("a placement barrier"));
+        // The toplevel ends, so the barrier has no step left to send.
+        d.s.guest([xdg_toplevel::req::destroy(w.toplevel)]).await;
+        d.s.host_received();
 
-        assert_eq!(Handlers::on_done(&mut ctx, 123), Action::Drop);
-        assert_eq!(ctx.internal_callbacks.count(), 0);
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert!(ctx.shadow_table.is_retired_host(callback_id));
-        assert!(!ctx.shadow_table.is_host_id_available(callback_id));
+        d.s.host([wl_callback::evt::done(barrier, 0)]).await;
+        assert_eq!(d.s.guest_received(), []);
+        assert_eq!(d.s.host_received(), []);
+        let callback = d.s.new_id();
+        let host_callback =
+            d.s.create(wl_display::req::sync(WL_DISPLAY_ID, callback))
+                .await;
+        assert_ne!(host_callback, barrier, "reserved until its delete_id");
 
-        ctx.last_sender_id = 1;
-        assert_eq!(Handlers::on_delete_id(&mut ctx, callback_id), Action::Drop);
-        assert!(ctx.shadow_table.is_host_id_available(callback_id));
+        d.s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, barrier)])
+            .await;
+        assert_eq!(d.s.guest_received(), []);
+        let callback = d.s.new_id();
+        let host_callback =
+            d.s.create(wl_display::req::sync(WL_DISPLAY_ID, callback))
+                .await;
+        assert_eq!(host_callback, barrier, "freed by its delete_id");
     }
 }

@@ -129,27 +129,6 @@ pub fn dispatch_request(
     crate::protocols::dispatch_request::<crate::handler::Handlers>(sender, msg, ctx)
 }
 
-/// Dispatch host event `msg` to the proxy's handlers as `Client` does:
-/// one from an untracked sender is dropped, and any other decodes whole
-/// first. Unlike `Client`, this dispatches an event of a destroyed guest
-/// object too.
-pub fn dispatch_event(
-    ctx: &mut crate::state::Context,
-    msg: &mut WireMessage,
-) -> Result<Option<Outgoing>, ProtocolError> {
-    let Some(sender) = ctx.shadow_table.resolve_event(msg.sender_id) else {
-        return Ok(None);
-    };
-    let event = crate::protocols::AnyEvent::decode(sender.iface, msg)?;
-    ctx.last_sender_id = msg.sender_id;
-    crate::protocols::dispatch_event::<crate::handler::Handlers>(
-        sender,
-        event,
-        msg.payload.len(),
-        ctx,
-    )
-}
-
 /// The header of an encoded Wayland message.
 pub fn msg_header(message: &[u8]) -> MessageHeader {
     MessageHeader::parse(message).expect("a complete Wayland message header")
