@@ -372,6 +372,9 @@ pub struct Context {
     pub keyboard_to_seat: BTreeMap<u32, u32>,
     pub keyboard_focus: KeyboardFocusRegistry,
     pub pointer_focus: PointerFocus,
+    /// Wheel steps from touchpad scrolling, for a connection whose client
+    /// [`crate::client_kind`] chose when it connected; `None` otherwise.
+    pub(crate) wheel_steps: Option<crate::handler::pointer::WheelSteps>,
     pub last_sender_id: u32,
     /// Requests the message being dispatched sends the host besides its
     /// forward (an ack_key or a bind, say); part of its [`Effects`].
@@ -1025,6 +1028,7 @@ impl Context {
             keyboard_to_seat: BTreeMap::new(),
             keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),
+            wheel_steps: None,
             last_sender_id: 0,
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),
@@ -1272,6 +1276,7 @@ mod tests {
             // elsewhere a probe fails unseen.
             ("SOMMELIER_DRM_DEVICE", "/dev/dri/renderD128"),
             ("SOMMELIER_VM_IDENTIFIER", "penguin-vm"),
+            ("SOMMELIER_WHEEL_FROM_TOUCHPAD", "all"),
             ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
             ("SOMMELIER_WINDOW_PLACEMENT_BACKEND", "arc"),
             ("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left"),

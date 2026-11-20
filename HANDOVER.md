@@ -215,6 +215,11 @@
   [manual test plan](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#manual-test-plan)
   lists what to check for each.
 
+- Wheel steps for touchpad scrolling in Wine apps
+  ([pointer scrolling](docs/INVARIANTS.md#pointer-scrolling)) have not
+  been checked with KakaoTalk on a host yet; a scroll that feels too fast
+  or slow would tune `WHEEL_STEP` in `handler/pointer.rs`.
+
 ## Next steps
 
 1. Continue Crostini manual testing through the `wayland-2` service.

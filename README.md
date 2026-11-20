@@ -223,6 +223,7 @@ test uses `/dev/wl0`.
 | `SOMMELIER_WINDOW_PLACEMENT_BACKEND` | The experimental window placement backend, `arc`, `remote-shell-v2` or `off`; off by default. `arc` is expected to bypass the ChromeOS IME, so Korean composition would not work in any window (unverified on a host); `remote-shell-v2` needs a host that offers remote shell, which Crostini does not. See [the backends](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#backends). |
 | `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Legacy switch for the `arc` placement backend, used while `SOMMELIER_WINDOW_PLACEMENT_BACKEND` is unset; it has the same expected IME bypass. See [the settings](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#settings). |
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional `CHORD=ACTION,...` placement bindings. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
+| `SOMMELIER_WHEEL_FROM_TOUCHPAD` | Which clients get mouse-wheel steps (`wl_pointer.axis_discrete`) for touchpad scrolling, which Wine apps such as KakaoTalk need to scroll: `auto` (the default) Wine clients, `all` every client, `off` none. See [the rule](docs/INVARIANTS.md#pointer-scrolling). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |

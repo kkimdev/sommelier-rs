@@ -23,6 +23,7 @@ use clap::Parser;
 mod accelerator;
 mod allocator;
 mod arc_task_ids;
+mod client_kind;
 mod connection;
 mod handler;
 mod ime;
@@ -143,6 +144,7 @@ async fn main() {
         shortcuts_file,
     ));
     let vm_identifier = state::vm_identifier_from_environment();
+    let wheel_from_touchpad = client_kind::WheelFromTouchpad::from_environment();
 
     if local_compositor.is_none() && virtio_wl.is_none() {
         virtio_wl = Some("/dev/wl0".to_string());
@@ -162,6 +164,7 @@ async fn main() {
         virtio_wl,
         vm_identifier,
         placement,
+        wheel_from_touchpad,
         reload_signal,
     )
     .await;
