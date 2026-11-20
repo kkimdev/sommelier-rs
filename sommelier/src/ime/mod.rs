@@ -375,9 +375,9 @@ impl ImeCore {
 pub(crate) type StateForTest = (String, (usize, usize), std::ops::Range<usize>);
 
 impl ImeCore {
-    /// H10: the seat of the text input whose host keysyms reach the
-    /// guest: an attached one, whatever its fence.
-    pub fn keysym_target(&self, ti: TiId) -> Option<SeatId> {
+    /// The seat of text input `ti` while Exo's input method is attached
+    /// to it, whatever its fence.
+    pub fn attached_seat(&self, ti: TiId) -> Option<SeatId> {
         self.inputs
             .get(&ti)
             .filter(|t| t.is_attached())

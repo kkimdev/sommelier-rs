@@ -45,9 +45,8 @@
   see [Surfaces, damage and SHM](docs/INVARIANTS.md#surfaces-damage-and-shm).
 - ChromiumOS parity reviews left these differences unconfirmed, with no
   reproducer: commits on a surface with no role or window, cleanup of a
-  keyboard leave for a pending surface, and two keyboards on one seat (the
-  IME Backspace fallback picks a seat-level keyboard while keysyms prefer
-  the focused one, and one chord can issue a redundant placement batch).
+  keyboard leave for a pending surface, and two keyboards on one seat (one
+  chord can issue a redundant placement batch).
 - A text input whose guest `wl_seat` goes away while it is active ends its
   host generation without a `deactivate`, since none can name a live
   seat (R1 of [IME.md](docs/IME.md#23-cross-concern-inputs-and-reconcile-outcomes)).
@@ -186,9 +185,6 @@
   [IME.md](docs/IME.md#53-open-design-questions)).
 - A focus-loss commit too long for one message loses the preedit (Exo's
   confirmation is dropped while the link drains).
-- The keysym channel is unproven (U1): no release follows a keysym
-  press, a late one cannot close its retired press, and one after a new
-  keymap finds no keycode.
 - Key generations: an `Announced` peek accepts an older release, and a
   stale held Backspace can still be leased (`arm_ime_repeat` ignores
   `stale`).

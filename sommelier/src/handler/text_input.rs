@@ -122,7 +122,7 @@ fn glue_last_two(queue: &mut Vec<Outgoing>) {
     into_fds.extend(fds);
 }
 
-/// The keyboard concern forwarded a key press or repeat to the guest on
+/// The keyboard concern forwarded a key press to the guest on
 /// guest seat `seat`, which may edit its text where Exo does not see.
 pub(crate) fn guest_key(ctx: &mut Context, seat: u32) {
     ime(ctx, Input::GuestKey(SeatId(seat)));
@@ -134,14 +134,6 @@ fn apply_key_effect(ctx: &mut Context, effect: KeyEffect) {
         KeyEffect::Lease { .. } => apply_lease(ctx, effect),
         KeyEffect::RecoverHeldKey { ti, seat } => hold_recovery(ctx, ti, seat),
     }
-}
-
-/// The guest text input of host text input `host_id`, and its guest seat,
-/// while its host keysyms reach the guest (H10).
-pub(super) fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<(u32, u32)> {
-    let guest_id = ctx.shadow_table.get_guest_id(host_id)?;
-    let seat = ctx.ime.keysym_target(TiId(guest_id))?;
-    Some((guest_id, seat.0))
 }
 
 /// Apply what the IME core asks of the Backspace repeat leased to a text
@@ -196,16 +188,28 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         host_v1_event(ctx, HostIme::Commit { serial, text })
     }
 
+    /// H10: dropped. Exo sends no keysym for a physical key: its one
+    /// `SendKey` caller, `TextInput::InsertChar`, sends a key the input
+    /// method handled with no `DomCode` as `commit_string` instead, and
+    /// never sends a release, so a keysym delivered as a key would stay
+    /// pressed in the guest. The first is logged.
     fn on_keysym(
         &mut self,
-        ctx: &mut Context,
-        serial: u32,
-        time: u32,
+        _ctx: &mut Context,
+        _serial: u32,
+        _time: u32,
         sym: u32,
         state: u32,
         _modifiers: u32,
     ) -> Action {
-        crate::handler::ime_keys::on_keysym(ctx, serial, time, sym, state)
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            log::debug!(
+                "Dropping zwp_text_input_v1.keysym {sym:#x} (state {state}), which Exo is not \
+                 known to send; later ones are dropped unlogged"
+            );
+        }
+        Action::Drop
     }
 
     /// Exo attached the input method. While attached this answers the
@@ -224,7 +228,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     /// draining and is ignored (H2').
     fn on_leave(&mut self, ctx: &mut Context) -> Action {
         if let Some(ti) = v1_sender(ctx) {
-            let detached = ctx.ime.keysym_target(ti);
+            let detached = ctx.ime.attached_seat(ti);
             ime(ctx, Input::HostLeave(ti));
             if let Some(seat) = detached {
                 forget_held_keys_for_seat(ctx, seat.0);
@@ -677,7 +681,7 @@ pub(super) mod tests {
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::ZwpTextInputV3Handler;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display;
-    use crate::protocols::wayland::wl_keyboard::{self, WlKeyboardHandler};
+    use crate::protocols::wayland::wl_keyboard;
     use crate::protocols::wayland::{
         wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_touch,
     };
@@ -1427,7 +1431,7 @@ pub(super) mod tests {
         /// host keyboard, which no peer sees.
         fn owner(&mut self, key: u32) -> Option<GuestKeyOwner> {
             let keyboard = HostId(self.keyboard.host);
-            self.s.ctx().guest_key_owner(keyboard, key)
+            self.s.ctx().key_generations.guest_owner(keyboard, key)
         }
 
         /// The proxy's state of the text input, for state no peer sees.
@@ -3771,6 +3775,40 @@ pub(super) mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
+    /// H10: Exo sends no keysym for a physical key, and no keysym release
+    /// at all, so a keysym reaches the guest as nothing, rather than as a
+    /// press no release would end. It leaves no state behind either: the
+    /// key's own press, which follows, reaches the guest.
+    #[tokio::test]
+    async fn a_keysym_reaches_no_peer() {
+        use xkbcommon::xkb::keysyms::KEY_space;
+        let mut f = Field::typing().await;
+        let press = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 700,
+            time: 1_234,
+        };
+        let release = Stroke {
+            state: RELEASED,
+            serial: 701,
+            time: 1_300,
+            ..press
+        };
+        f.s.host([f.keysym(KEY_space, press), f.keysym(KEY_space, release)])
+            .await;
+        assert_eq!(f.s.guest_received(), []);
+
+        let press = Stroke {
+            serial: 702,
+            time: 1_400,
+            ..press
+        };
+        f.s.host([f.peek(press), f.key(press)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(press)]);
+        assert_eq!(f.host_received().await, [f.ack(702, true)]);
+    }
+
     /// Events of a host text input that is not active belong to no guest
     /// generation: none reaches the guest or edits its next transaction.
     #[tokio::test]
@@ -3782,20 +3820,8 @@ pub(super) mod tests {
         f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
         assert_eq!(f.host_received().await, f.reset(1, Reset::default()));
         f.answered(1);
-        f.s.host([
-            f.preedit("가", ""),
-            f.delete_range(0, 3),
-            f.commit("가"),
-            v1::keysym(
-                f.host,
-                0,
-                0,
-                u32::from(b'a'),
-                wl_keyboard::KEY_STATE_PRESSED,
-                0,
-            ),
-        ])
-        .await;
+        f.s.host([f.preedit("가", ""), f.delete_range(0, 3), f.commit("가")])
+            .await;
         assert_eq!(f.s.guest_received(), []);
 
         // A new seat activates it.
@@ -3826,19 +3852,10 @@ pub(super) mod tests {
         let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
-        let repeat = Stroke {
-            state: REPEATED,
-            serial: 705,
-            time: 1_300,
-            ..space
-        };
-        for held in [space, repeat] {
-            if held.state == REPEATED {
-                f.s.host([f.peek(held)]).await;
-            }
+        for _ in 0..2 {
             f.s.host([f.confirm()]).await;
             f.answer_recovery_syncs().await;
-            assert_eq!(f.s.guest_received(), f.recovered(held), "{held:?}");
+            assert_eq!(f.s.guest_received(), f.recovered(space));
         }
     }
 
@@ -4006,8 +4023,8 @@ pub(super) mod tests {
     }
 
     /// Exo's own detach (H2) ends only the recovery of the keys held
-    /// across it, which stay the guest's keys: the keysym of `1` reaches
-    /// the guest. Their releases died with the input method, so a
+    /// across it, which stay the guest's keys: the `wl_keyboard.key` of
+    /// `1` reaches the guest. Their releases died with the input method, so a
     /// `peek_key` press of a key still held is its next press, which an
     /// empty confirmation recovers.
     #[tokio::test]
@@ -4038,9 +4055,9 @@ pub(super) mod tests {
             time: 1_400,
             ..one
         };
-        f.s.host([f.peek(one_again), f.keysym(u32::from(b'1'), one_again)])
-            .await;
+        f.s.host([f.peek(one_again), f.key(one_again)]).await;
         assert_eq!(f.s.guest_received(), [f.guest_key(one_again)]);
+        assert_eq!(f.host_received().await, [f.ack(702, true)]);
 
         let space_again = Stroke {
             serial: 703,
@@ -4200,17 +4217,14 @@ pub(super) mod tests {
 
     /// Held Space after a Korean commit, then held Backspace over an
     /// emptied preedit, each held twice. Every empty confirmation while
-    /// the key is held stands for one press and release, the key's other
-    /// channels (keysyms and the delayed `wl_keyboard.key`) duplicate none,
-    /// and no confirmation after the release recovers it.
+    /// the key is held stands for one press and release, a delayed
+    /// `wl_keyboard.key` duplicates none, and no confirmation after the
+    /// release recovers it.
     #[tokio::test]
     async fn held_keys_repeat_through_confirmations_after_korean_input() {
-        use xkbcommon::xkb::keysyms::{KEY_BackSpace, KEY_space};
         let mut f = Field::typing().await;
 
-        // The input method commits the syllable with Space, whose keysyms
-        // reach the proxy before the delayed wl_keyboard press: this
-        // overlap once ended held Space after its first commit.
+        // The input method commits the syllable with Space.
         let space = Stroke {
             key: SPACE,
             state: PRESSED,
@@ -4221,23 +4235,6 @@ pub(super) mod tests {
             .await;
         let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
         assert_eq!(f.s.guest_received(), f.events(expected));
-        let keysym_release = Stroke {
-            state: RELEASED,
-            serial: 701,
-            time: 1_235,
-            ..space
-        };
-        f.s.host([
-            f.keysym(KEY_space, space),
-            f.keysym(KEY_space, keysym_release),
-            f.key(space),
-        ])
-        .await;
-        assert_eq!(
-            f.s.guest_received(),
-            [f.guest_key(space), f.guest_key(keysym_release)]
-        );
-        assert_eq!(f.host_received().await, [f.ack(700, false)]);
 
         f.s.host([f.confirm(), f.confirm(), f.confirm()]).await;
         f.answer_recovery_syncs().await;
@@ -4299,18 +4296,7 @@ pub(super) mod tests {
         let mut expected = f.recovered(backspace);
         expected.extend(f.recovered(backspace));
         assert_eq!(f.s.guest_received(), expected);
-        let keysym_release = Stroke {
-            state: RELEASED,
-            serial: 801,
-            time: 1_601,
-            ..backspace
-        };
-        f.s.host([
-            f.keysym(KEY_BackSpace, backspace),
-            f.keysym(KEY_BackSpace, keysym_release),
-            f.key(backspace),
-        ])
-        .await;
+        f.s.host([f.key(backspace)]).await;
         assert_eq!(f.s.guest_received(), []);
         assert_eq!(f.host_received().await, [f.ack(800, false)]);
 
@@ -4559,8 +4545,8 @@ pub(super) mod tests {
     }
 
     /// A release delayed past a wrapped serial's next press ends only its
-    /// own generation: the new press stays held and owned, repeats, and
-    /// gets its own release, and every key gets one `ack_key`. Then a key
+    /// own generation: the new press stays held and owned, and gets its
+    /// own release, and every key gets one `ack_key`. Then a key
     /// is held as the focus leaves, which drains the field: a confirmation
     /// recovers nothing.
     #[tokio::test]
@@ -4597,15 +4583,6 @@ pub(super) mod tests {
         assert!(f.held(SPACE));
         assert_eq!(f.owner(SPACE), Some(GuestKeyOwner::Physical));
 
-        let repeat = Stroke {
-            state: REPEATED,
-            serial: 2,
-            time: 210,
-            ..old_press
-        };
-        f.s.host([f.key(repeat)]).await;
-        assert_eq!(f.s.guest_received(), [f.guest_key(repeat)]);
-        assert_eq!(f.host_received().await, [f.ack(repeat.serial, true)]);
         let new_release = Stroke {
             state: RELEASED,
             serial: 3,
@@ -4729,7 +4706,6 @@ pub(super) mod tests {
     pub(in crate::handler) const BACKSPACE: u32 = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
     pub(in crate::handler) const PRESSED: u32 = wl_keyboard::KEY_STATE_PRESSED;
     pub(in crate::handler) const RELEASED: u32 = wl_keyboard::KEY_STATE_RELEASED;
-    pub(in crate::handler) const REPEATED: u32 = wl_keyboard::KEY_STATE_REPEATED;
 
     /// Handler tests of key and IME state that the peers of a [`Session`]
     /// cannot set up exactly: the guest text input [`TI`] of seat [`SEAT`]
@@ -4853,28 +4829,9 @@ pub(super) mod tests {
             crate::handler::ime_keys::recover_pending(&mut self.ctx);
         }
 
-        /// The host's `keysym` of key `serial` at `time`, which Exo sends
-        /// in each other's arguments.
-        pub(in crate::handler) fn keysym(&mut self, sym: u32, state: u32, serial: u32, time: u32) {
-            self.ctx.last_sender_id = HOST;
-            TextInputV1Handler.on_keysym(&mut self.ctx, time, serial, sym, state, 0);
-        }
-
         pub(in crate::handler) fn peek(&mut self, key: u32, state: u32, serial: u32, time: u32) {
             self.ctx.last_sender_id = HOST_EXTENDED_KEYBOARD;
             KeyboardHandler::new().on_peek_key(&mut self.ctx, serial, time, key, state);
-        }
-
-        /// The host keyboard's `key`; returns whether it reaches the guest.
-        pub(in crate::handler) fn key(
-            &mut self,
-            key: u32,
-            state: u32,
-            serial: u32,
-            time: u32,
-        ) -> Action {
-            self.ctx.last_sender_id = HOST_KEYBOARD.0;
-            KeyboardHandler::new().on_key(&mut self.ctx, serial, time, key, state)
         }
 
         /// Hold repeatable `key` on `keyboard`, whose press `peek_key`
@@ -4910,20 +4867,8 @@ pub(super) mod tests {
             assert!(generations.arm_ime_repeat(HOST_KEYBOARD, BACKSPACE, text_input));
         }
 
-        /// Hold `key` on [`HOST_KEYBOARD`], with its guest press owned by
-        /// `owner`.
-        pub(in crate::handler) fn hold_owned(&mut self, key: u32, owner: GuestKeyOwner) {
-            let generations = &mut self.ctx.key_generations;
-            generations.observe_physical_state(HOST_KEYBOARD, key, 1);
-            assert!(self.ctx.claim_guest_key(HOST_KEYBOARD, key, owner));
-        }
-
         pub(in crate::handler) fn repeat_active(&self) -> bool {
             backspace_repeat_active_for_keyboard(&self.ctx, HOST_KEYBOARD)
-        }
-
-        pub(in crate::handler) fn owner(&self, key: u32) -> Option<GuestKeyOwner> {
-            self.ctx.guest_key_owner(HOST_KEYBOARD, key)
         }
 
         /// The events queued for the guest since the last call.

@@ -461,11 +461,9 @@ pub struct Context {
     pub(crate) pending_recovery: Option<crate::handler::ime_keys::PendingRecovery>,
     /// Evdev keycodes that the active XKB keymap marks as repeatable.
     pub keyboard_repeatable_keys: BTreeMap<HostId, BTreeSet<u32>>,
-    /// Parsed keymap for each host keyboard. Keymap updates and failures are
-    /// scoped to their sender so one seat cannot invalidate another seat.
-    pub(crate) keyboard_keymaps: BTreeMap<HostId, xkb::Keymap>,
-    /// XKB state for each host keyboard. A client can bind keyboards from
-    /// multiple seats, whose modifier and layout-group state must not leak.
+    /// XKB state for each host keyboard, which holds the keymap it was
+    /// compiled from. A client can bind keyboards from multiple seats, whose
+    /// keymaps, modifiers and layout groups must not leak.
     /// It makes `Context` `!Send` and `!Sync`: `xkb::State` uses non-atomic
     /// interior mutation, so a connection stays on its one thread.
     pub(crate) keyboard_xkb_states: BTreeMap<HostId, xkb::State>,
@@ -474,11 +472,6 @@ pub struct Context {
     /// than after it, and not again with a new keymap, so focus changes and
     /// keymaps must not reset them.
     pub(crate) keyboard_modifiers: BTreeMap<HostId, KeyboardModifiers>,
-    /// Effective keysym → evdev keycode mappings from each host keyboard's
-    /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
-    /// physical keycode, so the IME bridge uses this per-keyboard map when it
-    /// synthesizes a wl_keyboard event.
-    pub keyboard_keysym_to_keycode: BTreeMap<HostId, BTreeMap<u32, u32>>,
     /// The process-wide placement configuration: host accelerators, the
     /// ARC bounds policy, and the placement bindings. Shared, never copied:
     /// a reloaded binding generation is visible to the next lookup.
@@ -952,24 +945,6 @@ impl Context {
             .is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
     }
 
-    pub(crate) fn guest_key_owner(
-        &self,
-        host_keyboard_id: HostId,
-        key: u32,
-    ) -> Option<GuestKeyOwner> {
-        self.key_generations.guest_owner(host_keyboard_id, key)
-    }
-
-    pub(crate) fn transition_guest_key(
-        &mut self,
-        host_keyboard_id: HostId,
-        key: u32,
-        event: GuestKeyEvent,
-    ) -> GuestKeyDecision {
-        self.key_generations
-            .transition_guest_key(host_keyboard_id, key, event)
-    }
-
     /// Claim delivery ownership for a key that currently has no guest owner.
     ///
     /// Returning `false` leaves the existing owner untouched. Callers can
@@ -1083,10 +1058,8 @@ impl Context {
             key_generations: KeyGenerationRegistry::default(),
             pending_recovery: None,
             keyboard_repeatable_keys: BTreeMap::new(),
-            keyboard_keymaps: BTreeMap::new(),
             keyboard_xkb_states: BTreeMap::new(),
             keyboard_modifiers: BTreeMap::new(),
-            keyboard_keysym_to_keycode: BTreeMap::new(),
             placement,
             supported_formats: BTreeSet::new(),
             host_globals: BTreeMap::new(),

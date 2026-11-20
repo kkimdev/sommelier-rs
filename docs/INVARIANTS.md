@@ -728,31 +728,38 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `an_unusable_keymap_clears_the_loaded_one_and_is_forwarded`.
 - **A keymap ends no held key.** A keymap, whether the proxy can use it or
   not, replaces only what was compiled from the one before it: the XKB
-  state and the keysym and repeat tables. The keys held and their
+  state and the repeat table. The keys held and their
   generations stay, so each key's release goes where its press went, and
   so does the suppression of a held accelerator's key, which its press set
   and only its release, an `enter` or the keyboard's end takes. Otherwise a
   keymap that arrives while a key is held would send its release to the
   host, and the guest, which got the press, would hold the key and repeat
   it; and Exo, which switches the layout on Ctrl+Space while Space is
-  held, would let the IME hand Space to the guest as a keysym or a
-  recovered key. This holds for a release on the `wl_keyboard` channel: a
-  keysym release finds its key through the current keymap's table, so one
-  after a keymap may find none. Exo sends no keysym releases today.
+  held, would let the IME hand Space to the guest as a recovered key.
   Tests: `a_new_keymap_keeps_held_keys_and_modifiers`,
   `a_rejected_keymap_keeps_held_keys`,
   `an_unusable_keymap_clears_the_loaded_one_and_is_forwarded`,
-  `an_accelerator_held_across_a_keymap_is_not_recovered`,
-  `an_accelerator_held_across_a_keymap_takes_no_keysym`.
-- **IME state is scoped to its keyboard or seat.** Pressed-key sets, repeat
-  flags and focus markers used to bridge ChromeOS IME events belong to the
-  originating keyboard or seat, never to the process. Synthetic
+  `an_accelerator_held_across_a_keymap_is_not_recovered`.
+- **IME state is scoped to its keyboard or seat.** Key generations,
+  Backspace leases and focus markers used to bridge ChromeOS IME events
+  belong to the originating keyboard or seat, never to the process. Synthetic
   `wl_keyboard` events use the compositor's monotonic millisecond time
-  domain of the real keyboard events, never wall-clock time. Host keysyms
-  go to the keyboard whose surface has the seat's current focus.
+  domain of the real keyboard events, never wall-clock time.
   Tests: `ime_repeat_state_is_scoped_to_the_originating_keyboard`,
-  `an_empty_confirmation_recovers_the_latest_eligible_held_key`,
-  `keysym_prefers_keyboard_with_current_surface_focus`.
+  `an_empty_confirmation_recovers_the_latest_eligible_held_key`.
+- **Host keysyms and repeats are dropped.** A `zwp_text_input_v1.keysym`
+  reaches no peer and changes no key state. Exo sends none for a physical key: its
+  one `SendKey` caller, `TextInput::InsertChar`, sends a key its input
+  method handled with no `DomCode` as `commit_string` instead, and it
+  never sends a keysym release, so a keysym delivered as a key would stay
+  pressed in the guest. The keys the input method consumes reach the
+  guest through the recovery of an empty confirmation (X2'). The first
+  keysym of a process is logged, at debug level. A `wl_keyboard.key` or
+  `peek_key` of any state but pressed or released, such as a repeat, is
+  dropped too, unacknowledged: `wl_keyboard` has no repeat before version
+  10, beyond the version 5 the proxy binds `wl_seat` at, and Exo's
+  `Keyboard::OnKeyEvent` drops every repeat before either is sent.
+  Tests: `a_keysym_reaches_no_peer`, `a_repeated_key_state_reaches_no_peer`.
 - **A recovered key carries the host's serial.** When an empty IME
   confirmation stands for a held key the input method consumed, the guest
   gets a `wl_keyboard.key` press and release the host never sent. Both
@@ -796,9 +803,9 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   recovery of every key the seat holds: the key events in flight die with
   the input method, so a held key's release may never come, and only the
   key's next press can be recovered. The detach ends nothing else: such a
-  key is still guest input, so its keysym reaches the guest, which a flag
-  of its own on the key's held phase (`KeyPhase::Held`'s `stale`) keeps apart
-  from the one that marks an accelerator's key. Otherwise a key typed
+  key is still guest input, which a flag of its own on the key's held
+  phase (`KeyPhase::Held`'s `stale`) keeps apart from the one that marks an
+  accelerator's key. Otherwise a key typed
   while Backspace or Space is held would also repeat the held key, and so
   would a restart. A `peek_key` press of a key the proxy still counts held
   across the detach, one held since `wl_keyboard.enter` without a peek
@@ -809,8 +816,8 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   its recovery, nor an accelerator's suppression; otherwise the new press
   would be dropped as the old one's duplicate. A late release of the old
   press, under a serial before the peek's, ends nothing. A guest that
-  still holds the old press, which `wl_keyboard`, a keysym or the enter
-  gave it, gets its release first, under the peek's serial and time, so it
+  still holds the old press, which `wl_keyboard` or the enter gave it,
+  gets its release first, under the peek's serial and time, so it
   never sees two presses without a release between, and its autorepeat of
   the old press stops. Being a new press, it also leaves a waiting
   recovery waiting, as the press of a key not held does
@@ -835,27 +842,19 @@ the DST; [KEYBOARD.md](KEYBOARD.md) describes the key states.
   `a_press_after_a_detach_ends_an_accelerators_suppression`,
   `a_late_release_of_a_press_retired_by_a_detach_is_dropped`,
   `keys_held_since_enter_are_ordered_by_their_peeks`.
-- **A key waits for at most one late release per channel.** When a key
-  is pressed again before the channel that gave the guest its previous
-  press (`wl_keyboard` or an IME keysym) has released it, the proxy keeps
-  that retired release pending beside the new generation, so a late
-  `wl_keyboard` release still closes the old press. It keeps at most one
-  retired release per key and channel, plus the current generation's: a
-  newer retired release replaces an older one. For `wl_keyboard` this drops
-  nothing Exo sends: Exo sends each `wl_keyboard.key` right after its
-  `peek_key`, and a release only for a key it sent pressed, so the one
-  retired release already tolerates a host that delays a release past
-  the key's next press. For keysyms the bound is only defensive, and a
-  late release is not supported: a keysym release that arrives after the
-  key's next press does not close the retired press, since the proxy
-  bounds the retired press by a peek serial while Exo numbers each keysym
-  when it sends it. Exo sends keysym presses only (its one `SendKey`
-  caller, `InsertChar`, handles presses), so a retired keysym release
-  waits for an event Exo never sends, and the bound only keeps such
-  entries from piling up; making a late keysym release close its press is
-  a known follow-up. A host that never sends a release leaves one pending release
-  per key and channel, not one per press.
-  Tests: `a_channel_keeps_one_pending_release_per_key`,
+- **A key waits for at most one late release.** When a key is pressed
+  again before `wl_keyboard` has released the guest's previous press of
+  it, the proxy keeps that retired release pending beside the new
+  generation, so a late release still closes the old press. It keeps at
+  most one retired release per key, plus the current generation's: a
+  newer retired release replaces an older one. This drops nothing Exo
+  sends: Exo sends each `wl_keyboard.key` right after its `peek_key`, and
+  a release only for a key it sent pressed, so the one retired release
+  already tolerates a host that delays a release past the key's next
+  press. A host that never sends a release leaves one pending release per
+  key, not one per press.
+  Tests: `a_key_keeps_one_pending_release`,
+  `a_retired_release_closes_its_press_across_the_serial_wrap`,
   `a_delayed_release_ends_only_its_generation`.
 - **Host modifiers last as long as their keyboard.** Exo sends
   `wl_keyboard.modifiers` only when they differ from the last it sent that

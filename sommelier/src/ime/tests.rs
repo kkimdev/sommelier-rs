@@ -1384,18 +1384,18 @@ fn row_H9_a_delete_that_cannot_be_measured_is_dropped() {
 }
 
 #[test]
-fn row_H10_keysyms_go_to_an_attached_input_whatever_its_fence() {
+fn an_attached_input_has_its_seat_whatever_its_fence() {
     let mut ime = Ime::new();
     ime.create(TI);
-    assert_eq!(ime.core.keysym_target(TI), None);
+    assert_eq!(ime.core.attached_seat(TI), None);
     ime.enable(TI);
-    assert_eq!(ime.core.keysym_target(TI), Some(SEAT));
+    assert_eq!(ime.core.attached_seat(TI), Some(SEAT));
     ime.compose("가");
     ime.press(SURFACE);
-    assert_eq!(ime.core.keysym_target(TI), Some(SEAT));
+    assert_eq!(ime.core.attached_seat(TI), Some(SEAT));
     ime.step(Input::Disable(TI));
     ime.step(Input::Commit(TI));
-    assert_eq!(ime.core.keysym_target(TI), None);
+    assert_eq!(ime.core.attached_seat(TI), None);
 }
 
 #[test]

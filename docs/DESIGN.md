@@ -202,7 +202,7 @@ encode wire bytes ad hoc.
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs` (the IME core's adapter), `ime_keys.rs` (keysym routing, held-key recovery, Backspace leases), `seat.rs` | `input.rs` (focus, key generations); the IME core, `sommelier/src/ime` (text inputs) |
+| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs` (the IME core's adapter), `ime_keys.rs` (held-key recovery, Backspace leases), `seat.rs` | `input.rs` (focus, key generations); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
@@ -542,18 +542,17 @@ returns, the field's host composition events are dropped, because Exo
 sent them for the composition the press committed. The rules are under
 [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 
-Keys can reach the guest twice: as a `wl_keyboard.key` and as a
-host-generated keysym from the IME. `state/input.rs` assigns each physical
-key a generation and an owner (guest keyboard, IME, or a compositor
-shortcut), so a press is released through the path that delivered it,
-and never twice. Once the key is pressed again, only one older
-generation per path still waits for its release, and a late IME keysym
-release does not close its press; see
+Keys can reach the guest twice: as a `wl_keyboard.key` and as the press
+and release the proxy recovers for an empty IME confirmation; the host's
+text-input keysyms are dropped. `state/input.rs` assigns each physical
+key a generation and an owner (guest keyboard, IME recovery, or a
+compositor shortcut), so a press is released through the path that
+delivered it, and never twice. Once the key is pressed again, only one
+older generation still waits for its release; see
 [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 [KEYBOARD.md](KEYBOARD.md) describes each key's states and the one
-transition each input makes. Keymaps are
-compiled locally with xkbcommon to map keysyms back to keycodes and to
-classify chords; chords listed in
+transition each input makes. Keymaps are compiled locally with
+xkbcommon to classify chords; chords listed in
 `SOMMELIER_ACCELERATORS` are acknowledged as not handled through
 `zcr_extended_keyboard_v1.ack_key`, so Exo keeps them as accelerators.
 
