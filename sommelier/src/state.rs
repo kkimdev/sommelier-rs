@@ -1462,6 +1462,7 @@ mod tests {
                 })),
             },
             logged_viewport_rule: false,
+            new_host_copies: Default::default(),
         };
         surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
 
@@ -1518,6 +1519,7 @@ mod tests {
                 viewport: Some(None),
             },
             logged_viewport_rule: false,
+            new_host_copies: Default::default(),
         };
         surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
         let before = surface.clone();

@@ -22,6 +22,7 @@ use std::fs::File;
 use std::marker::PhantomData;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::outputs::transformed_extent;
 use super::HostId;
@@ -586,6 +587,45 @@ pub struct SurfaceState {
     /// Whether the proxy has logged a viewport rule it leaves unenforced,
     /// which it does once per surface rather than every frame.
     pub logged_viewport_rule: bool,
+    /// The host copies this surface has shown for the first time, for the
+    /// debug log.
+    pub new_host_copies: NewHostCopies,
+}
+
+/// The SHM host copies one surface showed for the first time, which a
+/// debug log reports at most once a second.
+///
+/// Each guest SHM buffer gets host storage of its own, which its first
+/// commit copies in full. A client that draws each frame into a new buffer,
+/// as GTK3 does while the host still holds its last one (and Exo holds it
+/// until it is detached), pays a host allocation and a full copy every
+/// frame. The log shows whether a client does.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NewHostCopies {
+    count: u32,
+    bytes: u64,
+    since: Option<Instant>,
+}
+
+impl NewHostCopies {
+    /// Count a new host copy of `bytes`, shown at `now`. Once a second has
+    /// passed since the count began, returns the count, the bytes and that
+    /// time, and begins a new count.
+    pub fn record(&mut self, bytes: u64, now: Instant) -> Option<(u32, u64, Duration)> {
+        let since = *self.since.get_or_insert(now);
+        self.count += 1;
+        self.bytes += bytes;
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < Duration::from_secs(1) {
+            return None;
+        }
+        let report = (self.count, self.bytes, elapsed);
+        *self = Self {
+            since: Some(now),
+            ..Self::default()
+        };
+        Some(report)
+    }
 }
 
 /// Everything a `wl_surface` request sets for the next commit, which
@@ -848,6 +888,7 @@ impl Default for SurfaceState {
             viewport: None,
             pending: SurfacePending::default(),
             logged_viewport_rule: false,
+            new_host_copies: NewHostCopies::default(),
         }
     }
 }
@@ -1342,6 +1383,28 @@ impl RenderBufferRegistry {
 #[cfg(test)]
 mod tests {
     use super::{BufferRect, SurfaceMapping, SurfaceRect, SurfaceState, ViewportState};
+
+    /// New host copies are counted for a second, then reported together,
+    /// and the next second's count begins.
+    #[test]
+    fn new_host_copies_are_reported_at_most_once_a_second() {
+        use super::NewHostCopies;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+        let mut copies = NewHostCopies::default();
+        assert_eq!(copies.record(100, at(0)), None);
+        assert_eq!(copies.record(100, at(500)), None);
+        assert_eq!(
+            copies.record(100, at(1000)),
+            Some((3, 300, Duration::from_secs(1)))
+        );
+        assert_eq!(copies.record(7, at(1999)), None);
+        assert_eq!(
+            copies.record(7, at(2500)),
+            Some((2, 14, Duration::from_millis(1500)))
+        );
+    }
 
     #[test]
     fn scaling_damage_clamps_to_non_negative_i32_edges() {
