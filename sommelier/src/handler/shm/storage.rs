@@ -17,7 +17,7 @@ limitations under the License.
 //! The host storage of a guest SHM buffer: choosing and allocating it, and
 //! creating the host buffer that imports it.
 
-use super::dmabuf::{allocate_virtwl_dmabuf, map_dmabuf, DmabufAllocation};
+use super::dmabuf::{allocate_virtwl_dmabuf, DmabufAllocation};
 use super::dmabuf_layout::DmabufLayout;
 use super::formats::wl_shm_format_to_drm_format;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
@@ -368,6 +368,7 @@ pub(super) fn create_dmabuf_buffer(
     } = request;
     let DmabufAllocation {
         fd: dmabuf_fd_owned,
+        host_copy,
         layout,
         modifier,
         dmabuf_sync,
@@ -400,15 +401,6 @@ pub(super) fn create_dmabuf_buffer(
         }
     } else {
         None
-    };
-
-    let Some(host_copy) = map_dmabuf(dmabuf_fd_owned.as_fd(), layout) else {
-        error!(
-            "dma-buf cannot be safely mmaped (offset={}, size={})",
-            layout.plane0().offset,
-            layout.span()
-        );
-        return reject_buffer_creation(ctx, pool_id, "unable to map wl_shm dma-buf backing");
     };
 
     // A new object takes its parent's version.
@@ -497,6 +489,7 @@ fn register_shm_buffer(
 #[cfg(test)]
 mod tests {
     use super::super::copy::{copy_shm_damage, ShmCopyLayout};
+    use super::super::dmabuf::map_dmabuf;
     use super::super::dmabuf_layout::validate_dmabuf_layout;
     use super::super::ShmHandler;
     use super::{create_dmabuf_buffer, create_shared_buffer, DmabufAllocation, ShmBufferRequest};
@@ -507,9 +500,11 @@ mod tests {
     use crate::protocols::AnyRequest;
     use crate::proxy::harness::Session;
     use crate::state::{BufferState, Context, DamageRegion, ShmPool};
+    use crate::test_support::counting::Counts;
     use crate::test_support::{decode, protocol_error_code, shm_pool_file};
     use crate::wire::{Action, WL_DISPLAY_ID};
     use std::fs::File;
+    use std::os::fd::AsFd;
     use std::os::unix::fs::FileExt;
     use std::sync::Arc;
 
@@ -561,7 +556,8 @@ mod tests {
     /// allocator's layout, and copies each plane where that layout puts it.
     /// Plane 1 of this NV12 buffer starts after a gap past plane 0, with
     /// rows of another stride. A memfd stands in for the VirtWL dma-buf,
-    /// which `map_dmabuf` maps the same way.
+    /// which `map_dmabuf` maps the same way. The copy writes the mapping
+    /// the allocation made, so the buffer maps nothing more.
     #[test]
     fn a_dmabuf_host_copy_takes_each_plane_where_its_layout_puts_it() {
         use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
@@ -588,16 +584,17 @@ mod tests {
         };
         let allocation = DmabufAllocation {
             fd: host_copy.try_clone().unwrap().into(),
+            host_copy: map_dmabuf(host_copy.as_fd(), layout).expect("a mappable layout"),
             layout,
             modifier: 0,
             dmabuf_sync: true,
         };
 
-        assert_eq!(
-            create_dmabuf_buffer(&mut ctx, request, host_dmabuf, allocation),
-            Action::Drop
-        );
+        let (cost, created) =
+            Counts::of(|| create_dmabuf_buffer(&mut ctx, request, host_dmabuf, allocation));
+        assert_eq!(created, Action::Drop);
         assert!(!ctx.is_fatal());
+        assert_eq!(cost.host_maps, 0, "the allocation's mapping is the copy's");
         let senders = std::iter::once(zwp_linux_dmabuf_v1::NAME)
             .chain(std::iter::repeat(zwp_linux_buffer_params_v1::NAME));
         let planes: Vec<_> = ctx
