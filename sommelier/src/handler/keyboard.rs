@@ -709,7 +709,6 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
 #[cfg(test)]
 pub(crate) mod for_test {
     use super::*;
-    use crate::keymap;
 
     /// Record host keyboard `host` of guest keyboard `guest` on guest seat
     /// `seat`, as `wl_seat.get_keyboard` does once its forward paired them.
@@ -730,14 +729,6 @@ pub(crate) mod for_test {
     pub(crate) fn extended(ctx: &mut Context, host: u32, extended: u32) {
         let (keyboard, extended) = (HostId(host), HostId(extended));
         keys(ctx, KeyInput::ExtendedBound { keyboard, extended });
-    }
-
-    /// Give host keyboard `host` the default keymap, as its
-    /// `wl_keyboard.keymap` does.
-    pub(crate) fn default_keymap(ctx: &mut Context, host: u32) {
-        let keymap = Some(keymap::default_for_test());
-        let keyboard = HostId(host);
-        keys(ctx, KeyInput::Keymap { keyboard, keymap });
     }
 
     /// The `peek_key` of `key` in `state` from extended keyboard

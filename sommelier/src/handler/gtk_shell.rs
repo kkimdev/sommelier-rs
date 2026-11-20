@@ -157,160 +157,195 @@ impl GtkSurface1Handler for Handlers {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::handler::test_support::{
-        add_surface, bind_shell, toplevel_ctx_with, SHELL, SURFACE,
-    };
-    use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
-    use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
-    use crate::state::GtkShellState;
-    use crate::state::Singleton;
-    use crate::test_support::{msg_opcode, msg_sender, queued_headers};
-    use crate::wire::WireMessage;
+    use crate::placement_config::PlacementConfig;
+    use crate::protocols::aura_shell::{zaura_shell, zaura_surface};
+    use crate::protocols::gtk::{gtk_shell1, gtk_surface1};
+    use crate::protocols::wayland::{wl_registry, wl_surface};
+    use crate::protocols::AnyRequest;
+    use crate::proxy::harness::{GtkShell, Object, Session};
+    use crate::settings::Settings;
+    use crate::state::Context;
+    use crate::wire::Outgoing;
 
-    const GTK_SHELL: u32 = 10;
-    const GTK_SURFACE: u32 = 11;
+    /// The VM the guest runs in, which namespaces its application IDs.
+    const VM: &str = "penguin";
 
-    /// Give `ctx` the gtk_shell1 [`GTK_SHELL`].
-    fn add_gtk_shell(ctx: &mut Context) {
-        ctx.shadow_table
-            .create_local(GTK_SHELL, Iface::GtkShell1, 1);
-        ctx.gtk_shells.insert(GTK_SHELL, GtkShellState::default());
+    /// A session whose guest has a `gtk_shell1` and a toplevel, or a
+    /// surface without a role, which GTK wraps.
+    struct Gtk {
+        s: Session,
+        gtk: GtkShell,
+        surface: Object,
     }
 
-    /// [`toplevel_ctx_with`] `placement` and [`add_gtk_shell`].
-    fn setup_ctx_with(placement: crate::placement_config::PlacementConfig) -> Context {
-        let mut ctx = toplevel_ctx_with(placement);
-        add_gtk_shell(&mut ctx);
-        ctx
+    impl Gtk {
+        /// A session with placement off.
+        async fn new() -> Self {
+            Self::with(PlacementConfig::for_test(), true).await
+        }
+
+        /// A session under `placement` whose surface is a toplevel if
+        /// `toplevel`.
+        async fn with(placement: PlacementConfig, toplevel: bool) -> Self {
+            let settings = Settings {
+                vm_id: VM.to_string(),
+                ..Settings::for_test()
+            };
+            let mut s = Session::with_context(Context::for_test(settings, placement));
+            let gtk = s.gtk_shell(zaura_shell::VERSION).await;
+            let surface = if toplevel {
+                let toplevel = s.toplevel().await;
+                // Placement gives the toplevel an Aura toplevel.
+                s.host_received();
+                toplevel.surface
+            } else {
+                s.surface().await
+            };
+            Self { s, gtk, surface }
+        }
+
+        /// The guest wraps the surface in a new `gtk_surface1`; returns it.
+        /// What the proxy sends either peer is kept.
+        async fn gtk_surface(&mut self) -> u32 {
+            let id = self.s.new_id();
+            self.s
+                .guest([gtk_shell1::req::get_gtk_surface(
+                    self.gtk.id,
+                    id,
+                    self.surface.id,
+                )])
+                .await;
+            id
+        }
+
+        /// The host gets the creation of the surface's Aura surface, then
+        /// `rest`, which name it; returns it.
+        fn aura_surface_and(&mut self, rest: impl Fn(u32) -> Vec<AnyRequest>) -> u32 {
+            let host = self.s.host_received();
+            let [(_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { id, .. })), ..] =
+                host[..]
+            else {
+                panic!("the surface got no Aura surface: {host:?}");
+            };
+            let get = zaura_shell::Request::GetAuraSurface {
+                id,
+                surface: self.surface.host,
+            };
+            let rest = rest(id).into_iter().map(|request| (id, request));
+            assert_eq!(
+                host,
+                Vec::from_iter([(self.gtk.shell, get.into())].into_iter().chain(rest))
+            );
+            id
+        }
     }
 
-    /// [`setup_ctx`], but [`SURFACE`] has no role.
-    fn roleless_ctx() -> Context {
-        let mut ctx =
-            Context::with_placement_for_test(crate::placement_config::PlacementConfig::for_test());
-        add_surface(&mut ctx);
-        bind_shell(&mut ctx);
-        add_gtk_shell(&mut ctx);
-        ctx
+    /// `set_startup_id` of `startup_id`, as the host's Aura surface gets it.
+    fn startup_id(startup_id: Option<&str>) -> AnyRequest {
+        zaura_surface::Request::SetStartupId {
+            startup_id: startup_id.map(str::to_string),
+        }
+        .into()
     }
 
-    fn setup_ctx() -> Context {
-        setup_ctx_with(crate::placement_config::PlacementConfig::for_test())
+    /// The guest's `gtk_surface1.set_dbus_properties` that names the
+    /// application `com.example.Terminal`.
+    fn terminal(gtk_surface: u32) -> Outgoing {
+        let application = Some("com.example.Terminal");
+        gtk_surface1::req::set_dbus_properties(
+            gtk_surface,
+            application,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
     }
 
-    fn nullable_string(message: &[u8]) -> Option<String> {
-        let mut wire = WireMessage::new(msg_sender(message), msg_opcode(message), &message[8..]);
-        wire.read_nullable_string().unwrap()
+    /// `com.example.Terminal` in the Guest OS namespace, as the host's Aura
+    /// surface gets it.
+    fn terminal_id() -> AnyRequest {
+        let application_id = format!("org.chromium.guest_os.{VM}.wayland.com.example.Terminal");
+        zaura_surface::Request::SetApplicationId {
+            application_id: Some(application_id),
+        }
+        .into()
     }
 
-    #[test]
-    fn new_gtk_surface_inherits_startup_id_on_shared_aura_surface() {
-        let mut ctx = setup_ctx();
-        ctx.last_sender_id = GTK_SHELL;
-        assert_eq!(
-            Handlers::on_set_startup_id(&mut ctx, &Some("launch-token".to_string())),
-            Action::Drop
-        );
-        assert_eq!(
-            Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest),
-            Action::Drop
-        );
+    #[tokio::test]
+    async fn new_gtk_surface_inherits_startup_id_on_shared_aura_surface() {
+        let mut g = Gtk::new().await;
+        g.s.guest([gtk_shell1::req::set_startup_id(g.gtk.id, Some("launch-token")).unwrap()])
+            .await;
+        assert_eq!(g.s.host_received(), []);
 
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
-        let get_aura_surface = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_sender(get_aura_surface), SHELL);
-        assert_eq!(msg_opcode(get_aura_surface), REQ_GET_AURA_SURFACE);
-        let startup_id = &ctx.client_to_host_queue[1].0;
-        assert_eq!(msg_opcode(startup_id), zaura_surface::REQ_SET_STARTUP_ID);
-        assert_eq!(nullable_string(startup_id).as_deref(), Some("launch-token"));
-        assert!(ctx.shadow_table.is_local(GTK_SURFACE));
-        assert_eq!(ctx.gtk_surfaces[&GTK_SURFACE].wl_surface_id, SURFACE.guest);
+        let gtk_surface = g.gtk_surface().await;
+        let aura_surface = g.aura_surface_and(|_| vec![startup_id(Some("launch-token"))]);
+
+        // The GTK surface is the proxy's own, and wraps the surface.
+        g.s.guest([terminal(gtk_surface)]).await;
+        assert_eq!(g.s.host_received(), [(aura_surface, terminal_id())]);
     }
 
-    #[test]
-    fn gtk_surface_takes_its_shell_version() {
-        let mut ctx = setup_ctx();
-        // Every vendored gtk-shell interface is v1, so an artificial shell
-        // version shows where the surface's version comes from.
+    #[tokio::test]
+    async fn gtk_surface_takes_its_shell_version() {
+        let mut g = Gtk::new().await;
+        // Injects a fault no peer can cause: every vendored gtk-shell
+        // interface is v1, so an artificial shell version shows where the
+        // surface's version comes from.
         let shell_version = 7;
-        ctx.shadow_table
-            .set_guest_version_for_test(GTK_SHELL, shell_version);
-        ctx.last_sender_id = GTK_SHELL;
-        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
+        g.s.ctx()
+            .shadow_table
+            .set_guest_version_for_test(g.gtk.id, shell_version);
+        let gtk_surface = g.gtk_surface().await;
+        g.aura_surface_and(|_| vec![startup_id(None)]);
+        // Reads state no peer can observe, for the same reason.
         assert_eq!(
-            ctx.shadow_table.guest_object_version(GTK_SURFACE),
+            g.s.ctx().shadow_table.guest_object_version(gtk_surface),
             Some(shell_version)
         );
     }
 
-    #[test]
-    fn startup_id_updates_and_clears_all_unique_aura_surfaces() {
-        let mut ctx = setup_ctx();
-        ctx.last_sender_id = GTK_SHELL;
-        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
-        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE + 1, SURFACE.guest);
-        ctx.client_to_host_queue.clear();
+    #[tokio::test]
+    async fn startup_id_updates_and_clears_all_unique_aura_surfaces() {
+        let mut g = Gtk::new().await;
+        g.gtk_surface().await;
+        let aura_surface = g.aura_surface_and(|_| vec![startup_id(None)]);
+        g.gtk_surface().await;
+        assert_eq!(g.s.host_received(), [(aura_surface, startup_id(None))]);
 
-        Handlers::on_set_startup_id(&mut ctx, &Some("next-token".to_string()));
+        g.s.guest([gtk_shell1::req::set_startup_id(g.gtk.id, Some("next-token")).unwrap()])
+            .await;
         assert_eq!(
-            ctx.client_to_host_queue.len(),
-            1,
+            g.s.host_received(),
+            [(aura_surface, startup_id(Some("next-token")))],
             "two GTK wrappers for one wl_surface must share one Aura update"
         );
-        assert_eq!(
-            nullable_string(&ctx.client_to_host_queue[0].0).as_deref(),
-            Some("next-token")
-        );
 
-        ctx.client_to_host_queue.clear();
-        Handlers::on_set_startup_id(&mut ctx, &None);
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert_eq!(nullable_string(&ctx.client_to_host_queue[0].0), None);
+        g.s.guest([gtk_shell1::req::set_startup_id(g.gtk.id, None).unwrap()])
+            .await;
+        assert_eq!(g.s.host_received(), [(aura_surface, startup_id(None))]);
     }
 
     /// GTK names the application of a surface with or without a role.
-    #[test]
-    fn dbus_application_id_is_namespaced_on_aura_surface() {
-        let placed = setup_ctx_with(crate::placement_config::PlacementConfig::active_for_test(
-            &[],
-        ));
-        for (case, mut ctx) in [
-            ("toplevel", setup_ctx()),
-            ("no role", roleless_ctx()),
-            ("placement on", placed),
+    #[tokio::test]
+    async fn dbus_application_id_is_namespaced_on_aura_surface() {
+        for (case, placement, toplevel) in [
+            ("toplevel", PlacementConfig::for_test(), true),
+            ("no role", PlacementConfig::for_test(), false),
+            ("placement on", PlacementConfig::active_for_test(&[]), true),
         ] {
-            ctx.last_sender_id = GTK_SHELL;
-            Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
-            ctx.client_to_host_queue.clear();
-            ctx.last_sender_id = GTK_SURFACE;
+            let mut g = Gtk::with(placement, toplevel).await;
+            let gtk_surface = g.gtk_surface().await;
+            g.aura_surface_and(|_| vec![startup_id(None)]);
 
-            assert_eq!(
-                Handlers::on_set_dbus_properties(
-                    &mut ctx,
-                    &Some("com.example.Terminal".to_string()),
-                    &None,
-                    &None,
-                    &None,
-                    &None,
-                    &None,
-                ),
-                Action::Drop,
-                "{case}"
-            );
-            assert_eq!(ctx.client_to_host_queue.len(), 1, "{case}");
-            let message = &ctx.client_to_host_queue[0].0;
-            assert_eq!(msg_opcode(message), REQ_SET_APPLICATION_ID, "{case}");
-            assert_eq!(
-                nullable_string(message).as_deref(),
-                Some(
-                    format!(
-                        "org.chromium.guest_os.{}.wayland.com.example.Terminal",
-                        ctx.settings().vm_id
-                    )
-                    .as_str()
-                ),
-                "{case}"
+            g.s.guest([terminal(gtk_surface)]).await;
+            let host = g.s.host_received();
+            assert!(
+                matches!(&host[..], [(_, request)] if *request == terminal_id()),
+                "{case}: {host:?}"
             );
         }
     }
@@ -319,83 +354,61 @@ mod tests {
     /// its re-advertisement has no Aura surface. GTK requests issued after
     /// a new shell is bound create one; nothing replays the requests issued
     /// while no shell was bound.
-    #[test]
-    fn gtk_requests_after_a_shell_rebind_reach_the_new_shell() {
-        use crate::handler::Handlers;
-        use crate::protocols::wayland::wl_registry::WlRegistryHandler;
+    #[tokio::test]
+    async fn gtk_requests_after_a_shell_rebind_reach_the_new_shell() {
+        let mut g = Gtk::new().await;
+        let registry = g.s.registry().await;
+        g.s.global_remove(registry, g.gtk.name).await;
+        let release = zaura_shell::Request::Release {};
+        assert_eq!(g.s.host_received(), [(g.gtk.shell, release.into())]);
+        let removal = wl_registry::Event::GlobalRemove { name: g.gtk.name };
+        assert_eq!(g.s.guest_received(), [(registry.id, removal.into())]);
 
-        const REGISTRY: u32 = 1;
-        const SHELL_NAME: u32 = 7;
-        let mut ctx = setup_ctx();
-        ctx.singletons.unbind_for_test(Singleton::AuraShell);
-        ctx.shadow_table
-            .insert_paired_for_test(REGISTRY, REGISTRY, "wl_registry");
-        let shell = "zaura_shell".to_string();
-        let set_application_id = |ctx: &mut Context| {
-            ctx.last_sender_id = GTK_SURFACE;
-            Handlers::on_set_dbus_properties(
-                ctx,
-                &Some("com.example.Terminal".to_string()),
-                &None,
-                &None,
-                &None,
-                &None,
-                &None,
-            );
+        let gtk_surface = g.gtk_surface().await;
+        g.s.guest([terminal(gtk_surface)]).await;
+        assert_eq!(g.s.host_received(), []);
+
+        g.s.global(
+            registry,
+            g.gtk.name,
+            zaura_shell::NAME,
+            zaura_shell::VERSION,
+        )
+        .await;
+        g.s.guest_received();
+        let host = g.s.host_received();
+        let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { ref id, .. }))] = host[..]
+        else {
+            panic!("the host got {host:?}, not the shell's bind alone");
         };
+        g.gtk.shell = id.2;
 
-        ctx.last_sender_id = REGISTRY;
-        Handlers::on_global(&mut ctx, SHELL_NAME, &shell, 38);
-        Handlers::on_global_remove(&mut ctx, SHELL_NAME);
-        assert_eq!(ctx.singletons.get(Singleton::AuraShell), None);
-        ctx.last_sender_id = GTK_SHELL;
-        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
-        set_application_id(&mut ctx);
-        assert_eq!(ctx.aura_surfaces.get(SURFACE.host), None);
-
-        ctx.last_sender_id = REGISTRY;
-        Handlers::on_global(&mut ctx, SHELL_NAME, &shell, 38);
-        let shell_host = ctx
-            .singletons
-            .host(Singleton::AuraShell)
-            .expect("rebound zaura_shell");
-        ctx.client_to_host_queue.clear();
-        ctx.last_sender_id = GTK_SHELL;
-        Handlers::on_set_startup_id(&mut ctx, &Some("launch-token".to_string()));
-        set_application_id(&mut ctx);
-
-        let zaura_surface = ctx
-            .aura_surfaces
-            .get(SURFACE.host)
-            .expect("set_startup_id creates the Aura surface");
-        let queued = queued_headers(&ctx.client_to_host_queue);
-        assert_eq!(
-            queued,
-            vec![
-                (shell_host, REQ_GET_AURA_SURFACE),
-                (zaura_surface, zaura_surface::REQ_SET_STARTUP_ID),
-                (zaura_surface, REQ_SET_APPLICATION_ID),
-            ]
-        );
+        g.s.guest([
+            gtk_shell1::req::set_startup_id(g.gtk.id, Some("launch-token")).unwrap(),
+            terminal(gtk_surface),
+        ])
+        .await;
+        g.aura_surface_and(|_| vec![startup_id(Some("launch-token")), terminal_id()]);
     }
 
-    #[test]
-    fn wl_surface_destroy_removes_gtk_and_aura_associations() {
-        use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
+    #[tokio::test]
+    async fn wl_surface_destroy_removes_gtk_and_aura_associations() {
+        let mut g = Gtk::new().await;
+        let gtk_surface = g.gtk_surface().await;
+        let aura_surface = g.aura_surface_and(|_| vec![startup_id(None)]);
 
-        let mut ctx = setup_ctx();
-        ctx.last_sender_id = GTK_SHELL;
-        Handlers::on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
-        assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
-
-        ctx.last_sender_id = SURFACE.guest;
-        assert_eq!(Handlers::on_destroy(&mut ctx), Action::Drop);
-        assert!(!ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
-        assert!(
-            ctx.shadow_table.is_local(GTK_SURFACE),
-            "gtk_surface1 has no destroy request, so its client ID stays reserved"
+        g.s.guest([wl_surface::req::destroy(g.surface.id)]).await;
+        assert_eq!(
+            g.s.host_received(),
+            [
+                (aura_surface, zaura_surface::Request::Release {}.into()),
+                (g.surface.host, wl_surface::Request::Destroy {}.into()),
+            ]
         );
-        assert!(!ctx.shadow_table.is_guest_id_available(GTK_SURFACE));
-        assert_eq!(ctx.aura_surfaces.get(SURFACE.host), None);
+        // gtk_surface1 has no destroy request, so it stays the guest's,
+        // with nothing to name.
+        g.s.guest([terminal(gtk_surface)]).await;
+        assert_eq!(g.s.host_received(), []);
+        assert_eq!(g.s.guest_received(), []);
     }
 }

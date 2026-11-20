@@ -1113,30 +1113,19 @@ async fn connect_host(
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::harness::Session;
+    use super::harness::{default_keymap, Object, Session};
+    use super::Direction::{ClientToHost, HostToClient};
     use super::*;
     use crate::handler::test_support::session_with_shm;
     use crate::protocols::AnyRequest;
     use crate::state::PlaneFenceForTest;
     use crate::test_support::{
-        any_fd_has_identity, fd_identity, fds_with_identity, msg_header, raw_dispatch, respell,
-        shm_pool_file, stream_headers,
+        any_fd_has_identity, fd_identity, fds_with_identity, raw_dispatch, respell, shm_pool_file,
+        TestFdIdentity,
     };
     use crate::wire::Outgoing;
     use crate::wire::{MessageBuilder, WL_DISPLAY_ID};
-    use std::fs;
-    use std::io::Write;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-
-    impl Client {
-        /// Dispatch one batch and send what it produced, as `run` does
-        /// once nothing more is buffered; returns whether the session goes
-        /// on.
-        async fn handle_msgs_and_flush(&mut self, direction: Direction) -> bool {
-            let goes_on = self.handle_msgs(direction).await;
-            self.flush().await && goes_on
-        }
-    }
+    use std::os::fd::{AsRawFd, OwnedFd};
 
     /// Every vendored interface has one `Iface`, which the wire names by
     /// its `NAME` and versions by its `VERSION`.
@@ -1155,134 +1144,125 @@ mod tests {
         assert_eq!(Iface::from_name("unknown_interface"), None);
     }
 
+    /// `Client::run` asks the preferred peer for more before it dispatches
+    /// another batch of the other's, so bytes still in the kernel's queue
+    /// do not wait behind a render burst the proxy has already received.
     #[tokio::test]
     async fn fairness_probe_receives_preferred_host_events_between_render_batches() {
-        use std::os::unix::net::UnixStream;
+        use protocols::wayland::{wl_region, wl_seat};
+        let mut s = Session::new();
+        let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+        let region = region(&mut s).await;
 
-        let (_guest_peer, client_socket) =
-            UnixStream::pair().expect("guest unix socket pair should be created");
-        let (mut host_peer, host_socket) =
-            UnixStream::pair().expect("host unix socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(client_socket.into()).expect("register test socket"),
-            WaylandConnection::new(host_socket.into()).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
-
-        let render_request = MessageBuilder::new().build_message(7, 0);
-        client
-            .client_conn
-            .read_buf
-            .extend_from_slice(&render_request);
+        s.queue(ClientToHost, [wl_region::req::add(region.id, 0, 0, 1, 1)]);
         assert_eq!(
-            client.next_buffered_direction(true).unwrap(),
-            Some(Direction::ClientToHost),
+            s.next_direction(true),
+            Some(ClientToHost),
             "an idle preferred transport must not block the buffered fallback"
         );
 
-        let host_event = MessageBuilder::new().build_message(8, 0);
-        host_peer
-            .write_all(&host_event)
-            .expect("queue host input event");
+        s.write(
+            HostToClient,
+            [wl_seat::evt::name(seat.host, "seat0").unwrap()],
+        );
         assert_eq!(
-            client.next_buffered_direction(true).unwrap(),
-            Some(Direction::HostToClient),
+            s.next_direction(true),
+            Some(HostToClient),
             "host bytes queued after a render batch must be received before another batch"
         );
-        assert_eq!(client.host_conn.read_buf, host_event);
+        assert!(s.batch(HostToClient).await && s.flush().await);
+        let name = "seat0".to_string();
+        assert_eq!(
+            s.guest_received(),
+            [(seat.id, wl_seat::Event::Name { name }.into())]
+        );
+        assert!(s.batch(ClientToHost).await && s.flush().await);
+        assert_eq!(s.host_received(), [added(region, 0)]);
     }
 
     /// A message whose header arrived in one read and whose body arrives in
     /// a later one must wait for that read, not be redispatched in a loop.
     #[test]
     fn run_receives_the_rest_of_a_partially_buffered_message() {
-        use std::io::Read;
-        use std::os::unix::net::UnixStream;
-        use std::time::Duration;
+        use protocols::wayland::wl_display;
+        use std::sync::mpsc::RecvTimeoutError;
 
-        let (mut guest_peer, client_socket) =
-            UnixStream::pair().expect("guest unix socket pair should be created");
-        let (mut host_peer, host_socket) =
-            UnixStream::pair().expect("host unix socket pair should be created");
-        host_peer
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("bound the wait for the forwarded request");
-
-        // wl_display.sync has opcode 0, so the opcode bytes of its header
-        // read as an invalid zero length when decoded as the length field.
-        const GUEST_CALLBACK: u32 = 2;
-        let mut sync = MessageBuilder::new();
-        sync.write_u32(GUEST_CALLBACK);
-        let sync = sync.build_message(1, protocols::wayland::wl_display::REQ_SYNC);
-        let (header, body) = sync.split_at(MessageHeader::LEN);
-        // The body waits in the socket, so the proxy must read again to
-        // complete the message whose header it has already buffered.
-        guest_peer.write_all(body).expect("queue the message body");
-
-        // Run the proxy on its own thread: a loop that spins without
+        // Run the session on its own thread: a loop that spins without
         // awaiting would starve a runtime shared with this test.
-        let header = header.to_vec();
-        let proxy = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+        let (done, finished) = std::sync::mpsc::channel();
+        let session = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("proxy runtime")
-                .block_on(async move {
-                    let mut client = Client::new(
-                        WaylandConnection::new(client_socket.into()).expect("register test socket"),
-                        WaylandConnection::new(host_socket.into()).expect("register test socket"),
-                        Context::new_for_test(false, false, Vec::new()),
+                .expect("a runtime");
+            runtime.block_on(async {
+                let mut s = Session::new();
+                // wl_display.sync has opcode 0, so the opcode bytes of its
+                // header read as an invalid zero length when decoded as the
+                // length field.
+                let (sync, _) = wl_display::req::sync(WL_DISPLAY_ID, s.new_id());
+                let (header, body) = sync.split_at(MessageHeader::LEN);
+                // The body waits in the socket, so the proxy must read again
+                // to complete the message whose header it has already
+                // buffered.
+                s.queue(ClientToHost, [(header.to_vec(), Vec::new())]);
+                s.write(ClientToHost, [(body.to_vec(), Vec::new())]);
+                s.run(async |peers| {
+                    let forwarded = peers.host_received().await;
+                    assert!(
+                        matches!(
+                            forwarded[..],
+                            [(
+                                WL_DISPLAY_ID,
+                                AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
+                            )]
+                        ),
+                        "the completed request must reach the host: {forwarded:?}"
                     );
-                    client.client_conn.read_buf.extend_from_slice(&header);
-                    client.run().await;
-                });
+                })
+                .await;
+            });
+            let _ = done.send(());
         });
-
-        let mut forwarded = [0u8; 12];
-        host_peer
-            .read_exact(&mut forwarded)
-            .expect("the completed request must reach the host");
-        let forwarded_header = msg_header(&forwarded);
-        assert_eq!(
-            (forwarded_header.sender_id, forwarded_header.opcode),
-            (1, protocols::wayland::wl_display::REQ_SYNC)
+        let waited = finished.recv_timeout(Duration::from_secs(10));
+        assert!(
+            !matches!(waited, Err(RecvTimeoutError::Timeout)),
+            "the proxy loop must read the rest of the message"
         );
-
-        drop(guest_peer);
-        drop(host_peer);
-        proxy
-            .join()
-            .expect("the proxy loop must end when its peers close");
-    }
-
-    /// A proxy whose peers are open sockets, with `wl_display` registered as
-    /// `Client::run` registers it.
-    fn client_with_socket_peers() -> (
-        Client,
-        std::os::unix::net::UnixStream,
-        std::os::unix::net::UnixStream,
-    ) {
-        use std::os::unix::net::UnixStream;
-
-        let (guest_peer, client_socket) =
-            UnixStream::pair().expect("guest unix socket pair should be created");
-        let (host_peer, host_socket) =
-            UnixStream::pair().expect("host unix socket pair should be created");
-        let client = Client::new(
-            WaylandConnection::new(client_socket.into()).expect("register test socket"),
-            WaylandConnection::new(host_socket.into()).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
-        (client, guest_peer, host_peer)
-    }
-
-    /// The host delivers `events` to the proxy.
-    async fn host_events(client: &mut Client, events: &[Vec<u8>]) {
-        for event in events {
-            client.host_conn.read_buf.extend_from_slice(event);
+        if let Err(panic) = session.join() {
+            std::panic::resume_unwind(panic);
         }
-        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
-        assert!(client.host_conn.read_buf.is_empty());
+    }
+
+    /// A new `wl_region`, from a `wl_compositor` the guest binds.
+    async fn region(s: &mut Session) -> Object {
+        use protocols::wayland::wl_compositor;
+        let compositor = s.bind("wl_compositor", wl_compositor::VERSION).await;
+        let id = s.new_id();
+        let host = s
+            .create(wl_compositor::req::create_region(compositor, id))
+            .await;
+        Object { id, host }
+    }
+
+    /// The forward of the guest's `wl_region.add(x, 0, 1, 1)` to `region`.
+    fn added(region: Object, x: i32) -> (u32, AnyRequest) {
+        use protocols::wayland::wl_region;
+        let add = wl_region::Request::Add {
+            x,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        (region.host, add.into())
+    }
+
+    /// A `wl_pointer` whose focus is on a surface.
+    async fn pointer(s: &mut Session) -> Object {
+        use protocols::wayland::wl_seat;
+        let seat = s.bind("wl_seat", wl_seat::VERSION).await;
+        let surface = s.surface().await;
+        s.pointer_on(seat, surface).await
     }
 
     /// A message no encoder builds, such as a malformed one: `words` as
@@ -1291,12 +1271,6 @@ mod tests {
         let mut message = MessageBuilder::new();
         words.iter().for_each(|&word| message.write_u32(word));
         (message.build_message(sender, opcode), Vec::new())
-    }
-
-    fn callback_done(host_callback: u32) -> Vec<u8> {
-        let mut done = MessageBuilder::new();
-        done.write_u32(0);
-        done.build_message(host_callback, protocols::wayland::wl_callback::EVT_DONE)
     }
 
     /// libwayland-server rejects client object IDs past its map limit, so a
@@ -1405,36 +1379,53 @@ mod tests {
         );
     }
 
+    /// A session whose proxy has GPU access, without which the guest does
+    /// not get the host's linux-dmabuf, and whose guest has bound it. The
+    /// plane of each native buffer stands in for its own sync_file.
+    async fn session_with_dmabuf() -> (Session, Object) {
+        let mut s = Session::with_context(Context::new_for_test(true, false, Vec::new()));
+        let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await;
+        s.guest_received();
+        s.host_received();
+        // Injects what no peer can provide: each plane stands in for its
+        // own sync_file, which a readable pipe is once the guest GPU is done.
+        s.ctx().plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
+        (s, dmabuf)
+    }
+
     /// A guest may destroy a buffer the host still holds. Its guest object
     /// takes no more requests, but the host's `release` must still reach the
     /// handler, which then destroys the host buffer.
     #[tokio::test]
     async fn a_retired_buffer_still_routes_its_release() {
-        use crate::protocols::wayland::wl_buffer;
-        use crate::state::RenderBufferLifecycle;
-        const GUEST: u32 = 20;
-        const HOST: u32 = 30;
-        let (mut client, _guest_peer, _host_peer) = client_with_socket_peers();
-        let ctx = &mut client.ctx;
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(GUEST, HOST, "wl_buffer", 1);
-        assert!(ctx.register_native_buffer(HOST, (1, 1), Vec::new()));
-        assert!(ctx.mark_buffer_submitted(GUEST));
-
-        let (destroy, _) = wl_buffer::req::destroy(GUEST);
-        client.client_conn.read_buf.extend_from_slice(&destroy);
-        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
-        assert_eq!(client.ctx.shadow_table.request_sender(GUEST), None);
-        assert!(client.ctx.shadow_table.is_pending_destroy_guest(GUEST));
-
-        let (release, _) = wl_buffer::evt::release(HOST);
-        host_events(&mut client, &[release]).await;
+        use protocols::wayland::{wl_buffer, wl_surface};
+        let (mut s, dmabuf) = session_with_dmabuf().await;
+        let surface = s.surface().await;
+        // A native buffer the guest GPU has finished writing.
+        let (plane, signal) = crate::test_support::pipe();
+        assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+        let buffer = s.native_buffer(dmabuf.id, plane, 1, 1).await;
+        s.guest([
+            wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
         assert_eq!(
-            client
-                .ctx
-                .render_buffer_lifecycle_for_host(crate::state::HostId(HOST)),
-            Some(RenderBufferLifecycle::HostDestroyQueued)
+            s.host_received(),
+            [
+                attached(surface, buffer),
+                (surface.host, wl_surface::Request::Commit {}.into())
+            ]
         );
+
+        s.guest([wl_buffer::req::destroy(buffer.id)]).await;
+        assert_eq!(s.host_received(), [], "the host still shows the buffer");
+        s.host([wl_buffer::evt::release(buffer.host)]).await;
+        assert_eq!(
+            s.host_received(),
+            [(buffer.host, wl_buffer::Request::Destroy {}.into())]
+        );
+        assert_eq!(s.guest_received(), []);
     }
 
     /// CPU time this thread has used.
@@ -1493,106 +1484,63 @@ mod tests {
 
     /// A burst of requests longer than one fairness batch reaches the host
     /// in as few submissions as fit it, not one per batch: each submission
-    /// is a synchronous VirtWL round trip.
+    /// is a synchronous VirtWL round trip. No batch sends its output, which
+    /// fills no submission, so the burst leaves at once when the proxy
+    /// flushes before it waits.
     #[tokio::test]
     async fn a_burst_of_batches_reaches_the_host_in_one_submission() {
-        use crate::protocols::wayland::wl_region;
-        use std::os::fd::AsRawFd;
+        use crate::connection::MAX_BYTES_PER_SEND;
+        use protocols::wayland::wl_region;
+        const REQUESTS: i32 = 100;
+        const { assert!(REQUESTS as usize > 3 * MAX_MESSAGES_PER_BATCH) };
+        let mut s = Session::new();
+        let region = region(&mut s).await;
+        let add = |x| wl_region::req::add(region.id, x, 0, 1, 1);
+        assert!(REQUESTS as usize * add(0).0.len() <= MAX_BYTES_PER_SEND);
 
-        const GUEST_REGION: u32 = 30;
-        const HOST_REGION: u32 = 31;
-        const REQUESTS: usize = 100;
-        const { assert!(REQUESTS > 3 * MAX_MESSAGES_PER_BATCH) };
-        let (guest_peer, client_socket) =
-            std::os::unix::net::UnixStream::pair().expect("a guest socket pair");
-        // A sequenced-packet host keeps each submission apart.
-        let (host_peer, host_socket) = nix::sys::socket::socketpair(
-            nix::sys::socket::AddressFamily::Unix,
-            nix::sys::socket::SockType::SeqPacket,
-            None,
-            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
-        )
-        .expect("a host socket pair");
-        let mut client = Client::new(
-            WaylandConnection::new(client_socket.into()).expect("register test socket"),
-            WaylandConnection::new(host_socket).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
-        client
-            .ctx
-            .shadow_table
-            .insert_paired_for_test(GUEST_REGION, HOST_REGION, "wl_region");
-
-        // The guest writes the burst at once and goes away, which ends the
-        // proxy once it has dispatched the burst.
-        let requests: Vec<u8> = (0..REQUESTS as i32)
-            .flat_map(|x| wl_region::req::add(GUEST_REGION, x, 0, 1, 1).0)
-            .collect();
-        (&guest_peer).write_all(&requests).expect("send the burst");
-        drop(guest_peer);
-        client.run().await;
-
-        let mut submissions = Vec::new();
-        loop {
-            let mut data = [0u8; 4096];
-            let received = nix::sys::socket::recv(
-                host_peer.as_raw_fd(),
-                &mut data,
-                nix::sys::socket::MsgFlags::empty(),
-            )
-            .expect("receive from the proxy");
-            if received == 0 {
-                break;
-            }
-            submissions.push(data[..received].to_vec());
+        s.queue(ClientToHost, (0..REQUESTS).map(add));
+        while s.next_direction(false).is_some() {
+            assert!(s.batch(ClientToHost).await);
+            assert_eq!(s.host_received(), [], "a batch sends nothing of its own");
         }
-        let forwarded: Vec<u8> = (0..REQUESTS as i32)
-            .flat_map(|x| wl_region::req::add(HOST_REGION, x, 0, 1, 1).0)
-            .collect();
-        let sizes: Vec<usize> = submissions.iter().map(Vec::len).collect();
-        assert_eq!(sizes, [forwarded.len()], "bytes per submission");
-        assert_eq!(submissions.concat(), forwarded);
+        assert!(s.flush().await);
+        let forwarded: Vec<_> = (0..REQUESTS).map(|x| added(region, x)).collect();
+        assert_eq!(s.host_received(), forwarded);
     }
 
     /// A host batch's output reaches the guest before the proxy dispatches
     /// a guest batch: a key or IME event must not wait behind the rest of
-    /// a render burst the guest has already sent. (`harness::Session`
-    /// dispatches one direction and then flushes, so it cannot show this.)
+    /// a render burst the guest has already sent.
     #[tokio::test]
     async fn a_host_batchs_output_reaches_the_guest_before_the_next_guest_batch() {
-        use crate::protocols::wayland::{wl_pointer, wl_region};
-        use std::io::Read;
-
-        const GUEST_POINTER: u32 = 30;
-        const HOST_POINTER: u32 = 31;
-        const GUEST_REGION: u32 = 32;
-        const HOST_REGION: u32 = 33;
-        let (mut client, guest_peer, _host_peer) = client_with_socket_peers();
-        let table = &mut client.ctx.shadow_table;
-        table.insert_paired_for_test(GUEST_POINTER, HOST_POINTER, "wl_pointer");
-        table.insert_paired_for_test(GUEST_REGION, HOST_REGION, "wl_region");
+        use protocols::wayland::{wl_pointer, wl_region};
+        let mut s = Session::new();
+        let pointer = pointer(&mut s).await;
+        let region = region(&mut s).await;
 
         // An event from the host, and a render burst longer than a batch
         // from the guest.
-        let (motion, _) = wl_pointer::evt::motion(HOST_POINTER, 1, 2, 3);
-        client.host_conn.read_buf.extend(motion);
-        for x in 0..=MAX_MESSAGES_PER_BATCH as i32 {
-            let (add, _) = wl_region::req::add(GUEST_REGION, x, 0, 1, 1);
-            client.client_conn.read_buf.extend(add);
-        }
-        assert!(client.handle_msgs(Direction::HostToClient).await);
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
-        assert!(client.client_conn.has_complete_message());
+        s.queue(
+            HostToClient,
+            [wl_pointer::evt::motion(pointer.host, 1, 2, 3)],
+        );
+        let burst = 0..=MAX_MESSAGES_PER_BATCH as i32;
+        let add = |x| wl_region::req::add(region.id, x, 0, 1, 1);
+        s.queue(ClientToHost, burst.clone().map(add));
+        assert!(s.batch(HostToClient).await);
+        assert!(s.batch(ClientToHost).await);
+        let motion = wl_pointer::Event::Motion {
+            time: 1,
+            surface_x: 2,
+            surface_y: 3,
+        };
+        assert_eq!(s.guest_received(), [(pointer.id, motion.into())]);
 
-        guest_peer
-            .set_nonblocking(true)
-            .expect("a non-blocking guest peer");
-        let mut received = [0u8; 64];
-        let len = (&guest_peer)
-            .read(&mut received)
-            .expect("the guest has the event");
-        let (forwarded, _) = wl_pointer::evt::motion(GUEST_POINTER, 1, 2, 3);
-        assert_eq!(received[..len], forwarded);
+        // The rest of the burst, and the whole of it once the proxy waits.
+        assert_eq!(s.next_direction(true), Some(ClientToHost));
+        assert!(s.batch(ClientToHost).await && s.flush().await);
+        let forwarded: Vec<_> = burst.map(|x| added(region, x)).collect();
+        assert_eq!(s.host_received(), forwarded);
     }
 
     /// A long stream in one direction still sends what it produced every
@@ -1600,124 +1548,89 @@ mod tests {
     #[tokio::test]
     async fn a_one_way_stream_sends_every_few_batches() {
         use crate::connection::MAX_BYTES_PER_SEND;
-        use crate::protocols::wayland::wl_region;
-        use std::io::Read;
-
-        const GUEST_REGION: u32 = 30;
-        const HOST_REGION: u32 = 31;
-        let (mut client, _guest_peer, host_peer) = client_with_socket_peers();
-        client
-            .ctx
-            .shadow_table
-            .insert_paired_for_test(GUEST_REGION, HOST_REGION, "wl_region");
+        use protocols::wayland::wl_region;
+        let mut s = Session::new();
+        let region = region(&mut s).await;
         let batches = MAX_BATCHES_PER_FLUSH + 1;
-        for x in 0..(batches * MAX_MESSAGES_PER_BATCH) as i32 {
-            let (add, _) = wl_region::req::add(GUEST_REGION, x, 0, 1, 1);
-            client.client_conn.read_buf.extend(add);
-        }
-        let (add, _) = wl_region::req::add(GUEST_REGION, 0, 0, 1, 1);
-        let sent = MAX_BATCHES_PER_FLUSH * MAX_MESSAGES_PER_BATCH * add.len();
+        let requests = (batches * MAX_MESSAGES_PER_BATCH) as i32;
+        let add = |x| wl_region::req::add(region.id, x, 0, 1, 1);
+        let sent = (MAX_BATCHES_PER_FLUSH * MAX_MESSAGES_PER_BATCH) as i32;
         // The batches' output fits one submission, so only the count sends it.
-        assert!(sent < MAX_BYTES_PER_SEND);
-        for _ in 0..batches {
-            assert!(client.handle_msgs(Direction::ClientToHost).await);
-        }
+        assert!(sent as usize * add(0).0.len() < MAX_BYTES_PER_SEND);
 
-        host_peer
-            .set_nonblocking(true)
-            .expect("a non-blocking host peer");
-        let mut received = vec![0u8; 8 * 4096];
-        let len = (&host_peer)
-            .read(&mut received)
-            .expect("the host has the first batches");
-        assert_eq!(len, sent);
+        s.queue(ClientToHost, (0..requests).map(add));
+        for _ in 0..batches {
+            assert!(s.batch(ClientToHost).await);
+        }
+        let forwarded: Vec<_> = (0..sent).map(|x| added(region, x)).collect();
+        assert_eq!(s.host_received(), forwarded, "the first batches");
+        assert!(s.flush().await);
+        let forwarded: Vec<_> = (sent..requests).map(|x| added(region, x)).collect();
+        assert_eq!(s.host_received(), forwarded);
+    }
+
+    /// A guest `wl_data_device` of a seat, and its host object.
+    async fn data_device(s: &mut Session) -> Object {
+        use protocols::wayland::{wl_data_device_manager, wl_seat};
+        let seat = s.bind("wl_seat", wl_seat::VERSION).await;
+        let manager = s
+            .bind("wl_data_device_manager", wl_data_device_manager::VERSION)
+            .await;
+        let id = s.new_id();
+        let host = s
+            .create(wl_data_device_manager::req::get_data_device(
+                manager, id, seat,
+            ))
+            .await;
+        Object { id, host }
     }
 
     /// A VirtWL transaction carries at most 28 descriptors, so a batch that
-    /// forwards more must be split, between messages.
+    /// forwards more must be split, between messages: the batch sends its
+    /// full submission at once, and the rest when the proxy flushes.
     #[tokio::test]
     async fn batches_send_at_most_the_transport_descriptor_limit_at_once() {
         use crate::connection::MAX_FDS_PER_SEND;
-        use std::os::fd::AsRawFd;
-
-        const GUEST_OFFER: u32 = 30;
-        const HOST_OFFER: u32 = 31;
+        use protocols::wayland::{wl_data_device, wl_data_offer};
         const RECEIVES: usize = MAX_FDS_PER_SEND + 2;
-        let (mut client, guest_peer, host_peer) = client_with_socket_peers();
-        client
-            .ctx
-            .shadow_table
-            .insert_paired_for_test(GUEST_OFFER, HOST_OFFER, "wl_data_offer");
+        const { assert!(RECEIVES <= MAX_MESSAGES_PER_BATCH) };
+        let mut s = Session::new();
+        let device = data_device(&mut s).await;
+        const HOST_OFFER: u32 = crate::test_support::wire_peer::SERVER_ID_START;
+        s.host([wl_data_device::evt::data_offer(device.host, HOST_OFFER)])
+            .await;
+        let [(_, AnyEvent::WlDataDevice(wl_data_device::Event::DataOffer { id: offer }))] =
+            s.guest_received()[..]
+        else {
+            panic!("the guest got no offer");
+        };
 
-        // The guest asks for the selection once per descriptor, in one write
-        // the proxy dispatches as one batch.
+        // The guest asks for the selection once per descriptor, which the
+        // proxy dispatches as one batch.
         let (pipe_read, pipe_write) = crate::test_support::pipe();
-        let mut receive = MessageBuilder::new();
-        receive.write_string("text/plain");
-        let receive =
-            receive.build_message(GUEST_OFFER, protocols::wayland::wl_data_offer::REQ_RECEIVE);
-        let requests = receive.repeat(RECEIVES);
-        let fds = [pipe_write.as_raw_fd(); RECEIVES];
-        let sent = nix::sys::socket::sendmsg::<()>(
-            guest_peer.as_raw_fd(),
-            &[std::io::IoSlice::new(&requests)],
-            &[nix::sys::socket::ControlMessage::ScmRights(&fds)],
-            nix::sys::socket::MsgFlags::empty(),
-            None,
-        )
-        .expect("send the guest requests");
-        assert_eq!(sent, requests.len());
+        let receive = |_| {
+            let fd = pipe_write.try_clone().expect("duplicate the pipe");
+            wl_data_offer::req::receive(offer, "text/plain", fd).unwrap()
+        };
+        s.queue(ClientToHost, (0..RECEIVES).map(receive));
         drop((pipe_read, pipe_write));
-        assert_eq!(
-            client
-                .client_conn
-                .recv()
-                .await
-                .expect("receive the requests"),
-            requests.len()
-        );
-        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
-        drop(client);
-
-        // Read the host side one submission at a time.
-        let mut received_bytes = 0;
-        let mut per_submission = Vec::new();
-        loop {
-            let mut data = [0u8; 4096];
-            let mut control = nix::cmsg_space!([RawFd; 253]);
-            let mut iov = [std::io::IoSliceMut::new(&mut data)];
-            let message = nix::sys::socket::recvmsg::<()>(
-                host_peer.as_raw_fd(),
-                &mut iov,
-                Some(&mut control),
-                nix::sys::socket::MsgFlags::empty(),
-            )
-            .expect("receive from the proxy");
-            if message.bytes == 0 {
-                break;
-            }
-            received_bytes += message.bytes;
-            let mut fds = Vec::new();
-            for cmsg in message.cmsgs().expect("control messages") {
-                if let nix::sys::socket::ControlMessageOwned::ScmRights(received) = cmsg {
-                    fds.extend(received);
-                }
-            }
-            for &fd in &fds {
-                unsafe { libc::close(fd) };
-            }
-            per_submission.push(fds.len());
-        }
-        drop(guest_peer);
-
-        assert_eq!(received_bytes, requests.len());
-        assert_eq!(per_submission.iter().sum::<usize>(), RECEIVES);
-        assert!(
-            per_submission
-                .iter()
-                .all(|&count| count <= MAX_FDS_PER_SEND),
-            "descriptors per submission: {per_submission:?}"
-        );
+        let receives = |received: Vec<(u32, AnyRequest)>| {
+            assert!(
+                received.iter().all(|request| matches!(
+                    request,
+                    (
+                        HOST_OFFER,
+                        AnyRequest::WlDataOffer(wl_data_offer::Request::Receive { .. })
+                    )
+                )),
+                "{received:?}"
+            );
+            received.len()
+        };
+        assert!(s.batch(ClientToHost).await);
+        assert_eq!(receives(s.host_received()), MAX_FDS_PER_SEND);
+        assert!(s.flush().await);
+        assert_eq!(receives(s.host_received()), RECEIVES - MAX_FDS_PER_SEND);
     }
 
     #[test]
@@ -1745,248 +1658,164 @@ mod tests {
         assert!(!socket.exists());
     }
 
+    /// A batch dispatches at most `MAX_MESSAGES_PER_BATCH` messages and
+    /// leaves the rest buffered for the next turn of the loop.
     #[tokio::test]
     async fn message_batches_leave_buffered_frames_for_fair_dispatch() {
-        use std::os::unix::net::UnixStream;
+        use protocols::wayland::wl_pointer;
+        let mut s = Session::new();
+        let pointer = pointer(&mut s).await;
+        let batch = MAX_MESSAGES_PER_BATCH as u32;
+        let motion = |time| wl_pointer::evt::motion(pointer.host, time, 0, 0);
+        let moved = |time| {
+            let motion = wl_pointer::Event::Motion {
+                time,
+                surface_x: 0,
+                surface_y: 0,
+            };
+            (pointer.id, AnyEvent::from(motion))
+        };
 
-        let (client_socket, host_socket) =
-            UnixStream::pair().expect("test socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(client_socket.into()).expect("register test socket"),
-            WaylandConnection::new(host_socket.into()).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
-
-        // Use an untracked host event so dispatch has no protocol state to
-        // mutate. The batch limit itself is what this regression test covers.
-        let message = MessageBuilder::new().build_message(77, 0);
-        for _ in 0..=MAX_MESSAGES_PER_BATCH {
-            client.host_conn.read_buf.extend_from_slice(&message);
-        }
-        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
-        assert!(
-            client.host_conn.has_complete_message(),
+        s.queue(HostToClient, (0..=batch).map(motion));
+        assert!(s.batch(HostToClient).await && s.flush().await);
+        let forwarded: Vec<_> = (0..batch).map(moved).collect();
+        assert_eq!(s.guest_received(), forwarded);
+        assert_eq!(
+            s.next_direction(true),
+            Some(HostToClient),
             "a bounded batch must leave complete frames for the next loop turn"
         );
+        assert!(s.batch(HostToClient).await && s.flush().await);
         assert_eq!(
-            client.host_conn.read_buf.len(),
-            message.len(),
+            s.guest_received(),
+            [moved(batch)],
             "exactly one frame should remain after the first bounded batch"
         );
-
-        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
-        assert!(client.host_conn.read_buf.is_empty());
+        assert_eq!(s.next_direction(true), None);
     }
 
-    fn assert_fd_released(fd: std::os::unix::io::RawFd, target: &std::path::Path) {
-        let current = fs::read_link(format!("/proc/self/fd/{fd}"));
-        assert!(
-            current.as_ref().map_or(true, |current| current != target),
-            "descriptor {fd} still refers to its owned resource: {current:?}"
+    /// A seat's two keyboards: one the guest has released, whose host
+    /// `delete_id` has not come yet, and a live one.
+    async fn released_and_live_keyboards(s: &mut Session) -> (Object, Object) {
+        use protocols::wayland::wl_keyboard;
+        let (seat, released) = s.keyboard().await;
+        let live = s.keyboard_of(seat).await;
+        s.guest([wl_keyboard::req::release(released.id)]).await;
+        assert_eq!(
+            s.host_received(),
+            [(released.host, wl_keyboard::Request::Release {}.into())]
         );
+        (released, live)
     }
 
-    const STALE_GUEST_KEYBOARD: u32 = 10;
-    const STALE_HOST_KEYBOARD: u32 = 20;
-    const LIVE_GUEST_KEYBOARD: u32 = 11;
-    const LIVE_HOST_KEYBOARD: u32 = 21;
-
-    fn pending_keyboard_client() -> (
-        Client,
-        std::os::unix::net::UnixStream,
-        std::os::unix::net::UnixStream,
-    ) {
-        use std::os::unix::net::UnixStream;
-
-        let (guest_peer, guest_socket) =
-            UnixStream::pair().expect("guest unix socket pair should be created");
-        let (_host_peer, host_socket) =
-            UnixStream::pair().expect("host unix socket pair should be created");
-        guest_peer
-            .set_nonblocking(true)
-            .expect("guest peer should become nonblocking");
-        let mut client = Client::new(
-            WaylandConnection::new(guest_socket.into()).expect("register test socket"),
-            WaylandConnection::new(host_socket.into()).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
-
-        for (guest_id, host_id) in [
-            (STALE_GUEST_KEYBOARD, STALE_HOST_KEYBOARD),
-            (LIVE_GUEST_KEYBOARD, LIVE_HOST_KEYBOARD),
-        ] {
-            client.ctx.shadow_table.insert_paired_with_version_for_test(
-                guest_id,
-                host_id,
-                "wl_keyboard",
-                10,
-            );
-        }
-        client.ctx.guest_destroyed(STALE_GUEST_KEYBOARD);
-
-        (client, guest_peer, _host_peer)
-    }
-
-    /// A valid keymap event from the destroyed keyboard, and the identity
-    /// of its descriptor, which travels apart from its bytes. Were its
-    /// handler to run, it would load the keymap for the destroyed keyboard,
-    /// state the orphan check after the batch reports.
-    fn stale_keymap_event() -> (Vec<u8>, OwnedFd, crate::test_support::TestFdIdentity) {
-        use crate::protocols::wayland::wl_keyboard;
-        use xkbcommon::xkb;
-
-        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let keymap = xkb::Keymap::new_from_names(
-            &context,
-            "",
-            "",
-            "",
-            "",
-            None,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .expect("the default keymap");
-        // The size counts the NUL that ends the keymap text.
-        let mut text = keymap
-            .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
-            .into_bytes();
-        text.push(0);
-        let file = OwnedFd::from(shm_pool_file(&text));
+    /// A valid keymap event of host `keyboard`, and the identity of its
+    /// descriptor. Were its handler to run for a released keyboard, it
+    /// would load the keymap for it, state the orphan check after the batch
+    /// reports.
+    fn keymap_event(keyboard: u32) -> (Outgoing, TestFdIdentity) {
+        use protocols::wayland::wl_keyboard;
+        let keymap = default_keymap();
+        let file = shm_pool_file(&keymap);
         let identity = fd_identity(file.as_raw_fd());
-        let (event, mut fds) = wl_keyboard::evt::keymap(
-            STALE_HOST_KEYBOARD,
-            wl_keyboard::KEYMAP_FORMAT_XKB_V1,
-            file,
-            text.len() as u32,
-        );
-        (event, fds.pop().expect("the keymap's descriptor"), identity)
+        let format = wl_keyboard::KEYMAP_FORMAT_XKB_V1;
+        let size = keymap.len() as u32;
+        let event = wl_keyboard::evt::keymap(keyboard, format, file.into(), size);
+        (event, identity)
     }
 
-    fn repeat_info_event(keyboard: u32) -> Vec<u8> {
-        use crate::protocols::wayland::wl_keyboard;
-
-        let mut repeat_info = MessageBuilder::new();
-        repeat_info.write_i32(25);
-        repeat_info.write_i32(400);
-        repeat_info.build_message(keyboard, wl_keyboard::EVT_REPEAT_INFO)
+    /// The `repeat_info` the host sends a live keyboard after a stale
+    /// keymap, as `keyboard` sends it on.
+    fn repeat_info(keyboard: u32) -> Outgoing {
+        protocols::wayland::wl_keyboard::evt::repeat_info(keyboard, 25, 400)
     }
 
-    fn assert_live_repeat_info_forwarded(
-        guest_peer: &mut std::os::unix::net::UnixStream,
-        expected: &[u8],
-    ) {
-        use std::io::Read;
-
-        let mut forwarded = vec![0; expected.len()];
-        guest_peer
-            .read_exact(&mut forwarded)
-            .expect("the live follow-up event must reach the guest");
-        assert_eq!(forwarded, expected);
+    /// The guest's `repeat_info` of `keyboard`.
+    fn repeated(keyboard: Object) -> (u32, AnyEvent) {
+        use protocols::wayland::wl_keyboard;
+        let repeat_info = wl_keyboard::Event::RepeatInfo {
+            rate: 25,
+            delay: 400,
+        };
+        (keyboard.id, repeat_info.into())
     }
 
     #[tokio::test]
     async fn pending_destroy_event_consumes_known_fd_before_live_event_in_same_batch() {
-        let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
-        let (keymap, keymap_fd, keymap_identity) = stale_keymap_event();
-        let live_repeat_info = repeat_info_event(LIVE_HOST_KEYBOARD);
-        let expected_repeat_info = repeat_info_event(LIVE_GUEST_KEYBOARD);
+        use protocols::wayland::wl_display;
+        let mut s = Session::new();
+        let (released, live) = released_and_live_keyboards(&mut s).await;
+        let (keymap, keymap_identity) = keymap_event(released.host);
 
-        client.host_conn.read_buf.extend_from_slice(&keymap);
-        client
-            .host_conn
-            .read_buf
-            .extend_from_slice(&live_repeat_info);
-        client.host_conn.read_fds.push_back(keymap_fd);
-
-        assert!(
-            client.handle_msgs_and_flush(Direction::HostToClient).await,
-            "a known stale event with an FD must not terminate the connection"
-        );
-        assert!(client.host_conn.read_buf.is_empty());
-        assert!(client.host_conn.read_fds.is_empty());
-        assert!(
-            !client.host_conn.ambiguous_untracked_fd,
-            "schema-aware consumption must not poison later FD ordering"
-        );
-        assert!(
-            client
-                .ctx
-                .shadow_table
-                .is_pending_destroy_guest(STALE_GUEST_KEYBOARD),
-            "dropping a stale event must not complete object teardown"
-        );
-        assert_live_repeat_info_forwarded(&mut guest_peer, &expected_repeat_info);
+        // A known stale event with a descriptor does not end the session.
+        s.host([keymap, repeat_info(live.host)]).await;
+        assert_eq!(s.guest_received(), [repeated(live)]);
         assert!(
             !any_fd_has_identity(keymap_identity),
             "the stale keymap's descriptor is closed"
+        );
+        // Schema-aware consumption does not poison later descriptor
+        // ordering: the next descriptor reaches its own event.
+        s.keymap(live).await;
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, released.host)])
+            .await;
+        assert_eq!(
+            s.guest_received(),
+            [(
+                WL_DISPLAY_ID,
+                wl_display::Event::DeleteId { id: released.id }.into()
+            )],
+            "dropping a stale event must not complete object teardown"
         );
     }
 
     #[tokio::test]
     async fn pending_destroy_event_consumes_known_fd_before_partial_followup() {
-        use std::io::Read;
+        let mut s = Session::new();
+        let (released, live) = released_and_live_keyboards(&mut s).await;
+        let (keymap, keymap_identity) = keymap_event(released.host);
+        let (live_repeat_info, _) = repeat_info(live.host);
+        let (head, rest) = live_repeat_info.split_at(4);
 
-        let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
-        let (keymap, keymap_fd, keymap_identity) = stale_keymap_event();
-        let live_repeat_info = repeat_info_event(LIVE_HOST_KEYBOARD);
-        let expected_repeat_info = repeat_info_event(LIVE_GUEST_KEYBOARD);
-
-        client.host_conn.read_buf.extend_from_slice(&keymap);
-        client
-            .host_conn
-            .read_buf
-            .extend_from_slice(&live_repeat_info[..4]);
-        client.host_conn.read_fds.push_back(keymap_fd);
-
-        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
+        s.host([keymap, (head.to_vec(), Vec::new())]).await;
         assert_eq!(
-            client.host_conn.read_buf,
-            live_repeat_info[..4],
-            "the incomplete follow-up must remain buffered"
+            s.guest_received(),
+            [],
+            "an incomplete live event must not be forwarded"
         );
-        assert!(client.host_conn.read_fds.is_empty());
-        assert!(!client.host_conn.ambiguous_untracked_fd);
-        let mut premature = [0u8; 1];
-        let read_error = guest_peer
-            .read(&mut premature)
-            .expect_err("an incomplete live event must not be forwarded");
-        assert_eq!(read_error.kind(), io::ErrorKind::WouldBlock);
         assert!(
             !any_fd_has_identity(keymap_identity),
             "the stale keymap's descriptor is closed"
         );
 
-        client
-            .host_conn
-            .read_buf
-            .extend_from_slice(&live_repeat_info[4..]);
-        assert!(
-            client.handle_msgs_and_flush(Direction::HostToClient).await,
-            "the completed live follow-up must remain decodable"
-        );
-        assert!(client.host_conn.read_buf.is_empty());
-        assert_live_repeat_info_forwarded(&mut guest_peer, &expected_repeat_info);
+        // The completed live follow-up remains decodable.
+        s.host([(rest.to_vec(), Vec::new())]).await;
+        assert_eq!(s.guest_received(), [repeated(live)]);
+    }
+
+    /// An event of host object 77, which the proxy does not track, with a
+    /// descriptor it may or may not own, and that descriptor's identity.
+    fn untracked_event_with_a_descriptor() -> (Outgoing, TestFdIdentity) {
+        // Memfds have identities of their own; pipe ends share one.
+        let file = shm_pool_file(&[]);
+        let identity = fd_identity(file.as_raw_fd());
+        let event = MessageBuilder::new().build_message(77, 0);
+        ((event, vec![file.into()]), identity)
+    }
+
+    /// A seat the guest has bound, and the `name` event the host sends it,
+    /// which the guest gets as it is.
+    async fn seat_and_its_name(s: &mut Session) -> (Object, Vec<u8>) {
+        use protocols::wayland::wl_seat;
+        let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+        let (name, _) = wl_seat::evt::name(seat.host, "seat0").unwrap();
+        (seat, name)
     }
 
     #[tokio::test]
     async fn untracked_message_fd_is_retained_when_followup_is_partial() {
-        use std::os::unix::net::UnixStream;
-
-        let (client_socket, host_socket) =
-            UnixStream::pair().expect("test socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(client_socket.into()).expect("register test socket"),
-            WaylandConnection::new(host_socket.into()).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
-
-        let (pipe_read, pipe_write) = crate::test_support::pipe();
-        let pending_fd =
-            unsafe { libc::fcntl(pipe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(pending_fd >= 1000, "fd duplication should succeed");
-        let pending_target =
-            fs::read_link(format!("/proc/self/fd/{pending_fd}")).expect("pending fd target");
-        drop((pipe_read, pipe_write));
+        let mut s = Session::new();
+        let (_, follow_up) = seat_and_its_name(&mut s).await;
+        let (stale_event, pending) = untracked_event_with_a_descriptor();
 
         // Sender 77 is complete but deliberately untracked. The four bytes
         // after it are only a partial header for the next message. There is no
@@ -1994,137 +1823,117 @@ mod tests {
         // belongs to the stale message or the partial follow-up, so the
         // descriptor must remain queued while the complete stale message is
         // dropped. The connection stays alive for the rest of the follow-up.
-        let stale_event = MessageBuilder::new().build_message(77, 0);
-        client.host_conn.read_buf.extend_from_slice(&stale_event);
-        client.host_conn.read_buf.extend_from_slice(&[0, 0, 0, 0]);
-        client
-            .host_conn
-            .read_fds
-            .push_back(unsafe { OwnedFd::from_raw_fd(pending_fd) });
-
-        assert!(
-            client.handle_msgs_and_flush(Direction::HostToClient).await,
-            "a pending FD after an untracked complete message must not terminate the connection"
-        );
-        assert!(
-            client.host_conn.read_buf.len() == 4,
-            "only the complete stale message should be consumed"
-        );
+        s.host([stale_event, (follow_up[..4].to_vec(), Vec::new())])
+            .await;
+        assert_eq!(s.guest_received(), []);
+        // The proxy's, and the host's own, which it keeps for the messages
+        // it has not finished sending.
         assert_eq!(
-            client
-                .host_conn
-                .read_fds
-                .iter()
-                .map(AsRawFd::as_raw_fd)
-                .collect::<Vec<_>>(),
-            vec![pending_fd],
+            fds_with_identity(pending),
+            2,
             "the pending descriptor must remain ordered for the later message"
         );
-        drop(client);
-
-        assert_fd_released(pending_fd, &pending_target);
+        drop(s);
+        assert!(!any_fd_has_identity(pending));
     }
 
     #[tokio::test]
     async fn untracked_message_fd_ambiguity_survives_separate_receive_calls() {
-        use std::os::unix::net::UnixStream;
+        use protocols::wayland::wl_display;
+        let mut s = Session::new();
+        let (_, follow_up) = seat_and_its_name(&mut s).await;
+        let (stale_event, pending) = untracked_event_with_a_descriptor();
 
-        let (client_socket, host_socket) =
-            UnixStream::pair().expect("test socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(client_socket.into()).expect("register test socket"),
-            WaylandConnection::new(host_socket.into()).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
-
-        let (pipe_read, pipe_write) = crate::test_support::pipe();
-        let pending_fd =
-            unsafe { libc::fcntl(pipe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(pending_fd >= 1000, "fd duplication should succeed");
-        let pending_target =
-            fs::read_link(format!("/proc/self/fd/{pending_fd}")).expect("pending fd target");
-        drop((pipe_read, pipe_write));
-
-        let stale_event = MessageBuilder::new().build_message(77, 0);
-        client.host_conn.read_buf.extend_from_slice(&stale_event);
-        // Keep only a partial header for the follow-up message in the first
-        // receive batch, exactly as a stream socket may do.
-        let known_event = MessageBuilder::new().build_message(88, 0);
-        client
-            .host_conn
-            .read_buf
-            .extend_from_slice(&known_event[..4]);
-        client
-            .host_conn
-            .read_fds
-            .push_back(unsafe { OwnedFd::from_raw_fd(pending_fd) });
-        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
-        assert_eq!(client.host_conn.read_buf.len(), 4);
-
-        // The rest of the follow-up arrives in a later recv/handle_msgs call.
-        // The ambiguity marker must survive that boundary and terminate
+        // Only a partial header of the follow-up message arrives with the
+        // first receive, exactly as a stream socket may deliver it.
+        s.host([stale_event, (follow_up[..4].to_vec(), Vec::new())])
+            .await;
+        // The rest of the follow-up arrives in a later receive. The
+        // ambiguity marker must survive that boundary and end the session
         // before the pending descriptor can be attached to this message.
-        client
-            .host_conn
-            .read_buf
-            .extend_from_slice(&known_event[4..]);
-        client
-            .ctx
-            .shadow_table
-            .insert_host_only_for_test(88, "wl_display", 1);
-        assert!(
-            !client.handle_msgs_and_flush(Direction::HostToClient).await,
+        s.host_fatal([(follow_up[4..].to_vec(), Vec::new())]).await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)),
             "descriptor ambiguity must remain fatal across receive calls"
         );
-        drop(client);
-
-        assert_fd_released(pending_fd, &pending_target);
+        drop(s);
+        assert!(!any_fd_has_identity(pending));
     }
 
     #[tokio::test]
     async fn untracked_message_fd_ambiguity_terminates_before_followup_complete() {
-        use std::os::unix::net::UnixStream;
-
-        let (client_socket, host_socket) =
-            UnixStream::pair().expect("test socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(client_socket.into()).expect("register test socket"),
-            WaylandConnection::new(host_socket.into()).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
-
-        let (pipe_read, pipe_write) = crate::test_support::pipe();
-        let pending_fd =
-            unsafe { libc::fcntl(pipe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(pending_fd >= 1000, "fd duplication should succeed");
-        let pending_target =
-            fs::read_link(format!("/proc/self/fd/{pending_fd}")).expect("pending fd target");
-        drop((pipe_read, pipe_write));
+        use protocols::wayland::wl_display;
+        let mut s = Session::new();
+        let (_, follow_up) = seat_and_its_name(&mut s).await;
+        let (stale_event, pending) = untracked_event_with_a_descriptor();
 
         // Both messages are complete, but the first sender is untracked. The
         // descriptor arrived on the ordered stream with these bytes and
         // cannot be assigned to either message. The proxy must not guess and
         // accidentally deliver it to the known follow-up.
-        let stale_event = MessageBuilder::new().build_message(77, 0);
-        let known_event = MessageBuilder::new().build_message(88, 0);
-        client.host_conn.read_buf.extend_from_slice(&stale_event);
-        client.host_conn.read_buf.extend_from_slice(&known_event);
-        client
-            .host_conn
-            .read_fds
-            .push_back(unsafe { OwnedFd::from_raw_fd(pending_fd) });
-        client
-            .ctx
-            .shadow_table
-            .insert_host_only_for_test(88, "wl_display", 1);
-
-        assert!(
-            !client.handle_msgs_and_flush(Direction::HostToClient).await,
+        s.host_fatal([stale_event, (follow_up, Vec::new())]).await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)),
             "complete untracked message plus a complete follow-up is fatal FD ambiguity"
         );
-        drop(client);
+        drop(s);
+        assert!(!any_fd_has_identity(pending));
+    }
 
-        assert_fd_released(pending_fd, &pending_target);
+    /// A batch that ends early sends nothing more. The descriptors of the
+    /// messages it translated close with it; the connection keeps the ones
+    /// no message has taken yet until it closes.
+    #[tokio::test]
+    async fn early_output_cleanup_preserves_incoming_fd_ownership() {
+        use protocols::wayland::{wl_display, wl_keyboard};
+        let mut s = Session::new();
+        let (_, keyboard) = s.keyboard().await;
+        // Memfds have identities of their own; pipe ends share one.
+        let forwarded = shm_pool_file(&[]);
+        let pending = shm_pool_file(&[]);
+        let forwarded_identity = fd_identity(forwarded.as_raw_fd());
+        let pending_identity = fd_identity(pending.as_raw_fd());
+
+        // A keymap the proxy forwards, then an event with trailing bytes,
+        // which ends the session, then a keymap the proxy never reads,
+        // which `pending` belongs to.
+        let no_keymap = wl_keyboard::KEYMAP_FORMAT_NO_KEYMAP;
+        s.host_fatal([
+            wl_keyboard::evt::keymap(keyboard.host, no_keymap, forwarded.into(), 0),
+            raw(keyboard.host, wl_keyboard::EVT_REPEAT_INFO, &[25, 400, 0]),
+            wl_keyboard::evt::keymap(keyboard.host, no_keymap, pending.into(), 0),
+        ])
+        .await;
+        let (events, error) = s.guest_received_and_error();
+        assert_eq!(
+            error,
+            (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION),
+            "trailing bytes in a host event end the session"
+        );
+        assert!(
+            matches!(
+                &events[..],
+                [(id, AnyEvent::WlKeyboard(wl_keyboard::Event::Keymap { format, size: 0, .. }))]
+                    if *id == keyboard.id && *format == no_keymap
+            ),
+            "the valid event reaches the guest ahead of the session's error: {events:?}"
+        );
+        drop(events);
+        assert!(
+            !any_fd_has_identity(forwarded_identity),
+            "the proxy closes a forwarded descriptor once it is sent"
+        );
+        assert!(
+            any_fd_has_identity(pending_identity),
+            "the connection still owns the descriptor no message took"
+        );
+        drop(s);
+        assert!(
+            !any_fd_has_identity(pending_identity),
+            "closing the connection must close every pending descriptor"
+        );
     }
 
     /// Descriptor ambiguity ends the session like any host protocol error:
@@ -2132,45 +1941,26 @@ mod tests {
     #[tokio::test]
     async fn descriptor_ambiguity_is_reported_after_the_valid_events() {
         use protocols::wayland::{wl_data_device, wl_display};
-        const DATA_DEVICE: u32 = 10;
-        const HOST_DATA_DEVICE: u32 = 80;
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
-        client.ctx.shadow_table.insert_paired_with_version_for_test(
-            DATA_DEVICE,
-            HOST_DATA_DEVICE,
-            "wl_data_device",
-            3,
-        );
-        let (pending, _) = std::os::unix::net::UnixStream::pair().expect("a descriptor");
-        let mut offer = MessageBuilder::new();
-        offer.write_u32(0xff00_0001);
-        let offer = offer.build_message(HOST_DATA_DEVICE, wl_data_device::EVT_DATA_OFFER);
+        let mut s = Session::new();
+        let device = data_device(&mut s).await;
         // An untracked message with a descriptor it may or may not own, then
         // a complete follow-up the descriptor might belong to.
-        let stale_event = MessageBuilder::new().build_message(77, 0);
-        let follow_up = MessageBuilder::new().build_message(HOST_DATA_DEVICE, 0);
-        for event in [offer, stale_event, follow_up] {
-            client.host_conn.read_buf.extend_from_slice(&event);
-        }
-        client.host_conn.read_fds.push_back(pending.into());
-
-        assert!(!client.handle_msgs_and_flush(Direction::HostToClient).await);
-        drop(client);
-        let mut events = Vec::new();
-        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
-        let headers: Vec<_> = crate::test_support::frames(&events)
-            .map(|(header, _)| (header.sender_id, header.opcode))
-            .collect();
+        let (stale_event, _) = untracked_event_with_a_descriptor();
+        s.host_fatal([
+            wl_data_device::evt::data_offer(device.host, 0xff00_0001),
+            stale_event,
+            wl_data_device::evt::leave(device.host),
+        ])
+        .await;
         assert_eq!(
-            headers,
-            [
-                (DATA_DEVICE, wl_data_device::EVT_DATA_OFFER),
-                (crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR),
-            ]
-        );
-        assert_eq!(
-            display_errors_in(&events),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+            s.guest_received_and_error(),
+            (
+                vec![(
+                    device.id,
+                    wl_data_device::Event::DataOffer { id: 0xff00_0000 }.into()
+                )],
+                (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)
+            )
         );
     }
 
@@ -2234,32 +2024,14 @@ mod tests {
         );
     }
 
-    /// A guest `xdg_toplevel` of a new surface, and the host's.
-    async fn session_with_a_toplevel() -> (Session, super::harness::Object) {
-        use protocols::xdg_shell::{xdg_surface, xdg_wm_base};
-        let (mut s, surface) = session_with_a_surface().await;
-        let wm_base = s.bind_paired("xdg_wm_base", xdg_wm_base::VERSION).await;
-        let xdg_surface = s.new_id();
-        s.create(xdg_wm_base::req::get_xdg_surface(
-            wm_base.id,
-            xdg_surface,
-            surface.id,
-        ))
-        .await;
-        let id = s.new_id();
-        let host = s
-            .create(xdg_surface::req::get_toplevel(xdg_surface, id))
-            .await;
-        (s, super::harness::Object { id, host })
-    }
-
     /// libwayland passes a string that is not UTF-8 through, so a client
     /// that sets its title from Latin-1 bytes keeps its session: the host
     /// gets the title with each invalid sequence replaced by U+FFFD.
     #[tokio::test]
     async fn a_guest_string_that_is_not_utf8_reaches_the_host_with_replacement_characters() {
         use protocols::xdg_shell::xdg_toplevel;
-        let (mut s, toplevel) = session_with_a_toplevel().await;
+        let mut s = Session::new();
+        let toplevel = s.toplevel().await.toplevel;
         let title = xdg_toplevel::req::set_title(toplevel.id, "Cafe creme").unwrap();
         s.guest([respell(title, "Cafe creme", b"Caf\xe9 cr\xe8me")])
             .await;
@@ -2323,7 +2095,8 @@ mod tests {
     async fn a_string_with_a_nul_inside_is_an_invalid_method() {
         use protocols::wayland::wl_display;
         use protocols::xdg_shell::xdg_toplevel;
-        let (mut s, toplevel) = session_with_a_toplevel().await;
+        let mut s = Session::new();
+        let toplevel = s.toplevel().await.toplevel;
         let title = xdg_toplevel::req::set_title(toplevel.id, "a b").unwrap();
         s.guest_fatal([respell(title, "a b", b"a\0b")]).await;
         assert_eq!(
@@ -2370,44 +2143,33 @@ mod tests {
     /// track must not hand the guest a buffer.
     #[tokio::test]
     async fn a_failed_handler_forwards_nothing() {
-        use crate::state::{HostId, PendingNativeCreate};
-        use protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
+        use protocols::linux_dmabuf_v1::{
+            zwp_linux_buffer_params_v1 as params, zwp_linux_dmabuf_v1,
+        };
         use protocols::wayland::wl_display;
-        const PARAMS: u32 = 10;
-        const HOST_PARAMS: u32 = 80;
-        const HOST_BUFFER: u32 = 0xff00_0001;
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
-        let ctx = &mut client.ctx;
-        ctx.shadow_table
-            .insert_paired_for_test(PARAMS, HOST_PARAMS, "zwp_linux_buffer_params_v1");
-        ctx.pending_native_creates.insert(
-            HostId(HOST_PARAMS),
-            PendingNativeCreate {
-                guest_params_id: PARAMS,
-                dimensions: (16, 8),
-                sync_fds: Vec::new(),
-            },
-        );
-        // The proxy already tracks a buffer under the ID the host creates.
-        assert!(ctx.register_native_buffer(HOST_BUFFER, (16, 8), Vec::new()));
-        let mut created = MessageBuilder::new();
-        created.write_u32(HOST_BUFFER);
-        client
-            .host_conn
-            .read_buf
-            .extend(created.build_message(HOST_PARAMS, zwp_linux_buffer_params_v1::EVT_CREATED));
+        const XRGB8888: u32 = 0x3432_5258;
+        const BUFFER: u32 = crate::test_support::wire_peer::SERVER_ID_START;
+        let (mut s, dmabuf) = session_with_dmabuf().await;
+        let id = s.new_id();
+        let host = s
+            .create(zwp_linux_dmabuf_v1::req::create_params(dmabuf.id, id))
+            .await;
+        let (plane, _) = crate::test_support::pipe();
+        s.guest([
+            params::req::add(id, plane, 0, 0, 64, 0, 0),
+            params::req::create(id, 16, 8, XRGB8888, 0),
+        ])
+        .await;
+        s.host_received();
 
-        assert!(!client.handle_msgs_and_flush(Direction::HostToClient).await);
-        drop(client);
-        let mut events = Vec::new();
-        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        // Injects a fault no peer can cause: the proxy already tracks a
+        // buffer under the ID the host creates. (A host that reuses a live
+        // ID is caught before the handler runs.)
+        assert!(s.ctx().register_native_buffer(BUFFER, (16, 8), Vec::new()));
+        s.host_fatal([params::evt::created(host, BUFFER)]).await;
         assert_eq!(
-            stream_headers(&events),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR)]
-        );
-        assert_eq!(
-            display_errors_in(&events),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
     }
 
@@ -2463,35 +2225,28 @@ mod tests {
     /// cannot retire must not release the shell on the host.
     #[tokio::test]
     async fn a_failed_message_sends_no_reverse_output() {
+        use protocols::aura_shell::zaura_shell;
         use protocols::wayland::{wl_display, wl_registry};
-        const REGISTRY: u32 = 10;
-        const HOST_REGISTRY: u32 = 20;
-        // The shell's ID, which is also its global's name. The object table
-        // does not track it, so retiring it fails.
-        const SHELL: u32 = 40;
-        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
-        let ctx = &mut client.ctx;
-        ctx.shadow_table
-            .insert_paired_for_test(REGISTRY, HOST_REGISTRY, "wl_registry");
-        ctx.bind_aura_shell_for_test(SHELL);
-        ctx.global_generations.insert(SHELL, 1);
-        ctx.registries
-            .entry(HOST_REGISTRY)
-            .or_default()
-            .list(SHELL, 1);
-        let mut remove = MessageBuilder::new();
-        remove.write_u32(SHELL);
-        client
-            .host_conn
-            .read_buf
-            .extend(remove.build_message(HOST_REGISTRY, wl_registry::EVT_GLOBAL_REMOVE));
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        let name = s.advertise(zaura_shell::NAME, zaura_shell::VERSION).await;
+        let shell = match &s.host_received()[..] {
+            [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))] => id.2,
+            other => panic!("the proxy did not bind zaura_shell alone: {other:?}"),
+        };
+        // The guest sees gtk_shell1 in its place.
+        s.guest_received();
 
-        assert!(!client.handle_msgs_and_flush(Direction::HostToClient).await);
-        drop(client);
-        assert_eq!(sent_messages(&mut host_peer), Vec::new());
+        // Injects a fault no peer can cause: the object table no longer
+        // tracks the proxy's shell as a live host-only object, so retiring
+        // it fails.
+        s.ctx().shadow_table.retire_host(shell);
+        s.host_fatal([wl_registry::evt::global_remove(registry.host, name)])
+            .await;
+        assert_eq!(s.host_received(), []);
         assert_eq!(
-            display_errors(&mut guest_peer),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
     }
 
@@ -2500,80 +2255,36 @@ mod tests {
     /// is already pending must not send its plane and create to the host.
     #[tokio::test]
     async fn a_handler_error_discards_its_earlier_output() {
-        use crate::state::{HostId, PendingNativeCreate, PendingParam};
-        use protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
+        use crate::state::{HostId, PendingNativeCreate};
+        use protocols::linux_dmabuf_v1::{
+            zwp_linux_buffer_params_v1 as params, zwp_linux_dmabuf_v1,
+        };
         use protocols::wayland::wl_display;
-        const PARAMS: u32 = 10;
-        const HOST_PARAMS: u32 = 80;
         const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
-        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
-        let ctx = &mut client.ctx;
-        ctx.shadow_table
-            .insert_paired_for_test(PARAMS, HOST_PARAMS, "zwp_linux_buffer_params_v1");
-        let (plane, _) = std::os::unix::net::UnixStream::pair().expect("a descriptor");
-        ctx.pending_params.insert(
-            PARAMS,
-            vec![PendingParam {
-                fd: plane.into(),
-                plane_idx: 0,
-                offset: 0,
-                stride: 64,
-                modifier_hi: 0,
-                modifier_lo: 0,
-            }],
-        );
-        ctx.pending_native_creates.insert(
-            HostId(HOST_PARAMS),
-            PendingNativeCreate {
-                guest_params_id: PARAMS,
-                dimensions: (16, 8),
-                sync_fds: Vec::new(),
-            },
-        );
-        let mut create = MessageBuilder::new();
-        for word in [16, 8, DRM_FORMAT_ARGB8888, 0] {
-            create.write_u32(word);
-        }
-        client
-            .client_conn
-            .read_buf
-            .extend(create.build_message(PARAMS, zwp_linux_buffer_params_v1::REQ_CREATE));
+        let (mut s, dmabuf) = session_with_dmabuf().await;
+        let id = s.new_id();
+        let host = s
+            .create(zwp_linux_dmabuf_v1::req::create_params(dmabuf.id, id))
+            .await;
+        let (plane, _) = crate::test_support::pipe();
+        s.guest([params::req::add(id, plane, 0, 0, 64, 0, 0)]).await;
+        assert_eq!(s.host_received(), [], "the plane waits for the create");
 
-        assert!(!client.handle_msgs_and_flush(Direction::ClientToHost).await);
-        drop(client);
-        assert_eq!(sent_messages(&mut host_peer), Vec::new());
+        // Injects a fault no peer can cause: a create already pending for
+        // the params' host ID, which the proxy allocates itself.
+        let pending = PendingNativeCreate {
+            guest_params_id: id,
+            dimensions: (16, 8),
+            sync_fds: Vec::new(),
+        };
+        s.ctx().pending_native_creates.insert(HostId(host), pending);
+        s.guest_fatal([params::req::create(id, 16, 8, DRM_FORMAT_ARGB8888, 0)])
+            .await;
+        assert_eq!(s.host_received(), []);
         assert_eq!(
-            display_errors(&mut guest_peer),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
-    }
-
-    /// The object and code of each `wl_display.error` the guest received
-    /// before the proxy closed the connection.
-    fn display_errors(guest_peer: &mut std::os::unix::net::UnixStream) -> Vec<(u32, u32)> {
-        use std::io::Read;
-        let mut events = Vec::new();
-        guest_peer
-            .read_to_end(&mut events)
-            .expect("read the guest's events");
-        display_errors_in(&events)
-    }
-
-    /// The object and code of each `wl_display.error` in `events`.
-    fn display_errors_in(events: &[u8]) -> Vec<(u32, u32)> {
-        crate::test_support::frames(events)
-            .filter(|(header, _)| {
-                (header.sender_id, header.opcode)
-                    == (
-                        crate::wire::WL_DISPLAY_ID,
-                        protocols::wayland::wl_display::EVT_ERROR,
-                    )
-            })
-            .map(|(header, payload)| {
-                let mut error = WireMessage::new(header.sender_id, header.opcode, payload);
-                (error.read_u32().unwrap(), error.read_u32().unwrap())
-            })
-            .collect()
     }
 
     #[tokio::test]
@@ -2626,28 +2337,6 @@ mod tests {
         let mut s = Session::new();
         let surface = s.surface().await;
         (s, surface)
-    }
-
-    /// The guest's `wl_surface` in [`client_with_a_surface`].
-    const SURFACE: u32 = 5;
-    /// The host's [`SURFACE`].
-    const SURFACE_HOST: u32 = 6;
-
-    /// A proxy whose guest has the v4 `wl_surface` [`SURFACE`].
-    fn client_with_a_surface() -> (
-        Client,
-        std::os::unix::net::UnixStream,
-        std::os::unix::net::UnixStream,
-    ) {
-        let (mut client, guest_peer, host_peer) = client_with_socket_peers();
-        client.ctx.shadow_table.insert_paired_with_version_for_test(
-            SURFACE,
-            SURFACE_HOST,
-            "wl_surface",
-            4,
-        );
-        client.ctx.create_surface(SURFACE);
-        (client, guest_peer, host_peer)
     }
 
     /// libwayland-server reports every rejected request on `wl_display`,
@@ -2743,163 +2432,118 @@ mod tests {
         );
     }
 
-    /// The native buffer of [`client_committing_a_fenced_buffer`], and its
-    /// host ID.
-    const FENCED_BUFFER: u32 = 7;
-    const HOST_FENCED_BUFFER: u32 = 8;
-    /// A callback the host can finish while the guest stream is parked.
-    const CALLBACK: u32 = 9;
-    const HOST_CALLBACK: u32 = 10;
-    /// The callback of the `wl_display.sync` the guest sends after its commit.
-    const SYNC_CALLBACK: u32 = 11;
-
-    /// Thirty planes that share one fence give a commit a 30 s deadline,
-    /// which no loaded test machine reaches, so a test that runs the proxy
-    /// in real time fails only when the commit is held back.
-    const SLOW_DEADLINE_PLANES: usize = 30;
-
-    /// A proxy whose guest has buffered an attach of [`FENCED_BUFFER`] to
-    /// [`SURFACE`], its commit and a `wl_display.sync`. The buffer has
-    /// `planes` planes that share one fence, which `stand_in` describes;
-    /// the guest GPU writes the buffer until the returned descriptor is
-    /// written.
-    fn client_committing_a_fenced_buffer(
+    /// A session whose guest has a surface and a 1x1 native buffer whose
+    /// one plane the guest GPU writes until the returned descriptor is
+    /// written; `stand_in` describes the plane's fence.
+    async fn session_with_a_fenced_buffer(
         stand_in: PlaneFenceForTest,
-        planes: usize,
-    ) -> (
-        Client,
-        std::os::unix::net::UnixStream,
-        std::os::unix::net::UnixStream,
-        OwnedFd,
-    ) {
+    ) -> (Session, Object, Object, OwnedFd) {
+        let (mut s, dmabuf) = session_with_dmabuf().await;
+        // Injects what no peer can provide (see `session_with_dmabuf`).
+        s.ctx().plane_fences_for_test = Some(stand_in);
+        let surface = s.surface().await;
+        let (plane, signal) = crate::test_support::pipe();
+        let buffer = s.native_buffer(dmabuf.id, plane, 1, 1).await;
+        (s, surface, buffer, signal)
+    }
+
+    /// The guest's attach of `buffer` to `surface`, its commit, and a
+    /// `wl_display.sync` that creates `callback`.
+    fn commit_and_sync(surface: Object, buffer: Object, callback: u32) -> [Outgoing; 3] {
         use protocols::wayland::{wl_display, wl_surface};
-        let (mut client, guest_peer, host_peer) = client_with_a_surface();
-        let ctx = &mut client.ctx;
-        ctx.plane_fences_for_test = Some(stand_in);
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            FENCED_BUFFER,
-            HOST_FENCED_BUFFER,
-            "wl_buffer",
-            1,
-        );
-        let (fence, signal) = crate::test_support::pipe();
-        let planes = (0..planes)
-            .map(|_| fence.try_clone().expect("share the fence"))
-            .collect();
-        assert!(ctx.register_native_buffer(HOST_FENCED_BUFFER, (1, 1), planes));
-        ctx.shadow_table
-            .insert_paired_for_test(CALLBACK, HOST_CALLBACK, "wl_callback");
-        for (request, _) in [
-            wl_surface::req::attach(SURFACE, Some(FENCED_BUFFER), 0, 0),
-            wl_surface::req::commit(SURFACE),
-            wl_display::req::sync(crate::wire::WL_DISPLAY_ID, SYNC_CALLBACK),
-        ] {
-            client.client_conn.read_buf.extend_from_slice(&request);
-        }
-        (client, guest_peer, host_peer, signal)
+        [
+            wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0),
+            wl_surface::req::commit(surface.id),
+            wl_display::req::sync(WL_DISPLAY_ID, callback),
+        ]
     }
 
-    /// `peer` as a Tokio stream, so a test can drive it beside
-    /// `Client::run` on the same thread.
-    fn async_peer(peer: std::os::unix::net::UnixStream) -> tokio::net::UnixStream {
-        peer.set_nonblocking(true).expect("non-blocking peer");
-        tokio::net::UnixStream::from_std(peer).expect("register the peer")
-    }
-
-    /// The next message the proxy sends `peer`.
-    async fn read_frame(peer: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
-        use tokio::io::AsyncReadExt;
-        let mut frame = vec![0; MessageHeader::LEN];
-        peer.read_exact(&mut frame).await.expect("read a header");
-        frame.resize(msg_header(&frame).len, 0);
-        peer.read_exact(&mut frame[MessageHeader::LEN..])
-            .await
-            .expect("read a body");
-        frame
-    }
-
-    /// The headers of what the host reads up to the guest's
-    /// `wl_display.sync`, which follows the commit, waiting at most `limit`.
-    async fn forwarded_through_sync(
-        host: &mut (impl tokio::io::AsyncRead + Unpin),
-        limit: Duration,
-    ) -> Vec<(u32, u16)> {
-        let sync = (
-            crate::wire::WL_DISPLAY_ID,
-            protocols::wayland::wl_display::REQ_SYNC,
-        );
-        let read = async {
-            let mut headers = Vec::new();
-            while headers.last() != Some(&sync) {
-                headers.extend(stream_headers(&read_frame(host).await));
-            }
-            headers
+    /// The forward of the guest's attach of `buffer` to `surface`.
+    fn attached(surface: Object, buffer: Object) -> (u32, AnyRequest) {
+        use protocols::wayland::wl_surface;
+        let attach = wl_surface::Request::Attach {
+            buffer: buffer.host,
+            x: 0,
+            y: 0,
         };
-        tokio::time::timeout(limit, read)
-            .await
-            .expect("the commit and the request after it reach the host")
+        (surface.host, attach.into())
     }
 
-    /// Assert that `forwarded` has one commit, as the guest sent it (a
-    /// commit has no arguments, so its header is all its bytes), and that
-    /// the request after it follows it.
-    fn assert_one_commit_then_sync(forwarded: &[(u32, u16)]) {
+    /// Assert that `forwarded` is `surface`'s commit, once, and the
+    /// `wl_display.sync` after it.
+    fn assert_commit_then_sync(forwarded: &[(u32, AnyRequest)], surface: Object) {
         use protocols::wayland::{wl_display, wl_surface};
-        let commit = (SURFACE_HOST, wl_surface::REQ_COMMIT);
-        assert_eq!(forwarded.iter().filter(|&&m| m == commit).count(), 1);
-        assert_eq!(
-            forwarded[forwarded.len() - 2..],
-            [commit, (crate::wire::WL_DISPLAY_ID, wl_display::REQ_SYNC)]
+        assert!(
+            matches!(
+                forwarded,
+                [
+                    (commit, AnyRequest::WlSurface(wl_surface::Request::Commit {})),
+                    (
+                        WL_DISPLAY_ID,
+                        AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
+                    ),
+                ] if *commit == surface.host
+            ),
+            "the commit, once, then the request after it: {forwarded:?}"
         );
     }
 
     /// A commit whose fence is pending parks the guest stream: neither it
-    /// nor the request after it is dispatched, fair dispatch does not offer
-    /// the stream, and the commit keeps its deadline when it waits again,
-    /// while host events still reach the guest.
+    /// nor the request after it is dispatched, also when it is dispatched
+    /// again while the fence is pending, and fair dispatch does not offer
+    /// the stream, while host events still reach the guest. (That it keeps
+    /// its deadline when it waits again
+    /// `a_fence_that_never_signals_ends_the_session_at_its_deadline` pins.)
     #[tokio::test]
     async fn a_pending_fence_parks_the_guest_stream_while_host_events_flow() {
-        use protocols::wayland::{wl_callback, wl_surface};
-        let (mut client, mut guest_peer, mut host_peer, _signal) =
-            client_committing_a_fenced_buffer(PlaneFenceForTest::SyncFile, 1);
+        use protocols::wayland::{wl_callback, wl_display};
+        let (mut s, surface, buffer, _signal) =
+            session_with_a_fenced_buffer(PlaneFenceForTest::SyncFile).await;
+        // A callback the host can finish while the guest stream is parked.
+        let callback = s.new_id();
+        let host_callback = s
+            .create(wl_display::req::sync(WL_DISPLAY_ID, callback))
+            .await;
 
-        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
-        assert!(client.parked.is_some());
+        let sync_callback = s.new_id();
+        s.guest(commit_and_sync(surface, buffer, sync_callback))
+            .await;
+        assert!(s.parked());
         assert_eq!(
-            client.ctx.shadow_table.get_host_id(SYNC_CALLBACK),
-            None,
+            s.host_received(),
+            [attached(surface, buffer)],
             "the request after the commit waits behind it"
         );
         assert_eq!(
-            client.next_buffered_direction(false).unwrap(),
+            s.next_direction(false),
             None,
             "fair dispatch must not offer a parked stream"
         );
-        let deadline = client.parked.as_ref().map(|parked| parked.deadline);
-        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
-        assert_eq!(
-            client.parked.as_ref().map(|parked| parked.deadline),
-            deadline,
-            "a request that waits again keeps its deadline"
-        );
+        s.guest([]).await;
+        assert!(s.parked());
+        assert_eq!(s.host_received(), []);
 
-        client
-            .host_conn
-            .read_buf
-            .extend_from_slice(&callback_done(HOST_CALLBACK));
+        s.queue(HostToClient, [wl_callback::evt::done(host_callback, 0)]);
         assert_eq!(
-            client.next_buffered_direction(false).unwrap(),
-            Some(Direction::HostToClient),
+            s.next_direction(false),
+            Some(HostToClient),
             "a parked client still serves the host"
         );
-        assert!(client.handle_msgs_and_flush(Direction::HostToClient).await);
-        assert!(client.parked.is_some());
-        drop(client);
+        assert!(s.batch(HostToClient).await && s.flush().await);
+        assert!(s.parked());
         assert_eq!(
-            sent_messages(&mut host_peer),
-            [(SURFACE_HOST, wl_surface::REQ_ATTACH)]
+            s.guest_received(),
+            [
+                (
+                    callback,
+                    wl_callback::Event::Done { callback_data: 0 }.into()
+                ),
+                (
+                    WL_DISPLAY_ID,
+                    wl_display::Event::DeleteId { id: callback }.into()
+                ),
+            ]
         );
-        assert!(sent_messages(&mut guest_peer).contains(&(CALLBACK, wl_callback::EVT_DONE)));
     }
 
     /// A message that waits for a fence after it queued output or deferred
@@ -2908,7 +2552,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_with_output_ends_the_session() {
         use protocols::wayland::{wl_callback, wl_display, wl_surface};
-        type Inject = fn(&mut Context, super::harness::Object, u32);
+        type Inject = fn(&mut Context, Object, u32);
         let faults: [(&str, Inject); 3] = [
             ("an event for the guest", |ctx, _, callback| {
                 ctx.host_to_client_queue
@@ -2926,18 +2570,12 @@ mod tests {
             }),
         ];
         for (fault, inject) in faults {
-            let (mut s, surface) = session_with_a_surface().await;
-            let (buffer, callback) = (s.new_id(), s.new_id());
-            // A native buffer whose one plane the guest GPU is still
-            // writing.
-            let (plane, _signal) = crate::test_support::pipe();
-            s.pair_for_test(buffer, HOST_FENCED_BUFFER, "wl_buffer", 1);
-            let ctx = s.ctx();
-            ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
-            assert!(ctx.register_native_buffer(HOST_FENCED_BUFFER, (1, 1), vec![plane]));
-            s.guest([wl_surface::req::attach(surface.id, Some(buffer), 0, 0)])
+            let (mut s, surface, buffer, _signal) =
+                session_with_a_fenced_buffer(PlaneFenceForTest::SyncFile).await;
+            let callback = s.new_id();
+            s.guest([wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0)])
                 .await;
-            assert_eq!(s.host_received().len(), 1, "the attach");
+            assert_eq!(s.host_received(), [attached(surface, buffer)]);
 
             // Injects a fault no peer can cause: what the commit has when
             // it waits, as from a handler that queued it first.
@@ -2955,101 +2593,93 @@ mod tests {
 
     #[tokio::test]
     async fn a_parked_commit_is_forwarded_once_when_its_fence_signals() {
-        use protocols::wayland::{wl_display, wl_surface};
-        let (mut s, surface) = session_with_a_surface().await;
-        let (buffer, callback) = (s.new_id(), s.new_id());
-        // A native buffer whose one plane the guest GPU writes until
-        // `signal` is written.
-        let (plane, signal) = crate::test_support::pipe();
+        let (mut s, surface, buffer, signal) =
+            session_with_a_fenced_buffer(PlaneFenceForTest::SyncFile).await;
         let fence = fd_identity(signal.as_raw_fd());
-        s.pair_for_test(buffer, HOST_FENCED_BUFFER, "wl_buffer", 1);
-        let ctx = s.ctx();
-        ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
-        assert!(ctx.register_native_buffer(HOST_FENCED_BUFFER, (1, 1), vec![plane]));
+        // What the proxy keeps of the plane, and `signal`.
+        let idle = fds_with_identity(fence);
 
-        s.guest([
-            wl_surface::req::attach(surface.id, Some(buffer), 0, 0),
-            wl_surface::req::commit(surface.id),
-            wl_display::req::sync(WL_DISPLAY_ID, callback),
-        ])
-        .await;
+        let callback = s.new_id();
+        s.guest(commit_and_sync(surface, buffer, callback)).await;
         assert!(s.parked());
+        assert_eq!(s.host_received(), [attached(surface, buffer)]);
         assert_eq!(
-            s.host_received(),
-            [(
-                surface.host,
-                wl_surface::Request::Attach {
-                    buffer: HOST_FENCED_BUFFER,
-                    x: 0,
-                    y: 0
-                }
-                .into()
-            )]
+            fds_with_identity(fence),
+            idle + 1,
+            "the parked request holds the fence"
         );
-        // The registered plane, the parked duplicate and `signal`.
-        assert_eq!(fds_with_identity(fence), 3);
 
         assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
         s.resume().await;
         assert!(!s.parked());
-        assert_eq!(fds_with_identity(fence), 2);
-        let forwarded = s.host_received();
-        assert!(
-            matches!(
-                &forwarded[..],
-                [
-                    (commit, AnyRequest::WlSurface(wl_surface::Request::Commit {})),
-                    (
-                        WL_DISPLAY_ID,
-                        AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
-                    ),
-                ] if *commit == surface.host
-            ),
-            "the commit, once, then the request after it: {forwarded:?}"
-        );
+        assert_eq!(fds_with_identity(fence), idle);
+        assert_commit_then_sync(&s.host_received(), surface);
         drop(s);
         drop(signal);
         assert!(!any_fd_has_identity(fence));
     }
+
+    /// Thirty planes that share one fence give a commit a 30 s deadline,
+    /// which no loaded test machine reaches, so a test that runs the proxy
+    /// in real time fails only when the commit is held back.
+    const SLOW_DEADLINE_PLANES: usize = 30;
 
     /// Through `Client::run`: the parked commit waits while host events
     /// reach the guest, and is forwarded once its sync_file becomes
     /// readable, before the request after it and only once.
     #[tokio::test]
     async fn run_forwards_a_parked_commit_once_its_sync_file_signals() {
-        use protocols::wayland::{wl_callback, wl_surface};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (client, guest_peer, host_peer, signal) =
-            client_committing_a_fenced_buffer(PlaneFenceForTest::SyncFile, SLOW_DEADLINE_PLANES);
-        let mut guest_peer = async_peer(guest_peer);
-        let mut host_peer = async_peer(host_peer);
-
-        let peers = async {
-            let attach = read_frame(&mut host_peer).await;
-            assert_eq!(
-                stream_headers(&attach),
-                [(SURFACE_HOST, wl_surface::REQ_ATTACH)]
-            );
-            host_peer
-                .write_all(&callback_done(HOST_CALLBACK))
-                .await
-                .expect("send a host event");
-            let done = read_frame(&mut guest_peer).await;
-            assert_eq!(stream_headers(&done), [(CALLBACK, wl_callback::EVT_DONE)]);
-
-            assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
-            let forwarded = forwarded_through_sync(&mut host_peer, Duration::from_secs(5)).await;
-            assert_one_commit_then_sync(&forwarded);
-
-            drop(guest_peer);
-            let mut rest = Vec::new();
-            host_peer
-                .read_to_end(&mut rest)
-                .await
-                .expect("read until the proxy closes");
-            assert_eq!(stream_headers(&rest), []);
+        use protocols::wayland::{wl_callback, wl_display};
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let buffer = Object {
+            id: s.new_id(),
+            host: 0x100,
         };
-        tokio::join!(client.run(), peers);
+        // Injects what no peer can provide: a native buffer of
+        // `SLOW_DEADLINE_PLANES` planes (a guest's has at most four) that
+        // share one fence, the guest GPU's write until `signal` is written,
+        // each plane standing in for its own sync_file.
+        let (plane, signal) = crate::test_support::pipe();
+        s.pair_for_test(buffer.id, buffer.host, "wl_buffer", 1);
+        let ctx = s.ctx();
+        ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
+        let planes = (0..SLOW_DEADLINE_PLANES)
+            .map(|_| plane.try_clone().expect("share the fence"))
+            .collect();
+        assert!(ctx.register_native_buffer(buffer.host, (1, 1), planes));
+        let callback = s.new_id();
+        let host_callback = s
+            .create(wl_display::req::sync(WL_DISPLAY_ID, callback))
+            .await;
+        let sync_callback = s.new_id();
+        s.queue(
+            ClientToHost,
+            commit_and_sync(surface, buffer, sync_callback),
+        );
+
+        s.run(async |peers| {
+            assert_eq!(peers.host_received().await, [attached(surface, buffer)]);
+            peers.host([wl_callback::evt::done(host_callback, 0)]);
+            assert_eq!(
+                peers.guest_received().await,
+                [
+                    (
+                        callback,
+                        wl_callback::Event::Done { callback_data: 0 }.into()
+                    ),
+                    (
+                        WL_DISPLAY_ID,
+                        wl_display::Event::DeleteId { id: callback }.into()
+                    ),
+                ]
+            );
+            assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+            assert_commit_then_sync(&peers.host_received().await, surface);
+        })
+        .await;
+        assert_eq!(s.host_received(), []);
+        assert_eq!(s.guest_received(), []);
     }
 
     /// Host traffic must not postpone asking about a fence that gives no
@@ -3060,44 +2690,36 @@ mod tests {
     /// between events can let a postponed poll through.
     #[tokio::test(start_paused = true)]
     async fn host_traffic_does_not_postpone_polling_a_busy_fence() {
-        use protocols::wayland::wl_surface;
-        use tokio::io::AsyncWriteExt;
         /// A host object the proxy does not track, so it reads and drops
         /// what the object sends.
         const UNTRACKED_HOST_OBJECT: u32 = 0x7000;
-        let (client, _guest_peer, host_peer, signal) =
-            client_committing_a_fenced_buffer(PlaneFenceForTest::Busy, 1);
-        let mut host_peer = async_peer(host_peer);
+        let (mut s, surface, buffer, signal) =
+            session_with_a_fenced_buffer(PlaneFenceForTest::Busy).await;
+        let callback = s.new_id();
+        s.queue(ClientToHost, commit_and_sync(surface, buffer, callback));
 
-        let peers = async {
-            let (mut reader, mut writer) = host_peer.split();
-            let traffic = async {
+        s.run(async |peers| {
+            assert_eq!(peers.host_received().await, [attached(surface, buffer)]);
+            assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+            // The first polls are 2, 4 and 8 ms apart; the deadline is 15 s
+            // away.
+            let start = Instant::now();
+            let forwarded = loop {
                 let event = MessageBuilder::new().build_message(UNTRACKED_HOST_OBJECT, 0);
-                loop {
-                    writer.write_all(&event).await.expect("send host traffic");
-                    tokio::time::advance(Duration::from_micros(500)).await;
+                peers.host([(event, Vec::new())]);
+                tokio::select! {
+                    forwarded = peers.host_received() => break forwarded,
+                    () = tokio::time::advance(Duration::from_micros(500)) => {}
                 }
-            };
-            let forwarded = async {
-                let attach = read_frame(&mut reader).await;
-                assert_eq!(
-                    stream_headers(&attach),
-                    [(SURFACE_HOST, wl_surface::REQ_ATTACH)]
+                assert!(
+                    start.elapsed() < Duration::from_millis(100),
+                    "host traffic postpones polling the fence"
                 );
-                assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
-                // The first polls are 2, 4 and 8 ms apart; the deadline is
-                // 15 s away.
-                forwarded_through_sync(&mut reader, Duration::from_millis(100)).await
             };
-            tokio::select! {
-                forwarded = forwarded => assert_one_commit_then_sync(&forwarded),
-                () = traffic => unreachable!("the traffic never ends"),
-            }
-        };
-        tokio::select! {
-            () = client.run() => panic!("the proxy loop ended"),
-            () = peers => {}
-        }
+            assert_commit_then_sync(&forwarded, surface);
+        })
+        .await;
+        assert_eq!(s.host_received(), []);
     }
 
     /// Dispatch a commit behind a fence, which `stand_in` describes, that
@@ -3110,32 +2732,32 @@ mod tests {
     /// time jumps to the next timer whenever the runtime waits on a
     /// socket, so a guard timer beside `run` would be jumped to.
     async fn session_with_a_fence_that_never_signals(stand_in: PlaneFenceForTest) -> Duration {
-        use protocols::wayland::{wl_display, wl_surface};
-        let (mut client, mut guest_peer, mut host_peer, signal) =
-            client_committing_a_fenced_buffer(stand_in, 1);
+        use protocols::wayland::wl_display;
+        let (mut s, surface, buffer, signal) = session_with_a_fenced_buffer(stand_in).await;
         let fence = fd_identity(signal.as_raw_fd());
 
+        let callback = s.new_id();
         let start = Instant::now();
-        let mut alive = client.handle_msgs_and_flush(Direction::ClientToHost).await;
+        let mut alive = s
+            .try_guest(commit_and_sync(surface, buffer, callback))
+            .await;
+        assert_eq!(s.host_received(), [attached(surface, buffer)]);
         while alive {
             assert!(
                 start.elapsed() < crate::allocator::VIRTGPU_WAIT_TIMEOUT * 4,
                 "the session outlives its deadline"
             );
-            ParkedRequest::due(client.parked.as_ref()).await;
-            alive = client.handle_msgs_and_flush(Direction::ClientToHost).await;
+            s.fence_due().await;
+            alive = s.try_guest([]).await;
         }
         let lasted = start.elapsed();
 
-        drop(client);
         assert_eq!(
-            display_errors(&mut guest_peer),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
-        assert_eq!(
-            sent_messages(&mut host_peer),
-            [(SURFACE_HOST, wl_surface::REQ_ATTACH)]
-        );
+        assert_eq!(s.host_received(), []);
+        drop(s);
         drop(signal);
         assert!(!any_fd_has_identity(fence));
         lasted
@@ -3181,25 +2803,23 @@ mod tests {
     /// sync_file may, asked about all the while.
     #[tokio::test(start_paused = true)]
     async fn a_slow_fallback_fence_outlasts_the_sync_file_bound() {
-        let (mut client, _guest_peer, mut host_peer, signal) =
-            client_committing_a_fenced_buffer(PlaneFenceForTest::Busy, 1);
-        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
+        let (mut s, surface, buffer, signal) =
+            session_with_a_fenced_buffer(PlaneFenceForTest::Busy).await;
+        let callback = s.new_id();
+        s.guest(commit_and_sync(surface, buffer, callback)).await;
+        assert_eq!(s.host_received(), [attached(surface, buffer)]);
         let start = Instant::now();
         let gpu_time = crate::allocator::SYNC_FILE_TIMEOUT * 5;
         assert!(gpu_time < crate::allocator::VIRTGPU_WAIT_TIMEOUT);
-        while client.parked.is_some() {
+        while s.parked() {
             if start.elapsed() >= gpu_time {
                 assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
             }
-            ParkedRequest::due(client.parked.as_ref()).await;
-            assert!(
-                client.handle_msgs_and_flush(Direction::ClientToHost).await,
-                "a slow fallback fence must not end the session"
-            );
+            // A slow fallback fence must not end the session.
+            s.resume().await;
         }
         assert!(start.elapsed() < gpu_time + MAX_FENCE_POLL_INTERVAL * 2);
-        drop(client);
-        assert_one_commit_then_sync(&sent_messages(&mut host_peer));
+        assert_commit_then_sync(&s.host_received(), surface);
     }
 
     /// The host's error is the guest's one error: a malformed request that
@@ -3426,88 +3046,61 @@ mod tests {
         );
     }
 
-    const XDG_SURFACE: u32 = 10;
-    const XDG_SURFACE_HOST: u32 = 20;
-    const XDG_TOPLEVEL: u32 = 11;
-    const WL_SURFACE: u32 = 12;
-    const ZAURA_SHELL_HOST: u32 = 40;
-
-    /// A client with the ARC bounds policy on, a bound `zaura_shell`, and the
-    /// v6 xdg_surface `XDG_SURFACE` on wl_surface `WL_SURFACE`, with the
-    /// peers of its guest and host connections.
-    fn client_with_xdg_surface() -> (
-        Client,
-        std::os::unix::net::UnixStream,
-        std::os::unix::net::UnixStream,
-    ) {
-        use std::os::unix::net::UnixStream;
-
-        let (guest_proxy, guest_peer) =
-            UnixStream::pair().expect("guest socket pair should be created");
-        let (host_proxy, host_peer) =
-            UnixStream::pair().expect("host socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(guest_proxy.into()).expect("register test socket"),
-            WaylandConnection::new(host_proxy.into()).expect("register test socket"),
-            Context::with_placement_for_test(PlacementConfig::active_for_test(&[])),
-        );
-        let ctx = &mut client.ctx;
-        ctx.bind_aura_shell_for_test(ZAURA_SHELL_HOST);
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            XDG_SURFACE,
-            XDG_SURFACE_HOST,
-            "xdg_surface",
-            6,
-        );
-        ctx.shadow_table
-            .insert_paired_for_test(WL_SURFACE, 22, "wl_surface");
-        ctx.xdg_roles.add_xdg_surface(XDG_SURFACE, WL_SURFACE);
-        (client, guest_peer, host_peer)
+    /// A session whose proxy applies the placement policy and has bound
+    /// the host's `zaura_shell`, and whose guest has an `xdg_surface`;
+    /// returns the host shell and the `xdg_surface`.
+    async fn session_with_an_xdg_surface() -> (Session, u32, Object) {
+        use protocols::xdg_shell::xdg_wm_base;
+        let placement = PlacementConfig::active_for_test(&[]);
+        let mut s = Session::with_context(Context::with_placement_for_test(placement));
+        let shell = s.aura_shell().await;
+        let wm_base = s.bind("xdg_wm_base", xdg_wm_base::VERSION).await;
+        let surface = s.surface().await;
+        let id = s.new_id();
+        let host = s
+            .create(xdg_wm_base::req::get_xdg_surface(wm_base, id, surface.id))
+            .await;
+        (s, shell, Object { id, host })
     }
 
-    /// `xdg_surface.get_toplevel` creating `XDG_TOPLEVEL`, followed by the
-    /// extra payload words `trailing`.
-    fn get_toplevel_request(trailing: &[u32]) -> Vec<u8> {
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(XDG_TOPLEVEL);
-        for &word in trailing {
-            builder.write_u32(word);
-        }
-        builder.build_message(
-            XDG_SURFACE,
-            protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL,
-        )
+    /// Whether the proxy has an Aura toplevel for any guest toplevel, or
+    /// recorded an XDG toplevel role for `xdg_surface`. Reads state no peer
+    /// can observe: a session that ended sends nothing more that would
+    /// show it.
+    fn has_toplevel_state(s: &mut Session, xdg_surface: Object) -> bool {
+        let ctx = s.ctx();
+        ctx.placement()
+            .is_some_and(|state| state.toplevel_count() > 0)
+            || ctx
+                .xdg_roles
+                .toplevel_of_xdg_surface(xdg_surface.id)
+                .is_some()
     }
 
     #[tokio::test]
     async fn failed_get_toplevel_does_not_create_internal_aura_object() {
-        let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
-        client.ctx.guest_destroyed(XDG_SURFACE);
-        let request = get_toplevel_request(&[]);
-        client.client_conn.read_buf.extend_from_slice(&request);
-
-        assert!(
-            !client.handle_msgs_and_flush(Direction::ClientToHost).await,
-            "a request from a pending xdg_surface must terminate the session"
+        use protocols::wayland::wl_display;
+        use protocols::xdg_shell::xdg_surface;
+        let (mut s, _, xdg_surface) = session_with_an_xdg_surface().await;
+        s.guest([xdg_surface::req::destroy(xdg_surface.id)]).await;
+        assert_eq!(
+            s.host_received(),
+            [(xdg_surface.host, xdg_surface::Request::Destroy {}.into())]
         );
+
+        let toplevel = s.new_id();
+        s.guest_fatal([xdg_surface::req::get_toplevel(xdg_surface.id, toplevel)])
+            .await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_OBJECT)),
+            "a request from a destroyed xdg_surface must end the session"
+        );
+        assert_eq!(s.host_received(), []);
         assert!(
-            client
-                .ctx
-                .placement()
-                .map_or(0, |state| state.toplevel_count())
-                == 0,
+            !has_toplevel_state(&mut s, xdg_surface),
             "failed get_toplevel requests must not leave an internal Aura child"
         );
-    }
-
-    /// The (sender, opcode) of every message written to `peer` until EOF.
-    fn sent_messages(peer: &mut std::os::unix::net::UnixStream) -> Vec<(u32, u16)> {
-        use std::io::Read;
-
-        let mut stream = Vec::new();
-        peer.read_to_end(&mut stream)
-            .expect("the peer stream should be readable");
-        crate::test_support::stream_headers(&stream)
     }
 
     /// A forwarded `xdg_surface.get_toplevel` records the XDG role and
@@ -3515,38 +3108,32 @@ mod tests {
     /// forwarded request on the host stream.
     #[tokio::test]
     async fn forwarded_get_toplevel_records_the_role_after_the_request() {
-        let (mut client, _guest_peer, mut host_peer) = client_with_xdg_surface();
-        let request = get_toplevel_request(&[]);
-        client.client_conn.read_buf.extend_from_slice(&request);
-        assert!(client.handle_msgs_and_flush(Direction::ClientToHost).await);
+        use protocols::aura_shell::{zaura_shell, zaura_toplevel};
+        use protocols::xdg_shell::xdg_surface;
+        let (mut s, shell, xdg_surface) = session_with_an_xdg_surface().await;
+        let toplevel = s.new_id();
+        s.guest([xdg_surface::req::get_toplevel(xdg_surface.id, toplevel)])
+            .await;
+        let forwarded = s.host_received();
+        let [(
+            sender,
+            AnyRequest::XdgSurface(xdg_surface::Request::GetToplevel { id: host_toplevel }),
+        ), (
+            aura_shell,
+            AnyRequest::ZauraShell(zaura_shell::Request::GetAuraToplevelForXdgToplevel {
+                id: aura_toplevel,
+                toplevel: xdg_toplevel,
+            }),
+        ), (
+            supporting,
+            AnyRequest::ZauraToplevel(zaura_toplevel::Request::SetSupportsScreenCoordinates {}),
+        )] = forwarded[..]
+        else {
+            panic!("the host did not get the toplevel and its Aura toplevel: {forwarded:?}");
+        };
         assert_eq!(
-            client.ctx.xdg_roles.wl_surface_of_toplevel(XDG_TOPLEVEL),
-            Some(WL_SURFACE)
-        );
-        let aura_toplevel = client
-            .ctx
-            .placement()
-            .and_then(|state| state.aura_toplevel(crate::state::GuestId(XDG_TOPLEVEL)))
-            .expect("placement Aura toplevel")
-            .0;
-        drop(client);
-
-        assert_eq!(
-            sent_messages(&mut host_peer),
-            vec![
-                (
-                    XDG_SURFACE_HOST,
-                    protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL
-                ),
-                (
-                    ZAURA_SHELL_HOST,
-                    protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL
-                ),
-                (
-                    aura_toplevel,
-                    protocols::aura_shell::zaura_toplevel::REQ_SET_SUPPORTS_SCREEN_COORDINATES
-                ),
-            ]
+            (sender, aura_shell, xdg_toplevel, supporting),
+            (xdg_surface.host, shell, host_toplevel, aura_toplevel)
         );
     }
 
@@ -3555,22 +3142,22 @@ mod tests {
     /// Aura toplevel: the deferred work is discarded with the message.
     #[tokio::test]
     async fn rejected_get_toplevel_discards_its_deferred_work() {
-        let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
-        let request = get_toplevel_request(&[0]);
-        client.client_conn.read_buf.extend_from_slice(&request);
-
-        assert!(!client.handle_msgs_and_flush(Direction::ClientToHost).await);
+        use protocols::wayland::wl_display;
+        use protocols::xdg_shell::xdg_surface;
+        let (mut s, _, xdg_surface) = session_with_an_xdg_surface().await;
+        let toplevel = s.new_id();
+        s.guest_fatal([raw(
+            xdg_surface.id,
+            xdg_surface::REQ_GET_TOPLEVEL,
+            &[toplevel, 0],
+        )])
+        .await;
         assert_eq!(
-            client.ctx.xdg_roles.toplevel_of_xdg_surface(XDG_SURFACE),
-            None
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD))
         );
-        assert_eq!(
-            client
-                .ctx
-                .placement()
-                .map_or(0, |state| state.toplevel_count()),
-            0
-        );
+        assert_eq!(s.host_received(), []);
+        assert!(!has_toplevel_state(&mut s, xdg_surface));
     }
 
     /// A get_toplevel that is forwarded but ends the session (here, as if
@@ -3578,23 +3165,20 @@ mod tests {
     /// recorded and no Aura toplevel is created.
     #[tokio::test]
     async fn a_forward_that_ends_the_session_discards_its_deferred_work() {
-        let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
-        client.ctx.end_session(SessionEnd::Internal);
-        let request = get_toplevel_request(&[]);
-        client.client_conn.read_buf.extend_from_slice(&request);
-
-        assert!(!client.handle_msgs_and_flush(Direction::ClientToHost).await);
+        use protocols::wayland::wl_display;
+        use protocols::xdg_shell::xdg_surface;
+        let (mut s, _, xdg_surface) = session_with_an_xdg_surface().await;
+        // Injects a fault no peer can cause: a handler that failed.
+        s.ctx().end_session(SessionEnd::Internal);
+        let toplevel = s.new_id();
+        s.guest_fatal([xdg_surface::req::get_toplevel(xdg_surface.id, toplevel)])
+            .await;
         assert_eq!(
-            client.ctx.xdg_roles.toplevel_of_xdg_surface(XDG_SURFACE),
-            None
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
-        assert_eq!(
-            client
-                .ctx
-                .placement()
-                .map_or(0, |state| state.toplevel_count()),
-            0
-        );
+        assert_eq!(s.host_received(), []);
+        assert!(!has_toplevel_state(&mut s, xdg_surface));
     }
 
     #[tokio::test]
@@ -3631,543 +3215,336 @@ mod tests {
         );
     }
 
-    fn dispatch_raw_request_result(
-        ctx: &mut Context,
-        message: Vec<u8>,
-    ) -> Option<crate::wire::Outgoing> {
-        let header = msg_header(&message);
-        let mut wire = WireMessage::new(
-            header.sender_id,
-            header.opcode,
-            &message[MessageHeader::LEN..],
-        );
-        let result = crate::test_support::dispatch_request(ctx, &mut wire)
-            .expect("raw guest request must dispatch");
+    /// The proxy implements `gtk_shell1` itself, over the host's
+    /// `zaura_shell`: a `get_gtk_surface` is consumed whole and becomes
+    /// the surface's Aura surface, and the proxy's own `gtk_surface1`
+    /// takes the shell's local requests.
+    #[tokio::test]
+    async fn raw_gtk_surface_request_is_consumed_and_translated_to_aura() {
+        use protocols::aura_shell::zaura_shell;
+        use protocols::gtk::gtk_shell1;
+        let mut s = Session::new();
+        let gtk_shell = s.bind(zaura_shell::NAME, zaura_shell::VERSION).await;
+        let surface = s.surface().await;
+        let gtk_surface = s.new_id();
+        s.guest([gtk_shell1::req::get_gtk_surface(
+            gtk_shell,
+            gtk_surface,
+            surface.id,
+        )])
+        .await;
+        let forwarded = s.host_received();
         assert!(
-            wire.is_payload_consumed(),
-            "proxy dispatch must consume the complete raw request payload"
+            matches!(
+                &forwarded[..],
+                [
+                    (_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { surface: host_surface, .. })),
+                    (_, AnyRequest::ZauraSurface(_)),
+                ] if *host_surface == surface.host
+            ),
+            "{forwarded:?}"
         );
-        result
-    }
 
-    #[test]
-    fn raw_gtk_surface_request_is_consumed_and_translated_to_aura() {
-        const GTK_SHELL: u32 = 40;
-        const GTK_SURFACE: u32 = 41;
-        const GUEST_SURFACE: u32 = 42;
-        const HOST_SURFACE: u32 = 142;
-        const AURA_SHELL: u32 = 240;
-
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .create_local(GTK_SHELL, Iface::GtkShell1, 1);
-        ctx.gtk_shells
-            .insert(GTK_SHELL, crate::state::GtkShellState::default());
-        register_raw_surface(&mut ctx, GUEST_SURFACE, HOST_SURFACE);
-        ctx.bind_aura_shell_for_test(AURA_SHELL);
-        ctx.shadow_table
-            .insert_host_only_for_test(AURA_SHELL, "zaura_shell", 38);
-        let mut request = MessageBuilder::new();
-        request.write_u32(GTK_SURFACE);
-        request.write_u32(GUEST_SURFACE);
-        let request =
-            request.build_message(GTK_SHELL, protocols::gtk::gtk_shell1::REQ_GET_GTK_SURFACE);
-
-        assert!(dispatch_raw_request_result(&mut ctx, request).is_none());
-        assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        s.guest([gtk_shell1::req::system_bell(gtk_shell, Some(gtk_surface))])
+            .await;
         assert_eq!(
-            crate::test_support::msg_sender(&ctx.client_to_host_queue[0].0),
-            AURA_SHELL
-        );
-
-        let mut bell = MessageBuilder::new();
-        bell.write_u32(GTK_SURFACE);
-        let bell = bell.build_message(GTK_SHELL, protocols::gtk::gtk_shell1::REQ_SYSTEM_BELL);
-        assert!(
-            dispatch_raw_request_result(&mut ctx, bell).is_none(),
+            s.host_received(),
+            [],
             "a local gtk_surface object must be accepted by a local no-op request"
         );
     }
 
-    fn register_raw_surface(ctx: &mut Context, guest_surface: u32, host_surface: u32) {
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_surface,
-            host_surface,
-            "wl_surface",
-            1,
+    #[tokio::test]
+    async fn synthetic_manager_destroy_emits_one_guest_delete_id() {
+        use protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
+        use protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
+        use protocols::wayland::wl_display;
+        let mut s = Session::new();
+        // The guest sees the host's v1 manager as a v3 one.
+        let manager = s
+            .bind(
+                "zwp_text_input_manager_v1",
+                zwp_text_input_manager_v1::VERSION,
+            )
+            .await;
+        s.guest([zwp_text_input_manager_v3::req::destroy(manager)])
+            .await;
+        assert_eq!(
+            s.guest_received(),
+            [(
+                WL_DISPLAY_ID,
+                wl_display::Event::DeleteId { id: manager }.into()
+            )]
         );
-    }
+        assert_eq!(s.host_received(), []);
 
-    #[test]
-    fn synthetic_manager_destroy_emits_one_guest_delete_id() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let guest_id = 20;
-        ctx.shadow_table
-            .create_local(guest_id, Iface::ZwpTextInputManagerV3, 1);
-
-        let mut destroy = WireMessage::new(
-            guest_id,
-            protocols::text_input_unstable_v3::zwp_text_input_manager_v3::REQ_DESTROY,
-            &[],
-        );
+        s.guest_fatal([zwp_text_input_manager_v3::req::destroy(manager)])
+            .await;
         assert_eq!(
-            raw_dispatch(crate::test_support::dispatch_request(
-                &mut ctx,
-                &mut destroy
-            )),
-            Ok(None)
-        );
-        assert_eq!(ctx.shadow_table.get_interface(guest_id), None);
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap()),
-            guest_id
-        );
-
-        let mut duplicate_destroy = WireMessage::new(
-            guest_id,
-            protocols::text_input_unstable_v3::zwp_text_input_manager_v3::REQ_DESTROY,
-            &[],
-        );
-        assert_eq!(
-            raw_dispatch(crate::test_support::dispatch_request(
-                &mut ctx,
-                &mut duplicate_destroy
-            )),
-            Err(ProtocolError::InvalidSender(guest_id))
-        );
-        assert_eq!(
-            ctx.host_to_client_queue.len(),
-            1,
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_OBJECT)),
             "a retired synthetic ID must not emit duplicate delete_id events"
         );
     }
 
-    #[test]
-    fn synthetic_shm_pool_destroy_emits_one_guest_delete_id() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let guest_id = 21;
-        ctx.shadow_table.create_local(guest_id, Iface::WlShmPool, 1);
-
-        let mut destroy =
-            WireMessage::new(guest_id, protocols::wayland::wl_shm_pool::REQ_DESTROY, &[]);
-        assert_eq!(
-            raw_dispatch(crate::test_support::dispatch_request(
-                &mut ctx,
-                &mut destroy
-            )),
-            Ok(None)
-        );
-        assert_eq!(ctx.shadow_table.get_interface(guest_id), None);
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap()),
-            guest_id
-        );
-    }
-
-    /// A batch that ends early sends nothing. The descriptors of the
-    /// messages it translated close with it; the connection keeps the ones
-    /// no message has taken yet until it closes.
     #[tokio::test]
-    async fn early_output_cleanup_preserves_incoming_fd_ownership() {
-        use crate::protocols::wayland::wl_keyboard;
-
-        let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
-        // Memfds have identities of their own; pipe ends share one.
-        let forwarded = shm_pool_file(&[]);
-        let pending = shm_pool_file(&[]);
-        let forwarded_identity = fd_identity(forwarded.as_raw_fd());
-        let pending_identity = fd_identity(pending.as_raw_fd());
-
-        // A keymap the proxy forwards, then an event with trailing bytes,
-        // which ends the session. `pending` belongs to a later message.
-        let mut keymap = MessageBuilder::new();
-        keymap.write_u32(wl_keyboard::KEYMAP_FORMAT_NO_KEYMAP);
-        keymap.write_u32(0);
-        let keymap = keymap.build_message(LIVE_HOST_KEYBOARD, wl_keyboard::EVT_KEYMAP);
-        let mut repeat_info = MessageBuilder::new();
-        for word in [25, 400, 0] {
-            repeat_info.write_i32(word);
-        }
-        let repeat_info =
-            repeat_info.build_message(LIVE_HOST_KEYBOARD, wl_keyboard::EVT_REPEAT_INFO);
-        client.host_conn.read_buf.extend_from_slice(&keymap);
-        client.host_conn.read_buf.extend_from_slice(&repeat_info);
-        client.host_conn.read_fds.push_back(forwarded.into());
-        client.host_conn.read_fds.push_back(pending.into());
-
-        assert!(
-            !client.handle_msgs_and_flush(Direction::HostToClient).await,
-            "trailing bytes in a host event end the session"
-        );
-        assert!(
-            !any_fd_has_identity(forwarded_identity),
-            "the proxy closes a forwarded descriptor once it is sent"
-        );
-        assert!(
-            any_fd_has_identity(pending_identity),
-            "the connection still owns the descriptor no message took"
-        );
-        drop(client);
-        assert!(
-            !any_fd_has_identity(pending_identity),
-            "closing the connection must close every pending descriptor"
-        );
-        // The fixture's peer is non-blocking; block until the connection's
-        // close reaches it, which a process forked meanwhile may delay.
-        guest_peer
-            .set_nonblocking(false)
-            .expect("guest peer should become blocking");
-        let mut events = Vec::new();
-        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
-        let headers: Vec<_> = crate::test_support::frames(&events)
-            .map(|(header, _)| (header.sender_id, header.opcode))
-            .collect();
+    async fn synthetic_shm_pool_destroy_emits_one_guest_delete_id() {
+        use protocols::wayland::{wl_display, wl_shm_pool};
+        let (mut s, pool) = session_with_a_shm_pool().await;
+        s.guest([wl_shm_pool::req::destroy(pool)]).await;
         assert_eq!(
-            headers,
-            [
-                (LIVE_GUEST_KEYBOARD, wl_keyboard::EVT_KEYMAP),
-                (
-                    crate::wire::WL_DISPLAY_ID,
-                    crate::protocols::wayland::wl_display::EVT_ERROR
-                ),
-            ],
-            "the valid event reaches the guest ahead of the session's error"
+            s.guest_received(),
+            [(
+                WL_DISPLAY_ID,
+                wl_display::Event::DeleteId { id: pool }.into()
+            )]
         );
+        assert_eq!(s.host_received(), []);
     }
 
-    #[test]
-    fn destructor_mapping_survives_until_host_delete_id() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(1, 1, "wl_display", 1);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
-
-        let mut destroy = WireMessage::new(10, protocols::wayland::wl_region::REQ_DESTROY, &[]);
-        let forwarded = crate::test_support::dispatch_request(&mut ctx, &mut destroy)
-            .expect("destructor request should dispatch");
-        assert!(forwarded.is_some());
+    /// The destroy of an object the host shares keeps its host ID mapped
+    /// until the host's `delete_id`, which reaches the guest under its own
+    /// ID.
+    #[tokio::test]
+    async fn destructor_mapping_survives_until_host_delete_id() {
+        use protocols::wayland::{wl_display, wl_region};
+        let mut s = Session::new();
+        let region = region(&mut s).await;
+        s.guest([wl_region::req::destroy(region.id)]).await;
         assert_eq!(
-            ctx.shadow_table.get_guest_id(20),
-            Some(10),
+            s.host_received(),
+            [(region.host, wl_region::Request::Destroy {}.into())]
+        );
+        assert_eq!(s.guest_received(), [], "the guest's ID waits for the host");
+
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, region.host)])
+            .await;
+        assert_eq!(
+            s.guest_received(),
+            [(
+                WL_DISPLAY_ID,
+                wl_display::Event::DeleteId { id: region.id }.into()
+            )],
             "host ID must remain mapped until host delete_id"
         );
-        assert!(
-            ctx.shadow_table.is_pending_destroy_guest(10),
-            "destroyed guest object must be marked pending"
-        );
-
-        let payload = 20u32.to_ne_bytes();
-        let mut delete_id =
-            WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
-        assert_eq!(
-            raw_dispatch(crate::test_support::dispatch_event(
-                &mut ctx,
-                &mut delete_id
-            )),
-            Ok(None)
-        );
-        let (message, _) = ctx
-            .host_to_client_queue
-            .pop()
-            .expect("host delete_id should be queued for the guest");
-        assert_eq!(u32::from_ne_bytes(message[8..12].try_into().unwrap()), 10);
-        assert_eq!(ctx.shadow_table.get_guest_id(20), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_guest(10));
     }
 
-    #[test]
-    fn wl_fixes_destroy_registry_forwards_host_id_until_delete_id() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(1, 1, "wl_display", 1);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(5, 15, "wl_fixes", 1);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 20, "wl_registry", 1);
-
-        let payload = 10u32.to_ne_bytes();
-        let mut destroy_registry = WireMessage::new(
-            5,
-            protocols::wayland::wl_fixes::REQ_DESTROY_REGISTRY,
-            &payload,
-        );
-        let (forwarded, fds) =
-            crate::test_support::dispatch_request(&mut ctx, &mut destroy_registry)
-                .expect("destroy_registry request should dispatch")
-                .expect("destroy_registry request should be forwarded");
-        assert!(fds.is_empty());
-        assert_eq!(crate::test_support::msg_sender(&forwarded), 15);
+    #[tokio::test]
+    async fn wl_fixes_destroy_registry_forwards_host_id_until_delete_id() {
+        use protocols::wayland::{wl_display, wl_fixes};
+        let mut s = Session::new();
+        let fixes = s.bind_paired("wl_fixes", 1).await;
+        let registry = s.registry().await;
+        s.guest([wl_fixes::req::destroy_registry(fixes.id, registry.id)])
+            .await;
         assert_eq!(
-            crate::test_support::msg_opcode(&forwarded),
-            protocols::wayland::wl_fixes::REQ_DESTROY_REGISTRY
-        );
-        assert_eq!(
-            u32::from_ne_bytes(forwarded[8..12].try_into().unwrap()),
-            20,
+            s.host_received(),
+            [(
+                fixes.host,
+                wl_fixes::Request::DestroyRegistry {
+                    registry: registry.host
+                }
+                .into()
+            )],
             "the registry object argument must use its host ID"
         );
-        assert_eq!(ctx.shadow_table.get_guest_id(20), Some(10));
-        assert!(ctx.shadow_table.is_pending_destroy_guest(10));
+        assert_eq!(s.guest_received(), []);
 
-        let payload = 20u32.to_ne_bytes();
-        let mut delete_id =
-            WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, registry.host)])
+            .await;
         assert_eq!(
-            raw_dispatch(crate::test_support::dispatch_event(
-                &mut ctx,
-                &mut delete_id
-            )),
-            Ok(None)
+            s.guest_received(),
+            [(
+                WL_DISPLAY_ID,
+                wl_display::Event::DeleteId { id: registry.id }.into()
+            )]
         );
-        let (message, _) = ctx
-            .host_to_client_queue
-            .pop()
-            .expect("host delete_id should be queued for the guest");
-        assert_eq!(u32::from_ne_bytes(message[8..12].try_into().unwrap()), 10);
-        assert_eq!(ctx.shadow_table.get_guest_id(20), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_guest(10));
     }
 
-    #[test]
-    fn pending_destructor_host_events_are_suppressed_except_deferred_buffer_release() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let stale = |ctx: &Context, host: u32, event: AnyEvent| {
-            let sender = ctx
-                .shadow_table
-                .resolve_event(host)
-                .expect("a live host object");
-            pending_host_event_is_stale(ctx, &sender, &event)
-        };
-        let release = || AnyEvent::WlBuffer(wl_buffer::Event::Release {});
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 20, "wl_surface", 1);
-        ctx.guest_destroyed(10);
-        let enter = protocols::wayland::wl_surface::Event::Enter { output: 30 };
-        assert!(stale(&ctx, 20, AnyEvent::WlSurface(enter)));
+    /// A host event of an object the guest has destroyed reaches neither
+    /// the guest nor a handler, except a buffer's `release`, which the
+    /// proxy needs to destroy a host buffer the host still showed (a native
+    /// one: `a_retired_buffer_still_routes_its_release`).
+    #[tokio::test]
+    async fn pending_destructor_host_events_are_suppressed_except_deferred_buffer_release() {
+        use protocols::wayland::{wl_buffer, wl_surface};
+        let (mut s, shm) = session_with_shm().await;
+        let output = s.bind_paired("wl_output", 3).await;
+        let surface = s.surface().await;
+        s.guest([wl_surface::req::destroy(surface.id)]).await;
+        assert_eq!(
+            s.host_received(),
+            [(surface.host, wl_surface::Request::Destroy {}.into())]
+        );
+        s.host([wl_surface::evt::enter(surface.host, output.host)])
+            .await;
+        assert_eq!(s.guest_received(), []);
 
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(11, 21, "wl_buffer", 1);
-        assert!(ctx.register_local_buffer(11, 21, test_buffer_state()));
-        assert!(ctx.mark_buffer_guest_destroyed(11));
-        ctx.guest_destroyed_in_use(11);
-        assert!(!stale(&ctx, 21, release()));
-
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(12, 22, "wl_buffer", 1);
-        assert!(ctx.register_native_buffer(22, (1, 1), Vec::new()));
-        // Match the production native-buffer destroy path: the host
-        // object still dispatches wl_buffer.release.
-        assert!(ctx.mark_buffer_guest_destroyed(12));
-        ctx.guest_destroyed_in_use(12);
-        assert!(!stale(&ctx, 22, release()));
+        let surface = s.surface().await;
+        let pool = s.shm_pool(shm, shm_pool_file(&[0; 4])).await;
+        let buffer = s.shm_buffer(pool, 1, 1).await;
+        s.guest([
+            wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
+        s.host_received();
+        s.guest([wl_buffer::req::destroy(buffer.id)]).await;
+        assert_eq!(s.host_received(), [], "the host still shows the buffer");
+        s.host([wl_buffer::evt::release(buffer.host)]).await;
+        assert_eq!(
+            s.host_received(),
+            [(buffer.host, wl_buffer::Request::Destroy {}.into())]
+        );
     }
 
-    #[test]
-    fn released_output_events_never_reach_the_output_handlers() {
-        use crate::protocols::wayland::wl_output::{Event, WlOutputHandler};
-        // The wl_output handlers rely on this filter instead of checking for
-        // a pending destructor themselves.
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 20, "wl_output", 3);
-        ctx.last_sender_id = 10;
-        <Handlers as WlOutputHandler>::on_release(&mut ctx);
-        let sender = ctx
-            .shadow_table
-            .resolve_event(20)
-            .expect("a live host object");
-        let geometry = Event::Geometry {
-            x: 0,
-            y: 0,
-            physical_width: 0,
-            physical_height: 0,
-            subpixel: 0,
-            make: String::new(),
-            model: String::new(),
-            transform: 0,
-        };
-        let mode = Event::Mode {
-            flags: 0,
-            width: 1,
-            height: 1,
-            refresh: 60,
-        };
-        for event in [geometry, mode, Event::Done {}, Event::Scale { factor: 1 }] {
-            let event = AnyEvent::WlOutput(event);
-            assert!(
-                pending_host_event_is_stale(&ctx, &sender, &event),
-                "{event:?}"
-            );
-        }
-    }
-
-    fn test_buffer_state() -> crate::state::BufferState {
-        use crate::state::{BufferState, StalePixels};
-        use std::sync::Arc;
-        BufferState {
-            pool_file: Arc::new(crate::test_support::shm_pool_file(&[])),
-            offset: 0,
-            width: 1,
-            height: 1,
-            stride: 4,
-            format: 0,
-            dmabuf_fd: None,
-            dest_stride: 4,
-            dmabuf_plane1_offset: 0,
-            dmabuf_plane1_stride: 0,
-            dmabuf_sync: false,
-            host_copy: None,
-            stale: StalePixels::all(),
-        }
+    /// The `wl_output` handlers rely on the stale-event filter instead of
+    /// checking for a pending destructor themselves: no event of a
+    /// released output reaches them, or the guest.
+    #[tokio::test]
+    async fn released_output_events_never_reach_the_output_handlers() {
+        use protocols::wayland::wl_output;
+        let mut s = Session::new();
+        let output = s.bind_paired("wl_output", 3).await;
+        s.guest([wl_output::req::release(output.id)]).await;
+        assert_eq!(
+            s.host_received(),
+            [(output.host, wl_output::Request::Release {}.into())]
+        );
+        s.host([
+            wl_output::evt::geometry(output.host, 0, 0, 0, 0, 0, "", "", 0).unwrap(),
+            wl_output::evt::mode(output.host, 0, 1, 1, 60),
+            wl_output::evt::done(output.host),
+            wl_output::evt::scale(output.host, 1),
+        ])
+        .await;
+        assert_eq!(s.guest_received(), []);
     }
 
     /// The proxy dispatches a host event by its sender's interface, so an
-    /// event from a sender it does not track never reaches a handler.
+    /// event from a sender it does not track reaches no handler: a
+    /// registry's global from one reaches no registry of the guest.
     #[tokio::test]
     async fn untracked_host_event_is_dropped_before_handler_state_mutation() {
-        let (mut client, _guest_peer, _host_peer) = client_with_socket_peers();
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(7);
-        builder.write_string("wl_seat");
-        builder.write_u32(1);
-        let global = builder.build_message(77, protocols::wayland::wl_registry::EVT_GLOBAL);
+        use protocols::wayland::wl_registry;
+        let mut s = Session::new();
+        s.registry().await;
+        s.host([wl_registry::evt::global(77, 7, "wl_seat", 1).unwrap()])
+            .await;
+        assert_eq!(s.guest_received(), []);
+        assert_eq!(s.host_received(), []);
+    }
 
-        host_events(&mut client, &[global]).await;
-        assert!(
-            client.ctx.host_globals.is_empty(),
-            "an untracked host event must not reach a stateful handler"
+    /// A v3 host `wl_compositor` is offered as v4, whose
+    /// `wl_surface.damage_buffer` the proxy emulates: a guest surface is a
+    /// v4 object, and its host surface a v3 one, which gets no v4 request.
+    #[tokio::test]
+    async fn created_surface_keeps_separate_guest_and_host_versions() {
+        use protocols::wayland::{wl_compositor, wl_surface};
+        let mut s = Session::new();
+        let compositor = s.bind("wl_compositor", 3).await;
+        let id = s.new_id();
+        let host = s
+            .create(wl_compositor::req::create_surface(compositor, id))
+            .await;
+        s.guest([
+            wl_surface::req::damage_buffer(id, 0, 0, 1, 1),
+            wl_surface::req::commit(id),
+        ])
+        .await;
+        // The buffer damage reaches the v3 host surface as surface damage,
+        // at its commit.
+        let damage = wl_surface::Request::Damage {
+            x: -1,
+            y: -1,
+            width: 3,
+            height: 3,
+        };
+        assert_eq!(
+            s.host_received(),
+            [
+                (host, damage.into()),
+                (host, wl_surface::Request::Commit {}.into())
+            ]
         );
     }
 
-    #[test]
-    fn created_surface_keeps_separate_guest_and_host_versions() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let host_compositor = ctx
-            .shadow_table
-            .create_paired(10, Iface::WlCompositor, 4, 3);
-        let payload = 30u32.to_ne_bytes();
-        let mut msg = WireMessage::new(
-            10,
-            protocols::wayland::wl_compositor::REQ_CREATE_SURFACE,
-            &payload,
-        );
-        let (forwarded, fds) = crate::test_support::dispatch_request(&mut ctx, &mut msg)
-            .expect("create_surface dispatch")
-            .expect("create_surface forwarded");
-        assert!(fds.is_empty());
-        assert_eq!(crate::test_support::msg_sender(&forwarded), host_compositor);
-        let host_surface = ctx.shadow_table.get_host_id(30).expect("host surface");
+    #[tokio::test]
+    async fn request_since_guard_rejects_a_newer_opcode_for_an_old_guest_object() {
+        use protocols::wayland::wl_display;
+        use protocols::xdg_shell::{xdg_positioner, xdg_wm_base};
+        const { assert!(xdg_positioner::REQ_SET_REACTIVE_SINCE > 1) };
+        let mut s = Session::new();
+        let wm_base = s.bind("xdg_wm_base", 1).await;
+        let positioner = s.new_id();
+        s.create(xdg_wm_base::req::create_positioner(wm_base, positioner))
+            .await;
+        s.guest_fatal([xdg_positioner::req::set_reactive(positioner)])
+            .await;
         assert_eq!(
-            u32::from_ne_bytes(forwarded[8..12].try_into().unwrap()),
-            host_surface
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD))
         );
-        assert_eq!(ctx.shadow_table.guest_object_version(30), Some(4));
-        assert_eq!(ctx.shadow_table.host_object_version(host_surface), Some(3));
-        assert!(
-            ctx.surfaces.contains_key(&30),
-            "a surface has its state from its creation"
-        );
-        ctx.assert_no_orphans();
+        assert_eq!(s.host_received(), []);
     }
 
-    #[test]
-    fn request_since_guard_rejects_a_newer_opcode_for_an_old_guest_object() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 20, "xdg_positioner", 1);
-
-        let payload = [];
-        let mut msg = WireMessage::new(
-            10,
-            protocols::xdg_shell::xdg_positioner::REQ_SET_REACTIVE,
-            &payload,
-        );
-        let result = crate::test_support::dispatch_request(&mut ctx, &mut msg);
-
+    /// The generated dispatcher rejects an event newer than its host
+    /// object, which ends the session.
+    #[tokio::test]
+    async fn event_since_guard_rejects_a_newer_event_for_an_old_host_object() {
+        use protocols::wayland::wl_display;
+        use protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
+        const { assert!(xdg_toplevel::EVT_CONFIGURE_BOUNDS_SINCE > 3) };
+        let mut s = Session::new();
+        let wm_base = s.bind("xdg_wm_base", 3).await;
+        let surface = s.surface().await;
+        let xdg = s.new_id();
+        s.create(xdg_wm_base::req::get_xdg_surface(wm_base, xdg, surface.id))
+            .await;
+        let toplevel = s.new_id();
+        let host_toplevel = s
+            .create(xdg_surface::req::get_toplevel(xdg, toplevel))
+            .await;
+        s.host_fatal([xdg_toplevel::evt::configure_bounds(host_toplevel, 0, 0)])
+            .await;
         assert_eq!(
-            raw_dispatch(result),
-            Err(ProtocolError::UnsupportedVersion {
-                object_id: 10,
-                required: 3,
-                actual: 1,
-            })
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
     }
 
-    #[test]
-    fn request_rejects_object_argument_that_is_pending_destroy() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let sender = 10;
-        let host_sender = 20;
-        let surface = 30;
-        let host_surface = 40;
-        let parent = 31;
-        let host_parent = 41;
-        let new_subsurface: u32 = 50;
-
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            sender,
-            host_sender,
-            "wl_subcompositor",
-            1,
-        );
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            surface,
-            host_surface,
-            "wl_surface",
-            1,
-        );
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(parent, host_parent, "wl_surface", 1);
-        ctx.guest_destroyed(surface);
-
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&new_subsurface.to_ne_bytes());
-        payload.extend_from_slice(&surface.to_ne_bytes());
-        payload.extend_from_slice(&parent.to_ne_bytes());
-        let mut msg = WireMessage::new(
-            sender,
-            protocols::wayland::wl_subcompositor::REQ_GET_SUBSURFACE,
-            &payload,
-        );
-
+    #[tokio::test]
+    async fn request_rejects_object_argument_that_is_pending_destroy() {
+        use protocols::wayland::{wl_display, wl_subcompositor, wl_surface};
+        let mut s = Session::new();
+        let subcompositor = s.bind("wl_subcompositor", 1).await;
+        let surface = s.surface().await;
+        let parent = s.surface().await;
+        s.guest([wl_surface::req::destroy(surface.id)]).await;
         assert_eq!(
-            raw_dispatch(crate::test_support::dispatch_request(&mut ctx, &mut msg)),
-            Err(ProtocolError::InvalidObjectId(surface)),
+            s.host_received(),
+            [(surface.host, wl_surface::Request::Destroy {}.into())]
+        );
+
+        let subsurface = s.new_id();
+        s.guest_fatal([wl_subcompositor::req::get_subsurface(
+            subcompositor,
+            subsurface,
+            surface.id,
+            parent.id,
+        )])
+        .await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD)),
             "requests must not retain a pending-destroy object through another argument"
         );
+        assert_eq!(s.host_received(), []);
+        // Reads state no peer can observe: the session has ended.
         assert_eq!(
-            ctx.shadow_table.get_host_id(new_subsurface),
+            s.ctx().shadow_table.get_host_id(subsurface),
             None,
             "rejected requests must not allocate their new object"
-        );
-    }
-
-    #[test]
-    fn event_since_guard_rejects_a_newer_event_for_an_old_host_object() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 20, "xdg_toplevel", 3);
-
-        let payload = [0u8; 8];
-        let mut msg = WireMessage::new(
-            20,
-            protocols::xdg_shell::xdg_toplevel::EVT_CONFIGURE_BOUNDS,
-            &payload,
-        );
-        let result = crate::test_support::dispatch_event(&mut ctx, &mut msg);
-
-        assert_eq!(
-            raw_dispatch(result),
-            Err(ProtocolError::UnsupportedVersion {
-                object_id: 20,
-                required: 4,
-                actual: 3,
-            })
         );
     }
 

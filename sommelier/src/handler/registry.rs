@@ -1451,131 +1451,223 @@ mod tests {
     };
     use crate::handler::Handlers;
     use crate::placement_config::PlacementConfig;
-    use crate::protocols::aura_shell::{zaura_output, zaura_shell};
-    use crate::protocols::gtk::gtk_shell1;
-    use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
+    use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
+    use crate::protocols::gtk::{gtk_shell1, gtk_surface1};
+    use crate::protocols::keyboard_extension_unstable_v1::{
+        zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
+    };
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
-    use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
-    use crate::protocols::wayland::wl_callback::WlCallbackHandler;
-    use crate::protocols::wayland::wl_fixes::WlFixesHandler;
+    use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
-    use crate::protocols::wayland::{wl_display, wl_registry, wl_shm};
-    use crate::protocols::AnyRequest;
-    use crate::protocols::Iface;
-    use crate::state::Singleton;
-    use crate::state::{Context, HostGlobal, HostId, InternalCallback};
-    use crate::test_support::{decode, decoded, protocol_error};
-    use crate::wire::{Action, WL_DISPLAY_ID};
+    use crate::protocols::wayland::{
+        wl_callback, wl_display, wl_fixes, wl_keyboard, wl_output, wl_registry, wl_shm, wl_surface,
+    };
+    use crate::protocols::{AnyEvent, AnyRequest, Iface};
+    use crate::proxy::harness::{Object, Session};
+    use crate::state::{Context, HostGlobal, Singleton};
+    use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
 
-    /// A guest `wl_registry` and the host registry the proxy paired it
-    /// with. Their IDs differ, so looking up the wrong one fails.
+    /// How many IDs the guest skips before its first object. The proxy
+    /// allocates host IDs densely from the bottom, so without the gap a
+    /// registry could have the same ID on both sides, and looking up the
+    /// wrong one would pass.
+    const GUEST_ID_LEAD: u32 = 10;
+
+    /// One of the guest's two registries.
     #[derive(Clone, Copy, Debug)]
-    struct Registry {
-        guest: u32,
-        host: u32,
+    enum Registry {
+        A,
+        B,
+    }
+    use Registry::{A, B};
+
+    /// What a table test has the host or the guest do to the registries.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// The host advertises global `name` of `interface` at `version` on
+        /// the registry.
+        Global(Registry, u32, &'static str, u32),
+        /// The host removes global `name` from the registry.
+        Remove(Registry, u32),
+        /// The guest destroys the registry through `wl_fixes`.
+        Destroy(Registry),
+    }
+    use Step::{Destroy, Global, Remove};
+
+    /// A whole session for registry tests: the guest's registries [`A`]
+    /// (the session's [`Session::registry`]) and [`B`], and the
+    /// `wl_fixes` it destroys them with, which the host advertised on `A`
+    /// as global 1.
+    struct Registries {
+        s: Session,
+        a: Object,
+        b: Object,
+        fixes: Object,
     }
 
-    const A: Registry = Registry {
-        guest: 10,
-        host: 100,
-    };
-
-    const B: Registry = Registry {
-        guest: 11,
-        host: 101,
-    };
-
-    impl Registry {
-        /// The host advertises global `name` on this registry.
-        fn global(self, ctx: &mut Context, name: u32, interface: &str, version: u32) -> Action {
-            ctx.last_sender_id = self.host;
-            Handlers::on_global(ctx, name, &interface.to_string(), version)
+    impl Registries {
+        /// A session without GPU access.
+        async fn new() -> Self {
+            Self::with_context(Context::new_for_test(false, false, vec![])).await
         }
 
-        /// The host removes global `name` from this registry.
-        fn remove(self, ctx: &mut Context, name: u32) -> Action {
-            ctx.last_sender_id = self.host;
-            Handlers::on_global_remove(ctx, name)
+        /// A session with GPU access, which the proxy needs to offer the
+        /// host's linux-dmabuf, and with synthetic dma-buf feedback if
+        /// `feedback`.
+        async fn gpu(feedback: bool) -> Self {
+            let mut ctx = Context::new_for_test(true, false, vec![]);
+            // Stands in for a virtio-gpu render node, which the proxy
+            // synthesizes feedback for and a test cannot have.
+            ctx.synthetic_feedback_available_for_test = feedback;
+            Self::with_context(ctx).await
         }
 
-        /// The guest binds global `name` as `interface` at `version`, as
-        /// its new object `id`.
-        fn bind(self, ctx: &mut Context, name: u32, interface: &str, version: u32, id: u32) {
-            ctx.last_sender_id = self.guest;
-            Handlers::on_bind(ctx, name, &(interface.to_string(), version, id));
+        /// A session whose window placement uses Aura.
+        async fn aura_placement() -> Self {
+            let placement = PlacementConfig::active_for_test(&[]);
+            Self::with_context(Context::with_placement_for_test(placement)).await
         }
 
-        /// The guest destroys this registry through `wl_fixes`.
-        fn destroy(self, ctx: &mut Context) -> Action {
-            Handlers::on_destroy_registry(ctx, self.guest)
+        async fn with_context(ctx: Context) -> Self {
+            let mut s = Session::with_context(ctx);
+            for _ in 0..GUEST_ID_LEAD {
+                s.new_id();
+            }
+            let a = s.registry().await;
+            let b = s.new_registry().await;
+            let fixes = s.bind_paired(wl_fixes::NAME, wl_fixes::VERSION).await;
+            assert_ne!(a.id, a.host);
+            Self { s, a, b, fixes }
+        }
+
+        fn of(&self, registry: Registry) -> Object {
+            match registry {
+                A => self.a,
+                B => self.b,
+            }
+        }
+
+        /// The host advertises global `name` of `interface` at `version`
+        /// on `registry`.
+        async fn global(&mut self, registry: Registry, name: u32, interface: &str, version: u32) {
+            let registry = self.of(registry);
+            self.s.global(registry, name, interface, version).await;
+        }
+
+        /// The host removes global `name` from `registry`.
+        async fn remove(&mut self, registry: Registry, name: u32) {
+            let registry = self.of(registry);
+            self.s.global_remove(registry, name).await;
+        }
+
+        /// The guest binds global `name` as `interface` at `version`
+        /// through `registry`; returns its new object.
+        async fn bind(
+            &mut self,
+            registry: Object,
+            name: u32,
+            interface: &str,
+            version: u32,
+        ) -> u32 {
+            let id = self.s.new_id();
+            let bind = wl_registry::req::bind(registry.id, name, interface, version, id).unwrap();
+            self.s.guest([bind]).await;
+            id
+        }
+
+        /// [`Self::bind`] of a global the proxy forwards, which the host
+        /// gets alone through `registry`, at the same version; returns the
+        /// guest's object and the host's.
+        async fn bind_paired(
+            &mut self,
+            registry: Object,
+            name: u32,
+            interface: &str,
+            version: u32,
+        ) -> Object {
+            let id = self.bind(registry, name, interface, version).await;
+            let host = self.s.host_received();
+            let [forward] = &host[..] else {
+                panic!("the host got {host:?}, not one bind");
+            };
+            let bound = bound(forward);
+            assert_eq!(
+                host,
+                [(registry.host, bind_request(name, interface, version, bound))]
+            );
+            Object { id, host: bound }
+        }
+
+        /// [`Self::bind`], which the proxy refuses with an
+        /// `INVALID_OBJECT` error on `registry` that ends the session; the
+        /// host gets nothing.
+        async fn bind_fatal(&mut self, registry: Object, name: u32, interface: &str, version: u32) {
+            let id = self.s.new_id();
+            let bind = wl_registry::req::bind(registry.id, name, interface, version, id).unwrap();
+            self.s.guest_fatal([bind]).await;
+            assert_eq!(
+                self.s.guest_received_and_error(),
+                (vec![], (registry.id, wl_display::ERROR_INVALID_OBJECT))
+            );
+            assert_eq!(self.s.host_received(), []);
+        }
+
+        /// The guest destroys `registry` through `wl_fixes`, which the
+        /// proxy forwards, and the host acknowledges it with `delete_id`,
+        /// which the guest gets; returns what else the proxy sent the host.
+        async fn destroy(&mut self, registry: Registry) -> Vec<(u32, AnyRequest)> {
+            let registry = self.of(registry);
+            let destroy = wl_fixes::req::destroy_registry(self.fixes.id, registry.id);
+            self.s.guest([destroy]).await;
+            let mut host = self.s.host_received();
+            let forward = |request: &(u32, AnyRequest)| {
+                let destroy = wl_fixes::Request::DestroyRegistry {
+                    registry: registry.host,
+                };
+                *request == (self.fixes.host, destroy.into())
+            };
+            let at = host
+                .iter()
+                .position(forward)
+                .unwrap_or_else(|| panic!("the host got no destroy_registry: {host:?}"));
+            host.remove(at);
+            self.s
+                .host([wl_display::evt::delete_id(WL_DISPLAY_ID, registry.host)])
+                .await;
+            let deleted = wl_display::Event::DeleteId { id: registry.id };
+            assert_eq!(self.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+            host
+        }
+
+        /// Run `step`; returns what the proxy sent the host for it. What
+        /// the guest gets is kept.
+        async fn run(&mut self, step: Step) -> Vec<(u32, AnyRequest)> {
+            match step {
+                Global(registry, name, interface, version) => {
+                    self.global(registry, name, interface, version).await;
+                }
+                Remove(registry, name) => self.remove(registry, name).await,
+                Destroy(registry) => return self.destroy(registry).await,
+            }
+            self.s.host_received()
         }
     }
 
-    /// `ctx` with the guest's `registries`.
-    fn with_registries(mut ctx: Context, registries: &[Registry]) -> Context {
-        for registry in registries {
-            ctx.shadow_table
-                .insert_paired_for_test(registry.guest, registry.host, "wl_registry");
-        }
-        ctx
-    }
-
-    /// A test context with the guest's `registries`, and no GPU access.
-    fn context(registries: &[Registry]) -> Context {
-        with_registries(Context::new_for_test(false, false, vec![]), registries)
-    }
-
-    /// [`context`] with GPU access, which the proxy needs to bind the
-    /// host's linux-dmabuf.
-    fn gpu_context(registries: &[Registry]) -> Context {
-        with_registries(Context::new_for_test(true, false, vec![]), registries)
-    }
-
-    /// A context whose window placement uses Aura, for output and toplevel
-    /// tests.
-    fn aura_placement_context() -> Context {
-        let placement = PlacementConfig::active_for_test(&[]);
-        with_registries(Context::with_placement_for_test(placement), &[A])
-    }
-
-    /// Take the events queued for the guest, all of them `wl_registry`'s.
-    fn guest_globals(ctx: &mut Context) -> Vec<(u32, wl_registry::Event)> {
-        let queue = std::mem::take(&mut ctx.host_to_client_queue);
-        decoded(&queue, wl_registry::Event::from_wire)
-    }
-
-    fn global_event(name: u32, interface: &str, version: u32) -> wl_registry::Event {
+    /// A `wl_registry.global` event.
+    fn global(name: u32, interface: &str, version: u32) -> AnyEvent {
         wl_registry::Event::Global {
             name,
             interface: interface.to_string(),
             version,
         }
+        .into()
     }
 
-    /// Take the requests queued for the host, decoded: those of the
-    /// display, of registries A and B, and of the objects `others` names
-    /// with their interfaces.
-    fn host_requests(ctx: &mut Context, others: &[(u32, &str)]) -> Vec<(u32, AnyRequest)> {
-        let queue = std::mem::take(&mut ctx.client_to_host_queue);
-        queue
-            .into_iter()
-            .map(|(message, fds)| {
-                decode(&message, &mut fds.into(), |msg| {
-                    let interface = match msg.sender_id {
-                        WL_DISPLAY_ID => "wl_display",
-                        sender if sender == A.host || sender == B.host => "wl_registry",
-                        sender => others
-                            .iter()
-                            .find(|(id, _)| *id == sender)
-                            .map_or("an unknown interface", |(_, interface)| interface),
-                    };
-                    AnyRequest::from_wire(interface, msg)
-                })
-                .expect("a queued request decodes")
-            })
-            .collect()
+    /// A `wl_registry.global_remove` event.
+    fn global_remove(name: u32) -> AnyEvent {
+        wl_registry::Event::GlobalRemove { name }.into()
     }
 
     fn bind_request(name: u32, interface: &str, version: u32, id: u32) -> AnyRequest {
@@ -1586,19 +1678,91 @@ mod tests {
         .into()
     }
 
-    /// The host ID of the proxy's binding of `singleton`.
-    fn bound_host_id(singleton: Singleton, ctx: &Context) -> Option<u32> {
-        ctx.singletons.host(singleton)
+    /// The host object that `request`, a bind, creates.
+    fn bound(request: &(u32, AnyRequest)) -> u32 {
+        match request {
+            (_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. })) => id.2,
+            _ => panic!("{request:?} is no bind"),
+        }
     }
 
-    /// The global name of the proxy's binding of `singleton`.
-    fn bound_name(singleton: Singleton, ctx: &Context) -> Option<u32> {
-        Some(ctx.singletons.get(singleton)?.name)
+    /// The `wl_display.sync` of callback `callback`.
+    fn sync(callback: u32) -> (u32, AnyRequest) {
+        (WL_DISPLAY_ID, wl_display::Request::Sync { callback }.into())
     }
 
     /// A format the proxy can offer in synthetic linux-dmabuf feedback:
     /// `XRGB8888` with the linear modifier.
     const XRGB8888_LINEAR: (u32, u64) = (0x3432_5258, 0);
+
+    /// The proxy's binding of host linux-dmabuf global `name` through
+    /// `registry`, at v3, which asks for the binding's capabilities with a
+    /// sync: `requests`, which are all the host got. Returns the binding
+    /// and the sync's callback.
+    fn dmabuf_binding(requests: &[(u32, AnyRequest)], registry: Object, name: u32) -> (u32, u32) {
+        let [bind, (WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            requests
+        else {
+            panic!("the host got {requests:?}, not a bind and a sync");
+        };
+        let dmabuf = bound(bind);
+        let expected = bind_request(name, zwp_linux_dmabuf_v1::NAME, 3, dmabuf);
+        assert_eq!(*bind, (registry.host, expected));
+        (dmabuf, *callback)
+    }
+
+    /// The host's answer to capability sync `callback` of linux-dmabuf
+    /// binding `dmabuf`: its `formats`, the callback's `done`, and the
+    /// callback's `delete_id`.
+    fn capabilities(dmabuf: u32, callback: u32, formats: &[(u32, u64)]) -> Vec<Outgoing> {
+        let formats = formats.iter().map(|&(format, modifier)| {
+            let (hi, lo) = ((modifier >> 32) as u32, modifier as u32);
+            zwp_linux_dmabuf_v1::evt::modifier(dmabuf, format, hi, lo)
+        });
+        formats
+            .chain([
+                wl_callback::evt::done(callback, 0),
+                wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+            ])
+            .collect()
+    }
+
+    /// The guest's `id`, a `wl_shm` or `gtk_shell1` it just bound, is the
+    /// proxy's own: the host gets no bind for it, and the guest gets what
+    /// the proxy serves it, `wl_shm`'s mandatory formats, or `gtk_shell1`'s
+    /// capabilities once the host has answered the proxy's sync.
+    async fn assert_served_locally(s: &mut Session, id: u32, interface: &str) {
+        match interface {
+            wl_shm::NAME => {
+                assert_eq!(s.host_received(), [], "no second host bind");
+                assert_eq!(
+                    s.guest_received(),
+                    [
+                        (id, wl_shm::Event::Format { format: 0 }.into()),
+                        (id, wl_shm::Event::Format { format: 1 }.into()),
+                    ],
+                    "only the mandatory formats before the host's capabilities"
+                );
+            }
+            gtk_shell1::NAME => {
+                let host = s.host_received();
+                let [(WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+                    host[..]
+                else {
+                    panic!("the host got {host:?}, not one sync");
+                };
+                assert_eq!(s.guest_received(), []);
+                s.host([
+                    wl_callback::evt::done(callback, 0),
+                    wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+                ])
+                .await;
+                let capabilities = gtk_shell1::Event::Capabilities { capabilities: 0 };
+                assert_eq!(s.guest_received(), [(id, capabilities.into())]);
+            }
+            _ => panic!("the proxy serves no {interface}"),
+        }
+    }
 
     #[test]
     fn keyboard_extension_uses_peek_key_without_exceeding_host_version() {
@@ -1616,66 +1780,59 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wl_fixes_destroy_registry_removes_deferred_dmabuf_advertisements() {
-        let mut ctx = gpu_context(&[A]);
-        let record = ctx.registries.entry(A.host).or_default();
-        record.list(7, 9);
-        record.set_visibility(7, false);
-        ctx.dmabuf_capabilities.entry(9).or_default();
-        ctx.pending_dmabuf_globals
-            .push(crate::state::PendingDmabufGlobal {
-                registry_host_id: A.host,
-                name: 7,
-                version: 4,
-                generation: 9,
-            });
+    /// A registry destroyed through `wl_fixes` takes the linux-dmabuf
+    /// global it was to be advertised with it: once the capabilities
+    /// arrive, no registry gets it. The session's check that no state
+    /// outlives its object pins that the proxy drops the deferred
+    /// advertisement with the registry.
+    #[tokio::test]
+    async fn wl_fixes_destroy_registry_removes_deferred_dmabuf_advertisements() {
+        let mut r = Registries::gpu(true).await;
+        r.global(B, 7, zwp_linux_dmabuf_v1::NAME, 4).await;
+        let (dmabuf, callback) = dmabuf_binding(&r.s.host_received(), r.b, 7);
+        assert_eq!(r.s.guest_received(), [], "the global waits for its formats");
 
-        assert_eq!(A.destroy(&mut ctx), Action::Forward);
-        assert!(!ctx.registries.contains_key(&A.host));
-        assert!(ctx.pending_dmabuf_globals.is_empty());
-        assert!(!ctx.dmabuf_capabilities.contains_key(&9));
-        assert!(ctx.shadow_table.is_pending_destroy_guest(A.guest));
+        assert_eq!(r.destroy(B).await, []);
+
+        let formats = capabilities(dmabuf, callback, &[XRGB8888_LINEAR]);
+        r.s.host(formats).await;
+        assert_eq!(r.s.guest_received(), []);
+        assert_eq!(r.s.host_received(), []);
     }
 
     /// Each registry gets its own synthetic global, under the name its host
     /// registry gave it, and every such name is bindable.
-    #[test]
-    fn synthetic_globals_are_sent_to_each_guest_registry() {
-        for (interface, version, advertised) in
-            [("wl_shm", 2, "wl_shm"), ("zaura_shell", 38, "gtk_shell1")]
-        {
+    #[tokio::test]
+    async fn synthetic_globals_are_sent_to_each_guest_registry() {
+        for (interface, version, bound_version, advertised) in [
+            ("wl_shm", 2, 1, wl_shm::NAME),
+            ("zaura_shell", 38, 38, gtk_shell1::NAME),
+        ] {
             for name_on_b in [7, 8] {
-                let mut ctx = context(&[A, B]);
-                assert_eq!(A.global(&mut ctx, 7, interface, version), Action::Drop);
+                let mut r = Registries::new().await;
+                r.global(A, 7, interface, version).await;
+                r.global(B, name_on_b, interface, version).await;
                 assert_eq!(
-                    B.global(&mut ctx, name_on_b, interface, version),
-                    Action::Drop
-                );
-                assert_eq!(
-                    guest_globals(&mut ctx),
+                    r.s.guest_received(),
                     [
-                        (A.guest, global_event(7, advertised, 1)),
-                        (B.guest, global_event(name_on_b, advertised, 1)),
+                        (r.a.id, global(7, advertised, 1)),
+                        (r.b.id, global(name_on_b, advertised, 1)),
                     ],
                     "{interface} as {name_on_b} on B"
                 );
+                let host = r.s.host_received();
+                let [binding] = &host[..] else {
+                    panic!("the host got {host:?}, not one bind");
+                };
+                let binding = bound(binding);
                 assert_eq!(
-                    ctx.host_globals.get(&name_on_b),
-                    Some(&HostGlobal {
-                        interface: advertised.to_string(),
-                        version: 1,
-                    }),
-                    "{interface} as {name_on_b} on B"
+                    host,
+                    [(r.a.host, bind_request(7, interface, bound_version, binding))],
+                    "{interface} is bound once"
                 );
 
-                B.bind(&mut ctx, name_on_b, advertised, 1, 20);
-                assert!(!ctx.is_fatal(), "{interface} as {name_on_b} on B");
-                assert_eq!(
-                    ctx.shadow_table.get_interface(20).map(Iface::name),
-                    Some(advertised),
-                    "{interface} as {name_on_b} on B"
-                );
+                let id = r.bind(r.b, name_on_b, advertised, 1).await;
+                assert_served_locally(&mut r.s, id, advertised).await;
             }
         }
     }
@@ -1683,254 +1840,255 @@ mod tests {
     /// The proxy serves the `gtk_shell1` it advertises for `zaura_shell`
     /// itself, and sends its capabilities once the host has answered a
     /// sync.
-    #[test]
-    fn a_gtk_shell_bind_is_served_locally() {
-        let mut ctx = context(&[A]);
-        assert_eq!(A.global(&mut ctx, 7, "zaura_shell", 38), Action::Drop);
-        guest_globals(&mut ctx);
-        ctx.client_to_host_queue.clear();
+    #[tokio::test]
+    async fn a_gtk_shell_bind_is_served_locally() {
+        let mut r = Registries::new().await;
+        r.global(A, 7, zaura_shell::NAME, 38).await;
+        assert_eq!(r.s.guest_received(), [(r.a.id, global(7, "gtk_shell1", 1))]);
+        assert_eq!(r.s.host_received().len(), 1, "the proxy binds the shell");
 
-        A.bind(&mut ctx, 7, "gtk_shell1", 1, 50);
-        assert!(ctx.shadow_table.is_local(50));
-        assert!(ctx.gtk_shells.contains_key(&50));
-        assert_eq!(guest_globals(&mut ctx), []);
-        let requests = host_requests(&mut ctx, &[]);
-        let [(WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
-            requests[..]
-        else {
-            panic!("the host got {requests:?}, not one sync");
-        };
-        assert_eq!(
-            ctx.internal_callbacks.get(HostId(callback)),
-            Some(InternalCallback::GtkShellCapabilities { gtk_shell: 50 })
-        );
-
-        ctx.last_sender_id = callback;
-        assert_eq!(Handlers::on_done(&mut ctx, 0), Action::Drop);
-        assert_eq!(
-            decoded(&ctx.host_to_client_queue, gtk_shell1::Event::from_wire),
-            [(50, gtk_shell1::Event::Capabilities { capabilities: 0 })]
-        );
+        let gtk_shell = r.bind(r.a, 7, gtk_shell1::NAME, 1).await;
+        assert_served_locally(&mut r.s, gtk_shell, gtk_shell1::NAME).await;
     }
 
     /// The proxy binds each global it uses itself at the newest version
     /// both it and the host support, and keeps each binding's host ID from
-    /// reuse.
-    #[test]
-    fn internal_bindings_are_capped_and_reserved_from_host_id_reuse() {
-        let mut ctx = context(&[A]);
+    /// reuse: the host, which checks every new object, gets the guest's
+    /// next objects under other IDs.
+    #[tokio::test]
+    async fn internal_bindings_are_capped_and_reserved_from_host_id_reuse() {
+        let mut r = Registries::new().await;
         // Offered at v99, each is bound at the newest version the proxy
         // supports: the vendored XML's, or wl_shm's v1.
         let bindings = [
             (
-                1,
+                11,
                 "zwp_text_input_manager_v1",
                 zwp_text_input_manager_v1::VERSION,
-                2,
             ),
             (
-                2,
+                12,
                 "zcr_text_input_extension_v1",
                 zcr_text_input_extension_v1::VERSION,
-                3,
             ),
             (
-                3,
+                13,
                 "zcr_keyboard_extension_v1",
                 zcr_keyboard_extension_v1::VERSION,
-                4,
             ),
-            (4, "wl_shm", 1, 5),
+            (14, "wl_shm", 1),
         ];
-        for (name, interface, _, _) in bindings {
-            assert_eq!(A.global(&mut ctx, name, interface, 99), Action::Drop);
+        for (name, interface, _) in bindings {
+            r.global(A, name, interface, 99).await;
         }
 
+        let host = r.s.host_received();
+        let ids = Vec::from_iter(host.iter().map(bound));
+        let binds = bindings.iter().zip(&ids);
         assert_eq!(
-            host_requests(&mut ctx, &[]),
-            bindings.map(|(name, interface, version, id)| {
-                (A.host, bind_request(name, interface, version, id))
-            })
+            host,
+            Vec::from_iter(binds.map(|(&(name, interface, version), &id)| {
+                (r.a.host, bind_request(name, interface, version, id))
+            }))
         );
-        assert_eq!(ctx.host_text_input_manager_v1_id, Some(2));
-        assert_eq!(ctx.host_text_input_extension_v1_id, Some(3));
-        assert_eq!(ctx.singletons.host(Singleton::KeyboardExtension), Some(4));
-        assert_eq!(ctx.singletons.host(Singleton::Shm), Some(5));
-        for (_, interface, version, id) in bindings {
-            assert_eq!(
-                ctx.shadow_table.get_host_interface(id).map(Iface::name),
-                Some(interface)
-            );
-            assert_eq!(ctx.shadow_table.host_object_version(id), Some(version));
-        }
-        assert_eq!(ctx.shadow_table.create_host_only(Iface::WlCallback, 1), 6);
+        assert_eq!(
+            r.s.guest_received(),
+            [
+                (
+                    r.a.id,
+                    global(
+                        11,
+                        zwp_text_input_manager_v3::NAME,
+                        zwp_text_input_manager_v3::VERSION
+                    )
+                ),
+                (r.a.id, global(14, wl_shm::NAME, 1)),
+            ]
+        );
+        let surface = r.s.surface().await;
+        assert!(!ids.contains(&surface.host), "{ids:?} stay reserved");
 
         // Offered at v1, each is bound at v1.
-        for (_, interface, _, _) in bindings {
-            let mut ctx = context(&[A]);
-            assert_eq!(A.global(&mut ctx, 1, interface, 1), Action::Drop);
+        for (name, interface, _) in bindings {
+            let mut r = Registries::new().await;
+            r.global(A, name, interface, 1).await;
+            let host = r.s.host_received();
+            let [binding] = &host[..] else {
+                panic!("the host got {host:?}, not one bind");
+            };
+            let binding = bound(binding);
             assert_eq!(
-                host_requests(&mut ctx, &[]),
-                [(A.host, bind_request(1, interface, 1, 2))],
+                host,
+                [(r.a.host, bind_request(name, interface, 1, binding))],
                 "{interface}"
             );
-            assert_eq!(ctx.shadow_table.host_object_version(2), Some(1));
+            r.s.guest_received();
         }
     }
 
     /// Without synthetic feedback the guest gets the host's linux-dmabuf at
     /// once, capped at v3, the version the proxy binds to collect legacy
     /// format modifiers.
-    #[test]
-    fn a_dmabuf_without_synthetic_feedback_is_offered_and_bound_at_v3() {
-        let dmabuf = "zwp_linux_dmabuf_v1";
+    #[tokio::test]
+    async fn a_dmabuf_without_synthetic_feedback_is_offered_and_bound_at_v3() {
+        let dmabuf = zwp_linux_dmabuf_v1::NAME;
         for version in [4, 5, 99] {
-            let mut ctx = gpu_context(&[A]);
-            assert_eq!(A.global(&mut ctx, 10, dmabuf, version), Action::Drop);
+            let mut r = Registries::gpu(false).await;
+            r.global(A, 10, dmabuf, version).await;
 
-            let host_id = ctx
-                .singletons
-                .host(Singleton::Dmabuf)
-                .expect("the internal binding");
-            assert_eq!(ctx.shadow_table.host_object_version(host_id), Some(3));
+            let host = r.s.host_received();
+            let [binding] = &host[..] else {
+                panic!("the host got {host:?}, not one bind and no sync");
+            };
+            let binding = bound(binding);
             assert_eq!(
-                host_requests(&mut ctx, &[]),
-                [(A.host, bind_request(10, dmabuf, 3, host_id))],
+                host,
+                [(r.a.host, bind_request(10, dmabuf, 3, binding))],
                 "v{version}"
             );
-            assert_eq!(
-                guest_globals(&mut ctx),
-                [(A.guest, global_event(10, dmabuf, 3))]
-            );
-            assert_eq!(
-                ctx.host_globals.get(&10),
-                Some(&HostGlobal {
-                    interface: dmabuf.to_string(),
-                    version: 3,
-                })
-            );
-            assert!(ctx.pending_dmabuf_globals.is_empty());
-            assert_eq!(ctx.internal_callbacks.count(), 0);
+            assert_eq!(r.s.guest_received(), [(r.a.id, global(10, dmabuf, 3))]);
+            r.bind_paired(r.a, 10, dmabuf, 3).await;
+            r.bind_fatal(r.a, 10, dmabuf, 4).await;
         }
     }
 
     /// With synthetic feedback the guest's linux-dmabuf global waits for
     /// the capabilities of its binding, and stays hidden if the host offers
-    /// no format the proxy supports.
-    #[test]
-    fn a_synthetic_dmabuf_global_waits_for_its_capabilities() {
-        let dmabuf = "zwp_linux_dmabuf_v1";
+    /// no format the proxy supports: its removal does not reach the guest
+    /// either.
+    #[tokio::test]
+    async fn a_synthetic_dmabuf_global_waits_for_its_capabilities() {
+        let dmabuf = zwp_linux_dmabuf_v1::NAME;
         for (formats, offered) in [(&[XRGB8888_LINEAR][..], Some(4)), (&[], None)] {
-            let mut ctx = gpu_context(&[A]);
-            ctx.synthetic_feedback_available_for_test = true;
-            assert_eq!(A.global(&mut ctx, 10, dmabuf, 4), Action::Drop);
-            let generation = ctx.global_generations[&10];
-            assert!(!ctx.host_globals.contains_key(&10));
-            assert_eq!(guest_globals(&mut ctx), []);
-            assert_eq!(ctx.pending_dmabuf_globals.len(), 1);
+            let mut r = Registries::gpu(true).await;
+            r.global(A, 10, dmabuf, 4).await;
+            let (binding, callback) = dmabuf_binding(&r.s.host_received(), r.a, 10);
+            assert_eq!(r.s.guest_received(), []);
 
-            ctx.dmabuf_capabilities
-                .get_mut(&generation)
-                .expect("capability generation")
-                .format_modifiers
-                .extend_from_slice(formats);
-            crate::handler::linux_dmabuf::complete_capability_discovery(&mut ctx, generation);
+            r.s.host(capabilities(binding, callback, formats)).await;
+            assert_eq!(
+                r.s.guest_received(),
+                Vec::from_iter(offered.map(|version| (r.a.id, global(10, dmabuf, version))))
+            );
 
-            assert!(ctx.pending_dmabuf_globals.is_empty());
+            r.remove(A, 10).await;
+            let destroy = zwp_linux_dmabuf_v1::Request::Destroy {};
+            assert_eq!(r.s.host_received(), [(binding, destroy.into())]);
             assert_eq!(
-                ctx.host_globals.get(&10),
-                offered
-                    .map(|version| HostGlobal {
-                        interface: dmabuf.to_string(),
-                        version,
-                    })
-                    .as_ref()
-            );
-            assert_eq!(
-                guest_globals(&mut ctx),
-                Vec::from_iter(offered.map(|version| (A.guest, global_event(10, dmabuf, version))))
-            );
-            assert_eq!(
-                ctx.registries[&A.host].visibility(10),
-                Some(offered.is_some())
+                r.s.guest_received(),
+                Vec::from_iter(offered.map(|_| (r.a.id, global_remove(10))))
             );
         }
     }
 
     /// A global of version 0 is malformed; the proxy drops it.
-    #[test]
-    fn a_zero_version_global_is_dropped() {
-        let mut ctx = context(&[A]);
-        assert_eq!(A.global(&mut ctx, 10, "wl_seat", 0), Action::Drop);
-        assert!(!ctx.host_globals.contains_key(&10));
-        assert_eq!(guest_globals(&mut ctx), []);
+    #[tokio::test]
+    async fn a_zero_version_global_is_dropped() {
+        let mut r = Registries::new().await;
+        r.global(A, 10, "wl_seat", 0).await;
+        assert_eq!(r.s.guest_received(), []);
+        assert_eq!(r.s.host_received(), []);
+        r.bind_fatal(r.a, 10, "wl_seat", 1).await;
     }
 
     /// A second global under a name a registry lists is a duplicate; the
     /// proxy drops it and keeps the first.
-    #[test]
-    fn a_duplicate_global_name_is_dropped() {
-        let mut ctx = context(&[A]);
-        assert_eq!(A.global(&mut ctx, 11, "wl_seat", 5), Action::Forward);
-        assert_eq!(A.global(&mut ctx, 11, "wl_output", 3), Action::Drop);
-        assert_eq!(
-            ctx.host_globals.get(&11),
-            Some(&HostGlobal {
-                interface: "wl_seat".to_string(),
-                version: 5,
-            })
-        );
-        assert_eq!(guest_globals(&mut ctx), []);
+    #[tokio::test]
+    async fn a_duplicate_global_name_is_dropped() {
+        let mut r = Registries::new().await;
+        r.global(A, 11, "wl_seat", 5).await;
+        r.global(A, 11, "wl_output", 3).await;
+        assert_eq!(r.s.guest_received(), [(r.a.id, global(11, "wl_seat", 5))]);
+        r.bind_paired(r.a, 11, "wl_seat", 5).await;
     }
 
     /// A removed output is forgotten and its `zaura_output` released at
     /// once: a `wl_output` before v3 has no release request to free them
     /// later. The guest's object itself stays valid until it releases it.
-    #[test]
-    fn global_remove_forgets_the_output_and_releases_its_aura_child() {
-        let mut ctx = aura_placement_context();
-        assert_eq!(A.global(&mut ctx, 11, "zaura_shell", 38), Action::Drop);
-        assert_eq!(A.global(&mut ctx, 10, "wl_output", 2), Action::Forward);
-        A.bind(&mut ctx, 10, "wl_output", 2, 20);
-        let output = ctx.shadow_table.get_host_id(20).expect("bound output");
-        let aura_output = ctx.outputs.aura_output(output).expect("Aura output");
-        ctx.client_to_host_queue.clear();
-
-        assert_eq!(A.remove(&mut ctx, 10), Action::Forward);
+    #[tokio::test]
+    async fn global_remove_forgets_the_output_and_releases_its_aura_child() {
+        let mut r = Registries::aura_placement().await;
+        r.global(A, 11, zaura_shell::NAME, 38).await;
+        let host = r.s.host_received();
+        let [shell] = &host[..] else {
+            panic!("the host got {host:?}, not the shell's bind");
+        };
+        let shell = bound(shell);
+        r.global(A, 10, "wl_output", 2).await;
         assert_eq!(
-            host_requests(&mut ctx, &[(aura_output, "zaura_output")]),
+            r.s.guest_received(),
+            [
+                (r.a.id, global(11, "gtk_shell1", 1)),
+                (r.a.id, global(10, "wl_output", 2)),
+            ]
+        );
+        let output = r.bind(r.a, 10, "wl_output", 2).await;
+        let host = r.s.host_received();
+        let [bind, (_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraOutput { id, .. }))] =
+            &host[..]
+        else {
+            panic!("the output got no Aura output: {host:?}");
+        };
+        let (output_host, aura_output) = (bound(bind), *id);
+        let get_aura_output = zaura_shell::Request::GetAuraOutput {
+            id: aura_output,
+            output: output_host,
+        };
+        assert_eq!(host[1], (shell, get_aura_output.into()));
+
+        r.remove(A, 10).await;
+        assert_eq!(
+            r.s.host_received(),
             [(aura_output, zaura_output::Request::Release {}.into())]
         );
-        assert!(ctx.shadow_table.is_retired_host(aura_output));
-        assert!(ctx.outputs.is_empty_for_test());
-        assert_eq!(ctx.shadow_table.get_host_id(20), Some(output));
+        assert_eq!(r.s.guest_received(), [(r.a.id, global_remove(10))]);
+        // Reads state no peer can observe: placement no longer reads the
+        // output.
+        assert!(r.s.ctx().outputs.is_empty_for_test());
+
+        r.s.host([wl_output::evt::done(output_host)]).await;
+        assert_eq!(
+            r.s.guest_received(),
+            [(output, wl_output::Event::Done {}.into())],
+            "the guest's output stays valid"
+        );
     }
 
+    /// A bind through a guest registry with no host object cannot be sent,
+    /// so it registers no output. No peer can make such a registry, so this
+    /// test builds the proxy's state by hand.
     #[test]
     fn output_bind_through_an_unmapped_registry_registers_no_output() {
-        let mut ctx = context(&[A]);
-        assert_eq!(A.global(&mut ctx, 10, "wl_output", 3), Action::Forward);
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let (registry, host_registry) = (10, 100);
+        ctx.shadow_table
+            .insert_paired_for_test(registry, host_registry, "wl_registry");
+        ctx.last_sender_id = host_registry;
+        let output = "wl_output".to_string();
+        assert_eq!(
+            Handlers::on_global(&mut ctx, 10, &output, 3),
+            Action::Forward
+        );
 
         // The guest's registry 12 has no host object, so the bind cannot be
         // sent.
-        let unmapped = Registry {
-            guest: 12,
-            host: 102,
-        };
-        unmapped.bind(&mut ctx, 10, "wl_output", 3, 20);
+        ctx.last_sender_id = 12;
+        Handlers::on_bind(&mut ctx, 10, &(output, 3, 20));
         assert!(!ctx.is_fatal());
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert_eq!(host_requests(&mut ctx, &[]), []);
+        assert!(ctx.client_to_host_queue.is_empty());
         assert!(ctx.outputs.is_empty_for_test());
     }
 
     /// A bind the proxy cannot serve is a protocol error on the guest's
-    /// registry, and creates no object.
-    #[test]
-    fn an_invalid_bind_is_a_protocol_error() {
+    /// registry, and reaches no host.
+    #[tokio::test]
+    async fn an_invalid_bind_is_a_protocol_error() {
         struct Case {
             name: &'static str,
-            setup: fn(&mut Context),
+            setup: &'static [Step],
+            /// Injects a fault no peer can cause, after `setup`.
+            fault: Option<fn(&mut Context)>,
             /// The registry the guest binds through.
             through: Registry,
             bind: (u32, &'static str, u32),
@@ -1938,13 +2096,15 @@ mod tests {
         for case in [
             Case {
                 name: "a global of another interface",
-                setup: |ctx| assert_eq!(A.global(ctx, 7, "wl_compositor", 1), Action::Forward),
+                setup: &[Global(A, 7, "wl_compositor", 1)],
+                fault: None,
                 through: A,
                 bind: (7, "wl_seat", 1),
             },
             Case {
                 name: "a name never advertised",
-                setup: |_| {},
+                setup: &[],
+                fault: None,
                 through: A,
                 bind: (42, "wl_seat", 5),
             },
@@ -1953,19 +2113,22 @@ mod tests {
             // the forwarding guard cannot be isolated by a test.
             Case {
                 name: "an interface the proxy does not forward",
-                setup: |_| {},
+                setup: &[],
+                fault: None,
                 through: A,
                 bind: (42, "zcr_text_input_extension_v1", 1),
             },
             Case {
                 name: "a global hidden without GPU access",
-                setup: |ctx| assert_eq!(A.global(ctx, 42, "zwp_linux_dmabuf_v1", 5), Action::Drop),
+                setup: &[Global(A, 42, "zwp_linux_dmabuf_v1", 5)],
+                fault: None,
                 through: A,
                 bind: (42, "zwp_linux_dmabuf_v1", 5),
             },
             Case {
                 name: "a version above the advertised one",
-                setup: |ctx| assert_eq!(A.global(ctx, 10, "wl_seat", 3), Action::Forward),
+                setup: &[Global(A, 10, "wl_seat", 3)],
+                fault: None,
                 through: A,
                 bind: (10, "wl_seat", 4),
             },
@@ -1975,11 +2138,8 @@ mod tests {
                 // The removal of a name the registry never listed is
                 // dropped.
                 name: "a removed seat",
-                setup: |ctx| {
-                    assert_eq!(A.global(ctx, 10, "wl_seat", 5), Action::Forward);
-                    assert_eq!(A.remove(ctx, 99), Action::Drop);
-                    assert_eq!(A.remove(ctx, 10), Action::Forward);
-                },
+                setup: &[Global(A, 10, "wl_seat", 5), Remove(A, 99), Remove(A, 10)],
+                fault: None,
                 through: A,
                 bind: (10, "wl_seat", 5),
             },
@@ -1987,19 +2147,15 @@ mod tests {
                 // A bind that crossed an output's removal is inert only as
                 // the output it was.
                 name: "a removed output bound as another interface",
-                setup: |ctx| {
-                    assert_eq!(A.global(ctx, 10, "wl_output", 3), Action::Forward);
-                    assert_eq!(A.remove(ctx, 10), Action::Forward);
-                },
+                setup: &[Global(A, 10, "wl_output", 3), Remove(A, 10)],
+                fault: None,
                 through: A,
                 bind: (10, "wl_seat", 3),
             },
             Case {
                 name: "a live global the binding registry never listed",
-                setup: |ctx| {
-                    assert_eq!(A.global(ctx, 10, "wl_output", 3), Action::Forward);
-                    assert_eq!(B.global(ctx, 11, "wl_seat", 5), Action::Forward);
-                },
+                setup: &[Global(A, 10, "wl_output", 3), Global(B, 11, "wl_seat", 5)],
+                fault: None,
                 through: B,
                 bind: (10, "wl_output", 3),
             },
@@ -2007,198 +2163,234 @@ mod tests {
                 // Registry B listed nothing, so only the retirement of the
                 // global its removal from A completed can refuse the bind.
                 name: "a retired global bound through a registry that listed nothing",
-                setup: |ctx| {
-                    assert_eq!(A.global(ctx, 10, "wl_seat", 5), Action::Forward);
-                    assert_eq!(A.remove(ctx, 10), Action::Forward);
-                },
+                setup: &[Global(A, 10, "wl_seat", 5), Remove(A, 10)],
+                fault: None,
                 through: B,
                 bind: (10, "wl_seat", 5),
             },
             Case {
                 // Reachable only through a proxy bookkeeping bug, not a
                 // guest error: a name in `host_globals` whose advertisement
-                // generation was never recorded.
+                // generation was never recorded. Registry B lists nothing,
+                // so only the generation can refuse the bind.
                 name: "a global without an advertisement generation",
-                setup: |ctx| {
+                setup: &[],
+                fault: Some(|ctx| {
                     let output = HostGlobal {
                         interface: "wl_output".to_string(),
                         version: 3,
                     };
                     ctx.host_globals.insert(10, output);
-                },
-                through: A,
+                }),
+                through: B,
                 bind: (10, "wl_output", 3),
             },
         ] {
-            let mut ctx = context(&[A, B]);
-            (case.setup)(&mut ctx);
-            ctx.client_to_host_queue.clear();
+            let mut r = Registries::new().await;
+            for &step in case.setup {
+                r.run(step).await;
+            }
+            r.s.guest_received();
+            if let Some(fault) = case.fault {
+                fault(r.s.ctx());
+            }
 
             let (name, interface, version) = case.bind;
-            case.through.bind(&mut ctx, name, interface, version, 20);
-            assert!(ctx.is_fatal(), "{} must end the session", case.name);
+            let through = r.of(case.through);
+            let id = r.s.new_id();
+            let bind = wl_registry::req::bind(through.id, name, interface, version, id).unwrap();
+            r.s.guest_fatal([bind]).await;
             assert_eq!(
-                protocol_error(&ctx),
-                (case.through.guest, wl_display::ERROR_INVALID_OBJECT),
+                r.s.guest_received_and_error(),
+                (vec![], (through.id, wl_display::ERROR_INVALID_OBJECT)),
                 "{}",
                 case.name
             );
-            assert_eq!(ctx.shadow_table.get_interface(20), None, "{}", case.name);
-            assert_eq!(ctx.shadow_table.get_host_id(20), None, "{}", case.name);
-            assert_eq!(host_requests(&mut ctx, &[]), [], "{}", case.name);
-            assert!(ctx.outputs.is_empty_for_test(), "{}", case.name);
+            assert_eq!(r.s.host_received(), [], "{}", case.name);
         }
     }
 
-    #[test]
-    fn late_zaura_shell_binding_attaches_existing_outputs() {
-        let mut ctx = aura_placement_context();
-        assert_eq!(A.global(&mut ctx, 10, "wl_output", 3), Action::Forward);
-        A.bind(&mut ctx, 10, "wl_output", 3, 20);
-        let output = ctx.shadow_table.get_host_id(20).expect("bound output");
-        assert_eq!(
-            ctx.outputs.aura_output(output),
-            None,
-            "Aura output must wait for the shell binding"
-        );
+    /// An output bound before the proxy binds `zaura_shell` gets its Aura
+    /// output when the shell is bound.
+    #[tokio::test]
+    async fn late_zaura_shell_binding_attaches_existing_outputs() {
+        let mut r = Registries::aura_placement().await;
+        r.global(A, 10, "wl_output", 3).await;
+        r.s.guest_received();
+        // The host gets the bind alone: the Aura output waits for the
+        // shell's binding.
+        let output = r.bind_paired(r.a, 10, "wl_output", 3).await;
 
-        assert_eq!(A.global(&mut ctx, 11, "zaura_shell", 38), Action::Drop);
-        assert!(
-            ctx.outputs.aura_output(output).is_some(),
-            "late shell binding must attach every already-bound output"
+        r.global(A, 11, zaura_shell::NAME, 38).await;
+        assert_eq!(
+            r.s.guest_received(),
+            [(r.a.id, global(11, "gtk_shell1", 1))]
+        );
+        let host = r.s.host_received();
+        let [bind, (_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraOutput { id, .. }))] =
+            &host[..]
+        else {
+            panic!("late shell binding must attach every already-bound output: {host:?}");
+        };
+        let shell = bound(bind);
+        let get_aura_output = zaura_shell::Request::GetAuraOutput {
+            id: *id,
+            output: output.host,
+        };
+        assert_eq!(
+            host,
+            [
+                (r.a.host, bind_request(11, zaura_shell::NAME, 38, shell)),
+                (shell, get_aura_output.into()),
+            ]
         );
     }
 
     /// A toplevel created before zaura_shell is bound gets its Aura
     /// toplevel when the shell is bound.
-    #[test]
-    fn late_zaura_shell_binding_attaches_existing_toplevels() {
-        let placement = PlacementConfig::active_for_test(&[]);
-        let mut ctx = with_registries(Context::with_placement_for_test(placement), &[A]);
-        ctx.shadow_table
-            .insert_paired_for_test(12, 22, "wl_surface");
-        ctx.shadow_table
-            .insert_paired_for_test(13, 23, "xdg_toplevel");
-        ctx.xdg_roles.add_toplevel_role_for_test(13 + 1000, 12, 13);
+    #[tokio::test]
+    async fn late_zaura_shell_binding_attaches_existing_toplevels() {
+        let mut r = Registries::aura_placement().await;
+        let toplevel = r.s.toplevel().await;
+        assert_eq!(r.s.host_received(), []);
 
-        assert_eq!(A.global(&mut ctx, 11, "zaura_shell", 38), Action::Drop);
-        assert!(
-            ctx.placement()
-                .and_then(|state| state.aura_toplevel(crate::state::GuestId(13)))
-                .is_some(),
-            "late shell binding must attach every recorded toplevel"
+        r.global(A, 11, zaura_shell::NAME, 38).await;
+        assert_eq!(
+            r.s.guest_received(),
+            [(r.a.id, global(11, "gtk_shell1", 1))]
+        );
+        let host = r.s.host_received();
+        let [bind, (
+            _,
+            AnyRequest::ZauraShell(zaura_shell::Request::GetAuraToplevelForXdgToplevel {
+                id, ..
+            }),
+        ), _] = &host[..]
+        else {
+            panic!("late shell binding must attach every recorded toplevel: {host:?}");
+        };
+        let (shell, aura_toplevel) = (bound(bind), *id);
+        let get_aura_toplevel = zaura_shell::Request::GetAuraToplevelForXdgToplevel {
+            id: aura_toplevel,
+            toplevel: toplevel.toplevel.host,
+        };
+        assert_eq!(
+            host,
+            [
+                (r.a.host, bind_request(11, zaura_shell::NAME, 38, shell)),
+                (shell, get_aura_toplevel.into()),
+                (
+                    aura_toplevel,
+                    zaura_toplevel::Request::SetSupportsScreenCoordinates {}.into()
+                ),
+            ]
         );
     }
 
     /// The guest's `wl_shm` is emulated over the proxy's one host binding.
-    #[test]
-    fn synthetic_shm_bind_does_not_create_a_second_host_object() {
-        let mut ctx = context(&[A]);
-        assert_eq!(A.global(&mut ctx, 7, "wl_shm", 1), Action::Drop);
-        guest_globals(&mut ctx);
-        ctx.client_to_host_queue.clear();
+    #[tokio::test]
+    async fn synthetic_shm_bind_does_not_create_a_second_host_object() {
+        let mut r = Registries::new().await;
+        r.global(A, 7, wl_shm::NAME, 1).await;
+        assert_eq!(r.s.guest_received(), [(r.a.id, global(7, wl_shm::NAME, 1))]);
+        assert_eq!(r.s.host_received().len(), 1, "the proxy binds wl_shm");
 
-        A.bind(&mut ctx, 7, "wl_shm", 1, 20);
-        assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert_eq!(ctx.shadow_table.get_interface(20), Some(Iface::WlShm));
-        assert_eq!(host_requests(&mut ctx, &[]), [], "no second host bind");
-        assert_eq!(
-            decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
-            [
-                (20, wl_shm::Event::Format { format: 0 }),
-                (20, wl_shm::Event::Format { format: 1 }),
-            ],
-            "only the mandatory formats before the host's capabilities"
-        );
+        let shm = r.bind(r.a, 7, wl_shm::NAME, 1).await;
+        assert_served_locally(&mut r.s, shm, wl_shm::NAME).await;
     }
 
     /// Every guest `zwp_text_input_manager_v3` is local: mapping each to
     /// the one host manager would let one's destruction unmap the others'.
-    #[test]
-    fn synthetic_text_input_managers_do_not_alias_shared_host_id() {
-        let mut ctx = context(&[A]);
-        assert_eq!(
-            A.global(&mut ctx, 9, "zwp_text_input_manager_v1", 1),
-            Action::Drop
-        );
-        let manager = ctx
-            .host_text_input_manager_v1_id
-            .expect("host manager binding");
-        for id in [20, 21] {
-            A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, id);
-            assert_eq!(ctx.shadow_table.get_host_id(id), None);
-        }
+    #[tokio::test]
+    async fn synthetic_text_input_managers_do_not_alias_shared_host_id() {
+        let mut r = Registries::new().await;
+        r.global(A, 9, zwp_text_input_manager_v1::NAME, 1).await;
+        let extension = zcr_text_input_extension_v1::VERSION;
+        r.global(A, 10, zcr_text_input_extension_v1::NAME, extension)
+            .await;
+        let host = r.s.host_received();
+        let [manager, _] = &host[..] else {
+            panic!("the host got {host:?}, not the managers' binds");
+        };
+        let manager = bound(manager);
+        r.s.guest_received();
+        let manager_v3 = zwp_text_input_manager_v3::NAME;
+        let first = r.bind(r.a, 9, manager_v3, 1).await;
+        let second = r.bind(r.a, 9, manager_v3, 1).await;
+        assert_eq!(r.s.host_received(), [], "the managers are local");
 
-        ctx.last_sender_id = 20;
-        assert_eq!(
-            <Handlers as ZwpTextInputManagerV3Handler>::on_destroy(&mut ctx),
-            Action::Drop
+        r.s.guest([zwp_text_input_manager_v3::req::destroy(first)])
+            .await;
+        assert_eq!(r.s.host_received(), []);
+        let deleted = wl_display::Event::DeleteId { id: first };
+        assert_eq!(r.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+
+        // The host manager still serves the other one.
+        let seat = r.s.bind("wl_seat", 5).await;
+        let text_input = r.s.new_id();
+        r.s.guest([zwp_text_input_manager_v3::req::get_text_input(
+            second, text_input, seat,
+        )])
+        .await;
+        let host = r.s.host_received();
+        assert!(
+            matches!(
+                &host[..],
+                [(sender, AnyRequest::ZwpTextInputManagerV1(
+                    zwp_text_input_manager_v1::Request::CreateTextInput { .. }
+                )), _] if *sender == manager
+            ),
+            "the host got {host:?}, not a text input of its manager"
         );
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(manager),
-            Some(Iface::ZwpTextInputManagerV1)
-        );
-        assert!(ctx.shadow_table.get_interface(21).is_some());
     }
 
-    #[test]
-    fn duplicate_interfaces_keep_each_global_name_bindable() {
-        let mut ctx = context(&[A]);
-        assert_eq!(A.global(&mut ctx, 10, "wl_seat", 5), Action::Forward);
-        assert_eq!(A.global(&mut ctx, 11, "wl_seat", 5), Action::Forward);
+    #[tokio::test]
+    async fn duplicate_interfaces_keep_each_global_name_bindable() {
+        let mut r = Registries::new().await;
+        r.global(A, 10, "wl_seat", 5).await;
+        r.global(A, 11, "wl_seat", 5).await;
+        assert_eq!(
+            r.s.guest_received(),
+            [
+                (r.a.id, global(10, "wl_seat", 5)),
+                (r.a.id, global(11, "wl_seat", 5)),
+            ]
+        );
 
-        A.bind(&mut ctx, 10, "wl_seat", 5, 20);
-        A.bind(&mut ctx, 11, "wl_seat", 5, 21);
-        let host = |id| ctx.shadow_table.get_host_id(id).expect("a host seat");
-        let expected = [
-            (A.host, bind_request(10, "wl_seat", 5, host(20))),
-            (A.host, bind_request(11, "wl_seat", 5, host(21))),
-        ];
-        assert_eq!(host_requests(&mut ctx, &[]), expected);
+        r.bind_paired(r.a, 10, "wl_seat", 5).await;
+        r.bind_paired(r.a, 11, "wl_seat", 5).await;
     }
 
-    #[test]
-    fn removed_text_input_globals_keep_bound_manager_usable() {
-        let mut ctx = context(&[A]);
-        assert_eq!(
-            A.global(&mut ctx, 9, "zwp_text_input_manager_v1", 1),
-            Action::Drop
-        );
-        assert_eq!(
-            A.global(&mut ctx, 10, "zcr_text_input_extension_v1", 11),
-            Action::Drop
-        );
-        let manager = ctx
-            .host_text_input_manager_v1_id
-            .expect("host manager binding");
-        let extension = ctx
-            .host_text_input_extension_v1_id
-            .expect("host extension binding");
+    #[tokio::test]
+    async fn removed_text_input_globals_keep_bound_manager_usable() {
+        let mut r = Registries::new().await;
+        r.global(A, 9, zwp_text_input_manager_v1::NAME, 1).await;
+        r.global(A, 10, zcr_text_input_extension_v1::NAME, 11).await;
+        let host = r.s.host_received();
+        let [manager, extension] = &host[..] else {
+            panic!("the host got {host:?}, not the managers' binds");
+        };
+        let (manager, extension) = (bound(manager), bound(extension));
+        r.s.guest_received();
 
         // The synthetic v3 global is advertised under the host manager's
         // numeric name. Bind a guest manager before removing the host globals.
-        A.bind(&mut ctx, 9, "zwp_text_input_manager_v3", 1, 20);
-        assert_eq!(A.remove(&mut ctx, 9), Action::Forward);
-        assert_eq!(A.remove(&mut ctx, 10), Action::Drop);
-        assert_eq!(ctx.host_text_input_manager_v1_id, Some(manager));
-        assert_eq!(ctx.host_text_input_extension_v1_id, Some(extension));
-        ctx.client_to_host_queue.clear();
+        let manager_v3 = r.bind(r.a, 9, zwp_text_input_manager_v3::NAME, 1).await;
+        r.remove(A, 9).await;
+        r.remove(A, 10).await;
+        assert_eq!(r.s.guest_received(), [(r.a.id, global_remove(9))]);
+        assert_eq!(r.s.host_received(), []);
 
         // An already-bound manager remains usable after global_remove. New
         // text-input children must still be created through both retained
         // host-side factories.
-        ctx.last_sender_id = 20;
-        assert_eq!(
-            <Handlers as ZwpTextInputManagerV3Handler>::on_get_text_input(&mut ctx, 21, 30),
-            Action::Drop
-        );
-        let host = host_requests(
-            &mut ctx,
-            &[
-                (manager, "zwp_text_input_manager_v1"),
-                (extension, "zcr_text_input_extension_v1"),
-            ],
-        );
+        let seat = r.s.bind("wl_seat", 5).await;
+        let text_input = r.s.new_id();
+        r.s.guest([zwp_text_input_manager_v3::req::get_text_input(
+            manager_v3, text_input, seat,
+        )])
+        .await;
+        let host = r.s.host_received();
         // The host IDs come from the requests that create them, and the
         // extension extends the text input the manager creates.
         let created = |request: &(u32, AnyRequest)| request.1.new_object().map(|(id, _)| id);
@@ -2228,55 +2420,49 @@ mod tests {
         );
     }
 
-    #[test]
-    fn keyboard_extension_global_remove_keeps_existing_children_alive() {
-        let mut ctx = context(&[A]);
-        assert_eq!(
-            A.global(&mut ctx, 20, "zcr_keyboard_extension_v1", 2),
-            Action::Drop
-        );
-        let manager_id = ctx
-            .singletons
-            .host(Singleton::KeyboardExtension)
-            .map(HostId)
-            .expect("keyboard extension binding");
+    /// The `zcr_extended_keyboard_v1` of a keyboard outlives its manager's
+    /// global: the keyboard's release still destroys it.
+    #[tokio::test]
+    async fn keyboard_extension_global_remove_keeps_existing_children_alive() {
+        let mut r = Registries::new().await;
+        r.global(A, 20, zcr_keyboard_extension_v1::NAME, 2).await;
+        let host = r.s.host_received();
+        let [extension] = &host[..] else {
+            panic!("the host got {host:?}, not the extension's bind");
+        };
+        let extension = bound(extension);
+        let (_, keyboard) = r.s.keyboard().await;
+        let surface = r.s.surface().await;
+        r.s.host([wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap()])
+            .await;
+        assert_eq!(r.s.guest_received().len(), 2, "the enter and its modifiers");
+        let host = r.s.host_received();
+        let [(
+            sender,
+            AnyRequest::ZcrKeyboardExtensionV1(
+                zcr_keyboard_extension_v1::Request::GetExtendedKeyboard {
+                    id: child,
+                    keyboard: of,
+                },
+            ),
+        )] = host[..]
+        else {
+            panic!("the keyboard got no extended keyboard: {host:?}");
+        };
+        assert_eq!((sender, of), (extension, keyboard.host));
 
-        // Simulate the child created by get_extended_keyboard for an already
-        // bound host wl_keyboard. The child owns its own destructor and must
-        // outlive the manager global.
-        crate::handler::keyboard::for_test::created(&mut ctx, 41, 40, 42);
-        crate::handler::keyboard::ensure_extended_keyboard_bound(&mut ctx, HostId(40));
-        let child_id = ctx
-            .keys
-            .keyboards()
-            .extended_for_test(HostId(40))
-            .expect("extended keyboard child");
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(child_id.0),
-            Some(Iface::ZcrExtendedKeyboardV1)
-        );
+        r.remove(A, 20).await;
+        assert_eq!(r.s.host_received(), []);
+        assert_eq!(r.s.guest_received(), []);
 
-        assert_eq!(A.remove(&mut ctx, 20), Action::Drop);
-        assert_eq!(ctx.singletons.get(Singleton::KeyboardExtension), None);
+        r.s.guest([wl_keyboard::req::release(keyboard.id)]).await;
         assert_eq!(
-            ctx.shadow_table.get_host_interface(manager_id.0),
-            None,
-            "global removal retires only the manager dispatch entry"
-        );
-        assert_eq!(
-            ctx.keys.keyboards().extended_for_test(HostId(40)),
-            Some(child_id),
+            r.s.host_received(),
+            [
+                (keyboard.host, wl_keyboard::Request::Release {}.into()),
+                (child, zcr_extended_keyboard_v1::Request::Destroy {}.into()),
+            ],
             "an existing child must remain mapped after manager removal"
-        );
-        assert_eq!(
-            ctx.keys.keyboards().of_extended(child_id),
-            Some(HostId(40)),
-            "the reverse child mapping must remain routable"
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(child_id.0),
-            Some(Iface::ZcrExtendedKeyboardV1),
-            "child dispatch metadata must survive global removal"
         );
     }
 
@@ -2284,59 +2470,53 @@ mod tests {
     /// host ID stays reserved, the host object is destroyed if its
     /// interface has a destructor, and the name's next advertisement is
     /// bound afresh.
-    #[test]
-    fn removing_a_bound_singleton_global_retires_its_binding() {
+    #[tokio::test]
+    async fn removing_a_bound_singleton_global_retires_its_binding() {
         struct Case {
             singleton: Singleton,
             /// The version the host advertises, and the one the proxy binds.
             version: u32,
             bound_version: u32,
-            /// What the proxy does with the host's `global_remove`.
-            removal: Action,
+            /// The global the guest is advertised for it, which its removal
+            /// reaches.
+            advertised: Option<(&'static str, u32)>,
             /// The request that destroys the old binding, if its interface
             /// has one.
             destructor: Option<AnyRequest>,
             /// Whether a new binding asks for its capabilities with a sync.
             capability_sync: bool,
-            /// Whether a guest global waits for the binding's capabilities
-            /// when the host removes it.
-            pending_guest_global: bool,
         }
         for Case {
             singleton,
             version,
             bound_version,
-            removal,
+            advertised,
             destructor,
             capability_sync,
-            pending_guest_global,
         } in [
             Case {
                 singleton: Singleton::Shm,
                 version: 1,
                 bound_version: 1,
-                removal: Action::Forward,
+                advertised: Some((wl_shm::NAME, 1)),
                 destructor: None,
                 capability_sync: false,
-                pending_guest_global: false,
             },
             Case {
                 singleton: Singleton::KeyboardExtension,
                 version: 2,
                 bound_version: 2,
-                removal: Action::Drop,
+                advertised: None,
                 destructor: None,
                 capability_sync: false,
-                pending_guest_global: false,
             },
             Case {
                 singleton: Singleton::AuraShell,
                 version: 38,
                 bound_version: 38,
-                removal: Action::Forward,
+                advertised: Some((gtk_shell1::NAME, 1)),
                 destructor: Some(zaura_shell::Request::Release {}.into()),
                 capability_sync: false,
-                pending_guest_global: false,
             },
             // Removed before its capabilities arrived, the global was never
             // shown to the guest.
@@ -2344,106 +2524,171 @@ mod tests {
                 singleton: Singleton::Dmabuf,
                 version: 4,
                 bound_version: 3,
-                removal: Action::Drop,
+                advertised: None,
                 destructor: Some(zwp_linux_dmabuf_v1::Request::Destroy {}.into()),
                 capability_sync: true,
-                pending_guest_global: true,
             },
         ] {
             let interface = singleton.interface().name();
-            let mut ctx = gpu_context(&[A]);
-            ctx.synthetic_feedback_available_for_test = true;
-            assert_eq!(A.global(&mut ctx, 10, interface, version), Action::Drop);
-            let old = bound_host_id(singleton, &ctx).expect("a binding");
-            ctx.client_to_host_queue.clear();
-            assert_eq!(
-                ctx.pending_dmabuf_globals.len(),
-                usize::from(pending_guest_global),
-                "{interface}"
-            );
+            let mut r = Registries::gpu(true).await;
+            let a = r.a;
+            let advertise = || {
+                Vec::from_iter(
+                    advertised.map(|(advertised, version)| (a.id, global(10, advertised, version))),
+                )
+            };
+            // The proxy binds the global as `version`, and asks for its
+            // capabilities if it has some; returns the binding.
+            let binding = |host: Vec<(u32, AnyRequest)>| {
+                let binding = bound(&host[0]);
+                let expected = bind_request(10, interface, bound_version, binding);
+                let sync = capability_sync.then(|| {
+                    let callback = host[1].1.new_object().expect("a callback").0;
+                    sync(callback)
+                });
+                assert_eq!(
+                    host,
+                    Vec::from_iter([(a.host, expected)].into_iter().chain(sync)),
+                    "{interface}"
+                );
+                binding
+            };
+            r.global(A, 10, interface, version).await;
+            let old = binding(r.s.host_received());
+            assert_eq!(r.s.guest_received(), advertise(), "{interface}");
 
-            assert_eq!(A.remove(&mut ctx, 10), removal, "{interface}");
-            assert_eq!(bound_name(singleton, &ctx), None);
-            assert_eq!(bound_host_id(singleton, &ctx), None);
-            assert_eq!(ctx.shadow_table.get_host_interface(old), None);
+            r.remove(A, 10).await;
             assert_eq!(
-                host_requests(&mut ctx, &[(old, interface)]),
+                r.s.host_received(),
                 Vec::from_iter(destructor.map(|request| (old, request))),
                 "{interface}"
             );
-            assert!(ctx.pending_dmabuf_globals.is_empty(), "{interface}");
-            assert_ne!(ctx.shadow_table.create_host_only(Iface::WlCallback, 1), old);
-
-            assert_eq!(A.global(&mut ctx, 10, interface, version), Action::Drop);
-            let new = bound_host_id(singleton, &ctx).expect("a new binding");
-            assert_ne!(new, old, "{interface}");
-            let mut requests = host_requests(&mut ctx, &[]);
-            if capability_sync {
-                assert!(matches!(
-                    requests.pop(),
-                    Some((
-                        WL_DISPLAY_ID,
-                        AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
-                    ))
-                ));
-            }
             assert_eq!(
-                requests,
-                [(A.host, bind_request(10, interface, bound_version, new))],
+                r.s.guest_received(),
+                Vec::from_iter(advertised.map(|_| (a.id, global_remove(10)))),
                 "{interface}"
             );
+            // Reads state no peer can observe: the guest global that waited
+            // for the binding's capabilities, which no registry lists now.
+            assert!(r.s.ctx().pending_dmabuf_globals.is_empty(), "{interface}");
+
+            r.global(A, 10, interface, version).await;
+            let new = binding(r.s.host_received());
+            assert_ne!(new, old, "{interface}");
+            assert_eq!(r.s.guest_received(), advertise(), "{interface}");
         }
     }
 
     /// Removing the `zaura_shell` global releases the proxy's binding if
     /// its version has a destructor, and keeps the `zaura_surface`s made
     /// from it until their surfaces are destroyed.
-    #[test]
-    fn global_remove_keeps_aura_children_until_surface_destroy() {
+    #[tokio::test]
+    async fn global_remove_keeps_aura_children_until_surface_destroy() {
         for (version, released) in [(38, true), (37, false)] {
-            let mut ctx = context(&[A]);
-            assert_eq!(A.global(&mut ctx, 10, "zaura_shell", version), Action::Drop);
-            let shell = ctx
-                .singletons
-                .host(Singleton::AuraShell)
-                .expect("aura shell binding");
-            let surface = ctx.shadow_table.create_host_only(Iface::ZauraSurface, 38);
-            ctx.aura_surfaces.remember(50, surface);
-            ctx.client_to_host_queue.clear();
-
-            assert_eq!(A.remove(&mut ctx, 10), Action::Forward);
-            assert_eq!(ctx.singletons.get(Singleton::AuraShell), None);
-            assert_eq!(ctx.shadow_table.get_host_interface(shell), None);
+            let mut r = Registries::new().await;
+            r.global(A, 10, zaura_shell::NAME, version).await;
+            let host = r.s.host_received();
+            let [shell] = &host[..] else {
+                panic!("the host got {host:?}, not the shell's bind");
+            };
+            let shell = bound(shell);
+            r.s.guest_received();
+            let gtk_shell = r.bind(r.a, 10, gtk_shell1::NAME, 1).await;
+            assert_served_locally(&mut r.s, gtk_shell, gtk_shell1::NAME).await;
+            let surface = r.s.surface().await;
+            let gtk_surface = r.s.new_id();
+            r.s.guest([
+                gtk_shell1::req::set_startup_id(gtk_shell, Some("launch")).unwrap(),
+                gtk_shell1::req::get_gtk_surface(gtk_shell, gtk_surface, surface.id),
+            ])
+            .await;
+            let host = r.s.host_received();
+            let [(_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { id, .. })), _] =
+                host[..]
+            else {
+                panic!("the surface got no Aura surface: {host:?}");
+            };
+            let aura_surface = id;
+            let get_aura_surface = zaura_shell::Request::GetAuraSurface {
+                id: aura_surface,
+                surface: surface.host,
+            };
+            let startup_id = zaura_surface::Request::SetStartupId {
+                startup_id: Some("launch".to_string()),
+            };
             assert_eq!(
-                host_requests(&mut ctx, &[(shell, "zaura_shell")]),
+                host,
+                [
+                    (shell, get_aura_surface.into()),
+                    (aura_surface, startup_id.into())
+                ]
+            );
+
+            r.remove(A, 10).await;
+            assert_eq!(
+                r.s.host_received(),
                 Vec::from_iter(released.then(|| (shell, zaura_shell::Request::Release {}.into()))),
                 "v{version}"
             );
-            assert_eq!(ctx.aura_surfaces.get(50), Some(surface));
-            assert_eq!(
-                ctx.shadow_table.get_host_interface(surface),
-                Some(Iface::ZauraSurface)
+            assert_eq!(r.s.guest_received(), [(r.a.id, global_remove(10))]);
+
+            // The Aura surface outlives the global: GTK still names the
+            // application on it.
+            let application = Some("com.example.Terminal");
+            r.s.guest([gtk_surface1::req::set_dbus_properties(
+                gtk_surface,
+                application,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()])
+                .await;
+            let host = r.s.host_received();
+            assert!(
+                matches!(
+                    &host[..],
+                    [(sender, AnyRequest::ZauraSurface(
+                        zaura_surface::Request::SetApplicationId { .. }
+                    ))] if *sender == aura_surface
+                ),
+                "the host got {host:?}, not the application of the Aura surface"
             );
-            for reserved in [shell, surface] {
-                assert_ne!(
-                    ctx.shadow_table.create_host_only(Iface::WlCallback, 1),
-                    reserved
-                );
-            }
+
+            // Until its surface is destroyed: an Aura surface of v38
+            // releases with it.
+            r.s.guest([wl_surface::req::destroy(surface.id)]).await;
+            let release =
+                (released).then(|| (aura_surface, zaura_surface::Request::Release {}.into()));
+            assert_eq!(
+                r.s.host_received(),
+                Vec::from_iter(
+                    release
+                        .into_iter()
+                        .chain([(surface.host, wl_surface::Request::Destroy {}.into())])
+                ),
+                "v{version}"
+            );
+            assert_eq!(r.s.guest_received(), []);
         }
     }
 
     /// A host may advertise a singleton global under a new name before it
     /// removes the old one. The proxy keeps its binding of the old name,
     /// and binds the new one when the old one retires.
-    #[test]
-    fn a_singleton_advertised_anew_is_bound_when_the_old_name_retires() {
+    #[tokio::test]
+    async fn a_singleton_advertised_anew_is_bound_when_the_old_name_retires() {
         struct Case {
             singleton: Singleton,
             /// The version the host advertises both globals at, and the
             /// one the proxy binds.
             version: u32,
             bound_version: u32,
+            /// The global the guest is advertised for each, which its
+            /// removal reaches.
+            advertised: Option<(&'static str, u32)>,
             /// The request that destroys the old binding, if its interface
             /// has one.
             destructor: Option<AnyRequest>,
@@ -2452,18 +2697,21 @@ mod tests {
             singleton,
             version,
             bound_version,
+            advertised,
             destructor,
         } in [
             Case {
                 singleton: Singleton::Dmabuf,
                 version: LINUX_DMABUF_CAPABILITY_VERSION,
                 bound_version: 3,
+                advertised: Some((zwp_linux_dmabuf_v1::NAME, 3)),
                 destructor: Some(zwp_linux_dmabuf_v1::Request::Destroy {}.into()),
             },
             Case {
                 singleton: Singleton::KeyboardExtension,
                 version: KEYBOARD_EXTENSION_VERSION,
                 bound_version: 2,
+                advertised: None,
                 destructor: None,
             },
             // Before v38 `zaura_shell` has no destructor.
@@ -2471,64 +2719,60 @@ mod tests {
                 singleton: Singleton::AuraShell,
                 version: ZAURA_SHELL_MIN_VERSION,
                 bound_version: 6,
+                advertised: Some((gtk_shell1::NAME, 1)),
                 destructor: None,
             },
             Case {
                 singleton: Singleton::Shm,
                 version: WL_SHM_VERSION,
                 bound_version: 1,
+                advertised: Some((wl_shm::NAME, 1)),
                 destructor: None,
             },
         ] {
-            let mut ctx = gpu_context(&[A]);
+            let mut r = Registries::gpu(false).await;
             let interface = singleton.interface().name();
-            assert_eq!(A.global(&mut ctx, 10, interface, version), Action::Drop);
-            let old = bound_host_id(singleton, &ctx).expect("a binding");
-            assert_eq!(A.global(&mut ctx, 11, interface, version), Action::Drop);
-            assert_eq!(bound_name(singleton, &ctx), Some(10), "{interface}");
-            assert_eq!(bound_host_id(singleton, &ctx), Some(old));
+            let a = r.a;
+            let advertise = |name| {
+                Vec::from_iter(
+                    advertised
+                        .map(|(advertised, version)| (a.id, global(name, advertised, version))),
+                )
+            };
+            r.global(A, 10, interface, version).await;
+            assert_eq!(r.s.guest_received(), advertise(10), "{interface}");
+            let host = r.s.host_received();
+            let [old] = &host[..] else {
+                panic!("the host got {host:?}, not one bind");
+            };
+            let old = bound(old);
             assert_eq!(
-                host_requests(&mut ctx, &[]),
-                [(A.host, bind_request(10, interface, bound_version, old))],
-                "{interface} is bound once"
+                host,
+                [(a.host, bind_request(10, interface, bound_version, old))],
+                "{interface} is bound"
             );
+            r.global(A, 11, interface, version).await;
+            assert_eq!(r.s.guest_received(), advertise(11), "{interface}");
+            assert_eq!(r.s.host_received(), [], "{interface} is bound once");
 
-            A.remove(&mut ctx, 10);
+            r.remove(A, 10).await;
 
-            assert!(!ctx.is_fatal());
-            assert_eq!(bound_name(singleton, &ctx), Some(11), "{interface}");
-            let new = bound_host_id(singleton, &ctx).expect("a new binding");
+            let host = r.s.host_received();
+            let new = bound(host.last().expect("a new binding"));
             let expected = destructor.map(|request| (old, request)).into_iter();
             assert_eq!(
-                host_requests(&mut ctx, &[(old, interface)]),
+                host,
                 Vec::from_iter(
-                    expected.chain([(A.host, bind_request(11, interface, bound_version, new))])
+                    expected.chain([(a.host, bind_request(11, interface, bound_version, new))])
                 ),
                 "{interface}"
             );
+            assert_eq!(
+                r.s.guest_received(),
+                Vec::from_iter(advertised.map(|_| (a.id, global_remove(10)))),
+                "{interface}"
+            );
         }
-    }
-
-    /// A step of [`a_singleton_binding_moves_to_the_lowest_live_candidate`].
-    #[derive(Clone, Copy, Debug)]
-    enum Step {
-        /// The registry sees the global's removal.
-        Remove(Registry, u32),
-        /// The registry sees the name advertised anew, for `wl_output`.
-        ReuseAsOutput(Registry, u32),
-        /// The registry sees the name advertised anew, for `wl_shm` again.
-        ReadvertiseShm(Registry, u32),
-        /// The guest destroys the registry through `wl_fixes`.
-        Destroy(Registry),
-    }
-
-    /// A `wl_shm` bind the proxy sent `through` a registry, of global
-    /// `name` as host object `id`.
-    #[derive(Clone, Copy, Debug)]
-    struct Bind {
-        through: Registry,
-        name: u32,
-        id: u32,
     }
 
     /// When the proxy's `wl_shm` binding retires, it binds the lowest name
@@ -2536,18 +2780,19 @@ mod tests {
     /// lists and whose removal no registry has seen, through the lowest
     /// registry that lists it. A registry lists a name only at the
     /// generation it last saw advertised.
-    #[test]
-    fn a_singleton_binding_moves_to_the_lowest_live_candidate() {
-        use Step::{Destroy, ReadvertiseShm, Remove, ReuseAsOutput};
+    #[tokio::test]
+    async fn a_singleton_binding_moves_to_the_lowest_live_candidate() {
         struct Case {
             name: &'static str,
             /// The `wl_shm` names each registry lists, in the order the
-            /// host advertised them.
+            /// host advertised them. The proxy binds the first.
             listings: &'static [(Registry, &'static [u32])],
             steps: &'static [Step],
+            /// The name the proxy has bound after the steps.
             bound: Option<u32>,
-            /// The binds the steps sent.
-            binds: &'static [Bind],
+            /// The `wl_shm` binds the steps sent, through each registry, of
+            /// each name.
+            binds: &'static [(Registry, u32)],
             candidates: &'static [u32],
         }
         for case in [
@@ -2556,11 +2801,7 @@ mod tests {
                 listings: &[(B, &[10, 12, 11]), (A, &[10, 12, 11])],
                 steps: &[Remove(B, 10), Remove(A, 10)],
                 bound: Some(11),
-                binds: &[Bind {
-                    through: A,
-                    name: 11,
-                    id: 3,
-                }],
+                binds: &[(A, 11)],
                 candidates: &[11, 12],
             },
             Case {
@@ -2568,13 +2809,9 @@ mod tests {
                 // that has may see it advertised for another interface.
                 name: "a bound name reused by another interface hands the binding on",
                 listings: &[(A, &[10, 11]), (B, &[10])],
-                steps: &[Remove(A, 10), ReuseAsOutput(A, 10)],
+                steps: &[Remove(A, 10), Global(A, 10, "wl_output", 3)],
                 bound: Some(11),
-                binds: &[Bind {
-                    through: A,
-                    name: 11,
-                    id: 3,
-                }],
+                binds: &[(A, 11)],
                 candidates: &[11],
             },
             Case {
@@ -2582,7 +2819,7 @@ mod tests {
                 listings: &[(A, &[10, 11]), (B, &[10, 11])],
                 steps: &[
                     Remove(A, 11),
-                    ReuseAsOutput(A, 11),
+                    Global(A, 11, "wl_output", 3),
                     Remove(A, 10),
                     Remove(B, 10),
                 ],
@@ -2622,13 +2859,9 @@ mod tests {
                 // it cannot carry the bind of the new one.
                 name: "a name advertised anew is bound through a registry that lists it anew",
                 listings: &[(A, &[10]), (B, &[10])],
-                steps: &[Remove(B, 10), ReadvertiseShm(B, 10)],
+                steps: &[Remove(B, 10), Global(B, 10, "wl_shm", 1)],
                 bound: Some(10),
-                binds: &[Bind {
-                    through: B,
-                    name: 10,
-                    id: 3,
-                }],
+                binds: &[(B, 10)],
                 candidates: &[10],
             },
             Case {
@@ -2639,13 +2872,9 @@ mod tests {
                 // rows below.
                 name: "a name advertised anew retires when only its old generation is listed",
                 listings: &[(A, &[10]), (B, &[10])],
-                steps: &[Remove(B, 10), ReadvertiseShm(B, 10), Remove(B, 10)],
+                steps: &[Remove(B, 10), Global(B, 10, "wl_shm", 1), Remove(B, 10)],
                 bound: None,
-                binds: &[Bind {
-                    through: B,
-                    name: 10,
-                    id: 3,
-                }],
+                binds: &[(B, 10)],
                 candidates: &[],
             },
             Case {
@@ -2656,16 +2885,12 @@ mod tests {
                 listings: &[(A, &[10]), (B, &[10])],
                 steps: &[
                     Remove(B, 10),
-                    ReadvertiseShm(B, 10),
-                    ReadvertiseShm(A, 10),
+                    Global(B, 10, "wl_shm", 1),
+                    Global(A, 10, "wl_shm", 1),
                     Remove(B, 10),
                 ],
                 bound: Some(10),
-                binds: &[Bind {
-                    through: B,
-                    name: 10,
-                    id: 3,
-                }],
+                binds: &[(B, 10)],
                 candidates: &[10],
             },
             Case {
@@ -2676,17 +2901,13 @@ mod tests {
                 listings: &[(A, &[10]), (B, &[10])],
                 steps: &[
                     Remove(A, 10),
-                    ReadvertiseShm(A, 10),
+                    Global(A, 10, "wl_shm", 1),
                     Remove(B, 10),
-                    ReadvertiseShm(B, 10),
+                    Global(B, 10, "wl_shm", 1),
                     Remove(B, 10),
                 ],
                 bound: Some(10),
-                binds: &[Bind {
-                    through: A,
-                    name: 10,
-                    id: 3,
-                }],
+                binds: &[(A, 10)],
                 candidates: &[10],
             },
             Case {
@@ -2705,370 +2926,361 @@ mod tests {
                 listings: &[(A, &[10, 11]), (B, &[10, 12])],
                 steps: &[Remove(A, 10), Destroy(B)],
                 bound: Some(11),
-                binds: &[Bind {
-                    through: A,
-                    name: 11,
-                    id: 3,
-                }],
+                binds: &[(A, 11)],
                 candidates: &[11],
             },
         ] {
-            let mut ctx = context(&[A, B]);
-            for &(registry, names) in case.listings {
-                for &name in names {
-                    registry.global(&mut ctx, name, "wl_shm", WL_SHM_VERSION);
-                }
-            }
-            ctx.client_to_host_queue.clear();
-            for &step in case.steps {
-                match step {
-                    Remove(registry, name) => {
-                        registry.remove(&mut ctx, name);
-                    }
-                    ReuseAsOutput(registry, name) => {
-                        registry.global(&mut ctx, name, "wl_output", 3);
-                    }
-                    ReadvertiseShm(registry, name) => {
-                        registry.global(&mut ctx, name, "wl_shm", WL_SHM_VERSION);
-                    }
-                    Destroy(registry) => assert_eq!(registry.destroy(&mut ctx), Action::Forward),
-                }
-                ctx.assert_no_orphans();
-            }
-
-            assert_eq!(
-                bound_name(Singleton::Shm, &ctx),
-                case.bound,
-                "{}",
-                case.name
-            );
-            let binds = case.binds.iter().map(|bind| {
-                let request = bind_request(bind.name, "wl_shm", WL_SHM_VERSION, bind.id);
-                (bind.through.host, request)
+            let mut r = Registries::new().await;
+            let mut host = Vec::new();
+            let listings = case.listings.iter().flat_map(|&(registry, names)| {
+                names
+                    .iter()
+                    .map(move |&name| Global(registry, name, "wl_shm", 1))
             });
-            assert_eq!(
-                host_requests(&mut ctx, &[]),
-                Vec::from_iter(binds),
-                "{}",
-                case.name
-            );
-            let mut candidates = Vec::from_iter(ctx.singleton_candidates.keys().copied());
+            for step in listings.chain(case.steps.iter().copied()) {
+                r.s.guest_received();
+                host.extend(r.run(step).await);
+            }
+            r.s.guest_received();
+
+            // The first name listed is bound through its registry, then
+            // each the steps bind.
+            let (first, names) = case.listings[0];
+            let binds = [(first, names[0])]
+                .into_iter()
+                .chain(case.binds.iter().copied());
+            let expected = binds.zip(&host).map(|((registry, name), request)| {
+                let bind = bind_request(name, "wl_shm", 1, bound(request));
+                (r.of(registry).host, bind)
+            });
+            assert_eq!(host, Vec::from_iter(expected), "{}", case.name);
+            // Reads state no peer can observe: the names a later
+            // retirement could bind.
+            let mut candidates = Vec::from_iter(r.s.ctx().singleton_candidates.keys().copied());
             candidates.sort_unstable();
             assert_eq!(candidates, case.candidates, "{}", case.name);
+
+            // A new name is bound at once only if no other is.
+            r.global(A, 99, "wl_shm", 1).await;
+            r.s.guest_received();
+            let host = r.s.host_received();
+            assert_eq!(host.is_empty(), case.bound.is_some(), "{}", case.name);
+            if case.bound.is_none() {
+                let expected = bind_request(99, "wl_shm", 1, bound(&host[0]));
+                assert_eq!(host, [(r.a.host, expected)], "{}", case.name);
+            }
+            if let Some(bound) = case.bound {
+                let last = case.binds.last().map_or(names[0], |&(_, name)| name);
+                assert_eq!(last, bound, "{}", case.name);
+            }
         }
     }
 
     /// The guest global of a replacement linux-dmabuf waits, like any, for
     /// the capabilities of its own binding.
-    #[test]
-    fn a_promoted_dmabuf_publishes_its_deferred_guest_global() {
-        let mut ctx = gpu_context(&[A]);
-        ctx.synthetic_feedback_available_for_test = true;
-        let dmabuf = "zwp_linux_dmabuf_v1";
-        assert_eq!(A.global(&mut ctx, 10, dmabuf, 4), Action::Drop);
-        assert_eq!(A.global(&mut ctx, 11, dmabuf, 4), Action::Drop);
-        let replacement = ctx.global_generations[&11];
-        assert_eq!(ctx.pending_dmabuf_globals.len(), 2);
+    #[tokio::test]
+    async fn a_promoted_dmabuf_publishes_its_deferred_guest_global() {
+        let mut r = Registries::gpu(true).await;
+        let dmabuf = zwp_linux_dmabuf_v1::NAME;
+        r.global(A, 10, dmabuf, 4).await;
+        let (old, _) = dmabuf_binding(&r.s.host_received(), r.a, 10);
+        r.global(A, 11, dmabuf, 4).await;
+        assert_eq!(r.s.host_received(), []);
 
-        assert_eq!(A.remove(&mut ctx, 10), Action::Drop);
-        assert_eq!(ctx.host_dmabuf_generation, Some(replacement));
-        assert!(!ctx.host_globals.contains_key(&11));
-        assert_eq!(guest_globals(&mut ctx), []);
-        ctx.dmabuf_capabilities
-            .get_mut(&replacement)
-            .expect("the replacement's capabilities")
-            .format_modifiers
-            .push(XRGB8888_LINEAR);
-        crate::handler::linux_dmabuf::complete_capability_discovery(&mut ctx, replacement);
+        r.remove(A, 10).await;
+        let host = r.s.host_received();
+        let destroy = zwp_linux_dmabuf_v1::Request::Destroy {};
+        assert_eq!(host[0], (old, destroy.into()));
+        let (new, callback) = dmabuf_binding(&host[1..], r.a, 11);
+        assert_eq!(r.s.guest_received(), []);
 
-        assert_eq!(
-            ctx.host_globals.get(&11),
-            Some(&HostGlobal {
-                interface: dmabuf.to_string(),
-                version: 4,
-            })
-        );
-        assert!(ctx.pending_dmabuf_globals.is_empty());
-        assert_eq!(
-            guest_globals(&mut ctx),
-            [(A.guest, global_event(11, dmabuf, 4))]
-        );
+        r.s.host(capabilities(new, callback, &[XRGB8888_LINEAR]))
+            .await;
+        assert_eq!(r.s.guest_received(), [(r.a.id, global(11, dmabuf, 4))]);
     }
 
     /// libwayland-server lets a bind cross its global's removal on the
     /// wire, as when a dock flaps and the client binds the output it saw
     /// advertised in the same dispatch. Such an output becomes an inert
-    /// guest object. A name never advertised to the binding registry stays
-    /// a protocol error.
-    #[test]
-    fn bind_crossing_an_output_removal_creates_an_inert_output() {
-        let mut ctx = context(&[A, B]);
-        assert_eq!(A.global(&mut ctx, 10, "wl_output", 3), Action::Forward);
-        assert_eq!(A.remove(&mut ctx, 10), Action::Forward);
-        assert_eq!(B.global(&mut ctx, 11, "wl_seat", 5), Action::Forward);
-
-        A.bind(&mut ctx, 10, "wl_output", 3, 20);
-        assert!(!ctx.is_fatal());
-        assert_eq!(host_requests(&mut ctx, &[]), [], "nothing reaches the host");
-        assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert!(ctx
-            .shadow_table
-            .request_object(20, Iface::WlOutput)
-            .is_some());
-        assert_eq!(ctx.shadow_table.guest_object_version(20), Some(3));
-        assert!(ctx.outputs.is_empty_for_test());
-
-        B.bind(&mut ctx, 10, "wl_output", 3, 21);
+    /// guest object, of the version bound, whose release completes in the
+    /// proxy. A name never advertised to the binding registry stays a
+    /// protocol error.
+    #[tokio::test]
+    async fn bind_crossing_an_output_removal_creates_an_inert_output() {
+        let mut r = Registries::new().await;
+        r.global(A, 10, "wl_output", 3).await;
+        r.remove(A, 10).await;
+        r.global(B, 11, "wl_seat", 5).await;
         assert_eq!(
-            protocol_error(&ctx),
-            (B.guest, wl_display::ERROR_INVALID_OBJECT),
-            "name 10 is retired, and registry B never saw it"
+            r.s.guest_received(),
+            [
+                (r.a.id, global(10, "wl_output", 3)),
+                (r.a.id, global_remove(10)),
+                (r.b.id, global(11, "wl_seat", 5)),
+            ]
         );
-        assert_eq!(ctx.shadow_table.get_interface(21), None);
+
+        let output = r.bind(r.a, 10, "wl_output", 3).await;
+        assert_eq!(r.s.host_received(), [], "nothing reaches the host");
+        r.s.guest([wl_output::req::release(output)]).await;
+        assert_eq!(r.s.host_received(), []);
+        let deleted = wl_display::Event::DeleteId { id: output };
+        assert_eq!(r.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+
+        // Name 10 is retired, and registry B never saw it.
+        r.bind_fatal(r.b, 10, "wl_output", 3).await;
     }
 
     /// Registries A and B list global 7, a `wl_seat`, whose removal only
     /// registry A has seen.
-    fn a_global_removed_from_one_of_two_registries() -> Context {
-        let mut ctx = context(&[A, B]);
+    async fn a_global_removed_from_one_of_two_registries() -> Registries {
+        let mut r = Registries::new().await;
         for registry in [A, B] {
-            assert_eq!(registry.global(&mut ctx, 7, "wl_seat", 5), Action::Forward);
+            r.global(registry, 7, "wl_seat", 5).await;
         }
-        assert_eq!(A.remove(&mut ctx, 7), Action::Forward);
-        assert!(
-            ctx.host_globals.contains_key(&7),
-            "registry B has not seen the removal yet"
+        r.remove(A, 7).await;
+        assert_eq!(
+            r.s.guest_received(),
+            [
+                (r.a.id, global(7, "wl_seat", 5)),
+                (r.b.id, global(7, "wl_seat", 5)),
+                (r.a.id, global_remove(7)),
+            ]
         );
-        ctx.assert_no_orphans();
-        ctx
+        r
     }
 
     /// The removal of a global the proxy neither advertises nor binds is
-    /// on record too, and waits for every registry that lists it.
-    #[test]
-    fn the_removal_of_a_dropped_global_waits_for_every_registry() {
-        let mut ctx = context(&[A, B]);
+    /// on record too, and waits for every registry that lists it. The
+    /// session's check that no state outlives its object pins that the
+    /// proxy drops the record once no registry lists the global.
+    #[tokio::test]
+    async fn the_removal_of_a_dropped_global_waits_for_every_registry() {
+        let mut r = Registries::new().await;
         for registry in [A, B] {
-            assert_eq!(
-                registry.global(&mut ctx, 7, "zz_unknown_v1", 1),
-                Action::Drop
-            );
+            r.global(registry, 7, "zz_unknown_v1", 1).await;
         }
-        assert_eq!(A.remove(&mut ctx, 7), Action::Drop);
-        assert!(ctx.removed_global_generations.contains_key(&7));
-        ctx.assert_no_orphans();
+        r.remove(A, 7).await;
+        assert_eq!(r.s.guest_received(), []);
+        // Reads state no peer can observe: the removal of a global the
+        // proxy uses for nothing.
+        assert!(r.s.ctx().removed_global_generations.contains_key(&7));
 
-        B.destroy(&mut ctx);
-        assert!(ctx.removed_global_generations.is_empty());
-        ctx.assert_no_orphans();
+        assert_eq!(r.destroy(B).await, []);
     }
 
     /// O3: a global removed from one registry waits for every registry that
     /// still lists it. Destroying the last of those through `wl_fixes`
-    /// means it never sees the removal, so the global is retired then.
-    #[test]
-    fn destroying_the_last_registry_to_list_a_removed_global_retires_it() {
-        let mut ctx = a_global_removed_from_one_of_two_registries();
+    /// means it never sees the removal, so the global is retired then: a
+    /// registry that listed nothing can no longer bind it.
+    #[tokio::test]
+    async fn destroying_the_last_registry_to_list_a_removed_global_retires_it() {
+        let mut r = a_global_removed_from_one_of_two_registries().await;
 
-        assert_eq!(B.destroy(&mut ctx), Action::Forward);
+        assert_eq!(r.destroy(B).await, []);
 
-        assert!(!ctx.host_globals.contains_key(&7));
+        let c = r.s.new_registry().await;
+        r.bind_fatal(c, 7, "wl_seat", 5).await;
     }
 
     /// The removal stays on record when the only registry that saw it is
     /// destroyed first, so destroying the last one still retires the
     /// global.
-    #[test]
-    fn a_removal_outlives_the_registry_that_saw_it() {
-        let mut ctx = a_global_removed_from_one_of_two_registries();
+    #[tokio::test]
+    async fn a_removal_outlives_the_registry_that_saw_it() {
+        let mut r = a_global_removed_from_one_of_two_registries().await;
 
-        assert_eq!(A.destroy(&mut ctx), Action::Forward);
-        assert!(ctx.host_globals.contains_key(&7), "registry B lists it");
-        assert_eq!(B.destroy(&mut ctx), Action::Forward);
+        assert_eq!(r.destroy(A).await, []);
+        // Registry B lists it, so its bind still reaches the host.
+        r.bind_paired(r.b, 7, "wl_seat", 5).await;
+        assert_eq!(r.destroy(B).await, []);
 
-        assert!(!ctx.host_globals.contains_key(&7));
-        assert!(ctx.removed_global_generations.is_empty());
+        let c = r.s.new_registry().await;
+        r.bind_fatal(c, 7, "wl_seat", 5).await;
     }
 
     /// A registry destroyed while a global is still advertised leaves it
     /// to the other registries.
-    #[test]
-    fn destroying_a_registry_keeps_a_global_no_registry_saw_removed() {
-        let mut ctx = context(&[A]);
-        assert_eq!(A.global(&mut ctx, 7, "wl_seat", 5), Action::Forward);
+    #[tokio::test]
+    async fn destroying_a_registry_keeps_a_global_no_registry_saw_removed() {
+        let mut r = Registries::new().await;
+        r.global(A, 7, "wl_seat", 5).await;
+        r.s.guest_received();
 
-        assert_eq!(A.destroy(&mut ctx), Action::Forward);
+        assert_eq!(r.destroy(A).await, []);
 
-        assert!(ctx.host_globals.contains_key(&7));
+        // Registry B, which has listed nothing yet, may still bind it.
+        r.bind_paired(r.b, 7, "wl_seat", 5).await;
     }
 
-    #[test]
-    fn stale_remove_cannot_invalidate_a_re_advertised_global_generation() {
-        let mut ctx = context(&[A, B]);
-        assert_eq!(A.global(&mut ctx, 7, "wl_seat", 5), Action::Forward);
-        assert_eq!(B.global(&mut ctx, 7, "wl_seat", 5), Action::Forward);
+    #[tokio::test]
+    async fn stale_remove_cannot_invalidate_a_re_advertised_global_generation() {
+        let mut r = Registries::new().await;
+        r.global(A, 7, "wl_seat", 5).await;
+        r.global(B, 7, "wl_seat", 5).await;
 
         // Registry A observes removal and receives a replacement with the
         // same numeric name before registry B delivers the old remove.
-        assert_eq!(A.remove(&mut ctx, 7), Action::Forward);
-        assert_eq!(A.global(&mut ctx, 7, "wl_seat", 5), Action::Forward);
+        r.remove(A, 7).await;
+        r.global(A, 7, "wl_seat", 5).await;
 
         // B's delayed remove belongs to generation 1. It must be forwarded to
         // B, but must not retire generation 2 advertised to A.
-        assert_eq!(B.remove(&mut ctx, 7), Action::Forward);
-        assert!(
-            ctx.host_globals.contains_key(&7),
-            "an old registry remove must not invalidate the replacement"
+        r.remove(B, 7).await;
+        assert_eq!(
+            r.s.guest_received(),
+            [
+                (r.a.id, global(7, "wl_seat", 5)),
+                (r.b.id, global(7, "wl_seat", 5)),
+                (r.a.id, global_remove(7)),
+                (r.a.id, global(7, "wl_seat", 5)),
+                (r.b.id, global_remove(7)),
+            ]
         );
-        ctx.assert_no_orphans();
 
-        A.bind(&mut ctx, 7, "wl_seat", 5, 20);
-        assert!(ctx.shadow_table.get_host_id(20).is_some());
+        // An old registry remove must not invalidate the replacement.
+        r.bind_paired(r.a, 7, "wl_seat", 5).await;
     }
 
-    #[test]
-    fn re_advertised_name_replaces_visible_metadata_before_hidden_global() {
-        let mut ctx = context(&[A]);
-        let keyboard_extension = "zcr_keyboard_extension_v1";
-        assert_eq!(A.global(&mut ctx, 7, "wl_seat", 5), Action::Forward);
-        assert_eq!(A.remove(&mut ctx, 7), Action::Forward);
+    #[tokio::test]
+    async fn re_advertised_name_replaces_visible_metadata_before_hidden_global() {
+        let mut r = Registries::new().await;
+        let keyboard_extension = zcr_keyboard_extension_v1::NAME;
+        r.global(A, 7, "wl_seat", 5).await;
+        r.remove(A, 7).await;
 
         // The host reused name 7 for a hidden singleton. The old visible
         // wl_seat metadata must not survive and authorize a stale bind.
-        assert_eq!(A.global(&mut ctx, 7, keyboard_extension, 2), Action::Drop);
-        assert!(
-            !ctx.host_globals.contains_key(&7),
-            "reused name must not retain the old visible interface metadata"
-        );
+        r.global(A, 7, keyboard_extension, 2).await;
         assert_eq!(
-            bound_name(Singleton::KeyboardExtension, &ctx),
-            Some(7),
+            r.s.guest_received(),
+            [
+                (r.a.id, global(7, "wl_seat", 5)),
+                (r.a.id, global_remove(7))
+            ]
+        );
+        let host = r.s.host_received();
+        let [binding] = &host[..] else {
+            panic!("the host got {host:?}, not one bind");
+        };
+        let binding = bound(binding);
+        assert_eq!(
+            host,
+            [(r.a.host, bind_request(7, keyboard_extension, 2, binding))],
             "the replacement hidden global must own the numeric name"
         );
 
-        A.bind(&mut ctx, 7, "wl_seat", 5, 20);
-        assert_eq!(ctx.shadow_table.get_host_id(20), None);
+        r.bind_fatal(r.a, 7, "wl_seat", 5).await;
     }
 
-    #[test]
-    fn re_advertised_hidden_name_replaces_hidden_metadata_before_visible_global() {
-        let mut ctx = context(&[A]);
-        assert_eq!(
-            A.global(&mut ctx, 7, "zcr_keyboard_extension_v1", 2),
-            Action::Drop
-        );
-        assert_eq!(A.remove(&mut ctx, 7), Action::Drop);
+    #[tokio::test]
+    async fn re_advertised_hidden_name_replaces_hidden_metadata_before_visible_global() {
+        let mut r = Registries::new().await;
+        r.global(A, 7, zcr_keyboard_extension_v1::NAME, 2).await;
+        assert_eq!(r.s.host_received().len(), 1, "the proxy binds it");
+        r.remove(A, 7).await;
+        assert_eq!(r.s.guest_received(), []);
 
         // Name 7 is now a normal visible global. A stale hidden marker would
         // make its later global_remove disappear instead of reaching the guest.
-        assert_eq!(A.global(&mut ctx, 7, "wl_seat", 5), Action::Forward);
+        r.global(A, 7, "wl_seat", 5).await;
+        assert_eq!(r.s.guest_received(), [(r.a.id, global(7, "wl_seat", 5))]);
+        r.bind_paired(r.a, 7, "wl_seat", 5).await;
+        r.remove(A, 7).await;
         assert_eq!(
-            ctx.host_globals.get(&7),
-            Some(&HostGlobal {
-                interface: "wl_seat".to_string(),
-                version: 5,
-            })
-        );
-        assert_eq!(
-            A.remove(&mut ctx, 7),
-            Action::Forward,
+            r.s.guest_received(),
+            [(r.a.id, global_remove(7))],
             "the visible replacement must forward its own removal"
         );
     }
 
-    #[test]
-    fn delayed_remove_does_not_reset_replacement_internal_binding() {
-        let mut ctx = context(&[A, B]);
-        let keyboard_extension = "zcr_keyboard_extension_v1";
+    #[tokio::test]
+    async fn delayed_remove_does_not_reset_replacement_internal_binding() {
+        let mut r = Registries::new().await;
+        let keyboard_extension = zcr_keyboard_extension_v1::NAME;
         for registry in [A, B] {
-            assert_eq!(
-                registry.global(&mut ctx, 7, keyboard_extension, 2),
-                Action::Drop
-            );
+            r.global(registry, 7, keyboard_extension, 2).await;
         }
-        let old_id = ctx
-            .singletons
-            .host(Singleton::KeyboardExtension)
-            .map(HostId)
-            .expect("initial keyboard extension binding");
+        let host = r.s.host_received();
+        let [old] = &host[..] else {
+            panic!("the host got {host:?}, not one bind");
+        };
+        let old = bound(old);
 
         // Registry A sees the host generation disappear and immediately sees
         // the replacement. The old internal object is retired and a fresh
         // binding is created for the new generation.
-        assert_eq!(A.remove(&mut ctx, 7), Action::Drop);
-        assert_eq!(A.global(&mut ctx, 7, keyboard_extension, 2), Action::Drop);
-        let replacement_id = ctx
-            .singletons
-            .host(Singleton::KeyboardExtension)
-            .map(HostId)
-            .expect("replacement keyboard extension binding");
-        assert_ne!(replacement_id, old_id);
+        r.remove(A, 7).await;
+        r.global(A, 7, keyboard_extension, 2).await;
+        let host = r.s.host_received();
+        let [replacement] = &host[..] else {
+            panic!("the host got {host:?}, not one bind");
+        };
+        let replacement = bound(replacement);
+        assert_ne!(replacement, old);
         assert_eq!(
-            ctx.shadow_table.get_host_interface(replacement_id.0),
-            Some(Iface::ZcrKeyboardExtensionV1)
+            host,
+            [(
+                r.a.host,
+                bind_request(7, keyboard_extension, 2, replacement)
+            )]
         );
 
         // Registry B's queued remove belongs to generation 1. It must not
-        // tear down the generation-2 internal object that is now active.
-        assert_eq!(B.remove(&mut ctx, 7), Action::Drop);
-        assert_eq!(
-            ctx.singletons.host(Singleton::KeyboardExtension),
-            Some(replacement_id.0)
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(replacement_id.0),
-            Some(Iface::ZcrKeyboardExtensionV1)
+        // tear down the generation-2 internal object that is now active:
+        // a keyboard's first enter binds its extended keyboard from it.
+        r.remove(B, 7).await;
+        assert_eq!(r.s.host_received(), []);
+        assert_eq!(r.s.guest_received(), []);
+        let (_, keyboard) = r.s.keyboard().await;
+        let surface = r.s.surface().await;
+        r.s.host([wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap()])
+            .await;
+        assert_eq!(r.s.guest_received().len(), 2, "the enter and its modifiers");
+        let host = r.s.host_received();
+        assert!(
+            matches!(
+                &host[..],
+                [(sender, AnyRequest::ZcrKeyboardExtensionV1(
+                    zcr_keyboard_extension_v1::Request::GetExtendedKeyboard { .. }
+                ))] if *sender == replacement
+            ),
+            "the host got {host:?}, not an extended keyboard of the replacement"
         );
     }
 
-    #[test]
-    fn compositor_guest_version_and_host_bind_are_negotiated_separately() {
+    #[tokio::test]
+    async fn compositor_guest_version_and_host_bind_are_negotiated_separately() {
         let compositor = "wl_compositor";
         // A global the guest may take as the host offers it is forwarded;
         // the proxy advertises any other at the guest's version itself.
-        for (host_version, guest_version, bound_version, action) in [
-            (1, 1, 1, Action::Forward),
-            (2, 2, 2, Action::Forward),
-            (3, 4, 3, Action::Drop),
-            (4, 4, 3, Action::Forward),
-            (6, 4, 3, Action::Drop),
-        ] {
-            let mut ctx = context(&[A]);
+        for (host_version, guest_version, bound_version) in
+            [(1, 1, 1), (2, 2, 2), (3, 4, 3), (4, 4, 3), (6, 4, 3)]
+        {
+            let mut r = Registries::new().await;
+            r.global(A, 7, compositor, host_version).await;
             assert_eq!(
-                A.global(&mut ctx, 7, compositor, host_version),
-                action,
+                r.s.guest_received(),
+                [(r.a.id, global(7, compositor, guest_version))],
                 "v{host_version}"
             );
-            let advertised = (action == Action::Drop)
-                .then(|| (A.guest, global_event(7, compositor, guest_version)));
-            assert_eq!(guest_globals(&mut ctx), Vec::from_iter(advertised));
 
-            A.bind(&mut ctx, 7, compositor, guest_version, 20);
-            assert!(!ctx.is_fatal());
-            let host_id = ctx
-                .shadow_table
-                .get_host_id(20)
-                .expect("paired host object");
+            r.bind(r.a, 7, compositor, guest_version).await;
+            let host = r.s.host_received();
+            let [binding] = &host[..] else {
+                panic!("the host got {host:?}, not one bind");
+            };
+            let binding = bound(binding);
             assert_eq!(
-                ctx.shadow_table.guest_object_version(20),
-                Some(guest_version)
-            );
-            assert_eq!(
-                ctx.shadow_table.host_object_version(host_id),
-                Some(bound_version)
-            );
-            assert_eq!(
-                host_requests(&mut ctx, &[]),
-                [(A.host, bind_request(7, compositor, bound_version, host_id))]
+                host,
+                [(
+                    r.a.host,
+                    bind_request(7, compositor, bound_version, binding)
+                )],
+                "v{host_version}"
             );
 
-            A.bind(&mut ctx, 7, compositor, guest_version + 1, 21);
-            assert_eq!(
-                protocol_error(&ctx),
-                (A.guest, wl_display::ERROR_INVALID_OBJECT)
-            );
-            assert_eq!(ctx.shadow_table.get_host_id(21), None);
-            assert_eq!(host_requests(&mut ctx, &[]), []);
+            r.bind_fatal(r.a, 7, compositor, guest_version + 1).await;
         }
     }
 
@@ -3120,9 +3332,8 @@ mod tests {
         assert_eq!(offered("wl_seat", u32::MAX), super::WL_SEAT_VERSION);
     }
 
-    #[test]
-    fn ordinary_globals_are_capped_to_supported_versions() {
-        let mut ctx = context(&[A]);
+    #[tokio::test]
+    async fn ordinary_globals_are_capped_to_supported_versions() {
         for (interface, host_version, offered) in [
             ("wl_compositor", 6, 4),
             ("wl_compositor", 3, 4),
@@ -3140,22 +3351,17 @@ mod tests {
             );
         }
 
+        let mut r = Registries::new().await;
+        r.global(A, 9, "zxdg_output_manager_v1", 3).await;
+        r.global(A, 10, "wl_seat", 10).await;
         assert_eq!(
-            A.global(&mut ctx, 9, "zxdg_output_manager_v1", 3),
-            Action::Forward
-        );
-        assert_eq!(A.global(&mut ctx, 10, "wl_seat", 10), Action::Drop);
-        assert_eq!(
-            ctx.host_globals.get(&10),
-            Some(&HostGlobal {
-                interface: "wl_seat".to_string(),
-                version: 5
-            })
-        );
-        assert_eq!(
-            guest_globals(&mut ctx),
-            [(A.guest, global_event(10, "wl_seat", 5))],
+            r.s.guest_received(),
+            [
+                (r.a.id, global(9, "zxdg_output_manager_v1", 3)),
+                (r.a.id, global(10, "wl_seat", 5)),
+            ],
             "the guest must receive the capped version"
         );
+        r.bind_paired(r.a, 10, "wl_seat", 5).await;
     }
 }

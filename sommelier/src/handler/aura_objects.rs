@@ -250,120 +250,254 @@ pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_support::queued_headers;
+    use crate::placement_config::PlacementConfig;
+    use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
+    use crate::protocols::gtk::gtk_shell1;
+    use crate::protocols::wayland::{wl_output, wl_registry, wl_surface};
+    use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
+    use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::proxy::harness::{GtkShell, Object, Session};
+    use crate::state::Context;
 
-    const SHELL_HOST: u32 = 0xff00_0001;
-    const PARENT_HOST: u32 = 0xff00_0002;
-    /// Each child with the opcodes of its `zaura_shell` request and its
-    /// destructor.
-    const ALL: [(AuraChild, u16, u16); 3] = [
-        (
-            AuraChild::SURFACE,
-            zaura_shell::REQ_GET_AURA_SURFACE,
-            zaura_surface::REQ_RELEASE,
-        ),
-        (
-            AuraChild::TOPLEVEL,
-            zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
-            zaura_toplevel::REQ_RELEASE,
-        ),
-        (
-            AuraChild::OUTPUT,
-            zaura_shell::REQ_GET_AURA_OUTPUT,
-            zaura_output::REQ_RELEASE,
-        ),
-    ];
+    /// A kind of object the proxy gives a host Aura child.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        /// A `wl_surface` GTK wraps: its `zaura_surface`.
+        Surface,
+        /// An `xdg_toplevel` under placement: its `zaura_toplevel`.
+        Toplevel,
+        /// A `wl_output` under placement: its `zaura_output`.
+        Output,
+    }
+    const KINDS: [Kind; 3] = [Kind::Surface, Kind::Toplevel, Kind::Output];
 
-    fn ctx_with_shell(version: u32) -> Context {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.singletons
-            .bind_for_test(Singleton::AuraShell, SHELL_HOST);
-        ctx.singletons
-            .set_version_for_test(Singleton::AuraShell, version);
-        ctx
+    /// A session under placement whose proxy bound `zaura_shell`, and whose
+    /// guest has what it needs to create each kind of parent.
+    struct Aura {
+        s: Session,
+        registry: Object,
+        gtk: GtkShell,
+        wm_base: u32,
+        /// A `wl_output` global.
+        output: u32,
     }
 
-    #[test]
-    fn create_queues_the_shell_request_with_the_shell_version() {
-        // The oldest shell that can create every child.
-        let version = zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE;
-        for (child, get_opcode, _) in ALL {
-            let mut ctx = ctx_with_shell(version);
-            let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
+    impl Aura {
+        /// The proxy binds `zaura_shell` at `version`.
+        async fn new(version: u32) -> Self {
+            let placement = PlacementConfig::active_for_test(&[]);
+            let mut s = Session::with_context(Context::with_placement_for_test(placement));
+            let registry = s.registry().await;
+            let gtk = s.gtk_shell(version).await;
+            let wm_base = s.bind(xdg_wm_base::NAME, xdg_wm_base::VERSION).await;
+            let output = s.advertise(wl_output::NAME, 3).await;
+            s.guest_received();
+            Self {
+                s,
+                registry,
+                gtk,
+                wm_base,
+                output,
+            }
+        }
+
+        /// The guest creates a parent of `kind`, which the proxy gives an
+        /// Aura child: the host gets the shell's request for it with the
+        /// parent's own forward. Returns the parent and the child.
+        async fn create(&mut self, kind: Kind) -> (Object, u32) {
+            let shell = self.gtk.shell;
+            match kind {
+                Kind::Surface => {
+                    let surface = self.s.surface().await;
+                    let gtk_surface = self.s.new_id();
+                    self.s
+                        .guest([gtk_shell1::req::get_gtk_surface(
+                            self.gtk.id,
+                            gtk_surface,
+                            surface.id,
+                        )])
+                        .await;
+                    let host = self.s.host_received();
+                    let [(
+                        _,
+                        AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { id, .. }),
+                    ), _] = host[..]
+                    else {
+                        panic!("the surface got no Aura surface: {host:?}");
+                    };
+                    let get = zaura_shell::Request::GetAuraSurface {
+                        id,
+                        surface: surface.host,
+                    };
+                    let startup_id = zaura_surface::Request::SetStartupId { startup_id: None };
+                    assert_eq!(host, [(shell, get.into()), (id, startup_id.into())]);
+                    (surface, id)
+                }
+                Kind::Toplevel => {
+                    let surface = self.s.surface().await;
+                    let xdg = self.s.new_id();
+                    let get_xdg_surface =
+                        xdg_wm_base::req::get_xdg_surface(self.wm_base, xdg, surface.id);
+                    let xdg_host = self.s.create(get_xdg_surface).await;
+                    let id = self.s.new_id();
+                    self.s
+                        .guest([xdg_surface::req::get_toplevel(xdg, id)])
+                        .await;
+                    let host = self.s.host_received();
+                    let [(
+                        _,
+                        AnyRequest::XdgSurface(xdg_surface::Request::GetToplevel { id: toplevel }),
+                    ), (
+                        _,
+                        AnyRequest::ZauraShell(
+                            zaura_shell::Request::GetAuraToplevelForXdgToplevel {
+                                id: aura, ..
+                            },
+                        ),
+                    ), _] = host[..]
+                    else {
+                        panic!("the toplevel got no Aura toplevel: {host:?}");
+                    };
+                    let get =
+                        zaura_shell::Request::GetAuraToplevelForXdgToplevel { id: aura, toplevel };
+                    let screen = zaura_toplevel::Request::SetSupportsScreenCoordinates {};
+                    assert_eq!(
+                        host,
+                        [
+                            (
+                                xdg_host,
+                                xdg_surface::Request::GetToplevel { id: toplevel }.into()
+                            ),
+                            (shell, get.into()),
+                            (aura, screen.into()),
+                        ]
+                    );
+                    (Object { id, host: toplevel }, aura)
+                }
+                Kind::Output => self.bind_output(self.output).await,
+            }
+        }
+
+        /// The guest binds `wl_output` global `name` at v3, which the proxy
+        /// gives an Aura output; returns the output and its Aura output.
+        async fn bind_output(&mut self, name: u32) -> (Object, u32) {
+            let guest = self.s.new_id();
+            let bind = wl_registry::req::bind(self.registry.id, name, wl_output::NAME, 3, guest);
+            self.s.guest([bind.unwrap()]).await;
+            let host = self.s.host_received();
+            let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { ref id, .. })), (_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraOutput { id: aura, .. }))] =
+                host[..]
+            else {
+                panic!("the output got no Aura output: {host:?}");
+            };
+            let output = id.2;
+            let get = zaura_shell::Request::GetAuraOutput { id: aura, output };
+            assert_eq!(host[1], (self.gtk.shell, get.into()));
+            (
+                Object {
+                    id: guest,
+                    host: output,
+                },
+                aura,
+            )
+        }
+
+        /// The guest ends `parent`, of `kind`, which ends its Aura child
+        /// `child`: the host gets the child's release if `released`, then
+        /// the parent's destructor.
+        async fn end(&mut self, kind: Kind, parent: Object, child: u32, released: bool) {
+            let (request, destructor, release): (_, AnyRequest, AnyRequest) = match kind {
+                Kind::Surface => (
+                    wl_surface::req::destroy(parent.id),
+                    wl_surface::Request::Destroy {}.into(),
+                    zaura_surface::Request::Release {}.into(),
+                ),
+                Kind::Toplevel => (
+                    xdg_toplevel::req::destroy(parent.id),
+                    xdg_toplevel::Request::Destroy {}.into(),
+                    zaura_toplevel::Request::Release {}.into(),
+                ),
+                Kind::Output => (
+                    wl_output::req::release(parent.id),
+                    wl_output::Request::Release {}.into(),
+                    zaura_output::Request::Release {}.into(),
+                ),
+            };
+            self.s.guest([request]).await;
+            let release = released.then_some((child, release));
             assert_eq!(
-                queued_headers(&ctx.client_to_host_queue),
-                vec![(SHELL_HOST, get_opcode)]
+                self.s.host_received(),
+                Vec::from_iter(release.into_iter().chain([(parent.host, destructor)])),
+                "{kind:?}"
             );
-            assert_eq!(
-                ctx.client_to_host_queue[0].0[8..16],
-                [id.to_ne_bytes(), PARENT_HOST.to_ne_bytes()].concat()
-            );
-            assert_eq!(
-                ctx.shadow_table.get_host_interface(id),
-                Some(child.interface)
-            );
-            assert_eq!(live_child_version(&ctx, child, id), Some(version));
+            assert_eq!(self.s.guest_received(), [], "{kind:?}");
         }
     }
 
-    #[test]
-    fn create_needs_a_bound_shell() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        assert_eq!(create(&mut ctx, AuraChild::SURFACE, PARENT_HOST), None);
-        assert!(ctx.client_to_host_queue.is_empty());
-    }
-
-    #[test]
-    fn release_follows_each_childs_release_version() {
-        for (child, _, release_opcode) in ALL {
-            let since = child.release_since;
-            let mut ctx = ctx_with_shell(since);
-            let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
-            ctx.client_to_host_queue.clear();
-            release(&mut ctx, child, id);
-            assert_eq!(
-                queued_headers(&ctx.client_to_host_queue),
-                vec![(id, release_opcode)]
-            );
-            assert!(ctx.shadow_table.is_retired_host(id));
-
-            let mut ctx = ctx_with_shell(since - 1);
-            let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
-            ctx.client_to_host_queue.clear();
-            release(&mut ctx, child, id);
-            assert!(
-                ctx.client_to_host_queue.is_empty(),
-                "{child:?} has no destructor"
-            );
-            assert_eq!(ctx.shadow_table.get_host_interface(id), None);
-            assert!(ctx.shadow_table.is_retired_host(id));
-            assert!(!ctx.shadow_table.is_host_id_available(id));
+    /// The proxy creates each Aura child from its `zaura_shell`, extending
+    /// the child's parent, here under the oldest shell it creates every
+    /// child from: placement's.
+    #[tokio::test]
+    async fn create_queues_the_shell_request_with_the_shell_version() {
+        let version = zaura_output::EVT_INSETS_SINCE;
+        let mut a = Aura::new(version).await;
+        for kind in KINDS {
+            a.create(kind).await;
         }
     }
 
-    #[test]
-    fn only_a_live_output_without_one_gets_an_aura_output() {
-        let mut ctx = ctx_with_shell(crate::protocols::aura_shell::zaura_shell::VERSION);
-        ctx.outputs
-            .bind_for_test(PARENT_HOST, crate::state::OutputState::default());
-        ensure_zaura_output(&mut ctx, PARENT_HOST);
-        let aura_output = ctx.outputs.aura_output(PARENT_HOST).expect("Aura output");
-        ensure_zaura_output(&mut ctx, PARENT_HOST);
-        assert_eq!(ctx.client_to_host_queue.len(), 1, "an output gets one");
-        assert_eq!(ctx.outputs.aura_output(PARENT_HOST), Some(aura_output));
+    /// A child takes its shell's version, so it is released with its
+    /// parent only from the version its destructor has on.
+    #[tokio::test]
+    async fn release_follows_each_childs_release_version() {
+        for (version, released) in [(38, true), (37, false)] {
+            assert_eq!(zaura_surface::REQ_RELEASE_SINCE, 38);
+            assert_eq!(zaura_toplevel::REQ_RELEASE_SINCE, 38);
+            assert_eq!(zaura_output::REQ_RELEASE_SINCE, 38);
+            let mut a = Aura::new(version).await;
+            for kind in KINDS {
+                let (parent, child) = a.create(kind).await;
+                a.end(kind, parent, child, released).await;
+            }
+        }
+    }
 
-        let removed = PARENT_HOST + 1;
-        ctx.outputs
-            .bind_for_test(removed, crate::state::OutputState::default());
-        let removed_aura_outputs = ctx.outputs.remove_global(crate::state::GlobalBinding {
-            name: removed,
-            generation: 1,
+    /// An output gets one Aura output, which a new shell binding keeps,
+    /// and an output whose global the host removed gets none.
+    #[tokio::test]
+    async fn only_a_live_output_without_one_gets_an_aura_output() {
+        let mut a = Aura::new(zaura_shell::VERSION).await;
+        a.create(Kind::Output).await;
+        let removed = a.s.advertise(wl_output::NAME, 3).await;
+        a.s.guest_received();
+        let (_, removed_aura_output) = a.bind_output(removed).await;
+        let registry = a.registry;
+        a.s.global_remove(registry, removed).await;
+        let release = zaura_output::Request::Release {};
+        assert_eq!(a.s.host_received(), [(removed_aura_output, release.into())]);
+
+        // The shell retires, and the host advertises a new one.
+        a.s.global_remove(registry, a.gtk.name).await;
+        let release = zaura_shell::Request::Release {};
+        assert_eq!(a.s.host_received(), [(a.gtk.shell, release.into())]);
+        let removals = [removed, a.gtk.name].map(|name| {
+            let removal: AnyEvent = wl_registry::Event::GlobalRemove { name }.into();
+            (registry.id, removal)
         });
-        assert!(removed_aura_outputs.is_empty());
-        ctx.client_to_host_queue.clear();
-        ensure_zaura_output(&mut ctx, removed);
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(ctx.outputs.aura_output(removed), None);
+        assert_eq!(a.s.guest_received(), removals);
+        a.s.global(registry, 99, zaura_shell::NAME, zaura_shell::VERSION)
+            .await;
+        a.s.guest_received();
+        let host = a.s.host_received();
+        assert!(
+            matches!(
+                &host[..],
+                [(
+                    _,
+                    AnyRequest::WlRegistry(wl_registry::Request::Bind { name: 99, .. })
+                )]
+            ),
+            "the host got {host:?}, not the new shell's bind alone"
+        );
     }
 }

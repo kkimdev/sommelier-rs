@@ -574,12 +574,6 @@ impl Context {
         self.session_end.is_some()
     }
 
-    /// Forget a session end, so a test can go on with the same context.
-    #[cfg(test)]
-    pub(crate) fn clear_session_end_for_test(&mut self) {
-        self.session_end = None;
-    }
-
     /// Bind host object `id` as the internal `zaura_shell` at the vendored
     /// protocol's version, as the registry would.
     #[cfg(test)]
@@ -646,19 +640,6 @@ impl Context {
     /// Whether any buffer the guest destroyed waits to be retired.
     pub(crate) fn has_guest_destroyed_buffers(&self) -> bool {
         self.render_buffers.has_guest_destroyed()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn render_buffer_lifecycle_for_host(
-        &self,
-        host_id: HostId,
-    ) -> Option<RenderBufferLifecycle> {
-        self.render_buffers.lifecycle(host_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_render_buffer_host(&self, host_id: HostId) -> bool {
-        self.render_buffers.contains(host_id)
     }
 
     #[cfg(test)]
@@ -1016,22 +997,6 @@ impl Context {
         self.window_placement.as_ref()?.rect(binding)
     }
 
-    /// Who owns `key` of host keyboard `keyboard` under its state now
-    /// ([`crate::keys::KeyboardCore::classify`]).
-    #[cfg(test)]
-    pub(crate) fn classify_key_for_test(
-        &self,
-        keyboard: HostId,
-        key: u32,
-    ) -> crate::keys::KeyClass {
-        let env = crate::handler::keyboard::CtxEnv::new(
-            &self.keyboard_focus,
-            self.window_placement.as_ref(),
-            &self.ime,
-        );
-        self.keys.classify(keyboard, key, &env)
-    }
-
     /// Where the placement bound to `chord` puts the focused window.
     #[cfg(test)]
     pub(crate) fn placement_rect_for(
@@ -1161,8 +1126,8 @@ mod tests {
         guest.set_nonblocking(true).unwrap();
         let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
 
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.clipboard_pumps.slot().unwrap().start(async move {
+        let mut pumps = ClipboardPumps::default();
+        pumps.slot().unwrap().start(async move {
             let pump = crate::handler::data_device::pump(src.into(), dst.into());
             pump.await.expect("the pump runs until it is stopped");
         });
@@ -1173,7 +1138,7 @@ mod tests {
         guest.read_exact(&mut first).await.unwrap();
         assert_eq!(&first, b"first");
 
-        ctx.clipboard_pumps.stop().await;
+        pumps.stop().await;
 
         assert!(!pump_ends.into_iter().any(any_fd_has_identity));
         assert_eq!(
@@ -1187,25 +1152,22 @@ mod tests {
     /// finishes makes room for another.
     #[tokio::test]
     async fn clipboard_pumps_are_capped_per_connection() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut pumps = ClipboardPumps::default();
         let mut releases = Vec::new();
         for _ in 0..MAX_CLIPBOARD_PUMPS {
             let (release, released) = tokio::sync::oneshot::channel::<()>();
-            let slot = ctx.clipboard_pumps.slot().expect("room under the cap");
+            let slot = pumps.slot().expect("room under the cap");
             slot.start(async {
                 let _ = released.await;
             });
             releases.push(release);
         }
-        assert!(
-            ctx.clipboard_pumps.slot().is_none(),
-            "no pump beyond the cap"
-        );
+        assert!(pumps.slot().is_none(), "no pump beyond the cap");
 
         drop(releases.pop());
         // Every ready task runs before this one resumes.
         tokio::task::yield_now().await;
-        assert!(ctx.clipboard_pumps.slot().is_some());
+        assert!(pumps.slot().is_some());
     }
 
     #[test]

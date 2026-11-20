@@ -120,13 +120,4 @@ impl Keyboards {
     pub(crate) fn keymap_for_test(&self, host: HostId) -> Option<&Keymap> {
         self.get(host).and_then(|keyboard| keyboard.keymap.as_ref())
     }
-
-    /// The extended keyboard of host keyboard `host`, once bound.
-    pub(crate) fn extended_for_test(&self, host: HostId) -> Option<HostId> {
-        self.get(host).and_then(|keyboard| keyboard.extended)
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }

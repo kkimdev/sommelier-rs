@@ -44,14 +44,11 @@ impl wl_seat::WlSeatHandler for Handlers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::GuestKeyOwner;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-    use crate::protocols::wayland::wl_keyboard::{self, WlKeyboardHandler};
-    use crate::protocols::wayland::wl_seat::WlSeatHandler;
+    use crate::protocols::wayland::wl_keyboard;
     use crate::protocols::wayland::{wl_compositor, wl_display};
     use crate::proxy::harness::{Object, Session, TextInput};
-    use crate::state::{Context, HostId};
     use crate::wire::WL_DISPLAY_ID;
 
     /// A guest seat, a keyboard of it whose focus the host gives to a
@@ -66,7 +63,11 @@ mod tests {
 
     impl Focused {
         async fn new() -> Self {
-            let mut s = Session::new();
+            Self::with(Session::new()).await
+        }
+
+        /// [`Self::new`] in `s`.
+        async fn with(mut s: Session) -> Self {
             let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
             let keyboard = s.keyboard_of(seat.id).await;
             let surface = s.surface().await;
@@ -130,42 +131,93 @@ mod tests {
         }
     }
 
-    #[test]
-    fn release_keeps_child_keyboard_routing_state() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let guest_seat = 10;
-        let guest_keyboard = 20;
-        let host_keyboard = 30;
-        ctx.shadow_table
-            .insert_paired_for_test(guest_seat, 11, "wl_seat");
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-        crate::handler::keyboard::for_test::created(
-            &mut ctx,
-            guest_keyboard,
-            host_keyboard,
-            guest_seat,
+    /// The seat's release leaves its keyboard's routing and key state
+    /// alone: a key the extended keyboard peeked and the keyboard pressed
+    /// before the release is released to the guest after it, and the
+    /// keyboard's focus, which the seat's text input shares, still ends
+    /// with a `leave` for both.
+    #[tokio::test]
+    async fn release_keeps_child_keyboard_routing_state() {
+        use crate::protocols::keyboard_extension_unstable_v1::{
+            zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
+        };
+        use crate::protocols::wayland::wl_registry;
+        use crate::protocols::AnyRequest;
+        use zcr_extended_keyboard_v1::HANDLED_STATE_HANDLED as HANDLED;
+        let mut s = Session::new();
+        // The proxy binds the keyboard extension for itself, and gives the
+        // keyboard an extended keyboard at its first enter.
+        s.advertise(
+            zcr_keyboard_extension_v1::NAME,
+            zcr_keyboard_extension_v1::VERSION,
+        )
+        .await;
+        let bind = s.host_received();
+        assert!(
+            matches!(
+                &bind[..],
+                [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { .. }))]
+            ),
+            "{bind:?}"
         );
-        crate::handler::keyboard::for_test::extended(&mut ctx, host_keyboard, 31);
-        ctx.keyboard_focus
-            .set_for_test(HostId(host_keyboard), guest_seat, 40, 41);
-        crate::handler::keyboard::for_test::peek(&mut ctx, 31, 1, 14, 1);
-        ctx.last_sender_id = guest_seat;
+        let mut f = Focused::with(s).await;
+        let host = f.s.host_received();
+        let [(
+            _,
+            AnyRequest::ZcrKeyboardExtensionV1(
+                zcr_keyboard_extension_v1::Request::GetExtendedKeyboard {
+                    id: extended,
+                    keyboard,
+                },
+            ),
+        )] = host[..]
+        else {
+            panic!("the keyboard got no extended keyboard: {host:?}");
+        };
+        assert_eq!(keyboard, f.keyboard.host);
+        let backspace = 14;
+        let key = |serial, state| {
+            let key = wl_keyboard::Event::Key {
+                serial,
+                time: serial,
+                key: backspace,
+                state,
+            };
+            (f.keyboard.id, key.into())
+        };
+        let ack = |serial| {
+            let ack = zcr_extended_keyboard_v1::Request::AckKey {
+                serial,
+                handled: HANDLED,
+            };
+            (extended, ack.into())
+        };
+        let pressed = wl_keyboard::KEY_STATE_PRESSED;
+        f.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(extended, 3, 3, backspace, pressed),
+            wl_keyboard::evt::key(f.keyboard.host, 3, 3, backspace, pressed),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), [key(3, pressed)]);
+        assert_eq!(f.s.host_received(), [ack(3)]);
 
+        f.s.guest([wl_seat::req::release(f.seat.id)]).await;
         assert_eq!(
-            <Handlers as WlSeatHandler>::on_release(&mut ctx),
-            Action::Forward
+            f.s.host_received(),
+            [(f.seat.host, wl_seat::Request::Release {}.into())]
         );
-        assert_eq!(ctx.keyboard_focus.surface_for_seat(guest_seat), Some(40));
-        assert_eq!(
-            ctx.keys.keyboards().seat(HostId(host_keyboard)),
-            Some(guest_seat)
-        );
-        assert!(ctx
-            .keyboard_focus
-            .focus_for_keyboard(HostId(host_keyboard))
-            .is_some());
-        assert!(ctx.keys.held(HostId(host_keyboard), 14));
+        assert_eq!(f.s.guest_received(), []);
+
+        let released = wl_keyboard::KEY_STATE_RELEASED;
+        f.s.host([
+            zcr_extended_keyboard_v1::evt::peek_key(extended, 4, 4, backspace, released),
+            wl_keyboard::evt::key(f.keyboard.host, 4, 4, backspace, released),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), [key(4, released)]);
+        assert_eq!(f.s.host_received(), [ack(4)]);
+        f.keyboard_leave().await;
+        assert_eq!(f.s.host_received(), []);
     }
 
     #[tokio::test]
@@ -236,69 +288,51 @@ mod tests {
         assert_eq!(f.s.host_received(), []);
     }
 
-    #[test]
-    fn seat_release_does_not_break_live_child_keyboard_press_release_pair() {
+    #[tokio::test]
+    async fn seat_release_does_not_break_live_child_keyboard_press_release_pair() {
         // wl_seat.release destroys only the seat proxy. ChromiumOS' C
         // implementation does not destroy already-created wl_keyboard
         // children from sl_host_seat_removed(), so a child can still receive
         // the release matching a press that arrived before the parent seat
         // was released.
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let guest_seat = 10;
-        let host_seat = 11;
-        let guest_keyboard = 20;
-        let host_keyboard = 30;
+        let mut s = Session::new();
+        let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+        let keyboard = s.keyboard_of(seat.id).await;
         let key = 30;
-
-        ctx.shadow_table
-            .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-        crate::handler::keyboard::for_test::created(
-            &mut ctx,
-            guest_keyboard,
-            host_keyboard,
-            guest_seat,
-        );
+        let event = |serial, state| {
+            let event = wl_keyboard::Event::Key {
+                serial,
+                time: 100 + serial,
+                key,
+                state,
+            };
+            (keyboard.id, event.into())
+        };
 
         // The child press was forwarded while the seat was live. Its release
         // must remain paired even if the parent seat is released first.
-        ctx.last_sender_id = host_keyboard;
-        assert_eq!(
-            <Handlers as WlKeyboardHandler>::on_key(
-                &mut ctx,
-                1,
-                100,
-                key,
-                wl_keyboard::KEY_STATE_PRESSED,
-            ),
-            Action::Forward
-        );
-        assert_eq!(
-            ctx.keys.owner(HostId(host_keyboard), key),
-            Some(GuestKeyOwner::Physical)
-        );
+        let pressed = wl_keyboard::KEY_STATE_PRESSED;
+        s.host([wl_keyboard::evt::key(keyboard.host, 1, 101, key, pressed)])
+            .await;
+        assert_eq!(s.guest_received(), [event(1, pressed)]);
 
         // Release the parent seat without releasing its child keyboard.
-        ctx.last_sender_id = guest_seat;
+        s.guest([wl_seat::req::release(seat.id)]).await;
         assert_eq!(
-            <Handlers as WlSeatHandler>::on_release(&mut ctx),
-            Action::Forward
+            s.host_received(),
+            [(seat.host, wl_seat::Request::Release {}.into())]
         );
 
         // This is the behavior observed in ChromiumOS' proxy: the child
         // keyboard remains live and its matching release reaches the guest.
-        ctx.last_sender_id = host_keyboard;
+        let released = wl_keyboard::KEY_STATE_RELEASED;
+        s.host([wl_keyboard::evt::key(keyboard.host, 2, 102, key, released)])
+            .await;
         assert_eq!(
-            <Handlers as WlKeyboardHandler>::on_key(
-                &mut ctx,
-                2,
-                101,
-                key,
-                wl_keyboard::KEY_STATE_RELEASED,
-            ),
-            Action::Forward,
+            s.guest_received(),
+            [event(2, released)],
             "a live child keyboard must forward the release after seat release"
         );
+        assert_eq!(s.host_received(), []);
     }
 }

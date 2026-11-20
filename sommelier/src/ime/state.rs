@@ -541,10 +541,6 @@ impl TextInput {
         }
     }
 
-    pub(crate) fn set_link_for_test(&mut self, link: LinkState) {
-        self.link = link;
-    }
-
     /// Attach the host text input with the content type the field calls
     /// for, as the reconcile of the guest commit that set its state would.
     pub(crate) fn attach_for_test(&mut self, env: &impl Env) {
@@ -576,16 +572,6 @@ impl TextInput {
 
     pub(crate) fn pieces_for_test(&self) -> &V1Pieces {
         &self.pieces
-    }
-
-    /// Record `pieces` for Exo's next edit.
-    pub(crate) fn set_pieces_for_test(&mut self, pieces: V1Pieces) {
-        self.pieces = pieces;
-    }
-
-    /// Take `other`'s view of Exo's text.
-    pub(crate) fn copy_exo_for_test(&mut self, other: &Self) {
-        self.exo = other.exo.clone();
     }
 
     /// Whether it warned of a missing seat.

@@ -178,17 +178,19 @@ pub(super) fn wl_shm_format_to_drm_format(format: u32) -> u32 {
 mod tests {
     use super::{
         clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, format_bytes_per_pixel,
-        guest_shm_format_available, host_reported_shm_format, is_supported_drm_format,
-        record_host_shm_drm_format, record_host_shm_wl_format, register_guest_shm,
-        shm_format_from_drm, wl_shm_format_to_drm_format, SUPPORTED_SHM_FORMATS,
+        host_reported_shm_format, is_supported_drm_format, record_host_shm_drm_format,
+        record_host_shm_wl_format, register_guest_shm, shm_format_from_drm,
+        wl_shm_format_to_drm_format, SUPPORTED_SHM_FORMATS,
     };
+    use crate::handler::test_support::{bind_shm, shm_global, GUEST_SHM_VERSION};
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
-    use crate::protocols::wayland::{wl_registry, wl_shm};
-    use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::protocols::wayland::{wl_registry, wl_shm, wl_shm_pool};
+    use crate::protocols::AnyEvent;
     use crate::proxy::harness::Session;
     use crate::state::Context;
-    use crate::test_support::decoded;
-    use crate::wire::Action;
+    use crate::test_support::{decoded, shm_pool_file};
+
+    const RGB565: u32 = wl_shm::FORMAT_RGB565;
 
     /// Every advertised format has a size, so a buffer in it is never refused
     /// for want of a bytes-per-pixel.
@@ -226,44 +228,64 @@ mod tests {
         }
     }
 
-    #[test]
-    fn synthetic_shm_advertises_mandatory_formats_until_host_capabilities_arrive() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        register_guest_shm(&mut ctx, 20, 10);
-
-        assert_eq!(
-            decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
-            [
-                (20, wl_shm::Event::Format { format: 0 }),
-                (20, wl_shm::Event::Format { format: 1 })
-            ]
-        );
-        assert!(guest_shm_format_available(&ctx, 0));
-        assert!(guest_shm_format_available(&ctx, 1));
-        assert!(!guest_shm_format_available(&ctx, 0x3631_4752));
+    /// The guest creates a 1x1 `format` buffer from a new pool of `shm`;
+    /// returns the pool and the buffer's request.
+    async fn buffer_request(
+        s: &mut Session,
+        shm: u32,
+        format: u32,
+    ) -> (u32, crate::wire::Outgoing) {
+        let pool = s.shm_pool(shm, shm_pool_file(&[0; 4096])).await;
+        let buffer = s.new_id();
+        let request = wl_shm_pool::req::create_buffer(pool, buffer, 0, 1, 1, 4, format);
+        (pool, request)
     }
 
-    #[test]
-    fn host_optional_shm_format_is_sent_once_to_existing_guest_bindings() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        register_guest_shm(&mut ctx, 20, 10);
-        ctx.host_to_client_queue.clear();
+    /// A guest `wl_shm` offers the two mandatory formats at once, and no
+    /// optional one before the host reports it: a buffer in one is an
+    /// invalid format.
+    #[tokio::test]
+    async fn synthetic_shm_advertises_mandatory_formats_until_host_capabilities_arrive() {
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        let (name, _) = shm_global(&mut s).await;
+        let shm = bind_shm(&mut s, registry.id, name).await;
 
-        record_host_shm_wl_format(&mut ctx, 0x3631_4752);
-        record_host_shm_wl_format(&mut ctx, 0x3631_4752);
-
+        let (pool, request) = buffer_request(&mut s, shm, RGB565).await;
+        s.guest_fatal([request]).await;
         assert_eq!(
-            decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
-            [(
-                20,
-                wl_shm::Event::Format {
-                    format: 0x3631_4752
-                }
-            )]
+            s.guest_received_and_error(),
+            (vec![], (pool, wl_shm::ERROR_INVALID_FORMAT))
         );
-        assert!(guest_shm_format_available(&ctx, 0x3631_4752));
+        assert_eq!(s.host_received(), []);
     }
 
+    /// An optional format the host reports reaches a guest `wl_shm` once,
+    /// however often the host reports it, and the guest may then use it.
+    #[tokio::test]
+    async fn host_optional_shm_format_is_sent_once_to_existing_guest_bindings() {
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        let (name, host_shm) = shm_global(&mut s).await;
+        let shm = bind_shm(&mut s, registry.id, name).await;
+
+        s.host([
+            wl_shm::evt::format(host_shm, RGB565),
+            wl_shm::evt::format(host_shm, RGB565),
+        ])
+        .await;
+        assert_eq!(
+            s.guest_received(),
+            [(shm, wl_shm::Event::Format { format: RGB565 }.into())]
+        );
+        let (_, request) = buffer_request(&mut s, shm, RGB565).await;
+        s.guest([request]).await;
+        assert_eq!(s.guest_received(), []);
+        s.host_received();
+    }
+
+    /// Kept a unit test: the host's linux-dmabuf is a format source of the
+    /// guest's `wl_shm` only with a VirtWL channel, which no session has.
     #[test]
     fn source_separated_host_formats_survive_single_source_removal() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
@@ -304,6 +326,9 @@ mod tests {
         );
     }
 
+    /// Kept a unit test, as
+    /// [`source_separated_host_formats_survive_single_source_removal`]: a
+    /// DRM code the host's linux-dmabuf reports counts only with VirtWL.
     #[test]
     fn drm_fourcc_capability_maps_to_wayland_shm_format() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
@@ -315,22 +340,6 @@ mod tests {
         assert!(!host_reported_shm_format(&ctx, 0xdead_beef));
     }
 
-    /// The host object the proxy binds for itself when the host advertises
-    /// `interface`, learned from the bind among what the host received.
-    fn internal_bind(received: &[(u32, AnyRequest)], interface: &str) -> u32 {
-        received
-            .iter()
-            .find_map(|(_, request)| match request {
-                AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. })
-                    if id.0 == interface =>
-                {
-                    Some(id.2)
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("the proxy did not bind {interface}: {received:?}"))
-    }
-
     /// Without VirtWL every guest SHM buffer reaches the host's wl_shm, so
     /// the guest's wl_shm offers an optional format only once the host's
     /// wl_shm lists it, even if the host's linux-dmabuf takes it.
@@ -338,29 +347,11 @@ mod tests {
     async fn without_virtwl_guest_shm_offers_only_the_host_wl_shm_formats() {
         let mut s = Session::with_context(Context::new_for_test(true, false, vec![]));
         let registry = s.registry().await;
-        let shm_name = s.advertise("wl_shm", wl_shm::VERSION).await;
-        let host_shm = internal_bind(&s.host_received(), "wl_shm");
-        let advertised = s.guest_received();
-        let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
-            &advertised[..]
-        else {
-            panic!("the guest was not advertised wl_shm: {advertised:?}");
-        };
-        let shm = s.new_id();
-        s.guest([wl_registry::req::bind(registry.id, shm_name, "wl_shm", *version, shm).unwrap()])
-            .await;
-        assert_eq!(s.host_received(), [], "the proxy implements wl_shm");
-        assert_eq!(
-            s.guest_received(),
-            [
-                (shm, wl_shm::Event::Format { format: 0 }.into()),
-                (shm, wl_shm::Event::Format { format: 1 }.into()),
-            ]
-        );
+        let (shm_name, host_shm) = shm_global(&mut s).await;
+        let shm = bind_shm(&mut s, registry.id, shm_name).await;
         // With `--gpu-accel` the proxy binds the host linux-dmabuf too; the
         // guest gets that global as well, which is not this test's concern.
-        s.advertise("zwp_linux_dmabuf_v1", 3).await;
-        let host_dmabuf = internal_bind(&s.host_received(), "zwp_linux_dmabuf_v1");
+        let (_, host_dmabuf) = s.advertise_internal("zwp_linux_dmabuf_v1", 3).await;
         s.guest_received();
 
         s.host([
@@ -405,19 +396,12 @@ mod tests {
     async fn a_host_format_reaches_every_guest_shm_in_id_order() {
         let mut s = Session::new();
         let registry = s.registry().await;
-        let name = s.advertise("wl_shm", wl_shm::VERSION).await;
-        let host_shm = internal_bind(&s.host_received(), "wl_shm");
-        let advertised = s.guest_received();
-        let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
-            &advertised[..]
-        else {
-            panic!("the guest was not advertised wl_shm: {advertised:?}");
-        };
+        let (name, host_shm) = shm_global(&mut s).await;
         let format =
             |shm, format| -> (u32, AnyEvent) { (shm, wl_shm::Event::Format { format }.into()) };
         let shms = (0..8).map(|_| s.new_id()).collect::<Vec<_>>();
         for &shm in shms.iter().rev() {
-            let bind = wl_registry::req::bind(registry.id, name, "wl_shm", *version, shm);
+            let bind = wl_registry::req::bind(registry.id, name, "wl_shm", GUEST_SHM_VERSION, shm);
             s.guest([bind.unwrap()]).await;
             assert_eq!(s.guest_received(), [format(shm, 0), format(shm, 1)]);
         }
@@ -429,42 +413,47 @@ mod tests {
         assert_eq!(s.guest_received(), expected.collect::<Vec<_>>());
     }
 
-    #[test]
-    fn replacement_shm_capability_does_not_reach_stale_guest_object() {
-        use crate::handler::Handlers;
-        use crate::protocols::wayland::wl_registry::WlRegistryHandler;
+    /// A guest `wl_shm` bound from a removed global gets no format the
+    /// host reports for the global advertised anew under its name; the one
+    /// bound from the new global does.
+    #[tokio::test]
+    async fn replacement_shm_capability_does_not_reach_stale_guest_object() {
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        let (name, _) = shm_global(&mut s).await;
+        let old_guest_shm = bind_shm(&mut s, registry.id, name).await;
 
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let shm = "wl_shm".to_string();
+        s.host([wl_registry::evt::global_remove(registry.host, name)])
+            .await;
+        let removal = wl_registry::Event::GlobalRemove { name };
+        assert_eq!(s.guest_received(), [(registry.id, removal.into())]);
+        assert_eq!(s.host_received(), [], "a wl_shm v1 has no destructor");
 
-        assert_eq!(Handlers::on_global(&mut ctx, 10, &shm, 1), Action::Drop);
-        let old_guest_shm = 20;
-        register_guest_shm(&mut ctx, old_guest_shm, 10);
-        ctx.host_to_client_queue.clear();
+        let global = wl_registry::evt::global(registry.host, name, wl_shm::NAME, wl_shm::VERSION);
+        s.host([global.unwrap()]).await;
+        let received = s.host_received();
+        let [(
+            _,
+            crate::protocols::AnyRequest::WlRegistry(wl_registry::Request::Bind {
+                id: (_, _, host_shm),
+                ..
+            }),
+        )] = received[..]
+        else {
+            panic!("the proxy did not bind the new wl_shm: {received:?}");
+        };
+        s.guest_received();
+        let new_guest_shm = bind_shm(&mut s, registry.id, name).await;
 
-        assert_eq!(Handlers::on_global_remove(&mut ctx, 10), Action::Forward);
-        assert!(
-            ctx.stale_shm_guest_objects.contains(&old_guest_shm),
-            "removed host SHM generation must mark existing guest objects stale"
-        );
-        assert_eq!(Handlers::on_global(&mut ctx, 10, &shm, 1), Action::Drop);
-        let new_guest_shm = 21;
-        register_guest_shm(&mut ctx, new_guest_shm, 10);
-        ctx.host_to_client_queue.clear();
-
-        record_host_shm_wl_format(&mut ctx, 0x3631_4752);
-
+        s.host([wl_shm::evt::format(host_shm, RGB565)]).await;
         assert_eq!(
-            decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
+            s.guest_received(),
             [(
                 new_guest_shm,
-                wl_shm::Event::Format {
-                    format: 0x3631_4752
-                }
+                wl_shm::Event::Format { format: RGB565 }.into()
             )],
-            "replacement capability must be sent only to the replacement guest object"
+            "replacement capability must be sent only to the replacement guest object, not \
+             {old_guest_shm}"
         );
     }
 }

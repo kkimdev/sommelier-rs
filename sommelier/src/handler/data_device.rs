@@ -343,11 +343,14 @@ fn retry_interrupted<R>(mut op: impl FnMut() -> io::Result<R>) -> io::Result<R> 
 #[cfg(test)]
 mod tests {
     use super::{pump, reopen, write_nowait, PUMP_IDLE_TIMEOUT};
-    use crate::protocols::wayland::wl_data_device;
-    use crate::protocols::Iface;
+    use crate::protocols::wayland::{
+        wl_data_device, wl_data_device_manager, wl_data_offer, wl_display, wl_seat,
+    };
+    use crate::protocols::{AnyEvent, Iface};
+    use crate::proxy::harness::{Object, Session};
     use crate::state::Context;
     use crate::test_support::{raw_dispatch, Rng};
-    use crate::wire::WireMessage;
+    use crate::wire::{WireMessage, WL_DISPLAY_ID};
     use std::io::{self, Read, Write};
     use std::thread;
     use std::time::Duration;
@@ -646,108 +649,139 @@ mod tests {
         assert!(received == data, "the transfer must arrive intact");
     }
 
-    #[test]
-    fn host_data_offer_gets_a_guest_server_id_mapping() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        // Host wl_data_device object 80 is represented by guest object 10.
-        ctx.shadow_table
-            .insert_paired_for_test(10, 80, "wl_data_device");
-
-        // wl_data_device.data_offer(new_id wl_data_offer) is a host-generated
-        // object event. The host chooses its ID, which must not be forwarded
-        // verbatim into the guest namespace.
-        let host_offer_id: u32 = 0xff00_0123;
-        let payload = host_offer_id.to_ne_bytes();
-        let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-        let result = crate::test_support::dispatch_event(&mut ctx, &mut msg)
-            .expect("data_offer should decode")
-            .expect("data_offer should be forwarded");
-
-        let (wire, fds) = result;
-        assert!(fds.is_empty());
-        assert_eq!(
-            crate::test_support::msg_sender(&wire),
-            10,
-            "event sender must be translated to the guest object"
-        );
-        let guest_offer_id = u32::from_ne_bytes(wire[8..12].try_into().unwrap());
-        assert_ne!(guest_offer_id, host_offer_id);
-        assert!(
-            guest_offer_id >= 0xff00_0000,
-            "server-generated guest IDs must use Wayland's reserved range"
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_id(guest_offer_id),
-            Some(host_offer_id)
-        );
-        assert_eq!(
-            ctx.shadow_table.get_interface(guest_offer_id),
-            Some(Iface::WlDataOffer)
-        );
+    /// A guest seat's `wl_data_device`, which the host offers data on.
+    struct Clipboard {
+        s: Session,
+        seat: u32,
+        manager: u32,
     }
 
-    #[test]
-    fn host_data_offer_rejects_reused_host_object_id() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_for_test(10, 80, "wl_data_device");
-        let host_surface = 0xff00_0123;
-        ctx.shadow_table
-            .insert_host_only_for_test(host_surface, "wl_surface", 6);
+    /// The first ID of the range a server allocates, where the proxy puts
+    /// the guest's side of each object the host creates.
+    const SERVER_ID_START: u32 = crate::test_support::wire_peer::SERVER_ID_START;
 
-        let payload = host_surface.to_ne_bytes();
-        let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-        let result = crate::test_support::dispatch_event(&mut ctx, &mut msg);
+    impl Clipboard {
+        /// A session whose guest has bound a `wl_seat` and a
+        /// `wl_data_device_manager`.
+        async fn new() -> Self {
+            let mut s = Session::new();
+            let seat = s.bind("wl_seat", wl_seat::VERSION).await;
+            let version = wl_data_device_manager::VERSION;
+            let manager = s.bind("wl_data_device_manager", version).await;
+            Self { s, seat, manager }
+        }
 
+        /// A new `wl_data_device` of the seat, with the host object the
+        /// proxy paired it with.
+        async fn device(&mut self) -> Object {
+            let id = self.s.new_id();
+            let get = wl_data_device_manager::req::get_data_device(self.manager, id, self.seat);
+            let host = self.s.create(get).await;
+            Object { id, host }
+        }
+
+        /// The host offers data on `device` as its object `host_offer`;
+        /// returns the guest's offer, which the guest gets from its device.
+        async fn offer(&mut self, device: Object, host_offer: u32) -> u32 {
+            self.s
+                .host([wl_data_device::evt::data_offer(device.host, host_offer)])
+                .await;
+            let received = self.s.guest_received();
+            let [(sender, AnyEvent::WlDataDevice(wl_data_device::Event::DataOffer { id }))] =
+                received[..]
+            else {
+                panic!("the guest got no data offer: {received:?}");
+            };
+            assert_eq!(sender, device.id, "the offer comes from the guest's device");
+            id
+        }
+
+        /// The guest destroys its `offer`, whose destroy reaches the host's
+        /// `host_offer`.
+        async fn destroy(&mut self, offer: u32, host_offer: u32) {
+            self.s.guest([wl_data_offer::req::destroy(offer)]).await;
+            assert_eq!(
+                self.s.host_received(),
+                [(host_offer, wl_data_offer::Request::Destroy {}.into())]
+            );
+            assert_eq!(self.s.guest_received(), []);
+        }
+    }
+
+    /// A host data offer, a `new_id` the host chose, reaches the guest from
+    /// the guest's device under an ID of the guest's server range, which the
+    /// proxy allocates rather than forward the host's verbatim, and the
+    /// guest's requests on it reach the host's offer.
+    #[tokio::test]
+    async fn host_data_offer_gets_a_guest_server_id_mapping() {
+        let mut c = Clipboard::new().await;
+        let device = c.device().await;
+        let host_offer = SERVER_ID_START + 0x123;
+
+        let offer = c.offer(device, host_offer).await;
+        assert_eq!(offer, SERVER_ID_START, "the guest's first server ID");
+
+        c.destroy(offer, host_offer).await;
+    }
+
+    /// A host data offer under the ID of a host object that is still alive
+    /// cannot be told from it: it ends the session.
+    #[tokio::test]
+    async fn host_data_offer_rejects_reused_host_object_id() {
+        let mut c = Clipboard::new().await;
+        let device = c.device().await;
+        let host_offer = SERVER_ID_START + 0x123;
+        c.offer(device, host_offer).await;
+
+        c.s.host_fatal([wl_data_device::evt::data_offer(device.host, host_offer)])
+            .await;
         assert_eq!(
-            raw_dispatch(result),
-            Err(crate::wire::ProtocolError::InvalidObjectId(host_surface))
-        );
-        assert!(
-            ctx.shadow_table.get_guest_id(host_surface).is_none(),
-            "a colliding host ID must not overwrite an existing mapping"
+            c.s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
     }
 
     /// libwayland-server creates objects only with server IDs. One from the
     /// client range is the proxy's to allocate, so taking it would let the
-    /// proxy's next object collide with it.
-    #[test]
-    fn host_data_offer_rejects_a_client_range_id() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_for_test(10, 80, "wl_data_device");
+    /// proxy's next object collide with it: it ends the session instead.
+    #[tokio::test]
+    async fn host_data_offer_rejects_a_client_range_id() {
+        let mut c = Clipboard::new().await;
+        let device = c.device().await;
 
-        let payload = 123u32.to_ne_bytes();
-        let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-        let result = crate::test_support::dispatch_event(&mut ctx, &mut msg);
-
+        c.s.host_fatal([wl_data_device::evt::data_offer(device.host, 123)])
+            .await;
         assert_eq!(
-            raw_dispatch(result),
-            Err(crate::wire::ProtocolError::InvalidObjectId(123))
+            c.s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
-        assert!(ctx.shadow_table.is_host_id_available(123));
     }
 
-    #[test]
-    fn event_from_an_unmapped_sender_maps_no_new_id() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        // The data device object exists, but this host ID was never mapped.
-        ctx.shadow_table
-            .insert_host_only_for_test(81, "wl_data_device", 3);
-        let host_offer: u32 = 0xff00_0001;
-        let payload = host_offer.to_ne_bytes();
-        let mut offer = WireMessage::new(81, wl_data_device::EVT_DATA_OFFER, &payload);
-
+    /// An offer from a device the guest has released, which crosses the
+    /// release, reaches no one and takes no guest server ID: the next
+    /// offer, on a live device, takes the first.
+    #[tokio::test]
+    async fn event_from_an_unmapped_sender_maps_no_new_id() {
+        let mut c = Clipboard::new().await;
+        let released = c.device().await;
+        c.s.guest([wl_data_device::req::release(released.id)]).await;
         assert_eq!(
-            raw_dispatch(crate::test_support::dispatch_event(&mut ctx, &mut offer)),
-            Ok(None)
+            c.s.host_received(),
+            [(released.host, wl_data_device::Request::Release {}.into())]
         );
-        assert_eq!(ctx.shadow_table.get_guest_id(host_offer), None);
+
+        c.s.host([wl_data_device::evt::data_offer(
+            released.host,
+            SERVER_ID_START + 1,
+        )])
+        .await;
+        assert_eq!(c.s.guest_received(), []);
+        assert_eq!(c.s.host_received(), []);
+
+        let device = c.device().await;
         assert_eq!(
-            ctx.shadow_table
-                .adopt_host_created(0xff00_0009, Iface::WlDataOffer, 3),
-            0xff00_0000,
+            c.offer(device, SERVER_ID_START).await,
+            SERVER_ID_START,
             "a dropped event must not consume a guest server ID"
         );
     }
@@ -815,85 +849,40 @@ mod tests {
     /// Every clipboard or drag-and-drop selection brings a new host data
     /// offer. The guest IDs must be recycled, or a long session would run
     /// out of server IDs.
-    #[test]
-    fn cycled_data_offers_keep_their_guest_id_small() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 80, "wl_data_device", 3);
-        let mut first_guest_offer = None;
+    #[tokio::test]
+    async fn cycled_data_offers_keep_their_guest_id_small() {
+        let mut c = Clipboard::new().await;
+        let device = c.device().await;
 
         for round in 0..1000u32 {
             // The host may pick any free server ID for each offer.
-            let host_offer = 0xff00_0000 + round % 3;
-            let payload = host_offer.to_ne_bytes();
-            let mut offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-            let (event, _) = crate::test_support::dispatch_event(&mut ctx, &mut offer)
-                .expect("data_offer should decode")
-                .expect("data_offer should be forwarded");
-            let guest_offer = u32::from_ne_bytes(event[8..12].try_into().unwrap());
+            let host_offer = SERVER_ID_START + round % 3;
+            let offer = c.offer(device, host_offer).await;
             assert_eq!(
-                guest_offer,
-                *first_guest_offer.get_or_insert(guest_offer),
+                offer, SERVER_ID_START,
                 "round {round}: a destroyed offer's guest ID must be reused"
             );
-
-            let mut destroy = WireMessage::new(
-                guest_offer,
-                crate::protocols::wayland::wl_data_offer::REQ_DESTROY,
-                &[],
-            );
-            crate::test_support::dispatch_request(&mut ctx, &mut destroy)
-                .expect("data_offer.destroy should decode");
+            c.destroy(offer, host_offer).await;
         }
     }
 
-    #[test]
-    fn destroyed_host_data_offer_allows_ordered_server_id_reuse() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, 80, "wl_data_device", 3);
-        let host_offer_id = 0xff00_0000u32;
+    /// The guest's destroy of a host-created offer frees both its IDs at
+    /// once: the host may create its next offer under the same ID, which
+    /// the guest gets under its first offer's ID.
+    #[tokio::test]
+    async fn destroyed_host_data_offer_allows_ordered_server_id_reuse() {
+        let mut c = Clipboard::new().await;
+        let device = c.device().await;
+        let host_offer = SERVER_ID_START;
 
-        let payload = host_offer_id.to_ne_bytes();
-        let mut first_offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-        let (first_event, _) = crate::test_support::dispatch_event(&mut ctx, &mut first_offer)
-            .expect("first data_offer should decode")
-            .expect("first data_offer should be forwarded");
-        let first_guest_id = u32::from_ne_bytes(first_event[8..12].try_into().unwrap());
-        assert_eq!(
-            ctx.shadow_table.get_host_id(first_guest_id),
-            Some(host_offer_id)
-        );
+        let first = c.offer(device, host_offer).await;
+        c.destroy(first, host_offer).await;
 
-        let mut destroy = WireMessage::new(
-            first_guest_id,
-            crate::protocols::wayland::wl_data_offer::REQ_DESTROY,
-            &[],
-        );
-        let (destroy_request, _) = crate::test_support::dispatch_request(&mut ctx, &mut destroy)
-            .expect("data_offer.destroy should decode")
-            .expect("data_offer.destroy should be forwarded");
+        let replacement = c.offer(device, host_offer).await;
         assert_eq!(
-            crate::test_support::msg_sender(&destroy_request),
-            host_offer_id
-        );
-        assert_eq!(ctx.shadow_table.get_host_id(first_guest_id), None);
-        assert_eq!(ctx.shadow_table.get_guest_id(host_offer_id), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_guest(first_guest_id));
-
-        let mut replacement = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
-        let (replacement_event, _) =
-            crate::test_support::dispatch_event(&mut ctx, &mut replacement)
-                .expect("reused server ID should decode")
-                .expect("replacement data_offer should be forwarded");
-        let replacement_guest_id = u32::from_ne_bytes(replacement_event[8..12].try_into().unwrap());
-        assert_eq!(
-            replacement_guest_id, first_guest_id,
+            replacement, first,
             "a destroyed server-created object's guest ID is reused first"
         );
-        assert_eq!(
-            ctx.shadow_table.get_host_id(replacement_guest_id),
-            Some(host_offer_id)
-        );
+        c.destroy(replacement, host_offer).await;
     }
 }

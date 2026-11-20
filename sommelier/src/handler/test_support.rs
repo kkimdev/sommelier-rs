@@ -18,9 +18,10 @@ limitations under the License.
 
 use crate::placement_config::PlacementConfig;
 use crate::protocols::aura_shell::zaura_shell;
-use crate::protocols::wayland::wl_shm;
+use crate::protocols::wayland::{wl_registry, wl_shm};
+use crate::protocols::AnyEvent;
 use crate::proxy::harness::Session;
-use crate::state::{Context, HostId, RenderBufferLifecycle};
+use crate::state::Context;
 
 /// A guest object and the host object it is paired with.
 #[derive(Clone, Copy)]
@@ -83,33 +84,48 @@ pub(crate) fn toplevel_ctx() -> Context {
     toplevel_ctx_with(PlacementConfig::for_test())
 }
 
-/// The lifecycle of render buffer `guest_id`, while it has one.
-pub(crate) fn buffer_lifecycle(ctx: &Context, guest_id: u32) -> Option<RenderBufferLifecycle> {
-    let host_id: HostId = ctx.render_buffer_host_id(guest_id)?;
-    ctx.render_buffer_lifecycle_for_host(host_id)
-}
-
-/// Whether the guest has destroyed render buffer `guest_id`, which the
-/// proxy still holds.
-pub(crate) fn buffer_is_guest_destroyed(ctx: &Context, guest_id: u32) -> bool {
-    buffer_lifecycle(ctx, guest_id).is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
-}
-
-/// Whether the host destroy of render buffer `guest_id` is queued.
-pub(crate) fn buffer_host_destroy_is_queued(ctx: &Context, guest_id: u32) -> bool {
-    buffer_lifecycle(ctx, guest_id) == Some(RenderBufferLifecycle::HostDestroyQueued)
-}
-
-/// Record that the guest destroyed render buffer `guest_id`, as its
-/// `wl_buffer.destroy` does.
-pub(crate) fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
-    assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-    ctx.guest_destroyed_in_use(guest_id);
-}
-
 /// A session whose guest has bound `wl_shm`, which the proxy implements.
 pub(crate) async fn session_with_shm() -> (Session, u32) {
     let mut s = Session::new();
     let shm = s.bind("wl_shm", wl_shm::VERSION).await;
     (s, shm)
+}
+
+/// The version of `wl_shm` the proxy offers the guest, which has no
+/// destructor (`WL_SHM_VERSION` in `handler::registry`).
+pub(crate) const GUEST_SHM_VERSION: u32 = 1;
+
+/// The host advertises `wl_shm`, which the proxy binds for itself and
+/// offers the guest, which gets the global; returns the global's name and
+/// the proxy's host `wl_shm`.
+pub(crate) async fn shm_global(s: &mut Session) -> (u32, u32) {
+    let registry = s.registry().await;
+    let (name, host) = s.advertise_internal(wl_shm::NAME, wl_shm::VERSION).await;
+    let global = wl_registry::Event::Global {
+        name,
+        interface: wl_shm::NAME.to_string(),
+        version: GUEST_SHM_VERSION,
+    };
+    assert_eq!(s.guest_received(), [(registry.id, global.into())]);
+    assert_eq!(s.host_received(), []);
+    (name, host)
+}
+
+/// The guest binds `wl_shm` global `name` through its `registry`; returns
+/// the new `wl_shm`, which the proxy implements and which gets the two
+/// mandatory formats.
+pub(crate) async fn bind_shm(s: &mut Session, registry: u32, name: u32) -> u32 {
+    let shm = s.new_id();
+    let bind = wl_registry::req::bind(registry, name, wl_shm::NAME, GUEST_SHM_VERSION, shm);
+    s.guest([bind.unwrap()]).await;
+    assert_eq!(s.host_received(), [], "the proxy implements wl_shm");
+    let format = |format| -> (u32, AnyEvent) { (shm, wl_shm::Event::Format { format }.into()) };
+    assert_eq!(
+        s.guest_received(),
+        [
+            format(wl_shm::FORMAT_ARGB8888),
+            format(wl_shm::FORMAT_XRGB8888)
+        ]
+    );
+    shm
 }

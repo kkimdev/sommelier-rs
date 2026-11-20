@@ -96,7 +96,7 @@ awaited one every batch; as before, Tokio's cooperative budget decides
 when such an await lets another client run. Interleaved directions send
 once per switch, as one send per batch did. `proxy::harness::Session`
 dispatches what one peer sent and then flushes, so tests of the
-interleaving drive `Client::handle_msgs` directly.
+interleaving dispatch a batch at a time (`Session::batch`).
 
 ### Descriptors
 

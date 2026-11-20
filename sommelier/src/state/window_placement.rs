@@ -253,12 +253,6 @@ impl PlacementState {
         placed.placement.take()
     }
 
-    /// The placement in flight for `xdg_toplevel`.
-    #[cfg(test)]
-    pub(crate) fn placement(&self, xdg_toplevel: GuestId) -> Option<Placement> {
-        self.toplevels.get(&xdg_toplevel)?.placement
-    }
-
     #[cfg(test)]
     pub(crate) fn toplevel_count(&self) -> usize {
         self.toplevels.len()

@@ -15,60 +15,59 @@ limitations under the License.
 */
 
 use super::*;
-use crate::handler::window_placement::{
-    attach_toplevel, place_focused, surface_configured, translate_aura_configure, PlacementSkip,
-};
-use crate::handler::Handlers;
+use crate::handler::window_placement::PlacementSkip;
 use crate::keymap::MAX_KEYMAP_SIZE;
-use crate::keys::{GuestKeyOwner, KeyClass, EVDEV_KEY_BACKSPACE};
+use crate::keys::EVDEV_KEY_BACKSPACE;
 use crate::placement_config::PlacementConfig;
-use crate::protocols::aura_shell::zaura_surface;
+use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
 use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::{
-    ZcrExtendedKeyboardV1Handler, HANDLED_STATE_HANDLED as HANDLED,
-    HANDLED_STATE_NOT_HANDLED as NOT_HANDLED,
+    HANDLED_STATE_HANDLED as HANDLED, HANDLED_STATE_NOT_HANDLED as NOT_HANDLED,
 };
-use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::{
-    self, ZcrExtendedTextInputV1Handler,
-};
-use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
-use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
+use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
-use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
-use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
+use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::protocols::wayland::wl_keyboard::{KEYMAP_FORMAT_NO_KEYMAP, KEYMAP_FORMAT_XKB_V1};
 use crate::protocols::wayland::wl_keyboard::{KEY_STATE_PRESSED, KEY_STATE_RELEASED};
-use crate::protocols::wayland::{wl_callback, wl_display, wl_registry, wl_seat, wl_surface};
-use crate::protocols::xdg_shell::xdg_toplevel;
+use crate::protocols::wayland::{
+    wl_callback, wl_display, wl_output, wl_registry, wl_seat, wl_surface,
+};
+use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
-use crate::state::OutputState;
-use crate::state::Singleton;
-use crate::test_support::text_input::{self, Host};
-use crate::test_support::{decode, msg_opcode, msg_sender, shm_pool_file};
-use crate::window_layout::NormalizedRect;
 use crate::wire::WL_DISPLAY_ID;
-use std::os::fd::AsFd;
 use xkb::keysyms;
 use xkbcommon::xkb;
-use GuestKeyOwner::{ImeRecovery, Physical, Shortcut};
 
-/// The named preset `name`.
-fn preset(name: &str) -> NormalizedRect {
-    NormalizedRect::preset(name).unwrap_or_else(|| panic!("no preset {name:?}"))
-}
-
-/// A key's class, with a shortcut's binding resolved to where it places
-/// the focused window.
+/// A key's class, from where its press went, with a shortcut's binding
+/// resolved to where it placed the focused window.
 #[derive(Debug, PartialEq)]
 enum Class {
     Guest,
     HostAccelerator,
-    Placed(Option<NormalizedRect>),
+    Placed([i32; 4]),
 }
 
 /// The class of a chord bound to the named preset `name`.
 fn placed(name: &str) -> Class {
-    Class::Placed(Some(preset(name)))
+    Class::Placed(bounds(name))
+}
+
+/// Where the named preset places a window, `[x, y, width, height]`, in
+/// the work area of [`Kb::placing`]'s output: 1920x1032, above a
+/// 48-pixel shelf.
+fn bounds(name: &str) -> [i32; 4] {
+    match name {
+        "top-left" => [0, 0, 960, 516],
+        "top" => [0, 0, 1920, 516],
+        "top-right" => [960, 0, 960, 516],
+        "left" => [0, 0, 960, 1032],
+        "fullscreen" => [0, 0, 1920, 1032],
+        "right" => [960, 0, 960, 1032],
+        "bottom-left" => [0, 516, 960, 516],
+        "bottom" => [0, 516, 1920, 516],
+        "bottom-right" => [960, 516, 960, 516],
+        _ => panic!("no preset {name:?}"),
+    }
 }
 
 // Evdev keycodes and modifier masks of the default keymap, which
@@ -96,238 +95,7 @@ const PRESSED: u32 = KEY_STATE_PRESSED;
 const RELEASED: u32 = KEY_STATE_RELEASED;
 
 // -----------------------------------------------------------------------
-// Handler fixture: for state no peer sees
-// -----------------------------------------------------------------------
-
-/// A guest keyboard of guest seat `seat`, and the host keyboard and
-/// `zcr_extended_keyboard_v1` the proxy pairs with it.
-#[derive(Clone, Copy)]
-struct Mapped {
-    guest: u32,
-    host: u32,
-    extended: u32,
-    seat: u32,
-}
-
-const KEYBOARD: Mapped = Mapped {
-    guest: 10,
-    host: 100,
-    extended: 1000,
-    seat: 1,
-};
-
-/// Another keyboard of `KEYBOARD`'s seat.
-const OTHER_KEYBOARD: Mapped = Mapped {
-    guest: 11,
-    host: 101,
-    extended: 1001,
-    seat: 1,
-};
-
-/// A guest text input, and the host `zwp_text_input_v1` and
-/// `zcr_extended_text_input_v1` behind it.
-#[derive(Clone, Copy)]
-struct MappedTextInput {
-    guest: u32,
-    host: u32,
-    extended: u32,
-}
-
-const TEXT_INPUT: MappedTextInput = MappedTextInput {
-    guest: 40,
-    host: 140,
-    extended: 2000,
-};
-
-/// A surface the tests focus that the guest never created.
-const UNCREATED_SURFACE: u32 = 900;
-
-/// The proxy state the keyboard handler works on. Each method dispatches
-/// one event as the generated dispatcher would, from the sender it names.
-struct Proxy {
-    ctx: Context,
-}
-
-impl Proxy {
-    fn new() -> Self {
-        Self::with(Context::new_for_test(false, false, Vec::new()))
-    }
-
-    fn with(ctx: Context) -> Self {
-        Self { ctx }
-    }
-
-    /// Pair keyboard `k` as `wl_seat.get_keyboard` and its first enter
-    /// do, and give it the whole default keymap, which, as Exo's does,
-    /// repeats Backspace and makes chords of its keys.
-    fn map(&mut self, k: Mapped) {
-        let ctx = &mut self.ctx;
-        ctx.shadow_table
-            .insert_paired_for_test(k.guest, k.host, "wl_keyboard");
-        crate::handler::keyboard::for_test::created(ctx, k.guest, k.host, k.seat);
-        crate::handler::keyboard::for_test::extended(ctx, k.host, k.extended);
-        crate::handler::keyboard::for_test::default_keymap(ctx, k.host);
-    }
-
-    /// Record keyboard `k` as `wl_seat.get_keyboard` does, if it is not
-    /// yet: a host sends its keymap and modifiers before any enter.
-    fn created(&mut self, k: Mapped) {
-        if self.ctx.keys.keyboards().get(HostId(k.host)).is_none() {
-            self.ctx
-                .shadow_table
-                .insert_paired_for_test(k.guest, k.host, "wl_keyboard");
-            crate::handler::keyboard::for_test::created(&mut self.ctx, k.guest, k.host, k.seat);
-        }
-    }
-
-    /// Pair guest surface `guest` with host surface `host`.
-    fn surface(&mut self, guest: u32, host: u32) {
-        self.ctx
-            .shadow_table
-            .insert_paired_for_test(guest, host, "wl_surface");
-    }
-
-    /// Record that `k`'s focus is on guest surface `surface`.
-    fn focus(&mut self, k: Mapped, surface: u32) {
-        let host_surface = self
-            .ctx
-            .shadow_table
-            .get_host_id(surface)
-            .unwrap_or(surface);
-        self.ctx
-            .keyboard_focus
-            .set_for_test(HostId(k.host), k.seat, surface, host_surface);
-    }
-
-    /// Text input `t` of `seat`, enabled with surrounding text and
-    /// active on the host, on guest surface `surface`.
-    fn text_input(&mut self, t: MappedTextInput, seat: u32, surface: u32) {
-        self.text_input_showing(t, seat, surface, None);
-    }
-
-    /// [`Self::text_input`], whose guest shows `preedit`.
-    fn text_input_showing(
-        &mut self,
-        t: MappedTextInput,
-        seat: u32,
-        surface: u32,
-        preedit: Option<&str>,
-    ) {
-        self.ctx
-            .shadow_table
-            .insert_paired_for_test(t.guest, t.host, "zwp_text_input_v3");
-        let active = text_input::Active {
-            ext: Some(t.extended),
-            surrounding_text: Some(("가", 3, 3)),
-            preedit,
-            ..text_input::Active::new(t.host, seat, Some(surface))
-        };
-        text_input::insert(&mut self.ctx, t.guest, active);
-    }
-
-    /// `k`'s host sends a keymap event; returns what the handler does.
-    fn keymap_of(&mut self, k: Mapped, format: u32, bytes: &[u8], size: u32) -> Action {
-        self.created(k);
-        self.ctx.last_sender_id = k.host;
-        // The memfd's offset stays at its end, as a host may leave it.
-        let file = shm_pool_file(bytes);
-        Handlers::on_keymap(&mut self.ctx, format, file.as_fd(), size)
-    }
-
-    /// `k`'s host sends the default keymap, which loads.
-    fn keymap(&mut self, k: Mapped) {
-        let keymap = crate::proxy::harness::default_keymap();
-        let size = keymap.len() as u32;
-        let action = self.keymap_of(k, KEYMAP_FORMAT_XKB_V1, &keymap, size);
-        assert_eq!(action, Action::Forward);
-        assert!(self
-            .ctx
-            .keys
-            .keyboards()
-            .keymap_for_test(HostId(k.host))
-            .is_some());
-    }
-
-    /// `k`'s host holds the `depressed` modifiers.
-    fn modifiers(&mut self, k: Mapped, depressed: u32) {
-        self.created(k);
-        self.ctx.last_sender_id = k.host;
-        let action = Handlers::on_modifiers(&mut self.ctx, 1, depressed, 0, 0, 0);
-        assert_eq!(action, Action::Forward);
-    }
-
-    fn key(&mut self, k: Mapped, serial: u32, time: u32, key: u32, state: u32) -> Action {
-        self.ctx.last_sender_id = k.host;
-        Handlers::on_key(&mut self.ctx, serial, time, key, state)
-    }
-
-    fn peek(&mut self, k: Mapped, serial: u32, time: u32, key: u32, state: u32) -> Action {
-        self.ctx.last_sender_id = k.extended;
-        Handlers::on_peek_key(&mut self.ctx, serial, time, key, state)
-    }
-
-    /// `k`'s host enters host surface `surface` with `keys` held.
-    fn enter(&mut self, k: Mapped, surface: u32, keys: &[u32]) -> Action {
-        self.ctx.last_sender_id = k.host;
-        let keys: Vec<u8> = keys.iter().flat_map(|key| key.to_ne_bytes()).collect();
-        Handlers::on_enter(&mut self.ctx, 1, surface, &keys)
-    }
-
-    /// `k`'s host leaves host surface `surface`.
-    fn leave(&mut self, k: Mapped, surface: u32) -> Action {
-        self.ctx.last_sender_id = k.host;
-        Handlers::on_leave(&mut self.ctx, 1, surface)
-    }
-
-    /// The guest releases `k`, as the generated dispatcher does: the
-    /// handler forwards `wl_keyboard.release`, and ending the keyboard
-    /// forgets its state.
-    fn release(&mut self, k: Mapped) {
-        self.ctx.last_sender_id = k.guest;
-        assert_eq!(Handlers::on_release(&mut self.ctx), Action::Forward);
-        self.ctx.guest_destroyed(k.guest);
-    }
-
-    /// The host input method of `t` confirms an empty composition.
-    fn confirm(&mut self, t: MappedTextInput) -> Action {
-        self.ctx.last_sender_id = t.extended;
-        crate::handler::Handlers::on_confirm_preedit(&mut self.ctx, 0)
-    }
-
-    /// The IME core leases `k`'s held Backspace to text input `t`, as a
-    /// preedit its input method empties does.
-    fn lease(&mut self, k: Mapped, t: MappedTextInput) {
-        let lease = crate::ime::KeyEffect::Lease {
-            ti: crate::ime::TiId(t.guest),
-            seat: crate::ime::SeatId(k.seat),
-            outcome: crate::ime::LeaseOutcome::ArmIfBackspaceHeld,
-        };
-        crate::handler::keyboard::keys(&mut self.ctx, crate::keys::KeyInput::Ime(lease));
-    }
-
-    fn owner(&self, k: Mapped, key: u32) -> Option<GuestKeyOwner> {
-        self.ctx.keys.owner(HostId(k.host), key)
-    }
-
-    fn held(&self, k: Mapped, key: u32) -> bool {
-        self.ctx.keys.held(HostId(k.host), key)
-    }
-
-    fn cancelled(&self, k: Mapped) -> bool {
-        self.ctx.keys.backspace_repeat_cancelled(HostId(k.host))
-    }
-
-    fn classify(&self, k: Mapped, key: u32) -> Class {
-        match self.ctx.classify_key_for_test(HostId(k.host), key) {
-            KeyClass::Guest => Class::Guest,
-            KeyClass::HostAccelerator => Class::HostAccelerator,
-            KeyClass::Shortcut(binding) => Class::Placed(self.ctx.placement_rect(binding)),
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
-// Session fixture: for what the peers see
+// Session fixture
 // -----------------------------------------------------------------------
 
 /// A guest keyboard in a [`Session`], and the host objects behind it.
@@ -340,6 +108,15 @@ struct Keyboard {
     ext: u32,
 }
 
+/// `k`, which no enter has given an extended keyboard yet.
+fn unentered(k: Object) -> Keyboard {
+    Keyboard {
+        id: k.id,
+        host: k.host,
+        ext: 0,
+    }
+}
+
 /// A guest text input the host activated, and the host
 /// `zwp_text_input_v1` and `zcr_extended_text_input_v1` behind it.
 #[derive(Clone, Copy, Debug)]
@@ -349,6 +126,8 @@ struct Ime {
     ext: u32,
     /// The host `wl_seat` the host text input is activated for.
     host_seat: u32,
+    /// The guest's commits, which number its `done` events.
+    serial: u32,
 }
 
 /// Where a host key event went, from what each peer received.
@@ -370,20 +149,24 @@ struct Kb {
     s: Session,
     /// The name of the extension's global.
     extension: u32,
-    seat: u32,
+    seat: Object,
     k: Keyboard,
     surface: Object,
+    /// The serial of the host's latest `xdg_surface.configure`.
+    configure_serial: u32,
 }
 
 impl Kb {
     /// `k`'s focus has not entered the surface.
     async fn unfocused(ctx: Context) -> Self {
-        let mut s = Session::with_context(ctx);
-        let extension = s.advertise(
-            "zcr_keyboard_extension_v1",
-            crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1::VERSION,
-        )
-        .await;
+        Self::start(Session::with_context(ctx)).await
+    }
+
+    /// [`Self::unfocused`], in session `s`.
+    async fn start(mut s: Session) -> Self {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
+        let version = zcr_keyboard_extension_v1::VERSION;
+        let extension = s.advertise(zcr_keyboard_extension_v1::NAME, version).await;
         // The proxy binds the extension for itself.
         let bind = s.host_received();
         assert!(
@@ -393,19 +176,16 @@ impl Kb {
             ),
             "{bind:?}"
         );
-        let (seat, k) = s.keyboard().await;
+        let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+        let k = unentered(s.keyboard_of(seat.id).await);
         let surface = s.surface().await;
-        let k = Keyboard {
-            id: k.id,
-            host: k.host,
-            ext: 0,
-        };
         Self {
             s,
             extension,
             seat,
             k,
             surface,
+            configure_serial: 0,
         }
     }
 
@@ -447,12 +227,7 @@ impl Kb {
     /// Another keyboard of the seat, which the host gives its first
     /// focus on the surface, which the seat's focus is on.
     async fn another_keyboard(&mut self) -> Keyboard {
-        let k = self.s.keyboard_of(self.seat).await;
-        let k = Keyboard {
-            id: k.id,
-            host: k.host,
-            ext: 0,
-        };
+        let k = unentered(self.s.keyboard_of(self.seat.id).await);
         let surface = self.surface;
         self.first_enter(k, surface).await
     }
@@ -529,71 +304,43 @@ impl Kb {
     /// A guest text input of the seat, which the guest enables on the
     /// focused surface and the host activates.
     async fn text_input(&mut self) -> Ime {
-        use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1::Request as ExtManager;
-        use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1::Request as Manager;
-        let manager = self
-            .s
-            .bind(
-                "zwp_text_input_manager_v1",
-                zwp_text_input_manager_v1::VERSION,
-            )
-            .await;
-        self.s
-            .advertise(
-                "zcr_text_input_extension_v1",
-                zcr_text_input_extension_v1::VERSION,
-            )
-            .await;
-        // The proxy binds the extension for itself.
-        self.s.host_received();
-        let id = self.s.new_id();
-        self.s
-            .guest([zwp_text_input_manager_v3::req::get_text_input(
-                manager, id, self.seat,
-            )])
-            .await;
-        let host = self.s.host_received();
-        let [(_, AnyRequest::ZwpTextInputManagerV1(Manager::CreateTextInput { id: host_id })), (
-            _,
-            AnyRequest::ZcrTextInputExtensionV1(ExtManager::GetExtendedTextInput {
-                id: ext, ..
-            }),
-        )] = host[..]
-        else {
-            panic!("the host got no text input: {host:?}");
-        };
+        let t = self.s.text_input(self.seat.id).await;
         let surface = self.surface.id;
         let enter = zwp_text_input_v3::Event::Enter { surface };
-        assert_eq!(self.s.guest_received(), [(id, enter.into())]);
-        self.s
-            .guest([
-                zwp_text_input_v3::req::enable(id),
-                zwp_text_input_v3::req::commit(id),
-            ])
-            .await;
+        assert_eq!(self.s.guest_received(), [(t.id, enter.into())]);
         // The activation, which the text-input tests pin.
-        let host_seat = self
-            .s
-            .host_received()
-            .into_iter()
-            .find_map(|request| match request {
-                (
-                    sender,
-                    AnyRequest::ZwpTextInputV1(zwp_text_input_v1::Request::Activate {
-                        seat, ..
-                    }),
-                ) if sender == host_id => Some(seat),
-                _ => None,
-            })
-            .expect("the host activates the text input");
-        let done = zwp_text_input_v3::Event::Done { serial: 1 };
-        assert_eq!(self.s.guest_received(), [(id, done.into())]);
+        self.s.enable(t, 1).await;
         Ime {
-            id,
-            host: host_id,
-            ext,
-            host_seat,
+            id: t.id,
+            host: t.host,
+            ext: t.ext,
+            host_seat: self.seat.host,
+            serial: 1,
         }
+    }
+
+    /// The host input method shows preedit `text`, which the guest gets.
+    async fn compose(&mut self, ime: Ime, text: &str) {
+        let preedit = zwp_text_input_v1::evt::preedit_string(ime.host, 0, text, "").unwrap();
+        self.s.host([preedit]).await;
+        assert_eq!(self.s.guest_received(), [v3_preedit(ime, text), done(ime)]);
+    }
+
+    /// The host input method shows a preedit and empties it, as a held
+    /// Backspace it takes deletes it: the proxy leases Backspace's
+    /// repeat to `ime`.
+    async fn lease(&mut self, ime: Ime) {
+        self.compose(ime, "가").await;
+        self.compose(ime, "").await;
+    }
+
+    /// Whether `k`'s held Backspace is leased to a text input. Reads
+    /// state no peer can observe: the lease shows only in the delivery
+    /// of Backspace's next `wl_keyboard` press, which the test does not
+    /// send.
+    fn leased(&mut self, k: Keyboard) -> bool {
+        let keys = &self.s.ctx().keys;
+        keys.backspace_lease(HostId(k.host)).is_some()
     }
 
     /// The host input method confirms its empty composition, and sends
@@ -642,6 +389,325 @@ impl Kb {
         self.s.host_received();
         assert_eq!(self.s.guest_received(), []);
     }
+
+    /// The guest destroys a new surface, whose destroy the host has not
+    /// read: the host may still name it. Returns it.
+    async fn dying_surface(&mut self) -> Object {
+        let surface = self.s.surface().await;
+        self.s.guest([wl_surface::req::destroy(surface.id)]).await;
+        let destroy = wl_surface::Request::Destroy {};
+        assert_eq!(self.s.host_received(), [(surface.host, destroy.into())]);
+        surface
+    }
+}
+
+/// A guest `xdg_toplevel` and the host objects behind it.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    xdg_surface: Object,
+    toplevel: Object,
+    /// The host `zaura_toplevel` the proxy creates for it while placement
+    /// is on.
+    aura_toplevel: Option<u32>,
+}
+
+/// Window placement, through a whole session.
+impl Kb {
+    /// [`Self::new`] under `ctx`, whose host has the Aura shell, which
+    /// the proxy binds, and an output, 1920x1080 at the origin, which it
+    /// has measured ([`Self::measure`]). Returns the shell's global name
+    /// too.
+    async fn placing(ctx: Context, device_scale: bool) -> (Self, u32) {
+        let mut s = Session::with_context(ctx);
+        let registry = s.registry().await;
+        // The shell, as `Session::aura_shell`, whose name a test removes.
+        let shell = s.advertise(zaura_shell::NAME, zaura_shell::VERSION).await;
+        let host = s.host_received();
+        assert!(
+            matches!(
+                &host[..],
+                [(sender, AnyRequest::WlRegistry(wl_registry::Request::Bind { name, .. }))]
+                    if (*sender, *name) == (registry.host, shell)
+            ),
+            "the proxy did not bind zaura_shell: {host:?}"
+        );
+        let advertised = s.guest_received();
+        assert!(
+            matches!(
+                &advertised[..],
+                [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { interface, .. }))]
+                    if interface == "gtk_shell1"
+            ),
+            "{advertised:?}"
+        );
+        let mut kb = Self::start(s).await;
+        let (output, aura_output) = kb.output().await;
+        kb.measure(output, aura_output, 0, device_scale).await;
+        let surface = kb.surface;
+        kb.k = kb.first_enter(kb.k, surface).await;
+        (kb, shell)
+    }
+
+    /// The host advertises a `wl_output`, which the guest binds; returns
+    /// it and the host `zaura_output` the proxy gets for it while
+    /// placement is on.
+    async fn output(&mut self) -> (Object, Option<u32>) {
+        let registry = self.s.registry().await;
+        let name = self.s.advertise("wl_output", wl_output::VERSION).await;
+        let advertised = self.s.guest_received();
+        let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+            &advertised[..]
+        else {
+            panic!("the output was not advertised: {advertised:?}");
+        };
+        let id = self.s.new_id();
+        let bind = wl_registry::req::bind(registry.id, name, "wl_output", *version, id);
+        self.s.guest([bind.unwrap()]).await;
+        let host = self.s.host_received();
+        let (bound, aura_output) = match &host[..] {
+            [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id: bound, .. }))] => {
+                (bound.2, None)
+            }
+            [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id: bound, .. })), (_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraOutput { id, .. }))] => {
+                (bound.2, Some(*id))
+            }
+            _ => panic!("the host got {host:?}"),
+        };
+        (Object { id, host: bound }, aura_output)
+    }
+
+    /// The host sends `output`'s metadata: its 1920x1080 mode at
+    /// `origin_x`, and, through its Aura output, if it has one, a scale
+    /// of 1, insets for a 48-pixel shelf, and its device scale, 1, if
+    /// `device_scale`. The guest gets the output's events.
+    async fn measure(
+        &mut self,
+        output: Object,
+        aura_output: Option<u32>,
+        origin_x: i32,
+        device_scale: bool,
+    ) {
+        let geometry = wl_output::evt::geometry(output.host, origin_x, 0, 0, 0, 0, "", "", 0);
+        let mode = wl_output::evt::mode(output.host, wl_output::MODE_CURRENT, 1920, 1080, 60);
+        let mut events = vec![geometry.unwrap(), mode];
+        if let Some(aura) = aura_output {
+            let current = zaura_output::SCALE_PROPERTY_CURRENT;
+            events.push(zaura_output::evt::scale(aura, current, 1000));
+            if device_scale {
+                events.push(zaura_output::evt::device_scale_factor(aura, 1000));
+            }
+            events.push(zaura_output::evt::insets(aura, 0, 0, 48, 0));
+        }
+        events.push(wl_output::evt::done(output.host));
+        self.s.host(events).await;
+        let guest = self.s.guest_received();
+        assert!(
+            !guest.is_empty() && guest.iter().all(|(sender, _)| *sender == output.id),
+            "{guest:?}"
+        );
+        assert_eq!(self.s.host_received(), []);
+    }
+
+    /// The guest makes the surface an `xdg_toplevel`, from an
+    /// `xdg_wm_base` it binds.
+    async fn window(&mut self) -> Window {
+        let wm_base = self.s.bind("xdg_wm_base", xdg_wm_base::VERSION).await;
+        let id = self.s.new_id();
+        let get_xdg_surface = xdg_wm_base::req::get_xdg_surface(wm_base, id, self.surface.id);
+        let host = self.s.create(get_xdg_surface).await;
+        let xdg_surface = Object { id, host };
+        let id = self.s.new_id();
+        self.s
+            .guest([xdg_surface::req::get_toplevel(xdg_surface.id, id)])
+            .await;
+        let host = self.s.host_received();
+        use xdg_surface::Request::GetToplevel;
+        let (toplevel, aura_toplevel) = match host[..] {
+            [(sender, AnyRequest::XdgSurface(GetToplevel { id: host }))]
+                if sender == xdg_surface.host =>
+            {
+                (host, None)
+            }
+            [(sender, AnyRequest::XdgSurface(GetToplevel { id: host })), (
+                _,
+                AnyRequest::ZauraShell(zaura_shell::Request::GetAuraToplevelForXdgToplevel {
+                    id: aura,
+                    toplevel,
+                }),
+            ), (
+                supports,
+                AnyRequest::ZauraToplevel(zaura_toplevel::Request::SetSupportsScreenCoordinates {}),
+            )] if sender == xdg_surface.host && toplevel == host && supports == aura => {
+                (host, Some(aura))
+            }
+            _ => panic!("the host got {host:?}"),
+        };
+        Window {
+            xdg_surface,
+            toplevel: Object { id, host: toplevel },
+            aura_toplevel,
+        }
+    }
+
+    /// The host's Aura toplevel configures `w` at `origin`, 640x480 and
+    /// activated, with a new `xdg_surface.configure`, which the guest
+    /// gets as an XDG configure.
+    async fn configured(&mut self, w: Window, origin: (i32, i32)) {
+        self.configure_serial += 1;
+        let serial = self.configure_serial;
+        let aura = w.aura_toplevel.expect("an Aura toplevel");
+        let states = activated();
+        let configure = zaura_toplevel::evt::configure(aura, origin.0, origin.1, 640, 480, &states);
+        self.s
+            .host([
+                configure.unwrap(),
+                xdg_surface::evt::configure(w.xdg_surface.host, serial),
+            ])
+            .await;
+        let configure = xdg_toplevel::Event::Configure {
+            width: 640,
+            height: 480,
+            states,
+        };
+        assert_eq!(
+            self.s.guest_received(),
+            [
+                (w.toplevel.id, configure.into()),
+                (
+                    w.xdg_surface.id,
+                    xdg_surface::Event::Configure { serial }.into()
+                ),
+            ]
+        );
+    }
+
+    /// The host answers placement barrier `callback`, and deletes it.
+    async fn barrier_done(&mut self, callback: u32) {
+        self.s
+            .host([
+                wl_callback::evt::done(callback, 0),
+                wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+            ])
+            .await;
+    }
+
+    /// The host sends the press of Q, which with Alt is the `<Alt>q`
+    /// chord, as key event `serial`, on the focused window `w`: the guest
+    /// gets nothing, and the host the placement's first step, which
+    /// restores `w` and ends with its barrier, and then the press's
+    /// acknowledgement. Returns the step and the barrier's callback.
+    async fn place(&mut self, w: Window, serial: u32) -> (Vec<(u32, AnyRequest)>, u32) {
+        self.s
+            .host([wl_keyboard::evt::key(
+                self.k.host,
+                serial,
+                serial,
+                KEY_Q,
+                PRESSED,
+            )])
+            .await;
+        assert_eq!(self.s.guest_received(), [], "the chord is consumed");
+        let mut host = self.s.host_received();
+        assert_eq!(host.pop(), Some(acked(self.k, serial, HANDLED)), "{host:?}");
+        let restore = match &host[..] {
+            [(_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { surface, .. })), restore @ ..]
+                if *surface == self.surface.host =>
+            {
+                restore
+            }
+            restore => restore,
+        };
+        let [(fullscreen, AnyRequest::XdgToplevel(xdg_toplevel::Request::UnsetFullscreen {})), (maximized, AnyRequest::XdgToplevel(xdg_toplevel::Request::UnsetMaximized {})), (WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            restore
+        else {
+            panic!("no placement: {host:?}");
+        };
+        assert_eq!(
+            (*fullscreen, *maximized),
+            (w.toplevel.host, w.toplevel.host)
+        );
+        let callback = *callback;
+        (host, callback)
+    }
+
+    /// Exo answers the placement step whose barrier is `callback` with
+    /// `w` at `from`, and the proxy moves it; Exo then reports it where
+    /// moved, which ends the placement. Returns where `w` went, `[x, y,
+    /// width, height]`, from the move and the size the guest's configure
+    /// gives it.
+    async fn finish(&mut self, w: Window, callback: u32, from: (i32, i32)) -> [i32; 4] {
+        self.configured(w, from).await;
+        self.barrier_done(callback).await;
+        assert_eq!(self.s.guest_received(), []);
+        let host = self.s.host_received();
+        let [(
+            aura_surface,
+            AnyRequest::ZauraSurface(zaura_surface::Request::SetParent { parent, x, y }),
+        ), (unset, AnyRequest::XdgToplevel(xdg_toplevel::Request::UnsetFullscreen {})), (WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+            host[..]
+        else {
+            panic!("no move: {host:?}");
+        };
+        assert_eq!((parent, unset), (aura_surface, w.toplevel.host));
+        let at = (from.0 + x, from.1 + y);
+        self.configured(w, at).await;
+        self.barrier_done(callback).await;
+        assert_eq!(self.s.host_received(), []);
+        let guest = self.s.guest_received();
+        let [(toplevel, AnyEvent::XdgToplevel(xdg_toplevel::Event::Configure { width, height, .. })), (xdg, AnyEvent::XdgSurface(xdg_surface::Event::Configure { serial }))] =
+            &guest[..]
+        else {
+            panic!("the window was not resized: {guest:?}");
+        };
+        assert_eq!(
+            (*toplevel, *xdg, *serial),
+            (w.toplevel.id, w.xdg_surface.id, self.configure_serial)
+        );
+        [at.0, at.1, *width, *height]
+    }
+
+    /// The class of `key`, pressed as key event `serial` on the focused
+    /// window `w`, from where it goes: a placement it starts is finished
+    /// ([`Self::finish`]).
+    async fn class(&mut self, w: Window, serial: u32, key: u32) -> Class {
+        self.s
+            .host([wl_keyboard::evt::key(
+                self.k.host,
+                serial,
+                serial,
+                key,
+                PRESSED,
+            )])
+            .await;
+        let guest = self.s.guest_received();
+        let mut host = self.s.host_received();
+        let ack = host.pop();
+        let delivered = [key_event(self.k, serial, serial, key, PRESSED)];
+        match ack {
+            Some(ack) if ack == acked(self.k, serial, HANDLED) && guest == delivered => {
+                assert_eq!(host, []);
+                Class::Guest
+            }
+            Some(ack) if ack == acked(self.k, serial, NOT_HANDLED) && guest.is_empty() => {
+                assert_eq!(host, []);
+                Class::HostAccelerator
+            }
+            Some(ack) if ack == acked(self.k, serial, HANDLED) && guest.is_empty() => {
+                let Some(&(_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))) =
+                    host.last()
+                else {
+                    panic!("a consumed chord placed nothing: {host:?}");
+                };
+                Class::Placed(self.finish(w, callback, (300, 200)).await)
+            }
+            _ => panic!("key {serial} went astray: the guest got {guest:?}, the host {host:?}"),
+        }
+    }
+}
+
+/// The `xdg_toplevel.configure` states of an activated window.
+fn activated() -> Vec<u8> {
+    xdg_toplevel::STATE_ACTIVATED.to_ne_bytes().to_vec()
 }
 
 /// The host `zcr_extended_keyboard_v1` the proxy creates for `k`, from
@@ -721,6 +787,12 @@ fn released(k: Keyboard) -> [(u32, AnyRequest); 2] {
 /// host text input of `ime`: the deactivate, and the sync that drains
 /// the events the host sent before it.
 fn deactivated(ime: Ime, host: &[(u32, AnyRequest)]) -> bool {
+    deactivation(ime, host).is_some()
+}
+
+/// The callback of the sync that drains `ime`'s deactivation, if `host`
+/// is what the host gets for it ([`deactivated`]).
+fn deactivation(ime: Ime, host: &[(u32, AnyRequest)]) -> Option<u32> {
     let deactivate = (
         ime.host,
         zwp_text_input_v1::Request::Deactivate {
@@ -728,11 +800,14 @@ fn deactivated(ime: Ime, host: &[(u32, AnyRequest)]) -> bool {
         }
         .into(),
     );
-    matches!(
-        host,
-        [first, (WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { .. }))]
-            if *first == deactivate
-    )
+    match host {
+        [first, (WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))]
+            if *first == deactivate =>
+        {
+            Some(*callback)
+        }
+        _ => None,
+    }
 }
 
 /// The guest's preedit `text`, with the cursor at its end.
@@ -761,17 +836,18 @@ fn v3_leave(ime: Ime, surface: u32) -> (u32, AnyEvent) {
     (ime.id, zwp_text_input_v3::Event::Leave { surface }.into())
 }
 
-/// The text-input `done` that closes the guest's first commit.
+/// The text-input `done` that closes the guest's latest commit.
 fn done(ime: Ime) -> (u32, AnyEvent) {
-    (ime.id, zwp_text_input_v3::Event::Done { serial: 1 }.into())
+    let serial = ime.serial;
+    (ime.id, zwp_text_input_v3::Event::Done { serial }.into())
 }
 
 // -----------------------------------------------------------------------
 // Chords
 // -----------------------------------------------------------------------
 
-#[test]
-fn chord_classification_follows_the_configuration() {
+#[tokio::test]
+async fn chord_classification_follows_the_configuration() {
     let none = crate::accelerator::HostAccelerators::default;
     let active = |bindings: &[(&str, &str)]| (none(), PlacementConfig::active_for_test(bindings));
     let nine = active(&[
@@ -818,94 +894,47 @@ fn chord_classification_follows_the_configuration() {
             host_accelerators: host_accelerators.clone(),
             ..crate::settings::Settings::for_test()
         };
-        let mut p = Proxy::with(Context::for_test(settings, placement.clone()));
-        p.keymap(KEYBOARD);
-        p.modifiers(KEYBOARD, modifiers);
+        let ctx = Context::for_test(settings, placement.clone());
+        let (mut kb, _) = Kb::placing(ctx, true).await;
+        let w = kb.window().await;
+        kb.modifiers(modifiers).await;
         assert_eq!(
-            p.classify(KEYBOARD, key),
+            kb.class(w, 2, key).await,
             class,
             "key {key} with modifiers {modifiers:#x}"
         );
     }
 }
 
-#[test]
-fn a_key_forms_no_chord_without_a_keymap_or_beyond_the_keycode_range() {
-    let mut p = Proxy::new();
-    let keyboard = HostId(KEYBOARD.host);
-    assert!(p.ctx.keys.keyboards().keymap_for_test(keyboard).is_none());
-    assert_eq!(
-        p.ctx.classify_key_for_test(keyboard, KEY_A),
-        KeyClass::Guest
-    );
-    p.keymap(KEYBOARD);
-    // XKB's keycode is the evdev keycode plus 8.
-    let keymap = p.ctx.keys.keyboards().keymap_for_test(keyboard).unwrap();
-    assert_eq!(keymap.chord(u32::MAX), None);
+/// A keyboard with no keymap yet classifies no chord, and a key beyond
+/// the keymap's keycode range (XKB's keycode is the evdev keycode plus 8)
+/// forms none.
+#[tokio::test]
+async fn a_key_forms_no_chord_without_a_keymap_or_beyond_the_keycode_range() {
+    let accelerators = crate::accelerator::parse_accelerators("a").unwrap();
+    let mut kb = Kb::unfocused(Context::new_for_test(false, false, accelerators)).await;
+    let id = kb.s.new_id();
+    let host =
+        kb.s.create(wl_seat::req::get_keyboard(kb.seat.id, id))
+            .await;
+    kb.k = Keyboard { id, host, ext: 0 };
+    let surface = kb.surface;
+    kb.k = kb.first_enter(kb.k, surface).await;
+    assert_eq!(kb.key(1, KEY_A, PRESSED).await, Route::Guest);
+    assert_eq!(kb.key(2, KEY_A, RELEASED).await, Route::Guest);
+
+    kb.keymap().await;
+    assert_eq!(kb.key(3, u32::MAX, PRESSED).await, Route::Guest);
+    assert_eq!(kb.key(4, KEY_A, PRESSED).await, Route::Host);
 }
 
 // -----------------------------------------------------------------------
 // Placement shortcuts
 // -----------------------------------------------------------------------
 
-/// The keyboard of the placement tests.
-const PLACING: Mapped = Mapped {
-    guest: 15,
-    host: 5,
-    extended: 50,
-    seat: 11,
-};
-
-/// The text input the placement tests compose in, on the placed surface.
-const PLACED_TEXT_INPUT: MappedTextInput = MappedTextInput {
-    guest: 43,
-    host: 143,
-    extended: 60,
-};
-
-/// The placed window: xdg_toplevel 13 (host 23) of wl_surface 12 (host
-/// 22), on whose output 25 Aura shell 24 places it.
-const PLACED_TOPLEVEL: u32 = 13;
-const PLACED_SURFACE: u32 = 12;
-const PLACED_HOST_SURFACE: u32 = 22;
-
-/// A 3840x2160 output whose Aura scales are known.
-fn placeable_output() -> OutputState {
-    OutputState {
-        mode_width: 3840,
-        mode_height: 2160,
-        aura_current_scale: Some(1000),
-        aura_device_scale_factor: Some(1000),
-        ..Default::default()
-    }
-}
-
-/// `PLACING` focused on the placed window on `output`, with `placement`
-/// configured and Alt held.
-fn placeable(placement: PlacementConfig, output: OutputState) -> Proxy {
-    let mut p = Proxy::with(Context::with_placement_for_test(placement));
-    p.map(PLACING);
-    p.surface(PLACED_SURFACE, PLACED_HOST_SURFACE);
-    p.ctx
-        .shadow_table
-        .insert_paired_for_test(PLACED_TOPLEVEL, 23, "xdg_toplevel");
-    p.ctx
-        .xdg_roles
-        .add_toplevel_role_for_test(1013, PLACED_SURFACE, PLACED_TOPLEVEL);
-    p.focus(PLACING, PLACED_SURFACE);
-    p.ctx.bind_aura_shell_for_test(24);
-    p.ctx.outputs.bind_for_test(25, output);
-    p.keymap(PLACING);
-    p.modifiers(PLACING, ALT);
-    p
-}
-
-/// [`placeable`] with `<Alt>q=top-left` configured.
-fn placeable_shortcut() -> Proxy {
-    placeable(
-        PlacementConfig::active_for_test(&[("<Alt>q", "top-left")]),
-        placeable_output(),
-    )
+/// The `<Alt>q=top-left` placement, which is on.
+fn top_left() -> Context {
+    Context::with_placement_for_test(PlacementConfig::active_for_test(&[("<Alt>q", "top-left")]))
 }
 
 /// A placement configuration whose bindings come from a file in `dir`,
@@ -918,181 +947,96 @@ fn file_placement(
     crate::placement_config::BindingsFile::loaded_for_test(&path)
 }
 
-/// The placed window's host xdg_toplevel.
-const PLACED_HOST_TOPLEVEL: u32 = 23;
-
-/// How many placements of the placed window were queued: each starts
-/// with `xdg_toplevel.unset_maximized`.
-fn placements_started(ctx: &Context) -> usize {
-    ctx.client_to_host_queue
-        .iter()
-        .filter(|(message, _)| {
-            msg_sender(message) == PLACED_HOST_TOPLEVEL
-                && msg_opcode(message) == xdg_toplevel::REQ_UNSET_MAXIMIZED
-        })
-        .count()
-}
-
-/// The placement in flight for the placed window.
-fn placement_in_flight(ctx: &Context) -> Option<crate::state::Placement> {
-    ctx.placement()?
-        .placement(crate::state::GuestId(PLACED_TOPLEVEL))
-}
-
-/// How many placements were queued, and the `[x, y, width, height]` of
-/// the one in flight.
-fn queued_bounds(ctx: &Context) -> (usize, Option<[i32; 4]>) {
-    let target = placement_in_flight(ctx).map(|placement| {
-        let bounds = placement.target;
-        [bounds.x, bounds.y, bounds.width, bounds.height]
-    });
-    (placements_started(ctx), target)
-}
-
-/// No placement was queued.
-const NOT_PLACED: (usize, Option<[i32; 4]>) = (0, None);
-
-/// Where the `<Alt>q=top-left` placement puts the placed window.
-const TOP_LEFT_BOUNDS: (usize, Option<[i32; 4]>) = (1, Some([0, 0, 1920, 1080]));
-
-/// The host completes internal callback `callback`.
-fn complete_callback(ctx: &mut Context, callback: HostId) {
-    use crate::protocols::wayland::wl_callback::WlCallbackHandler;
-    ctx.last_sender_id = callback.0;
-    assert_eq!(crate::handler::Handlers::on_done(ctx, 0), Action::Drop);
-}
-
-/// `PLACED_TEXT_INPUT`, composing a preedit on the placed surface.
-fn compose_on_placed_surface(p: &mut Proxy) {
-    p.text_input_showing(PLACED_TEXT_INPUT, PLACING.seat, PLACED_SURFACE, Some("한"));
-    // Text-input activation requests name the host seat.
-    p.ctx
-        .shadow_table
-        .insert_paired_for_test(PLACING.seat, 70, "wl_seat");
-}
-
 /// A matched chord belongs to Sommelier while the policy is active, so
 /// it is consumed even when placement has to be skipped. The skip leaves
-/// no Aura objects or barriers behind.
-#[test]
-fn placement_chord_is_consumed_while_aura_scale_metadata_is_incomplete() {
+/// no Aura objects or barriers behind: the host gets only the keys'
+/// acknowledgements.
+#[tokio::test]
+async fn placement_chord_is_consumed_while_aura_scale_metadata_is_incomplete() {
     // The device scale event has not arrived yet.
-    let output = OutputState {
-        aura_device_scale_factor: None,
-        ..placeable_output()
-    };
-    let mut p = placeable(
-        PlacementConfig::active_for_test(&[("<Alt>q", "top-left")]),
-        output,
-    );
-    assert_eq!(p.classify(PLACING, KEY_Q), placed("top-left"));
+    let (mut kb, _) = Kb::placing(top_left(), false).await;
+    kb.window().await;
+    kb.modifiers(ALT).await;
 
     assert_eq!(
-        p.key(PLACING, 1, 100, KEY_Q, PRESSED),
-        Action::Drop,
+        kb.key(1, KEY_Q, PRESSED).await,
+        Route::Consumed,
         "a skipped placement must not leak the chord to the guest"
     );
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
-    assert_eq!(p.key(PLACING, 2, 101, KEY_Q, RELEASED), Action::Drop);
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
-    assert_eq!(
-        p.ctx.placement().map_or(0, |state| state.toplevel_count()),
-        0
-    );
-    assert_eq!(p.ctx.aura_surfaces.count(), 0);
-    assert_eq!(p.ctx.internal_callbacks.count(), 0);
-    assert!(
-        p.ctx
-            .client_to_host_queue
-            .iter()
-            .all(|(message, _)| msg_sender(message) == PLACING.extended),
-        "only keyboard acknowledgments may be queued when placement lacks geometry"
-    );
+    assert_eq!(kb.key(2, KEY_Q, RELEASED).await, Route::Consumed);
 }
 
-#[test]
-fn placement_is_skipped_rather_than_moved_to_another_output() {
-    let mut p = placeable_shortcut();
-    let entered_output = 26;
-    p.ctx.outputs.bind_for_test(
-        entered_output,
-        OutputState {
-            origin_x: 3840,
-            mode_width: 1920,
-            mode_height: 1080,
-            aura_current_scale: Some(1000),
-            // The device scale event for this output has not arrived.
-            ..Default::default()
-        },
-    );
-    p.ctx
-        .outputs
-        .surface_entered(PLACED_HOST_SURFACE, entered_output);
-    assert!(
-        p.ctx.outputs.primary().is_some(),
-        "another output is usable, but the surface is not on it"
-    );
+/// The focused surface entered an output that cannot place it yet, so
+/// placement is skipped, though another output could.
+#[tokio::test]
+async fn placement_is_skipped_rather_than_moved_to_another_output() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    kb.window().await;
+    let (entered_output, aura_output) = kb.output().await;
+    // The device scale event for this output has not arrived.
+    kb.measure(entered_output, aura_output, 1920, false).await;
+    let surface = kb.surface;
+    kb.s.host([wl_surface::evt::enter(surface.host, entered_output.host)])
+        .await;
+    let enter = wl_surface::Event::Enter {
+        output: entered_output.id,
+    };
+    assert_eq!(kb.s.guest_received(), [(surface.id, enter.into())]);
+    kb.modifiers(ALT).await;
 
-    assert_eq!(
-        place_focused(&mut p.ctx, HostId(PLACING.host), preset("top-left")),
-        Err(PlacementSkip::NoUsableOutput)
-    );
-    assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    assert_eq!(queued_bounds(&p.ctx), NOT_PLACED);
+    assert_eq!(kb.key(2, KEY_Q, PRESSED).await, Route::Consumed);
 }
 
 /// The press and release of a matched chord stay with Sommelier
 /// even when its placement is skipped, for every reason to skip it.
-#[test]
-fn a_skipped_placement_still_consumes_its_chord() {
+#[tokio::test]
+async fn a_skipped_placement_still_consumes_its_chord() {
     let dir = crate::test_support::TempDir::new("keyboard-sliver");
-    // 0.0001 of the 3840-pixel work area floors onto the left border.
-    let sliver = NormalizedRect::new(0.0001, 0.0, 0.9999, 1.0).unwrap();
-    let mut no_toplevel = placeable_shortcut();
-    // The focused surface is not (or no longer) an xdg_toplevel.
-    no_toplevel.ctx.xdg_roles = crate::state::XdgRoles::default();
+    // 0.0001 of the 1920-pixel work area floors onto the left border.
     let sliver_binding =
         b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.0001, 0.0, 0.9999, 1.0]\n";
-    let mut no_shell = placeable_shortcut();
-    no_shell
-        .ctx
-        .singletons
-        .unbind_for_test(Singleton::AuraShell);
-    let cases = [
-        (
-            no_toplevel,
-            preset("top-left"),
-            PlacementSkip::NoFocusedToplevel,
-        ),
-        (
-            placeable(file_placement(&dir, sliver_binding).1, placeable_output()),
-            sliver,
-            PlacementSkip::RectNotRepresentable,
-        ),
-        (no_shell, preset("top-left"), PlacementSkip::NoAuraToplevel),
-    ];
-    for (mut p, action, skip) in cases {
+    for skip in [
+        PlacementSkip::NoFocusedToplevel,
+        PlacementSkip::RectNotRepresentable,
+        PlacementSkip::NoAuraToplevel,
+    ] {
+        let mut kb = match skip {
+            // The focused surface is not an xdg_toplevel.
+            PlacementSkip::NoFocusedToplevel => Kb::placing(top_left(), true).await.0,
+            PlacementSkip::RectNotRepresentable => {
+                let placement = file_placement(&dir, sliver_binding).1;
+                let ctx = Context::with_placement_for_test(placement);
+                let mut kb = Kb::placing(ctx, true).await.0;
+                kb.window().await;
+                kb
+            }
+            // The host removed its Aura shell before the window, which
+            // has no Aura toplevel.
+            _ => {
+                let (mut kb, shell) = Kb::placing(top_left(), true).await;
+                let registry = kb.s.registry().await;
+                kb.s.host([wl_registry::evt::global_remove(registry.host, shell)])
+                    .await;
+                let removed = wl_registry::Event::GlobalRemove { name: shell };
+                assert_eq!(kb.s.guest_received(), [(registry.id, removed.into())]);
+                let release = kb.s.host_received();
+                assert!(
+                    matches!(
+                        &release[..],
+                        [(_, AnyRequest::ZauraShell(zaura_shell::Request::Release {}))]
+                    ),
+                    "{release:?}"
+                );
+                let w = kb.window().await;
+                assert_eq!(w.aura_toplevel, None);
+                kb
+            }
+        };
+        kb.modifiers(ALT).await;
+        assert_eq!(kb.key(2, KEY_Q, PRESSED).await, Route::Consumed, "{skip:?}");
         assert_eq!(
-            place_focused(&mut p.ctx, HostId(PLACING.host), action),
-            Err(skip)
-        );
-        assert_eq!(
-            p.key(PLACING, 2, 100, KEY_Q, PRESSED),
-            Action::Drop,
-            "{skip:?}"
-        );
-        assert_eq!(queued_bounds(&p.ctx), NOT_PLACED, "{skip:?}");
-        assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut), "{skip:?}");
-        assert_eq!(
-            p.key(PLACING, 3, 160, KEY_Q, RELEASED),
-            Action::Drop,
-            "{skip:?}"
-        );
-        assert_eq!(p.owner(PLACING, KEY_Q), None, "{skip:?}");
-        assert_eq!(p.ctx.internal_callbacks.count(), 0, "{skip:?}");
-        assert_eq!(
-            p.ctx.placement().map_or(0, |state| state.toplevel_count()),
-            0,
+            kb.key(3, KEY_Q, RELEASED).await,
+            Route::Consumed,
             "{skip:?}"
         );
     }
@@ -1112,343 +1056,314 @@ fn a_skipped_placement_still_consumes_its_chord() {
 /// happens, takes effect on the next press; the key path never reads
 /// the file. A key already captured as a shortcut stays captured until
 /// its release.
-#[test]
-fn a_bindings_file_edit_takes_effect_on_the_next_press() {
+#[tokio::test]
+async fn a_bindings_file_edit_takes_effect_on_the_next_press() {
     let dir = crate::test_support::TempDir::new("keyboard-shortcut-reload");
     let (mut file, placement) = file_placement(&dir, b"version = 1\n");
-    let mut p = placeable(placement, placeable_output());
+    let (mut kb, _) = Kb::placing(Context::with_placement_for_test(placement), true).await;
+    let w = kb.window().await;
+    kb.modifiers(ALT).await;
     assert_eq!(
-        p.classify(PLACING, KEY_Q),
-        Class::Guest,
+        kb.key(1, KEY_Q, PRESSED).await,
+        Route::Guest,
         "the file binds nothing"
     );
+    assert_eq!(kb.key(2, KEY_Q, RELEASED).await, Route::Guest);
 
     dir.write(
         "window-placement.toml",
         b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.25, 0.0, 0.5, 1.0]\n",
     );
     assert_eq!(
-        p.classify(PLACING, KEY_Q),
-        Class::Guest,
+        kb.key(3, KEY_Q, PRESSED).await,
+        Route::Guest,
         "only a reload adopts an edit"
     );
+    assert_eq!(kb.key(4, KEY_Q, RELEASED).await, Route::Guest);
     // What the watcher does as the file changes.
     file.reload();
+    // The new chord is consumed by the compositor.
+    let (_, callback) = kb.place(w, 5).await;
     assert_eq!(
-        p.key(PLACING, 1, 100, KEY_Q, PRESSED),
-        Action::Drop,
-        "the new chord is consumed by the compositor"
+        kb.finish(w, callback, (300, 200)).await,
+        [480, 0, 960, 1032]
     );
-    assert_eq!(queued_bounds(&p.ctx), (1, Some([960, 0, 1920, 2160])));
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
 
     // Removing the binding while the key is held still suppresses the
     // matching release: ownership, not the binding, owns the release.
     dir.write("window-placement.toml", b"version = 1\n");
     file.reload();
-    assert_eq!(p.key(PLACING, 2, 101, KEY_Q, RELEASED), Action::Drop);
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
-    p.ctx.client_to_host_queue.clear();
+    assert_eq!(kb.key(6, KEY_Q, RELEASED).await, Route::Consumed);
     assert_eq!(
-        p.key(PLACING, 3, 102, KEY_Q, PRESSED),
-        Action::Forward,
+        kb.key(7, KEY_Q, PRESSED).await,
+        Route::Guest,
         "a removed binding is delivered to the guest"
     );
-    assert_eq!(placements_started(&p.ctx), 0);
 }
 
-#[test]
-fn peeked_placement_chord_is_not_an_ime_recovery_candidate() {
-    let mut p = placeable_shortcut();
-    let keyboard = HostId(PLACING.host);
+/// A placement chord's peek, which comes before its `wl_keyboard` press,
+/// makes it no candidate of IME recovery: an empty confirmation then
+/// replays nothing, and the press places the window.
+#[tokio::test]
+async fn peeked_placement_chord_is_not_an_ime_recovery_candidate() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    let w = kb.window().await;
+    let ime = kb.text_input().await;
+    kb.modifiers(ALT).await;
 
-    // peek_key reports the physical press before the wl_keyboard event
-    // for the same generation.
-    assert_eq!(p.peek(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    assert!(
-        p.ctx
-            .keys
-            .peek(keyboard, KEY_Q)
-            .is_some_and(|press| !press.eligible),
+    kb.peek(2, 100, KEY_Q, PRESSED).await;
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [],
         "a placement chord must never become an IME recovery candidate"
     );
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
 
-    assert_eq!(
-        p.key(PLACING, 2, 100, KEY_Q, PRESSED),
-        Action::Drop,
-        "the chord stays Sommelier's"
-    );
-    assert_eq!(
-        queued_bounds(&p.ctx),
-        TOP_LEFT_BOUNDS,
-        "the window is placed"
-    );
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
-
-    assert_eq!(p.peek(PLACING, 3, 101, KEY_Q, RELEASED), Action::Drop);
-    assert_eq!(p.key(PLACING, 3, 101, KEY_Q, RELEASED), Action::Drop);
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
+    // The chord stays Sommelier's, and the window is placed.
+    let (_, callback) = kb.place(w, 2).await;
+    kb.peek(3, 101, KEY_Q, RELEASED).await;
+    assert_eq!(kb.key(3, KEY_Q, RELEASED).await, Route::Consumed);
+    assert_eq!(kb.finish(w, callback, (300, 200)).await, bounds("top-left"));
 }
 
 /// The host IME consumed the chord, so no `wl_keyboard.key` arrives.
 /// The chord is neither placed (placement runs only on
 /// `wl_keyboard.key`) nor delivered to the guest.
-#[test]
-fn placement_chord_consumed_by_the_host_ime_is_neither_placed_nor_delivered() {
-    let mut p = placeable_shortcut();
-    compose_on_placed_surface(&mut p);
-    let guest_messages = p.ctx.host_to_client_queue.len();
+#[tokio::test]
+async fn placement_chord_consumed_by_the_host_ime_is_neither_placed_nor_delivered() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    kb.window().await;
+    let ime = kb.text_input().await;
+    kb.compose(ime, "한").await;
+    kb.modifiers(ALT).await;
 
-    assert_eq!(p.peek(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    assert_eq!(p.peek(PLACING, 3, 101, KEY_Q, RELEASED), Action::Drop);
-
-    assert_eq!(
-        p.ctx.host_to_client_queue.len(),
-        guest_messages,
-        "nothing reaches the guest"
-    );
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
-    assert_eq!(queued_bounds(&p.ctx), NOT_PLACED);
-    assert_eq!(
-        p.ctx.placement().map_or(0, |state| state.toplevel_count()),
-        0
-    );
+    // Neither peek reaches a peer.
+    kb.peek(2, 100, KEY_Q, PRESSED).await;
+    kb.peek(3, 101, KEY_Q, RELEASED).await;
 }
 
-#[test]
-fn duplicate_shortcut_press_does_not_queue_another_placement() {
-    let mut p = placeable_shortcut();
-    assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    assert_eq!(queued_bounds(&p.ctx), TOP_LEFT_BOUNDS);
-    let barriers = p.ctx.internal_callbacks.count();
+#[tokio::test]
+async fn duplicate_shortcut_press_does_not_queue_another_placement() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    let w = kb.window().await;
+    kb.modifiers(ALT).await;
+    let (_, callback) = kb.place(w, 2).await;
 
     assert_eq!(
-        p.key(PLACING, 2, 130, KEY_Q, PRESSED),
-        Action::Drop,
-        "a duplicate press of a consumed shortcut stays consumed"
+        kb.key(2, KEY_Q, PRESSED).await,
+        Route::Consumed,
+        "a duplicate press of a consumed shortcut stays consumed, and places nothing"
     );
-    assert_eq!(
-        queued_bounds(&p.ctx),
-        TOP_LEFT_BOUNDS,
-        "a duplicate press must not place the window again"
-    );
-    assert_eq!(p.ctx.internal_callbacks.count(), barriers);
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
-
-    assert_eq!(p.key(PLACING, 3, 160, KEY_Q, RELEASED), Action::Drop);
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
+    assert_eq!(kb.key(3, KEY_Q, RELEASED).await, Route::Consumed);
+    assert_eq!(kb.finish(w, callback, (300, 200)).await, bounds("top-left"));
 }
 
-#[test]
-fn peek_after_consumed_shortcut_press_is_not_an_ime_recovery_candidate() {
-    let mut p = placeable_shortcut();
-    let keyboard = HostId(PLACING.host);
-    assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    assert_eq!(queued_bounds(&p.ctx), TOP_LEFT_BOUNDS);
+#[tokio::test]
+async fn peek_after_consumed_shortcut_press_is_not_an_ime_recovery_candidate() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    let w = kb.window().await;
+    let ime = kb.text_input().await;
+    kb.modifiers(ALT).await;
+    let (_, callback) = kb.place(w, 2).await;
 
     // The extension's peek for the same generation trails the
     // wl_keyboard press.
-    assert_eq!(p.peek(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    assert!(
-        p.ctx
-            .keys
-            .peek(keyboard, KEY_Q)
-            .is_some_and(|press| !press.eligible),
-        "a consumed shortcut generation must not be recoverable"
-    );
+    kb.peek(2, 100, KEY_Q, PRESSED).await;
     // An empty IME confirmation never replays a shortcut's key
     // (`ime_recovery_does_not_replay_a_compositor_shortcut_key`).
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [],
+        "a consumed shortcut generation must not be recoverable"
+    );
 
-    assert_eq!(p.peek(PLACING, 3, 101, KEY_Q, RELEASED), Action::Drop);
-    assert_eq!(p.key(PLACING, 3, 101, KEY_Q, RELEASED), Action::Drop);
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
+    kb.peek(3, 101, KEY_Q, RELEASED).await;
+    assert_eq!(kb.key(3, KEY_Q, RELEASED).await, Route::Consumed);
+    assert_eq!(kb.finish(w, callback, (300, 200)).await, bounds("top-left"));
 }
 
 /// Placement moves a window with `zaura_surface.set_parent` and sizes
 /// it with a configure, so it never changes the surface's application
 /// ID (an ARC ID would make Chrome bypass the IME) and never touches
-/// the focused IME generation, an in-progress composition included.
-#[test]
-fn placement_shortcuts_leave_the_focused_ime_generation_untouched() {
-    let mut p = placeable_shortcut();
-    compose_on_placed_surface(&mut p);
-    let t = PLACED_TEXT_INPUT;
-    let before = text_input::snapshot(&p.ctx, t.guest);
-    // Exo reports the window at (100, 50), with xdg_surface 1013's
-    // configure serial 1.
-    let aura_toplevel = attach_toplevel(&mut p.ctx, PLACED_TOPLEVEL).expect("an Aura toplevel");
-    translate_aura_configure(&mut p.ctx, aura_toplevel, 100, 50, 800, 600, &[]);
-    surface_configured(&mut p.ctx, 1013, 1);
+/// the focused IME generation, an in-progress composition included:
+/// the steps are all the host gets, and the guest's text input gets
+/// nothing until the composition goes on.
+#[tokio::test]
+async fn placement_shortcuts_leave_the_focused_ime_generation_untouched() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    let w = kb.window().await;
+    let ime = kb.text_input().await;
+    kb.compose(ime, "한").await;
+    kb.modifiers(ALT).await;
 
-    for (serial, time) in [(2, 100), (4, 200)] {
-        assert_eq!(p.key(PLACING, serial, time, KEY_Q, PRESSED), Action::Drop);
-        assert_eq!(
-            p.key(PLACING, serial + 1, time + 1, KEY_Q, RELEASED),
-            Action::Drop
-        );
-        // Restore, then move: Exo reports the window at the target.
-        for origin in [None, Some((0, 0))] {
-            if let Some((x, y)) = origin {
-                translate_aura_configure(&mut p.ctx, aura_toplevel, x, y, 800, 600, &[]);
-            }
-            let barrier = placement_in_flight(&p.ctx)
-                .expect("each step waits on a barrier")
-                .barrier;
-            complete_callback(&mut p.ctx, barrier);
-        }
-        assert_eq!(placement_in_flight(&p.ctx), None, "the window is placed");
+    for serial in [2, 4] {
+        let (_, callback) = kb.place(w, serial).await;
+        assert_eq!(kb.key(serial + 1, KEY_Q, RELEASED).await, Route::Consumed);
+        // Exo reports the window at (100, 50) before each.
+        assert_eq!(kb.finish(w, callback, (100, 50)).await, bounds("top-left"));
     }
-    assert_eq!(placements_started(&p.ctx), 2);
-    let aura_surface = p
-        .ctx
-        .aura_surfaces
-        .get(PLACED_HOST_SURFACE)
-        .expect("placement must create the Aura surface");
-    let moves = p.ctx.client_to_host_queue.iter().filter(|(message, _)| {
-        msg_sender(message) == aura_surface && msg_opcode(message) == zaura_surface::REQ_SET_PARENT
-    });
-    assert_eq!(moves.count(), 2, "each placement moves the window");
-    assert!(
-        p.ctx
-            .client_to_host_queue
-            .iter()
-            .all(
-                |(message, _)| msg_opcode(message) != zaura_surface::REQ_SET_APPLICATION_ID
-                    || msg_sender(message) != aura_surface
-            ),
-        "placement must not change the application ID"
-    );
-    assert!(
-        p.ctx
-            .client_to_host_queue
-            .iter()
-            .all(|(message, _)| ![t.host, t.extended].contains(&msg_sender(message))),
-        "placement must not reset, deactivate, or replay host text input"
-    );
-    assert!(
-        p.ctx
-            .host_to_client_queue
-            .iter()
-            .all(|(message, _)| msg_sender(message) != t.guest),
-        "placement must not synthesize guest text-input focus or editor events"
-    );
-    assert_eq!(text_input::snapshot(&p.ctx, t.guest), before);
+
+    // The composition goes on, on the focused surface.
+    kb.confirm(ime).await;
     assert_eq!(
-        p.ctx.keyboard_focus.surface_for_seat(PLACING.seat),
-        Some(PLACED_SURFACE)
+        kb.s.guest_received(),
+        [v3_preedit(ime, ""), v3_commit(ime, "한"), done(ime)]
     );
 }
 
-#[test]
-fn focus_leave_during_consumed_shortcut_does_not_swallow_the_next_press() {
-    let mut p = placeable_shortcut();
-    assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(Shortcut));
+#[tokio::test]
+async fn focus_leave_during_consumed_shortcut_does_not_swallow_the_next_press() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    let w = kb.window().await;
+    kb.modifiers(ALT).await;
+    let (_, callback) = kb.place(w, 2).await;
 
     // Focus leaves before the chord's release, which the old surface
     // will never receive. The consumed generation must not survive and
     // swallow the first press after focus returns.
-    assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Drop);
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
+    let surface = kb.surface;
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 3, surface.host)])
+        .await;
+    assert_eq!(kb.s.guest_received(), [left(kb.k, 3, surface.id)]);
     // Exo sends the released Alt before the enter.
-    p.modifiers(PLACING, 0);
-    assert_eq!(p.enter(PLACING, PLACED_HOST_SURFACE, &[]), Action::Drop);
+    kb.modifiers(0).await;
+    let enter = wl_keyboard::evt::enter(kb.k.host, 5, surface.host, &[]).unwrap();
+    kb.s.host([enter]).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [entered(kb.k, 5, surface.id, &[]), modifiers(kb.k, 5, 0)]
+    );
 
     assert_eq!(
-        p.key(PLACING, 6, 300, KEY_Q, PRESSED),
-        Action::Forward,
+        kb.key(6, KEY_Q, PRESSED).await,
+        Route::Guest,
         "a plain press after focus returns is ordinary guest input"
     );
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(Physical));
-    assert_eq!(p.key(PLACING, 7, 301, KEY_Q, RELEASED), Action::Forward);
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
-    assert_eq!(queued_bounds(&p.ctx), TOP_LEFT_BOUNDS);
+    assert_eq!(kb.key(7, KEY_Q, RELEASED).await, Route::Guest);
+    assert_eq!(kb.finish(w, callback, (300, 200)).await, bounds("top-left"));
 }
 
-#[test]
-fn chord_key_held_across_refocus_is_released_to_the_guest_that_saw_it() {
-    let mut p = placeable_shortcut();
-    assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
+#[tokio::test]
+async fn chord_key_held_across_refocus_is_released_to_the_guest_that_saw_it() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    let w = kb.window().await;
+    kb.modifiers(ALT).await;
+    let (_, callback) = kb.place(w, 2).await;
 
     // The host re-enters with the chord key still held. The re-sent
     // enter's keys array reports it pressed to the guest, so its later
     // release belongs to the guest rather than to the consumed shortcut.
-    assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Drop);
+    let surface = kb.surface;
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 3, surface.host)])
+        .await;
+    assert_eq!(kb.s.guest_received(), [left(kb.k, 3, surface.id)]);
+    let keys = KEY_Q.to_ne_bytes();
+    let enter = wl_keyboard::evt::enter(kb.k.host, 4, surface.host, &keys).unwrap();
+    kb.s.host([enter]).await;
     assert_eq!(
-        p.enter(PLACING, PLACED_HOST_SURFACE, &[KEY_Q]),
-        Action::Drop
+        kb.s.guest_received(),
+        [
+            entered(kb.k, 4, surface.id, &[KEY_Q]),
+            modifiers(kb.k, 4, ALT)
+        ]
     );
-    assert_eq!(p.owner(PLACING, KEY_Q), Some(Physical));
-    assert_eq!(p.key(PLACING, 5, 101, KEY_Q, RELEASED), Action::Forward);
-    assert_eq!(p.owner(PLACING, KEY_Q), None);
-    assert_eq!(queued_bounds(&p.ctx), TOP_LEFT_BOUNDS);
+    assert_eq!(kb.key(5, KEY_Q, RELEASED).await, Route::Guest);
+    assert_eq!(kb.finish(w, callback, (300, 200)).await, bounds("top-left"));
 }
 
-#[test]
-fn ime_focus_churn_inside_a_placement_barrier_keeps_both_barriers_separate() {
-    use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::ZwpTextInputV3Handler;
+/// A host focus cycle that lands while a placement's barrier is pending
+/// drains the host IME generation through a barrier of its own, which
+/// activates the text input again without ending the placement, whose
+/// barrier then moves the window.
+#[tokio::test]
+async fn ime_focus_churn_inside_a_placement_barrier_keeps_both_barriers_separate() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    let w = kb.window().await;
+    let mut ime = kb.text_input().await;
+    kb.compose(ime, "한").await;
+    kb.modifiers(ALT).await;
+    let (_, placement_barrier) = kb.place(w, 2).await;
 
-    let mut p = placeable_shortcut();
-    compose_on_placed_surface(&mut p);
-    let t = PLACED_TEXT_INPUT;
-    assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    let placement_barrier = placement_in_flight(&p.ctx)
-        .expect("placement must wait on a barrier")
-        .barrier;
-
-    // A real host focus cycle lands while the placement barrier is
-    // pending. It drains the host IME generation through its own
-    // text-input barrier and the guest re-enables on the new enter.
-    assert_eq!(p.leave(PLACING, PLACED_HOST_SURFACE), Action::Drop);
-    let state = text_input::view(&p.ctx, t.guest);
-    let Host::Draining(ime_barrier) = state.host else {
-        panic!("focus leave must drain the host IME generation: {state:?}");
-    };
+    // The leave commits the preedit, and drains the host IME generation.
+    let surface = kb.surface;
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 3, surface.host)])
+        .await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [
+            v3_preedit(ime, ""),
+            v3_commit(ime, "한"),
+            done(ime),
+            left(kb.k, 3, surface.id),
+            v3_leave(ime, surface.id),
+        ]
+    );
+    let host = kb.s.host_received();
+    let ime_barrier = deactivation(ime, &host).expect("focus leave must drain the host IME");
     assert_ne!(ime_barrier, placement_barrier);
-    assert_eq!(state.preedit, None);
-    assert_eq!(p.enter(PLACING, PLACED_HOST_SURFACE, &[]), Action::Drop);
-    p.ctx.last_sender_id = t.guest;
-    assert_eq!(Handlers::on_enable(&mut p.ctx), Action::Drop);
-    assert_eq!(Handlers::on_commit(&mut p.ctx), Action::Drop);
-    assert_ne!(text_input::view(&p.ctx, t.guest).host, Host::Active);
-
-    // The IME barrier reactivates text input without retiring the
-    // placement barrier.
-    let queued_before = p.ctx.client_to_host_queue.len();
-    complete_callback(&mut p.ctx, ime_barrier);
-    assert_eq!(text_input::view(&p.ctx, t.guest).host, Host::Active);
-    // The activation, then the committed content type it replays.
-    let (activate, _) = &p.ctx.client_to_host_queue[queued_before];
+    // The guest enables again on the new enter.
+    let enter = wl_keyboard::evt::enter(kb.k.host, 4, surface.host, &[]).unwrap();
+    kb.s.host([enter]).await;
     assert_eq!(
-        decode(
-            activate,
-            &mut Default::default(),
-            zwp_text_input_v1::Request::from_wire
-        ),
-        Ok((
-            t.host,
-            zwp_text_input_v1::Request::Activate {
-                seat: 70,
-                surface: PLACED_HOST_SURFACE
+        kb.s.guest_received(),
+        [
+            entered(kb.k, 4, surface.id, &[]),
+            modifiers(kb.k, 4, ALT),
+            v3_enter(ime, surface.id)
+        ]
+    );
+    kb.s.guest([
+        zwp_text_input_v3::req::enable(ime.id),
+        zwp_text_input_v3::req::commit(ime.id),
+    ])
+    .await;
+    ime.serial = 2;
+    assert_eq!(kb.s.guest_received(), [done(ime)]);
+    // The enable resets the host's state, but activates nothing while
+    // the drain is pending. Exo's display answers the reset's barrier.
+    for (_, request) in kb.s.host_received() {
+        match request {
+            AnyRequest::ZwpTextInputV1(zwp_text_input_v1::Request::Activate { .. }) => {
+                panic!("an activation while the drain is pending")
             }
-        ))
-    );
-    assert!(placement_in_flight(&p.ctx).is_some());
+            AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) => {
+                kb.barrier_done(callback).await;
+            }
+            _ => {}
+        }
+    }
 
-    // The placement barrier then retires without disturbing the fresh
-    // IME generation.
-    let host_queue_len = p.ctx.client_to_host_queue.len();
-    let state_after_activation = text_input::snapshot(&p.ctx, t.guest);
-    // Exo has reported no origin here, so the placement ends.
-    complete_callback(&mut p.ctx, placement_barrier);
-    assert_eq!(placement_in_flight(&p.ctx), None);
-    assert_eq!(p.ctx.client_to_host_queue.len(), host_queue_len);
+    // The IME barrier activates the text input again.
+    kb.barrier_done(ime_barrier).await;
+    let host = kb.s.host_received();
+    let activate = zwp_text_input_v1::Request::Activate {
+        seat: ime.host_seat,
+        surface: surface.host,
+    };
+    assert_eq!(host.first(), Some(&(ime.host, activate.into())), "{host:?}");
+    assert_eq!(kb.s.guest_received(), []);
+
+    // The placement goes on: its barrier moves the window, and leaves
+    // the fresh IME generation alone.
     assert_eq!(
-        text_input::snapshot(&p.ctx, t.guest),
-        state_after_activation
+        kb.finish(w, placement_barrier, (300, 200)).await,
+        bounds("top-left")
     );
+}
+
+/// A chord's placement reaches the host before the chord's `ack_key`, as
+/// Sommelier acts on a shortcut before it acknowledges its key.
+#[tokio::test]
+async fn a_shortcut_places_before_its_key_is_acknowledged() {
+    let (mut kb, _) = Kb::placing(top_left(), true).await;
+    let w = kb.window().await;
+    kb.modifiers(ALT).await;
+    // The placement's step, then the acknowledgement.
+    let (step, callback) = kb.place(w, 2).await;
+    let ext = kb.k.ext;
+    assert!(step.iter().all(|(sender, _)| *sender != ext), "{step:?}");
+    assert_eq!(kb.finish(w, callback, (300, 200)).await, bounds("top-left"));
 }
 
 // -----------------------------------------------------------------------
@@ -1456,15 +1371,20 @@ fn ime_focus_churn_inside_a_placement_barrier_keeps_both_barriers_separate() {
 // -----------------------------------------------------------------------
 
 /// The proxy maps a keymap, rather than reading it, so it loads from a
-/// memfd whose offset the host left at its end. It compiles to the
-/// keycodes and modifier masks the tests name.
-#[test]
-fn keymap_loads_from_non_rewound_memfd() {
-    let mut p = Proxy::new();
-    p.keymap(KEYBOARD);
+/// memfd whose offset the host left at its end, as the session's host
+/// sends it: a chord then classifies. It compiles to the keycodes and
+/// modifier masks the tests name.
+#[tokio::test]
+async fn keymap_loads_from_non_rewound_memfd() {
+    let mut kb = Kb::with_accelerators("<Control>a").await;
+    kb.modifiers(CONTROL).await;
+    assert_eq!(kb.key(2, KEY_A, PRESSED).await, Route::Host);
 
-    let keyboard = HostId(KEYBOARD.host);
-    let keymap = p.ctx.keys.keyboards().keymap_for_test(keyboard).unwrap();
+    // Reads state no peer can observe: the compiled keymap, which the
+    // test's constants name.
+    let keyboard = HostId(kb.k.host);
+    let ctx = kb.s.ctx();
+    let keymap = ctx.keys.keyboards().keymap_for_test(keyboard).unwrap();
     let state = keymap.state();
     for (sym, key) in [
         (keysyms::KEY_q, KEY_Q),
@@ -1535,59 +1455,48 @@ fn unusable_keymaps() -> [(&'static str, u32, Vec<u8>, u32); 9] {
 /// A keymap the proxy cannot use replaces the loaded one: it is
 /// forwarded, and the keyboard's XKB state goes, so that no chord is
 /// classified until a usable keymap arrives. The keys held and their
-/// generations, with their accelerator suppressions, the keyboard's
+/// generations, with their accelerator suppressions and the IME's
+/// tombstone and cancelled repeat of a held Backspace, the keyboard's
 /// modifiers, which Exo does not send again, and another keyboard's
 /// keymap stay.
-#[test]
-fn an_unusable_keymap_clears_the_loaded_one_and_is_forwarded() {
+#[tokio::test]
+async fn an_unusable_keymap_clears_the_loaded_one_and_is_forwarded() {
     for (case, format, bytes, size) in unusable_keymaps() {
-        let bytes = &bytes[..];
-        let accelerators = vec![crate::accelerator::parse_accelerator("<Control>a").unwrap()];
-        let mut p = Proxy::with(Context::new_for_test(false, false, accelerators));
-        p.map(KEYBOARD);
-        p.keymap(OTHER_KEYBOARD);
-        let keyboard = HostId(KEYBOARD.host);
+        let mut kb = Kb::with_accelerators("<Control>a,<Control>b").await;
+        let ime = kb.text_input().await;
+        let other = kb.another_keyboard().await;
         // The input method takes Backspace and repeats it: its press is
         // the repeat's tombstone.
-        assert_eq!(p.peek(KEYBOARD, 1, 123, BACKSPACE, PRESSED), Action::Drop);
-        p.lease(KEYBOARD, TEXT_INPUT);
-        assert_eq!(p.key(KEYBOARD, 1, 123, BACKSPACE, PRESSED), Action::Drop);
+        kb.peek(1, 123, BACKSPACE, PRESSED).await;
+        kb.lease(ime).await;
+        assert_eq!(kb.key(1, BACKSPACE, PRESSED).await, Route::Host, "{case}");
         // Control+A, a host accelerator, is suppressed, and ends the
         // lease for the rest of Backspace's hold.
-        p.modifiers(KEYBOARD, CONTROL);
-        assert_eq!(p.key(KEYBOARD, 2, 124, KEY_A, PRESSED), Action::Drop);
+        kb.modifiers(CONTROL).await;
+        assert_eq!(kb.key(2, KEY_A, PRESSED).await, Route::Host, "{case}");
 
-        assert_eq!(
-            p.keymap_of(KEYBOARD, format, bytes, size),
-            Action::Forward,
-            "{case}"
-        );
+        kb.keymap_of(format, &bytes, size).await;
 
-        let ctx = &p.ctx;
-        assert!(
-            ctx.keys.keyboards().keymap_for_test(keyboard).is_none(),
-            "{case}"
-        );
-        assert!(p.held(KEYBOARD, BACKSPACE), "{case}");
-        assert!(p.cancelled(KEYBOARD), "{case}");
-        assert!(ctx.keys.peek(keyboard, BACKSPACE).is_some(), "{case}");
-        assert_eq!(p.owner(KEYBOARD, BACKSPACE), Some(ImeRecovery), "{case}");
-        assert!(ctx.keys.accelerator_suppressed(keyboard, KEY_A), "{case}");
+        // No chord without a keymap.
+        assert_eq!(kb.key(3, KEY_B, PRESSED).await, Route::Guest, "{case}");
+        assert_eq!(kb.key(4, KEY_B, RELEASED).await, Route::Guest, "{case}");
+        // Backspace keeps its tombstone, and A its suppression: the
+        // host keeps their presses again.
+        assert_eq!(kb.key(1, BACKSPACE, PRESSED).await, Route::Host, "{case}");
+        assert_eq!(kb.key(2, KEY_A, PRESSED).await, Route::Host, "{case}");
+        // Another keyboard's keymap stays.
+        kb.modifiers_on(other, CONTROL).await;
         assert_eq!(
-            ctx.keys
-                .keyboards()
-                .get(keyboard)
-                .unwrap()
-                .modifiers
-                .depressed,
-            CONTROL,
-            "{case}"
-        );
-        let other = HostId(OTHER_KEYBOARD.host);
-        assert!(
-            ctx.keys.keyboards().keymap_for_test(other).is_some(),
+            kb.key_on(other, 5, KEY_B, PRESSED).await,
+            Route::Host,
             "{case}: another keyboard's keymap stays"
         );
+        // Control stays held for the next keymap.
+        kb.keymap().await;
+        assert_eq!(kb.key(6, KEY_B, PRESSED).await, Route::Host, "{case}");
+        // Backspace stays held, its repeat cancelled.
+        kb.confirm(ime).await;
+        assert_eq!(kb.s.guest_received(), [], "{case}");
     }
 }
 
@@ -1602,51 +1511,67 @@ fn a_host_without_the_keyboard_extension_warns_once_per_process() {
     crate::test_support::in_own_process(
         "handler::keyboard::tests::a_host_without_the_keyboard_extension_warns_once_per_process",
         || {
-            let mut p = Proxy::new();
-            // The host has the extension, but no enter has bound the
-            // keyboard's extended keyboard yet.
-            p.ctx
-                .singletons
-                .bind_for_test(Singleton::KeyboardExtension, 500);
-            p.key(KEYBOARD, 1, 1, KEY_A, PRESSED);
-            assert!(p.ctx.client_to_host_queue.is_empty());
-            assert!(!NO_KEYBOARD_EXTENSION_WARNED.logged());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            runtime.block_on(async {
+                // The host has the extension, but no enter has bound the
+                // keyboard's extended keyboard yet.
+                let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+                let press = wl_keyboard::evt::key(kb.k.host, 1, 1, KEY_A, PRESSED);
+                kb.s.host([press]).await;
+                assert_eq!(
+                    kb.s.guest_received(),
+                    [key_event(kb.k, 1, 1, KEY_A, PRESSED)]
+                );
+                assert_eq!(kb.s.host_received(), []);
+                assert!(!NO_KEYBOARD_EXTENSION_WARNED.logged());
 
-            p.ctx
-                .singletons
-                .unbind_for_test(Singleton::KeyboardExtension);
-            p.key(KEYBOARD, 2, 2, KEY_A, RELEASED);
-            assert!(p.ctx.client_to_host_queue.is_empty());
-            assert!(NO_KEYBOARD_EXTENSION_WARNED.logged());
-            assert_eq!(
-                take_no_keyboard_extension_log_level(&NO_KEYBOARD_EXTENSION_WARNED),
-                log::Level::Debug
-            );
+                // The host removes the extension.
+                let registry = kb.s.registry().await;
+                kb.s.host([wl_registry::evt::global_remove(registry.host, kb.extension)])
+                    .await;
+                assert_eq!(kb.s.guest_received(), []);
+                assert_eq!(kb.s.host_received(), []);
+                let release = wl_keyboard::evt::key(kb.k.host, 2, 2, KEY_A, RELEASED);
+                kb.s.host([release]).await;
+                assert_eq!(
+                    kb.s.guest_received(),
+                    [key_event(kb.k, 2, 2, KEY_A, RELEASED)]
+                );
+                assert_eq!(kb.s.host_received(), []);
+                assert!(NO_KEYBOARD_EXTENSION_WARNED.logged());
+                assert_eq!(
+                    take_no_keyboard_extension_log_level(&NO_KEYBOARD_EXTENSION_WARNED),
+                    log::Level::Debug
+                );
+            });
         },
     );
 }
 
-#[test]
-fn on_keymap_ignores_a_keymap_over_the_size_limit() {
+/// A keymap of the size limit loads, and one byte more is refused: the
+/// keyboard then classifies no chord.
+#[tokio::test]
+async fn on_keymap_ignores_a_keymap_over_the_size_limit() {
     for (size, accepted) in [(MAX_KEYMAP_SIZE, true), (MAX_KEYMAP_SIZE + 1, false)] {
-        let mut p = Proxy::new();
+        let mut kb = Kb::with_accelerators("<Control>a").await;
+        kb.modifiers(CONTROL).await;
         // A valid keymap, padded with blanks to `size` with its NUL.
         let mut bytes = crate::proxy::harness::default_keymap();
         bytes.pop();
         bytes.resize(size as usize - 1, b' ');
         bytes.push(0);
 
+        kb.keymap_of(KEYMAP_FORMAT_XKB_V1, &bytes, size).await;
+        let chord = match accepted {
+            true => Route::Host,
+            false => Route::Guest,
+        };
         assert_eq!(
-            p.keymap_of(KEYBOARD, KEYMAP_FORMAT_XKB_V1, &bytes, size),
-            Action::Forward
-        );
-        assert_eq!(
-            p.ctx
-                .keys
-                .keyboards()
-                .keymap_for_test(HostId(KEYBOARD.host))
-                .is_some(),
-            accepted,
+            kb.key(2, KEY_A, PRESSED).await,
+            chord,
             "a keymap of {size} bytes"
         );
     }
@@ -1780,57 +1705,36 @@ async fn the_extended_keyboard_acks_keys_from_the_first_enter_until_the_keyboard
     assert_eq!(kb.s.host_received(), released(kb.k));
 }
 
-/// Releasing a keyboard forgets the key state it owns, and only that.
-#[test]
-fn on_release_destroys_extended_keyboard_and_cleans_map() {
-    let mut p = Proxy::new();
-    let other = Mapped {
-        guest: 12,
-        host: 102,
-        extended: 1002,
-        seat: 8,
-    };
-    p.map(KEYBOARD);
-    p.map(other);
-    let keyboard = HostId(KEYBOARD.host);
-    // The keyboard's peek watermarks, on no surface and on one, and
-    // another seat's.
-    p.peek(KEYBOARD, 1, 1, KEY_S, PRESSED);
-    p.focus(KEYBOARD, UNCREATED_SURFACE);
-    p.peek(KEYBOARD, 2, 2, KEY_D, PRESSED);
-    p.focus(other, UNCREATED_SURFACE);
-    p.peek(other, 3, 3, KEY_S, PRESSED);
+/// Releasing a keyboard forgets the key state it owns, as every batch
+/// checks: its peek watermark, the release a retired generation owes the
+/// guest, and its record. And only that: another keyboard's newer peek
+/// watermark stays, so that an empty confirmation recovers no older key.
+#[tokio::test]
+async fn on_release_destroys_extended_keyboard_and_cleans_map() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    let other = kb.another_keyboard().await;
+    // The keyboard's peek watermark.
+    kb.peek(1, 1, KEY_D, PRESSED).await;
     // A guest press whose release is retired: the peek released A before
     // `wl_keyboard` did, and A is pressed again.
-    assert_eq!(p.key(KEYBOARD, 4, 4, KEY_A, PRESSED), Action::Forward);
-    p.peek(KEYBOARD, 5, 5, KEY_A, RELEASED);
-    p.peek(KEYBOARD, 6, 6, KEY_A, PRESSED);
-    assert_eq!(p.ctx.keys.retired_release(keyboard, KEY_A), Some(5));
-    let watermark = |p: &Proxy, seat, surface| p.ctx.keys.latest_peek_sequence(seat, surface);
-    assert!(watermark(&p, KEYBOARD.seat, None).is_some());
-    assert!(watermark(&p, KEYBOARD.seat, Some(UNCREATED_SURFACE)).is_some());
+    assert_eq!(kb.key(2, KEY_A, PRESSED).await, Route::Guest);
+    kb.peek(3, 3, KEY_A, RELEASED).await;
+    kb.peek(4, 4, KEY_A, PRESSED).await;
+    // The other keyboard holds S, then Shift, which does not repeat.
+    kb.peek_on(other, 5, 5, KEY_S, PRESSED).await;
+    kb.peek_on(other, 6, 6, KEY_LEFTSHIFT, PRESSED).await;
 
-    p.release(KEYBOARD);
+    kb.s.guest([wl_keyboard::req::release(kb.k.id)]).await;
+    assert_eq!(kb.s.guest_received(), []);
+    assert_eq!(kb.s.host_received(), released(kb.k));
 
-    assert_eq!(p.ctx.keys.retired_release(keyboard, KEY_A), None);
-    assert_eq!(watermark(&p, KEYBOARD.seat, None), None);
-    assert_eq!(watermark(&p, KEYBOARD.seat, Some(UNCREATED_SURFACE)), None);
-    assert!(
-        watermark(&p, other.seat, Some(UNCREATED_SURFACE)).is_some(),
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [],
         "another keyboard's watermark stays"
     );
-    assert!(p.ctx.keys.keyboards().get(keyboard).is_none());
-}
-
-/// Releasing a keyboard the proxy does not know queues no destroy.
-#[test]
-fn on_release_with_unknown_guest_id_forwards_gracefully() {
-    let mut p = Proxy::new();
-    p.release(Mapped {
-        guest: 999,
-        ..KEYBOARD
-    });
-    assert!(p.ctx.client_to_host_queue.is_empty());
 }
 
 /// Accelerator suppression and modifiers belong to their keyboard.
@@ -2044,7 +1948,9 @@ async fn modifiers_sent_before_the_keymap_apply_to_it() {
     let accelerators = crate::accelerator::parse_accelerators("<Alt>q").unwrap();
     let mut kb = Kb::unfocused(Context::new_for_test(false, false, accelerators)).await;
     let id = kb.s.new_id();
-    let host = kb.s.create(wl_seat::req::get_keyboard(kb.seat, id)).await;
+    let host =
+        kb.s.create(wl_seat::req::get_keyboard(kb.seat.id, id))
+            .await;
     kb.k = Keyboard { id, host, ext: 0 };
     kb.modifiers(ALT).await;
     kb.keymap().await;
@@ -2066,7 +1972,9 @@ async fn modifiers_sent_before_the_keymap_apply_to_it() {
 async fn modifiers_without_a_keymap_end_with_their_keyboard() {
     let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
     let id = kb.s.new_id();
-    let host = kb.s.create(wl_seat::req::get_keyboard(kb.seat, id)).await;
+    let host =
+        kb.s.create(wl_seat::req::get_keyboard(kb.seat.id, id))
+            .await;
     let k = Keyboard { id, host, ext: 0 };
     kb.modifiers_on(k, CONTROL).await;
 
@@ -2081,10 +1989,6 @@ async fn modifiers_without_a_keymap_end_with_their_keyboard() {
 // -----------------------------------------------------------------------
 // Focus
 // -----------------------------------------------------------------------
-
-/// A surface of the handler tests, and another.
-const SURFACE: (u32, u32) = (20, 200);
-const OTHER_SURFACE: (u32, u32) = (21, 201);
 
 #[tokio::test]
 async fn keyboard_enter_initializes_held_key_state() {
@@ -2137,7 +2041,7 @@ async fn direct_focus_replacement_sends_balanced_leave_then_enter() {
     let ime = kb.text_input().await;
     let (k, surface) = (kb.k, kb.surface);
     let other_surface = kb.s.surface().await;
-    let other = kb.s.keyboard_of(kb.seat).await;
+    let other = kb.s.keyboard_of(kb.seat.id).await;
     let other = Keyboard {
         id: other.id,
         host: other.host,
@@ -2227,310 +2131,347 @@ async fn same_keyboard_reenter_drops_delayed_old_leave() {
     assert_eq!(kb.s.host_received(), []);
 }
 
-#[test]
-fn unmapped_leave_does_not_clear_live_keyboard_focus_state() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.focus(KEYBOARD, SURFACE.0);
-    p.peek(KEYBOARD, 1, 1, BACKSPACE, PRESSED);
-    p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
+/// A delayed leave for a surface the guest already destroyed, which the
+/// keyboard's focus is not on, does not tear down the live focus: the
+/// held Backspace stays held, on the focused field.
+#[tokio::test]
+async fn unmapped_leave_does_not_clear_live_keyboard_focus_state() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    kb.peek(1, 1, BACKSPACE, PRESSED).await;
+    let gone = kb.dying_surface().await;
 
-    // A delayed leave for a surface the guest already destroyed must
-    // not tear down the live focus.
-    assert_eq!(p.leave(KEYBOARD, 999), Action::Drop);
-    assert!(p.held(KEYBOARD, BACKSPACE));
-    assert_eq!(
-        p.ctx.keyboard_focus.surface_for_seat(KEYBOARD.seat),
-        Some(SURFACE.0)
-    );
-    assert!(p.ctx.host_to_client_queue.is_empty());
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 2, gone.host)])
+        .await;
+    assert_eq!(kb.s.guest_received(), []);
+    assert_eq!(kb.s.host_received(), []);
+    kb.confirm(ime).await;
+    assert_eq!(kb.s.guest_received(), recovered(ime, kb.k, 1, 1, BACKSPACE));
 }
 
-#[test]
-fn matching_leave_uses_stored_host_surface_after_mapping_is_unavailable() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
-    // The guest mapping is gone, but the focus keeps the exact host
-    // surface this leave names.
-    p.ctx
-        .keyboard_focus
-        .set_for_test(HostId(KEYBOARD.host), KEYBOARD.seat, SURFACE.0, 999);
+/// The guest destroys the focused surface, which ends the keyboard's
+/// focus at once (the host-surface mapping a focus keeps never outlives
+/// the guest surface): the host's leave that follows, which names the
+/// surface whose mapping waits for the host's `delete_id`, sends nothing
+/// more, and no focus outlives the surface. The next enter is the
+/// keyboard's and the text input's only focus.
+#[tokio::test]
+async fn matching_leave_uses_stored_host_surface_after_mapping_is_unavailable() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    let surface = kb.surface;
+    kb.s.guest([wl_surface::req::destroy(surface.id)]).await;
+    let host = kb.s.host_received();
+    assert_eq!(
+        host[0],
+        (surface.host, wl_surface::Request::Destroy {}.into())
+    );
+    assert!(deactivated(ime, &host[1..]), "{host:?}");
+    assert_eq!(kb.s.guest_received(), [v3_leave(ime, surface.id)]);
 
-    assert_eq!(p.leave(KEYBOARD, 999), Action::Drop);
-    assert_eq!(p.ctx.keyboard_focus.surface_for_seat(KEYBOARD.seat), None);
-    let state = text_input::view(&p.ctx, TEXT_INPUT.guest);
-    assert_eq!(state.focus, None);
-    assert_ne!(state.host, Host::Active);
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 2, surface.host)])
+        .await;
+    assert_eq!(kb.s.guest_received(), []);
+    assert_eq!(kb.s.host_received(), []);
+    kb.s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, surface.host)])
+        .await;
+    let delete_id = wl_display::Event::DeleteId { id: surface.id };
+    assert_eq!(kb.s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
+    let next = kb.s.surface().await;
+    let enter = wl_keyboard::evt::enter(kb.k.host, 3, next.host, &[]).unwrap();
+    kb.s.host([enter]).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [
+            entered(kb.k, 3, next.id, &[]),
+            modifiers(kb.k, 3, 0),
+            v3_enter(ime, next.id)
+        ]
+    );
+    assert_eq!(kb.s.host_received(), []);
 }
 
 /// A surface keeps its mapping until the host acknowledges its destroy,
 /// so a delayed host enter for it still translates; it must not make
-/// the dead surface current again.
-#[test]
-fn delayed_enter_for_pending_destroy_surface_does_not_revive_focus() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.ctx.guest_destroyed(SURFACE.0);
-    assert!(p.ctx.shadow_table.is_pending_destroy_guest(SURFACE.0));
+/// the dead surface current again, nor bind the keyboard's extended
+/// keyboard.
+#[tokio::test]
+async fn delayed_enter_for_pending_destroy_surface_does_not_revive_focus() {
+    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    let surface = kb.surface;
+    kb.s.guest([wl_surface::req::destroy(surface.id)]).await;
+    let destroy = wl_surface::Request::Destroy {};
+    assert_eq!(kb.s.host_received(), [(surface.host, destroy.into())]);
 
+    let enter = wl_keyboard::evt::enter(kb.k.host, 1, surface.host, &[]).unwrap();
+    kb.s.host([enter]).await;
     assert_eq!(
-        p.enter(KEYBOARD, SURFACE.1, &[]),
-        Action::Drop,
+        kb.s.guest_received(),
+        [],
         "the stale event must not be forwarded to the guest"
     );
-    assert!(p
-        .ctx
-        .keyboard_focus
-        .focus_for_keyboard(HostId(KEYBOARD.host))
-        .is_none());
-    assert!(p
-        .ctx
-        .keyboard_focus
-        .surface_for_seat(KEYBOARD.seat)
-        .is_none());
+    assert_eq!(kb.s.host_received(), []);
+    // The seat has no focus for a text input to enter.
+    kb.s.text_input(kb.seat.id).await;
+    assert_eq!(kb.s.guest_received(), []);
 }
 
-#[test]
-fn enter_without_keyboard_route_has_no_extension_side_effects() {
-    let mut p = Proxy::new();
-    p.ctx
-        .shadow_table
-        .insert_paired_for_test(KEYBOARD.guest, KEYBOARD.host, "wl_keyboard");
-    p.surface(SURFACE.0, SURFACE.1);
-    p.ctx
-        .singletons
-        .bind_for_test(Singleton::KeyboardExtension, 99);
-    p.ctx
-        .shadow_table
-        .insert_host_only_for_test(99, "zcr_keyboard_extension_v1", 2);
+/// An enter for a keyboard the guest has released, which the host sent
+/// before it read the release, cannot be delivered: it binds no extended
+/// keyboard.
+#[tokio::test]
+async fn enter_without_keyboard_route_has_no_extension_side_effects() {
+    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    kb.s.guest([wl_keyboard::req::release(kb.k.id)]).await;
+    let release = wl_keyboard::Request::Release {};
+    assert_eq!(kb.s.host_received(), [(kb.k.host, release.into())]);
 
+    let enter = wl_keyboard::evt::enter(kb.k.host, 1, kb.surface.host, &[]).unwrap();
+    kb.s.host([enter]).await;
     assert_eq!(
-        p.enter(KEYBOARD, SURFACE.1, &[]),
-        Action::Drop,
+        kb.s.guest_received(),
+        [],
         "an enter without a guest keyboard-to-seat route is undeliverable"
     );
-    assert!(p.ctx.keys.keyboards().get(HostId(KEYBOARD.host)).is_none());
-    assert!(p.ctx.client_to_host_queue.is_empty());
-    assert!(p
-        .ctx
-        .keyboard_focus
-        .focus_for_keyboard(HostId(KEYBOARD.host))
-        .is_none());
+    assert_eq!(kb.s.host_received(), []);
 }
 
 /// The other keyboard of a seat enters another surface while the first
 /// still holds Backspace: that enter retires the first keyboard's key
-/// state, and its later leave, mapped or not, changes nothing more.
-#[test]
-fn mapped_stale_leave_clears_old_keyboard_state_without_disturbing_new_focus() {
-    let accelerators = vec![crate::accelerator::parse_accelerator("<Control>BackSpace").unwrap()];
-    let mut p = Proxy::with(Context::new_for_test(false, false, accelerators));
-    p.map(KEYBOARD);
-    p.map(OTHER_KEYBOARD);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.surface(OTHER_SURFACE.0, OTHER_SURFACE.1);
-    p.focus(KEYBOARD, SURFACE.0);
-    let keyboard = HostId(KEYBOARD.host);
+/// state, and its later leave changes nothing more than its own focus.
+/// Its keymap and modifiers stay.
+#[tokio::test]
+async fn mapped_stale_leave_clears_old_keyboard_state_without_disturbing_new_focus() {
+    let mut kb = Kb::with_accelerators("<Control>BackSpace").await;
+    let ime = kb.text_input().await;
+    let other = unentered(kb.s.keyboard_of(kb.seat.id).await);
+    let (surface, other_surface) = (kb.surface, kb.s.surface().await);
     // The input method takes Backspace and repeats it. Control+Backspace,
     // a host accelerator, then comes as the repeat's tombstone, suppressed,
     // and another key's press ends the lease for the rest of the hold.
-    p.peek(KEYBOARD, 1, 123, BACKSPACE, PRESSED);
-    p.lease(KEYBOARD, TEXT_INPUT);
-    p.modifiers(KEYBOARD, CONTROL);
-    assert_eq!(p.key(KEYBOARD, 1, 123, BACKSPACE, PRESSED), Action::Drop);
-    assert_eq!(p.owner(KEYBOARD, BACKSPACE), Some(ImeRecovery));
-    assert!(p.ctx.keys.accelerator_suppressed(keyboard, BACKSPACE));
-    p.peek(KEYBOARD, 2, 124, KEY_X, PRESSED);
-    assert!(p.cancelled(KEYBOARD));
-    let held = KeyboardModifiers {
-        depressed: 0xdead_beef,
-        ..Default::default()
+    kb.peek(1, 123, BACKSPACE, PRESSED).await;
+    kb.lease(ime).await;
+    kb.modifiers(CONTROL).await;
+    assert_eq!(kb.key(1, BACKSPACE, PRESSED).await, Route::Host);
+    kb.peek(2, 124, KEY_X, PRESSED).await;
+    // Exo resends modifiers only when they change, so the focus teardown
+    // keeps them.
+    kb.modifiers(SHIFT).await;
+
+    let enter = wl_keyboard::evt::enter(other.host, 3, other_surface.host, &[]).unwrap();
+    kb.s.host([enter]).await;
+    let host = kb.s.host_received();
+    let other = Keyboard {
+        ext: extended_keyboard_of(other, &host[..1]),
+        ..other
     };
-    p.modifiers(KEYBOARD, held.depressed);
-
-    assert_eq!(p.enter(OTHER_KEYBOARD, OTHER_SURFACE.1, &[]), Action::Drop);
-    let queued_after_enter = p.ctx.host_to_client_queue.len();
-    assert_eq!(p.leave(KEYBOARD, SURFACE.1), Action::Drop);
+    assert!(deactivated(ime, &host[1..]), "{host:?}");
+    assert_eq!(
+        kb.s.guest_received(),
+        [
+            entered(other, 3, other_surface.id, &[]),
+            modifiers(other, 3, 0),
+            v3_leave(ime, surface.id),
+            v3_enter(ime, other_surface.id),
+        ]
+    );
     // Only the keyboard's own leave, which the IME core re-sends.
-    assert_eq!(p.ctx.host_to_client_queue.len(), queued_after_enter + 1);
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 4, surface.host)])
+        .await;
+    assert_eq!(kb.s.guest_received(), [left(kb.k, 4, surface.id)]);
+    assert_eq!(kb.s.host_received(), []);
 
-    assert!(p.ctx.keyboard_focus.focus_for_keyboard(keyboard).is_none());
+    // Backspace is idle: no tombstone, suppression or lease keeps its
+    // next press from the guest.
+    assert_eq!(kb.key(5, BACKSPACE, PRESSED).await, Route::Guest);
+    assert_eq!(kb.key(6, BACKSPACE, RELEASED).await, Route::Guest);
+    // The keyboard's modifiers come with its next enter, and its keymap
+    // still makes chords.
+    let enter = wl_keyboard::evt::enter(kb.k.host, 7, other_surface.host, &[]).unwrap();
+    kb.s.host([enter]).await;
     assert_eq!(
-        p.ctx
-            .keyboard_focus
-            .focus_for_keyboard(HostId(OTHER_KEYBOARD.host))
-            .map(|focus| focus.guest_surface),
-        Some(OTHER_SURFACE.0)
+        kb.s.guest_received(),
+        [
+            entered(kb.k, 7, other_surface.id, &[]),
+            modifiers(kb.k, 7, SHIFT)
+        ]
     );
-    assert_eq!(
-        p.ctx.keyboard_focus.surface_for_seat(KEYBOARD.seat),
-        Some(OTHER_SURFACE.0)
-    );
-    assert!(!p.held(KEYBOARD, BACKSPACE));
-    assert!(!p.cancelled(KEYBOARD));
-    assert!(p.ctx.keys.peek(keyboard, BACKSPACE).is_none());
-    assert_eq!(p.owner(KEYBOARD, BACKSPACE), None);
-    assert!(!p.ctx.keys.accelerator_suppressed(keyboard, BACKSPACE));
-    assert!(
-        p.ctx.keys.keyboards().keymap_for_test(keyboard).is_some(),
-        "focus teardown must preserve keymap-derived repeatability"
-    );
-    assert_eq!(
-        p.ctx
-            .keys
-            .keyboards()
-            .get(keyboard)
-            .map(|keyboard| keyboard.modifiers),
-        Some(held),
-        "Exo resends modifiers only when they change, so focus teardown keeps them"
-    );
+    kb.modifiers(CONTROL).await;
+    assert_eq!(kb.key(8, BACKSPACE, PRESSED).await, Route::Host);
 }
 
-#[test]
-fn new_focus_retires_stale_keyboard_state_before_delayed_leave() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    p.map(OTHER_KEYBOARD);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.surface(OTHER_SURFACE.0, OTHER_SURFACE.1);
-    // The first keyboard held Backspace on a surface the guest since
-    // destroyed.
-    p.focus(KEYBOARD, OTHER_SURFACE.0);
+/// Another keyboard's enter of another surface retires the first
+/// keyboard's key state before its delayed leave, which names a surface
+/// the guest destroyed: a dead keyboard must not keep the seat's
+/// Backspace fallback armed.
+#[tokio::test]
+async fn new_focus_retires_stale_keyboard_state_before_delayed_leave() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    let other = unentered(kb.s.keyboard_of(kb.seat.id).await);
+    let (surface, other_surface) = (kb.surface, kb.s.surface().await);
     // The input method took Backspace and repeated it, until another
     // key's press ended the lease.
-    p.peek(KEYBOARD, 1, 123, BACKSPACE, PRESSED);
-    p.lease(KEYBOARD, TEXT_INPUT);
-    assert_eq!(p.key(KEYBOARD, 1, 123, BACKSPACE, PRESSED), Action::Drop);
-    p.peek(KEYBOARD, 2, 124, KEY_X, PRESSED);
-    assert_eq!(p.owner(KEYBOARD, BACKSPACE), Some(ImeRecovery));
-    assert!(p.cancelled(KEYBOARD));
+    kb.peek(1, 123, BACKSPACE, PRESSED).await;
+    kb.lease(ime).await;
+    assert_eq!(kb.key(1, BACKSPACE, PRESSED).await, Route::Host);
+    kb.peek(2, 124, KEY_X, PRESSED).await;
 
-    assert_eq!(p.enter(OTHER_KEYBOARD, SURFACE.1, &[]), Action::Drop);
-    assert_eq!(p.leave(KEYBOARD, 999), Action::Drop);
-
-    assert!(!p.held(KEYBOARD, BACKSPACE));
-    assert!(!p.cancelled(KEYBOARD));
-    assert_eq!(p.owner(KEYBOARD, BACKSPACE), None);
-    assert!(p
-        .ctx
-        .keyboard_focus
-        .keyboard_owns_surface(HostId(OTHER_KEYBOARD.host), SURFACE.0));
+    let enter = wl_keyboard::evt::enter(other.host, 3, other_surface.host, &[]).unwrap();
+    kb.s.host([enter]).await;
+    let host = kb.s.host_received();
+    let other = Keyboard {
+        ext: extended_keyboard_of(other, &host[..1]),
+        ..other
+    };
+    assert!(deactivated(ime, &host[1..]), "{host:?}");
     assert_eq!(
-        p.ctx.keyboard_focus.surface_for_seat(KEYBOARD.seat),
-        Some(SURFACE.0)
+        kb.s.guest_received(),
+        [
+            entered(other, 3, other_surface.id, &[]),
+            modifiers(other, 3, 0),
+            v3_leave(ime, surface.id),
+            v3_enter(ime, other_surface.id),
+        ]
     );
-    assert!(
-        !p.held(KEYBOARD, BACKSPACE) && !p.held(OTHER_KEYBOARD, BACKSPACE),
-        "a dead keyboard must not keep the seat's Backspace fallback armed"
-    );
+    let gone = kb.dying_surface().await;
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 4, gone.host)])
+        .await;
+    assert_eq!(kb.s.guest_received(), []);
+    assert_eq!(kb.s.host_received(), []);
+
+    assert_eq!(kb.key(5, BACKSPACE, PRESSED).await, Route::Guest);
+    assert_eq!(kb.key(6, BACKSPACE, RELEASED).await, Route::Guest);
 }
 
-#[test]
-fn stale_leave_does_not_end_current_seat_backspace_repeat() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.surface(OTHER_SURFACE.0, OTHER_SURFACE.1);
-    p.focus(KEYBOARD, SURFACE.0);
-    p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
-    let keyboard = HostId(KEYBOARD.host);
-    p.peek(KEYBOARD, 1, 1, BACKSPACE, PRESSED);
-    p.lease(KEYBOARD, TEXT_INPUT);
-    let repeating = |p: &Proxy| p.ctx.keys.backspace_lease(keyboard).is_some();
-    assert!(repeating(&p));
+/// A leave of a surface the keyboard no longer focuses changes nothing:
+/// the seat's Backspace repeat goes on. A matching leave ends it, with
+/// the focus.
+#[tokio::test]
+async fn stale_leave_does_not_end_current_seat_backspace_repeat() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    let (surface, other_surface) = (kb.surface, kb.s.surface().await);
+    kb.peek(1, 1, BACKSPACE, PRESSED).await;
+    kb.lease(ime).await;
 
-    // The keyboard reports leaving a surface it no longer focuses.
-    assert_eq!(p.leave(KEYBOARD, OTHER_SURFACE.1), Action::Drop);
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 2, other_surface.host)])
+        .await;
     assert_eq!(
-        p.ctx.keyboard_focus.surface_for_seat(KEYBOARD.seat),
-        Some(SURFACE.0)
-    );
-    assert!(repeating(&p));
-    assert!(
-        p.ctx.host_to_client_queue.is_empty(),
+        kb.s.guest_received(),
+        [],
         "stale leave must not emit a text-input leave"
     );
+    assert_eq!(kb.s.host_received(), []);
+    assert!(kb.leased(kb.k));
+    // The repeat's tombstone.
+    assert_eq!(kb.key(1, BACKSPACE, PRESSED).await, Route::Host);
 
     // A matching leave still ends the fallback and clears focus.
-    assert_eq!(p.leave(KEYBOARD, SURFACE.1), Action::Drop);
-    assert_eq!(p.ctx.keyboard_focus.surface_for_seat(KEYBOARD.seat), None);
-    assert!(!repeating(&p));
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 3, surface.host)])
+        .await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [left(kb.k, 3, surface.id), v3_leave(ime, surface.id)]
+    );
+    assert!(deactivated(ime, &kb.s.host_received()));
+    assert!(!kb.leased(kb.k));
 }
 
-#[test]
-fn keyboard_enter_invalidates_stale_text_input_before_new_enable() {
-    let mut p = Proxy::new();
-    let keyboard = HostId(KEYBOARD.host);
-    p.ctx
-        .shadow_table
-        .insert_paired_for_test(KEYBOARD.guest, KEYBOARD.host, "wl_keyboard");
-    crate::handler::keyboard::for_test::created(
-        &mut p.ctx,
-        KEYBOARD.guest,
-        KEYBOARD.host,
-        KEYBOARD.seat,
+/// A keyboard's enter of another surface invalidates the text input's
+/// state for the old one before the guest enables it again: the shown
+/// preedit is committed, the request the guest did not commit is
+/// dropped, and the host text input waits, deactivated, for the new
+/// enable. The commits still count. The keys of the new focus then
+/// start afresh.
+#[tokio::test]
+async fn keyboard_enter_invalidates_stale_text_input_before_new_enable() {
+    let mut kb = Kb::new().await;
+    let mut ime = kb.text_input().await;
+    kb.compose(ime, "한").await;
+    // A request the guest has not committed.
+    let stale = zwp_text_input_v3::req::set_surrounding_text(ime.id, "stale", 5, 5).unwrap();
+    kb.s.guest([stale]).await;
+    assert_eq!(kb.s.host_received(), []);
+    let (surface, next) = (kb.surface, kb.s.surface().await);
+
+    let enter = wl_keyboard::evt::enter(kb.k.host, 2, next.host, &[]).unwrap();
+    kb.s.host([enter]).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [
+            v3_preedit(ime, ""),
+            v3_commit(ime, "한"),
+            done(ime),
+            entered(kb.k, 2, next.id, &[]),
+            modifiers(kb.k, 2, 0),
+            v3_leave(ime, surface.id),
+            v3_enter(ime, next.id),
+        ]
     );
-    crate::handler::keyboard::for_test::extended(&mut p.ctx, KEYBOARD.host, KEYBOARD.extended);
-    // Text-input v1 activation names the host seat.
-    p.ctx
-        .shadow_table
-        .insert_paired_for_test(KEYBOARD.seat, 2, "wl_seat");
-    p.surface(SURFACE.0, SURFACE.1);
-    p.surface(OTHER_SURFACE.0, OTHER_SURFACE.1);
-    let stale = text_input::Active {
-        surrounding_text: Some(("stale", 5, 5)),
-        preedit: Some("한"),
-        commits: 9,
-        pending: true,
-        ..text_input::Active::new(TEXT_INPUT.host, KEYBOARD.seat, Some(OTHER_SURFACE.0))
+    let host = kb.s.host_received();
+    let barrier = deactivation(ime, &host).expect("the deactivation of the old focus");
+
+    // Not enabled: a commit activates nothing, and gets no `done`.
+    kb.s.guest([zwp_text_input_v3::req::commit(ime.id)]).await;
+    assert_eq!(kb.s.guest_received(), []);
+    let commit_state = zwp_text_input_v1::Request::CommitState { serial: 2 };
+    assert_eq!(kb.s.host_received(), [(ime.host, commit_state.into())]);
+    kb.s.guest([
+        zwp_text_input_v3::req::enable(ime.id),
+        zwp_text_input_v3::req::commit(ime.id),
+    ])
+    .await;
+    ime.serial = 3;
+    assert_eq!(kb.s.guest_received(), [done(ime)]);
+    // The enable resets the host's state to the guest's, without the
+    // dropped request, but activates nothing while the old focus
+    // drains. Exo's display answers the reset's barrier.
+    let reset = kb.s.host_received();
+    for (_, request) in &reset {
+        if let AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) = request {
+            kb.barrier_done(*callback).await;
+        }
+    }
+    kb.barrier_done(barrier).await;
+    let activation = kb.s.host_received();
+    let activate = zwp_text_input_v1::Request::Activate {
+        seat: ime.host_seat,
+        surface: next.host,
     };
-    text_input::insert(&mut p.ctx, TEXT_INPUT.guest, stale);
-
-    assert_eq!(p.enter(KEYBOARD, SURFACE.1, &[]), Action::Drop);
-
-    let state = text_input::view(&p.ctx, TEXT_INPUT.guest);
-    assert_eq!(state.focus, Some(SURFACE.0));
-    assert!(!state.pending);
-    assert!(!state.enabled);
-    assert_ne!(state.host, Host::Active);
-    assert!(!state.surrounding_text_support);
-    assert_eq!(state.preedit, None);
-    assert_eq!(state.commits, 9);
-    assert!(p.ctx.client_to_host_queue.iter().any(|(message, _)| {
-        msg_sender(message) == TEXT_INPUT.host
-            && msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
-    }));
-    assert!(p.ctx.host_to_client_queue.iter().any(|(message, _)| {
-        msg_sender(message) == TEXT_INPUT.guest
-            && msg_opcode(message) == zwp_text_input_v3::EVT_ENTER
-    }));
+    assert_eq!(
+        activation.first(),
+        Some(&(ime.host, activate.into())),
+        "{activation:?}"
+    );
+    let stale = |(_, request): &(u32, AnyRequest)| match request {
+        AnyRequest::ZwpTextInputV1(zwp_text_input_v1::Request::SetSurroundingText {
+            text, ..
+        }) => *text == "stale".into(),
+        AnyRequest::ZwpTextInputV1(zwp_text_input_v1::Request::Activate { .. }) => true,
+        _ => false,
+    };
+    assert!(!reset.iter().any(stale), "{reset:?}");
+    assert!(!activation[1..].iter().any(stale), "{activation:?}");
+    assert_eq!(kb.s.guest_received(), []);
 
     // A Backspace the input method took: another key cancels its IME
-    // repeat.
-    assert_eq!(p.peek(KEYBOARD, 1, 9, BACKSPACE, PRESSED), Action::Drop);
-    assert_eq!(p.key(KEYBOARD, 2, 10, KEY_A, PRESSED), Action::Forward);
-    assert!(p.held(KEYBOARD, BACKSPACE));
-    assert!(p.cancelled(KEYBOARD));
-    let repeating = |p: &Proxy| p.ctx.keys.backspace_lease(keyboard).is_some();
-    assert!(!repeating(&p));
+    // repeat, so its confirmation recovers nothing.
+    kb.peek(5, 9, BACKSPACE, PRESSED).await;
+    assert_eq!(kb.key(6, KEY_A, PRESSED).await, Route::Guest);
+    kb.confirm(ime).await;
+    assert_eq!(kb.s.guest_received(), []);
 
     // Its release clears the cancellation, so the next Backspace, which
     // the IME consumes, may repeat.
-    assert_eq!(p.peek(KEYBOARD, 5, 13, BACKSPACE, RELEASED), Action::Drop);
-    assert_eq!(p.key(KEYBOARD, 5, 13, BACKSPACE, RELEASED), Action::Drop);
-    assert!(!p.held(KEYBOARD, BACKSPACE));
-    assert_eq!(p.peek(KEYBOARD, 6, 14, BACKSPACE, PRESSED), Action::Drop);
-    p.lease(KEYBOARD, TEXT_INPUT);
-    assert_eq!(p.key(KEYBOARD, 6, 14, BACKSPACE, PRESSED), Action::Drop);
-    assert!(p.held(KEYBOARD, BACKSPACE));
-    assert_eq!(p.peek(KEYBOARD, 7, 15, BACKSPACE, RELEASED), Action::Drop);
-    assert_eq!(p.key(KEYBOARD, 7, 15, BACKSPACE, RELEASED), Action::Drop);
-    assert!(!p.held(KEYBOARD, BACKSPACE));
-    assert!(!repeating(&p));
+    kb.peek(7, 13, BACKSPACE, RELEASED).await;
+    assert_eq!(kb.key(7, BACKSPACE, RELEASED).await, Route::Host);
+    kb.peek(8, 14, BACKSPACE, PRESSED).await;
+    kb.lease(ime).await;
+    assert_eq!(kb.key(8, BACKSPACE, PRESSED).await, Route::Host);
+    kb.peek(9, 15, BACKSPACE, RELEASED).await;
+    assert_eq!(kb.key(9, BACKSPACE, RELEASED).await, Route::Host);
+    assert!(!kb.leased(kb.k));
 }
 
 // -----------------------------------------------------------------------
@@ -2640,7 +2581,7 @@ async fn the_first_keyboard_leave_of_a_seat_commits_the_preedit_before_it() {
 async fn keyboard_release_after_seat_release_does_not_deactivate_destroyed_host_seat() {
     let mut kb = Kb::new().await;
     let ime = kb.text_input().await;
-    kb.s.guest([wl_seat::req::release(kb.seat)]).await;
+    kb.s.guest([wl_seat::req::release(kb.seat.id)]).await;
     assert_eq!(
         kb.s.host_received(),
         [(ime.host_seat, wl_seat::Request::Release {}.into())]
@@ -2656,285 +2597,251 @@ async fn keyboard_release_after_seat_release_does_not_deactivate_destroyed_host_
     );
 }
 
-#[test]
-fn keyboard_release_does_not_cancel_another_keyboard_ime_repeat() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    p.map(OTHER_KEYBOARD);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.focus(KEYBOARD, SURFACE.0);
-    p.focus(OTHER_KEYBOARD, SURFACE.0);
-    p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
+#[tokio::test]
+async fn keyboard_release_does_not_cancel_another_keyboard_ime_repeat() {
+    let mut kb = Kb::new().await;
+    kb.text_input().await;
+    let other = kb.another_keyboard().await;
     // The other keyboard holds Backspace, whose repeat another key's
     // press cancelled.
-    p.peek(OTHER_KEYBOARD, 1, 1, BACKSPACE, PRESSED);
-    p.peek(OTHER_KEYBOARD, 2, 2, KEY_X, PRESSED);
-    assert!(p.cancelled(OTHER_KEYBOARD));
+    kb.peek_on(other, 1, 1, BACKSPACE, PRESSED).await;
+    kb.peek_on(other, 2, 2, KEY_X, PRESSED).await;
 
-    p.release(KEYBOARD);
-    assert!(p.held(OTHER_KEYBOARD, BACKSPACE));
-    assert!(p.cancelled(OTHER_KEYBOARD));
-    assert!(p.ctx.host_to_client_queue.is_empty());
+    kb.s.guest([wl_keyboard::req::release(kb.k.id)]).await;
+    assert_eq!(kb.s.guest_received(), []);
+    assert_eq!(kb.s.host_received(), released(kb.k));
+    // Reads state no peer can observe: Backspace's cancelled repeat
+    // shows only in a confirmation while Backspace is the seat's latest
+    // press, which X is.
+    let keys = &kb.s.ctx().keys;
+    assert!(keys.held(HostId(other.host), BACKSPACE));
+    assert!(keys.backspace_repeat_cancelled(HostId(other.host)));
 }
 
-#[test]
-fn keyboard_release_invalidates_all_same_seat_text_inputs_and_delayed_leave_is_not_duplicate() {
-    let mut p = Proxy::new();
-    p.ctx
-        .shadow_table
-        .insert_paired_for_test(KEYBOARD.seat, 70, "wl_seat");
-    p.ctx
-        .shadow_table
-        .insert_paired_for_test(KEYBOARD.guest, KEYBOARD.host, "wl_keyboard");
-    crate::handler::keyboard::for_test::created(
-        &mut p.ctx,
-        KEYBOARD.guest,
-        KEYBOARD.host,
-        KEYBOARD.seat,
-    );
-    p.surface(SURFACE.0, SURFACE.1);
-    p.surface(OTHER_SURFACE.0, OTHER_SURFACE.1);
-    p.focus(KEYBOARD, SURFACE.0);
-    // One text input on the connection is enabled at a time, and only
-    // a focused one can be.
-    let text_inputs = [
-        (40, Some(SURFACE.0), true),
-        (41, Some(OTHER_SURFACE.0), false),
-        (42, None, false),
-    ];
-    for (guest, active_surface, enabled) in text_inputs {
-        p.ctx.shadow_table.insert_paired_with_version_for_test(
-            guest,
-            guest + 400,
-            "zwp_text_input_v3",
-            1,
-        );
-        let active = text_input::Active {
-            enabled,
-            ..text_input::Active::new(guest + 500, KEYBOARD.seat, active_surface)
+/// Releasing the keyboard that gave a seat its focus ends the focus of
+/// every text input of the seat: each focused one gets its leave, and
+/// only the active one's host text input is deactivated. None takes a
+/// request then, and the keyboard's delayed leave sends nothing again.
+#[tokio::test]
+async fn keyboard_release_invalidates_all_same_seat_text_inputs_and_delayed_leave_is_not_duplicate()
+{
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    let surface = kb.surface;
+    // Two more text inputs of the seat, which the guest does not enable:
+    // one text input of the connection is enabled at a time.
+    let mut others = Vec::new();
+    for _ in 0..2 {
+        let t = kb.s.text_input(kb.seat.id).await;
+        let enter = zwp_text_input_v3::Event::Enter {
+            surface: surface.id,
         };
-        text_input::insert(&mut p.ctx, guest, active);
+        assert_eq!(kb.s.guest_received(), [(t.id, enter.into())]);
+        others.push(t.id);
     }
 
-    p.release(KEYBOARD);
-    for (guest, _, _) in text_inputs {
-        let state = text_input::view(&p.ctx, guest);
-        assert_eq!(state.focus, None);
-        assert!(!state.pending);
-        assert!(!state.enabled);
-        assert_ne!(state.host, Host::Active);
-        assert_eq!(state.preedit, None);
-    }
-    assert_eq!(
-        p.ctx.host_to_client_queue.len(),
-        2,
-        "only focused text inputs should receive leave events"
-    );
-    let hosts = text_inputs.map(|(guest, _, _)| guest + 500);
-    let deactivated = p.ctx.client_to_host_queue.iter().filter(|(message, _)| {
-        msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
-            && hosts.contains(&msg_sender(message))
-    });
-    let deactivated: Vec<_> = deactivated
-        .map(|(message, _)| msg_sender(message))
+    kb.s.guest([wl_keyboard::req::release(kb.k.id)]).await;
+    let leaves: Vec<_> = [ime.id]
+        .iter()
+        .chain(&others)
+        .map(|&t| {
+            (
+                t,
+                zwp_text_input_v3::Event::Leave {
+                    surface: surface.id,
+                }
+                .into(),
+            )
+        })
         .collect();
-    assert_eq!(
-        deactivated,
-        [540],
-        "the active host v1 input must be deactivated, and no other"
+    assert_eq!(kb.s.guest_received(), leaves);
+    let host = kb.s.host_received();
+    assert_eq!(host[..2], released(kb.k));
+    assert!(
+        deactivated(ime, &host[2..]),
+        "the active host v1 input must be deactivated, and no other: {host:?}"
     );
 
-    let guest_queue_len = p.ctx.host_to_client_queue.len();
-    let host_queue_len = p.ctx.client_to_host_queue.len();
-    assert_eq!(p.leave(KEYBOARD, SURFACE.1), Action::Drop);
-    assert_eq!(p.ctx.host_to_client_queue.len(), guest_queue_len);
-    assert_eq!(p.ctx.client_to_host_queue.len(), host_queue_len);
+    // None is focused, so none takes a request.
+    for t in [ime.id].iter().chain(&others) {
+        kb.s.guest([
+            zwp_text_input_v3::req::enable(*t),
+            zwp_text_input_v3::req::commit(*t),
+        ])
+        .await;
+        assert_eq!(kb.s.host_received(), []);
+        assert_eq!(kb.s.guest_received(), []);
+    }
+    kb.s.host([wl_keyboard::evt::leave(kb.k.host, 2, surface.host)])
+        .await;
+    assert_eq!(kb.s.guest_received(), []);
+    assert_eq!(kb.s.host_received(), []);
 }
 
 // -----------------------------------------------------------------------
 // Physical keys the host IME consumes
 // -----------------------------------------------------------------------
 
-#[test]
-fn peek_key_tracks_the_physical_key() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    let keyboard = HostId(KEYBOARD.host);
-
-    assert!(p.ctx.keys.peek(keyboard, BACKSPACE).is_none());
-    assert_eq!(p.peek(KEYBOARD, 10, 20, BACKSPACE, PRESSED), Action::Drop);
-    assert!(p.held(KEYBOARD, BACKSPACE));
-    assert!(p.ctx.keys.peek(keyboard, BACKSPACE).is_some());
-
-    assert_eq!(p.peek(KEYBOARD, 12, 22, BACKSPACE, RELEASED), Action::Drop);
-    assert!(!p.held(KEYBOARD, BACKSPACE));
+/// A pressed peek that repeats a held key's refreshes the key's serial
+/// and time but keeps its generation: a key pressed since stays the
+/// latest, which an empty confirmation recovers.
+#[tokio::test]
+async fn a_duplicate_pressed_peek_keeps_its_generation() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    kb.peek(1, 100, KEY_SPACE, PRESSED).await;
+    kb.peek(2, 110, KEY_A, PRESSED).await;
+    kb.peek(3, 200, KEY_SPACE, PRESSED).await;
+    kb.confirm(ime).await;
+    assert_eq!(kb.s.guest_received(), recovered(ime, kb.k, 2, 110, KEY_A));
 }
 
-#[test]
-fn a_duplicate_pressed_peek_keeps_its_generation() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    let sequence = |p: &Proxy| {
-        let press = p.ctx.keys.peek(HostId(KEYBOARD.host), KEY_SPACE);
-        press.map(|press| press.sequence)
-    };
-    assert_eq!(p.peek(KEYBOARD, 1, 100, KEY_SPACE, PRESSED), Action::Drop);
-    let first = sequence(&p);
-    assert!(first.is_some());
-    assert_eq!(p.peek(KEYBOARD, 2, 200, KEY_SPACE, PRESSED), Action::Drop);
-    assert_eq!(sequence(&p), first);
-}
-
-#[test]
-fn backspace_peek_identity_survives_unrelated_release() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    assert_eq!(p.peek(KEYBOARD, 20, 200, BACKSPACE, PRESSED), Action::Drop);
-    assert_eq!(p.key(KEYBOARD, 21, 210, KEY_A, RELEASED), Action::Drop);
+#[tokio::test]
+async fn backspace_peek_identity_survives_unrelated_release() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    kb.peek(20, 200, BACKSPACE, PRESSED).await;
+    assert_eq!(kb.key(21, KEY_A, RELEASED).await, Route::Host);
+    kb.confirm(ime).await;
     assert_eq!(
-        p.ctx
-            .keys
-            .peek(HostId(KEYBOARD.host), BACKSPACE)
-            .map(|press| (press.serial, press.time)),
-        Some((20, 200)),
+        kb.s.guest_received(),
+        recovered(ime, kb.k, 20, 200, BACKSPACE),
         "an unrelated key event must not replace the Backspace peek identity"
     );
 }
 
-#[test]
-fn equal_serial_peek_release_uses_timestamp_order() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
+/// Whether the key's peeks leave it held shows in what an empty
+/// confirmation recovers.
+#[tokio::test]
+async fn equal_serial_peek_release_uses_timestamp_order() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
     let key = KEY_T;
     let serial = 18_857;
 
-    p.peek(KEYBOARD, serial, 100, key, PRESSED);
-    p.peek(KEYBOARD, serial, 110, key, RELEASED);
-    assert!(
-        !p.held(KEYBOARD, key),
+    kb.peek(serial, 100, key, PRESSED).await;
+    kb.peek(serial, 110, key, RELEASED).await;
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [],
         "a later release must close a press even when ChromeOS reuses its serial"
     );
 
-    p.peek(KEYBOARD, serial, 130, key, PRESSED);
-    p.peek(KEYBOARD, serial, 120, key, RELEASED);
-    assert!(
-        p.held(KEYBOARD, key),
+    kb.peek(serial, 130, key, PRESSED).await;
+    kb.peek(serial, 120, key, RELEASED).await;
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        recovered(ime, kb.k, serial, 130, key),
         "an older delayed release must not close the current generation"
     );
-    p.peek(KEYBOARD, serial, 130, key, RELEASED);
-    assert!(
-        !p.held(KEYBOARD, key),
+    kb.peek(serial, 130, key, RELEASED).await;
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [],
         "equal timestamps must remain valid for fast press/release pairs"
     );
 
-    p.peek(KEYBOARD, serial + 2, 150, key, PRESSED);
-    p.peek(KEYBOARD, serial + 1, 160, key, RELEASED);
-    assert!(
-        p.held(KEYBOARD, key),
+    kb.peek(serial + 2, 150, key, PRESSED).await;
+    kb.peek(serial + 1, 160, key, RELEASED).await;
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        recovered(ime, kb.k, serial + 2, 150, key),
         "an older serial must stay stale even when delivered with a newer timestamp"
     );
 }
 
-#[test]
-fn ime_repeat_state_is_scoped_to_the_originating_keyboard() {
-    let mut p = Proxy::new();
-    let other = Mapped {
-        seat: 2,
-        ..OTHER_KEYBOARD
-    };
-    p.map(KEYBOARD);
-    p.map(other);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
+#[tokio::test]
+async fn ime_repeat_state_is_scoped_to_the_originating_keyboard() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    // A keyboard of another seat, focused on the surface too.
+    let (_, other) = kb.s.keyboard().await;
+    let surface = kb.surface;
+    let other = kb.first_enter(unentered(other), surface).await;
 
     // The IME consumed Backspace on the first keyboard.
-    p.peek(KEYBOARD, 1, 500, BACKSPACE, PRESSED);
-    p.lease(KEYBOARD, TEXT_INPUT);
-    assert_eq!(p.key(KEYBOARD, 1, 500, BACKSPACE, PRESSED), Action::Drop);
+    kb.peek(1, 500, BACKSPACE, PRESSED).await;
+    kb.lease(ime).await;
+    assert_eq!(kb.key(1, BACKSPACE, PRESSED).await, Route::Host);
 
     // Its IME repeat must not swallow a Backspace of the other.
-    assert_eq!(p.key(other, 2, 501, BACKSPACE, PRESSED), Action::Forward);
+    assert_eq!(kb.key_on(other, 2, BACKSPACE, PRESSED).await, Route::Guest);
 }
 
-#[test]
-fn forwarded_backspace_release_is_not_dropped_by_ime_repeat_fallback() {
-    let mut p = Proxy::new();
-    p.map(KEYBOARD);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
-    assert_eq!(p.key(KEYBOARD, 1, 500, BACKSPACE, PRESSED), Action::Forward);
+#[tokio::test]
+async fn forwarded_backspace_release_is_not_dropped_by_ime_repeat_fallback() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    assert_eq!(kb.key(1, BACKSPACE, PRESSED).await, Route::Guest);
 
     // Exo later consumes repeat confirmations. The real release still
     // has to reach the guest to close the press/release pair.
-    p.lease(KEYBOARD, TEXT_INPUT);
-    assert_eq!(
-        p.key(KEYBOARD, 2, 501, BACKSPACE, RELEASED),
-        Action::Forward
-    );
+    kb.lease(ime).await;
+    assert!(kb.leased(kb.k));
+    assert_eq!(kb.key(2, BACKSPACE, RELEASED).await, Route::Guest);
 }
 
 /// A held Backspace the IME repeats: one the guest got (`forwarded`), or
 /// one whose peek, under serial 2, announced it.
-fn repeating_backspace(p: &mut Proxy, forwarded: bool) {
-    p.map(KEYBOARD);
-    p.surface(SURFACE.0, SURFACE.1);
-    p.text_input(TEXT_INPUT, KEYBOARD.seat, SURFACE.0);
+async fn repeating_backspace(kb: &mut Kb, ime: Ime, forwarded: bool) {
     if forwarded {
-        assert_eq!(p.key(KEYBOARD, 3, 400, BACKSPACE, PRESSED), Action::Forward);
+        assert_eq!(kb.key(3, BACKSPACE, PRESSED).await, Route::Guest);
     } else {
-        assert_eq!(p.peek(KEYBOARD, 2, 400, BACKSPACE, PRESSED), Action::Drop);
+        kb.peek(2, 400, BACKSPACE, PRESSED).await;
     }
-    p.lease(KEYBOARD, TEXT_INPUT);
-    assert!(p.ctx.keys.backspace_lease(HostId(KEYBOARD.host)).is_some());
+    kb.lease(ime).await;
+    assert!(kb.leased(kb.k));
 }
 
-#[test]
-fn non_backspace_press_cancels_repeat_without_losing_physical_backspace() {
-    let mut p = Proxy::new();
-    repeating_backspace(&mut p, true);
+#[tokio::test]
+async fn non_backspace_press_cancels_repeat_without_losing_physical_backspace() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    repeating_backspace(&mut kb, ime, true).await;
 
-    assert_eq!(p.key(KEYBOARD, 1, 500, KEY_A, PRESSED), Action::Forward);
-    assert!(
-        p.held(KEYBOARD, BACKSPACE),
-        "pressing another key must not falsify the physical Backspace state"
-    );
-    assert!(p.ctx.keys.backspace_lease(HostId(KEYBOARD.host)).is_none());
-    assert_eq!(p.confirm(TEXT_INPUT), Action::Drop);
-    assert!(
-        p.ctx.host_to_client_queue.is_empty(),
+    assert_eq!(kb.key(1, KEY_A, PRESSED).await, Route::Guest);
+    assert!(!kb.leased(kb.k));
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [],
         "a cancelled repeat must not rearm while Backspace remains physically held"
     );
 
-    assert_eq!(
-        p.key(KEYBOARD, 2, 501, BACKSPACE, RELEASED),
-        Action::Forward
-    );
-    assert!(!p.held(KEYBOARD, BACKSPACE));
-    assert!(
-        !p.cancelled(KEYBOARD),
-        "Backspace release must clear repeat cancellation"
-    );
+    // Pressing another key did not falsify the physical Backspace
+    // state: its release is the guest's.
+    assert_eq!(kb.key(2, BACKSPACE, RELEASED).await, Route::Guest);
+    // Backspace release clears the repeat's cancellation: the next one
+    // the input method takes is leased.
+    kb.peek(4, 4, BACKSPACE, PRESSED).await;
+    kb.lease(ime).await;
+    assert_eq!(kb.key(4, BACKSPACE, PRESSED).await, Route::Host);
 }
 
-#[test]
-fn backspace_auto_repeat_press_does_not_rearm_cancelled_repeat() {
-    let mut p = Proxy::new();
-    repeating_backspace(&mut p, false);
+#[tokio::test]
+async fn backspace_auto_repeat_press_does_not_rearm_cancelled_repeat() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    repeating_backspace(&mut kb, ime, false).await;
 
     // A newer key cancels the IME repeat while Backspace stays held.
-    assert_eq!(p.key(KEYBOARD, 1, 500, KEY_A, PRESSED), Action::Forward);
-    assert!(p.cancelled(KEYBOARD));
+    assert_eq!(kb.key(1, KEY_A, PRESSED).await, Route::Guest);
 
     // The press the peek announced must not clear the cancellation; only
     // the physical release does.
-    assert_eq!(p.key(KEYBOARD, 2, 501, BACKSPACE, PRESSED), Action::Forward);
-    assert!(
-        p.cancelled(KEYBOARD),
+    assert_eq!(
+        kb.key(2, BACKSPACE, PRESSED).await,
+        Route::Guest,
         "a repeated Backspace press must not rearm a cancelled IME repeat"
     );
-    assert_eq!(p.confirm(TEXT_INPUT), Action::Drop);
-    assert!(
-        p.ctx.host_to_client_queue.is_empty(),
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        [],
         "a repeated Backspace press must not synthesize another key pair"
     );
 }
@@ -3499,27 +3406,6 @@ async fn keyboard_retirement_removes_its_watermark_and_recovers_other_held_key()
     );
 }
 
-/// A chord's placement reaches the host before the chord's `ack_key`, as
-/// Sommelier acts on a shortcut before it acknowledges its key.
-#[test]
-fn a_shortcut_places_before_its_key_is_acknowledged() {
-    let mut p = placeable_shortcut();
-    p.ctx.client_to_host_queue.clear();
-    assert_eq!(p.key(PLACING, 2, 100, KEY_Q, PRESSED), Action::Drop);
-    assert_eq!(queued_bounds(&p.ctx), TOP_LEFT_BOUNDS);
-    let senders: Vec<_> = p
-        .ctx
-        .client_to_host_queue
-        .iter()
-        .map(|(message, _)| msg_sender(message))
-        .collect();
-    let [placement @ .., ack] = &senders[..] else {
-        panic!("nothing queued");
-    };
-    assert_eq!(*ack, PLACING.extended, "{senders:?}");
-    assert!(!placement.is_empty() && !placement.contains(&PLACING.extended));
-}
-
 /// A seat's peek watermarks end with its focus on the surface: at the
 /// keyboard's leave, and as the guest destroys the surface.
 #[tokio::test]
@@ -3528,7 +3414,7 @@ async fn a_seats_peek_watermarks_end_with_its_focus() {
     let surface = kb.surface;
     // Session::ctx: a watermark reaches no peer until a confirmation.
     let watermark = |kb: &mut Kb| {
-        let seat = kb.seat;
+        let seat = kb.seat.id;
         kb.s.ctx().keys.latest_peek_sequence(seat, Some(surface.id))
     };
     kb.peek(2, 2, KEY_A, PRESSED).await;

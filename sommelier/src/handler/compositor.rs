@@ -1008,137 +1008,403 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Hand
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::handler::test_support::{
-        buffer_host_destroy_is_queued, buffer_is_guest_destroyed, buffer_lifecycle,
-        mark_test_buffer_guest_destroyed, toplevel_ctx, toplevel_ctx_with, SHELL, SURFACE,
-        TOPLEVEL,
-    };
+    use crate::handler::test_support::{toplevel_ctx, SURFACE};
     use crate::protocols::aura_shell::{zaura_shell, zaura_surface};
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-    use crate::protocols::viewporter::wp_viewport::WpViewportHandler;
-    use crate::protocols::viewporter::wp_viewporter::WpViewporterHandler;
-    use crate::protocols::wayland::wl_buffer;
-    use crate::protocols::wayland::wl_buffer::WlBufferHandler;
-    use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
-    use crate::protocols::wayland::wl_surface::{REQ_COMMIT, REQ_DAMAGE};
-    use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
-    use crate::protocols::AnyRequest;
-    use crate::protocols::Iface;
-    use crate::proxy::harness::Session;
-    use crate::state::Singleton;
-    use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
+    use crate::protocols::wayland::wl_surface::REQ_COMMIT;
+    use crate::protocols::wayland::{
+        wl_buffer, wl_display, wl_keyboard, wl_output, wl_registry, wl_shm_pool,
+    };
+    use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::proxy::harness::{Object, Session, Toplevel};
+    use crate::state::{PlaneFenceForTest, RenderBufferUse};
     use crate::test_support::text_input::{self, Host};
     use crate::test_support::{
-        decode, decoded, mapped_test_buffer, msg_opcode, msg_sender, protocol_error_code,
-        queued_headers, register_test_buffer, shm_pool_file, BufferKind, BUFFER_KINDS,
+        msg_opcode, msg_sender, queued_headers, shm_pool_file, BufferKind, BUFFER_KINDS,
     };
+    use crate::wire::{Outgoing, WL_DISPLAY_ID};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::FileExt;
 
-    /// A request naming an inert output (whose bind crossed its global's
-    /// removal) reaches the host with no output, as if the guest named none.
-    #[test]
-    fn set_fullscreen_on_an_inert_output_is_forwarded_without_an_output() {
-        use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_FULLSCREEN;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let (toplevel_guest, toplevel_host, inert_output) = (400, 500, 10);
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            toplevel_guest,
-            toplevel_host,
-            "xdg_toplevel",
-            3,
-        );
-        ctx.shadow_table
-            .create_local(inert_output, Iface::WlOutput, 3);
+    /// A host damage rectangle: x, y, width and height.
+    type Rect = (i32, i32, i32, i32);
 
-        ctx.last_sender_id = toplevel_guest;
-        let payload = inert_output.to_ne_bytes();
-        let mut request =
-            crate::wire::WireMessage::new(toplevel_guest, REQ_SET_FULLSCREEN, &payload);
-        let forwarded = crate::test_support::dispatch_request(&mut ctx, &mut request)
-            .expect("valid request")
-            .expect("forwarded");
-        assert_eq!(
-            decoded(&[forwarded], xdg_toplevel::Request::from_wire),
-            [(
-                toplevel_host,
-                xdg_toplevel::Request::SetFullscreen { output: 0 }
-            )]
-        );
+    /// A whole proxy session with GPU access, whose guest has a surface and
+    /// makes buffers of either kind: SHM ones from its `wl_shm`, which the
+    /// proxy copies to host storage, and native ones from the host's
+    /// linux-dmabuf, which the guest gets with GPU access.
+    struct Screen {
+        s: Session,
+        surface: Object,
+        shm: u32,
+        dmabuf: u32,
+        viewporter: Option<u32>,
     }
 
-    #[test]
-    fn surface_enter_leave_tracks_the_last_entered_output() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.outputs.bind_for_test(20, Default::default());
-        ctx.outputs.bind_for_test(30, Default::default());
-        ctx.last_sender_id = 100;
-        let event = |ctx: &mut Context, enter: bool, output: u32| {
-            let action = if enter {
-                <Handlers as WlSurfaceHandler>::on_enter(ctx, output)
-            } else {
-                <Handlers as WlSurfaceHandler>::on_leave(ctx, output)
+    /// A guest SHM buffer, the guest's pool file it draws in, and the host
+    /// pool file the proxy copies its pixels into, which the host shows.
+    struct Shm {
+        buffer: Object,
+        width: usize,
+        guest: std::fs::File,
+        host: std::fs::File,
+    }
+
+    impl Shm {
+        /// The client draws its next frame: every pool byte becomes
+        /// `pixel`. The host copy is cleared, so [`Self::copied`] then
+        /// shows exactly what the next commit copies.
+        fn draw(&self, pixel: u8) {
+            let size = self.guest.metadata().unwrap().len() as usize;
+            self.guest.write_all_at(&vec![pixel; size], 0).unwrap();
+            self.host.write_all_at(&vec![0; size], 0).unwrap();
+        }
+
+        /// The (x, y) pixels of the host copy that hold `pixel`.
+        fn copied(&self, pixel: u8) -> Vec<(usize, usize)> {
+            let size = self.host.metadata().unwrap().len() as usize;
+            let mut host = vec![0; size];
+            self.host.read_exact_at(&mut host, 0).unwrap();
+            let stride = self.width * 4;
+            (0..size / stride)
+                .flat_map(|y| (0..self.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let start = y * stride + x * 4;
+                    host[start..start + 4].iter().all(|&byte| byte == pixel)
+                })
+                .collect()
+        }
+    }
+
+    impl Screen {
+        async fn new() -> Self {
+            let mut s = Session::with_context(Context::new_for_test(true, false, Vec::new()));
+            let surface = s.surface().await;
+            let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+            let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await.id;
+            // What the guest learns of the host's formats.
+            s.guest_received();
+            s.host_received();
+            Self {
+                s,
+                surface,
+                shm,
+                dmabuf,
+                viewporter: None,
+            }
+        }
+
+        /// A new 4x4 SHM buffer that `surface` shows, which copies it
+        /// whole, so that later commits copy only what they must.
+        async fn frame(&mut self, surface: Object) -> Shm {
+            let frame = self.shm(FRAME_SIDE as i32, FRAME_SIDE as i32).await;
+            let side = FRAME_SIDE as i32;
+            assert_eq!(self.show(surface, frame.buffer).await, [(0, 0, side, side)]);
+            frame
+        }
+
+        /// The guest sends `request` of `surface`, which the host gets at
+        /// once.
+        async fn forwarded(&mut self, surface: Object, request: Outgoing) {
+            self.s.guest([request]).await;
+            let host = self.s.host_received();
+            assert!(
+                matches!(&host[..], [(sender, _)] if *sender == surface.host),
+                "the host did not get the request alone: {host:?}"
+            );
+        }
+
+        /// The guest sets `scale` on `surface` and commits it on its own,
+        /// as a HiDPI client does once, so that later frames keep it;
+        /// returns the commit's damage.
+        async fn commit_scale(&mut self, surface: Object, scale: i32) -> Vec<Rect> {
+            let request = wl_surface::req::set_buffer_scale(surface.id, scale);
+            self.forwarded(surface, request).await;
+            self.commit(surface).await
+        }
+
+        /// A new `wp_viewport` of `surface`, from a `wp_viewporter` the
+        /// guest binds on first use.
+        async fn viewport(&mut self, surface: Object) -> Object {
+            use crate::protocols::viewporter::wp_viewporter::req::get_viewport;
+            let viewporter = match self.viewporter {
+                Some(viewporter) => viewporter,
+                None => {
+                    let viewporter = self.s.bind("wp_viewporter", 1).await;
+                    *self.viewporter.insert(viewporter)
+                }
             };
-            assert_eq!(action, Action::Forward);
-            ctx.outputs.entered_for_test(100)
+            let id = self.s.new_id();
+            let host = self
+                .s
+                .create(get_viewport(viewporter, id, surface.id))
+                .await;
+            Object { id, host }
+        }
+
+        /// Inject a fault no peer can cause: a failed dma-buf sync, which
+        /// fails a copy into `buffer`'s host storage while `fails`.
+        fn fail_copies(&mut self, buffer: Object, fails: bool) {
+            let host = crate::state::HostId(buffer.host);
+            let resources = self.s.ctx().local_buffer_copy_resources(host);
+            // Without a VirtWL channel the dma-buf sync, and so the copy,
+            // fails.
+            resources.expect("a local buffer").buffer.dmabuf_sync = fails;
+        }
+
+        /// A new `width`x`height` native buffer, whose plane is a pipe, which
+        /// has no dma-buf fence: its first commit falls back to implicit
+        /// synchronization.
+        async fn native(&mut self, width: i32, height: i32) -> Object {
+            let (plane, _) = crate::test_support::pipe();
+            self.s
+                .native_buffer(self.dmabuf, plane, width, height)
+                .await
+        }
+
+        /// A new `width`x`height` ARGB8888 SHM buffer, alone in its pool,
+        /// whose pixels are all 0.
+        async fn shm(&mut self, width: i32, height: i32) -> Shm {
+            let size = usize::try_from(4 * width * height).unwrap();
+            let guest = shm_pool_file(&vec![0; size]);
+            let pool = self.s.shm_pool(self.shm, guest.try_clone().unwrap()).await;
+            let (buffer, host) = self.s.shm_buffer_with_host_pool(pool, width, height).await;
+            Shm {
+                buffer,
+                width: usize::try_from(width).unwrap(),
+                guest,
+                host,
+            }
+        }
+
+        /// A new 4x4 buffer of `kind`.
+        async fn buffer(&mut self, kind: BufferKind) -> Object {
+            match kind {
+                BufferKind::Shm => self.shm(4, 4).await.buffer,
+                BufferKind::Native => self.native(4, 4).await,
+            }
+        }
+
+        /// The guest attaches `buffer`, or no buffer, to `surface`, which
+        /// the host gets at once.
+        async fn attach(&mut self, surface: Object, buffer: Option<Object>) {
+            self.attach_at(surface, buffer, (0, 0)).await;
+        }
+
+        /// [`Self::attach`] at `offset`.
+        async fn attach_at(&mut self, surface: Object, buffer: Option<Object>, offset: (i32, i32)) {
+            let (x, y) = offset;
+            let id = buffer.map(|buffer| buffer.id);
+            self.s
+                .guest([wl_surface::req::attach(surface.id, id, x, y)])
+                .await;
+            let host = buffer.map_or(0, |buffer| buffer.host);
+            let attach = wl_surface::Request::Attach { buffer: host, x, y };
+            assert_eq!(self.s.host_received(), [(surface.host, attach.into())]);
+        }
+
+        /// The guest sends `requests`, which reach no peer before a commit.
+        async fn pending(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
+            self.s.guest(requests).await;
+            assert_eq!(self.s.host_received(), []);
+            assert_eq!(self.s.guest_received(), []);
+        }
+
+        /// The guest commits `surface`; returns the damage the host gets
+        /// with the commit, which reaches the host.
+        async fn commit(&mut self, surface: Object) -> Vec<Rect> {
+            self.s.guest([wl_surface::req::commit(surface.id)]).await;
+            committed(surface, self.s.host_received())
+        }
+
+        /// The guest attaches `buffer` to `surface` and commits it; returns
+        /// the damage the host gets with the commit.
+        async fn show(&mut self, surface: Object, buffer: Object) -> Vec<Rect> {
+            self.attach(surface, Some(buffer)).await;
+            self.commit(surface).await
+        }
+
+        /// The host releases `buffer`, which the guest gets.
+        async fn release(&mut self, buffer: Object) {
+            self.s.host([wl_buffer::evt::release(buffer.host)]).await;
+            let release = wl_buffer::Event::Release {};
+            assert_eq!(self.s.guest_received(), [(buffer.id, release.into())]);
+        }
+
+        /// The host releases `buffer`, which the guest has destroyed, so it
+        /// gets nothing; returns what the proxy sends the host for it.
+        async fn release_destroyed(&mut self, buffer: Object) -> Vec<(u32, AnyRequest)> {
+            self.s.host([wl_buffer::evt::release(buffer.host)]).await;
+            assert_eq!(self.s.guest_received(), []);
+            self.s.host_received()
+        }
+
+        /// The guest destroys `buffer`; returns what the proxy sends the
+        /// host for it.
+        async fn destroy(&mut self, buffer: Object) -> Vec<(u32, AnyRequest)> {
+            self.s.guest([wl_buffer::req::destroy(buffer.id)]).await;
+            assert_eq!(self.s.guest_received(), []);
+            self.s.host_received()
+        }
+
+        /// The guest destroys `surface`; returns what the proxy sends the
+        /// host for it.
+        async fn destroy_surface(&mut self, surface: Object) -> Vec<(u32, AnyRequest)> {
+            self.s.guest([wl_surface::req::destroy(surface.id)]).await;
+            assert_eq!(self.s.guest_received(), []);
+            self.s.host_received()
+        }
+    }
+
+    /// The rectangles of the host `wl_surface.damage` requests of `host`,
+    /// which must be all `surface` gets but the commit after them.
+    fn committed(surface: Object, host: Vec<(u32, AnyRequest)>) -> Vec<Rect> {
+        let Some((commit, damage)) = host.split_last() else {
+            panic!("the host got no commit");
         };
-        assert_eq!(event(&mut ctx, true, 20), Some(20));
+        assert_eq!(
+            *commit,
+            (surface.host, wl_surface::Request::Commit {}.into())
+        );
+        damage
+            .iter()
+            .map(|request| match request {
+                (
+                    sender,
+                    AnyRequest::WlSurface(wl_surface::Request::Damage {
+                        x,
+                        y,
+                        width,
+                        height,
+                    }),
+                ) if *sender == surface.host => (*x, *y, *width, *height),
+                _ => panic!("the host got more than damage before the commit: {host:?}"),
+            })
+            .collect()
+    }
+
+    /// The host `wl_buffer.destroy` of `buffer`.
+    fn buffer_destroy(buffer: Object) -> (u32, AnyRequest) {
+        (buffer.host, wl_buffer::Request::Destroy {}.into())
+    }
+
+    /// The host `wl_surface.destroy` of `surface`.
+    fn surface_destroy(surface: Object) -> (u32, AnyRequest) {
+        (surface.host, wl_surface::Request::Destroy {}.into())
+    }
+
+    /// A `wl_output` the guest binds after the host removed its global, as
+    /// when the bind and the removal cross: an inert output, which has no
+    /// host object.
+    async fn inert_output(s: &mut Session) -> u32 {
+        let registry = s.registry().await;
+        let name = s.advertise("wl_output", 3).await;
+        s.host([wl_registry::evt::global_remove(registry.host, name)])
+            .await;
+        let output = s.new_id();
+        s.guest([wl_registry::req::bind(registry.id, name, "wl_output", 3, output).unwrap()])
+            .await;
+        let removed = wl_registry::Event::GlobalRemove { name };
+        assert_eq!(s.guest_received()[1..], [(registry.id, removed.into())]);
+        assert_eq!(s.host_received(), []);
+        output
+    }
+
+    /// A request naming an inert output (whose bind crossed its global's
+    /// removal) reaches the host with no output, as if the guest named none.
+    #[tokio::test]
+    async fn set_fullscreen_on_an_inert_output_is_forwarded_without_an_output() {
+        let mut s = Session::new();
+        let toplevel = s.toplevel().await.toplevel;
+        let output = inert_output(&mut s).await;
+        s.guest([xdg_toplevel::req::set_fullscreen(toplevel.id, Some(output))])
+            .await;
+        let fullscreen = xdg_toplevel::Request::SetFullscreen { output: 0 };
+        assert_eq!(s.host_received(), [(toplevel.host, fullscreen.into())]);
+    }
+
+    /// The host's `enter` and `leave` of `surface` and `output`, which the
+    /// guest gets.
+    async fn enter_or_leave(s: &mut Session, surface: Object, enter: bool, output: Object) {
+        let (event, forwarded) = if enter {
+            let event = wl_surface::evt::enter(surface.host, output.host);
+            (event, wl_surface::Event::Enter { output: output.id })
+        } else {
+            let event = wl_surface::evt::leave(surface.host, output.host);
+            (event, wl_surface::Event::Leave { output: output.id })
+        };
+        s.host([event]).await;
+        assert_eq!(s.guest_received(), [(surface.id, forwarded.into())]);
+    }
+
+    #[tokio::test]
+    async fn surface_enter_leave_tracks_the_last_entered_output() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let first = s.bind_paired("wl_output", 3).await;
+        let second = s.bind_paired("wl_output", 3).await;
+        let event = async |s: &mut Session, enter: bool, output: Object| {
+            enter_or_leave(s, surface, enter, output).await;
+            // Reads state no peer observes here: the output a placement
+            // chord places the window on, which window_placement's tests
+            // drive.
+            s.ctx().outputs.entered_for_test(surface.host)
+        };
+        assert_eq!(event(&mut s, true, first).await, Some(first.host));
         // Exo moves a surface with leave(old) before enter(new).
-        assert_eq!(event(&mut ctx, false, 20), None);
-        assert_eq!(event(&mut ctx, true, 30), Some(30));
+        assert_eq!(event(&mut s, false, first).await, None);
+        assert_eq!(event(&mut s, true, second).await, Some(second.host));
         // A leave of another output, in either order, changes nothing.
-        assert_eq!(event(&mut ctx, true, 20), Some(20));
-        assert_eq!(event(&mut ctx, false, 30), Some(20));
+        assert_eq!(event(&mut s, true, first).await, Some(first.host));
+        assert_eq!(event(&mut s, false, second).await, Some(first.host));
     }
 
     /// The enter and leave handlers rely on generated validation to drop an
     /// event that names a released output, which stays mapped until the
-    /// host's `delete_id`.
-    #[test]
-    fn surface_events_naming_a_released_output_never_reach_the_handlers() {
-        use crate::protocols::wayland::wl_surface::{EVT_ENTER, EVT_LEAVE};
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let (surface_guest, surface_host, output_guest, output_host) = (100, 200, 10, 20);
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            surface_guest,
-            surface_host,
-            "wl_surface",
-            4,
-        );
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            output_guest,
-            output_host,
-            "wl_output",
-            3,
-        );
-        ctx.outputs.bind_for_test(output_host, Default::default());
-        ctx.guest_destroyed(output_guest);
+    /// host's `delete_id`: had one reached them, they would forward it.
+    #[tokio::test]
+    async fn surface_events_naming_a_released_output_never_reach_the_handlers() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let output = s.bind_paired("wl_output", 3).await;
+        s.guest([wl_output::req::release(output.id)]).await;
+        let release = wl_output::Request::Release {};
+        assert_eq!(s.host_received(), [(output.host, release.into())]);
 
-        let payload = output_host.to_ne_bytes();
-        for opcode in [EVT_ENTER, EVT_LEAVE] {
-            let mut event = crate::wire::WireMessage::new(surface_host, opcode, &payload);
-            let dispatched = crate::test_support::dispatch_event(&mut ctx, &mut event);
-            assert!(matches!(dispatched, Ok(None)), "opcode {opcode}");
-            assert_eq!(ctx.outputs.entered_for_test(surface_host), None);
-        }
+        s.host([
+            wl_surface::evt::enter(surface.host, output.host),
+            wl_surface::evt::leave(surface.host, output.host),
+        ])
+        .await;
+        assert_eq!(s.guest_received(), []);
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, output.host)])
+            .await;
+        let deleted = wl_display::Event::DeleteId { id: output.id };
+        assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
     }
 
-    #[test]
-    fn surface_enter_of_a_removed_output_is_forwarded_but_not_recorded() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.outputs.bind_for_test(20, Default::default());
-        let removed_aura_outputs = ctx.outputs.remove_global(crate::state::GlobalBinding {
-            name: 20,
-            generation: 1,
-        });
-        assert!(removed_aura_outputs.is_empty());
-        ctx.last_sender_id = 100;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_enter(&mut ctx, 20),
-            Action::Forward
-        );
-        assert_eq!(ctx.outputs.entered_for_test(100), None);
+    #[tokio::test]
+    async fn surface_enter_of_a_removed_output_is_forwarded_but_not_recorded() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let registry = s.registry().await;
+        let name = s.advertise("wl_output", 3).await;
+        let id = s.new_id();
+        let bind = wl_registry::req::bind(registry.id, name, "wl_output", 3, id).unwrap();
+        let output = Object {
+            id,
+            host: s.create(bind).await,
+        };
+        s.host([wl_registry::evt::global_remove(registry.host, name)])
+            .await;
+        let removed = wl_registry::Event::GlobalRemove { name };
+        assert_eq!(s.guest_received()[1..], [(registry.id, removed.into())]);
+
+        enter_or_leave(&mut s, surface, true, output).await;
+        // Reads state no peer observes here, as in
+        // surface_enter_leave_tracks_the_last_entered_output.
+        assert_eq!(s.ctx().outputs.entered_for_test(surface.host), None);
     }
 
     /// An enabled text input of `seat` focused on `surface`, whose host is
@@ -1163,72 +1429,6 @@ mod tests {
         }
     }
 
-    /// The pool file of local-copy buffer `guest_id`, which a test writes
-    /// as the client would draw.
-    fn test_pool_file(ctx: &Context, guest_id: u32) -> Arc<std::fs::File> {
-        Arc::clone(&ctx.local_buffer(guest_id).unwrap().pool_file)
-    }
-
-    /// The host copy of local-copy buffer `guest_id`.
-    fn test_destination(ctx: &Context, guest_id: u32) -> Vec<u8> {
-        let buffer = ctx.local_buffer(guest_id).unwrap();
-        buffer.host_copy.as_ref().unwrap().to_vec()
-    }
-
-    fn register_test_local(ctx: &mut Context, guest_id: u32, backing: BufferState) {
-        let host_id = ctx.shadow_table.get_host_id(guest_id).unwrap_or_else(|| {
-            let host_id = guest_id + 1;
-            ctx.shadow_table
-                .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
-            host_id
-        });
-        assert!(ctx.register_local_buffer(guest_id, host_id, backing));
-    }
-
-    fn register_test_native(ctx: &mut Context, guest_id: u32, size: (i32, i32)) {
-        register_test_native_with_sync_fds(ctx, guest_id, size, Vec::new());
-    }
-
-    fn register_test_native_with_sync_fds(
-        ctx: &mut Context,
-        guest_id: u32,
-        size: (i32, i32),
-        sync_fds: Vec<OwnedFd>,
-    ) {
-        let host_id = ctx.shadow_table.get_host_id(guest_id).unwrap_or_else(|| {
-            let host_id = guest_id + 1;
-            ctx.shadow_table
-                .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
-            host_id
-        });
-        assert!(ctx.register_native_buffer(host_id, size, sync_fds));
-    }
-
-    /// The requests queued for the host, decoded by their senders'
-    /// interfaces.
-    fn host_requests(ctx: &Context) -> Vec<(u32, AnyRequest)> {
-        ctx.client_to_host_queue
-            .iter()
-            .map(|(message, fds)| {
-                let mut fds = fds.iter().map(|fd| fd.try_clone().unwrap()).collect();
-                decode(message, &mut fds, |msg| {
-                    let interface = ctx
-                        .shadow_table
-                        .get_host_interface(msg.sender_id)
-                        .unwrap_or_else(|| {
-                            panic!("queued request sender {} is no host object", msg.sender_id)
-                        });
-                    AnyRequest::from_wire(interface.name(), msg)
-                })
-                .expect("a queued request decodes")
-            })
-            .collect()
-    }
-
-    fn unsupported_dmabuf_sync_fd() -> OwnedFd {
-        crate::test_support::pipe().0
-    }
-
     fn invalid_ioctl_fd() -> OwnedFd {
         let path = std::ffi::CString::new("/proc/self/exe").unwrap();
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
@@ -1236,518 +1436,1283 @@ mod tests {
         unsafe { OwnedFd::from_raw_fd(fd) }
     }
 
-    fn set_test_surface_content(
-        ctx: &mut Context,
-        surface_id: u32,
-        buffer_id: Option<u32>,
-        dimensions: Option<(i32, i32)>,
-    ) {
-        ctx.surface_for_test(surface_id)
-            .set_current_buffer_for_test(buffer_id, dimensions);
-    }
-
-    #[test]
-    fn unsupported_native_sync_uses_cached_implicit_fallback_and_commits() {
-        let mut ctx = toplevel_ctx();
-        let surface = 100;
-        let buffer = 50;
-        register_test_native_with_sync_fds(
-            &mut ctx,
-            buffer,
-            (1, 1),
-            vec![unsupported_dmabuf_sync_fd()],
-        );
-
-        ctx.last_sender_id = surface;
-        assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert!(!ctx.is_fatal());
-        assert!(ctx.native_buffer_uses_implicit_sync(buffer));
+    #[tokio::test]
+    async fn unsupported_native_sync_uses_cached_implicit_fallback_and_commits() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        // Its plane is a pipe, which has no dma-buf fence.
+        let buffer = sc.native(1, 1).await;
+        assert_eq!(sc.show(surface, buffer).await, []);
+        // Reads state no peer can observe: the fallback is cached, so the
+        // later commits do not probe the plane again.
+        assert!(sc.s.ctx().native_buffer_uses_implicit_sync(buffer.id));
         assert_eq!(
-            queued_headers(&ctx.client_to_host_queue).last(),
-            Some(&(SURFACE.host, REQ_COMMIT))
-        );
-
-        ctx.client_to_host_queue.clear();
-        assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert!(!ctx.is_fatal());
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue).last(),
-            Some(&(SURFACE.host, REQ_COMMIT)),
+            sc.show(surface, buffer).await,
+            [],
             "the cached compatibility mode must keep later commits live"
         );
     }
 
-    #[test]
-    fn unexpected_native_sync_failure_is_fatal_and_never_commits() {
-        let mut ctx = toplevel_ctx();
-        let surface = 100;
-        let buffer = 50;
+    #[tokio::test]
+    async fn unexpected_native_sync_failure_is_fatal_and_never_commits() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
         let sync_fd = invalid_ioctl_fd();
         let error = crate::allocator::dmabuf_fence(sync_fd.as_fd(), None).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
-        register_test_native_with_sync_fds(&mut ctx, buffer, (1, 1), vec![sync_fd]);
+        let buffer = sc.s.native_buffer(sc.dmabuf, sync_fd, 1, 1).await;
 
-        ctx.last_sender_id = surface;
-        assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert!(ctx.is_fatal());
-        assert!(!ctx.native_buffer_uses_implicit_sync(buffer));
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .all(|(message, _)| msg_opcode(message) != REQ_COMMIT),
+        sc.attach(surface, Some(buffer)).await;
+        sc.s.guest_fatal([wl_surface::req::commit(surface.id)])
+            .await;
+        assert_eq!(
+            sc.s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
+        );
+        assert_eq!(
+            sc.s.host_received(),
+            [],
             "a commit whose synchronization failed must not reach the host"
         );
     }
 
     /// A commit of a buffer the guest GPU still writes waits before it
-    /// changes anything, and goes through once the fence signals.
-    #[test]
-    fn a_commit_waits_for_a_pending_fence_before_it_changes_anything() {
-        let mut ctx = toplevel_ctx();
-        ctx.plane_fences_for_test = Some(crate::state::PlaneFenceForTest::SyncFile);
-        let buffer = 50;
+    /// changes anything, and goes through once the fence signals: with the
+    /// damage it was sent with, which a first dispatch that had taken the
+    /// pending state would have lost.
+    #[tokio::test]
+    async fn a_commit_waits_for_a_pending_fence_before_it_changes_anything() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        // Injects what no peer can provide: the plane stands in for its own
+        // sync_file, which a readable pipe is once the guest GPU is done.
+        sc.s.ctx().plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
         let (fence, signal) = crate::test_support::pipe();
-        register_test_native_with_sync_fds(&mut ctx, buffer, (1, 1), vec![fence]);
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
-        let before = ctx.surfaces[&TEST_SURFACE].clone();
-
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        let wait = {
-            let effects = ctx.take_effects();
-            assert!(effects.end.is_none());
-            assert!(effects.to_host.as_slice().is_empty());
-            assert!(effects.to_guest.as_slice().is_empty());
-            effects.wait.expect("the commit waits for its fence")
-        };
-        assert_eq!(wait.timeout, crate::allocator::SYNC_FILE_TIMEOUT);
-        assert_eq!(
-            ctx.surfaces[&TEST_SURFACE], before,
-            "a commit that waits changes nothing, so it can be dispatched again"
-        );
+        let buffer = sc.s.native_buffer(sc.dmabuf, fence, 2, 2).await;
+        sc.attach(surface, Some(buffer)).await;
+        sc.s.guest([
+            wl_surface::req::damage_buffer(surface.id, 1, 1, 1, 1),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
+        assert!(sc.s.parked(), "the commit waits for its fence");
+        assert_eq!(sc.s.host_received(), []);
+        assert_eq!(sc.s.guest_received(), []);
 
         assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        let effects = ctx.take_effects();
-        assert!(effects.end.is_none() && effects.wait.is_none());
-        assert_eq!(
-            queued_headers(effects.to_host.as_slice()).last(),
-            Some(&(SURFACE.host, REQ_COMMIT))
-        );
+        sc.s.resume().await;
+        assert!(!sc.s.parked());
+        assert_eq!(committed(surface, sc.s.host_received()), [(0, 0, 3, 3)]);
     }
 
     /// A live surface without its state is an internal divergence that ends
     /// the session, not a state the proxy recreates.
-    #[test]
-    fn a_live_surface_without_state_ends_the_session() {
-        type Request = fn(&mut Context) -> Action;
+    #[tokio::test]
+    async fn a_live_surface_without_state_ends_the_session() {
+        use crate::protocols::viewporter::wp_viewporter::req::get_viewport;
+        type Request = fn(surface: u32, viewporter: u32, viewport: u32, new: u32) -> Outgoing;
         let requests: [(&str, Request); 9] = [
-            ("attach", |ctx| Handlers::on_attach(ctx, 0, 0, 0)),
-            ("damage", |ctx| Handlers::on_damage(ctx, 0, 0, 1, 1)),
-            ("damage_buffer", |ctx| {
-                Handlers::on_damage_buffer(ctx, 0, 0, 1, 1)
+            ("attach", |surface, _, _, _| {
+                wl_surface::req::attach(surface, None, 0, 0)
             }),
-            ("set_buffer_scale", |ctx| {
-                Handlers::on_set_buffer_scale(ctx, 1)
+            ("damage", |surface, _, _, _| {
+                wl_surface::req::damage(surface, 0, 0, 1, 1)
             }),
-            ("commit", |ctx| Handlers::on_commit(ctx)),
-            ("set_buffer_transform", |ctx| {
-                Handlers::on_set_buffer_transform(ctx, 0)
+            ("damage_buffer", |surface, _, _, _| {
+                wl_surface::req::damage_buffer(surface, 0, 0, 1, 1)
             }),
-            ("get_viewport", |ctx| {
-                Handlers::on_get_viewport(ctx, 700, TEST_SURFACE)
+            ("set_buffer_scale", |surface, _, _, _| {
+                wl_surface::req::set_buffer_scale(surface, 1)
             }),
-            ("set_source", |ctx| {
-                ctx.viewport_to_wl_surface.insert(700, TEST_SURFACE);
-                ctx.last_sender_id = 700;
-                Handlers::on_set_source(ctx, 0, 0, 1, 1)
+            ("commit", |surface, _, _, _| {
+                wl_surface::req::commit(surface)
             }),
-            ("set_destination", |ctx| {
-                ctx.viewport_to_wl_surface.insert(700, TEST_SURFACE);
-                ctx.last_sender_id = 700;
-                Handlers::on_set_destination(ctx, 1, 1)
+            ("set_buffer_transform", |surface, _, _, _| {
+                wl_surface::req::set_buffer_transform(surface, 0)
+            }),
+            ("get_viewport", |surface, viewporter, _, new| {
+                get_viewport(viewporter, new, surface)
+            }),
+            ("set_source", |_, _, viewport, _| {
+                wp_viewport::req::set_source(viewport, 0, 0, 256, 256)
+            }),
+            ("set_destination", |_, _, viewport, _| {
+                wp_viewport::req::set_destination(viewport, 1, 1)
             }),
         ];
         for (name, request) in requests {
-            let mut ctx = toplevel_ctx();
-            ctx.surfaces.remove(&TEST_SURFACE);
-            ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(request(&mut ctx), Action::Drop);
+            let mut s = Session::new();
+            let surface = s.surface().await;
+            let other = s.surface().await;
+            let viewporter = s.bind_paired("wp_viewporter", 1).await.id;
+            // The viewport of the other surface, which the requests that
+            // need one name.
+            let viewport = s.new_id();
+            s.create(get_viewport(viewporter, viewport, other.id)).await;
+            // Injects a fault no peer can cause: both live surfaces lose
+            // their state.
+            s.ctx().surfaces.clear();
+            let new = s.new_id();
+            s.guest_fatal([request(surface.id, viewporter, viewport, new)])
+                .await;
             assert_eq!(
-                ctx.session_end(),
-                Some(&crate::state::SessionEnd::Internal),
+                s.guest_received_and_error(),
+                (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)),
                 "{name}"
             );
-            assert!(ctx.surfaces.is_empty(), "{name} recreated the state");
+            assert_eq!(s.host_received(), [], "{name}");
+            assert!(s.ctx().surfaces.is_empty(), "{name} recreated the state");
         }
     }
 
     /// A `get_viewport` for a surface without state records no viewport:
     /// the error path changes nothing.
-    #[test]
-    fn get_viewport_without_surface_state_records_no_viewport() {
-        let mut ctx = toplevel_ctx();
-        ctx.surfaces.remove(&TEST_SURFACE);
-        ctx.last_sender_id = TEST_SURFACE;
+    #[tokio::test]
+    async fn get_viewport_without_surface_state_records_no_viewport() {
+        use crate::protocols::viewporter::wp_viewporter::req::get_viewport;
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let viewporter = s.bind_paired("wp_viewporter", 1).await.id;
+        // Injects a fault no peer can cause: a live surface without state.
+        s.ctx().surfaces.clear();
+        let viewport = s.new_id();
+        s.guest_fatal([get_viewport(viewporter, viewport, surface.id)])
+            .await;
         assert_eq!(
-            Handlers::on_get_viewport(&mut ctx, 700, TEST_SURFACE),
-            Action::Drop
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
-        assert!(ctx.viewport_to_wl_surface.is_empty());
+        assert_eq!(s.host_received(), []);
+        // Reads state no peer can observe once the session has ended.
+        assert!(s.ctx().viewport_to_wl_surface.is_empty());
     }
 
-    /// The wl_surface that [`toplevel_ctx`] maps to a host surface.
-    const TEST_SURFACE: u32 = SURFACE.guest;
     /// The side of the square ARGB8888 frames of the copy tests.
     const FRAME_SIDE: usize = 4;
-    const FRAME_STRIDE: usize = FRAME_SIDE * 4;
 
-    /// Register a 4x4 ARGB8888 local-copy buffer and commit it once on
-    /// `surface`, so that its host copy holds a frame and later commits copy
-    /// only what they must.
-    fn commit_test_frame(ctx: &mut Context, surface: u32, buffer: u32) {
-        let side = FRAME_SIDE as i32;
-        register_test_local(
-            ctx,
-            buffer,
-            mapped_test_buffer(side, side, FRAME_STRIDE as u32, StalePixels::all()),
-        );
-        attach_and_commit(ctx, surface, buffer);
-    }
-
-    fn attach_and_commit(ctx: &mut Context, surface: u32, buffer: u32) {
-        ctx.last_sender_id = surface;
-        assert_eq!(Handlers::on_attach(ctx, buffer, 0, 0), Action::Forward);
-        assert_eq!(Handlers::on_commit(ctx), Action::Drop);
-        assert!(!ctx.is_fatal());
-    }
-
-    /// Commit buffer scale `scale` on its own, as a HiDPI client does once,
-    /// so that later frames keep the mapping.
-    fn commit_test_buffer_scale(ctx: &mut Context, scale: i32) {
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(Handlers::on_set_buffer_scale(ctx, scale), Action::Forward);
-        assert_eq!(Handlers::on_commit(ctx), Action::Drop);
-        assert!(!ctx.is_fatal());
-    }
-
-    /// Draw the client's next frame into `buffer`: every pool byte becomes
-    /// `pixel`. The host copy is cleared, so `copied_pixels` then shows
-    /// exactly what the next commit copies.
-    fn draw_test_frame(ctx: &Context, buffer: u32, pixel: u8) {
-        let local = ctx.local_buffer(buffer).unwrap();
-        let host_copy = local.host_copy.as_ref().unwrap();
-        let size = host_copy.len();
-        local.pool_file.write_all_at(&vec![pixel; size], 0).unwrap();
-        host_copy
-            .pread_into(0..size, &shm_pool_file(&vec![0; size]), 0)
-            .unwrap();
-    }
-
-    /// The (x, y) pixels of `buffer`'s host copy that hold `pixel`.
-    fn copied_pixels(ctx: &Context, buffer: u32, pixel: u8) -> Vec<(usize, usize)> {
-        let host_copy = test_destination(ctx, buffer);
-        (0..FRAME_SIDE)
-            .flat_map(|y| (0..FRAME_SIDE).map(move |x| (x, y)))
-            .filter(|&(x, y)| {
-                let start = y * FRAME_STRIDE + x * 4;
-                host_copy[start..start + 4]
-                    .iter()
-                    .all(|&byte| byte == pixel)
-            })
-            .collect()
-    }
-
-    /// The (x, y) pixels of a rectangle, in `copied_pixels` order.
+    /// The (x, y) pixels of a rectangle, in [`Shm::copied`] order.
     fn rect_pixels(x: usize, y: usize, width: usize, height: usize) -> Vec<(usize, usize)> {
         (y..y + height)
             .flat_map(|y| (x..x + width).map(move |x| (x, y)))
             .collect()
     }
 
-    #[test]
-    fn buffer_damage_under_a_buffer_scale_copies_only_its_pixels() {
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        commit_test_buffer_scale(&mut ctx, 2);
-        draw_test_frame(&ctx, 42, 0x22);
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 1, 1, 1, 2),
-            Action::Drop
-        );
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 1, 1, 2));
+    /// Every pixel of a frame.
+    fn whole_frame() -> Vec<(usize, usize)> {
+        rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
     }
 
-    #[test]
-    fn surface_damage_under_an_integer_buffer_scale_copies_its_scaled_pixels() {
+    #[tokio::test]
+    async fn buffer_damage_under_a_buffer_scale_copies_only_its_pixels() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        sc.commit_scale(surface, 2).await;
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 1, 1, 1, 2)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x22), rect_pixels(1, 1, 1, 2));
+    }
+
+    #[tokio::test]
+    async fn surface_damage_under_an_integer_buffer_scale_copies_its_scaled_pixels() {
         // A HiDPI client: buffer scale 2, transform 0, no viewport. Its
         // surface damage maps exactly to buffer pixels, so a small update
         // must not copy the whole buffer every frame.
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        commit_test_buffer_scale(&mut ctx, 2);
-        draw_test_frame(&ctx, 42, 0x22);
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(Handlers::on_damage(&mut ctx, 1, 0, 1, 1), Action::Drop);
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(2, 0, 2, 2));
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        sc.commit_scale(surface, 2).await;
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage(surface.id, 1, 0, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x22), rect_pixels(2, 0, 2, 2));
     }
 
-    #[test]
-    fn surface_damage_under_a_buffer_transform_copies_the_whole_buffer() {
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        draw_test_frame(&ctx, 42, 0x22);
-        ctx.last_sender_id = TEST_SURFACE;
+    #[tokio::test]
+    async fn surface_damage_under_a_buffer_transform_copies_the_whole_buffer() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        a.draw(0x22);
         // WL_OUTPUT_TRANSFORM_90: the bridge does not rotate surface damage.
-        assert_eq!(
-            Handlers::on_set_buffer_transform(&mut ctx, 1),
-            Action::Forward
-        );
-        assert_eq!(Handlers::on_damage(&mut ctx, 1, 1, 1, 1), Action::Drop);
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(
-            copied_pixels(&ctx, 42, 0x22),
-            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
-        );
+        let transform = wl_surface::req::set_buffer_transform(surface.id, 1);
+        sc.forwarded(surface, transform).await;
+        sc.pending([wl_surface::req::damage(surface.id, 1, 1, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x22), whole_frame());
     }
 
-    #[test]
-    fn destination_only_viewport_copies_only_the_damaged_pixels() {
+    #[tokio::test]
+    async fn destination_only_viewport_copies_only_the_damaged_pixels() {
         // A fractional-scale client: the 4x4 buffer fills an 8x8 surface,
         // so a surface unit is half a buffer pixel. It damages surface
         // units, as a client that does not use damage_buffer does.
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_get_viewport(&mut ctx, 700, TEST_SURFACE),
-            Action::Forward
-        );
-        ctx.last_sender_id = 700;
-        assert_eq!(
-            Handlers::on_set_destination(&mut ctx, 8, 8),
-            Action::Forward
-        );
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        draw_test_frame(&ctx, 42, 0x22);
-        assert_eq!(Handlers::on_damage(&mut ctx, 0, 0, 2, 2), Action::Drop);
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        let viewport = sc.viewport(surface).await;
+        let destination = wp_viewport::req::set_destination(viewport.id, 8, 8);
+        sc.forwarded(viewport, destination).await;
+        sc.commit(surface).await;
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage(surface.id, 0, 0, 2, 2)])
+            .await;
+        sc.show(surface, a.buffer).await;
         // Surface units 0..2 are pixels 0..1, grown by a pixel.
-        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(0, 0, 2, 2));
+        assert_eq!(a.copied(0x22), rect_pixels(0, 0, 2, 2));
     }
 
-    #[test]
-    fn commit_without_damage_copies_nothing() {
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        draw_test_frame(&ctx, 42, 0x22);
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
+    #[tokio::test]
+    async fn commit_without_damage_copies_nothing() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        a.draw(0x22);
+        assert_eq!(sc.show(surface, a.buffer).await, []);
+        assert_eq!(a.copied(0x22), []);
     }
 
-    #[test]
-    fn damage_beyond_the_buffer_is_clipped_to_it() {
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        draw_test_frame(&ctx, 42, 0x22);
-        ctx.last_sender_id = TEST_SURFACE;
+    #[tokio::test]
+    async fn damage_beyond_the_buffer_is_clipped_to_it() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        a.draw(0x22);
+        let damage = wl_surface::req::damage_buffer(surface.id, 0, 0, i32::MAX, i32::MAX);
+        sc.pending([damage]).await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x22), whole_frame());
+    }
+
+    #[tokio::test]
+    async fn reattached_buffer_copies_the_damage_of_the_frames_it_missed() {
+        // Damage is relative to the surface's current contents. A client
+        // alternating A, B, A damages only what changed since B, so A's host
+        // copy must also receive what B's frame changed.
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        let b = sc.frame(surface).await;
+
+        b.draw(0x22);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 2, 1)])
+            .await;
+        sc.show(surface, b.buffer).await;
+        assert_eq!(b.copied(0x22), rect_pixels(0, 0, 2, 1));
+
+        // A's next frame holds B's change too, but damages only its own.
+        a.draw(0x33);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 2, 3, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        let mut expected = rect_pixels(0, 0, 2, 1);
+        expected.extend(rect_pixels(2, 3, 1, 1));
+        assert_eq!(a.copied(0x33), expected);
+    }
+
+    #[tokio::test]
+    async fn reattached_buffer_copies_the_damage_of_every_frame_it_missed() {
+        // A, B, C, A: A must also receive what both B's and C's frames changed.
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        let b = sc.frame(surface).await;
+        let c = sc.frame(surface).await;
+        // B changes pixel (0, 0), then C changes pixel (1, 0).
+        for (frame, x) in [(&b, 0), (&c, 1)] {
+            sc.pending([wl_surface::req::damage_buffer(surface.id, x, 0, 1, 1)])
+                .await;
+            sc.show(surface, frame.buffer).await;
+        }
+        a.draw(0x44);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 3, 3, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x44), [(0, 0), (1, 0), (3, 3)]);
+    }
+
+    #[tokio::test]
+    async fn damage_skipped_on_a_released_buffer_is_copied_at_its_next_attach() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        sc.release(a.buffer).await;
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 1, 2, 2, 1)])
+            .await;
+        sc.commit(surface).await;
+        assert_eq!(a.copied(0x22), []);
+
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x22), rect_pixels(1, 2, 2, 1));
+    }
+
+    #[tokio::test]
+    async fn a_buffer_moving_between_surfaces_copies_everything() {
+        // Its host copy relates to the contents of one surface only.
+        let mut sc = Screen::new().await;
+        let first = sc.surface;
+        let other = sc.s.surface().await;
+        let a = sc.frame(first).await;
+        for surface in [other, first] {
+            a.draw(0x22);
+            sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+                .await;
+            sc.show(surface, a.buffer).await;
+            assert_eq!(a.copied(0x22), whole_frame());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_copy_stales_the_whole_host_copy() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        sc.fail_copies(a.buffer, true);
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.attach(surface, Some(a.buffer)).await;
+        sc.s.guest([wl_surface::req::commit(surface.id)]).await;
+        assert_eq!(sc.s.host_received(), [], "the failed commit is dropped");
+        assert_eq!(a.copied(0x22), []);
+
+        sc.fail_copies(a.buffer, false);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        // The whole frame, which covers the damage, grown by a pixel.
+        let side = FRAME_SIDE as i32;
+        let whole = (-1, -1, side + 1, side + 1);
+        assert_eq!(sc.show(surface, a.buffer).await, [whole]);
+        assert_eq!(a.copied(0x22), whole_frame());
+    }
+
+    #[tokio::test]
+    async fn a_mapping_change_stales_the_other_host_copies() {
+        // B's frame is rotated 180 degrees: its pixel damage does not mark
+        // the same pixels of A, which was shown unrotated.
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        let b = sc.frame(surface).await;
+        let transform = wl_surface::req::set_buffer_transform(surface.id, 2);
+        sc.forwarded(surface, transform).await;
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.show(surface, b.buffer).await;
+
+        a.draw(0x33);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x33), whole_frame());
+    }
+
+    #[tokio::test]
+    async fn a_buffer_attached_with_a_new_mapping_copies_everything() {
+        // A's host copy holds its old frame, unrotated. The client rotates A
+        // by 180 degrees and damages one pixel: the rest of A's host copy no
+        // longer matches what the surface shows.
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        sc.frame(surface).await;
+        a.draw(0x33);
+        let transform = wl_surface::req::set_buffer_transform(surface.id, 2);
+        sc.forwarded(surface, transform).await;
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x33), whole_frame());
+    }
+
+    #[tokio::test]
+    async fn a_frame_of_another_size_stales_the_whole_host_copy() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        let small = sc.shm(2, 2).await;
+        sc.show(surface, small.buffer).await;
+
+        a.draw(0x33);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x33), whole_frame());
+    }
+
+    /// The guest destroys its surface, which the host acknowledges, and
+    /// creates a new one under the same ID: nothing relates the frame the
+    /// old one showed to the new one's contents.
+    #[tokio::test]
+    async fn destroying_a_surface_stales_the_host_copies_it_showed() {
+        use crate::protocols::wayland::wl_compositor;
+        let mut sc = Screen::new().await;
+        let old = sc.surface;
+        let a = sc.frame(old).await;
+        assert_eq!(sc.destroy_surface(old).await, [surface_destroy(old)]);
+        sc.s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, old.host)])
+            .await;
+        let deleted = wl_display::Event::DeleteId { id: old.id };
+        assert_eq!(sc.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+        let compositor = sc.s.bind("wl_compositor", wl_compositor::VERSION).await;
+        let create = wl_compositor::req::create_surface(compositor, old.id);
+        let surface = Object {
+            id: old.id,
+            host: sc.s.create(create).await,
+        };
+
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x22), whole_frame());
+    }
+
+    #[tokio::test]
+    async fn damage_only_commit_copies_the_mutated_current_shm_buffer() {
+        // The SHM Commit Copy Invariant: the host samples the current buffer
+        // again for a commit without an attach, so its damage must be copied
+        // before the commit is forwarded.
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 1, 2, 2, 1)])
+            .await;
+        sc.commit(surface).await;
+        assert_eq!(a.copied(0x22), rect_pixels(1, 2, 2, 1));
+    }
+
+    #[tokio::test]
+    async fn damage_only_commit_does_not_read_a_released_shm_buffer() {
+        // After wl_buffer.release the client owns the storage and may be
+        // drawing its next frame there; the host no longer samples it.
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        sc.release(a.buffer).await;
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 1, 2, 2, 1)])
+            .await;
+        sc.commit(surface).await;
+        assert_eq!(a.copied(0x22), []);
+    }
+
+    #[tokio::test]
+    async fn commit_without_damage_on_a_held_buffer_skips_the_copy() {
+        // A commit that only acknowledges a configure must reach the host
+        // even when the buffer's dma-buf sync would fail (here: no channel).
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        sc.fail_copies(a.buffer, true);
+
+        // No damage at all, then damage that clips to nothing.
+        assert_eq!(sc.commit(surface).await, []);
+        let side = FRAME_SIDE as i32;
+        sc.pending([wl_surface::req::damage_buffer(surface.id, side, 0, 1, 1)])
+            .await;
+        assert_eq!(sc.commit(surface).await, [(side - 1, -1, 3, 3)]);
+    }
+
+    #[tokio::test]
+    async fn destroyed_pending_shm_attach_survives_until_commit() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.shm(1, 1).await;
+        // This buffer has completed a previous compositor-use interval. A new
+        // attach must reopen that interval even when the guest destroys the
+        // object before commit.
+        sc.show(surface, a.buffer).await;
+        sc.release(a.buffer).await;
+        sc.attach(surface, Some(a.buffer)).await;
+
+        // Wayland permits destroying the guest object after attach and before
+        // commit. The host attach is already sent, so the local backing and
+        // pending surface reference must survive until commit.
+        assert_eq!(sc.destroy(a.buffer).await, []);
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.commit(surface).await;
         assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 0, 0, i32::MAX, i32::MAX),
-            Action::Drop
+            a.copied(0x22),
+            [(0, 0)],
+            "destroying the guest buffer before commit must not lose its frame"
         );
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        // The commit began a use that only the host's release ends.
         assert_eq!(
-            copied_pixels(&ctx, 42, 0x22),
-            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
+            sc.release_destroyed(a.buffer).await,
+            [buffer_destroy(a.buffer)]
         );
+    }
+
+    #[tokio::test]
+    async fn first_shm_commit_without_explicit_damage_queues_full_host_damage() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.shm(8, 6).await;
+        assert_eq!(sc.show(surface, a.buffer).await, [(0, 0, 8, 6)]);
+    }
+
+    #[tokio::test]
+    async fn failed_shm_copy_does_not_queue_a_host_commit() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.shm(8, 6).await;
+        sc.fail_copies(a.buffer, true);
+        sc.attach(surface, Some(a.buffer)).await;
+        sc.s.guest([wl_surface::req::commit(surface.id)]).await;
+        assert_eq!(
+            sc.s.host_received(),
+            [],
+            "stale or uninitialised host pixels must never be committed"
+        );
+
+        // A failed copy must force a complete retry on the next commit.
+        sc.fail_copies(a.buffer, false);
+        a.draw(0x22);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        // The whole buffer, which covers the damage, grown by a pixel.
+        assert_eq!(sc.commit(surface).await, [(-1, -1, 9, 7)]);
+        assert_eq!(a.copied(0x22), rect_pixels(0, 0, 8, 6));
     }
 
     /// Only a paired or local object can send a request or be named in one:
     /// an ID that names neither is rejected before any handler runs.
+    #[tokio::test]
+    async fn an_id_that_names_no_object_is_rejected() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let unknown = s.new_id();
+        s.guest_fatal([wl_surface::req::commit(unknown)]).await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_OBJECT))
+        );
+        assert_eq!(s.host_received(), []);
+
+        // libwayland-server reports an argument naming no object as an
+        // invalid method.
+        let mut s = Session::new();
+        let surface_too = s.surface().await;
+        assert_eq!(surface_too.id, surface.id);
+        s.guest_fatal([wl_surface::req::attach(surface.id, Some(unknown), 0, 0)])
+            .await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD))
+        );
+        assert_eq!(s.host_received(), []);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_scale_and_transform_without_mutating_pending_state() {
+        // wl_surface.invalid_scale for 0 and negative scales, and
+        // invalid_transform outside wl_output.transform's 0..=7. A client
+        // gets one error, so each rejection starts afresh; the rejected
+        // request reaches no host.
+        type Request = fn(surface: u32) -> Outgoing;
+        let requests: [(Request, u32); 3] = [
+            (
+                |surface| wl_surface::req::set_buffer_scale(surface, 0),
+                wl_surface::ERROR_INVALID_SCALE,
+            ),
+            (
+                |surface| wl_surface::req::set_buffer_scale(surface, -2),
+                wl_surface::ERROR_INVALID_SCALE,
+            ),
+            (
+                |surface| wl_surface::req::set_buffer_transform(surface, 8),
+                wl_surface::ERROR_INVALID_TRANSFORM,
+            ),
+        ];
+        for (request, code) in requests {
+            let mut s = Session::new();
+            let surface = s.surface().await;
+            s.guest_fatal([request(surface.id)]).await;
+            assert_eq!(s.guest_received_and_error(), (vec![], (surface.id, code)));
+            assert_eq!(s.host_received(), []);
+        }
+    }
+
+    /// An attach's offset applies to its commit only.
+    #[tokio::test]
+    async fn consumed_attach_offset_is_not_reapplied_on_later_commit() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.native(8, 6).await;
+        sc.show(surface, buffer).await;
+        let damage = || wl_surface::req::damage_buffer(surface.id, 1, 1, 1, 1);
+
+        // A non-zero offset with damage damages the whole surface.
+        sc.attach_at(surface, Some(buffer), (3, 4)).await;
+        sc.pending([damage()]).await;
+        assert_eq!(sc.commit(surface).await, [(0, 0, 8, 6)]);
+        sc.pending([damage()]).await;
+        assert_eq!(
+            sc.commit(surface).await,
+            [(0, 0, 3, 3)],
+            "the attach offset must be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn damage_buffer_is_translated_to_host_damage_before_commit() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        // damage_buffer must not be forwarded with its guest opcode.
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 4, 5, 6, 7)])
+            .await;
+        assert_eq!(sc.commit(surface).await, [(3, 4, 8, 9)]);
+    }
+
+    /// An offset without explicit damage invents none. Only an attach sets
+    /// an offset in a v4 surface, and a commit of an attach with an offset
+    /// damages the whole surface for the attach, so no peer can see this
+    /// decision alone; it stays a unit test, for the day v5's
+    /// `wl_surface.offset` sets an offset without an attach.
     #[test]
-    fn an_id_that_names_no_object_is_rejected() {
-        use crate::protocols::wayland::wl_surface;
-        use crate::wire::ProtocolError;
-        let dispatch = |ctx: &mut Context, (request, _): crate::wire::Outgoing| {
-            let (header, payload) = crate::test_support::frames(&request)
-                .next()
-                .expect("a whole request");
-            let mut request =
-                crate::wire::WireMessage::new(header.sender_id, header.opcode, payload);
-            crate::test_support::raw_dispatch(crate::test_support::dispatch_request(
-                ctx,
-                &mut request,
-            ))
-        };
+    fn offset_without_explicit_damage_does_not_invent_host_damage() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table
-            .insert_paired_for_test(22, 32, "wl_surface");
+        crate::handler::test_support::add_surface(&mut ctx);
+        ctx.surface_for_test(SURFACE.guest).pending.attach_offset = Some((3, 0));
+        ctx.last_sender_id = SURFACE.guest;
 
+        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
         assert_eq!(
-            dispatch(&mut ctx, wl_surface::req::commit(20)),
-            Err(ProtocolError::InvalidSender(20))
+            queued_headers(&ctx.client_to_host_queue),
+            [(SURFACE.host, REQ_COMMIT)],
+            "offset-only state must not manufacture a damage request"
         );
-        assert_eq!(
-            dispatch(&mut ctx, wl_surface::req::attach(22, Some(21), 0, 0)),
-            Err(ProtocolError::InvalidObjectId(21))
-        );
-        assert!(ctx.client_to_host_queue.is_empty());
     }
 
-    /// The guest sets `app_id` on the toplevel `xdg_toplevel_id`; returns the
-    /// requests that queues for the host.
-    fn set_test_app_id(
-        ctx: &mut Context,
-        xdg_toplevel_id: u32,
-        app_id: &str,
-    ) -> Vec<(u32, AnyRequest)> {
-        ctx.last_sender_id = xdg_toplevel_id;
+    #[tokio::test]
+    async fn nonzero_surface_offset_with_explicit_damage_forces_full_host_damage() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.native(8, 6).await;
+        sc.show(surface, buffer).await;
+        sc.attach_at(surface, Some(buffer), (3, 0)).await;
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 1, 1, 1, 1)])
+            .await;
         assert_eq!(
-            Handlers::on_set_app_id(ctx, &app_id.to_string()),
-            Action::Drop
+            sc.commit(surface).await,
+            [(0, 0, 8, 6)],
+            "offset plus explicit damage must include complete host damage"
         );
-        host_requests(ctx)
     }
 
-    #[test]
-    fn set_app_id_creates_zaura_surface_and_sets_app_id() {
-        let mut ctx = toplevel_ctx();
-        let requests = set_test_app_id(&mut ctx, TOPLEVEL.guest, "my_app");
-        let zaura_surface_host = ctx.aura_surfaces.get(SURFACE.host).unwrap();
-        let app_id = "org.chromium.guest_os.termina.wayland.my_app";
-        assert_eq!(
-            requests,
+    /// A commit of a surface whose host object the host destroyed on its
+    /// own reaches nothing: the guest's surface ended with it.
+    #[tokio::test]
+    async fn missing_host_surface_ends_the_session_without_a_commit() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        s.host_may_end(|_, interface| interface == "wl_surface");
+        s.guest([wl_surface::req::damage(surface.id, 1, 2, 3, 4)])
+            .await;
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, surface.host)])
+            .await;
+        let deleted = wl_display::Event::DeleteId { id: surface.id };
+        assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+
+        s.guest_fatal([wl_surface::req::commit(surface.id)]).await;
+        let (events, (_, code)) = s.guest_received_and_error();
+        assert_eq!((events, code), (vec![], wl_display::ERROR_INVALID_OBJECT));
+        assert_eq!(s.host_received(), []);
+    }
+
+    #[tokio::test]
+    async fn invalid_damage_spam_does_not_escalate_to_full_frame_damage() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let spam = (0..300).flat_map(|_| {
             [
-                (
-                    TOPLEVEL.host,
-                    xdg_toplevel::Request::SetAppId {
-                        app_id: app_id.into()
-                    }
-                    .into()
-                ),
-                (
-                    SHELL,
-                    zaura_shell::Request::GetAuraSurface {
-                        id: zaura_surface_host,
-                        surface: SURFACE.host
-                    }
-                    .into()
-                ),
-                (
-                    zaura_surface_host,
-                    zaura_surface::Request::SetApplicationId {
-                        application_id: Some(app_id.into())
-                    }
-                    .into()
-                ),
+                wl_surface::req::damage(surface.id, 0, 0, 0, 10),
+                wl_surface::req::damage_buffer(surface.id, 0, 0, 10, -1),
             ]
-        );
+        });
+        sc.pending(spam).await;
+        assert_eq!(sc.commit(surface).await, []);
     }
 
-    #[test]
-    fn set_app_id_reuses_existing_zaura_surface() {
-        let mut ctx = toplevel_ctx();
-        // An Aura surface created earlier, tracked the way
-        // ensure_host_zaura_surface records it.
-        let zaura_surface_host = 99u32;
-        ctx.shadow_table
-            .insert_host_only_for_test(zaura_surface_host, "zaura_surface", 38);
-        ctx.aura_surfaces.remember(SURFACE.host, zaura_surface_host);
+    #[tokio::test]
+    async fn bounded_damage_overflow_uses_the_exact_content_extent() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.native(8, 6).await;
+        sc.attach(surface, Some(buffer)).await;
+        let damage =
+            (0..=256).map(|index| wl_surface::req::damage_buffer(surface.id, index, index, 1, 1));
+        sc.pending(damage).await;
+        assert_eq!(sc.commit(surface).await, [(0, 0, 8, 6)]);
+    }
 
-        let app_id = "org.chromium.guest_os.termina.wayland.reused";
+    #[tokio::test]
+    async fn surface_damage_is_outset_before_host_forwarding() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        sc.pending([wl_surface::req::damage(surface.id, 10, 20, 1, 1)])
+            .await;
+        assert_eq!(sc.commit(surface).await, [(9, 19, 3, 3)]);
+    }
+
+    impl Screen {
+        /// The guest has `surface` show its buffer at `scale` through a new
+        /// viewport with `source` (in 24.8 fixed point) and `destination`,
+        /// which the host gets at once; returns the viewport.
+        async fn view(
+            &mut self,
+            surface: Object,
+            scale: i32,
+            source: Option<Rect>,
+            destination: Option<(i32, i32)>,
+        ) -> Object {
+            if scale != 1 {
+                let request = wl_surface::req::set_buffer_scale(surface.id, scale);
+                self.forwarded(surface, request).await;
+            }
+            let viewport = self.viewport(surface).await;
+            if let Some((x, y, width, height)) = source {
+                let request = wp_viewport::req::set_source(viewport.id, x, y, width, height);
+                self.forwarded(viewport, request).await;
+            }
+            if let Some((width, height)) = destination {
+                let request = wp_viewport::req::set_destination(viewport.id, width, height);
+                self.forwarded(viewport, request).await;
+            }
+            viewport
+        }
+    }
+
+    /// The host damage of a commit with buffer damage `rect` on a surface
+    /// that shows a native buffer of `size` at `scale` through a viewport
+    /// with `source` (24.8 fixed point) and `destination`.
+    async fn host_damage_for(
+        scale: i32,
+        source: Option<Rect>,
+        destination: Option<(i32, i32)>,
+        size: (i32, i32),
+        rect: Rect,
+    ) -> Vec<Rect> {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        sc.view(surface, scale, source, destination).await;
+        let buffer = sc.native(size.0, size.1).await;
+        sc.show(surface, buffer).await;
+        let (x, y, width, height) = rect;
+        sc.pending([wl_surface::req::damage_buffer(
+            surface.id, x, y, width, height,
+        )])
+        .await;
+        sc.commit(surface).await
+    }
+
+    /// Every host damage rectangle, partial or full, keeps both edges within
+    /// the headroom, however far a viewport stretches the buffer.
+    #[tokio::test]
+    async fn host_damage_is_clamped_on_both_edges() {
+        const MAX: i32 = i32::MAX / 10;
+        // A 1x1 buffer stretched to 1000x1000 puts damage at buffer pixel
+        // 1000000 past the headroom: it shrinks to the headroom's last unit.
         assert_eq!(
-            set_test_app_id(&mut ctx, TOPLEVEL.guest, "reused"),
-            [
-                (
-                    TOPLEVEL.host,
-                    xdg_toplevel::Request::SetAppId {
-                        app_id: app_id.into()
-                    }
-                    .into()
-                ),
-                (
-                    zaura_surface_host,
-                    zaura_surface::Request::SetApplicationId {
-                        application_id: Some(app_id.into())
-                    }
-                    .into()
-                ),
-            ]
+            host_damage_for(1, None, Some((1000, 1000)), (1, 1), (1_000_000, 0, 1, 1)).await,
+            [(MAX - 1, -1000, 1, 3000)]
         );
-    }
-
-    #[test]
-    fn set_app_id_keeps_the_guest_os_namespace_with_placement_on() {
-        let mut ctx = toplevel_ctx_with(crate::placement_config::PlacementConfig::active_for_test(
-            &[],
-        ));
-        let requests = set_test_app_id(&mut ctx, TOPLEVEL.guest, "com.example.Terminal");
-        let zaura_surface_host = ctx.aura_surfaces.get(SURFACE.host).unwrap();
-        let app_id = "org.chromium.guest_os.termina.wayland.com.example.Terminal";
+        // Stretched to i32::MAX units, the left edge of the last pixel would
+        // leave no room for its width.
         assert_eq!(
-            requests,
-            [
-                (
-                    TOPLEVEL.host,
-                    xdg_toplevel::Request::SetAppId {
-                        app_id: "org.chromium.guest_os.termina.wayland.com.example.Terminal".into()
-                    }
-                    .into()
-                ),
-                (
-                    SHELL,
-                    zaura_shell::Request::GetAuraSurface {
-                        id: zaura_surface_host,
-                        surface: SURFACE.host
-                    }
-                    .into()
-                ),
-                (
-                    zaura_surface_host,
-                    zaura_surface::Request::SetApplicationId {
-                        application_id: Some(app_id.into())
-                    }
-                    .into()
-                ),
-            ]
+            host_damage_for(
+                1,
+                Some((0, 0, 256, 256)),
+                Some((i32::MAX, 256)),
+                (1, 1),
+                (i32::MAX, 0, 1, 1)
+            )
+            .await,
+            [(MAX - 1, -256, 1, 768)]
         );
+        // A buffer attached under a viewport without damage damages the
+        // whole destination.
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        sc.view(surface, 1, None, Some((i32::MAX, i32::MAX))).await;
+        let buffer = sc.native(1, 1).await;
+        assert_eq!(sc.show(surface, buffer).await, [(0, 0, MAX, MAX)]);
     }
 
-    #[test]
-    fn set_app_id_noop_when_no_zaura_shell() {
-        let mut ctx = toplevel_ctx();
-        ctx.singletons.unbind_for_test(Singleton::AuraShell);
+    #[tokio::test]
+    async fn full_mapping_without_explicit_damage_still_damages_the_host_surface() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        // A native buffer, which has no host copy to make the damage full.
+        let buffer = sc.native(8, 6).await;
+        let transform = wl_surface::req::set_buffer_transform(surface.id, 1);
+        sc.forwarded(surface, transform).await;
+        assert_eq!(sc.show(surface, buffer).await, [(0, 0, 6, 8)]);
+    }
+
+    #[tokio::test]
+    async fn extreme_surface_damage_is_clamped_before_host_encoding() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        sc.pending([wl_surface::req::damage(
+            surface.id,
+            i32::MIN,
+            0,
+            i32::MAX,
+            1,
+        )])
+        .await;
         assert_eq!(
-            set_test_app_id(&mut ctx, TOPLEVEL.guest, "no_shell"),
-            [(
-                TOPLEVEL.host,
-                xdg_toplevel::Request::SetAppId {
-                    app_id: "org.chromium.guest_os.termina.wayland.no_shell".into()
-                }
-                .into()
-            )]
+            sc.commit(surface).await,
+            [(i32::MIN / 10, -1, 214_748_364, 3)]
         );
     }
 
-    #[test]
-    fn oversized_namespaced_app_id_is_dropped_before_wire_encoding() {
-        let mut ctx = toplevel_ctx();
-        ctx.last_sender_id = TOPLEVEL.guest;
-        let oversized = "x".repeat(4_084);
+    #[tokio::test]
+    async fn viewport_damage_uses_committed_crop_and_destination() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let source = (65_536, 131_072, 262_144, 262_144);
+        sc.view(surface, 1, Some(source), Some((200, 100))).await;
 
-        assert_eq!(Handlers::on_set_app_id(&mut ctx, &oversized), Action::Drop);
+        // The viewport becomes current at its own commit, as a client sets
+        // it once; a later frame's buffer damage is converted from buffer
+        // pixels into destination coordinates.
+        sc.commit(surface).await;
+        let buffer = sc.native(2048, 2048).await;
+        sc.attach(surface, Some(buffer)).await;
+        sc.pending([wl_surface::req::damage_buffer(
+            surface.id, 256, 512, 256, 256,
+        )])
+        .await;
+        // The damage, grown by a buffer pixel, starts just left of and above
+        // the source, so its mapped edges round outward to -1.
+        assert_eq!(sc.commit(surface).await, [(-1, -1, 52, 27)]);
+    }
+
+    #[tokio::test]
+    async fn buffer_damage_maps_through_buffer_scale_before_the_viewport() {
+        // Scale 2 makes the 100-pixel buffer a 50-unit surface, which the
+        // destination stretches back to 100 units: a pixel is one unit.
+        assert_eq!(
+            host_damage_for(2, None, Some((100, 100)), (100, 100), (80, 80, 20, 20)).await,
+            [(79, 79, 22, 22)]
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_buffer_damage_covers_the_whole_destination() {
+        assert_eq!(
+            host_damage_for(2, None, Some((100, 100)), (100, 100), (0, 0, 100, 100)).await,
+            [(-1, -1, 102, 102)]
+        );
+    }
+
+    #[tokio::test]
+    async fn buffer_damage_subtracts_the_source_offset_in_surface_units() {
+        // The source starts 10 units, which are 20 buffer pixels, into the
+        // 200-pixel buffer at scale 2.
+        let source = Some((10 * 256, 10 * 256, 80 * 256, 80 * 256));
+        assert_eq!(
+            host_damage_for(2, source, Some((80, 80)), (200, 200), (100, 100, 20, 20)).await,
+            [(39, 39, 12, 12)]
+        );
+    }
+
+    #[tokio::test]
+    async fn source_only_viewport_maps_buffer_damage() {
+        // Without a destination the source crops without scaling, and its
+        // origin keeps its fraction: x starts at 10.5 units.
+        let source = Some((10 * 256 + 128, 10 * 256, 80 * 256, 80 * 256));
+        assert_eq!(
+            host_damage_for(2, source, None, (200, 200), (100, 100, 20, 20)).await,
+            [(39, 39, 11, 12)]
+        );
+    }
+
+    /// A destroyed viewport is removed at the surface's next commit, as
+    /// its state is double-buffered.
+    #[tokio::test]
+    async fn destroying_viewport_is_double_buffered_until_surface_commit() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        // The 4x4 buffer fills an 8x8 surface: a pixel is two units.
+        let viewport = sc.view(surface, 1, None, Some((8, 8))).await;
+        let buffer = sc.native(4, 4).await;
+        sc.show(surface, buffer).await;
+        let damage = || wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1);
+        sc.pending([damage()]).await;
+        assert_eq!(sc.commit(surface).await, [(-2, -2, 6, 6)]);
+
+        sc.forwarded(viewport, wp_viewport::req::destroy(viewport.id))
+            .await;
+        // Reads state no peer can observe: until the commit, the surface
+        // keeps its viewport, as the host does.
+        let state = &sc.s.ctx().surfaces[&surface.id];
         assert!(
-            ctx.client_to_host_queue.is_empty(),
-            "an app ID exceeding the Wayland message limit must not be queued"
+            state.viewport.is_some(),
+            "destroy only changes pending viewport state"
         );
+        sc.pending([damage()]).await;
+        assert_eq!(
+            sc.commit(surface).await,
+            [(-1, -1, 3, 3)],
+            "the viewport is removed at the following surface commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_viewport_values_and_dead_surface_are_fatal() {
+        type Request = fn(viewport: u32) -> Outgoing;
+        let requests: [(Request, bool, u32); 3] = [
+            (
+                |viewport| wp_viewport::req::set_source(viewport, -1, 0, 10, 10),
+                false,
+                wp_viewport::ERROR_BAD_VALUE,
+            ),
+            (
+                |viewport| wp_viewport::req::set_destination(viewport, 0, 10),
+                false,
+                wp_viewport::ERROR_BAD_VALUE,
+            ),
+            // After its surface is destroyed.
+            (
+                |viewport| wp_viewport::req::set_destination(viewport, 10, 10),
+                true,
+                wp_viewport::ERROR_NO_SURFACE,
+            ),
+        ];
+        for (request, destroy_surface, code) in requests {
+            let mut sc = Screen::new().await;
+            let surface = sc.surface;
+            let viewport = sc.viewport(surface).await;
+            if destroy_surface {
+                sc.destroy_surface(surface).await;
+            }
+            sc.s.guest_fatal([request(viewport.id)]).await;
+            assert_eq!(
+                sc.s.guest_received_and_error(),
+                (vec![], (viewport.id, code))
+            );
+            assert_eq!(sc.s.host_received(), []);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_viewport_is_a_fatal_viewporter_error() {
+        use crate::protocols::viewporter::wp_viewporter::req::get_viewport;
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        sc.viewport(surface).await;
+        let viewporter = sc.viewporter.unwrap();
+        let viewport = sc.s.new_id();
+        sc.s.guest_fatal([get_viewport(viewporter, viewport, surface.id)])
+            .await;
+        assert_eq!(
+            sc.s.guest_received_and_error(),
+            (vec![], (viewporter, wp_viewporter::ERROR_VIEWPORT_EXISTS))
+        );
+        assert_eq!(sc.s.host_received(), []);
+    }
+
+    impl Screen {
+        /// Whether a viewport rule of `surface` that the proxy leaves
+        /// unenforced, as Exo does, was logged. Reads state no peer can
+        /// observe: the log.
+        fn logged(&mut self, surface: Object) -> bool {
+            self.s.ctx().surfaces[&surface.id].logged_viewport_rule
+        }
+    }
+
+    #[tokio::test]
+    async fn fractional_source_without_destination_is_logged_and_forwarded() {
+        // Exo takes the fractional source size as the surface size, and the
+        // host damage covers it, rounded up.
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        sc.view(surface, 1, Some((0, 0, 128, 256)), None).await;
+        let buffer = sc.native(1, 1).await;
+        assert_eq!(sc.show(surface, buffer).await, [(0, 0, 1, 1)]);
+        assert!(sc.logged(surface));
+    }
+
+    /// A buffer of `size` that the surface shows at scale 2 through a
+    /// viewport with `source` (24.8 fixed point) and a destination, which
+    /// lets the source be fractional; the commit reaches the host.
+    async fn commit_viewport_source(size: (i32, i32), source: Rect) -> (Screen, Object) {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let viewport = sc.view(surface, 2, Some(source), Some((10, 10))).await;
+        let buffer = sc.native(size.0, size.1).await;
+        sc.show(surface, buffer).await;
+        (sc, viewport)
+    }
+
+    #[tokio::test]
+    async fn viewport_source_outside_the_buffer_is_logged_and_forwarded() {
+        const ONE: i32 = 256;
+        // At scale 2 an 8x6 buffer is a 4x3 surface, the source's units.
+        let whole = (0, 0, 4 * ONE, 3 * ONE);
+        let (mut sc, _) = commit_viewport_source((8, 6), whole).await;
+        let surface = sc.surface;
+        assert!(!sc.logged(surface));
+
+        // Half a unit to the right the source leaves the buffer. Exo accepts
+        // that, so the commit is forwarded and only logged.
+        let (mut sc, _) = commit_viewport_source((8, 6), (ONE / 2, 0, 4 * ONE, 3 * ONE)).await;
+        assert!(sc.logged(surface));
+
+        // A later, smaller buffer under the unchanged viewport.
+        let (mut sc, _) = commit_viewport_source((8, 6), whole).await;
+        let smaller = sc.native(6, 6).await;
+        sc.show(surface, smaller).await;
+        assert!(sc.logged(surface));
+
+        // Detaching the buffer in the same commit exempts any source.
+        let (mut sc, viewport) = commit_viewport_source((8, 6), whole).await;
+        sc.attach(surface, None).await;
+        let source = wp_viewport::req::set_source(viewport.id, 0, 0, 100 * ONE, 100 * ONE);
+        sc.forwarded(viewport, source).await;
+        sc.commit(surface).await;
+        assert!(!sc.logged(surface));
+
+        // An odd buffer ends at a fractional unit, 3.5x2.5, which the source
+        // may reach exactly.
+        let edge = (0, 0, 3 * ONE + ONE / 2, 2 * ONE + ONE / 2);
+        let (mut sc, _) = commit_viewport_source((7, 5), edge).await;
+        assert!(!sc.logged(surface));
+    }
+
+    /// A session with `ctx` whose host has `zaura_shell`, which the proxy
+    /// binds for itself, and whose guest has a toplevel; returns the session,
+    /// the host `zaura_shell` and the toplevel.
+    async fn shelled(ctx: Context) -> (Session, u32, Toplevel) {
+        let mut s = Session::with_context(ctx);
+        let shell = s.aura_shell().await;
+        let toplevel = s.toplevel().await;
+        (s, shell, toplevel)
+    }
+
+    /// The guest sets `app_id` on `toplevel`; returns what the host gets.
+    async fn set_app_id(s: &mut Session, toplevel: Object, app_id: &str) -> Vec<(u32, AnyRequest)> {
+        s.guest([xdg_toplevel::req::set_app_id(toplevel.id, app_id).unwrap()])
+            .await;
+        assert_eq!(s.guest_received(), []);
+        s.host_received()
+    }
+
+    /// The host `xdg_toplevel.set_app_id` of `toplevel`, of guest OS app ID
+    /// `app_id`.
+    fn namespaced(toplevel: Object, app_id: &str) -> (u32, AnyRequest) {
+        let app_id = format!("org.chromium.guest_os.termina.wayland.{app_id}");
+        (
+            toplevel.host,
+            xdg_toplevel::Request::SetAppId { app_id }.into(),
+        )
+    }
+
+    /// What the host gets for the guest's first `set_app_id` of `app_id` on
+    /// `toplevel` while the proxy has `shell`: the namespaced ID, and a new
+    /// Aura surface of the toplevel's surface, which gets it too; returns
+    /// the Aura surface.
+    fn first_app_id(
+        host: &[(u32, AnyRequest)],
+        shell: u32,
+        toplevel: Toplevel,
+        app_id: &str,
+    ) -> u32 {
+        let [_, (_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { id, .. })), _] =
+            host
+        else {
+            panic!("the host got no Aura surface: {host:?}");
+        };
+        let application_id = Some(format!("org.chromium.guest_os.termina.wayland.{app_id}"));
+        assert_eq!(
+            host,
+            [
+                namespaced(toplevel.toplevel, app_id),
+                (
+                    shell,
+                    zaura_shell::Request::GetAuraSurface {
+                        id: *id,
+                        surface: toplevel.surface.host
+                    }
+                    .into()
+                ),
+                (
+                    *id,
+                    zaura_surface::Request::SetApplicationId { application_id }.into()
+                ),
+            ]
+        );
+        *id
+    }
+
+    #[tokio::test]
+    async fn set_app_id_creates_zaura_surface_and_sets_app_id() {
+        let ctx = Context::new_for_test(false, false, Vec::new());
+        let (mut s, shell, toplevel) = shelled(ctx).await;
+        let host = set_app_id(&mut s, toplevel.toplevel, "my_app").await;
+        first_app_id(&host, shell, toplevel, "my_app");
+    }
+
+    #[tokio::test]
+    async fn set_app_id_reuses_existing_zaura_surface() {
+        let ctx = Context::new_for_test(false, false, Vec::new());
+        let (mut s, shell, toplevel) = shelled(ctx).await;
+        // An Aura surface the first app ID created.
+        let host = set_app_id(&mut s, toplevel.toplevel, "first").await;
+        let aura_surface = first_app_id(&host, shell, toplevel, "first");
+
+        let application_id = Some("org.chromium.guest_os.termina.wayland.reused".into());
+        assert_eq!(
+            set_app_id(&mut s, toplevel.toplevel, "reused").await,
+            [
+                namespaced(toplevel.toplevel, "reused"),
+                (
+                    aura_surface,
+                    zaura_surface::Request::SetApplicationId { application_id }.into()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_app_id_keeps_the_guest_os_namespace_with_placement_on() {
+        let placement = crate::placement_config::PlacementConfig::active_for_test(&[]);
+        let ctx = Context::with_placement_for_test(placement);
+        let (mut s, shell, toplevel) = shelled(ctx).await;
+        let app_id = "com.example.Terminal";
+        let host = set_app_id(&mut s, toplevel.toplevel, app_id).await;
+        first_app_id(&host, shell, toplevel, app_id);
+    }
+
+    #[tokio::test]
+    async fn set_app_id_noop_when_no_zaura_shell() {
+        let mut s = Session::new();
+        let toplevel = s.toplevel().await.toplevel;
+        assert_eq!(
+            set_app_id(&mut s, toplevel, "no_shell").await,
+            [namespaced(toplevel, "no_shell")]
+        );
+    }
+
+    /// The longest app ID a guest can send, which namespaced exceeds the
+    /// Wayland message limit, reaches neither the role nor an Aura surface.
+    #[tokio::test]
+    async fn oversized_namespaced_app_id_is_dropped_before_wire_encoding() {
+        let ctx = Context::new_for_test(false, false, Vec::new());
+        let (mut s, _, toplevel) = shelled(ctx).await;
+        let oversized = "x".repeat(4_083);
+        assert_eq!(
+            set_app_id(&mut s, toplevel.toplevel, &oversized).await,
+            [],
+            "an app ID exceeding the Wayland message limit must not be sent"
+        );
+    }
+
+    /// Destroying a toplevel ends its role, which the session checks after
+    /// each batch (`Context::assert_no_orphans`): the role must not outlive
+    /// its toplevel.
+    #[tokio::test]
+    async fn xdg_toplevel_destroy_cleans_up_map() {
+        use crate::protocols::xdg_shell::xdg_surface;
+        let mut s = Session::new();
+        let Toplevel {
+            xdg_surface: role,
+            toplevel,
+            ..
+        } = s.toplevel().await;
+        s.guest([xdg_toplevel::req::destroy(toplevel.id)]).await;
+        let destroy = xdg_toplevel::Request::Destroy {};
+        assert_eq!(s.host_received(), [(toplevel.host, destroy.into())]);
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, toplevel.host)])
+            .await;
+        let deleted = wl_display::Event::DeleteId { id: toplevel.id };
+        assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+        // The xdg_surface, which has no role left, may end now.
+        s.guest([xdg_surface::req::destroy(role.id)]).await;
+        let destroy = xdg_surface::Request::Destroy {};
+        assert_eq!(s.host_received(), [(role.host, destroy.into())]);
+    }
+
+    #[tokio::test]
+    async fn wl_surface_destroy_releases_zaura_surface() {
+        let ctx = Context::new_for_test(false, false, Vec::new());
+        let (mut s, shell, toplevel) = shelled(ctx).await;
+        let host = set_app_id(&mut s, toplevel.toplevel, "app").await;
+        let aura_surface = first_app_id(&host, shell, toplevel, "app");
+
+        let surface = toplevel.surface;
+        s.guest([wl_surface::req::destroy(surface.id)]).await;
+        assert_eq!(
+            s.host_received(),
+            [
+                (aura_surface, zaura_surface::Request::Release {}.into()),
+                surface_destroy(surface),
+            ]
+        );
+    }
+
+    /// Destroying a surface ends the xdg role on it, so its toplevel's
+    /// later app ID reaches no Aura surface of the destroyed surface.
+    #[tokio::test]
+    async fn wl_surface_destroy_removes_stale_xdg_surface_links() {
+        let ctx = Context::new_for_test(false, false, Vec::new());
+        let (mut s, _, toplevel) = shelled(ctx).await;
+        let surface = toplevel.surface;
+        s.guest([wl_surface::req::destroy(surface.id)]).await;
+        assert_eq!(s.host_received(), [surface_destroy(surface)]);
+        assert_eq!(
+            set_app_id(&mut s, toplevel.toplevel, "app").await,
+            [namespaced(toplevel.toplevel, "app")]
+        );
+    }
+
+    /// An Aura shell older than `zaura_surface.release` (v38) has no
+    /// destructor for an Aura surface: destroying its surface sends none,
+    /// and the Aura surface's host ID stays reserved for the connection.
+    #[tokio::test]
+    async fn old_aura_surface_stays_reserved_without_release_request() {
+        let mut s = Session::new();
+        s.registry().await;
+        s.advertise(zaura_shell::NAME, 37).await;
+        let host = s.host_received();
+        let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))] = &host[..] else {
+            panic!("the proxy did not bind zaura_shell: {host:?}");
+        };
+        let shell = id.2;
+        // The gtk_shell1 the guest is advertised.
+        assert_eq!(s.guest_received().len(), 1);
+        let toplevel = s.toplevel().await;
+        let host = set_app_id(&mut s, toplevel.toplevel, "legacy").await;
+        let aura_surface = first_app_id(&host, shell, toplevel, "legacy");
+
+        let surface = toplevel.surface;
+        s.guest([wl_surface::req::destroy(surface.id)]).await;
+        assert_eq!(
+            s.host_received(),
+            [surface_destroy(surface)],
+            "old aura-shell versions must not receive release"
+        );
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, surface.host)])
+            .await;
+        let deleted = wl_display::Event::DeleteId { id: surface.id };
+        assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+        // The proxy reuses freed host IDs first: the surface's, and the
+        // Aura surface's if it were free.
+        for _ in 0..2 {
+            assert_ne!(s.surface().await.host, aura_surface);
+        }
     }
 
     #[test]
@@ -1758,368 +2723,460 @@ mod tests {
         assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(4_084)).is_err());
     }
 
-    #[test]
-    fn commit_without_attach_keeps_the_current_buffer() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.last_sender_id = surface_id;
-        register_test_native(&mut ctx, 42, (1, 1));
+    /// A commit without an attach keeps the surface's buffer, whose size
+    /// full damage covers; an attach of no buffer clears it.
+    #[tokio::test]
+    async fn commit_without_attach_keeps_the_current_buffer() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.native(8, 6).await;
+        // A rotated buffer damages its whole surface, which shows the size
+        // of the buffer the surface shows.
+        let transform = wl_surface::req::set_buffer_transform(surface.id, 1);
+        sc.forwarded(surface, transform).await;
+        assert_eq!(sc.show(surface, buffer).await, [(0, 0, 6, 8)]);
 
-        assert_eq!(Handlers::on_attach(&mut ctx, 42, 0, 0), Action::Forward);
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(SurfaceState::current_buffer_id),
-            Some(42)
-        );
-
-        // A commit without an attach keeps the surface contents, but it does
-        // not submit or copy the wl_buffer object again.
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(SurfaceState::current_buffer_id),
-            Some(42)
-        );
+        let damage = || wl_surface::req::damage_buffer(surface.id, 1, 1, 1, 1);
+        sc.pending([damage()]).await;
+        assert_eq!(sc.commit(surface).await, [(0, 0, 6, 8)]);
 
         // An explicit attach(NULL) is different from omitting attach and must
-        // clear the current buffer.
-        assert_eq!(Handlers::on_attach(&mut ctx, 0, 0, 0), Action::Forward);
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(SurfaceState::current_buffer_id),
-            None
-        );
+        // clear the current buffer: a surface without one maps as 1x1.
+        sc.attach(surface, None).await;
+        sc.pending([damage()]).await;
+        assert_eq!(sc.commit(surface).await, [(0, 0, 1, 1)]);
     }
 
     /// A buffer of a pool whose host `wl_shm` was removed has no host
-    /// object and no content.
-    #[test]
-    fn attaching_an_inert_buffer_detaches_the_surface() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.last_sender_id = surface_id;
-        register_test_native(&mut ctx, 42, (1, 1));
-        assert_eq!(Handlers::on_attach(&mut ctx, 42, 0, 0), Action::Forward);
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        ctx.shadow_table.create_local(43, Iface::WlBuffer, 1);
+    /// object and no content: attaching it detaches the surface.
+    #[tokio::test]
+    async fn attaching_an_inert_buffer_detaches_the_surface() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let registry = s.registry().await;
+        let name = s.advertise("wl_shm", wl_shm::VERSION).await;
+        let advertised = s.guest_received();
+        let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+            advertised[..]
+        else {
+            panic!("the guest was not advertised wl_shm: {advertised:?}");
+        };
+        let shm = s.new_id();
+        s.guest([wl_registry::req::bind(registry.id, name, "wl_shm", version, shm).unwrap()])
+            .await;
+        // The proxy binds the host's wl_shm for itself.
+        s.host_received();
+        let pool = s.shm_pool(shm, shm_pool_file(&[0; 4])).await;
+        let live = s.shm_buffer(pool, 1, 1).await;
+        s.guest([
+            wl_surface::req::attach(surface.id, Some(live.id), 0, 0),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
+        s.host_received();
+        s.host([wl_registry::evt::global_remove(registry.host, name)])
+            .await;
+        s.guest_received();
+        s.host_received();
 
-        assert_eq!(Handlers::on_attach(&mut ctx, 43, 0, 0), Action::Forward);
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert!(!ctx.is_fatal());
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(SurfaceState::current_buffer_id),
-            None
-        );
+        let pool = s.new_id();
+        let file = shm_pool_file(&[0; 4]);
+        s.guest([wl_shm::req::create_pool(shm, pool, file.into(), 4)])
+            .await;
+        let inert = s.new_id();
+        s.guest([
+            wl_shm_pool::req::create_buffer(pool, inert, 0, 1, 1, 4, wl_shm::FORMAT_ARGB8888),
+            wl_surface::req::attach(surface.id, Some(inert), 0, 0),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
+        let detach = wl_surface::Request::Attach {
+            buffer: 0,
+            x: 0,
+            y: 0,
+        };
+        let mut host = s.host_received();
+        assert_eq!(host.remove(0), (surface.host, detach.into()));
+        assert_eq!(committed(surface, host), []);
+        assert_eq!(s.guest_received(), []);
     }
 
-    #[test]
-    fn damage_only_commit_preserves_a_released_use() {
-        // Only committing an explicit attach begins a compositor use.
+    /// Only committing an explicit attach begins a compositor use: once the
+    /// host released the buffer, a damage-only commit leaves it released,
+    /// so the guest's destroy of it reaches the host at once.
+    #[tokio::test]
+    async fn damage_only_commit_preserves_a_released_use() {
         for kind in BUFFER_KINDS {
-            let mut ctx = toplevel_ctx();
-            let buffer = 42;
-            set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
-            register_test_buffer(&mut ctx, kind, buffer, 43);
-            assert!(ctx.mark_buffer_submitted(buffer));
-            assert!(ctx.mark_buffer_released(buffer));
+            let mut sc = Screen::new().await;
+            let surface = sc.surface;
+            let buffer = sc.buffer(kind).await;
+            sc.show(surface, buffer).await;
+            sc.release(buffer).await;
 
-            ctx.last_sender_id = TEST_SURFACE;
+            sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+                .await;
+            sc.commit(surface).await;
             assert_eq!(
-                Handlers::on_damage_buffer(&mut ctx, 0, 0, 1, 1),
-                Action::Drop
-            );
-            assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-            assert_eq!(
-                ctx.host_buffer_use(buffer),
-                Some(RenderBufferUse::Released),
-                "{kind:?}"
-            );
-            assert!(
-                !ctx.buffer_is_submitted(buffer),
+                sc.destroy(buffer).await,
+                [buffer_destroy(buffer)],
                 "not resubmitted ({kind:?})"
             );
         }
     }
 
-    #[test]
-    fn native_buffer_damage_uses_recorded_dimensions() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        register_test_native(&mut ctx, buffer_id, (100, 50));
+    #[tokio::test]
+    async fn native_buffer_damage_uses_recorded_dimensions() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.native(100, 50).await;
         // A rotated buffer damages its whole surface, whose extent shows
         // the dimensions the damage is mapped with.
-        ctx.surface_for_test(surface_id).current_buffer_transform = 1;
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 10, 10, 20, 20),
-            Action::Drop
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
+        let transform = wl_surface::req::set_buffer_transform(surface.id, 1);
+        sc.forwarded(surface, transform).await;
+        sc.show(surface, buffer).await;
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 10, 10, 20, 20)])
+            .await;
         // The whole rotated 100x50 buffer, not a 1x1 fallback.
-        assert_eq!(host_damage(&ctx), [(0, 0, 50, 100)]);
+        assert_eq!(sc.commit(surface).await, [(0, 0, 50, 100)]);
     }
 
-    #[test]
-    fn destroyed_buffer_damage_uses_committed_content_dimensions() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let mut surface = SurfaceState::default();
-        surface.current_buffer_transform = 1;
-        ctx.surfaces.insert(surface_id, surface);
-        set_test_surface_content(&mut ctx, surface_id, None, Some((100, 50)));
-        ctx.last_sender_id = surface_id;
+    #[tokio::test]
+    async fn destroyed_buffer_damage_uses_committed_content_dimensions() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.native(100, 50).await;
+        let transform = wl_surface::req::set_buffer_transform(surface.id, 1);
+        sc.forwarded(surface, transform).await;
+        sc.show(surface, buffer).await;
+        sc.release(buffer).await;
+        assert_eq!(sc.destroy(buffer).await, [buffer_destroy(buffer)]);
 
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 10, 10, 20, 20),
-            Action::Drop
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 10, 10, 20, 20)])
+            .await;
         // The whole rotated 100x50 content snapshot, not a 1x1 fallback.
-        assert_eq!(host_damage(&ctx), [(0, 0, 50, 100)]);
+        assert_eq!(sc.commit(surface).await, [(0, 0, 50, 100)]);
     }
 
-    #[test]
-    fn native_release_damage_commit_destroy_does_not_wait_for_another_release() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        let host_buffer_id = 43;
-        register_test_buffer(&mut ctx, BufferKind::Native, buffer_id, host_buffer_id);
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        ctx.mark_buffer_submitted(buffer_id);
-
-        ctx.last_sender_id = host_buffer_id;
-        assert_eq!(
-            <Handlers as WlBufferHandler>::on_release(&mut ctx),
-            Action::Forward
-        );
-        assert!(ctx.buffer_is_released(buffer_id));
-
-        // A commit without attach changes surface state but does not begin
-        // another wl_buffer access interval.
-        ctx.last_sender_id = surface_id;
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert!(ctx.buffer_is_released(buffer_id));
-        assert!(!ctx.buffer_is_submitted(buffer_id));
-
-        // The prior release is still authoritative, so guest destroy queues
-        // the host destructor immediately instead of waiting forever for an
-        // event that cannot arrive.
-        ctx.last_sender_id = buffer_id;
-        assert_eq!(
-            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert_eq!(
-            host_requests(&ctx).last(),
-            Some(&(host_buffer_id, wl_buffer::Request::Destroy {}.into())),
-            "host buffer destroy must use the completed release interval"
-        );
-    }
-
-    #[test]
-    fn release_owed_after_surface_destroy_is_expected() {
+    #[tokio::test]
+    async fn release_owed_after_surface_destroy_is_expected() {
         // A GTK client's exit: the surface showing a submitted buffer is
         // destroyed first, and Exo then releases the buffer it no longer
         // shows while the guest still owns it.
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        let host_buffer_id = 43;
-        register_test_buffer(&mut ctx, BufferKind::Native, buffer_id, host_buffer_id);
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        assert!(ctx.mark_buffer_submitted(buffer_id));
-
-        ctx.last_sender_id = surface_id;
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.native(1, 1).await;
+        sc.show(surface, buffer).await;
         assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert!(
-            !ctx.buffer_is_submitted(buffer_id),
-            "the ordered surface destructor ends the buffer's use"
+            sc.destroy_surface(surface).await,
+            [surface_destroy(surface)]
         );
 
-        ctx.last_sender_id = host_buffer_id;
+        // The guest still gets its wl_buffer.release.
+        sc.release(buffer).await;
+        // Reads state no peer can observe: the owed release is recorded
+        // rather than logged as unexpected, so a second one would be.
         assert_eq!(
-            <Handlers as WlBufferHandler>::on_release(&mut ctx),
-            Action::Forward,
-            "the guest still gets its wl_buffer.release"
+            sc.s.ctx().host_buffer_use(buffer.id),
+            Some(RenderBufferUse::Released)
         );
-        assert!(
-            ctx.buffer_is_released(buffer_id),
-            "the owed release is recorded instead of being ignored as unexpected"
-        );
-        assert!(
-            !ctx.mark_buffer_released(buffer_id),
-            "a second release is still unexpected"
-        );
+        assert_eq!(sc.destroy(buffer).await, [buffer_destroy(buffer)]);
     }
 
-    #[test]
-    fn attaching_an_idle_buffer_without_commit_keeps_its_release_edge() {
+    #[tokio::test]
+    async fn attaching_an_idle_buffer_without_commit_keeps_its_release_edge() {
         for kind in BUFFER_KINDS {
-            let mut ctx = toplevel_ctx();
-            let (buffer, host_buffer) = (42, 43);
-            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
-            set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
-            assert!(ctx.mark_buffer_submitted(buffer));
-
-            ctx.last_sender_id = host_buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_release(&mut ctx),
-                Action::Forward
-            );
-            ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
+            let mut sc = Screen::new().await;
+            let surface = sc.surface;
+            let buffer = sc.buffer(kind).await;
+            sc.show(surface, buffer).await;
+            sc.release(buffer).await;
+            sc.attach(surface, Some(buffer)).await;
 
             // No commit follows the attach yet. Keep the host object alive
             // until the pending state is resolved; otherwise a later commit
-            // could race the queued destructor.
-            ctx.last_sender_id = buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-            assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
-            assert_eq!(host_requests(&ctx), [], "{kind:?}");
+            // could race the destructor.
+            assert_eq!(sc.destroy(buffer).await, [], "{kind:?}");
 
             // Replacing the pending attach proves that it will never commit,
             // so the host destructor can now be ordered safely.
-            ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(Handlers::on_attach(&mut ctx, 0, 0, 0), Action::Forward);
-            assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
+            sc.s.guest([wl_surface::req::attach(surface.id, None, 0, 0)])
+                .await;
+            let detach = wl_surface::Request::Attach {
+                buffer: 0,
+                x: 0,
+                y: 0,
+            };
             assert_eq!(
-                host_requests(&ctx),
-                [(host_buffer, wl_buffer::Request::Destroy {}.into())],
+                sc.s.host_received(),
+                [(surface.host, detach.into()), buffer_destroy(buffer)],
                 "{kind:?}"
             );
         }
     }
 
-    #[test]
-    fn a_delayed_release_before_a_pending_commit_keeps_the_host_buffer_alive() {
+    #[tokio::test]
+    async fn a_delayed_release_before_a_pending_commit_keeps_the_host_buffer_alive() {
         for kind in BUFFER_KINDS {
-            let mut ctx = toplevel_ctx();
-            let (buffer, host_buffer) = (42, 43);
-            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
-            set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
-            assert!(ctx.mark_buffer_submitted(buffer));
-
-            ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
-            ctx.last_sender_id = buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-            assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
+            let mut sc = Screen::new().await;
+            let surface = sc.surface;
+            let buffer = sc.buffer(kind).await;
+            sc.show(surface, buffer).await;
+            sc.attach(surface, Some(buffer)).await;
+            assert_eq!(sc.destroy(buffer).await, [], "{kind:?}");
 
             // This release belongs to the old committed interval. It must not
             // destroy the host object while the pending attach can still
             // commit.
-            ctx.last_sender_id = host_buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_release(&mut ctx),
-                Action::Drop
-            );
-            assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
-            assert!(ctx.buffer_is_released(buffer), "{kind:?}");
-            assert_eq!(host_requests(&ctx), [], "{kind:?}");
-
-            ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-            assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
-            assert!(ctx.buffer_is_submitted(buffer), "{kind:?}");
+            assert_eq!(sc.release_destroyed(buffer).await, [], "{kind:?}");
+            sc.commit(surface).await;
 
             // A release for the newly committed interval is the one that
             // permits the host destructor.
-            ctx.last_sender_id = host_buffer;
             assert_eq!(
-                <Handlers as WlBufferHandler>::on_release(&mut ctx),
-                Action::Drop
-            );
-            assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
-            assert_eq!(
-                host_requests(&ctx).last(),
-                Some(&(host_buffer, wl_buffer::Request::Destroy {}.into())),
+                sc.release_destroyed(buffer).await,
+                [buffer_destroy(buffer)],
                 "{kind:?}"
             );
         }
     }
 
-    #[test]
-    fn replacing_a_pending_destroyed_buffer_does_not_wait_for_release() {
+    #[tokio::test]
+    async fn replacing_a_pending_destroyed_buffer_does_not_wait_for_release() {
         for kind in BUFFER_KINDS {
-            let mut ctx = toplevel_ctx();
-            let (old_buffer, old_host_buffer, new_buffer) = (42, 43, 44);
-            register_test_buffer(&mut ctx, kind, old_buffer, old_host_buffer);
-
-            ctx.last_sender_id = TEST_SURFACE;
+            let mut sc = Screen::new().await;
+            let surface = sc.surface;
+            let old = sc.buffer(kind).await;
+            let new = sc.buffer(kind).await;
+            sc.attach(surface, Some(old)).await;
             assert_eq!(
-                Handlers::on_attach(&mut ctx, old_buffer, 0, 0),
-                Action::Forward
-            );
-            ctx.last_sender_id = old_buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-            assert!(
-                buffer_is_guest_destroyed(&ctx, old_buffer),
+                sc.destroy(old).await,
+                [],
                 "a pending attach keeps the {kind:?} buffer alive until replaced"
             );
 
             // The old pending attach is superseded before any commit reaches
             // the compositor, so no wl_buffer.release can arrive for it.
-            ctx.last_sender_id = TEST_SURFACE;
+            sc.s.guest([wl_surface::req::attach(surface.id, Some(new.id), 0, 0)])
+                .await;
+            let attach = wl_surface::Request::Attach {
+                buffer: new.host,
+                x: 0,
+                y: 0,
+            };
             assert_eq!(
-                Handlers::on_attach(&mut ctx, new_buffer, 0, 0),
-                Action::Forward
-            );
-            assert!(buffer_host_destroy_is_queued(&ctx, old_buffer), "{kind:?}");
-            assert_eq!(
-                host_requests(&ctx),
-                [(old_host_buffer, wl_buffer::Request::Destroy {}.into())],
+                sc.s.host_received(),
+                [(surface.host, attach.into()), buffer_destroy(old)],
                 "{kind:?}"
             );
         }
     }
 
-    #[test]
-    fn replacing_detached_submitted_buffer_waits_for_release() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let guest_buffer = 42;
-        let host_buffer = 43;
-        register_test_buffer(&mut ctx, BufferKind::Shm, guest_buffer, host_buffer);
-        mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
+    #[tokio::test]
+    async fn replacing_detached_submitted_buffer_waits_for_release() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.shm(1, 1).await.buffer;
+        let next = sc.shm(1, 1).await.buffer;
         // The buffer was committed by an earlier surface state and destroyed
-        // by the guest, but its host use interval is still in flight. It is
-        // intentionally no longer referenced by the surface below: a later
-        // attach must not mistake that state for an uncommitted pending attach.
-        ctx.mark_buffer_submitted(guest_buffer);
+        // by the guest, but its host use interval is still in flight. The
+        // surface no longer shows it: a later attach must not mistake that
+        // state for an uncommitted pending attach.
+        sc.show(surface, buffer).await;
+        sc.attach(surface, None).await;
+        sc.commit(surface).await;
+        assert_eq!(sc.destroy(buffer).await, []);
 
-        ctx.last_sender_id = surface_id;
-        assert_eq!(Handlers::on_attach(&mut ctx, 44, 0, 0), Action::Forward);
-        assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
+        sc.attach(surface, Some(next)).await;
         assert_eq!(
-            host_requests(&ctx),
-            [],
+            sc.release_destroyed(buffer).await,
+            [buffer_destroy(buffer)],
             "a submitted buffer must wait for wl_buffer.release after detach"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_buffer_cannot_partially_commit_a_new_attach() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.native(8, 6).await;
+        sc.attach(surface, Some(buffer)).await;
+        // Injects a fault no peer can cause: the attached buffer's host
+        // destroy is queued, as if the guest had destroyed it.
+        let host = crate::state::HostId(buffer.host);
+        assert!(sc.s.ctx().complete_queued_buffer_destroy(buffer.id, host));
+
+        sc.s.guest_fatal([wl_surface::req::commit(surface.id)])
+            .await;
+        assert_eq!(
+            sc.s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
+        );
+        assert_eq!(sc.s.host_received(), []);
+    }
+
+    #[tokio::test]
+    async fn wl_surface_destroy_retires_a_submitted_buffer_after_the_surface() {
+        for kind in BUFFER_KINDS {
+            let mut sc = Screen::new().await;
+            let surface = sc.surface;
+            let buffer = sc.buffer(kind).await;
+            sc.show(surface, buffer).await;
+            assert_eq!(sc.destroy(buffer).await, [], "{kind:?}");
+
+            assert_eq!(
+                sc.destroy_surface(surface).await,
+                [surface_destroy(surface), buffer_destroy(buffer)],
+                "the host {kind:?} buffer must be destroyed after the surface"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_buffer_waits_for_its_last_surface_destroy() {
+        let mut sc = Screen::new().await;
+        let first = sc.surface;
+        let second = sc.s.surface().await;
+        let buffer = sc.native(1, 1).await;
+        for surface in [first, second] {
+            sc.show(surface, buffer).await;
+        }
+        assert_eq!(sc.destroy(buffer).await, []);
+
+        assert_eq!(
+            sc.destroy_surface(first).await,
+            [surface_destroy(first)],
+            "one surface cannot retire a buffer still owned by another"
+        );
+        assert_eq!(
+            sc.destroy_surface(second).await,
+            [surface_destroy(second), buffer_destroy(buffer)],
+            "the buffer destructor must follow both owning surface destructors"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_attach_preserves_backing_but_not_destroyed_surface_use() {
+        let mut sc = Screen::new().await;
+        let first = sc.surface;
+        let second = sc.s.surface().await;
+        let buffer = sc.native(1, 1).await;
+        sc.show(first, buffer).await;
+        sc.attach(second, Some(buffer)).await;
+        assert_eq!(sc.destroy(buffer).await, []);
+
+        // Destroying the only committed surface closes its compositor-use
+        // interval, but the unresolved pending attach must preserve the
+        // buffer backing.
+        assert_eq!(sc.destroy_surface(first).await, [surface_destroy(first)]);
+        assert_eq!(
+            sc.destroy_surface(second).await,
+            [surface_destroy(second), buffer_destroy(buffer)],
+            "the buffer destructor must follow both surface destructors without waiting for release"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroying_surface_then_live_buffer_does_not_wait_for_release() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let buffer = sc.shm(1, 1).await.buffer;
+        sc.show(surface, buffer).await;
+        // The destroyed surface was the only compositor-use reference.
+        assert_eq!(
+            sc.destroy_surface(surface).await,
+            [surface_destroy(surface)]
+        );
+
+        // The guest is allowed to keep the wl_buffer alive after destroying
+        // its surface. Once it eventually destroys the buffer, host teardown
+        // must follow the surface destructor instead of waiting forever for
+        // a release that may never arrive.
+        assert_eq!(sc.destroy(buffer).await, [buffer_destroy(buffer)]);
+    }
+
+    #[tokio::test]
+    async fn destroying_unrelated_surface_keeps_detached_submitted_buffer() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let unrelated = sc.s.surface().await;
+        let buffer = sc.shm(1, 1).await.buffer;
+        // A committed buffer whose surface was detached before the release
+        // edge arrived. It is not owned by the unrelated surface.
+        sc.show(surface, buffer).await;
+        sc.attach(surface, None).await;
+        sc.commit(surface).await;
+        assert_eq!(sc.destroy(buffer).await, []);
+
+        assert_eq!(
+            sc.destroy_surface(unrelated).await,
+            [surface_destroy(unrelated)],
+            "an unrelated surface destroy must not preempt wl_buffer.release"
+        );
+        assert_eq!(sc.release_destroyed(buffer).await, [buffer_destroy(buffer)]);
+    }
+
+    #[tokio::test]
+    async fn a_detached_use_survives_destroy_of_the_new_current_surface() {
+        for kind in BUFFER_KINDS {
+            let mut sc = Screen::new().await;
+            let (first, second) = (sc.surface, sc.s.surface().await);
+            let buffer = sc.buffer(kind).await;
+
+            sc.show(first, buffer).await;
+            // Replacing B on S0 begins an unattributed outstanding use: S0 no
+            // longer names B, but only wl_buffer.release can prove the host
+            // has stopped sampling that detached attachment.
+            sc.attach(first, None).await;
+            sc.commit(first).await;
+            // A later current use must preserve, not overwrite, the detached
+            // use from S0.
+            sc.show(second, buffer).await;
+            assert_eq!(sc.destroy(buffer).await, [], "{kind:?}");
+
+            assert_eq!(
+                sc.destroy_surface(second).await,
+                [surface_destroy(second)],
+                "destroying S1 proves only S1's current use, not S0's detached \
+                 use: it must keep the {kind:?} backing alive until host release"
+            );
+            assert_eq!(
+                sc.release_destroyed(buffer).await,
+                [buffer_destroy(buffer)],
+                "the global host release closes every outstanding {kind:?} use"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn destroying_a_pending_only_surface_keeps_awaiting_release() {
+        for kind in BUFFER_KINDS {
+            let mut sc = Screen::new().await;
+            let (first, second) = (sc.surface, sc.s.surface().await);
+            let buffer = sc.buffer(kind).await;
+
+            // The release belongs to an earlier committed use. Merely
+            // attaching the same buffer to another surface does not transfer
+            // ownership of that outstanding release edge until the new
+            // surface commits.
+            sc.show(first, buffer).await;
+            sc.attach(first, None).await;
+            sc.commit(first).await;
+            sc.attach(second, Some(buffer)).await;
+            assert_eq!(sc.destroy(buffer).await, [], "{kind:?}");
+
+            assert_eq!(
+                sc.destroy_surface(second).await,
+                [surface_destroy(second)],
+                "destroying a pending-only surface must not consume another \
+                 use's release edge: the host {kind:?} buffer must remain \
+                 alive until its real release"
+            );
+            assert_eq!(
+                sc.release_destroyed(buffer).await,
+                [buffer_destroy(buffer)],
+                "the real release must retire the {kind:?} buffer"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2161,241 +3218,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reattached_buffer_copies_the_damage_of_the_frames_it_missed() {
-        // Damage is relative to the surface's current contents. A client
-        // alternating A, B, A damages only what changed since B, so A's host
-        // copy must also receive what B's frame changed.
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        commit_test_frame(&mut ctx, TEST_SURFACE, 44);
-
-        draw_test_frame(&ctx, 44, 0x22);
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 0, 0, 2, 1),
-            Action::Drop
-        );
-        attach_and_commit(&mut ctx, TEST_SURFACE, 44);
-        assert_eq!(copied_pixels(&ctx, 44, 0x22), rect_pixels(0, 0, 2, 1));
-
-        // A's next frame holds B's change too, but damages only its own.
-        draw_test_frame(&ctx, 42, 0x33);
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 2, 3, 1, 1),
-            Action::Drop
-        );
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        let mut expected = rect_pixels(0, 0, 2, 1);
-        expected.extend(rect_pixels(2, 3, 1, 1));
-        assert_eq!(copied_pixels(&ctx, 42, 0x33), expected);
-    }
-
-    fn damage_test_buffer(ctx: &mut Context, surface: u32, rect: (i32, i32, i32, i32)) {
-        ctx.last_sender_id = surface;
-        let (x, y, width, height) = rect;
-        assert_eq!(
-            Handlers::on_damage_buffer(ctx, x, y, width, height),
-            Action::Drop
-        );
-    }
-
-    #[test]
-    fn reattached_buffer_copies_the_damage_of_every_frame_it_missed() {
-        // A, B, C, A: A must also receive what both B's and C's frames changed.
-        let mut ctx = toplevel_ctx();
-        for buffer in [42, 44, 46] {
-            commit_test_frame(&mut ctx, TEST_SURFACE, buffer);
-        }
-        // B changes pixel (0, 0), then C changes pixel (1, 0).
-        for (buffer, x) in [(44, 0), (46, 1)] {
-            damage_test_buffer(&mut ctx, TEST_SURFACE, (x, 0, 1, 1));
-            attach_and_commit(&mut ctx, TEST_SURFACE, buffer);
-        }
-        draw_test_frame(&ctx, 42, 0x44);
-        damage_test_buffer(&mut ctx, TEST_SURFACE, (3, 3, 1, 1));
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(copied_pixels(&ctx, 42, 0x44), [(0, 0), (1, 0), (3, 3)]);
-    }
-
-    #[test]
-    fn damage_skipped_on_a_released_buffer_is_copied_at_its_next_attach() {
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        assert!(ctx.mark_buffer_released(42));
-        draw_test_frame(&ctx, 42, 0x22);
-        damage_test_buffer(&mut ctx, TEST_SURFACE, (1, 2, 2, 1));
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
-
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 2, 2, 1));
-    }
-
-    #[test]
-    fn a_buffer_moving_between_surfaces_copies_everything() {
-        // Its host copy relates to the contents of one surface only.
-        let mut ctx = toplevel_ctx();
-        let other_surface = 101;
-        ctx.shadow_table
-            .insert_paired_for_test(other_surface, 201, "wl_surface");
-        ctx.create_surface(other_surface);
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        for surface in [other_surface, TEST_SURFACE] {
-            draw_test_frame(&ctx, 42, 0x22);
-            damage_test_buffer(&mut ctx, surface, (0, 0, 1, 1));
-            attach_and_commit(&mut ctx, surface, 42);
-            assert_eq!(
-                copied_pixels(&ctx, 42, 0x22),
-                rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
-            );
-        }
-    }
-
-    #[test]
-    fn a_failed_copy_stales_the_whole_host_copy() {
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        let set_dmabuf_sync = |ctx: &mut Context, enabled| {
-            let host_id = ctx.render_buffer_host_id(42).unwrap();
-            ctx.local_buffer_copy_resources(host_id)
-                .unwrap()
-                .buffer
-                .dmabuf_sync = enabled;
-        };
-        // Without a VirtWL channel the dma-buf sync, and so the copy, fails.
-        set_dmabuf_sync(&mut ctx, true);
-        draw_test_frame(&ctx, 42, 0x22);
-        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
-
-        set_dmabuf_sync(&mut ctx, false);
-        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(
-            copied_pixels(&ctx, 42, 0x22),
-            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
-        );
-    }
-
-    #[test]
-    fn a_mapping_change_stales_the_other_host_copies() {
-        // B's frame is rotated 180 degrees: its pixel damage does not mark
-        // the same pixels of A, which was shown unrotated.
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        commit_test_frame(&mut ctx, TEST_SURFACE, 44);
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_set_buffer_transform(&mut ctx, 2),
-            Action::Forward
-        );
-        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
-        attach_and_commit(&mut ctx, TEST_SURFACE, 44);
-
-        draw_test_frame(&ctx, 42, 0x33);
-        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(
-            copied_pixels(&ctx, 42, 0x33),
-            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
-        );
-    }
-
-    #[test]
-    fn a_buffer_attached_with_a_new_mapping_copies_everything() {
-        // A's host copy holds its old frame, unrotated. The client rotates A
-        // by 180 degrees and damages one pixel: the rest of A's host copy no
-        // longer matches what the surface shows.
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        commit_test_frame(&mut ctx, TEST_SURFACE, 44);
-        draw_test_frame(&ctx, 42, 0x33);
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_set_buffer_transform(&mut ctx, 2),
-            Action::Forward
-        );
-        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(
-            copied_pixels(&ctx, 42, 0x33),
-            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
-        );
-    }
-
-    #[test]
-    fn a_frame_of_another_size_stales_the_whole_host_copy() {
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        register_test_local(
-            &mut ctx,
-            46,
-            mapped_test_buffer(2, 2, 8, StalePixels::all()),
-        );
-        attach_and_commit(&mut ctx, TEST_SURFACE, 46);
-
-        draw_test_frame(&ctx, 42, 0x33);
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 0, 0, 1, 1),
-            Action::Drop
-        );
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(
-            copied_pixels(&ctx, 42, 0x33),
-            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
-        );
-    }
-
-    #[test]
-    fn destroying_a_surface_stales_the_host_copies_it_showed() {
-        // A new surface may reuse the ID; nothing relates to its contents.
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        let in_sync = |ctx: &Context| {
-            ctx.local_buffer(42)
-                .unwrap()
-                .stale
-                .to_copy_on(TEST_SURFACE)
-                .is_empty()
-        };
-        assert!(in_sync(&ctx));
-
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert!(!in_sync(&ctx));
-    }
-
-    #[test]
-    fn damage_only_commit_copies_the_mutated_current_shm_buffer() {
-        // The SHM Commit Copy Invariant: the host samples the current buffer
-        // again for a commit without an attach, so its damage must be copied
-        // before the commit is forwarded.
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        ctx.client_to_host_queue.clear();
-        draw_test_frame(&ctx, 42, 0x22);
-
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 1, 2, 2, 1),
-            Action::Drop
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 2, 2, 1));
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue).last(),
-            Some(&(SURFACE.host, REQ_COMMIT))
-        );
-    }
-
     /// A surface has no state until a request sets some, so its first
     /// commit may have none; it commits the defaults, as a fresh surface
     /// has them, and is forwarded.
@@ -2416,484 +3238,18 @@ mod tests {
     /// just the buffer damage, which here is none.
     #[tokio::test]
     async fn overflowing_surface_damage_copies_the_whole_buffer() {
-        use crate::protocols::wayland::{wl_shm, wl_shm_pool};
-        let mut s = Session::new();
-        let surface = s.surface().await;
-        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
-        let pool_file = shm_pool_file(&[0x11; 8]);
-        let pool = s.shm_pool(shm, pool_file.try_clone().unwrap()).await;
-        let buffer = s.new_id();
-        s.guest([wl_shm_pool::req::create_buffer(
-            pool,
-            buffer,
-            0,
-            2,
-            1,
-            8,
-            wl_shm::FORMAT_ARGB8888,
-        )])
-        .await;
-        let received = s.host_received();
-        let Some(host_pool) = received.iter().find_map(|(_, request)| match request {
-            AnyRequest::WlShm(wl_shm::Request::CreatePool { fd, .. }) => Some(fd),
-            _ => None,
-        }) else {
-            panic!("the host got no pool: {received:?}");
-        };
-        let host_pool = std::fs::File::from(host_pool.try_clone().unwrap());
-        s.guest([
-            wl_surface::req::attach(surface.id, Some(buffer), 0, 0),
-            wl_surface::req::damage(surface.id, 0, 0, 2, 1),
-            wl_surface::req::commit(surface.id),
-        ])
-        .await;
-        s.host_received();
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.shm(2, 1).await;
+        sc.show(surface, a.buffer).await;
 
         // The client redraws both pixels, and damages only the first, in
         // more rectangles than the proxy keeps (256).
-        pool_file.write_all_at(&[0x22; 8], 0).unwrap();
+        a.draw(0x22);
         let damage = (0..=256).map(|_| wl_surface::req::damage(surface.id, 0, 0, 1, 1));
-        s.guest(damage.chain([wl_surface::req::commit(surface.id)]))
-            .await;
-        assert_eq!(
-            s.host_received(),
-            [
-                (
-                    surface.host,
-                    wl_surface::Request::Damage {
-                        x: 0,
-                        y: 0,
-                        width: 2,
-                        height: 1
-                    }
-                    .into()
-                ),
-                (surface.host, wl_surface::Request::Commit {}.into()),
-            ]
-        );
-
-        let mut host_pixels = [0; 8];
-        host_pool.read_exact_at(&mut host_pixels, 0).unwrap();
-        assert_eq!(host_pixels, [0x22; 8]);
-        assert_eq!(s.guest_received(), []);
-    }
-
-    #[test]
-    fn damage_only_commit_does_not_read_a_released_shm_buffer() {
-        // After wl_buffer.release the client owns the storage and may be
-        // drawing its next frame there; the host no longer samples it.
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        assert!(ctx.mark_buffer_released(42));
-        ctx.client_to_host_queue.clear();
-        draw_test_frame(&ctx, 42, 0x22);
-
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 1, 2, 2, 1),
-            Action::Drop
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue).last(),
-            Some(&(SURFACE.host, REQ_COMMIT))
-        );
-    }
-
-    #[test]
-    fn commit_without_damage_on_a_held_buffer_skips_the_copy() {
-        // A commit that only acknowledges a configure must reach the host
-        // even when the buffer's dma-buf sync would fail (here: no channel).
-        let mut ctx = toplevel_ctx();
-        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
-        let host_id = ctx.render_buffer_host_id(42).unwrap();
-        ctx.local_buffer_copy_resources(host_id)
-            .unwrap()
-            .buffer
-            .dmabuf_sync = true;
-        ctx.client_to_host_queue.clear();
-
-        // No damage at all, then damage that clips to nothing.
-        for damage in [None, Some((FRAME_SIDE as i32, 0, 1, 1))] {
-            ctx.last_sender_id = TEST_SURFACE;
-            if let Some((x, y, width, height)) = damage {
-                assert_eq!(
-                    Handlers::on_damage_buffer(&mut ctx, x, y, width, height),
-                    Action::Drop
-                );
-            }
-            assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-            assert!(!ctx.is_fatal());
-            assert_eq!(
-                queued_headers(&ctx.client_to_host_queue).last(),
-                Some(&(SURFACE.host, REQ_COMMIT))
-            );
-            ctx.client_to_host_queue.clear();
-        }
-    }
-
-    #[test]
-    fn destroyed_pending_shm_attach_survives_until_commit() {
-        const BUFFER_BYTES: usize = 4;
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        let host_buffer_id = 43;
-        register_test_buffer(&mut ctx, BufferKind::Shm, buffer_id, host_buffer_id);
-        let pool = test_pool_file(&ctx, buffer_id);
-        // This buffer has completed a previous compositor-use interval. A new
-        // attach must reopen that interval even when the guest destroys the
-        // object before commit.
-        assert!(ctx.mark_buffer_submitted(buffer_id));
-        assert!(ctx.mark_buffer_released(buffer_id));
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
-
-        // Wayland permits destroying the guest object after attach and before
-        // commit. The host attach is already queued, so the local backing and
-        // pending surface reference must survive until commit.
-        ctx.last_sender_id = buffer_id;
-        assert_eq!(
-            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .map(|surface| surface.pending.attachment),
-            Some(SurfaceAttachment::Attach(buffer_id))
-        );
-
-        pool.write_all_at(&[0x22; BUFFER_BYTES], 0).unwrap();
-        ctx.last_sender_id = surface_id;
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        // The guest object is gone, but the local backing is not.
-        assert_eq!(
-            test_destination(&ctx, buffer_id)[..BUFFER_BYTES],
-            [0x22; BUFFER_BYTES],
-            "destroying the guest buffer before commit must not lose its frame"
-        );
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(SurfaceState::current_buffer_id),
-            Some(buffer_id)
-        );
-        assert!(ctx.buffer_is_submitted(buffer_id));
-    }
-
-    #[test]
-    fn rejects_invalid_scale_and_transform_without_mutating_pending_state() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.last_sender_id = surface_id;
-
-        // A client gets one error, so each rejection starts afresh.
-        let mut rejected = |reject: &dyn Fn(&mut Context) -> Action, code: u32| {
-            ctx.host_to_client_queue.clear();
-            ctx.clear_session_end_for_test();
-            assert_eq!(reject(&mut ctx), Action::Drop);
-            assert_eq!(protocol_error_code(&ctx), code);
-        };
-        // wl_surface.invalid_scale for 0 and negative scales, and
-        // invalid_transform outside wl_output.transform's 0..=7.
-        rejected(&|ctx| Handlers::on_set_buffer_scale(ctx, 0), 0);
-        rejected(&|ctx| Handlers::on_set_buffer_scale(ctx, -2), 0);
-        rejected(&|ctx| Handlers::on_set_buffer_transform(ctx, 8), 1);
-        assert!(
-            ctx.surfaces.get(&surface_id).is_none_or(|surface| {
-                surface.pending.buffer_scale.is_none() && surface.pending.buffer_transform.is_none()
-            }),
-            "invalid requests must not create or mutate pending surface state"
-        );
-    }
-
-    #[test]
-    fn consumed_attach_offset_is_not_reapplied_on_later_commit() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.last_sender_id = surface_id;
-
-        assert_eq!(Handlers::on_attach(&mut ctx, 42, 3, 4), Action::Forward);
-        let surface = ctx.surfaces.get_mut(&surface_id).expect("surface state");
-        assert_eq!(surface.prepare_commit().buffer_offset, (3, 4));
-        assert_eq!(
-            surface.prepare_commit().buffer_offset,
-            (0, 0),
-            "the attach offset must be consumed"
-        );
-    }
-
-    #[test]
-    fn damage_buffer_is_translated_to_host_damage_before_commit() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.last_sender_id = surface_id;
-
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 4, 5, 6, 7),
-            Action::Drop
-        );
-        assert!(
-            ctx.client_to_host_queue.is_empty(),
-            "damage_buffer must not be forwarded with its guest opcode"
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(200, REQ_DAMAGE), (200, REQ_COMMIT)],
-            "translated damage must be queued before the replacement commit"
-        );
-        assert_eq!(host_damage(&ctx), [(3, 4, 8, 9)]);
-    }
-
-    #[test]
-    fn first_shm_commit_without_explicit_damage_queues_full_host_damage() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(8, 6, 32, StalePixels::all()),
-        );
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(200, REQ_DAMAGE), (200, REQ_COMMIT)]
-        );
-        assert_eq!(host_damage(&ctx), [(0, 0, 8, 6)]);
-    }
-
-    #[test]
-    fn failed_shm_copy_does_not_queue_a_host_commit() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        let mut buffer = mapped_test_buffer(8, 6, 32, StalePixels::all());
-        buffer.host_copy = None;
-        register_test_local(&mut ctx, buffer_id, buffer);
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert!(
-            ctx.client_to_host_queue.is_empty(),
-            "stale or uninitialised host pixels must never be committed"
-        );
-        assert!(
-            ctx.local_buffer(buffer_id)
-                .is_some_and(|buffer| buffer.stale.to_copy_on(surface_id).is_full()),
-            "a failed copy must force a complete retry on the next commit"
-        );
-    }
-
-    #[test]
-    fn missing_host_surface_ends_the_session_without_a_commit() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.last_sender_id = surface_id;
-        assert_eq!(Handlers::on_damage(&mut ctx, 1, 2, 3, 4), Action::Drop);
-        ctx.release_deleted_host_id(200);
-
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert!(ctx.is_fatal());
-        assert!(ctx.client_to_host_queue.is_empty());
-    }
-
-    #[test]
-    fn terminal_buffer_cannot_partially_commit_a_new_attach() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        register_test_native(&mut ctx, buffer_id, (8, 6));
-        let host_id = ctx.render_buffer_host_id(buffer_id).unwrap();
-        assert!(ctx.complete_queued_buffer_destroy(buffer_id, host_id));
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
-
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert!(ctx.is_fatal());
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(
-            ctx.render_buffer_lifecycle_for_host(host_id),
-            Some(RenderBufferLifecycle::HostDestroyQueued)
-        );
-    }
-
-    #[test]
-    fn invalid_damage_spam_does_not_escalate_to_full_frame_damage() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.last_sender_id = surface_id;
-
-        for _ in 0..300 {
-            assert_eq!(Handlers::on_damage(&mut ctx, 0, 0, 0, 10), Action::Drop);
-            assert_eq!(
-                Handlers::on_damage_buffer(&mut ctx, 0, 0, 10, -1),
-                Action::Drop
-            );
-        }
-        let surface = ctx.surfaces.get(&surface_id).unwrap();
-        assert!(surface.pending.surface_damage.is_empty());
-        assert!(surface.pending.buffer_damage.is_empty());
-
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[0].0), REQ_COMMIT);
-    }
-
-    #[test]
-    fn bounded_damage_overflow_uses_the_exact_content_extent() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        register_test_native(&mut ctx, buffer_id, (8, 6));
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
-        for index in 0..=256 {
-            assert_eq!(
-                Handlers::on_damage_buffer(&mut ctx, index, index, 1, 1),
-                Action::Drop
-            );
-        }
-
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(200, REQ_DAMAGE), (200, REQ_COMMIT)]
-        );
-        assert_eq!(host_damage(&ctx), [(0, 0, 8, 6)]);
-    }
-
-    #[test]
-    fn surface_damage_is_outset_before_host_forwarding() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.last_sender_id = surface_id;
-
-        assert_eq!(Handlers::on_damage(&mut ctx, 10, 20, 1, 1), Action::Drop);
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(host_damage(&ctx), [(9, 19, 3, 3)]);
-    }
-
-    /// The rectangles of the host `wl_surface.damage` requests queued so
-    /// far, all of which the test surface's host object sends.
-    fn host_damage(ctx: &Context) -> Vec<(i32, i32, i32, i32)> {
-        const TEST_SURFACE_HOST: u32 = 200;
-        ctx.client_to_host_queue
-            .iter()
-            .filter(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
-            .map(|(message, _)| {
-                let sender = msg_sender(message);
-                assert_eq!(sender, TEST_SURFACE_HOST, "damage from another object");
-                let mut wire = crate::wire::WireMessage::new(sender, REQ_DAMAGE, &message[8..]);
-                let mut next = || wire.read_i32().unwrap();
-                (next(), next(), next(), next())
-            })
-            .collect()
-    }
-
-    /// A surface whose committed state shows its buffer at `scale` through
-    /// a viewport with `source` (in 24.8 fixed point) and `destination`.
-    fn viewed_surface(
-        scale: i32,
-        source: Option<(i32, i32, i32, i32)>,
-        destination: Option<(i32, i32)>,
-    ) -> SurfaceState {
-        let mut surface = SurfaceState::default();
-        surface.current_buffer_scale = scale;
-        surface.viewport = Some(ViewportState {
-            source,
-            destination,
-        });
-        surface
-    }
-
-    /// The host damage of a commit with buffer damage `rect` on `surface`,
-    /// which shows a buffer of `size`.
-    fn host_damage_for(
-        surface: SurfaceState,
-        size: (i32, i32),
-        rect: (i32, i32, i32, i32),
-    ) -> Vec<(i32, i32, i32, i32)> {
-        let mut ctx = toplevel_ctx();
-        ctx.surfaces.insert(TEST_SURFACE, surface);
-        set_test_surface_content(&mut ctx, TEST_SURFACE, None, Some(size));
-        ctx.last_sender_id = TEST_SURFACE;
-        let (x, y, width, height) = rect;
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, x, y, width, height),
-            Action::Drop
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        host_damage(&ctx)
-    }
-
-    /// Every host damage rectangle, partial or full, keeps both edges within
-    /// the headroom, however far a viewport stretches the buffer.
-    #[test]
-    fn host_damage_is_clamped_on_both_edges() {
-        const MAX: i32 = i32::MAX / 10;
-        // A 1x1 buffer stretched to 1000x1000 puts damage at buffer pixel
-        // 1000000 past the headroom: it shrinks to the headroom's last unit.
-        assert_eq!(
-            host_damage_for(
-                viewed_surface(1, None, Some((1000, 1000))),
-                (1, 1),
-                (1_000_000, 0, 1, 1)
-            ),
-            [(MAX - 1, -1000, 1, 3000)]
-        );
-        // Stretched to i32::MAX units, the left edge of the last pixel would
-        // leave no room for its width.
-        assert_eq!(
-            host_damage_for(
-                viewed_surface(1, Some((0, 0, 256, 256)), Some((i32::MAX, 256))),
-                (1, 1),
-                (i32::MAX, 0, 1, 1)
-            ),
-            [(MAX - 1, -256, 1, 768)]
-        );
-        // A buffer attached under a viewport without damage damages the
-        // whole destination.
-        let mut ctx = toplevel_ctx();
-        ctx.surfaces.insert(
-            TEST_SURFACE,
-            viewed_surface(1, None, Some((i32::MAX, i32::MAX))),
-        );
-        register_test_native(&mut ctx, 42, (1, 1));
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(host_damage(&ctx), [(0, 0, MAX, MAX)]);
+        sc.pending(damage).await;
+        assert_eq!(sc.commit(surface).await, [(0, 0, 2, 1)]);
+        assert_eq!(a.copied(0x22), [(0, 0), (1, 0)]);
     }
 
     #[test]
@@ -2906,31 +3262,6 @@ mod tests {
             .to_surface(BufferRect::new(20, 10, 4, 6));
 
         assert_eq!(mapped, SurfaceRect::new(9, 4, 4, 5));
-    }
-
-    #[test]
-    fn full_mapping_without_explicit_damage_still_damages_the_host_surface() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_set_buffer_transform(&mut ctx, 1),
-            Action::Forward
-        );
-        assert_eq!(
-            Handlers::on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(host_damage(&ctx), [(0, 0, 6, 8)]);
     }
 
     #[test]
@@ -2950,75 +3281,6 @@ mod tests {
             SurfaceRect::new(3, 4, 8, 9),
             "wl_surface.attach/offset changes content placement, not buffer damage coordinates"
         );
-    }
-
-    #[test]
-    fn offset_without_explicit_damage_does_not_invent_host_damage() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
-        let mut surface = SurfaceState::default();
-        surface.pending.attach_offset = Some((3, 0));
-        ctx.surfaces.insert(surface_id, surface);
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), Some((8, 6)));
-        ctx.last_sender_id = surface_id;
-
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .all(|(message, _)| msg_opcode(message) != REQ_DAMAGE),
-            "offset-only state must not manufacture a damage request"
-        );
-    }
-
-    #[test]
-    fn nonzero_surface_offset_with_explicit_damage_forces_full_host_damage() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
-        let mut surface = SurfaceState::default();
-        surface.pending.attach_offset = Some((3, 0));
-        ctx.surfaces.insert(surface_id, surface);
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), Some((8, 6)));
-        ctx.last_sender_id = surface_id;
-
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 1, 1, 1, 1),
-            Action::Drop
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(
-            host_damage(&ctx),
-            [(0, 0, 8, 6)],
-            "offset plus explicit damage must include complete host damage"
-        );
-    }
-
-    #[test]
-    fn extreme_surface_damage_is_clamped_before_host_encoding() {
-        let mut ctx = toplevel_ctx();
-        ctx.last_sender_id = 100;
-
-        assert_eq!(
-            Handlers::on_damage(&mut ctx, i32::MIN, 0, i32::MAX, 1),
-            Action::Drop
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(host_damage(&ctx), [(i32::MIN / 10, -1, 214_748_364, 3)]);
     }
 
     #[test]
@@ -3052,785 +3314,278 @@ mod tests {
         );
     }
 
-    #[test]
-    fn viewport_damage_uses_committed_crop_and_destination() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-        ctx.last_sender_id = surface_id;
-
-        assert_eq!(
-            Handlers::on_get_viewport(&mut ctx, 700, surface_id),
-            Action::Forward
-        );
-        ctx.last_sender_id = 700;
-        assert_eq!(
-            Handlers::on_set_source(&mut ctx, 65_536, 131_072, 262_144, 262_144),
-            Action::Forward
-        );
-        assert_eq!(
-            Handlers::on_set_destination(&mut ctx, 200, 100),
-            Action::Forward
-        );
-
-        // The viewport becomes current at its own commit, as a client sets
-        // it once; a later frame's buffer damage is converted from buffer
-        // pixels into destination coordinates. (A buffer attached with a new
-        // mapping damages the whole host surface.)
-        ctx.last_sender_id = surface_id;
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        ctx.client_to_host_queue.clear();
-        register_test_local(
-            &mut ctx,
-            42,
-            mapped_test_buffer(2048, 2048, 8192, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
-        assert_eq!(Handlers::on_attach(&mut ctx, 42, 0, 0), Action::Forward);
-        assert_eq!(
-            Handlers::on_damage_buffer(&mut ctx, 256, 512, 256, 256),
-            Action::Drop
-        );
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-
-        // The damage, grown by a buffer pixel, starts just left of and above
-        // the source, so its mapped edges round outward to -1.
-        assert_eq!(host_damage(&ctx), [(-1, -1, 52, 27)]);
+    /// A keyboard of its own seat, which the host has focused on a surface,
+    /// and the extended keyboard the proxy created for it at that enter.
+    #[derive(Clone, Copy)]
+    struct Focused {
+        seat: u32,
+        keyboard: Object,
+        ext: u32,
     }
 
-    #[test]
-    fn buffer_damage_maps_through_buffer_scale_before_the_viewport() {
-        // Scale 2 makes the 100-pixel buffer a 50-unit surface, which the
-        // destination stretches back to 100 units: a pixel is one unit.
-        assert_eq!(
-            host_damage_for(
-                viewed_surface(2, None, Some((100, 100))),
-                (100, 100),
-                (80, 80, 20, 20)
-            ),
-            [(79, 79, 22, 22)]
-        );
-    }
-
-    #[test]
-    fn whole_buffer_damage_covers_the_whole_destination() {
-        assert_eq!(
-            host_damage_for(
-                viewed_surface(2, None, Some((100, 100))),
-                (100, 100),
-                (0, 0, 100, 100)
-            ),
-            [(-1, -1, 102, 102)]
-        );
-    }
-
-    #[test]
-    fn buffer_damage_subtracts_the_source_offset_in_surface_units() {
-        // The source starts 10 units, which are 20 buffer pixels, into the
-        // 200-pixel buffer at scale 2.
-        let source = Some((10 * 256, 10 * 256, 80 * 256, 80 * 256));
-        assert_eq!(
-            host_damage_for(
-                viewed_surface(2, source, Some((80, 80))),
-                (200, 200),
-                (100, 100, 20, 20)
-            ),
-            [(39, 39, 12, 12)]
-        );
-    }
-
-    #[test]
-    fn source_only_viewport_maps_buffer_damage() {
-        // Without a destination the source crops without scaling, and its
-        // origin keeps its fraction: x starts at 10.5 units.
-        let source = Some((10 * 256 + 128, 10 * 256, 80 * 256, 80 * 256));
-        assert_eq!(
-            host_damage_for(
-                viewed_surface(2, source, None),
-                (200, 200),
-                (100, 100, 20, 20)
-            ),
-            [(39, 39, 11, 12)]
-        );
-    }
-
-    #[test]
-    fn destroying_viewport_is_double_buffered_until_surface_commit() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_get_viewport(&mut ctx, 700, surface_id),
-            Action::Forward
-        );
-        // The generated dispatcher pairs the forwarded viewport.
-        ctx.shadow_table
-            .insert_paired_for_test(700, 701, "wp_viewport");
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert!(ctx
-            .surfaces
-            .get(&surface_id)
-            .and_then(|surface| surface.viewport)
-            .is_some());
-
-        ctx.guest_destroyed(700);
+    /// The host advertises the keyboard extension, which the proxy binds
+    /// for itself.
+    async fn keyboard_extension(s: &mut Session) {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
+        let version = zcr_keyboard_extension_v1::VERSION;
+        s.advertise(zcr_keyboard_extension_v1::NAME, version).await;
+        let bind = s.host_received();
         assert!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(|surface| surface.viewport)
-                .is_some(),
-            "destroy only changes pending viewport state"
-        );
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert!(
-            ctx.surfaces
-                .get(&surface_id)
-                .and_then(|surface| surface.viewport)
-                .is_none(),
-            "the viewport is removed at the following surface commit"
+            matches!(
+                &bind[..],
+                [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { .. }))]
+            ),
+            "{bind:?}"
         );
     }
 
-    #[test]
-    fn invalid_viewport_values_and_dead_surface_are_fatal() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_get_viewport(&mut ctx, 700, surface_id),
-            Action::Forward
-        );
-        ctx.last_sender_id = 700;
-        assert_eq!(
-            Handlers::on_set_source(&mut ctx, -1, 0, 10, 10),
-            Action::Drop
-        );
-        assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.is_fatal());
-
-        ctx.host_to_client_queue.clear();
-        ctx.clear_session_end_for_test();
-        assert_eq!(Handlers::on_set_destination(&mut ctx, 0, 10), Action::Drop);
-        assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.is_fatal());
-
-        ctx.host_to_client_queue.clear();
-        ctx.clear_session_end_for_test();
-        ctx.viewport_to_wl_surface.remove(&700);
-        assert_eq!(Handlers::on_set_destination(&mut ctx, 10, 10), Action::Drop);
-        assert_eq!(protocol_error_code(&ctx), 3);
-        assert!(ctx.is_fatal());
-    }
-
-    #[test]
-    fn duplicate_viewport_is_a_fatal_viewporter_error() {
-        let mut ctx = toplevel_ctx();
-        let surface_id = 100;
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_get_viewport(&mut ctx, 700, surface_id),
-            Action::Forward
-        );
-        ctx.host_to_client_queue.clear();
-        ctx.clear_session_end_for_test();
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            Handlers::on_get_viewport(&mut ctx, 701, surface_id),
-            Action::Drop
-        );
-        assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.is_fatal());
-    }
-
-    #[test]
-    fn fractional_source_without_destination_is_logged_and_forwarded() {
-        // Exo takes the fractional source size as the surface size, and the
-        // host damage covers it, rounded up.
-        let mut ctx = toplevel_ctx();
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_get_viewport(&mut ctx, 700, TEST_SURFACE),
-            Action::Forward
-        );
-        set_test_viewport_source(&mut ctx, (0, 0, 128, 256));
-        register_test_native(&mut ctx, 42, (1, 1));
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        assert_eq!(forwarded_and_logged(&ctx), (true, true));
-        assert_eq!(host_damage(&ctx), [(0, 0, 1, 1)]);
-    }
-
-    /// Set the viewport source of `TEST_SURFACE`, whose viewport is 700.
-    fn set_test_viewport_source(ctx: &mut Context, source: (i32, i32, i32, i32)) {
-        ctx.last_sender_id = 700;
-        let (x, y, width, height) = source;
-        assert_eq!(
-            Handlers::on_set_source(ctx, x, y, width, height),
-            Action::Forward
-        );
-        ctx.last_sender_id = TEST_SURFACE;
-    }
-
-    /// Commit a buffer of `size` at scale 2 through a viewport with
-    /// `source` (24.8 fixed point) and a destination, which lets the
-    /// source be fractional.
-    fn commit_viewport_source(size: (i32, i32), source: (i32, i32, i32, i32)) -> Context {
-        let mut ctx = toplevel_ctx();
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            Handlers::on_get_viewport(&mut ctx, 700, TEST_SURFACE),
-            Action::Forward
-        );
-        assert_eq!(Handlers::on_set_buffer_scale(&mut ctx, 2), Action::Forward);
-        set_test_viewport_source(&mut ctx, source);
-        ctx.last_sender_id = 700;
-        assert_eq!(
-            Handlers::on_set_destination(&mut ctx, 10, 10),
-            Action::Forward
-        );
-        register_test_native(&mut ctx, 42, size);
-        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
-        ctx
-    }
-
-    /// Whether the last commit reached the host without ending the session,
-    /// and whether the surface's source leaving its buffer was logged.
-    fn forwarded_and_logged(ctx: &Context) -> (bool, bool) {
-        let forwarded = !ctx.is_fatal()
-            && queued_headers(&ctx.client_to_host_queue).last() == Some(&(200, REQ_COMMIT));
-        (forwarded, ctx.surfaces[&TEST_SURFACE].logged_viewport_rule)
-    }
-
-    #[test]
-    fn viewport_source_outside_the_buffer_is_logged_and_forwarded() {
-        const ONE: i32 = 256;
-        // At scale 2 an 8x6 buffer is a 4x3 surface, the source's units.
-        let whole = (0, 0, 4 * ONE, 3 * ONE);
-        let ctx = commit_viewport_source((8, 6), whole);
-        assert_eq!(forwarded_and_logged(&ctx), (true, false));
-
-        // Half a unit to the right the source leaves the buffer. Exo accepts
-        // that, so the commit is forwarded and only logged.
-        let ctx = commit_viewport_source((8, 6), (ONE / 2, 0, 4 * ONE, 3 * ONE));
-        assert_eq!(forwarded_and_logged(&ctx), (true, true));
-
-        // A later, smaller buffer under the unchanged viewport.
-        let mut ctx = commit_viewport_source((8, 6), whole);
-        register_test_native(&mut ctx, 43, (6, 6));
-        attach_and_commit(&mut ctx, TEST_SURFACE, 43);
-        assert_eq!(forwarded_and_logged(&ctx), (true, true));
-
-        // Detaching the buffer in the same commit exempts any source.
-        let mut ctx = commit_viewport_source((8, 6), whole);
-        assert_eq!(Handlers::on_attach(&mut ctx, 0, 0, 0), Action::Forward);
-        set_test_viewport_source(&mut ctx, (0, 0, 100 * ONE, 100 * ONE));
-        assert_eq!(Handlers::on_commit(&mut ctx), Action::Drop);
-        assert_eq!(forwarded_and_logged(&ctx), (true, false));
-
-        // An odd buffer ends at a fractional unit, 3.5x2.5, which the source
-        // may reach exactly.
-        let edge = (0, 0, 3 * ONE + ONE / 2, 2 * ONE + ONE / 2);
-        let ctx = commit_viewport_source((7, 5), edge);
-        assert_eq!(forwarded_and_logged(&ctx), (true, false));
-    }
-
-    #[test]
-    fn xdg_toplevel_destroy_cleans_up_map() {
-        let mut ctx = toplevel_ctx();
-
-        ctx.last_sender_id = TOPLEVEL.guest;
-
-        assert!(ctx
-            .xdg_roles
-            .wl_surface_of_toplevel(TOPLEVEL.guest)
-            .is_some());
-
-        ctx.last_sender_id = TOPLEVEL.guest;
-        let action = <Handlers as XdgToplevelHandler>::on_destroy(&mut ctx);
-        assert_eq!(action, Action::Drop);
-
-        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(TOPLEVEL.guest), None);
-    }
-
-    #[test]
-    fn wl_surface_destroy_releases_zaura_surface() {
-        let mut ctx = toplevel_ctx();
-        set_test_app_id(&mut ctx, TOPLEVEL.guest, "app");
-        let zaura_surface_host = ctx.aura_surfaces.get(SURFACE.host).unwrap();
-
-        ctx.client_to_host_queue.clear();
-        ctx.last_sender_id = TEST_SURFACE;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        // The released Aura surface no longer decodes: its dispatch
-        // metadata goes at once.
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [
-                (zaura_surface_host, zaura_surface::REQ_RELEASE),
-                (SURFACE.host, wl_surface::REQ_DESTROY),
-            ]
-        );
-        assert_eq!(ctx.aura_surfaces.get(SURFACE.host), None);
-    }
-
-    #[test]
-    fn wl_surface_destroy_retires_a_submitted_buffer_after_the_surface() {
-        for kind in BUFFER_KINDS {
-            let mut ctx = toplevel_ctx();
-            let (buffer, host_buffer) = (50, 60);
-            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
-            mark_test_buffer_guest_destroyed(&mut ctx, buffer);
-            assert!(ctx.mark_buffer_submitted(buffer));
-            set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
-
-            ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(
-                <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-
-            assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
-            assert!(!ctx.buffer_is_submitted(buffer), "{kind:?}");
-            assert_eq!(
-                host_requests(&ctx),
-                [
-                    (SURFACE.host, wl_surface::Request::Destroy {}.into()),
-                    (host_buffer, wl_buffer::Request::Destroy {}.into()),
-                ],
-                "the host {kind:?} buffer must be destroyed after the surface"
-            );
-        }
-    }
-
-    #[test]
-    fn shared_buffer_waits_for_its_last_surface_destroy() {
-        let mut ctx = toplevel_ctx();
-        let first_surface = 100u32;
-        let second_surface = 101u32;
-        let second_surface_host = 201u32;
-        let guest_buffer = 50u32;
-        let host_buffer = 60u32;
-
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            second_surface,
-            second_surface_host,
-            "wl_surface",
-            5,
-        );
-        register_test_buffer(&mut ctx, BufferKind::Native, guest_buffer, host_buffer);
-        mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
-        ctx.mark_buffer_submitted(guest_buffer);
-        for surface in [first_surface, second_surface] {
-            set_test_surface_content(&mut ctx, surface, Some(guest_buffer), None);
-        }
-
-        ctx.last_sender_id = first_surface;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
-        assert!(ctx.buffer_is_submitted(guest_buffer));
-        assert_eq!(
-            host_requests(&ctx),
-            [(SURFACE.host, wl_surface::Request::Destroy {}.into())],
-            "one surface cannot retire a buffer still owned by another"
-        );
-
-        ctx.last_sender_id = second_surface;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
-        assert!(ctx.host_buffer_use(guest_buffer).is_none());
-        assert_eq!(
-            host_requests(&ctx),
-            [
-                (SURFACE.host, wl_surface::Request::Destroy {}.into()),
-                (second_surface_host, wl_surface::Request::Destroy {}.into()),
-                (host_buffer, wl_buffer::Request::Destroy {}.into()),
-            ],
-            "the buffer destructor must follow both owning surface destructors"
-        );
-    }
-
-    #[test]
-    fn pending_attach_preserves_backing_but_not_destroyed_surface_use() {
-        let mut ctx = toplevel_ctx();
-        let first_surface = 100u32;
-        let second_surface = 101u32;
-        let second_surface_host = 201u32;
-        let guest_buffer = 50u32;
-        let host_buffer = 60u32;
-
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            second_surface,
-            second_surface_host,
-            "wl_surface",
-            5,
-        );
-        register_test_buffer(&mut ctx, BufferKind::Native, guest_buffer, host_buffer);
-        mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
-        assert!(ctx.mark_buffer_submitted(guest_buffer));
-        set_test_surface_content(&mut ctx, first_surface, Some(guest_buffer), None);
-        ctx.surface_for_test(second_surface).pending.attachment =
-            SurfaceAttachment::Attach(guest_buffer);
-
-        ctx.last_sender_id = first_surface;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert_eq!(
-            buffer_lifecycle(&ctx, guest_buffer),
-            Some(RenderBufferLifecycle::GuestDestroyed(
-                RenderBufferUse::ReleaseOwed
-            )),
-            "destroying the only committed surface closes its compositor-use interval"
-        );
-        assert!(
-            !buffer_host_destroy_is_queued(&ctx, guest_buffer),
-            "the unresolved pending attach must preserve the buffer backing"
-        );
-
-        ctx.last_sender_id = second_surface;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
-        assert_eq!(
-            host_requests(&ctx),
-            [
-                (SURFACE.host, wl_surface::Request::Destroy {}.into()),
-                (second_surface_host, wl_surface::Request::Destroy {}.into()),
-                (host_buffer, wl_buffer::Request::Destroy {}.into()),
-            ],
-            "the buffer destructor must follow both surface destructors without waiting for release"
-        );
-    }
-
-    #[test]
-    fn destroying_surface_then_live_buffer_does_not_wait_for_release() {
-        let mut ctx = toplevel_ctx();
-        let wl_surface_guest = 100u32;
-        let guest_buffer = 50u32;
-        let host_buffer = 51u32;
-
-        register_test_buffer(&mut ctx, BufferKind::Shm, guest_buffer, host_buffer);
-        ctx.mark_buffer_submitted(guest_buffer);
-        set_test_surface_content(&mut ctx, wl_surface_guest, Some(guest_buffer), None);
-
-        ctx.last_sender_id = wl_surface_guest;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert!(
-            !ctx.buffer_is_submitted(guest_buffer),
-            "the destroyed surface was the only compositor-use reference"
-        );
-
-        // The guest is allowed to keep the wl_buffer alive after destroying
-        // its surface. Once it eventually destroys the buffer, host teardown
-        // must be ordered after the already-queued surface destructor instead
-        // of waiting forever for a release that may never arrive.
-        ctx.last_sender_id = guest_buffer;
-        assert_eq!(
-            <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
-        assert_eq!(
-            host_requests(&ctx),
-            [
-                (SURFACE.host, wl_surface::Request::Destroy {}.into()),
-                (host_buffer, wl_buffer::Request::Destroy {}.into()),
-            ],
-            "surface destroy must precede the live buffer destroy"
-        );
-    }
-
-    #[test]
-    fn destroying_unrelated_surface_keeps_detached_submitted_buffer() {
-        let mut ctx = toplevel_ctx();
-        let guest_buffer = 50u32;
-        let host_buffer = 51u32;
-
-        register_test_buffer(&mut ctx, BufferKind::Shm, guest_buffer, host_buffer);
-        mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
-        // This is a committed buffer whose surface was detached before the
-        // release edge arrived. It is not owned by surface 100, even though
-        // the submitted marker is global.
-        ctx.mark_buffer_submitted(guest_buffer);
-
-        ctx.last_sender_id = 100;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-
-        assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
-        assert!(ctx.buffer_is_submitted(guest_buffer));
-        assert_eq!(
-            host_requests(&ctx),
-            [(SURFACE.host, wl_surface::Request::Destroy {}.into())],
-            "an unrelated surface destroy must not preempt wl_buffer.release"
-        );
-    }
-
-    #[test]
-    fn a_detached_use_survives_destroy_of_the_new_current_surface() {
-        for kind in BUFFER_KINDS {
-            let mut ctx = toplevel_ctx();
-            let (first_surface, second_surface) = (TEST_SURFACE, 101);
-            let (buffer, host_buffer) = (50, 51);
-            ctx.shadow_table.insert_paired_with_version_for_test(
-                second_surface,
-                201,
-                "wl_surface",
-                5,
-            );
-            ctx.create_surface(second_surface);
-            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
-            let awaiting_detached_release = Some(RenderBufferUse::AwaitingRelease {
-                has_detached_use: true,
-            });
-
-            attach_and_commit(&mut ctx, first_surface, buffer);
-            // Replacing B on S0 begins an unattributed outstanding use: S0 no
-            // longer names B, but only wl_buffer.release can prove the host
-            // has stopped sampling that detached attachment.
-            attach_and_commit(&mut ctx, first_surface, 0);
-            assert_eq!(
-                ctx.host_buffer_use(buffer),
-                awaiting_detached_release,
-                "{kind:?}"
-            );
-
-            // A later current use must preserve, not overwrite, the detached
-            // latch from S0.
-            attach_and_commit(&mut ctx, second_surface, buffer);
-            assert_eq!(
-                ctx.host_buffer_use(buffer),
-                awaiting_detached_release,
-                "{kind:?}"
-            );
-
-            ctx.last_sender_id = buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-            ctx.client_to_host_queue.clear();
-
-            ctx.last_sender_id = second_surface;
-            assert_eq!(
-                <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-            assert_eq!(
-                buffer_lifecycle(&ctx, buffer),
-                Some(RenderBufferLifecycle::GuestDestroyed(
-                    RenderBufferUse::AwaitingRelease {
-                        has_detached_use: true
-                    }
-                )),
-                "destroying S1 proves only S1's current use, not S0's detached \
-                 use ({kind:?})"
-            );
-            assert!(
-                !buffer_host_destroy_is_queued(&ctx, buffer),
-                "the detached S0 use must keep the {kind:?} backing alive until \
-                 host release"
-            );
-
-            ctx.last_sender_id = host_buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_release(&mut ctx),
-                Action::Drop
-            );
-            assert!(
-                buffer_host_destroy_is_queued(&ctx, buffer),
-                "the global host release closes every outstanding {kind:?} use"
-            );
-        }
-    }
-
-    #[test]
-    fn destroying_a_pending_only_surface_keeps_awaiting_release() {
-        for kind in BUFFER_KINDS {
-            let mut ctx = toplevel_ctx();
-            let (buffer, host_buffer) = (50, 51);
-            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
-            let awaiting_release = Some(RenderBufferLifecycle::GuestDestroyed(
-                RenderBufferUse::AwaitingRelease {
-                    has_detached_use: false,
-                },
-            ));
-
-            // The release belongs to an earlier committed use. Merely
-            // attaching the same buffer to another surface does not transfer
-            // ownership of that outstanding release edge until the new
-            // surface commits.
-            assert!(ctx.mark_buffer_submitted(buffer));
-            ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(Handlers::on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
-            ctx.last_sender_id = buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-            assert_eq!(buffer_lifecycle(&ctx, buffer), awaiting_release, "{kind:?}");
-
-            ctx.last_sender_id = TEST_SURFACE;
-            assert_eq!(
-                <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-                Action::Drop
-            );
-            assert_eq!(
-                buffer_lifecycle(&ctx, buffer),
-                awaiting_release,
-                "destroying a pending-only surface must not consume another \
-                 use's release edge ({kind:?})"
-            );
-            assert_eq!(
-                host_requests(&ctx),
-                [(SURFACE.host, wl_surface::Request::Destroy {}.into())],
-                "the host {kind:?} buffer must remain alive until its real release"
-            );
-
-            ctx.last_sender_id = host_buffer;
-            assert_eq!(
-                <Handlers as WlBufferHandler>::on_release(&mut ctx),
-                Action::Drop
-            );
-            assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
-            assert_eq!(
-                host_requests(&ctx),
-                [
-                    (SURFACE.host, wl_surface::Request::Destroy {}.into()),
-                    (host_buffer, wl_buffer::Request::Destroy {}.into()),
-                ],
-                "the real release must retire the {kind:?} buffer after the \
-                 surface destructor"
-            );
-        }
-    }
-
-    #[test]
-    fn wl_surface_destroy_removes_stale_xdg_surface_links() {
-        let mut ctx = toplevel_ctx();
-        let wl_surface_guest_id = 100u32;
-        ctx.xdg_roles.add_xdg_surface(601, wl_surface_guest_id);
-        ctx.xdg_roles
-            .add_toplevel_role_for_test(603, wl_surface_guest_id, 602);
-        ctx.last_sender_id = wl_surface_guest_id;
-
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert_eq!(ctx.xdg_roles.toplevel_of_xdg_surface(603), None);
-        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(602), None);
-        // The setup role is also ended because it is on the same surface;
-        // no stale association should survive destruction.
-        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(TOPLEVEL.guest), None);
-        assert!(ctx.xdg_roles.is_empty());
-    }
-
-    #[test]
-    fn wl_surface_destroy_removes_keyboard_focus_links() {
-        let mut ctx = toplevel_ctx();
-        let wl_surface_guest_id = 100u32;
-        let host_keyboard_id = crate::state::HostId(700);
-        use crate::handler::keyboard::for_test::{created, default_keymap, extended, peek};
-        // Keyboard 700 of seat 1 on the surface, and keyboard 701 of seat 2
-        // on another.
-        created(&mut ctx, 700, 700, 1);
-        extended(&mut ctx, 700, 750);
-        default_keymap(&mut ctx, 700);
-        created(&mut ctx, 701, 701, 2);
-        extended(&mut ctx, 701, 751);
-        ctx.keyboard_focus
-            .set_for_test(host_keyboard_id, 1, wl_surface_guest_id, SURFACE.host);
-        ctx.keyboard_focus
-            .set_for_test(crate::state::HostId(701), 2, 999, 1999);
-        let key = |ctx: &mut Context, serial, key, state| {
-            ctx.last_sender_id = 700;
-            <Handlers as WlKeyboardHandler>::on_key(ctx, serial, serial, key, state)
+    /// A keyboard of a new seat, which the host gives its first focus, on
+    /// `surface`; the guest gets the enter.
+    async fn focused_keyboard(s: &mut Session, surface: Object) -> Focused {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1::Request;
+        let (seat, keyboard) = s.keyboard().await;
+        s.host([wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap()])
+            .await;
+        let host = s.host_received();
+        let [(_, AnyRequest::ZcrKeyboardExtensionV1(Request::GetExtendedKeyboard { id, .. }))] =
+            host[..]
+        else {
+            panic!("the keyboard got no extended keyboard: {host:?}");
         };
-        // The input method takes Backspace and repeats it, until the press
-        // of key 30 ends the lease; key 30's guest press then waits for its
-        // release beside a new press.
-        peek(&mut ctx, 750, 1, 14, 1);
-        let lease = crate::ime::KeyEffect::Lease {
-            ti: crate::ime::TiId(1),
-            seat: crate::ime::SeatId(1),
-            outcome: crate::ime::LeaseOutcome::ArmIfBackspaceHeld,
+        let enter = wl_keyboard::Event::Enter {
+            serial: 1,
+            surface: surface.id,
+            keys: Vec::new(),
         };
-        crate::handler::keyboard::keys(&mut ctx, crate::keys::KeyInput::Ime(lease));
-        assert_eq!(key(&mut ctx, 1, 14, 1), Action::Drop);
-        assert_eq!(key(&mut ctx, 2, 30, 1), Action::Forward);
-        assert!(ctx.keys.backspace_repeat_cancelled(host_keyboard_id));
-        peek(&mut ctx, 750, 3, 30, 0);
-        peek(&mut ctx, 750, 4, 30, 1);
-        assert_eq!(ctx.keys.retired_release(host_keyboard_id, 30), Some(3));
-        // Seat 2's watermark.
-        peek(&mut ctx, 751, 5, 57, 1);
-        ctx.last_sender_id = wl_surface_guest_id;
+        let guest = s.guest_received();
+        assert_eq!(guest[..1], [(keyboard.id, enter.into())]);
+        assert_eq!(guest.len(), 2, "the enter and its modifiers");
+        Focused {
+            seat,
+            keyboard,
+            ext: id,
+        }
+    }
+
+    /// `k`'s extended keyboard peeks a press of `key`, which reaches no
+    /// peer.
+    async fn peek(s: &mut Session, k: Focused, serial: u32, key: u32) {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        let pressed = wl_keyboard::KEY_STATE_PRESSED;
+        s.host([zcr_extended_keyboard_v1::evt::peek_key(
+            k.ext, serial, serial, key, pressed,
+        )])
+        .await;
+        assert_eq!(s.guest_received(), []);
+        assert_eq!(s.host_received(), []);
+    }
+
+    /// `k`'s host sends key event `serial` of `key` in `state`; returns
+    /// what the guest gets. The proxy acknowledges it.
+    async fn key(
+        s: &mut Session,
+        k: Focused,
+        serial: u32,
+        key: u32,
+        state: u32,
+    ) -> Vec<(u32, AnyEvent)> {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::Request;
+        s.host([wl_keyboard::evt::key(
+            k.keyboard.host,
+            serial,
+            serial,
+            key,
+            state,
+        )])
+        .await;
+        let host = s.host_received();
+        assert!(
+            matches!(
+                host[..],
+                [(ext, AnyRequest::ZcrExtendedKeyboardV1(Request::AckKey { serial: acked, .. }))]
+                    if ext == k.ext && acked == serial
+            ),
+            "the key was not acknowledged: {host:?}"
+        );
+        s.guest_received()
+    }
+
+    /// The key event `k`'s guest keyboard gets for [`key`].
+    fn key_event(k: Focused, serial: u32, key: u32, state: u32) -> (u32, AnyEvent) {
+        let event = wl_keyboard::Event::Key {
+            serial,
+            time: serial,
+            key,
+            state,
+        };
+        (k.keyboard.id, event.into())
+    }
+
+    /// Destroying a surface retires the focus of the keyboards on it and
+    /// their input state, so the host's later keys of the guest's held key
+    /// reach the guest no more, while it keeps the keyboard's keymap, and
+    /// the focus and input state of another seat on another surface.
+    #[tokio::test]
+    async fn wl_surface_destroy_removes_keyboard_focus_links() {
+        const KEY_A: u32 = 30;
+        const KEY_S: u32 = 31;
+        const SPACE: u32 = 57;
+        let (pressed, released) = (
+            wl_keyboard::KEY_STATE_PRESSED,
+            wl_keyboard::KEY_STATE_RELEASED,
+        );
+        let mut s = Session::new();
+        keyboard_extension(&mut s).await;
+        let destroyed = s.surface().await;
+        let other = s.surface().await;
+        // A keyboard of one seat on the surface, and one of another seat on
+        // another.
+        let first = focused_keyboard(&mut s, destroyed).await;
+        let second = focused_keyboard(&mut s, other).await;
+        // The first keyboard holds A, whose press the guest got, and the
+        // second has a peek watermark.
+        peek(&mut s, first, 2, KEY_A).await;
+        assert_eq!(
+            key(&mut s, first, 2, KEY_A, pressed).await,
+            [key_event(first, 2, KEY_A, pressed)]
+        );
+        peek(&mut s, second, 3, SPACE).await;
+
+        s.guest([wl_surface::req::destroy(destroyed.id)]).await;
+        assert_eq!(s.host_received(), [surface_destroy(destroyed)]);
+        assert_eq!(s.guest_received(), []);
 
         assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
+            key(&mut s, first, 4, KEY_A, released).await,
+            [],
+            "destroying a surface must retire all per-keyboard input state"
         );
+        // Reads state no peer can observe: the keyboard's focus, as the
+        // proxy forwards a key of a keyboard without one (the guest drops
+        // it); the keymap, which the host sends once; and the peek
+        // watermarks, which reach no peer until a confirmation.
+        let keyboard = crate::state::HostId(first.keyboard.host);
         assert!(
-            ctx.keyboard_focus
-                .focus_for_keyboard(crate::state::HostId(700))
+            s.ctx()
+                .keyboard_focus
+                .focus_for_keyboard(keyboard)
                 .is_none(),
             "destroying a surface must retire per-keyboard focus"
         );
+        let keys = &s.ctx().keys;
         assert!(
-            !ctx.keys.held(host_keyboard_id, 14)
-                && !ctx.keys.backspace_repeat_cancelled(host_keyboard_id)
-                && ctx.keys.peek(host_keyboard_id, 14).is_none()
-                && ctx.keys.owner(host_keyboard_id, 14).is_none(),
-            "destroying a surface must retire all per-keyboard input state"
-        );
-        assert_eq!(
-            ctx.keys.retired_release(host_keyboard_id, 30),
-            None,
-            "surface destruction must discard retired guest releases"
-        );
-        assert!(
-            ctx.keys
-                .keyboards()
-                .keymap_for_test(host_keyboard_id)
-                .is_some(),
+            keys.keyboards().keymap_for_test(keyboard).is_some(),
             "surface focus teardown must preserve keymap-derived capabilities"
         );
         assert!(
-            ctx.keys
-                .latest_peek_sequence(1, Some(wl_surface_guest_id))
+            keys.latest_peek_sequence(first.seat, Some(destroyed.id))
                 .is_none(),
             "destroying a surface must retire its peek watermark"
         );
         assert!(
-            ctx.keys.latest_peek_sequence(2, Some(999)).is_some(),
+            keys.latest_peek_sequence(second.seat, Some(other.id))
+                .is_some(),
             "another live seat's watermark must remain intact"
         );
         assert_eq!(
-            ctx.keyboard_focus
-                .focus_for_keyboard(crate::state::HostId(701))
-                .map(|focus| focus.guest_surface),
-            Some(999),
+            key(&mut s, second, 6, KEY_S, pressed).await,
+            [key_event(second, 6, KEY_S, pressed)],
             "focus for another live surface must remain intact"
+        );
+    }
+
+    /// Destroying a surface moves every text input on it off it, with a
+    /// `leave` while the surface is still valid and no commit of a shown
+    /// preedit, and deactivates the active one, on every seat whose focus
+    /// was on it; a seat on another surface keeps its focus, peek
+    /// watermark and text input. The host's late keyboard leaves of the
+    /// destroyed surface change nothing.
+    #[tokio::test]
+    async fn wl_surface_destroy_transitions_all_focused_seats_and_preserves_others() {
+        use crate::protocols::wayland::wl_keyboard;
+        let mut s = Session::new();
+        keyboard_extension(&mut s).await;
+        let destroyed = s.surface().await;
+        let live = s.surface().await;
+        let mut seats = Vec::new();
+        for (surface, serial) in [(destroyed, 1), (destroyed, 2), (live, 3)] {
+            let k = focused_keyboard(&mut s, surface).await;
+            // A peek of each keyboard on its focus.
+            peek(&mut s, k, serial, 30).await;
+            let ti = s.text_input(k.seat).await;
+            let enter = zwp_text_input_v3::Event::Enter {
+                surface: surface.id,
+            };
+            assert_eq!(s.guest_received(), [(ti.id, enter.into())]);
+            seats.push((k, ti, surface));
+        }
+        let [(k1, ti1, _), (k2, ti2, _), (k3, ti3, _)] = seats[..] else {
+            unreachable!()
+        };
+        // Only the first is enabled, as one text input on a connection can
+        // be, and composes; the others have state pending.
+        s.enable(ti1, 1).await;
+        let preedit = zwp_text_input_v1::evt::preedit_string(ti1.host, 0, "한", "");
+        s.host([preedit.unwrap()]).await;
+        assert_eq!(s.guest_received().len(), 2, "the preedit and its done");
+        for ti in [ti2, ti3] {
+            let text = zwp_text_input_v3::req::set_surrounding_text(ti.id, "한", 3, 3);
+            s.guest([text.unwrap()]).await;
+        }
+        assert_eq!(s.host_received(), []);
+        // Reads state no peer can observe: the peek watermarks.
+        for (k, surface) in [(k1, destroyed), (k2, destroyed), (k3, live)] {
+            let keys = &s.ctx().keys;
+            assert!(keys
+                .latest_peek_sequence(k.seat, Some(surface.id))
+                .is_some());
+        }
+
+        s.guest([wl_surface::req::destroy(destroyed.id)]).await;
+        let leave = || zwp_text_input_v3::Event::Leave {
+            surface: destroyed.id,
+        };
+        assert_eq!(
+            s.guest_received(),
+            [(ti1.id, leave().into()), (ti2.id, leave().into())]
+        );
+        let host = s.host_received();
+        let [.., (_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] = host[..]
+        else {
+            panic!("the host got no drain barrier: {host:?}");
+        };
+        let deactivate = zwp_text_input_v1::Request::Deactivate {
+            seat: s.ctx().shadow_table.get_host_id(k1.seat).unwrap(),
+        };
+        assert_eq!(
+            host,
+            [
+                surface_destroy(destroyed),
+                (ti1.host, deactivate.into()),
+                (WL_DISPLAY_ID, wl_display::Request::Sync { callback }.into()),
+            ]
+        );
+        // Reads state no peer can observe: the peek watermarks.
+        let keys = &s.ctx().keys;
+        assert!(keys
+            .latest_peek_sequence(k1.seat, Some(destroyed.id))
+            .is_none());
+        assert!(keys
+            .latest_peek_sequence(k2.seat, Some(destroyed.id))
+            .is_none());
+        assert!(keys.latest_peek_sequence(k3.seat, Some(live.id)).is_some());
+
+        for k in [k1, k2] {
+            let leave = wl_keyboard::evt::leave(k.keyboard.host, 10, destroyed.host);
+            s.host([leave]).await;
+            assert_eq!(s.guest_received(), []);
+            assert_eq!(s.host_received(), []);
+        }
+        // The third seat keeps its focus on the live surface.
+        let pressed = wl_keyboard::KEY_STATE_PRESSED;
+        assert_eq!(
+            key(&mut s, k3, 11, 31, pressed).await,
+            [key_event(k3, 11, 31, pressed)]
         );
     }
 
@@ -3892,148 +3647,6 @@ mod tests {
             .await;
         let delete_id = wl_display::Event::DeleteId { id: surface.id };
         assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
-    }
-
-    #[test]
-    fn wl_surface_destroy_transitions_all_focused_seats_and_preserves_others() {
-        let mut ctx = toplevel_ctx();
-        let destroyed_surface = 100;
-        let live_surface = 101;
-        let live_host_surface = 201;
-        let seats = [(1, 2), (3, 4), (5, 6)];
-        let keyboards = [(800, 900), (801, 901), (802, 902)];
-        let text_inputs = [(700, 701, 702), (710, 711, 712), (720, 721, 722)];
-
-        ctx.shadow_table
-            .insert_paired_for_test(live_surface, live_host_surface, "wl_surface");
-        for (guest_seat, host_seat) in seats {
-            ctx.shadow_table
-                .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
-        }
-        for ((guest_keyboard, host_keyboard), (guest_seat, _)) in keyboards.into_iter().zip(seats) {
-            ctx.shadow_table
-                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-            crate::handler::keyboard::for_test::created(
-                &mut ctx,
-                guest_keyboard,
-                host_keyboard,
-                guest_seat,
-            );
-        }
-        // Only the first is enabled: one text input on a connection can be.
-        for (
-            ((guest_text_input, host_object, host_v1), (guest_seat, _)),
-            (active_surface, state),
-        ) in text_inputs.into_iter().zip(seats).zip([
-            (destroyed_surface, composing as fn(_, _, _) -> _),
-            (destroyed_surface, disabled),
-            (live_surface, disabled),
-        ]) {
-            ctx.shadow_table.insert_paired_for_test(
-                guest_text_input,
-                host_object,
-                "zwp_text_input_v3",
-            );
-            let active = state(host_v1, guest_seat, active_surface);
-            text_input::insert(&mut ctx, guest_text_input, active);
-        }
-
-        ctx.keyboard_focus.set_for_test(
-            crate::state::HostId(900),
-            1,
-            destroyed_surface,
-            SURFACE.host,
-        );
-        ctx.keyboard_focus.set_for_test(
-            crate::state::HostId(901),
-            3,
-            destroyed_surface,
-            SURFACE.host,
-        );
-        ctx.keyboard_focus.set_for_test(
-            crate::state::HostId(902),
-            5,
-            live_surface,
-            live_host_surface,
-        );
-        // A peek of each keyboard on its focus.
-        for (serial, host_keyboard) in (1..).zip([900, 901, 902]) {
-            let extended = host_keyboard + 50;
-            crate::handler::keyboard::for_test::extended(&mut ctx, host_keyboard, extended);
-            crate::handler::keyboard::for_test::peek(&mut ctx, extended, serial, 30, 1);
-        }
-        for (guest_seat, surface) in [
-            (1, destroyed_surface),
-            (3, destroyed_surface),
-            (5, live_surface),
-        ] {
-            assert!(ctx
-                .keys
-                .latest_peek_sequence(guest_seat, Some(surface))
-                .is_some());
-        }
-
-        let state = text_input::view(&ctx, 720);
-        assert_eq!(state.focus, Some(live_surface));
-        assert!(state.pending);
-        let unaffected = text_input::snapshot(&ctx, 720);
-        ctx.last_sender_id = destroyed_surface;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-
-        for guest_text_input in [700, 710] {
-            let state = text_input::view(&ctx, guest_text_input);
-            assert_eq!(state.focus, None);
-            assert!(!state.enabled);
-            assert_ne!(state.host, Host::Active);
-        }
-        assert_eq!(text_input::snapshot(&ctx, 720), unaffected);
-
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-        for guest_text_input in [700, 710] {
-            assert!(ctx.host_to_client_queue.iter().any(|(message, _)| {
-                msg_sender(message) == guest_text_input
-                    && msg_opcode(message) == zwp_text_input_v3::EVT_LEAVE
-            }));
-        }
-        assert!(ctx
-            .host_to_client_queue
-            .iter()
-            .all(|(message, _)| msg_sender(message) != 720));
-        assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
-            msg_sender(message) == 702 && msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
-        }));
-        assert!(ctx
-            .client_to_host_queue
-            .iter()
-            .all(|(message, _)| ![712, 722].contains(&msg_sender(message))));
-        assert!(ctx
-            .keys
-            .latest_peek_sequence(1, Some(destroyed_surface))
-            .is_none());
-        assert!(ctx
-            .keys
-            .latest_peek_sequence(3, Some(destroyed_surface))
-            .is_none());
-        assert!(ctx
-            .keys
-            .latest_peek_sequence(5, Some(live_surface))
-            .is_some());
-        assert_eq!(ctx.keyboard_focus.surface_for_seat(5), Some(live_surface));
-
-        let guest_queue_len = ctx.host_to_client_queue.len();
-        let host_queue_len = ctx.client_to_host_queue.len();
-        for host_keyboard in [900, 901] {
-            ctx.last_sender_id = host_keyboard;
-            assert_eq!(
-                <Handlers as WlKeyboardHandler>::on_leave(&mut ctx, 10, SURFACE.host,),
-                Action::Drop
-            );
-        }
-        assert_eq!(ctx.host_to_client_queue.len(), guest_queue_len);
-        assert_eq!(ctx.client_to_host_queue.len(), host_queue_len);
     }
 
     #[test]
@@ -4139,41 +3752,5 @@ mod tests {
             .keys
             .latest_peek_sequence(seat_with_replacement, Some(replacement_surface))
             .is_some());
-    }
-
-    #[test]
-    fn old_aura_surface_stays_reserved_without_release_request() {
-        let mut ctx = toplevel_ctx();
-        ctx.singletons
-            .set_version_for_test(Singleton::AuraShell, 37);
-        ctx.last_sender_id = TOPLEVEL.guest;
-
-        Handlers::on_set_app_id(&mut ctx, &"legacy".to_string());
-        let zaura_surface_host = ctx
-            .aura_surfaces
-            .get(SURFACE.host)
-            .expect("set_app_id must create the aura surface");
-
-        ctx.client_to_host_queue.clear();
-        ctx.last_sender_id = 100;
-        assert_eq!(
-            <Handlers as WlSurfaceHandler>::on_destroy(&mut ctx),
-            Action::Drop
-        );
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .all(|(message, _)| msg_opcode(message) != zaura_surface::REQ_RELEASE),
-            "old aura-shell versions must not receive release"
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(zaura_surface_host),
-            None,
-            "legacy aura objects must retire dispatch metadata after surface destroy"
-        );
-        assert_ne!(
-            ctx.shadow_table.create_host_only(Iface::WlCallback, 1),
-            zaura_surface_host
-        );
     }
 }
