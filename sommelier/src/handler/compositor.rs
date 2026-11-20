@@ -457,22 +457,15 @@ pub(crate) fn forget_surface(
     ctx.viewport_to_wl_surface
         .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
     ctx.pointer_focus.forget_surface(wl_surface_guest_id);
-    // Surface destruction can race the host's wl_keyboard.leave event.
-    // Transition the authoritative registry first, then emit the mandatory
-    // v3 leave while the guest surface ID is still valid. A later host leave
-    // matches no live generation and is idempotent. The IME core hears of
-    // the destroy before the focus changes it caused, so that no field
-    // commits its preedit into the destroyed surface, as one the focus
-    // leaves does.
-    let focus_update = ctx.keyboard_focus.destroy_surface(wl_surface_guest_id);
-    let surface = crate::ime::SurfaceId(wl_surface_guest_id);
-    crate::handler::text_input::ime(ctx, crate::ime::Input::SurfaceDestroyed(surface));
-    let focus = crate::keys::KeyInput::Focus {
-        update: focus_update,
-        enter: None,
-        keyboard: Vec::new(),
-    };
-    crate::handler::keyboard::keys(ctx, focus);
+    // Surface destruction can race the host's wl_keyboard.leave event. The
+    // keyboard core moves the focus off the surface first, and the IME core
+    // sends the mandatory v3 leave while the guest surface ID is still
+    // valid; a later host leave matches no live generation and is
+    // idempotent. The IME core hears of the destroy before the focus
+    // changes it caused, so that no field commits its preedit into the
+    // destroyed surface, as one the focus leaves does.
+    let destroyed = crate::keys::KeyInput::SurfaceDestroyed(wl_surface_guest_id);
+    crate::handler::keyboard::keys(ctx, destroyed);
 }
 
 impl WlSurfaceHandler for Handlers {
@@ -3520,10 +3513,7 @@ mod tests {
         // watermarks, which reach no peer until a confirmation.
         let keyboard = first.keyboard.host_id();
         assert!(
-            s.ctx()
-                .keyboard_focus
-                .focus_for_keyboard(keyboard)
-                .is_none(),
+            s.ctx().keys.focus().focus_for_keyboard(keyboard).is_none(),
             "destroying a surface must retire per-keyboard focus"
         );
         let keys = &s.ctx().keys;
@@ -3732,8 +3722,9 @@ mod tests {
             replacement_host_surface,
             Iface::WlSurface,
         );
-        ctx.keyboard_focus.set_for_test(
-            h(900),
+        crate::handler::keyboard::for_test::focus(
+            &mut ctx,
+            900,
             seat_with_replacement,
             replacement_surface,
             replacement_host_surface,
@@ -3769,7 +3760,8 @@ mod tests {
         crate::handler::keyboard::for_test::extended(&mut ctx, 900, 950);
         crate::handler::keyboard::for_test::peek(&mut ctx, 950, 1, 30, 1);
         assert!(
-            ctx.keyboard_focus
+            ctx.keys
+                .focus()
                 .surface_for_seat(seat_without_owner)
                 .is_none(),
             "one stale projection must have no remaining keyboard owner"

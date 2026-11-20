@@ -29,14 +29,16 @@ const OTHER: HostId = HostId::for_test(101);
 const OTHER_EXTENDED: HostId = HostId::for_test(1001);
 const SEAT: GuestId = GuestId::for_test(1);
 const SURFACE: GuestId = GuestId::for_test(20);
+/// The host surface of [`SURFACE`].
+const HOST_SURFACE: HostId = HostId::for_test(200);
 const TI: TiId = TiId(GuestId::for_test(40));
 const KEY_Q: u32 = 16;
 const KEY_A: u32 = 30;
 /// Mod1, Alt in the default keymap.
 const ALT: u32 = 1 << 3;
 
-/// The facts the core reads: [`KEYBOARD`] focuses `SURFACE` on its seat,
-/// `shortcuts` are bound, and the text input passes the gate if `gate`.
+/// The facts the core reads: `shortcuts` are bound, and the text input
+/// passes the gate if `gate`.
 struct TestEnv {
     shortcuts: Vec<(Accelerator, BindingId)>,
     gate: bool,
@@ -61,14 +63,6 @@ impl TestEnv {
 }
 
 impl Env for TestEnv {
-    fn seat_focus(&self, seat: GuestId) -> Option<GuestId> {
-        (seat == SEAT).then_some(SURFACE)
-    }
-
-    fn focuses(&self, keyboard: HostId, surface: GuestId) -> bool {
-        keyboard == KEYBOARD && surface == SURFACE
-    }
-
     fn shortcut(&self, chord: &Accelerator) -> Option<BindingId> {
         let mut shortcuts = self.shortcuts.iter();
         shortcuts.find_map(|(bound, binding)| (bound == chord).then_some(*binding))
@@ -81,7 +75,7 @@ impl Env for TestEnv {
 
 /// A core whose host keeps `accelerators`, with [`KEYBOARD`], then
 /// [`OTHER`], on [`SEAT`], their extended keyboards bound and the default
-/// keymap loaded.
+/// keymap loaded, and [`KEYBOARD`] focused on [`SURFACE`].
 fn core(accelerators: &str, env: &TestEnv) -> KeyboardCore {
     let accelerators = HostAccelerators::parse(accelerators).unwrap();
     let mut core = KeyboardCore::new(accelerators);
@@ -111,6 +105,16 @@ fn core(accelerators: &str, env: &TestEnv) -> KeyboardCore {
         KeyInput::Keymap {
             keyboard: OTHER,
             keymap: Some(crate::keymap::default_for_test()),
+        },
+        KeyInput::Enter {
+            keyboard: KEYBOARD,
+            focus: KeyboardFocus {
+                guest_seat: SEAT,
+                guest_surface: SURFACE,
+                host_surface: HOST_SURFACE,
+            },
+            keys: Vec::new(),
+            events: Vec::new(),
         },
     ];
     for input in inputs {
@@ -303,24 +307,29 @@ fn a_backspace_release_or_a_focus_change_ends_the_seats_lease() {
         release(&mut leased_backspace(&env), peeked);
     }
 
-    let mut keys = leased_backspace(&env);
-    let update = KeyboardFocusUpdate {
-        accepted: true,
-        seat_changes: vec![crate::state::SeatFocusChange {
-            guest_seat: SEAT,
-            previous_surface: Some(SURFACE),
-            current_surface: None,
-        }],
-        retired_keyboards: Vec::new(),
+    // A focus move retires the keyboard that left, and the keys it held,
+    // so hold the Backspace on the seat's other keyboard, which focuses
+    // nothing and stays.
+    let mut keys = core("", &env);
+    keys.step(
+        peek_on(OTHER_EXTENDED, EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 1),
+        &env,
+    );
+    let lease = KeyEffect::Lease {
+        ti: TI,
+        seat: SeatId(SEAT),
+        outcome: LeaseOutcome::ArmIfBackspaceHeld,
     };
-    let focus = KeyInput::Focus {
-        update,
-        enter: None,
-        keyboard: Vec::new(),
+    keys.step(KeyInput::Ime(lease), &env);
+    assert_eq!(keys.backspace_lease(OTHER), Some(TI));
+    let leave = KeyInput::Leave {
+        keyboard: KEYBOARD,
+        surface: HOST_SURFACE,
+        events: Vec::new(),
     };
-    keys.step(focus, &env);
-    assert_eq!(keys.backspace_lease(KEYBOARD), None);
-    assert!(keys.backspace_repeat_cancelled(KEYBOARD));
+    keys.step(leave, &env);
+    assert_eq!(keys.backspace_lease(OTHER), None);
+    assert!(keys.backspace_repeat_cancelled(OTHER));
 }
 
 /// A move of a seat's focus ends its peek watermarks.
@@ -330,21 +339,12 @@ fn a_focus_change_ends_the_seats_peek_watermarks() {
     let mut keys = core("", &env);
     keys.step(peek(KEY_A, KEY_STATE_PRESSED, 1), &env);
     assert!(keys.latest_peek_sequence(SEAT, Some(SURFACE)).is_some());
-    let update = KeyboardFocusUpdate {
-        accepted: true,
-        seat_changes: vec![crate::state::SeatFocusChange {
-            guest_seat: SEAT,
-            previous_surface: Some(SURFACE),
-            current_surface: None,
-        }],
-        retired_keyboards: Vec::new(),
+    let leave = KeyInput::Leave {
+        keyboard: KEYBOARD,
+        surface: HOST_SURFACE,
+        events: Vec::new(),
     };
-    let focus = KeyInput::Focus {
-        update,
-        enter: None,
-        keyboard: Vec::new(),
-    };
-    keys.step(focus, &env);
+    keys.step(leave, &env);
     assert_eq!(keys.latest_peek_sequence(SEAT, Some(SURFACE)), None);
 }
 

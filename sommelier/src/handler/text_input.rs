@@ -23,6 +23,7 @@ use crate::ime::{
     self, Edit, Env, HostExt, HostIme, HostOut, HostTi, Input, Piece, SeatId, SurfaceId, TiId,
 };
 use crate::keys::KeyInput;
+use crate::keys::KeyboardFocusRegistry;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
@@ -30,8 +31,8 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::state::{
-    Context, EventObject, EventSender, GuestId, HostId, InternalCallback, KeyboardFocusRegistry,
-    RequestObject, RequestSender, ShadowTable,
+    Context, EventObject, EventSender, GuestId, HostId, InternalCallback, RequestObject,
+    RequestSender, ShadowTable,
 };
 use crate::wire::{Action, IndexedString, ToGuest};
 
@@ -46,7 +47,7 @@ pub(crate) struct CtxEnv<'a> {
 impl<'a> CtxEnv<'a> {
     #[cfg(test)]
     pub(crate) fn of(ctx: &'a Context) -> Self {
-        Self::new(&ctx.shadow_table, &ctx.keyboard_focus)
+        Self::new(&ctx.shadow_table, ctx.keys.focus())
     }
 
     /// The facts of the context whose object table is `table` and whose
@@ -81,7 +82,7 @@ impl Env for CtxEnv<'_> {
 pub(crate) fn ime(ctx: &mut Context, input: ime::Input) -> bool {
     // Not `CtxEnv::of`, which would borrow the whole context while its IME
     // core steps.
-    let env = CtxEnv::new(&ctx.shadow_table, &ctx.keyboard_focus);
+    let env = CtxEnv::new(&ctx.shadow_table, ctx.keys.focus());
     let fx = ctx.ime.step(input, &env);
     ctx.send_guest_all(fx.to_guest);
     for out in fx.to_host {

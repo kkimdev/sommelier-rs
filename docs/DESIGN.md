@@ -325,7 +325,7 @@ keymaps are compiled in belongs to the keyboard core
 | Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of host globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (keyboard and pointer focus); `sommelier/src/keys` (the keyboard core: one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
+| Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (pointer focus); `sommelier/src/keys` (the keyboard core: the keyboard focus, one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
@@ -690,8 +690,10 @@ sent them for the composition the press committed. The rules are under
 The keyboard core (`sommelier/src/keys`, `Context::keys`) is the IME
 core's twin: a sans-IO state machine that owns every fact of the host
 keyboards and their keys, takes one `keys::KeyInput` through
-`KeyboardCore::step`, returns `keys::KeyEffects`, and reads the keyboard
-focus, the shortcut bindings and the IME core's gate through `keys::Env`.
+`KeyboardCore::step`, returns `keys::KeyEffects`, and reads the shortcut
+bindings and the IME core's gate through `keys::Env`. It owns the keyboard
+focus, which a focus input moves in the same step as what the move ends of
+the keys, and which the IME core and placement read.
 `handler/keyboard.rs` is its adapter. The two cores talk only through
 typed messages: the IME core's `ime::KeyEffect`s are keyboard inputs, and
 the keyboard core hands the IME core `ime::Input`s.

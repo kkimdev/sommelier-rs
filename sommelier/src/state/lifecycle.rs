@@ -357,7 +357,7 @@ impl Context {
         // checked against the table, and every copy of a keyboard's seat
         // must name it.
         let keyboard_seat = |keyboard: HostId| self.keys.keyboards().seat(keyboard);
-        for (keyboard, focus) in self.keyboard_focus.focuses_for_test() {
+        for (keyboard, focus) in self.keys.focus().focuses_for_test() {
             host("keyboard focus", keyboard, Iface::WlKeyboard);
             guest("keyboard focus", focus.guest_surface, Iface::WlSurface);
             assert_eq!(

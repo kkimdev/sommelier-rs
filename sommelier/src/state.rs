@@ -44,11 +44,7 @@ use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, ProtocolError, ToGuest, ToHost};
 use log::{debug, error, warn};
 
-#[cfg(test)]
-pub(crate) use self::input::SeatFocusChange;
-pub(crate) use self::input::{
-    KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PointerFocus,
-};
+pub(crate) use self::input::PointerFocus;
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::objects::{
     DeletedHostId, EventObject, EventSender, GuestId, HostId, Link, RequestObject, RequestSender,
@@ -337,7 +333,6 @@ pub struct Context {
     /// The keyboard core: every host keyboard, one record each, and its
     /// keys.
     pub(crate) keys: crate::keys::KeyboardCore,
-    pub keyboard_focus: KeyboardFocusRegistry,
     pub pointer_focus: PointerFocus,
     /// Wheel steps from touchpad scrolling, which the client gets if
     /// [`crate::client_kind`] chooses it.
@@ -930,7 +925,6 @@ impl Context {
             surfaces: BTreeMap::new(),
             ime: crate::ime::ImeCore::default(),
             keys: crate::keys::KeyboardCore::new(settings.host_accelerators.clone()),
-            keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),
             wheel_steps: crate::handler::pointer::WheelSteps::new(wheel),
             to_host: Vec::new(),
@@ -1025,11 +1019,7 @@ impl Context {
     /// Step the keyboard core with `input`, reading the facts it does not
     /// own from this context ([`crate::handler::keyboard::CtxEnv`]).
     pub(crate) fn step_keys(&mut self, input: crate::keys::KeyInput) -> crate::keys::KeyEffects {
-        let env = crate::handler::keyboard::CtxEnv::new(
-            &self.keyboard_focus,
-            self.window_placement.as_ref(),
-            &self.ime,
-        );
+        let env = crate::handler::keyboard::CtxEnv::new(self.window_placement.as_ref(), &self.ime);
         self.keys.step(input, &env)
     }
 

@@ -207,10 +207,6 @@
   ignores `stale`).
 - `on_peek_key`'s owed release of a stale press can reach the guest
   before a waiting recovery's pair.
-- The keyboard focus registry (`state::KeyboardFocusRegistry`) is still
-  `Context`'s: the keyboard core reads it through `keys::Env` and hears of
-  each change as `KeyInput::Focus`. Moving it into the core would make the
-  core the one owner of every keyboard fact.
 - The bindings watcher removes the watches of an arming attempt that
   started over (because a directory appeared while it armed), but no test
   reaches that race.

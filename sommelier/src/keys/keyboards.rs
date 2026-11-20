@@ -18,7 +18,7 @@ limitations under the License.
 //! holds every fact of the keyboard itself: its guest object and seat, its
 //! keymap, its modifiers and its extended keyboard. Its keys' generations
 //! are the key registry's (`super::generations`), and its focus the focus
-//! registry's (`crate::state::KeyboardFocusRegistry`). Only
+//! registry's (`super::focus`). Only
 //! [`super::KeyboardCore`] changes a record; the rest of the proxy reads
 //! them.
 

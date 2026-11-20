@@ -26,9 +26,15 @@ event decided, a consumed shortcut's binding for its subscriber, the
 `ack_key`, the sync of a recovery that waits, the destroy of an ended
 keyboard's extended keyboard, whether the guest gets the event, guest
 events, and inputs of the IME core. It reads what it does
-not own through `keys::Env`: the keyboard focus, the shortcut bindings,
-and the IME core's gate. It owns:
+not own through `keys::Env`: the shortcut bindings and the IME core's
+gate. It owns:
 
+- the keyboard focus (`keys/focus.rs`): which surface each keyboard
+  focuses, and which superseded enters still owe the guest a leave. A
+  focus input (`Enter`, `Leave`, `SurfaceDestroyed`, `Ended`) moves it
+  and, in the same step, ends what the move ends of the keys, so the
+  focus and the keys cannot disagree; the IME core and placement read it
+  (`KeyboardCore::focus`);
 - one `Keyboard` record per host keyboard (`keys/keyboards.rs`): its
   guest object and seat, its keymap, its modifiers and its extended
   keyboard;
@@ -111,10 +117,10 @@ keyboard's XKB state, focus):
 | `peek_key` press, release | `peek_key(PeekInput)` → `PeekOutcome` | `Peek` |
 | `wl_keyboard.key` | `admit_key` (physical), then `transition_physical` (delivery) | `Key` |
 | recovered pair | `recover` | the host event that decides the recovery |
-| `wl_keyboard.enter` | `install_enter_snapshot`: every listed key `Held`, `Physical` | `Focus` |
-| leave, keyboard end | `clear_keyboard` of each keyboard that lost its focus or ended | `Focus`, `Ended` |
+| `wl_keyboard.enter` | `install_enter_snapshot`: every listed key `Held`, `Physical` | `Enter` |
+| leave, surface or keyboard end | `clear_keyboard` of each keyboard that lost its focus or ended | `Leave`, `SurfaceDestroyed`, `Ended` |
 | H2 detach | `mark_held_keys_stale` | `Ime(KeyEffect::InputMethodDetached)` |
-| Backspace lease | `lease(LeaseInput)` | `Key`, `Peek`, `Ime(KeyEffect::Lease)`, a recovery and `Focus` |
+| Backspace lease | `lease(LeaseInput)` | `Key`, `Peek`, `Ime(KeyEffect::Lease)`, a recovery and a focus input |
 
 `wl_keyboard.key` has two steps, because only a press of the current
 generation needs its chord classified. `admit_key` settles the events

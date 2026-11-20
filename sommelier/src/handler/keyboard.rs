@@ -37,7 +37,7 @@ use crate::accelerator::{Accelerator, BindingId};
 use crate::handler::callback::queue_internal_sync;
 use crate::handler::Handlers;
 use crate::ime::TiId;
-use crate::keys::{Ack, Env, KeyEffects, KeyInput, Recovered};
+use crate::keys::{Ack, Env, KeyEffects, KeyInput, KeyboardFocus, Recovered};
 use crate::protocols::keyboard_extension_unstable_v1::{
     zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
 };
@@ -47,8 +47,7 @@ use crate::protocols::AnyEvent;
 use crate::protocols::Iface;
 use crate::state::Singleton;
 use crate::state::{
-    Context, EventObject, EventSender, GuestId, HostId, InternalCallback, KeyboardFocus,
-    KeyboardFocusRegistry, KeyboardModifiers,
+    Context, EventObject, EventSender, GuestId, HostId, InternalCallback, KeyboardModifiers,
 };
 use crate::warn_once::WarnOnce;
 use crate::wire::{Action, ToGuest};
@@ -73,38 +72,23 @@ fn take_no_keyboard_extension_log_level(once: &WarnOnce) -> log::Level {
 /// the IME core's gate. It borrows only those, so that the core can step
 /// beside them.
 pub(crate) struct CtxEnv<'a> {
-    focus: &'a KeyboardFocusRegistry,
     placement: Option<&'a crate::state::WindowPlacement>,
     ime: &'a crate::ime::ImeCore,
 }
 
 impl<'a> CtxEnv<'a> {
-    /// The facts of the context whose keyboard focus is `focus`, whose
-    /// window placement, while on, is `placement`, and whose IME core is
-    /// `ime`, borrowed apart from its keyboard core, which can then step
-    /// beside them.
+    /// The facts of the context whose window placement, while on, is
+    /// `placement`, and whose IME core is `ime`, borrowed apart from its
+    /// keyboard core, which can then step beside them.
     pub(crate) fn new(
-        focus: &'a KeyboardFocusRegistry,
         placement: Option<&'a crate::state::WindowPlacement>,
         ime: &'a crate::ime::ImeCore,
     ) -> Self {
-        Self {
-            focus,
-            placement,
-            ime,
-        }
+        Self { placement, ime }
     }
 }
 
 impl Env for CtxEnv<'_> {
-    fn seat_focus(&self, seat: GuestId) -> Option<GuestId> {
-        self.focus.surface_for_seat(seat)
-    }
-
-    fn focuses(&self, keyboard: HostId, surface: GuestId) -> bool {
-        self.focus.keyboard_owns_surface(keyboard, surface)
-    }
-
     fn shortcut(&self, chord: &Accelerator) -> Option<BindingId> {
         self.placement?.binding_for(chord)
     }
@@ -440,7 +424,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
             guest_surface: guest_surface_id,
             host_surface: surface.host,
         };
-        if ctx.keyboard_focus.focus_for_keyboard(host_keyboard_id) == Some(focus) {
+        if ctx.keys.focus().focus_for_keyboard(host_keyboard_id) == Some(focus) {
             // The C reference suppresses an enter when the resource already
             // owns this focus. Preserve physical pressed-key and XKB state as
             // well; rebuilding it from an empty/partial keys array would make
@@ -462,7 +446,6 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
         // queue extension requests before being rejected.
         ensure_extended_keyboard_bound(ctx, host_keyboard_id);
 
-        let focus_update = ctx.keyboard_focus.enter(host_keyboard_id, focus);
         // The protocol requires a modifiers event after every enter, but Exo
         // sends one before it, and only when the modifiers changed. Send
         // the guest the keyboard's modifiers after the enter.
@@ -488,25 +471,17 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
             modifiers.group,
         );
 
-        if focus_update.seat_changes.is_empty() {
-            // Another wl_keyboard resource can enter the seat's already
-            // focused surface. The guest resource still needs its own enter,
-            // but the seat-level text-input focus must remain untouched.
-            // Exact duplicates for the same resource were rejected above.
-            log::debug!(
-                "  -> additional keyboard entered seat {} surface {}, leaving IME focus intact",
-                guest_seat_id,
-                guest_surface_id
-            );
-        }
         // The IME core sends them after the commit of a preedit the focus
-        // change ends (F1).
-        let focus = KeyInput::Focus {
-            update: focus_update,
-            enter: Some((host_keyboard_id, held_keys(keys))),
-            keyboard: vec![enter, modifiers],
+        // change ends (F1). Another keyboard can enter the seat's focused
+        // surface: the guest keyboard still gets its own enter, and the
+        // seat's text-input focus stays as it is.
+        let enter = KeyInput::Enter {
+            keyboard: host_keyboard_id,
+            focus,
+            keys: held_keys(keys),
+            events: vec![enter, modifiers],
         };
-        self::keys(ctx, focus);
+        self::keys(ctx, enter);
         Action::Drop
     }
 
@@ -531,24 +506,18 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
             surface.guest
         );
 
-        let focus_update = ctx.keyboard_focus.leave(host_keyboard_id, surface.host);
-        if !focus_update.accepted {
-            log::debug!(
-                "  -> ignoring stale leave for keyboard {} host surface {}",
-                host_keyboard_id,
-                surface.host
-            );
-            return Action::Drop;
-        }
         // The IME core sends the leave after the commit of a preedit the
-        // focus change ends (F1).
-        let leave = wl_keyboard::evt::leave(guest_keyboard_id, serial, surface.guest);
-        let focus = KeyInput::Focus {
-            update: focus_update,
-            enter: None,
-            keyboard: vec![leave],
+        // focus change ends (F1); a stale leave changes nothing.
+        let leave = KeyInput::Leave {
+            keyboard: host_keyboard_id,
+            surface: surface.host,
+            events: vec![wl_keyboard::evt::leave(
+                guest_keyboard_id,
+                serial,
+                surface.guest,
+            )],
         };
-        keys(ctx, focus);
+        keys(ctx, leave);
         Action::Drop
     }
 
@@ -645,14 +614,7 @@ pub(crate) fn keyboard_created(ctx: &mut Context, keyboard: GuestId, seat: Guest
 /// `crate::state::lifecycle`): end its focus, its record and its key
 /// state, and destroy its extended keyboard.
 pub(crate) fn forget_keyboard(ctx: &mut Context, host_keyboard_id: HostId) {
-    let update = ctx.keyboard_focus.release(host_keyboard_id);
     keys(ctx, KeyInput::Ended(host_keyboard_id));
-    let focus = KeyInput::Focus {
-        update,
-        enter: None,
-        keyboard: Vec::new(),
-    };
-    keys(ctx, focus);
 }
 
 /// `zcr_keyboard_extension_v1` handler — sommelier only sends requests to this
@@ -719,6 +681,30 @@ pub(crate) mod for_test {
     pub(crate) fn extended(ctx: &mut Context, host: u32, extended: u32) {
         let (keyboard, extended) = (HostId::for_test(host), HostId::for_test(extended));
         keys(ctx, KeyInput::ExtendedBound { keyboard, extended });
+    }
+
+    /// Focus host keyboard `host`, of guest seat `seat`, on guest surface
+    /// `surface`, host surface `host_surface`, as its `wl_keyboard.enter`
+    /// does, holding no key; the guest gets no event of it.
+    pub(crate) fn focus(
+        ctx: &mut Context,
+        host: u32,
+        seat: GuestId,
+        surface: GuestId,
+        host_surface: HostId,
+    ) {
+        let focus = KeyboardFocus {
+            guest_seat: seat,
+            guest_surface: surface,
+            host_surface,
+        };
+        let enter = KeyInput::Enter {
+            keyboard: HostId::for_test(host),
+            focus,
+            keys: Vec::new(),
+            events: Vec::new(),
+        };
+        keys(ctx, enter);
     }
 
     /// The `peek_key` of `key` in `state` from extended keyboard
