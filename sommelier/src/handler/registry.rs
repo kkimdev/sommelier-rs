@@ -313,16 +313,6 @@ fn retire_unseen_global(ctx: &mut Context, name: u32) {
     }
 }
 
-fn queue_synthetic_global(
-    ctx: &mut Context,
-    registry: HostId,
-    name: u32,
-    interface: &str,
-    version: u32,
-) -> bool {
-    queue_synthetic_global_for_registry(ctx, registry, name, interface, version)
-}
-
 fn queue_synthetic_global_for_registry(
     ctx: &mut Context,
     registry_host_id: HostId,
@@ -678,7 +668,7 @@ fn advertise_synthetic_global(
             version,
         },
     );
-    let visible = queue_synthetic_global(ctx, registry, name, interface, version);
+    let visible = queue_synthetic_global_for_registry(ctx, registry, name, interface, version);
     record_registry_global_visibility(ctx, registry, name, visible);
 }
 
