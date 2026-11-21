@@ -36,7 +36,9 @@ limitations under the License.
 //! interface and IDs and never looks up its own entry.
 
 use super::{Context, DeletedHostId, GuestId, HostId, Link, ObjectData};
-use crate::handler::{compositor, keyboard, linux_dmabuf, output, pointer, registry, text_input};
+use crate::handler::{
+    compositor, data_control, keyboard, linux_dmabuf, output, pointer, registry, text_input,
+};
 use crate::protocols::wayland::wl_display;
 use crate::protocols::Iface;
 use crate::wire::WireId;
@@ -176,6 +178,7 @@ fn forget_object(
         ObjectData::DmabufFactory(factory) => linux_dmabuf::forget_factory(ctx, factory),
         ObjectData::DmabufFeedback(feedback) => linux_dmabuf::forget_feedback(ctx, guest, feedback),
         ObjectData::Viewport(viewport) => compositor::forget_viewport(ctx, viewport),
+        ObjectData::DataControlSource(source) => data_control::forget_source(ctx, source),
         ObjectData::None
         | ObjectData::Shm(_)
         | ObjectData::ShmPool(_)
@@ -250,7 +253,11 @@ fn forget_object(
             | Iface::ZauraSurface
             | Iface::ZauraOutput
             | Iface::ZauraToplevel
-            | Iface::ZauraPopup,
+            | Iface::ZauraPopup
+            | Iface::ExtDataControlManagerV1
+            | Iface::ExtDataControlDeviceV1
+            | Iface::ExtDataControlSourceV1
+            | Iface::ExtDataControlOfferV1,
             _,
         ) => {}
     }
@@ -337,6 +344,11 @@ impl Context {
                 outputs.contains(&output),
                 "surface output outlived output {output}"
             );
+        }
+
+        // The selections the connection carries for data-control sources.
+        for source in self.data_control.carried_for_test() {
+            host_only("carried selection", source, Iface::WlDataSource);
         }
 
         // Window placement.

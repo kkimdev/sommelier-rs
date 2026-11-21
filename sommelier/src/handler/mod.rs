@@ -18,6 +18,7 @@ pub mod aura_objects;
 pub mod buffer;
 pub mod callback;
 pub mod compositor;
+pub mod data_control;
 pub mod data_device;
 pub mod display;
 pub mod gtk_shell;

@@ -317,6 +317,9 @@ pub struct Context {
     pub(crate) xdg_roles: XdgRoles,
     /// The connection's clipboard transfers.
     pub(crate) clipboard_pumps: ClipboardPumps,
+    /// The guest's data-control objects and the selections the connection
+    /// carries for them, with `--data-control`.
+    pub(crate) data_control: crate::handler::data_control::DataControl,
 }
 
 pub(crate) struct LocalBufferCopyResources<'a> {
@@ -516,6 +519,9 @@ impl Context {
         // refreshes within a batch, and the next batch may publish a newer
         // table after more capabilities have arrived.
         self.dmabuf.end_batch();
+        // The hub learns which connection has the focus as of the last
+        // batch, before it routes a selection there.
+        self.data_control.end_batch(self.keys.focus().has_focus());
     }
 
     /// Take the work deferred while dispatching the current message.
@@ -812,6 +818,7 @@ impl Context {
             virtgpu,
             wheel,
             placement,
+            clipboard,
         } = facts;
         Self {
             shadow_table: ShadowTable::new(),
@@ -840,6 +847,7 @@ impl Context {
             aura_surfaces: AuraSurfaces::default(),
             xdg_roles: XdgRoles::default(),
             clipboard_pumps: ClipboardPumps::default(),
+            data_control: crate::handler::data_control::DataControl::new(clipboard.as_ref()),
         }
     }
 
@@ -944,6 +952,8 @@ pub(crate) struct ConnectionFacts {
     pub(crate) wheel: crate::client_kind::WheelClient,
     /// The process's window placement configuration.
     pub(crate) placement: PlacementConfig,
+    /// The clipboard state every connection shares, with `--data-control`.
+    pub(crate) clipboard: Option<crate::handler::data_control::ClipboardHub>,
 }
 
 #[cfg(test)]
@@ -956,6 +966,7 @@ impl ConnectionFacts {
             virtgpu: None,
             wheel: crate::client_kind::WheelClient::No,
             placement: PlacementConfig::for_test(),
+            clipboard: None,
         }
     }
 }

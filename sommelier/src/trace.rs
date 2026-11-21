@@ -129,6 +129,9 @@ pub(crate) struct Facts {
     placement: bool,
     accelerators: bool,
     vm_id: String,
+    /// Whether the guest is offered data-control, stated only when it is,
+    /// so a trace recorded before the fact existed states it as it was.
+    data_control: bool,
 }
 
 impl Facts {
@@ -147,6 +150,7 @@ impl Facts {
             placement: ctx.placement().is_some(),
             accelerators: settings.host_accelerators != Default::default(),
             vm_id: settings.vm_id.clone(),
+            data_control: ctx.data_control.is_on(),
         }
     }
 }
@@ -165,7 +169,11 @@ impl fmt::Display for Facts {
             if self.placement { "on" } else { "off" },
             if self.accelerators { "some" } else { "none" },
             escape(&self.vm_id),
-        )
+        )?;
+        if self.data_control {
+            write!(f, " data-control=on")?;
+        }
+        Ok(())
     }
 }
 
@@ -468,6 +476,23 @@ mod tests {
         assert_eq!(escape(name), "my%20vm%3d1%25%ea%b0%80");
         assert_eq!(unescape(&escape(name)).as_deref(), Some(name));
         assert_eq!(unescape("%4"), None);
+    }
+
+    /// Data-control is stated only when it is on, so a trace recorded
+    /// before the fact existed states its connection as it was.
+    #[test]
+    fn data_control_is_a_fact_only_when_it_is_on() {
+        let facts = crate::state::ConnectionFacts {
+            clipboard: Some(crate::handler::data_control::ClipboardHub::default()),
+            ..crate::state::ConnectionFacts::for_test()
+        };
+        let settings = std::rc::Rc::new(crate::settings::Settings::for_test());
+        let ctx = Context::new(settings, facts);
+        let facts = Facts::of(&ctx).to_string();
+        assert_eq!(
+            facts,
+            format!("{} data-control=on", Facts::of(&self::ctx()))
+        );
     }
 
     /// A trace records the text of each host keymap, as the proxy maps

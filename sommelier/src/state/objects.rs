@@ -732,6 +732,19 @@ impl ShadowTable {
         }
     }
 
+    /// The host object of each live paired guest object of `interface`, in
+    /// guest ID order.
+    pub fn live_hosts_of(&self, interface: Iface) -> impl Iterator<Item = HostId> + '_ {
+        self.guests.values().filter_map(move |object| match object {
+            GuestObject::Paired {
+                host,
+                interface: own,
+                state: GuestState::Live(_),
+            } if own.iface == interface => Some(*host),
+            _ => None,
+        })
+    }
+
     /// Return whether guest object `guest` is one the proxy implements
     /// itself ([`Self::create_local`]).
     pub fn is_local(&self, guest: GuestId) -> bool {

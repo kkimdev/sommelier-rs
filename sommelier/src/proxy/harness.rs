@@ -1036,6 +1036,16 @@ impl Session {
         goes_on
     }
 
+    /// Handle what other connections delivered through the clipboard hub,
+    /// as `Client::run` does once its mailbox is ready; returns whether the
+    /// session goes on.
+    pub(crate) async fn deliver(&mut self) -> bool {
+        let goes_on = self.client.handle_deliveries().await;
+        self.guest.receive();
+        self.host.receive();
+        goes_on
+    }
+
     /// Send all the batches left for either peer, as `Client::run` does
     /// before it waits; returns whether the session goes on.
     pub(super) async fn flush(&mut self) -> bool {
@@ -1057,7 +1067,7 @@ impl Session {
     /// returns, both close their connections, which ends the loop, and the
     /// session with it: an ended stand-in takes the proxy's place. What
     /// the proxy sent that `peers` did not take is kept.
-    pub(super) async fn run(&mut self, peers: impl AsyncFnOnce(&mut Running<'_>)) {
+    pub(crate) async fn run(&mut self, peers: impl AsyncFnOnce(&mut Running<'_>)) {
         let (_, guest_socket) = UnixStream::pair().expect("a guest socket pair");
         let (_, host_socket) = UnixStream::pair().expect("a host socket pair");
         let connection =
@@ -1083,26 +1093,26 @@ impl Session {
 
 /// Both peers of a session whose proxy runs its own event loop
 /// ([`Session::run`]).
-pub(super) struct Running<'a> {
+pub(crate) struct Running<'a> {
     guest: &'a mut Peer<AnyEvent>,
     host: &'a mut Peer<AnyRequest>,
 }
 
 impl Running<'_> {
     /// The host sends `events`.
-    pub(super) fn host(&mut self, events: impl IntoIterator<Item = Outgoing<u32>>) {
+    pub(crate) fn host(&mut self, events: impl IntoIterator<Item = Outgoing<u32>>) {
         events.into_iter().for_each(|event| self.host.send(event));
     }
 
     /// Wait until the proxy has sent the guest an event; returns what the
     /// guest has received.
-    pub(super) async fn guest_received(&mut self) -> Vec<(u32, AnyEvent)> {
+    pub(crate) async fn guest_received(&mut self) -> Vec<(u32, AnyEvent)> {
         self.guest.next().await
     }
 
     /// Wait until the proxy has sent the host a request; returns what the
     /// host has received.
-    pub(super) async fn host_received(&mut self) -> Vec<(u32, AnyRequest)> {
+    pub(crate) async fn host_received(&mut self) -> Vec<(u32, AnyRequest)> {
         self.host.next().await
     }
 }

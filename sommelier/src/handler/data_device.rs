@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::data_control;
 use crate::handler::Handlers;
 use crate::protocols::wayland::wl_data_device;
 use crate::protocols::wayland::wl_data_device_manager;
 use crate::protocols::wayland::wl_data_offer;
 use crate::protocols::wayland::wl_data_source;
-use crate::state::{Context, RequestSender};
+use crate::state::{Context, EventSender, RequestSender};
 use crate::wire::Action;
 use log::{debug, error};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -130,7 +131,23 @@ impl wl_data_offer::WlDataOfferHandler for Handlers {
     }
 }
 
-impl wl_data_source::WlDataSourceHandler for Handlers {}
+/// The host's events of a source the proxy carries for a data-control
+/// client go to that client (`handler::data_control`); the others are
+/// forwarded.
+impl wl_data_source::WlDataSourceHandler for Handlers {
+    fn on_send(
+        ctx: &mut Context,
+        sender: EventSender,
+        mime_type: &String,
+        fd: BorrowedFd<'_>,
+    ) -> Action {
+        data_control::host_send(ctx, sender, mime_type, fd)
+    }
+
+    fn on_cancelled(ctx: &mut Context, sender: EventSender) -> Action {
+        data_control::host_cancelled(ctx, sender)
+    }
+}
 
 /// How many bytes a clipboard pump reads at a time.
 const PUMP_BUFFER_LEN: usize = 64 * 1024;

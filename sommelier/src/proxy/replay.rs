@@ -51,7 +51,9 @@ limitations under the License.
 //!   the host as the device's would.
 //! - The other facts must be ones a test's proxy can have: no render
 //!   node, placement, accelerators or `--gpu-accel`. A trace of other
-//!   facts is refused, which names them.
+//!   facts is refused, which names them, and so is one with
+//!   `--data-control`, since what other connections handed it through the
+//!   clipboard hub is in no trace of its own (`handler::data_control`).
 //! - A host message the proxy did not track or could not read takes no
 //!   descriptor, as it took none when recorded; a descriptor it left
 //!   queued, which ends the session at the next message, is not in the
@@ -296,6 +298,13 @@ mod tests {
 
         let mut other = trace.clone();
         other.facts = other.facts.replace("placement=off", "placement=on");
+        let why = replay(&other).unwrap_err();
+        assert!(why.contains("cannot have the facts"), "{why}");
+
+        // What another connection hands a data-control connection is in
+        // no trace of its own.
+        let mut other = trace.clone();
+        other.facts.push_str(" data-control=on");
         let why = replay(&other).unwrap_err();
         assert!(why.contains("cannot have the facts"), "{why}");
     }

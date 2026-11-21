@@ -38,6 +38,7 @@ fn main() {
         "../third_party/protocols/keyboard-extension-unstable-v1.xml",
         "../third_party/protocols/gtk-shell.xml",
         "../third_party/protocols/aura-shell.xml",
+        "../third_party/protocols/ext-data-control-v1.xml",
     ];
 
     let mut parsed_protocols = Vec::with_capacity(protocols.len());

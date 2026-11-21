@@ -104,4 +104,5 @@ object_data! {
     GtkShell(crate::handler::gtk_shell::GtkShell) for GtkShell1,
     /// A synthetic guest `gtk_surface1`.
     GtkSurface(crate::handler::gtk_shell::GtkSurface) for GtkSurface1,
+    DataControlSource(crate::handler::data_control::Source) for ExtDataControlSourceV1,
 }

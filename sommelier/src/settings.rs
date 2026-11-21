@@ -72,6 +72,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     xdg_decoration: bool,
 
+    /// Offer ext-data-control-v1, through which any guest client may set
+    /// the ChromeOS clipboard without keyboard focus
+    #[arg(long)]
+    data_control: bool,
+
     /// Use the virtio-wayland channel at PATH (default: /dev/wl0)
     #[arg(long)]
     virtio_wl: Option<PathBuf>,
@@ -111,6 +116,9 @@ pub(crate) struct Settings {
     pub(crate) gpu_accel: bool,
     /// `--xdg-decoration`: offer the guest `zxdg_decoration_manager_v1`.
     pub(crate) xdg_decoration: bool,
+    /// `--data-control`: offer the guest `ext_data_control_manager_v1`
+    /// (`crate::handler::data_control`).
+    pub(crate) data_control: bool,
     /// The VM's name in ChromeOS application IDs
     /// (`org.chromium.guest_os.<vm_id>.wayland.<app-id>`).
     pub(crate) vm_id: String,
@@ -168,6 +176,7 @@ impl Settings {
             host,
             gpu_accel: cli.gpu_accel,
             xdg_decoration: cli.xdg_decoration,
+            data_control: cli.data_control,
             vm_id: vm_id(var(VM_IDENTIFIER)),
             drm_device: var(DRM_DEVICE)
                 .filter(|path| !path.is_empty())
@@ -190,6 +199,7 @@ impl Settings {
             host: HostTransport::Local(PathBuf::from("/nonexistent/host")),
             gpu_accel: false,
             xdg_decoration: false,
+            data_control: false,
             vm_id: DEFAULT_VM_IDENTIFIER.to_string(),
             drm_device: None,
             wheel_from_touchpad: WheelFromTouchpad::Off,
@@ -282,7 +292,7 @@ mod tests {
             PathBuf::from("/run/user/1000/wayland-proxy-0")
         );
         assert_eq!(settings.host, HostTransport::VirtWl("/dev/wl0".into()));
-        assert!(!settings.gpu_accel && !settings.xdg_decoration);
+        assert!(!settings.gpu_accel && !settings.xdg_decoration && !settings.data_control);
         assert_eq!(settings.vm_id, "termina");
         assert_eq!(settings.drm_device, None);
         assert_eq!(settings.wheel_from_touchpad, WheelFromTouchpad::Auto);
@@ -331,7 +341,12 @@ mod tests {
     #[test]
     fn switches_display_and_variables_reach_the_settings() {
         let settings = resolve(
-            &["--gpu-accel", "--xdg-decoration", "wayland-1"],
+            &[
+                "--gpu-accel",
+                "--xdg-decoration",
+                "--data-control",
+                "wayland-1",
+            ],
             &[
                 RUNTIME,
                 ("SOMMELIER_ACCELERATORS", "<Alt>a"),
@@ -344,7 +359,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings.socket, PathBuf::from("/run/user/1000/wayland-1"));
-        assert!(settings.gpu_accel && settings.xdg_decoration);
+        assert!(settings.gpu_accel && settings.xdg_decoration && settings.data_control);
         assert_eq!(
             settings.host_accelerators,
             vec![parse_accelerator("<Alt>a").unwrap()].into()

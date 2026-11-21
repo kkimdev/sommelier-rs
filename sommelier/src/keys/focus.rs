@@ -93,6 +93,11 @@ impl KeyboardFocusRegistry {
         surface
     }
 
+    /// Whether any keyboard has the focus.
+    pub(crate) fn has_focus(&self) -> bool {
+        !self.keyboards.is_empty()
+    }
+
     pub(crate) fn focus_for_keyboard(&self, host_keyboard: HostId) -> Option<KeyboardFocus> {
         self.keyboards.get(&host_keyboard).copied()
     }
