@@ -727,6 +727,20 @@ The proxy serves every Linux GUI app, so no single client may end it.
   Tests: `a_data_control_device_reads_the_focused_connections_clipboard`,
   `the_clipboard_reads_empty_once_its_connection_cannot_vouch_for_it`,
   `a_focus_taken_without_a_clipboard_empties_it`.
+- **A connection through a security context is offered no global that
+  widens its sandbox.** A sandbox engine (Flatpak) hands the proxy a
+  socket through `wp_security_context_v1` so that it can tell its
+  clients apart; every client the proxy accepts on it is sandboxed, and
+  is offered neither data-control, which would let it read or replace
+  the clipboard without the focus, nor the security-context manager, so
+  contexts never nest. The proxy accepts on the socket until the close
+  descriptor signals anything, never reading it, so a hangup of either
+  pipe end (Flatpak passes the write end) ends it and no byte written to
+  it can block the loop; it serves at most `MAX_SANDBOX_LISTENERS` (64)
+  contexts at once, and a commit beyond ends its session.
+  Tests: `a_sandboxed_connection_is_offered_no_privileged_global`,
+  `a_committed_security_context_hands_its_socket_to_the_proxy`,
+  `a_security_contexts_socket_serves_until_it_hangs_up`.
 - **The socket belongs to the process holding its lock.** Like
   libwayland, the proxy takes `flock(LOCK_EX | LOCK_NB)` on
   `<socket>.lock` for its lifetime and only then removes a stale socket;

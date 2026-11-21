@@ -24,6 +24,7 @@ the listed commit of this repository.
 | `aura-shell.xml` | Chromium Exo (`zaura_shell`) | Unknown (v38) | `439a872` |
 | `gtk-shell.xml` | Subset of GTK's `gtk_shell1`, as ChromiumOS Sommelier carries it | Unknown (v1) | `600fdf7` |
 | `ext-data-control-v1.xml` | wayland-protocols `staging/ext-data-control/` | wayland-protocols 1.45, unchanged through 1.49 | `98f411a` |
+| `security-context-v1.xml` | wayland-protocols `staging/security-context/` | wayland-protocols 1.45, unchanged through 1.49 | `20c1bd4` |
 
 ChromiumOS Sommelier carries copies of the Chromium and GTK files in
 [`vm_tools/sommelier/protocol/`](https://chromium.googlesource.com/chromiumos/platform2/+/main/vm_tools/sommelier/protocol/).

@@ -23,6 +23,7 @@ use crate::handler::Handlers;
 use crate::protocols::ext_data_control_v1::ext_data_control_manager_v1;
 use crate::protocols::gtk::gtk_shell1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
+use crate::protocols::security_context_v1::wp_security_context_manager_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry, wl_shm, wl_surface};
 use crate::protocols::Iface;
@@ -348,6 +349,8 @@ pub(crate) const fn policy(iface: Iface) -> Policy {
         // Advertised by the proxy for `zcr_keyboard_extension_v1`, with
         // data-control on.
         Iface::ExtDataControlManagerV1 => Policy::Synthetic,
+        // Advertised by the proxy for `zcr_text_input_extension_v1`.
+        Iface::WpSecurityContextManagerV1 => Policy::Synthetic,
         // No globals.
         Iface::WlDisplay
         | Iface::WlRegistry
@@ -385,7 +388,8 @@ pub(crate) const fn policy(iface: Iface) -> Policy {
         | Iface::ZauraPopup
         | Iface::ExtDataControlDeviceV1
         | Iface::ExtDataControlSourceV1
-        | Iface::ExtDataControlOfferV1 => Policy::Hide,
+        | Iface::ExtDataControlOfferV1
+        | Iface::WpSecurityContextV1 => Policy::Hide,
     }
 }
 
@@ -1053,6 +1057,11 @@ fn text_input_manager_global(
 
 /// A host `zcr_text_input_extension_v1` global, hidden from the guest; the
 /// proxy binds the first one for itself.
+///
+/// The guest is offered the proxy's `wp_security_context_manager_v1` under
+/// its name, unless the connection is offered none
+/// (`handler::security_context`): the manager needs no host global of its
+/// own, and every Exo has this one, which the guest never sees.
 fn text_input_extension_global(
     ctx: &mut Context,
     registry: HostId,
@@ -1060,7 +1069,17 @@ fn text_input_extension_global(
     version: u32,
 ) -> Action {
     let interface = Iface::ZcrTextInputExtensionV1;
-    hide_global(ctx, registry, name);
+    if ctx.sandboxing.offers_manager() {
+        advertise_synthetic_global(
+            ctx,
+            registry,
+            name,
+            wp_security_context_manager_v1::NAME,
+            wp_security_context_manager_v1::VERSION,
+        );
+    } else {
+        hide_global(ctx, registry, name);
+    }
     if ctx.globals.text_input_extension.is_some() {
         return Action::Drop;
     }
@@ -1090,7 +1109,7 @@ fn keyboard_extension_global(
     name: u32,
     version: u32,
 ) -> Action {
-    if ctx.data_control.is_on() {
+    if ctx.data_control.offers_global() {
         advertise_synthetic_global(
             ctx,
             registry,
@@ -1350,8 +1369,11 @@ impl wl_registry::WlRegistryHandler for Handlers {
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
             return;
-        } else if interface == Iface::ExtDataControlManagerV1 {
-            // The proxy implements data-control itself.
+        } else if interface == Iface::ExtDataControlManagerV1
+            || interface == Iface::WpSecurityContextManagerV1
+        {
+            // The proxy implements data-control and security contexts
+            // itself.
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
             return;

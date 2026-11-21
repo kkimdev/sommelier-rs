@@ -437,6 +437,10 @@ pub(crate) struct DataControl {
     /// Its membership in the hub; `None` with `--no-data-control`, which
     /// leaves the connection's traffic as it is without the protocol.
     port: Option<Port>,
+    /// Whether the guest is offered the global: not when it came through a
+    /// security context (`handler::security_context`). It still carries
+    /// and learns the clipboard for others while it has the focus.
+    offers_global: bool,
     /// The serial of the latest input event the host sent it, which Exo
     /// accepts in a `set_selection`: it checks only that the serial is
     /// among the last it issued.
@@ -452,17 +456,24 @@ pub(crate) struct DataControl {
 }
 
 impl DataControl {
-    /// A connection's state, in `hub` if the proxy offers data-control.
-    pub(crate) fn new(hub: Option<&ClipboardHub>) -> Self {
+    /// A connection's state, in `hub` if the proxy offers data-control,
+    /// and offered the global if `offers_global`.
+    pub(crate) fn new(hub: Option<&ClipboardHub>, offers_global: bool) -> Self {
         Self {
+            offers_global: offers_global && hub.is_some(),
             port: hub.map(ClipboardHub::join),
             ..Self::default()
         }
     }
 
-    /// Whether the proxy offers the guest data-control.
+    /// Whether the connection is in the hub.
     pub(crate) fn is_on(&self) -> bool {
         self.port.is_some()
+    }
+
+    /// Whether the guest is offered `ext_data_control_manager_v1`.
+    pub(crate) fn offers_global(&self) -> bool {
+        self.offers_global
     }
 
     /// Where the hub posts this connection's deliveries.

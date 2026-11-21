@@ -211,6 +211,10 @@ fn context(trace: &Trace) -> Result<Context, String> {
     let facts = ConnectionFacts {
         virtwl,
         clipboard: (trace.fact("data-control") == Some("on")).then(ClipboardHub::default),
+        // A security context the replay commits goes nowhere.
+        sandbox_listeners: (trace.fact("security-context") == Some("on"))
+            .then(|| crate::handler::security_context::SandboxListeners::new().0),
+        sandboxed: trace.fact("sandboxed") == Some("yes"),
         ..ConnectionFacts::for_test()
     };
     let ctx = Context::new(Rc::new(settings), facts);

@@ -108,4 +108,5 @@ object_data! {
     DataControlDevice(crate::handler::data_control::Device) for ExtDataControlDeviceV1,
     DataControlOffer(crate::handler::data_control::Offer) for ExtDataControlOfferV1,
     HostOfferTypes(crate::handler::data_control::OfferTypes) for WlDataOffer,
+    SecurityContext(crate::handler::security_context::SecurityContext) for WpSecurityContextV1,
 }

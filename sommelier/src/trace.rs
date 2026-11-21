@@ -130,8 +130,13 @@ pub(crate) struct Facts {
     accelerators: bool,
     vm_id: String,
     /// Whether the guest is offered data-control, stated only when it is,
-    /// so a trace recorded before the fact existed states it as it was.
+    /// so a trace recorded before the fact existed states it as it was;
+    /// and so for the two below.
     data_control: bool,
+    /// Whether the guest is offered `wp_security_context_manager_v1`.
+    security_context: bool,
+    /// Whether the connection came through a security context.
+    sandboxed: bool,
 }
 
 impl Facts {
@@ -151,6 +156,8 @@ impl Facts {
             accelerators: settings.host_accelerators != Default::default(),
             vm_id: settings.vm_id.clone(),
             data_control: ctx.data_control.is_on(),
+            security_context: ctx.sandboxing.offers_manager(),
+            sandboxed: ctx.sandboxing.is_sandboxed(),
         }
     }
 }
@@ -172,6 +179,12 @@ impl fmt::Display for Facts {
         )?;
         if self.data_control {
             write!(f, " data-control=on")?;
+        }
+        if self.security_context {
+            write!(f, " security-context=on")?;
+        }
+        if self.sandboxed {
+            write!(f, " sandboxed=yes")?;
         }
         Ok(())
     }
