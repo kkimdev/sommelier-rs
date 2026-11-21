@@ -492,6 +492,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
         serial: u32,
         surface: EventObject,
     ) -> Action {
+        ctx.data_control.focus_left();
         // The dispatcher resolved `surface` to a live guest surface, as for
         // `enter`.
         let host_keyboard_id = sender.host;

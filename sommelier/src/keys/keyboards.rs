@@ -77,11 +77,6 @@ impl Keyboards {
         self.0.get(&host)
     }
 
-    /// Whether the connection has no host keyboard.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     pub(super) fn get_mut(&mut self, host: HostId) -> Option<&mut Keyboard> {
         self.0.get_mut(&host)
     }

@@ -715,15 +715,18 @@ The proxy serves every Linux GUI app, so no single client may end it.
   `a_selection_ends_with_either_connection`.
 - **A data-control device reads the clipboard only while a focused
   connection vouches for it.** Exo tells only the focused client the
-  clipboard, and an offer of it reads each type once and keeps it. So
-  with `--data-control` a device is told the clipboard that the
-  connection whose keyboard has the focus learned, and reads it through
-  that connection's own host offer and bounded pumps; once that
-  connection loses the focus, or its guest the offer, every device is
-  told the clipboard is empty, and an offer of it reads nothing, rather
-  than paste what the clipboard may no longer hold.
+  clipboard, with a new offer each focus, and an offer reads each type
+  once and keeps it. So with `--data-control` a device is told the
+  clipboard that the connection whose keyboard has the focus learned
+  since the focus came, and reads it through that connection's own host
+  offer and bounded pumps; once that connection loses the focus, or its
+  guest the offer, or another connection takes the focus without telling
+  one, every device is told the clipboard is empty, and an offer of it,
+  or a read already on its way, reads nothing, rather than paste what the
+  clipboard may no longer hold.
   Tests: `a_data_control_device_reads_the_focused_connections_clipboard`,
-  `the_clipboard_reads_empty_once_its_connection_cannot_vouch_for_it`.
+  `the_clipboard_reads_empty_once_its_connection_cannot_vouch_for_it`,
+  `a_focus_taken_without_a_clipboard_empties_it`.
 - **The socket belongs to the process holding its lock.** Like
   libwayland, the proxy takes `flock(LOCK_EX | LOCK_NB)` on
   `<socket>.lock` for its lifetime and only then removes a stale socket;

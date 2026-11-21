@@ -586,3 +586,43 @@ async fn a_connection_without_a_keyboard_does_not_vouch_for_the_clipboard() {
     assert!(controller.s.deliver().await);
     assert!(controller.s.guest_received().is_empty());
 }
+
+/// A focus that another connection takes without telling a clipboard of
+/// its own, as one without a `wl_data_device` does, empties the clipboard,
+/// even before the connection that told it is left: Exo tells only the
+/// focused client of a change. A read the clipboard's connection had
+/// queued is refused, which closes its descriptor; an offer the client
+/// destroys, which the proxy created, ends without a `delete_id`.
+#[tokio::test]
+async fn a_focus_taken_without_a_clipboard_empties_it() {
+    let hub = ClipboardHub::default();
+    let mut focused = Focused::new(&hub, 7).await;
+    let mut controller = Controller::new(&hub).await;
+    focused.clipboard(HOST_OFFER).await;
+    assert!(controller.s.deliver().await);
+    let offer = announced(controller.s.guest_received(), controller.device);
+    let (read, write) = std::io::pipe().unwrap();
+    let write = OwnedFd::from(write);
+    let identity = fd_identity(write.as_raw_fd());
+    let receive = ext_data_control_offer_v1::req::receive(offer, TEXT[0], write).unwrap();
+    controller.s.guest([receive]).await;
+
+    let mut other = session(&hub);
+    let (_, keyboard) = other.keyboard().await;
+    let surface = other.surface().await;
+    let enter = wl_keyboard::evt::enter(keyboard.host, 8, surface.host, &[]).unwrap();
+    other.host([enter]).await;
+    other.guest_received();
+    assert!(controller.s.deliver().await);
+    assert_eq!(controller.s.guest_received(), empty(controller.device));
+    assert!(focused.s.deliver().await);
+    assert!(focused.s.host_received().is_empty());
+    drop(read);
+    assert!(!any_fd_has_identity(identity), "the queued read is closed");
+
+    controller
+        .s
+        .guest([ext_data_control_offer_v1::req::destroy(offer)])
+        .await;
+    assert!(controller.s.guest_received().is_empty());
+}

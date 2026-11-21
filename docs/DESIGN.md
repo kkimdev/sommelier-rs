@@ -258,8 +258,9 @@ The table's API keeps those entries consistent by construction:
 - **Constructors** create an object with all its facts, under IDs that
   nothing holds: `create_paired` (and `create_bridged`, for a v3 text
   input backed by a v1 host object), `adopt_host_created` for an object a
-  host event created, `create_local`, `create_host_only` and
-  `create_display`.
+  host event created, `create_local` (and `create_local_server_with`, for
+  one the proxy creates in an event, under a server ID, which ends
+  without a `delete_id`), `create_host_only` and `create_display`.
 - **Transitions** are named after what happened and change both sides at
   once: `guest_destroyed`, `guest_destroyed_in_use`,
   `guest_ended_host_kept`, `guest_ended_host_destroyed`,
