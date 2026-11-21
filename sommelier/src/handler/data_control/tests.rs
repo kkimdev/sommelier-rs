@@ -562,3 +562,27 @@ fn empty(device: u32) -> Vec<(u32, AnyEvent)> {
     let selection = ext_data_control_device_v1::Event::Selection { id: 0 };
     vec![(device, selection.into())]
 }
+
+/// A connection without a keyboard does not vouch for the clipboard it
+/// learns: no `leave` would tell it when the focus moved on.
+#[tokio::test]
+async fn a_connection_without_a_keyboard_does_not_vouch_for_the_clipboard() {
+    let hub = ClipboardHub::default();
+    let mut s = session(&hub);
+    let seat = s.bind("wl_seat", wl_seat::VERSION).await;
+    let manager = s
+        .bind("wl_data_device_manager", wl_data_device_manager::VERSION)
+        .await;
+    let id = s.new_id();
+    let device = s
+        .create(wl_data_device_manager::req::get_data_device(
+            manager, id, seat,
+        ))
+        .await;
+    let selection = wl_data_device::evt::selection(device, None);
+    let mut controller = Controller::new(&hub).await;
+    s.host([selection]).await;
+    s.guest_received();
+    assert!(controller.s.deliver().await);
+    assert!(controller.s.guest_received().is_empty());
+}

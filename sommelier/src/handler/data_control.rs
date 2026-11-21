@@ -519,11 +519,16 @@ pub(crate) fn host_offer_type(ctx: &mut Context, sender: EventSender, mime_type:
     }
 }
 
-/// The host told this connection its clipboard: `offer`, or nothing.
+/// The host told this connection its clipboard: `offer`, or nothing. A
+/// connection without a keyboard does not vouch for it: no `leave` would
+/// tell it when the focus, and with it the clipboard's news, moved on.
 pub(crate) fn host_selection(ctx: &mut Context, offer: Option<EventObject>) {
     let Some(port) = &ctx.data_control.port else {
         return;
     };
+    if ctx.keys.keyboards().is_empty() {
+        return;
+    }
     let offer = offer.map(|offer| {
         let types = ctx.shadow_table.data::<OfferTypes>(offer.guest);
         let mime_types = types.map(|t| t.mime_types.clone()).unwrap_or_default();
