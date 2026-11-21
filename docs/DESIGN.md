@@ -598,11 +598,16 @@ settings and resources: `proxy::run` makes one `ClipboardHub`, each
 handles each delivery as a transaction of its own
 (`proxy::dispatch::deliver`).
 
-It is opt-in because it lets any guest client set and read the ChromeOS
-clipboard without the focus, while a guest window has it. Inside the
-Crostini container every client runs as the same user and can already
-read the others' input and memory, so this opens no boundary the guest
-has, but a user who wants the focus to gate the clipboard leaves it off.
+It is opt-in because it lets any client that can reach the socket set
+and read the ChromeOS clipboard without the focus, while a guest window
+has it. Other users cannot reach it: the socket is in the user's
+`XDG_RUNTIME_DIR`, which only the user can enter. A process of the same
+user can already read the others' input and memory, unless a sandbox
+(bubblewrap, Flatpak, landlock) stops it, and a sandbox that leaves the
+socket reachable then lets it read what was copied, such as a password,
+or replace it before it is pasted. The proxy cannot tell such a client
+from another: `wp_security_context_v1`, which a sandbox uses to mark its
+connections, would let it hide the global from them.
 
 ## Keyboard and IME
 
