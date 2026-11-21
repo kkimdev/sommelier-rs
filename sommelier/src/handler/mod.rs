@@ -28,6 +28,7 @@ pub mod output;
 pub mod pointer;
 pub mod registry;
 pub mod seat;
+pub mod security_context;
 pub mod shm;
 #[cfg(test)]
 pub(crate) mod test_support;

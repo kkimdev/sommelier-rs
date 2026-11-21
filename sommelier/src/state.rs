@@ -320,6 +320,9 @@ pub struct Context {
     /// The guest's data-control objects and the selections the connection
     /// carries for them, with data-control on.
     pub(crate) data_control: crate::handler::data_control::DataControl,
+    /// Whether the connection came through a security context, and where
+    /// its own security contexts go.
+    pub(crate) sandboxing: crate::handler::security_context::Sandboxing,
 }
 
 pub(crate) struct LocalBufferCopyResources<'a> {
@@ -819,6 +822,8 @@ impl Context {
             wheel,
             placement,
             clipboard,
+            sandbox_listeners,
+            sandboxed,
         } = facts;
         Self {
             shadow_table: ShadowTable::new(),
@@ -847,7 +852,14 @@ impl Context {
             aura_surfaces: AuraSurfaces::default(),
             xdg_roles: XdgRoles::default(),
             clipboard_pumps: ClipboardPumps::default(),
-            data_control: crate::handler::data_control::DataControl::new(clipboard.as_ref()),
+            data_control: crate::handler::data_control::DataControl::new(
+                clipboard.as_ref(),
+                !sandboxed,
+            ),
+            sandboxing: crate::handler::security_context::Sandboxing::new(
+                sandbox_listeners,
+                sandboxed,
+            ),
         }
     }
 
@@ -954,6 +966,12 @@ pub(crate) struct ConnectionFacts {
     pub(crate) placement: PlacementConfig,
     /// The clipboard state every connection shares, with data-control on.
     pub(crate) clipboard: Option<crate::handler::data_control::ClipboardHub>,
+    /// Where the guest's committed security contexts go, which offers it
+    /// `wp_security_context_manager_v1`.
+    pub(crate) sandbox_listeners: Option<crate::handler::security_context::SandboxListeners>,
+    /// Whether it came through a security context, which keeps from it the
+    /// globals that would widen its sandbox.
+    pub(crate) sandboxed: bool,
 }
 
 #[cfg(test)]
@@ -967,6 +985,8 @@ impl ConnectionFacts {
             wheel: crate::client_kind::WheelClient::No,
             placement: PlacementConfig::for_test(),
             clipboard: None,
+            sandbox_listeners: None,
+            sandboxed: false,
         }
     }
 }

@@ -192,7 +192,8 @@ fn forget_object(
         | ObjectData::GtkSurface(_)
         | ObjectData::DataControlDevice(_)
         | ObjectData::DataControlOffer(_)
-        | ObjectData::HostOfferTypes(_) => {}
+        | ObjectData::HostOfferTypes(_)
+        | ObjectData::SecurityContext(_) => {}
     }
     match (interface, host) {
         (Iface::WlRegistry, Some(host)) => registry::forget_registry(ctx, host),
@@ -266,7 +267,9 @@ fn forget_object(
             | Iface::ExtDataControlManagerV1
             | Iface::ExtDataControlDeviceV1
             | Iface::ExtDataControlSourceV1
-            | Iface::ExtDataControlOfferV1,
+            | Iface::ExtDataControlOfferV1
+            | Iface::WpSecurityContextManagerV1
+            | Iface::WpSecurityContextV1,
             _,
         ) => {}
     }

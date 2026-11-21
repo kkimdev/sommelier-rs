@@ -18,6 +18,7 @@ use crate::allocator::{PendingFence, VirtGpuNode};
 use crate::client_kind;
 use crate::connection::{LastSubmission, OutgoingMessages, WaylandConnection};
 use crate::handler::data_control::{ClipboardHub, Mailbox};
+use crate::handler::security_context::{SandboxListener, SandboxListeners};
 use crate::placement_config::{self, PlacementConfig};
 use crate::settings::{HostTransport, Settings};
 use crate::state::{ConnectionFacts, Context, GuestId, HostId, SessionEnd};
@@ -33,6 +34,7 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::Instant;
 
 mod dispatch;
@@ -644,20 +646,28 @@ struct Shared {
     traces: Option<Traces>,
     /// The clipboard state the connections share, with data-control on.
     clipboard: Option<ClipboardHub>,
+    /// Where a connection hands the guest's committed security contexts,
+    /// whose sockets `serve` accepts sandboxed clients on.
+    sandbox_listeners: SandboxListeners,
 }
 
 impl Shared {
     /// Build what the connections share from `settings`, and start
     /// watching the placement bindings file on the current `LocalSet`.
-    fn new(settings: Settings) -> Self {
+    /// Returns it, and where the guest's committed security contexts
+    /// arrive, which `serve` reads.
+    fn new(settings: Settings) -> (Self, UnboundedReceiver<SandboxListener>) {
         let settings = Rc::new(settings);
-        Self {
+        let (sandbox_listeners, sandboxes) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Self {
             virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
             placement: placement_config::load_and_watch(&settings),
             traces: settings.trace_dir.clone().and_then(Traces::new),
             clipboard: settings.data_control.then(ClipboardHub::default),
+            sandbox_listeners,
             settings,
-        }
+        };
+        (shared, sandboxes)
     }
 }
 
@@ -718,7 +728,10 @@ pub(crate) async fn run(settings: Settings) {
     // this function's future type: callers cannot accidentally move the
     // proxy's client tasks to another executor thread.
     tokio::task::LocalSet::new()
-        .run_until(async move { serve(listener, Shared::new(settings)).await })
+        .run_until(async move {
+            let (shared, sandboxes) = Shared::new(settings);
+            serve(listener, shared, sandboxes).await
+        })
         .await;
 }
 
@@ -758,26 +771,101 @@ fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flo
     Ok(lock)
 }
 
-/// Accept guest clients for the life of the process.
+/// Accept guest clients for the life of the process: on the proxy's
+/// socket, and on each socket a guest's committed security context hands
+/// it (`handler::security_context`), whose clients are sandboxed.
 ///
 /// A failure concerning one client is logged and ends only that client.
 /// Must run inside a `LocalSet`, like the clients it spawns.
-async fn serve(listener: UnixListener, shared: Shared) {
-    // Log a run of failed accepts once, not every retry.
-    let mut accept_failing = false;
+async fn serve(
+    listener: UnixListener,
+    shared: Shared,
+    mut sandboxes: UnboundedReceiver<SandboxListener>,
+) {
+    let shared = Rc::new(shared);
+    let mut accepts = Accepts::default();
     loop {
-        match listener.accept().await {
+        tokio::select! {
+            accepted = listener.accept() => accepts.client(accepted, &shared, false).await,
+            Some(sandbox) = sandboxes.recv() => {
+                tokio::task::spawn_local(serve_sandbox(sandbox, Rc::clone(&shared)));
+            }
+        }
+    }
+}
+
+/// Accept sandboxed clients on `sandbox`'s socket until its close
+/// descriptor hangs up, as `wp_security_context_v1` asks, whether or not
+/// the client that made the context is still connected.
+async fn serve_sandbox(sandbox: SandboxListener, shared: Rc<Shared>) {
+    use std::io::Read;
+    let SandboxListener {
+        listen,
+        close,
+        metadata,
+    } = sandbox;
+    let listener = std::os::unix::net::UnixListener::from(listen);
+    let listener = listener
+        .set_nonblocking(true)
+        .and_then(|()| UnixListener::from_std(listener));
+    let close = AsyncFd::with_interest(std::fs::File::from(close), Interest::READABLE);
+    let (listener, close) = match (listener, close) {
+        (Ok(listener), Ok(close)) => (listener, close),
+        (Err(error), _) | (_, Err(error)) => {
+            log::error!("Ignoring a security context ({metadata:?}): {error}");
+            return;
+        }
+    };
+    log::info!("Accepting sandboxed clients through a security context ({metadata:?})");
+    let mut accepts = Accepts::default();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => accepts.client(accepted, &shared, true).await,
+            ready = close.readable() => {
+                let Ok(mut ready) = ready else { break };
+                let mut buf = [0; 64];
+                // A hangup reads as the end of the stream, or fails; bytes
+                // the engine writes mean nothing.
+                let read = ready.try_io(|close| (&mut close.get_ref()).read(&mut buf));
+                if let Ok(Ok(0) | Err(_)) = read {
+                    break;
+                }
+            }
+        }
+    }
+    log::info!("A security context hung up ({metadata:?}); accepting no more clients through it");
+}
+
+/// The accept loop's handling of one accept: start the client, or log a
+/// run of failed accepts once and back off between them, rather than spin
+/// on the shared thread.
+#[derive(Default)]
+struct Accepts {
+    failing: bool,
+}
+
+impl Accepts {
+    async fn client(
+        &mut self,
+        accepted: io::Result<(UnixStream, tokio::net::unix::SocketAddr)>,
+        shared: &Shared,
+        sandboxed: bool,
+    ) {
+        match accepted {
             Ok((stream, _)) => {
-                if std::mem::take(&mut accept_failing) {
+                if std::mem::take(&mut self.failing) {
                     log::info!("Accepting clients again");
                 }
-                log::info!("New client connected");
-                if let Err(error) = start_client(stream, &shared).await {
+                log::info!(
+                    "New {}client connected",
+                    if sandboxed { "sandboxed " } else { "" }
+                );
+                if let Err(error) = start_client(stream, shared, sandboxed).await {
                     log::error!("Closing the new client: {error}");
                 }
             }
             Err(e) => {
-                if !std::mem::replace(&mut accept_failing, true) {
+                if !std::mem::replace(&mut self.failing, true) {
                     log::error!(
                         "Accept error: {e}; retrying every {ACCEPT_RETRY_DELAY:?} until one succeeds"
                     );
@@ -788,9 +876,10 @@ async fn serve(listener: UnixListener, shared: Shared) {
     }
 }
 
-/// Pair an accepted guest connection with a new host connection and serve
-/// the pair on its own task.
-async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
+/// Pair an accepted guest connection, `sandboxed` if it came through a
+/// security context, with a new host connection and serve the pair on its
+/// own task.
+async fn start_client(stream: UnixStream, shared: &Shared, sandboxed: bool) -> io::Result<()> {
     // The peer's process, as it was when it connected.
     let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
     let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
@@ -804,6 +893,8 @@ async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
             .decide(pid, client_kind::is_wine_process),
         placement: shared.placement.clone(),
         clipboard: shared.clipboard.clone(),
+        sandbox_listeners: Some(shared.sandbox_listeners.clone()),
+        sandboxed,
     };
     let ctx = Context::new(Rc::clone(&shared.settings), facts);
     let trace = shared.traces.as_ref().and_then(|traces| traces.start(&ctx));
@@ -1177,14 +1268,54 @@ mod tests {
         std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
     }
 
-    fn test_shared() -> Shared {
-        Shared {
+    /// What a test's connections share, and where their committed security
+    /// contexts arrive.
+    fn test_shared() -> (Shared, UnboundedReceiver<SandboxListener>) {
+        let (sandbox_listeners, sandboxes) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared {
             settings: Rc::new(Settings::for_test()),
             virtgpu: VirtGpuNode::absent_for_test(),
             placement: PlacementConfig::for_test(),
             traces: None,
             clipboard: None,
-        }
+            sandbox_listeners,
+        };
+        (shared, sandboxes)
+    }
+
+    /// A security context's socket serves the engine's clients, each
+    /// started (and here closed, the test's host being unreachable), until
+    /// its close descriptor hangs up; then the proxy closes the socket.
+    #[tokio::test]
+    async fn a_security_contexts_socket_serves_until_it_hangs_up() {
+        use tokio::io::AsyncReadExt;
+        let dir = crate::test_support::TempDir::new("sandbox-listener");
+        let path = dir.path().join("sandbox");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (close, hang_up) = std::io::pipe().unwrap();
+        let sandbox = SandboxListener {
+            listen: listener.into(),
+            close: close.into(),
+            metadata: Default::default(),
+        };
+        let (shared, _sandboxes) = test_shared();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let served = tokio::task::spawn_local(serve_sandbox(sandbox, Rc::new(shared)));
+                let mut client = UnixStream::connect(&path)
+                    .await
+                    .expect("the socket listens");
+                let mut byte = [0];
+                assert_eq!(
+                    client.read(&mut byte).await.unwrap(),
+                    0,
+                    "the client was accepted"
+                );
+                drop(hang_up);
+                served.await.expect("the accept loop ends");
+                assert!(std::os::unix::net::UnixStream::connect(&path).is_err());
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1206,9 +1337,13 @@ mod tests {
                 .expect("register the socket");
 
         let window = std::time::Duration::from_millis(500);
+        let (shared, sandboxes) = test_shared();
         let cpu_before = thread_cpu_time();
         let served = tokio::task::LocalSet::new()
-            .run_until(tokio::time::timeout(window, serve(listener, test_shared())))
+            .run_until(tokio::time::timeout(
+                window,
+                serve(listener, shared, sandboxes),
+            ))
             .await;
         let cpu = thread_cpu_time() - cpu_before;
 
