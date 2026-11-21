@@ -346,7 +346,7 @@ pub(crate) const fn policy(iface: Iface) -> Policy {
         // Advertised by the proxy for `zaura_shell`.
         Iface::GtkShell1 => Policy::Synthetic,
         // Advertised by the proxy for `zcr_keyboard_extension_v1`, with
-        // `--data-control`.
+        // data-control on.
         Iface::ExtDataControlManagerV1 => Policy::Synthetic,
         // No globals.
         Iface::WlDisplay
@@ -1080,7 +1080,7 @@ fn text_input_extension_global(
 /// A host `zcr_keyboard_extension_v1` global, hidden from the guest and a
 /// candidate for the proxy's own binding.
 ///
-/// With `--data-control`, the guest is offered the proxy's
+/// With data-control on, the guest is offered the proxy's
 /// `ext_data_control_manager_v1` under its name: the manager needs no host
 /// global of its own (`handler::data_control`), and every Exo has this
 /// one, which the guest never sees, so its removal stays paired.

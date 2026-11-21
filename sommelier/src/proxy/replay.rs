@@ -52,7 +52,7 @@ limitations under the License.
 //! - The other facts must be ones a test's proxy can have: no render
 //!   node, placement, accelerators or `--gpu-accel`. A trace of other
 //!   facts is refused, which names them.
-//! - With `--data-control`, the proxy joins a clipboard hub of its own, so
+//! - With data-control on, the proxy joins a clipboard hub of its own, so
 //!   nothing reaches it from another connection: what another connection
 //!   handed the recorded one (`handler::data_control`) is in no trace, and
 //!   its output fails the replay.

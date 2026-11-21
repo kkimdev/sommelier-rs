@@ -642,7 +642,7 @@ struct Shared {
     placement: PlacementConfig,
     /// Where each connection's traffic is recorded, if it is.
     traces: Option<Traces>,
-    /// The clipboard state the connections share, with `--data-control`.
+    /// The clipboard state the connections share, with data-control on.
     clipboard: Option<ClipboardHub>,
 }
 

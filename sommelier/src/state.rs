@@ -318,7 +318,7 @@ pub struct Context {
     /// The connection's clipboard transfers.
     pub(crate) clipboard_pumps: ClipboardPumps,
     /// The guest's data-control objects and the selections the connection
-    /// carries for them, with `--data-control`.
+    /// carries for them, with data-control on.
     pub(crate) data_control: crate::handler::data_control::DataControl,
 }
 
@@ -952,7 +952,7 @@ pub(crate) struct ConnectionFacts {
     pub(crate) wheel: crate::client_kind::WheelClient,
     /// The process's window placement configuration.
     pub(crate) placement: PlacementConfig,
-    /// The clipboard state every connection shares, with `--data-control`.
+    /// The clipboard state every connection shares, with data-control on.
     pub(crate) clipboard: Option<crate::handler::data_control::ClipboardHub>,
 }
 

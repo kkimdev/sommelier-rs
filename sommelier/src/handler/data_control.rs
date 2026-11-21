@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The guest's `ext_data_control_v1`, with `--data-control`: a client sets
+//! The guest's `ext_data_control_v1`, unless `--no-data-control`: a client sets
 //! and reads the ChromeOS clipboard without keyboard focus, as a clipboard
 //! tool (`wl-copy`, `wl-paste`) or a detached copy helper (Orca's
 //! `orca-wayland-clipboard`) does.
@@ -259,7 +259,7 @@ impl HubState {
     }
 }
 
-/// The clipboard state every connection shares, with `--data-control`:
+/// The clipboard state every connection shares, with data-control on:
 /// which connection has the focus, and the route of each publication.
 #[derive(Clone, Default)]
 pub(crate) struct ClipboardHub(Rc<RefCell<HubState>>);
@@ -434,7 +434,7 @@ impl Drop for Port {
 /// One connection's data-control state (`Context::data_control`).
 #[derive(Default)]
 pub(crate) struct DataControl {
-    /// Its membership in the hub; `None` without `--data-control`, which
+    /// Its membership in the hub; `None` with `--no-data-control`, which
     /// leaves the connection's traffic as it is without the protocol.
     port: Option<Port>,
     /// The serial of the latest input event the host sent it, which Exo
@@ -552,7 +552,7 @@ pub(crate) struct Offer {
     selection: SelectionId,
 }
 
-/// The types a host `wl_data_offer` offers, with `--data-control`.
+/// The types a host `wl_data_offer` offers, with data-control on.
 #[derive(Debug, Default)]
 pub(crate) struct OfferTypes {
     mime_types: Vec<String>,

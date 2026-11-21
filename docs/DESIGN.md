@@ -586,7 +586,8 @@ connection ends.
 
 ### Data-control
 
-With `--data-control`, the guest is offered `ext_data_control_v1`, which
+The guest is offered `ext_data_control_v1`, unless `--no-data-control`
+turns it off, which
 `handler/data_control.rs` implements through another connection, the one
 whose keyboard has the focus (INVARIANTS "A data-control selection is set
 by the focused connection, or cancelled" and "A data-control device reads
@@ -598,16 +599,29 @@ settings and resources: `proxy::run` makes one `ClipboardHub`, each
 handles each delivery as a transaction of its own
 (`proxy::dispatch::deliver`).
 
-It is opt-in because it lets any client that can reach the socket set
-and read the ChromeOS clipboard without the focus, while a guest window
-has it. Other users cannot reach it: the socket is in the user's
-`XDG_RUNTIME_DIR`, which only the user can enter. A process of the same
-user can already read the others' input and memory, unless a sandbox
-(bubblewrap, Flatpak, landlock) stops it, and a sandbox that leaves the
-socket reachable then lets it read what was copied, such as a password,
-or replace it before it is pasted. The proxy cannot tell such a client
-from another: `wp_security_context_v1`, which a sandbox uses to mark its
-connections, would let it hide the global from them.
+It lets any client that can reach the socket set and read the ChromeOS
+clipboard without the focus, while a guest window has it, which is why
+it is on by default only after weighing who can reach the socket:
+
+- Other users cannot: the socket is in the user's `XDG_RUNTIME_DIR`,
+  which only the user can enter.
+- A process of the user's that can connect to the user's sockets there
+  can already run anything as the user, outside any sandbox it is in,
+  through the session bus beside it (`systemd-run --user`). So the
+  sandboxes of agent CLIs gain nothing: Claude Code's denies Unix
+  sockets, Codex's denies `connect` while it denies the network, and
+  either, once it allows them, reaches the bus.
+- A sandbox that exposes the Wayland socket alone and filters the bus,
+  as Flatpak does, is the one that data-control would widen. Flatpak
+  marks such connections through `wp_security_context_v1`, which the
+  proxy does not implement yet ([HANDOVER](../HANDOVER.md)).
+- Telling a sandboxed process from `/proc` (`NoNewPrivs`, seccomp,
+  namespaces) is not done: hardened services look sandboxed, snaps and
+  some sandboxes do not, and a connection made outside a sandbox can be
+  handed into it.
+
+`--no-data-control` is for a user who wants the focus to gate the
+clipboard.
 
 ## Keyboard and IME
 

@@ -697,7 +697,7 @@ The proxy serves every Linux GUI app, so no single client may end it.
 - **A data-control selection is set by the focused connection, or
   cancelled.** Exo takes a selection only from the client whose surface
   has the keyboard focus, with a serial it issued recently, and a
-  data-control client never has the focus. So with `--data-control` the
+  data-control client never has the focus. So with data-control on, the
   connection whose keyboard has the focus sets it for the client, with
   the serial of its own latest input event, through its own
   `wl_data_device`; without one, or without a focused connection, the
@@ -716,7 +716,7 @@ The proxy serves every Linux GUI app, so no single client may end it.
 - **A data-control device reads the clipboard only while a focused
   connection vouches for it.** Exo tells only the focused client the
   clipboard, with a new offer each focus, and an offer reads each type
-  once and keeps it. So with `--data-control` a device is told the
+  once and keeps it. So with data-control on, a device is told the
   clipboard that the connection whose keyboard has the focus learned
   since the focus came, and reads it through that connection's own host
   offer and bounded pumps; once that connection loses the focus, or its
