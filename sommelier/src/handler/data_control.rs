@@ -28,7 +28,8 @@ limitations under the License.
 //! - The guest's manager, devices and sources are local objects. A
 //!   device's `set_selection` hands the source's MIME types to the
 //!   [`ClipboardHub`] as a publication, whose carrier is the connection
-//!   whose keyboard has the focus ([`DataControl::end_batch`]).
+//!   whose keyboard the host entered last and has not left
+//!   ([`DataControl::claim_focus`]).
 //! - The carrier creates a host `wl_data_source` the proxy alone uses,
 //!   offers the types, and sets it as the selection of the guest's own
 //!   `wl_data_device` with the serial of its latest input event
@@ -37,8 +38,15 @@ limitations under the License.
 //!   descriptor, a VirtWL pipe the client writes, as the host's `send` of a
 //!   guest `wl_data_source` does; no pump is needed. `cancelled` reaches
 //!   it too, and the carrier destroys its host source.
-//! - A source the client destroys is withdrawn: the carrier destroys its
-//!   host source. ChromeOS keeps what it has read.
+//! - A source the client destroys, or whose client ends, is withdrawn: the
+//!   hub forgets its route. The carrier keeps its host source until the
+//!   host cancels it, since the host may already have sent `send`s, whose
+//!   descriptors only a live object can take, and refuses them, which
+//!   closes the descriptors. ChromeOS keeps what it has read.
+//!
+//! The hub's route is the one record of whether a publication is live: the
+//! carrier keeps which host source carries it, and the owner which guest
+//! source set it, and each asks the hub before it acts on it.
 //!
 //! The hub joins connections on the one thread they share: each connection
 //! has a [`Mailbox`] its `Client` waits on beside its peers, and a
@@ -47,8 +55,8 @@ limitations under the License.
 //! which cancels what it carried and withdraws what it published, so no
 //! route outlives either end.
 //!
-//! Only the regular selection is set, and only text the guest offers: the
-//! devices announce an empty selection and no primary selection, and a
+//! Only the regular selection is set, with every type the source offers:
+//! the devices announce an empty selection and no primary selection, and a
 //! primary selection is cancelled. Reading the clipboard through
 //! data-control is not supported; a focused client reads it through
 //! `wl_data_device`. With no focused connection, or one without a
@@ -89,8 +97,6 @@ pub(crate) enum Delivery {
         publication: Publication,
         mime_types: Vec<String>,
     },
-    /// To the carrier: the owner's source ended.
-    Withdraw { publication: Publication },
     /// To the owner: write the source's data as `mime_type` into `fd`.
     Send {
         publication: Publication,
@@ -101,7 +107,7 @@ pub(crate) enum Delivery {
     Cancelled { publication: Publication },
 }
 
-/// Who publishes and who carries a publication.
+/// Who publishes and who carries a live publication.
 struct Route {
     owner: ConnectionId,
     carrier: ConnectionId,
@@ -140,7 +146,8 @@ struct HubState {
     next_connection: u64,
     next_publication: u64,
     mailboxes: BTreeMap<ConnectionId, Rc<Mailbox>>,
-    /// The connection whose keyboard has the focus, as it last said.
+    /// The connection whose keyboard the host entered last, until it has
+    /// no focus at the end of a batch.
     focused: Option<ConnectionId>,
     routes: BTreeMap<Publication, Route>,
 }
@@ -184,11 +191,13 @@ struct Port {
 }
 
 impl Port {
-    fn set_focused(&self, focused: bool) {
+    fn claim_focus(&self) {
+        self.hub.0.borrow_mut().focused = Some(self.id);
+    }
+
+    fn release_focus(&self) {
         let mut state = self.hub.0.borrow_mut();
-        if focused {
-            state.focused = Some(self.id);
-        } else if state.focused == Some(self.id) {
+        if state.focused == Some(self.id) {
             state.focused = None;
         }
     }
@@ -217,13 +226,17 @@ impl Port {
 
     /// The owner's source of `publication` ended.
     fn withdraw(&self, publication: Publication) {
-        let mut state = self.hub.0.borrow_mut();
-        if let Some(route) = state.routes.remove(&publication) {
-            state.post(route.carrier, Delivery::Withdraw { publication });
-        }
+        self.hub.0.borrow_mut().routes.remove(&publication);
     }
 
-    /// The host asks the owner of `publication` for its data.
+    /// Whether `publication` is still routed: neither withdrawn nor
+    /// cancelled.
+    fn is_routed(&self, publication: Publication) -> bool {
+        self.hub.0.borrow().routes.contains_key(&publication)
+    }
+
+    /// The host asks the owner of `publication` for its data; a withdrawn
+    /// one drops `fd`, which closes it.
     fn send(&self, publication: Publication, mime_type: String, fd: OwnedFd) {
         let state = self.hub.0.borrow();
         if let Some(route) = state.routes.get(&publication) {
@@ -263,9 +276,7 @@ impl Drop for Port {
             .collect();
         for publication in ended {
             let route = state.routes.remove(&publication).expect("a route");
-            if route.owner == id {
-                state.post(route.carrier, Delivery::Withdraw { publication });
-            } else {
+            if route.owner != id {
                 state.post(route.owner, Delivery::Cancelled { publication });
             }
         }
@@ -278,14 +289,12 @@ pub(crate) struct DataControl {
     /// Its membership in the hub; `None` without `--data-control`, which
     /// leaves the connection's traffic as it is without the protocol.
     port: Option<Port>,
-    /// Whether its keyboard had the focus at the end of the last batch.
-    focused: bool,
     /// The serial of the latest input event the host sent it, which Exo
     /// accepts in a `set_selection`: it checks only that the serial is
     /// among the last it issued.
     latest_serial: Option<u32>,
-    /// The host source the proxy created for each publication it carries,
-    /// a host-only `wl_data_source`.
+    /// The publication each host-only `wl_data_source` the proxy created
+    /// carries, until the host cancels it; one the owner withdrew too.
     carried: BTreeMap<HostId, Publication>,
 }
 
@@ -313,12 +322,20 @@ impl DataControl {
         self.latest_serial = Some(serial);
     }
 
-    /// A batch ended with the connection's keyboard `focused` or not.
-    pub(crate) fn end_batch(&mut self, focused: bool) {
+    /// The host entered one of the connection's keyboards, so it carries
+    /// the next selection. Every enter claims it, so a leave and an enter in
+    /// one batch still take it back from a connection entered in between.
+    pub(crate) fn claim_focus(&mut self) {
         if let Some(port) = &self.port {
-            if std::mem::replace(&mut self.focused, focused) != focused {
-                port.set_focused(focused);
-            }
+            port.claim_focus();
+        }
+    }
+
+    /// A batch ended with the connection's keyboard `focused` or not; one
+    /// without the focus carries no selection.
+    pub(crate) fn end_batch(&mut self, focused: bool) {
+        if let (Some(port), false) = (&self.port, focused) {
+            port.release_focus();
         }
     }
 
@@ -353,16 +370,6 @@ pub(crate) fn deliver(ctx: &mut Context, delivery: Delivery) {
             publication,
             mime_types,
         } => carry(ctx, publication, &mime_types),
-        Delivery::Withdraw { publication } => {
-            let host = ctx
-                .data_control
-                .carried
-                .iter()
-                .find_map(|(&host, &carried)| (carried == publication).then_some(host));
-            if let Some(host) = host {
-                destroy_carrier(ctx, host);
-            }
-        }
         Delivery::Send {
             publication,
             mime_type,
@@ -395,7 +402,15 @@ fn published_source(ctx: &Context, publication: Publication) -> Option<GuestId> 
 
 /// Set `publication`, of `mime_types`, as the host selection through this
 /// connection's own `wl_data_device`, or cancel it if the connection cannot.
+/// One its owner withdrew before it arrived is not set: Exo would read it
+/// at once, from a source that is gone, and empty the clipboard.
 fn carry(ctx: &mut Context, publication: Publication, mime_types: &[String]) {
+    let Some(port) = &ctx.data_control.port else {
+        return;
+    };
+    if !port.is_routed(publication) {
+        return;
+    }
     let device = ctx.shadow_table.live_hosts_of(Iface::WlDataDevice).next();
     let manager = ctx
         .shadow_table
@@ -434,15 +449,9 @@ fn carry(ctx: &mut Context, publication: Publication, mime_types: &[String]) {
     ctx.data_control.carried.insert(source, publication);
 }
 
-/// Destroy carried host source `host`.
-fn destroy_carrier(ctx: &mut Context, host: HostId) {
-    ctx.data_control.carried.remove(&host);
-    ctx.send_host(wl_data_source::req::destroy(host));
-    ctx.retire_destroyed_host_object(host);
-}
-
 /// The host's `wl_data_source.send` to `sender`: one the connection carries
-/// goes to its owner, with the host's descriptor; any other is forwarded.
+/// goes to its owner, with the host's descriptor, unless it was withdrawn;
+/// any other is forwarded.
 pub(crate) fn host_send(
     ctx: &mut Context,
     sender: EventSender,
@@ -474,7 +483,9 @@ pub(crate) fn host_cancelled(ctx: &mut Context, sender: EventSender) -> Action {
     if let Some(port) = &ctx.data_control.port {
         port.cancelled(publication);
     }
-    destroy_carrier(ctx, sender.host);
+    ctx.data_control.carried.remove(&sender.host);
+    ctx.send_host(wl_data_source::req::destroy(sender.host));
+    ctx.retire_destroyed_host_object(sender.host);
     Action::Drop
 }
 

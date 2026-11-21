@@ -7,13 +7,14 @@ use crate::protocols::ext_data_control_v1::{
 };
 use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
 use crate::protocols::wayland::{
-    wl_data_device, wl_data_device_manager, wl_data_source, wl_keyboard, wl_seat,
+    wl_data_device, wl_data_device_manager, wl_data_source, wl_display, wl_keyboard, wl_seat,
 };
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
 use crate::settings::Settings;
 use crate::state::{ConnectionFacts, Context};
 use crate::test_support::{any_fd_has_identity, fd_identity};
+use crate::wire::WL_DISPLAY_ID;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 
@@ -37,6 +38,7 @@ fn session(hub: &ClipboardHub) -> Session {
 struct Focused {
     s: Session,
     keyboard: Object,
+    surface: Object,
     manager: Object,
     device: Object,
 }
@@ -61,6 +63,7 @@ impl Focused {
         Self {
             s,
             keyboard,
+            surface,
             manager,
             device: Object { id, host },
         }
@@ -218,9 +221,11 @@ async fn without_a_focused_connection_a_data_control_selection_is_cancelled() {
     assert!(controller.s.host_received().is_empty());
 }
 
-/// A source ends with its client: the focused connection destroys the
-/// source it carries, and ChromeOS keeps what it read. A focused
-/// connection that ends cancels what it carried.
+/// A source ends with its client: what the host still asks of it is
+/// refused, its descriptor closed, and the focused connection keeps its
+/// own source, so the host's late events have an object to reach, until
+/// the host cancels it. A focused connection that ends cancels what it
+/// carried.
 #[tokio::test]
 async fn a_selection_ends_with_either_connection() {
     let hub = ClipboardHub::default();
@@ -231,6 +236,22 @@ async fn a_selection_ends_with_either_connection() {
     let host_source = focused.selection_set(3);
     drop(controller);
     assert!(focused.s.deliver().await);
+    assert!(focused.s.host_received().is_empty());
+
+    let (read, write) = std::io::pipe().unwrap();
+    let write = OwnedFd::from(write);
+    let identity = fd_identity(write.as_raw_fd());
+    let send = wl_data_source::evt::send(host_source, TEXT[0], write).unwrap();
+    focused.s.host([send]).await;
+    drop(read);
+    assert!(
+        !any_fd_has_identity(identity),
+        "the refused descriptor is closed"
+    );
+    focused
+        .s
+        .host([wl_data_source::evt::cancelled(host_source)])
+        .await;
     assert_eq!(
         focused.s.host_received(),
         [(host_source, wl_data_source::Request::Destroy {}.into())]
@@ -340,4 +361,50 @@ async fn a_running_client_carries_a_selection_as_it_is_set() {
         .await;
     assert!(controller.s.deliver().await);
     assert_eq!(controller.s.guest_received(), cancelled(source));
+}
+
+/// A source its client destroys before the focused connection sets it is
+/// never set: Exo would read it at once, from a source that is gone, and
+/// empty the ChromeOS clipboard.
+#[tokio::test]
+async fn a_source_withdrawn_before_it_is_carried_is_never_set() {
+    let hub = ClipboardHub::default();
+    let mut focused = Focused::new(&hub, 7).await;
+    let mut controller = Controller::new(&hub).await;
+    let source = controller.copy().await;
+    controller
+        .s
+        .guest([ext_data_control_source_v1::req::destroy(source)])
+        .await;
+    let deleted = wl_display::Event::DeleteId { id: source };
+    assert_eq!(
+        controller.s.guest_received(),
+        [(WL_DISPLAY_ID, deleted.into())]
+    );
+    assert!(focused.s.deliver().await);
+    assert!(focused.s.host_received().is_empty());
+}
+
+/// Each enter of a connection's keyboard makes it the carrier, so a focus
+/// that leaves and comes back within one batch, after another connection
+/// was entered, is still the carrier once that other one is left.
+#[tokio::test]
+async fn a_focus_regained_within_one_batch_carries_the_selection() {
+    let hub = ClipboardHub::default();
+    let mut first = Focused::new(&hub, 1).await;
+    let mut second = Focused::new(&hub, 2).await;
+    let (keyboard, surface) = (first.keyboard.host, first.surface.host);
+    let leave = wl_keyboard::evt::leave(keyboard, 3, surface);
+    let enter = wl_keyboard::evt::enter(keyboard, 4, surface, &[]).unwrap();
+    first.s.host([leave, enter]).await;
+    first.s.guest_received();
+    let leave = wl_keyboard::evt::leave(second.keyboard.host, 5, second.surface.host);
+    second.s.host([leave]).await;
+    second.s.guest_received();
+
+    let mut controller = Controller::new(&hub).await;
+    controller.copy().await;
+    assert!(first.s.deliver().await);
+    first.selection_set(4);
+    assert!(controller.s.guest_received().is_empty());
 }

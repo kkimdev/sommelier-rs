@@ -519,8 +519,8 @@ impl Context {
         // refreshes within a batch, and the next batch may publish a newer
         // table after more capabilities have arrived.
         self.dmabuf.end_batch();
-        // The hub learns which connection has the focus as of the last
-        // batch, before it routes a selection there.
+        // A connection whose keyboard has no focus after the batch carries
+        // no selection.
         self.data_control.end_batch(self.keys.focus().has_focus());
     }
 

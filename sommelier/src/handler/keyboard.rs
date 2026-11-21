@@ -396,6 +396,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
         keys: &[u8],
     ) -> Action {
         ctx.data_control.note_serial(serial);
+        ctx.data_control.claim_focus();
         // The generated dispatcher resolved `surface` to a live guest
         // surface (`ShadowTable::event_object`): an enter of a surface the
         // guest destroyed, whose host ID stays mapped until the host's
