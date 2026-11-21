@@ -704,8 +704,12 @@ The proxy serves every Linux GUI app, so no single client may end it.
   source is cancelled at once rather than left waiting. The host reads
   the data through its own descriptor, which the client gets, so no
   transfer waits on the proxy. A selection ends with either connection:
-  the focused one destroys its source when the client's ends, and the
-  client's source is cancelled when the focused one ends.
+  once the client's source ends, what the host asks of it is refused,
+  which closes the host's descriptor, and the focused connection keeps
+  its own source, which the host's late events still reach, until the
+  host cancels it; once the focused connection ends, the client's source
+  is cancelled. The hub's route is the one record of whether a selection
+  is live.
   Tests: `a_data_control_selection_reaches_the_host_through_the_focused_connection`,
   `without_a_focused_connection_a_data_control_selection_is_cancelled`,
   `a_selection_ends_with_either_connection`.

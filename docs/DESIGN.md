@@ -596,11 +596,15 @@ settings and resources: `proxy::run` makes one `ClipboardHub`, each
 handles each delivery as a transaction of its own
 (`proxy::dispatch::deliver`).
 
-It is opt-in because any guest client can then set the ChromeOS clipboard
-without the focus. Inside the Crostini container every client runs as
-the same user and can already read the others' input and memory, so this
-opens no boundary the guest has; a user who wants the focus to gate the
-clipboard leaves it off.
+It is opt-in because it changes every client's globals while it carries
+only half the protocol: a client that reads the clipboard through
+data-control, as `wl-paste` does when the global exists, always finds it
+empty, where it would otherwise fall back to `wl_data_device`. Carrying
+the host's selection to data-control devices would lift that. It also
+lets any guest client set the ChromeOS clipboard without the focus;
+inside the Crostini container every client runs as the same user and can
+already read the others' input and memory, so this opens no boundary the
+guest has.
 
 ## Keyboard and IME
 
