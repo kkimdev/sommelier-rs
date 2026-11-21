@@ -34,6 +34,8 @@ has confirmed, then latent faults never seen, then test and code debt.
    - Data-control reading an image: text was confirmed on a host both
      ways (`wl-copy`, Orca's `orca-wayland-clipboard`, `wl-paste`), and
      that a ChromeOS window's focus empties what it reads.
+   - A Flatpak app through `wp_security_context_v1`: Flatpak is not
+     installed on the machine the proxy was checked on.
    - Clipboard transfers since the pumps stopped blocking: they rely on a
      VirtWL pipe supporting `poll` and returning `EAGAIN` under
      `O_NONBLOCK`, which ChromiumOS `virtio_wl.c` does.
@@ -61,13 +63,7 @@ has confirmed, then latent faults never seen, then test and code debt.
      Chromium behaviour, not an API, so recheck the
      [manual test plan](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#manual-test-plan)
      after a ChromeOS update.
-4. **Data-control and Flatpak.** A Flatpak app reaches the Wayland
-   socket while its bus is filtered, so data-control lets it read and
-   replace the clipboard, which its sandbox would otherwise prevent.
-   Implementing `wp_security_context_v1`, which Flatpak 1.15.6 and later
-   uses to mark its connections, and hiding data-control from them would
-   close that ([data-control](docs/DESIGN.md#data-control)).
-5. **Latent faults, never seen:**
+4. **Latent faults, never seen:**
    - The proxy forwards a `wl_keyboard.key` to the guest after the
      focused surface was destroyed and before the host's `leave`, so a
      key can reach a surface the guest already ended.
@@ -100,11 +96,11 @@ has confirmed, then latent faults never seen, then test and code debt.
    - Known limits stated with their rules:
      [a late owed buffer release](docs/INVARIANTS.md#surfaces-damage-and-shm)
      and [UTF-8 replacement growth](docs/INVARIANTS.md#wire-messages).
-6. **Test debt.** The host display the DST and the fuzzer share
+5. **Test debt.** The host display the DST and the fuzzer share
    (`sim::display`) does not answer the destroy of a
    `zcr_extended_keyboard_v1` with its `delete_id` in the DST
    (`Display::unanswered`), and its pointers send no `wl_pointer.frame`:
    either would shift every DST schedule, so the shrunk regressions in
    `sim/regressions.rs` would need deriving again.
-7. **Optional code debt.** Move the SHM copy and dma-buf fence code out
+6. **Optional code debt.** Move the SHM copy and dma-buf fence code out
    of `handler/compositor.rs` into the modules that own them.

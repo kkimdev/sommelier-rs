@@ -51,7 +51,9 @@ handler intercepts the ones whose meaning changes across the boundary.
   setting of it changes later.
 - `proxy::run` claims the socket through its lock file, then `serve`
   accepts guest clients and gives each a `Client` with its own guest
-  connection, host connection and `Context`. All clients run on one
+  connection, host connection and `Context`; it also accepts, on the
+  socket of each security context a guest commits, that sandbox's
+  clients, marked sandboxed (`handler::security_context`). All clients run on one
   current-thread Tokio runtime inside a `LocalSet`. Each `Context` holds
   xkb state, which is `!Send`; keeping every task on one thread avoids
   locks and makes that requirement part of the future's type. One thread
@@ -333,6 +335,7 @@ object's table entry instead ([Object ends](#object-ends)).
 | Dma-buf | `linux_dmabuf.rs` | `linux_dmabuf::Dmabuf` (capabilities), each params, factory and feedback object's entry, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (pointer focus); `sommelier/src/keys` (the keyboard core: the keyboard focus, one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`), `data_control.rs` (the guest's `ext_data_control_v1`) | `ClipboardPumps` in `state.rs`; `data_control::DataControl`, and the `ClipboardHub` every connection shares |
+| Sandboxed clients | `security_context.rs` (the guest's `wp_security_context_v1`) | `security_context::Sandboxing`; each context's entry; the accept loop of each committed context (`proxy::serve_sandbox`) |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs`, each GTK shell and surface's entry |
 | Window placement | `window_placement.rs` | `window_placement.rs` |
@@ -613,8 +616,12 @@ it is on by default only after weighing who can reach the socket:
   either, once it allows them, reaches the bus.
 - A sandbox that exposes the Wayland socket alone and filters the bus,
   as Flatpak does, is the one that data-control would widen. Flatpak
-  marks such connections through `wp_security_context_v1`, which the
-  proxy does not implement yet ([HANDOVER](../HANDOVER.md)).
+  1.15.6 and later hands its sandboxed clients' socket to the compositor
+  through `wp_security_context_v1`, which `handler/security_context.rs`
+  implements: the proxy accepts those clients itself, marked sandboxed
+  (`ConnectionFacts::sandboxed`), and offers them no data-control
+  (INVARIANTS "A connection through a security context is offered no
+  global that widens its sandbox").
 - Telling a sandboxed process from `/proc` (`NoNewPrivs`, seccomp,
   namespaces) is not done: hardened services look sandboxed, snaps and
   some sandboxes do not, and a connection made outside a sandbox can be
