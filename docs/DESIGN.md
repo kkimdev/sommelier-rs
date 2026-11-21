@@ -588,23 +588,20 @@ connection ends.
 With `--data-control`, the guest is offered `ext_data_control_v1`, which
 `handler/data_control.rs` implements through another connection, the one
 whose keyboard has the focus (INVARIANTS "A data-control selection is set
-by the focused connection, or cancelled"); its module docs own the
-mechanism. It is the one state connections share beyond `Shared`'s
+by the focused connection, or cancelled" and "A data-control device reads
+the clipboard only while a focused connection vouches for it"); its
+module docs own the mechanism. It is the one state connections share beyond `Shared`'s
 settings and resources: `proxy::run` makes one `ClipboardHub`, each
 `Context` joins it as it is built and leaves it as it drops, and
 `Client::run` waits on the connection's `Mailbox` beside its peers and
 handles each delivery as a transaction of its own
 (`proxy::dispatch::deliver`).
 
-It is opt-in because it changes every client's globals while it carries
-only half the protocol: a client that reads the clipboard through
-data-control, as `wl-paste` does when the global exists, always finds it
-empty, where it would otherwise fall back to `wl_data_device`. Carrying
-the host's selection to data-control devices would lift that. It also
-lets any guest client set the ChromeOS clipboard without the focus;
-inside the Crostini container every client runs as the same user and can
-already read the others' input and memory, so this opens no boundary the
-guest has.
+It is opt-in because it lets any guest client set and read the ChromeOS
+clipboard without the focus, while a guest window has it. Inside the
+Crostini container every client runs as the same user and can already
+read the others' input and memory, so this opens no boundary the guest
+has, but a user who wants the focus to gate the clipboard leaves it off.
 
 ## Keyboard and IME
 

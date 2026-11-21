@@ -34,7 +34,8 @@ has confirmed, then latent faults never seen, then test and code debt.
    - Data-control (`--data-control`): a copy button in Orca, whose
      `orca-wayland-clipboard` helper sets the selection through
      `ext_data_control_v1`, reaches the ChromeOS clipboard while Orca
-     has the focus.
+     has the focus; `wl-paste` in Orca's terminal reads what ChromeOS
+     holds, text and an image.
    - Clipboard transfers since the pumps stopped blocking: they rely on a
      VirtWL pipe supporting `poll` and returning `EAGAIN` under
      `O_NONBLOCK`, which ChromiumOS `virtio_wl.c` does.
