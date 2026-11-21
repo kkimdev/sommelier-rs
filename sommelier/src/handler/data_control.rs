@@ -15,15 +15,18 @@ limitations under the License.
 */
 
 //! The guest's `ext_data_control_v1`, with `--data-control`: a client sets
-//! the ChromeOS clipboard without keyboard focus, as a clipboard tool or
-//! a detached copy helper does (Orca's `orca-wayland-clipboard`).
+//! and reads the ChromeOS clipboard without keyboard focus, as a clipboard
+//! tool (`wl-copy`, `wl-paste`) or a detached copy helper (Orca's
+//! `orca-wayland-clipboard`) does.
 //!
-//! Exo has no data-control protocol, and it takes a selection only from
-//! the client whose surface has the keyboard focus (`Seat::SetSelection`
-//! cancels any other source), quoting a serial it issued recently. A
-//! data-control client never has focus, and each guest client has a host
-//! connection of its own, so the proxy sets the selection on another
-//! connection's behalf:
+//! Exo has no data-control protocol. It takes a selection only from the
+//! client whose surface has the keyboard focus (`Seat::SetSelection`
+//! cancels any other source), quoting a serial it issued recently, and
+//! tells only that client the clipboard. A data-control client never has
+//! focus, and each guest client has a host connection of its own, so the
+//! proxy uses the focused connection on the client's behalf.
+//!
+//! Setting the clipboard:
 //!
 //! - The guest's manager, devices and sources are local objects. A
 //!   device's `set_selection` hands the source's MIME types to the
@@ -48,6 +51,22 @@ limitations under the License.
 //! carrier keeps which host source carries it, and the owner which guest
 //! source set it, and each asks the hub before it acts on it.
 //!
+//! Reading the clipboard:
+//!
+//! - A connection's `wl_data_device` learns the clipboard from the host's
+//!   `selection`, with the types its offer announced ([`OfferTypes`]), and
+//!   tells the hub, which tells every data-control device: a new local
+//!   offer of those types, or none ([`Announcement`]).
+//! - A device's offer reads through the connection that learned the
+//!   clipboard: it has its host offer write into the client's descriptor,
+//!   through a VirtWL pipe and one of its bounded pumps
+//!   (`handler::data_device::receive`), as for its own guest.
+//! - The clipboard is known only while that connection keeps the focus,
+//!   and its guest the offer: once either ends, every device is told the
+//!   clipboard is empty. Exo tells no unfocused client of a change, and
+//!   its offer reads each type once and keeps it, so an older offer could
+//!   paste what the clipboard no longer holds; empty is never wrong.
+//!
 //! The hub joins connections on the one thread they share: each connection
 //! has a [`Mailbox`] its `Client` waits on beside its peers, and a
 //! [`Delivery`] is handled there like a message, with effects of its own
@@ -55,12 +74,10 @@ limitations under the License.
 //! which cancels what it carried and withdraws what it published, so no
 //! route outlives either end.
 //!
-//! Only the regular selection is set, with every type the source offers:
-//! the devices announce an empty selection and no primary selection, and a
-//! primary selection is cancelled. Reading the clipboard through
-//! data-control is not supported; a focused client reads it through
-//! `wl_data_device`. With no focused connection, or one without a
-//! `wl_data_device` or an input serial, the source is cancelled, which a
+//! Only the regular selection is carried, with every type offered: the
+//! devices announce no primary selection, and a primary selection set is
+//! cancelled. With no focused connection, or one without a
+//! `wl_data_device` or an input serial, a source is cancelled, which a
 //! client takes as another client's later copy.
 
 use crate::handler::Handlers;
@@ -70,7 +87,9 @@ use crate::protocols::ext_data_control_v1::{
 };
 use crate::protocols::wayland::{wl_data_device, wl_data_device_manager, wl_data_source};
 use crate::protocols::Iface;
-use crate::state::{Context, EventSender, GuestId, HostId, RequestObject, RequestSender};
+use crate::state::{
+    Context, EventObject, EventSender, GuestId, HostId, RequestObject, RequestSender,
+};
 use crate::wire::Action;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -105,6 +124,36 @@ pub(crate) enum Delivery {
     },
     /// To the owner: the host no longer uses the source.
     Cancelled { publication: Publication },
+    /// To every connection: the host's clipboard changed.
+    Selection { selection: Option<Announcement> },
+    /// To the carrier of the host's clipboard: have its host offer `offer`
+    /// write as `mime_type` into `fd`.
+    Receive {
+        offer: HostId,
+        mime_type: String,
+        fd: OwnedFd,
+    },
+}
+
+/// One state of the host's clipboard, which the connection whose keyboard
+/// had the focus learned from its own `wl_data_device`. Never reused, so
+/// an offer of an earlier one reads nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectionId(u64);
+
+/// The host's clipboard as the guest's data-control devices see it.
+#[derive(Clone, Debug)]
+pub(crate) struct Announcement {
+    id: SelectionId,
+    mime_types: Vec<String>,
+}
+
+/// The host's clipboard, and where to read it.
+struct HostSelection {
+    announcement: Announcement,
+    /// The connection whose host offer it is, and that offer.
+    carrier: ConnectionId,
+    offer: HostId,
 }
 
 /// Who publishes and who carries a live publication.
@@ -145,11 +194,17 @@ impl Mailbox {
 struct HubState {
     next_connection: u64,
     next_publication: u64,
+    next_selection: u64,
     mailboxes: BTreeMap<ConnectionId, Rc<Mailbox>>,
     /// The connection whose keyboard the host entered last, until it has
     /// no focus at the end of a batch.
     focused: Option<ConnectionId>,
     routes: BTreeMap<Publication, Route>,
+    /// The host's clipboard while the connection that learned it keeps the
+    /// focus: Exo tells only the focused client of a change, and its offer
+    /// reads each type once and keeps it, so one older than the focus could
+    /// paste what the clipboard no longer holds.
+    selection: Option<HostSelection>,
 }
 
 impl HubState {
@@ -158,6 +213,27 @@ impl HubState {
     fn post(&self, to: ConnectionId, delivery: Delivery) {
         if let Some(mailbox) = self.mailboxes.get(&to) {
             mailbox.post(delivery);
+        }
+    }
+
+    /// Tell every connection the host's clipboard as it now is.
+    fn announce(&self) {
+        let announcement = self.selection.as_ref().map(|s| &s.announcement);
+        for mailbox in self.mailboxes.values() {
+            let selection = announcement.cloned();
+            mailbox.post(Delivery::Selection { selection });
+        }
+    }
+
+    /// Forget the host's clipboard if `carrier` learned it, and its offer
+    /// is `offer` when given, and tell every connection.
+    fn end_selection(&mut self, carrier: ConnectionId, offer: Option<HostId>) {
+        let ends = self.selection.as_ref().is_some_and(|selection| {
+            selection.carrier == carrier && offer.is_none_or(|offer| selection.offer == offer)
+        });
+        if ends {
+            self.selection = None;
+            self.announce();
         }
     }
 }
@@ -195,10 +271,54 @@ impl Port {
         self.hub.0.borrow_mut().focused = Some(self.id);
     }
 
+    /// The connection has no focus: it neither carries the next selection
+    /// nor vouches for the host's clipboard any longer.
     fn release_focus(&self) {
         let mut state = self.hub.0.borrow_mut();
         if state.focused == Some(self.id) {
             state.focused = None;
+            state.end_selection(self.id, None);
+        }
+    }
+
+    /// The host told this connection its clipboard: host offer `offer`, of
+    /// `mime_types`, or nothing.
+    fn set_selection(&self, offer: Option<(HostId, Vec<String>)>) {
+        let mut state = self.hub.0.borrow_mut();
+        let id = SelectionId(state.next_selection);
+        state.next_selection += 1;
+        state.selection = offer.map(|(offer, mime_types)| HostSelection {
+            announcement: Announcement { id, mime_types },
+            carrier: self.id,
+            offer,
+        });
+        state.announce();
+    }
+
+    /// This connection's host offer `offer` ended.
+    fn offer_ended(&self, offer: HostId) {
+        self.hub.0.borrow_mut().end_selection(self.id, Some(offer));
+    }
+
+    /// The host's clipboard, as a new device is told it.
+    fn selection(&self) -> Option<Announcement> {
+        let state = self.hub.0.borrow();
+        state.selection.as_ref().map(|s| s.announcement.clone())
+    }
+
+    /// Read selection `id` as `mime_type` into `fd`, through its carrier;
+    /// one the clipboard no longer holds drops `fd`, which closes it.
+    fn receive(&self, id: SelectionId, mime_type: String, fd: OwnedFd) {
+        let state = self.hub.0.borrow();
+        if let Some(selection) = &state.selection {
+            if selection.announcement.id == id {
+                let receive = Delivery::Receive {
+                    offer: selection.offer,
+                    mime_type,
+                    fd,
+                };
+                state.post(selection.carrier, receive);
+            }
         }
     }
 
@@ -267,6 +387,7 @@ impl Drop for Port {
         if state.focused == Some(self.id) {
             state.focused = None;
         }
+        state.end_selection(self.id, None);
         let id = self.id;
         let ended: Vec<_> = state
             .routes
@@ -344,6 +465,16 @@ impl DataControl {
     pub(crate) fn carried_for_test(&self) -> impl Iterator<Item = HostId> + '_ {
         self.carried.keys().copied()
     }
+
+    /// The host offer of the host's clipboard, if this connection learned
+    /// it, for the orphan check.
+    #[cfg(test)]
+    pub(crate) fn selection_offer_for_test(&self) -> Option<HostId> {
+        let port = self.port.as_ref()?;
+        let state = port.hub.0.borrow();
+        let selection = state.selection.as_ref()?;
+        (selection.carrier == port.id).then_some(selection.offer)
+    }
 }
 
 /// A guest `ext_data_control_source_v1`'s state.
@@ -354,6 +485,84 @@ pub(crate) struct Source {
     used: bool,
     /// Its selection while the hub routes it.
     publication: Option<Publication>,
+}
+
+/// A guest `ext_data_control_device_v1`, which the host's clipboard
+/// reaches.
+#[derive(Debug, Default)]
+pub(crate) struct Device;
+
+/// A guest `ext_data_control_offer_v1`: one state of the host's clipboard.
+#[derive(Debug)]
+pub(crate) struct Offer {
+    selection: SelectionId,
+}
+
+/// The types a host `wl_data_offer` offers, with `--data-control`.
+#[derive(Debug, Default)]
+pub(crate) struct OfferTypes {
+    mime_types: Vec<String>,
+}
+
+/// The host offered host offer `sender` as `mime_type`.
+pub(crate) fn host_offer_type(ctx: &mut Context, sender: EventSender, mime_type: &str) {
+    let (true, Some(offer)) = (ctx.data_control.is_on(), sender.guest_id()) else {
+        return;
+    };
+    match ctx.shadow_table.data_mut::<OfferTypes>(offer) {
+        Some(types) => types.mime_types.push(mime_type.to_string()),
+        None => {
+            let mime_types = vec![mime_type.to_string()];
+            // An offer the guest destroyed keeps no data, and needs none.
+            let _ = ctx.shadow_table.attach(offer, OfferTypes { mime_types });
+        }
+    }
+}
+
+/// The host told this connection its clipboard: `offer`, or nothing.
+pub(crate) fn host_selection(ctx: &mut Context, offer: Option<EventObject>) {
+    let Some(port) = &ctx.data_control.port else {
+        return;
+    };
+    let offer = offer.map(|offer| {
+        let types = ctx.shadow_table.data::<OfferTypes>(offer.guest);
+        let mime_types = types.map(|t| t.mime_types.clone()).unwrap_or_default();
+        (offer.host, mime_types)
+    });
+    port.set_selection(offer);
+}
+
+/// This connection's host offer `offer` ended.
+pub(crate) fn forget_host_offer(ctx: &mut Context, offer: HostId) {
+    if let Some(port) = &ctx.data_control.port {
+        port.offer_ended(offer);
+    }
+}
+
+/// Tell guest device `device` the host's clipboard: a new offer of its
+/// types, or nothing.
+fn announce(ctx: &mut Context, device: GuestId, selection: Option<Announcement>) {
+    let Some(Announcement { id, mime_types }) = selection else {
+        ctx.send_guest(ext_data_control_device_v1::evt::selection(device, None));
+        return;
+    };
+    // A new object takes its parent's version.
+    let version = ctx.shadow_table.guest_object_version(device).unwrap_or(1);
+    let offer = Offer { selection: id };
+    let offer =
+        ctx.shadow_table
+            .create_local_server_with(Iface::ExtDataControlOfferV1, version, offer);
+    ctx.send_guest(ext_data_control_device_v1::evt::data_offer(device, offer));
+    for mime_type in &mime_types {
+        ctx.send_guest_or_drop(
+            ext_data_control_offer_v1::evt::offer(offer, mime_type),
+            format_args!("a data-control offer of {mime_type:?}"),
+        );
+    }
+    ctx.send_guest(ext_data_control_device_v1::evt::selection(
+        device,
+        Some(offer),
+    ));
 }
 
 /// Guest source `source`, with `data`, ended: its selection is withdrawn.
@@ -388,6 +597,32 @@ pub(crate) fn deliver(ctx: &mut Context, delivery: Delivery) {
                     data.publication = None;
                 }
                 ctx.send_guest(ext_data_control_source_v1::evt::cancelled(source));
+            }
+        }
+        Delivery::Selection { selection } => {
+            let devices: Vec<_> = ctx
+                .shadow_table
+                .data_of::<Device>()
+                .map(|(d, _)| d)
+                .collect();
+            for device in devices {
+                announce(ctx, device, selection.clone());
+            }
+        }
+        Delivery::Receive {
+            offer,
+            mime_type,
+            fd,
+        } => {
+            // The guest may have destroyed the offer since; the descriptor
+            // then closes.
+            let live = ctx.shadow_table.get_guest_id(offer).is_some_and(|guest| {
+                ctx.shadow_table
+                    .live_object(guest, Iface::WlDataOffer)
+                    .is_some()
+            });
+            if live {
+                crate::handler::data_device::receive(ctx, offer, &mime_type, fd);
             }
         }
     }
@@ -506,11 +741,15 @@ impl ext_data_control_manager_v1::ExtDataControlManagerV1Handler for Handlers {
         id: GuestId,
         _seat: RequestObject,
     ) -> Action {
-        ctx.shadow_table
-            .create_local(id, Iface::ExtDataControlDeviceV1, sender.version);
-        // The first selection event is sent upon binding: data-control
-        // reads no selection.
-        ctx.send_guest(ext_data_control_device_v1::evt::selection(id, None));
+        ctx.shadow_table.create_local_with(
+            id,
+            Iface::ExtDataControlDeviceV1,
+            sender.version,
+            Device,
+        );
+        // The first selection event is sent upon binding.
+        let selection = ctx.data_control.port.as_ref().and_then(Port::selection);
+        announce(ctx, id, selection);
         Action::Drop
     }
 }
@@ -599,8 +838,30 @@ impl ext_data_control_source_v1::ExtDataControlSourceV1Handler for Handlers {
     }
 }
 
-/// The proxy never creates an offer, so the guest has none to use.
-impl ext_data_control_offer_v1::ExtDataControlOfferV1Handler for Handlers {}
+impl ext_data_control_offer_v1::ExtDataControlOfferV1Handler for Handlers {
+    /// The guest reads the host's clipboard through the connection that
+    /// learned it.
+    fn on_receive(
+        ctx: &mut Context,
+        sender: RequestSender,
+        mime_type: &String,
+        fd: BorrowedFd<'_>,
+    ) -> Action {
+        let selection = ctx
+            .shadow_table
+            .data::<Offer>(sender.guest)
+            .map(|o| o.selection);
+        let (Some(selection), Some(port)) = (selection, &ctx.data_control.port) else {
+            return Action::Drop;
+        };
+        // The request closes its descriptor once handled.
+        match fd.try_clone_to_owned() {
+            Ok(fd) => port.receive(selection, mime_type.clone(), fd),
+            Err(error) => log::error!("Cannot pass on a data-control read: {error}"),
+        }
+        Action::Drop
+    }
+}
 
 #[cfg(test)]
 mod tests;

@@ -105,4 +105,7 @@ object_data! {
     /// A synthetic guest `gtk_surface1`.
     GtkSurface(crate::handler::gtk_shell::GtkSurface) for GtkSurface1,
     DataControlSource(crate::handler::data_control::Source) for ExtDataControlSourceV1,
+    DataControlDevice(crate::handler::data_control::Device) for ExtDataControlDeviceV1,
+    DataControlOffer(crate::handler::data_control::Offer) for ExtDataControlOfferV1,
+    HostOfferTypes(crate::handler::data_control::OfferTypes) for WlDataOffer,
 }

@@ -3,11 +3,13 @@
 
 use super::ClipboardHub;
 use crate::protocols::ext_data_control_v1::{
-    ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_source_v1,
+    ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_offer_v1,
+    ext_data_control_source_v1,
 };
 use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
 use crate::protocols::wayland::{
-    wl_data_device, wl_data_device_manager, wl_data_source, wl_display, wl_keyboard, wl_seat,
+    wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_display, wl_keyboard,
+    wl_seat,
 };
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
@@ -20,6 +22,9 @@ use std::rc::Rc;
 
 /// How long a running client may take to carry a selection.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The host's offer of its clipboard, under an ID of its server range.
+const HOST_OFFER: u32 = crate::test_support::wire_peer::SERVER_ID_START + 0x10;
 
 /// The MIME types Orca's copy helper offers.
 const TEXT: [&str; 3] = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"];
@@ -69,6 +74,31 @@ impl Focused {
         }
     }
 
+    /// The host tells the focused guest its clipboard: `host_offer`, of
+    /// `TEXT`. Returns the guest's offer.
+    async fn clipboard(&mut self, host_offer: u32) -> u32 {
+        let mut events = vec![wl_data_device::evt::data_offer(
+            self.device.host,
+            host_offer,
+        )];
+        for mime_type in TEXT {
+            events.push(wl_data_offer::evt::offer(host_offer, mime_type).unwrap());
+        }
+        events.push(wl_data_device::evt::selection(
+            self.device.host,
+            Some(host_offer),
+        ));
+        self.s.host(events).await;
+        let received = self.s.guest_received();
+        let Some((_, AnyEvent::WlDataDevice(wl_data_device::Event::Selection { id: offer }))) =
+            received.last()
+        else {
+            panic!("the guest got no selection: {received:?}");
+        };
+        assert_eq!(received.len(), 2 + TEXT.len(), "{received:?}");
+        *offer
+    }
+
     /// The host's selection, from the proxy's own source of `TEXT` with
     /// `serial`; returns that source.
     fn selection_set(&mut self, serial: u32) -> u32 {
@@ -104,6 +134,7 @@ impl Focused {
 struct Controller {
     s: Session,
     manager: u32,
+    seat: u32,
     device: u32,
 }
 
@@ -131,7 +162,12 @@ impl Controller {
                 ext_data_control_device_v1::Event::Selection { id: 0 }.into()
             )]
         );
-        Self { s, manager, device }
+        Self {
+            s,
+            manager,
+            seat,
+            device,
+        }
     }
 
     /// A new source of `TEXT`, which the device sets as the selection.
@@ -407,4 +443,122 @@ async fn a_focus_regained_within_one_batch_carries_the_selection() {
     assert!(first.s.deliver().await);
     first.selection_set(4);
     assert!(controller.s.guest_received().is_empty());
+}
+
+/// A data-control device is told the host's clipboard, which the focused
+/// connection learns from its own `wl_data_device`: at once when it is
+/// created, and whenever it changes. Its offer reads through the focused
+/// connection's host offer, into the client's own descriptor.
+#[tokio::test]
+async fn a_data_control_device_reads_the_focused_connections_clipboard() {
+    let hub = ClipboardHub::default();
+    let mut focused = Focused::new(&hub, 7).await;
+    let mut controller = Controller::new(&hub).await;
+    focused.clipboard(HOST_OFFER).await;
+    assert!(controller.s.deliver().await);
+    let offer = announced(controller.s.guest_received(), controller.device);
+
+    let device = controller.s.new_id();
+    let seat = controller.seat;
+    controller
+        .s
+        .guest([ext_data_control_manager_v1::req::get_data_device(
+            controller.manager,
+            device,
+            seat,
+        )])
+        .await;
+    announced(controller.s.guest_received(), device);
+
+    let (read, write) = std::io::pipe().unwrap();
+    let write = OwnedFd::from(write);
+    let identity = fd_identity(write.as_raw_fd());
+    let receive = ext_data_control_offer_v1::req::receive(offer, TEXT[0], write).unwrap();
+    controller.s.guest([receive]).await;
+    assert!(controller.s.host_received().is_empty());
+    assert!(focused.s.deliver().await);
+    let host = focused.s.host_received();
+    let [(HOST_OFFER, AnyRequest::WlDataOffer(wl_data_offer::Request::Receive { mime_type, fd }))] =
+        &host[..]
+    else {
+        panic!("the host's offer was not read: {host:?}");
+    };
+    assert_eq!(mime_type, TEXT[0]);
+    assert_eq!(
+        fd_identity(fd.as_raw_fd()),
+        identity,
+        "the client's own pipe"
+    );
+    drop((host, read));
+}
+
+/// The host's clipboard reads as empty once the connection that learned
+/// it loses the focus, since Exo tells only the focused client of a
+/// change, or once its guest destroys the offer; an offer of it then reads
+/// nothing.
+#[tokio::test]
+async fn the_clipboard_reads_empty_once_its_connection_cannot_vouch_for_it() {
+    let hub = ClipboardHub::default();
+    let mut focused = Focused::new(&hub, 7).await;
+    let mut controller = Controller::new(&hub).await;
+    focused.clipboard(HOST_OFFER).await;
+    assert!(controller.s.deliver().await);
+    let offer = announced(controller.s.guest_received(), controller.device);
+
+    let leave = wl_keyboard::evt::leave(focused.keyboard.host, 8, focused.surface.host);
+    focused.s.host([leave]).await;
+    focused.s.guest_received();
+    assert!(controller.s.deliver().await);
+    assert_eq!(controller.s.guest_received(), empty(controller.device));
+    let (read, write) = std::io::pipe().unwrap();
+    let write = OwnedFd::from(write);
+    let identity = fd_identity(write.as_raw_fd());
+    let receive = ext_data_control_offer_v1::req::receive(offer, TEXT[0], write).unwrap();
+    controller.s.guest([receive]).await;
+    assert!(focused.s.deliver().await);
+    assert!(focused.s.host_received().is_empty());
+    drop(read);
+    assert!(!any_fd_has_identity(identity), "the read is closed");
+
+    let enter = wl_keyboard::evt::enter(focused.keyboard.host, 9, focused.surface.host, &[]);
+    focused.s.host([enter.unwrap()]).await;
+    focused.s.guest_received();
+    let guest_offer = focused.clipboard(HOST_OFFER + 1).await;
+    assert!(controller.s.deliver().await);
+    announced(controller.s.guest_received(), controller.device);
+    focused
+        .s
+        .guest([wl_data_offer::req::destroy(guest_offer)])
+        .await;
+    focused.s.host_received();
+    assert!(controller.s.deliver().await);
+    assert_eq!(controller.s.guest_received(), empty(controller.device));
+}
+
+/// `device` was told a new offer of `TEXT`; returns that offer.
+fn announced(received: Vec<(u32, AnyEvent)>, device: u32) -> u32 {
+    let [(
+        sender,
+        AnyEvent::ExtDataControlDeviceV1(ext_data_control_device_v1::Event::DataOffer { id }),
+    ), ..] = received[..]
+    else {
+        panic!("the device got no offer: {received:?}");
+    };
+    assert_eq!(sender, device);
+    let offered = TEXT.iter().map(|mime_type| {
+        let offer = ext_data_control_offer_v1::Event::Offer {
+            mime_type: mime_type.to_string(),
+        };
+        (id, offer.into())
+    });
+    let selection = ext_data_control_device_v1::Event::Selection { id };
+    let expected: Vec<_> = offered.chain([(device, selection.into())]).collect();
+    assert_eq!(received[1..], expected[..]);
+    id
+}
+
+/// `device` was told the host's clipboard is empty.
+fn empty(device: u32) -> Vec<(u32, AnyEvent)> {
+    let selection = ext_data_control_device_v1::Event::Selection { id: 0 };
+    vec![(device, selection.into())]
 }

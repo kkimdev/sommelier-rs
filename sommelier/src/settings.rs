@@ -73,7 +73,7 @@ pub(crate) struct Cli {
     xdg_decoration: bool,
 
     /// Offer ext-data-control-v1, through which any guest client may set
-    /// the ChromeOS clipboard without keyboard focus
+    /// and read the ChromeOS clipboard without keyboard focus
     #[arg(long)]
     data_control: bool,
 
