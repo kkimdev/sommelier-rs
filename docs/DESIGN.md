@@ -331,7 +331,7 @@ object's table entry instead ([Object ends](#object-ends)).
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`); `shm::ShmFormats`; each `wl_shm`, `wl_shm_pool` and `wp_viewport`'s entry |
 | Dma-buf | `linux_dmabuf.rs` | `linux_dmabuf::Dmabuf` (capabilities), each params, factory and feedback object's entry, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (pointer focus); `sommelier/src/keys` (the keyboard core: the keyboard focus, one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
-| Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
+| Clipboard | `data_device.rs` (including `pump`), `data_control.rs` (the guest's `ext_data_control_v1`) | `ClipboardPumps` in `state.rs`; `data_control::DataControl`, and the `ClipboardHub` every connection shares |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs`, each GTK shell and surface's entry |
 | Window placement | `window_placement.rs` | `window_placement.rs` |
@@ -582,6 +582,25 @@ and pumps what the host writes into the guest's descriptor.
 it gives a `PumpSlot`, the only way to start one, while fewer than
 `MAX_CLIPBOARD_PUMPS` are in flight, and aborts them all when the
 connection ends.
+
+### Data-control
+
+With `--data-control`, the guest is offered `ext_data_control_v1`, which
+`handler/data_control.rs` implements through another connection, the one
+whose keyboard has the focus (INVARIANTS "A data-control selection is set
+by the focused connection, or cancelled"); its module docs own the
+mechanism. It is the one state connections share beyond `Shared`'s
+settings and resources: `proxy::run` makes one `ClipboardHub`, each
+`Context` joins it as it is built and leaves it as it drops, and
+`Client::run` waits on the connection's `Mailbox` beside its peers and
+handles each delivery as a transaction of its own
+(`proxy::dispatch::deliver`).
+
+It is opt-in because any guest client can then set the ChromeOS clipboard
+without the focus. Inside the Crostini container every client runs as
+the same user and can already read the others' input and memory, so this
+opens no boundary the guest has; a user who wants the focus to gate the
+clipboard leaves it off.
 
 ## Keyboard and IME
 

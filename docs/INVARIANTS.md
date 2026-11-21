@@ -694,6 +694,21 @@ The proxy serves every Linux GUI app, so no single client may end it.
   Tests: `a_transfer_the_host_stalls_ends_after_the_idle_timeout`,
   `a_transfer_the_guest_stalls_ends_after_the_idle_timeout`,
   `clipboard_pumps_are_capped_per_connection`.
+- **A data-control selection is set by the focused connection, or
+  cancelled.** Exo takes a selection only from the client whose surface
+  has the keyboard focus, with a serial it issued recently, and a
+  data-control client never has the focus. So with `--data-control` the
+  connection whose keyboard has the focus sets it for the client, with
+  the serial of its own latest input event, through its own
+  `wl_data_device`; without one, or without a focused connection, the
+  source is cancelled at once rather than left waiting. The host reads
+  the data through its own descriptor, which the client gets, so no
+  transfer waits on the proxy. A selection ends with either connection:
+  the focused one destroys its source when the client's ends, and the
+  client's source is cancelled when the focused one ends.
+  Tests: `a_data_control_selection_reaches_the_host_through_the_focused_connection`,
+  `without_a_focused_connection_a_data_control_selection_is_cancelled`,
+  `a_selection_ends_with_either_connection`.
 - **The socket belongs to the process holding its lock.** Like
   libwayland, the proxy takes `flock(LOCK_EX | LOCK_NB)` on
   `<socket>.lock` for its lifetime and only then removes a stale socket;
