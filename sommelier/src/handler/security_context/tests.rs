@@ -1,6 +1,6 @@
 //! Tests of `handler::security_context`.
 
-use super::{SandboxListener, SandboxListeners};
+use super::{SandboxListener, SandboxListeners, MAX_SANDBOX_LISTENERS};
 use crate::handler::data_control::ClipboardHub;
 use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
 use crate::protocols::security_context_v1::{
@@ -20,7 +20,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 /// and, unless sandboxed, the security-context manager; returns it and
 /// where its committed contexts arrive.
 fn session(sandboxed: bool) -> (Session, UnboundedReceiver<SandboxListener>) {
-    let (listeners, committed): (SandboxListeners, _) = tokio::sync::mpsc::unbounded_channel();
+    let (listeners, committed) = SandboxListeners::new();
     let facts = ConnectionFacts {
         clipboard: Some(ClipboardHub::default()),
         sandbox_listeners: Some(listeners),
@@ -179,4 +179,94 @@ async fn a_sandboxed_connection_is_offered_no_privileged_global() {
     .await;
     assert!(s.guest_received().is_empty(), "the guest sees no global");
     s.host_received();
+}
+
+/// A listening socket that is no Unix stream socket, which no Wayland
+/// client could connect to, and a close descriptor that cannot signal a
+/// hangup, which would keep the socket for good, are invalid.
+#[tokio::test]
+async fn a_security_context_takes_a_unix_stream_socket_and_a_hangup() {
+    use nix::sys::socket::{
+        bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr,
+    };
+    let dir = TempDir::new("security-context-kinds");
+    let seqpacket = socket(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .unwrap();
+    bind(
+        seqpacket.as_raw_fd(),
+        &UnixAddr::new(&dir.path().join("seqpacket")).unwrap(),
+    )
+    .unwrap();
+    listen(&seqpacket, Backlog::new(1).unwrap()).unwrap();
+    let (_, pipe) = std::io::pipe().unwrap();
+    let (stream, _, _hang_up) = socket_and_close(&dir);
+    let file = OwnedFd::from(std::fs::File::create(dir.path().join("file")).unwrap());
+    for (listen_fd, close_fd) in [(seqpacket, OwnedFd::from(pipe)), (stream, file)] {
+        let (mut s, _committed) = session(false);
+        let manager = manager(&mut s).await;
+        let context = s.new_id();
+        s.guest_fatal([wp_security_context_manager_v1::req::create_listener(
+            manager, context, listen_fd, close_fd,
+        )])
+        .await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (
+                vec![],
+                (
+                    manager,
+                    wp_security_context_manager_v1::ERROR_INVALID_LISTEN_FD
+                )
+            )
+        );
+    }
+}
+
+/// The proxy serves at most `MAX_SANDBOX_LISTENERS` committed contexts at
+/// once, each until its engine hangs up, also past its connection; the
+/// next commit ends its session, short of descriptors.
+#[tokio::test]
+async fn committed_security_contexts_are_capped() {
+    let (mut s, mut committed) = session(false);
+    let manager = manager(&mut s).await;
+    let dir = TempDir::new("security-context-cap");
+    let commit = |s: &mut Session, n: usize| {
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join(n.to_string())).unwrap();
+        let (close, _) = std::io::pipe().unwrap();
+        let context = s.new_id();
+        [
+            wp_security_context_manager_v1::req::create_listener(
+                manager,
+                context,
+                listener.into(),
+                close.into(),
+            ),
+            wp_security_context_v1::req::commit(context),
+        ]
+    };
+    for n in 0..MAX_SANDBOX_LISTENERS {
+        let requests = commit(&mut s, n);
+        s.guest(requests).await;
+    }
+    let requests = commit(&mut s, MAX_SANDBOX_LISTENERS);
+    s.guest_fatal(requests).await;
+    let (_, error) = s.guest_received_and_error();
+    assert_eq!(
+        error,
+        (
+            WL_DISPLAY_ID,
+            crate::protocols::wayland::wl_display::ERROR_NO_MEMORY
+        )
+    );
+    let mut served = 0;
+    while committed.try_recv().is_ok() {
+        served += 1;
+    }
+    assert_eq!(served, MAX_SANDBOX_LISTENERS);
 }

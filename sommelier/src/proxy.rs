@@ -658,7 +658,7 @@ impl Shared {
     /// arrive, which `serve` reads.
     fn new(settings: Settings) -> (Self, UnboundedReceiver<SandboxListener>) {
         let settings = Rc::new(settings);
-        let (sandbox_listeners, sandboxes) = tokio::sync::mpsc::unbounded_channel();
+        let (sandbox_listeners, sandboxes) = SandboxListeners::new();
         let shared = Self {
             virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
             placement: placement_config::load_and_watch(&settings),
@@ -795,20 +795,26 @@ async fn serve(
 }
 
 /// Accept sandboxed clients on `sandbox`'s socket until its close
-/// descriptor hangs up, as `wp_security_context_v1` asks, whether or not
+/// descriptor signals, as `wp_security_context_v1` asks, whether or not
 /// the client that made the context is still connected.
+///
+/// The descriptor is never read, so it cannot block the loop: any signal
+/// ends the context. Its hangup is an error on a pipe's write end, which
+/// Flatpak passes, and the end of the stream on a pipe's read end or a
+/// socket; bytes written to it mean nothing.
 async fn serve_sandbox(sandbox: SandboxListener, shared: Rc<Shared>) {
-    use std::io::Read;
     let SandboxListener {
         listen,
         close,
         metadata,
+        live: _live,
     } = sandbox;
+    let signals = Interest::READABLE | Interest::ERROR;
     let listener = std::os::unix::net::UnixListener::from(listen);
     let listener = listener
         .set_nonblocking(true)
         .and_then(|()| UnixListener::from_std(listener));
-    let close = AsyncFd::with_interest(std::fs::File::from(close), Interest::READABLE);
+    let close = AsyncFd::with_interest(close, signals);
     let (listener, close) = match (listener, close) {
         (Ok(listener), Ok(close)) => (listener, close),
         (Err(error), _) | (_, Err(error)) => {
@@ -821,16 +827,7 @@ async fn serve_sandbox(sandbox: SandboxListener, shared: Rc<Shared>) {
     loop {
         tokio::select! {
             accepted = listener.accept() => accepts.client(accepted, &shared, true).await,
-            ready = close.readable() => {
-                let Ok(mut ready) = ready else { break };
-                let mut buf = [0; 64];
-                // A hangup reads as the end of the stream, or fails; bytes
-                // the engine writes mean nothing.
-                let read = ready.try_io(|close| (&mut close.get_ref()).read(&mut buf));
-                if let Ok(Ok(0) | Err(_)) = read {
-                    break;
-                }
-            }
+            _ = close.ready(signals) => break,
         }
     }
     log::info!("A security context hung up ({metadata:?}); accepting no more clients through it");
@@ -1271,7 +1268,7 @@ mod tests {
     /// What a test's connections share, and where their committed security
     /// contexts arrive.
     fn test_shared() -> (Shared, UnboundedReceiver<SandboxListener>) {
-        let (sandbox_listeners, sandboxes) = tokio::sync::mpsc::unbounded_channel();
+        let (sandbox_listeners, sandboxes) = SandboxListeners::new();
         let shared = Shared {
             settings: Rc::new(Settings::for_test()),
             virtgpu: VirtGpuNode::absent_for_test(),
@@ -1285,37 +1282,44 @@ mod tests {
 
     /// A security context's socket serves the engine's clients, each
     /// started (and here closed, the test's host being unreachable), until
-    /// its close descriptor hangs up; then the proxy closes the socket.
+    /// its close descriptor signals: Flatpak passes a pipe's write end,
+    /// which signals an error once the sandbox closes the read end; a
+    /// pipe's read end signals the end of the stream. Then the proxy closes
+    /// the socket.
     #[tokio::test]
     async fn a_security_contexts_socket_serves_until_it_hangs_up() {
         use tokio::io::AsyncReadExt;
-        let dir = crate::test_support::TempDir::new("sandbox-listener");
-        let path = dir.path().join("sandbox");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let (close, hang_up) = std::io::pipe().unwrap();
-        let sandbox = SandboxListener {
-            listen: listener.into(),
-            close: close.into(),
-            metadata: Default::default(),
-        };
-        let (shared, _sandboxes) = test_shared();
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let served = tokio::task::spawn_local(serve_sandbox(sandbox, Rc::new(shared)));
-                let mut client = UnixStream::connect(&path)
-                    .await
-                    .expect("the socket listens");
-                let mut byte = [0];
-                assert_eq!(
-                    client.read(&mut byte).await.unwrap(),
-                    0,
-                    "the client was accepted"
-                );
-                drop(hang_up);
-                served.await.expect("the accept loop ends");
-                assert!(std::os::unix::net::UnixStream::connect(&path).is_err());
-            })
-            .await;
+        for flatpak in [true, false] {
+            let dir = crate::test_support::TempDir::new("sandbox-listener");
+            let path = dir.path().join("sandbox");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let (reader, writer) = std::io::pipe().unwrap();
+            let (close, hang_up): (OwnedFd, OwnedFd) = if flatpak {
+                (writer.into(), reader.into())
+            } else {
+                (reader.into(), writer.into())
+            };
+            let sandbox = SandboxListener::for_test(listener.into(), close);
+            let (shared, _sandboxes) = test_shared();
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let served = tokio::task::spawn_local(serve_sandbox(sandbox, Rc::new(shared)));
+                    let mut client = UnixStream::connect(&path)
+                        .await
+                        .expect("the socket listens");
+                    let mut byte = [0];
+                    assert_eq!(
+                        client.read(&mut byte).await.unwrap(),
+                        0,
+                        "the client was accepted"
+                    );
+                    drop(hang_up);
+                    let ended = tokio::time::timeout(Duration::from_secs(10), served).await;
+                    ended.expect("the hangup ends the accept loop").unwrap();
+                    assert!(std::os::unix::net::UnixStream::connect(&path).is_err());
+                })
+                .await;
+        }
     }
 
     #[tokio::test]

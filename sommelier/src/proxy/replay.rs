@@ -213,7 +213,7 @@ fn context(trace: &Trace) -> Result<Context, String> {
         clipboard: (trace.fact("data-control") == Some("on")).then(ClipboardHub::default),
         // A security context the replay commits goes nowhere.
         sandbox_listeners: (trace.fact("security-context") == Some("on"))
-            .then(|| tokio::sync::mpsc::unbounded_channel().0),
+            .then(|| crate::handler::security_context::SandboxListeners::new().0),
         sandboxed: trace.fact("sandboxed") == Some("yes"),
         ..ConnectionFacts::for_test()
     };

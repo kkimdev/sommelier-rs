@@ -37,20 +37,59 @@ use crate::handler::Handlers;
 use crate::protocols::security_context_v1::{
     wp_security_context_manager_v1, wp_security_context_v1,
 };
+use crate::protocols::wayland::wl_display;
 use crate::protocols::Iface;
 use crate::state::{Context, GuestId, RequestSender};
 use crate::wire::Action;
-use std::os::fd::{BorrowedFd, OwnedFd};
-use tokio::sync::mpsc::UnboundedSender;
+use nix::sys::socket::{getsockname, getsockopt, sockopt, SockType, UnixAddr};
+use nix::sys::stat::{fstat, SFlag};
+use std::cell::Cell;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::rc::Rc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+/// How many committed security contexts the proxy serves at once. Each
+/// holds two descriptors and an accept loop until its engine hangs up,
+/// also past the connection that made it, so a client that commits
+/// without end would otherwise exhaust the process's descriptors; a
+/// sandboxed app instance takes one.
+pub(crate) const MAX_SANDBOX_LISTENERS: usize = 64;
 
 /// What a committed security context hands the proxy: a socket to accept
-/// sandboxed clients on until `close` hangs up, and the engine's metadata,
-/// which only the log reads.
+/// sandboxed clients on until `close` signals, and the engine's metadata,
+/// which only the log reads. It counts as live until it drops.
 #[derive(Debug)]
 pub(crate) struct SandboxListener {
     pub(crate) listen: OwnedFd,
     pub(crate) close: OwnedFd,
     pub(crate) metadata: Metadata,
+    /// Its place in the count of live listeners, which it leaves as it
+    /// drops: the accept loop keeps it until the engine hangs up.
+    pub(crate) live: Live,
+}
+
+#[cfg(test)]
+impl SandboxListener {
+    /// A listener no security context committed, counted nowhere.
+    pub(crate) fn for_test(listen: OwnedFd, close: OwnedFd) -> Self {
+        let live = Rc::new(Cell::new(1));
+        Self {
+            listen,
+            close,
+            metadata: Metadata::default(),
+            live: Live(live),
+        }
+    }
+}
+
+/// One live listener in [`SandboxListeners`]' count, until it drops.
+#[derive(Debug)]
+pub(crate) struct Live(Rc<Cell<usize>>);
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 
 /// A security context's metadata, each set at most once.
@@ -62,8 +101,40 @@ pub(crate) struct Metadata {
 }
 
 /// Where a connection hands committed security contexts: the proxy's
-/// accept loop.
-pub(crate) type SandboxListeners = UnboundedSender<SandboxListener>;
+/// accept loop, while fewer than [`MAX_SANDBOX_LISTENERS`] are live.
+#[derive(Clone, Debug)]
+pub(crate) struct SandboxListeners {
+    sender: UnboundedSender<SandboxListener>,
+    live: Rc<Cell<usize>>,
+}
+
+impl SandboxListeners {
+    /// Where connections hand committed security contexts, and where the
+    /// accept loop receives them.
+    pub(crate) fn new() -> (Self, UnboundedReceiver<SandboxListener>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let live = Rc::default();
+        (Self { sender, live }, receiver)
+    }
+
+    /// Hand the accept loop a committed context; `false`, dropping it,
+    /// while [`MAX_SANDBOX_LISTENERS`] are live.
+    fn hand(&self, listen: OwnedFd, close: OwnedFd, metadata: Metadata) -> bool {
+        if self.live.get() >= MAX_SANDBOX_LISTENERS {
+            return false;
+        }
+        self.live.set(self.live.get() + 1);
+        let listener = SandboxListener {
+            listen,
+            close,
+            metadata,
+            live: Live(Rc::clone(&self.live)),
+        };
+        // An accept loop that has ended drops it, which closes the socket.
+        let _ = self.sender.send(listener);
+        true
+    }
+}
 
 /// One connection's sandboxing (`Context::sandboxing`), decided as it
 /// connects.
@@ -108,9 +179,21 @@ pub(crate) struct SecurityContext {
     committed: bool,
 }
 
-/// Whether `fd` is a socket that listens: `SO_ACCEPTCONN`.
+/// Whether `fd` is a Unix stream socket that listens, which Wayland
+/// clients can connect to.
 fn listens(fd: BorrowedFd<'_>) -> bool {
-    nix::sys::socket::getsockopt(&fd, nix::sys::socket::sockopt::AcceptConn).unwrap_or(false)
+    getsockopt(&fd, sockopt::AcceptConn).unwrap_or(false)
+        && getsockopt(&fd, sockopt::SockType).is_ok_and(|kind| kind == SockType::Stream)
+        && getsockname::<UnixAddr>(fd.as_raw_fd()).is_ok()
+}
+
+/// Whether `fd` can signal a hangup the event loop sees: a pipe, of
+/// either end, or a socket.
+fn can_hang_up(fd: BorrowedFd<'_>) -> bool {
+    fstat(fd).is_ok_and(|stat| {
+        let kind = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
+        kind == SFlag::S_IFIFO || kind == SFlag::S_IFSOCK
+    })
 }
 
 impl wp_security_context_manager_v1::WpSecurityContextManagerV1Handler for Handlers {
@@ -121,11 +204,11 @@ impl wp_security_context_manager_v1::WpSecurityContextManagerV1Handler for Handl
         listen_fd: BorrowedFd<'_>,
         close_fd: BorrowedFd<'_>,
     ) -> Action {
-        if !listens(listen_fd) {
+        if !listens(listen_fd) || !can_hang_up(close_fd) {
             return ctx.reject(
                 sender.guest,
                 wp_security_context_manager_v1::ERROR_INVALID_LISTEN_FD,
-                "listen_fd is not a listening socket",
+                "listen_fd is no listening Unix stream socket, or close_fd no pipe or socket",
             );
         }
         // The request closes its descriptors once handled.
@@ -218,13 +301,15 @@ impl wp_security_context_v1::WpSecurityContextV1Handler for Handlers {
             return Action::Drop;
         };
         let metadata = std::mem::take(&mut context.metadata);
-        // An accept loop that has ended drops it, which closes the socket.
-        let _ = listeners.send(SandboxListener {
-            listen,
-            close,
-            metadata,
-        });
-        Action::Drop
+        if listeners.hand(listen, close, metadata) {
+            return Action::Drop;
+        }
+        log::warn!("Refusing a security context: {MAX_SANDBOX_LISTENERS} are served");
+        ctx.reject(
+            GuestId::DISPLAY,
+            wl_display::ERROR_NO_MEMORY,
+            format!("{MAX_SANDBOX_LISTENERS} security contexts are served"),
+        )
     }
 }
 
