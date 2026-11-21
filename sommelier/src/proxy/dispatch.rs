@@ -304,6 +304,23 @@ pub(super) fn dispatch(
     }
 }
 
+/// Handle `delivery`, which another connection handed this one through
+/// the clipboard hub, as a transaction like a message's: commit what it
+/// produced to `out`, or nothing if it ends the session, which it returns.
+pub(super) fn deliver(
+    ctx: &mut Context,
+    delivery: crate::handler::data_control::Delivery,
+    out: &mut Outbox<'_>,
+) -> Option<SessionEnd> {
+    crate::handler::data_control::deliver(ctx, delivery);
+    let effects = ctx.take_effects();
+    debug_assert!(effects.wait.is_none(), "a delivery never waits for a fence");
+    if effects.end.is_none() {
+        commit(out, None, effects.to_host, effects.to_guest);
+    }
+    effects.end
+}
+
 /// Queue `forward`, then `to_host` and `to_guest`, each for its peer. The
 /// generated dispatcher encoded the forward under the sender it translated
 /// before the handler ran, so a handler that retires the sender's mapping

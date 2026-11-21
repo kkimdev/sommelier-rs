@@ -131,11 +131,12 @@ impl wl_pointer::WlPointerHandler for Handlers {
     fn on_enter(
         ctx: &mut Context,
         sender: EventSender,
-        _serial: u32,
+        serial: u32,
         surface: EventObject,
         _surface_x: i32,
         _surface_y: i32,
     ) -> Action {
+        ctx.data_control.note_serial(serial);
         // The generated dispatcher calls this only for a host surface
         // paired with a live guest surface (`ShadowTable::event_object`):
         // it drops an `enter` or `leave` that names a surface the guest
@@ -214,6 +215,7 @@ impl wl_pointer::WlPointerHandler for Handlers {
         button: u32,
         state: u32,
     ) -> Action {
+        ctx.data_control.note_serial(serial);
         if state != wl_pointer::BUTTON_STATE_PRESSED {
             return Action::Forward;
         }

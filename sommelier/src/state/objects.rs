@@ -528,6 +528,23 @@ impl ShadowTable {
         debug_assert!(previous.is_none(), "guest ID {guest} is in use");
     }
 
+    /// [`Self::create_local_with`], for an object the proxy creates in an
+    /// event, under a fresh ID from the guest's server range.
+    ///
+    /// # Returns
+    ///
+    /// The guest object's ID.
+    pub(crate) fn create_local_server_with<T: Data>(
+        &mut self,
+        interface: Iface,
+        version: u32,
+        data: T,
+    ) -> GuestId {
+        let guest = self.allocate_guest_server_id();
+        self.create_local_with(guest, interface, version, data);
+        guest
+    }
+
     /// Create a host object that only the proxy uses.
     ///
     /// # Returns
@@ -730,6 +747,19 @@ impl ShadowTable {
                 ..
             } => None,
         }
+    }
+
+    /// The host object of each live paired guest object of `interface`, in
+    /// guest ID order.
+    pub fn live_hosts_of(&self, interface: Iface) -> impl Iterator<Item = HostId> + '_ {
+        self.guests.values().filter_map(move |object| match object {
+            GuestObject::Paired {
+                host,
+                interface: own,
+                state: GuestState::Live(_),
+            } if own.iface == interface => Some(*host),
+            _ => None,
+        })
     }
 
     /// Return whether guest object `guest` is one the proxy implements

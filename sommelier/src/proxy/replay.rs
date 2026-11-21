@@ -52,12 +52,17 @@ limitations under the License.
 //! - The other facts must be ones a test's proxy can have: no render
 //!   node, placement, accelerators or `--gpu-accel`. A trace of other
 //!   facts is refused, which names them.
+//! - With data-control on, the proxy joins a clipboard hub of its own, so
+//!   nothing reaches it from another connection: what another connection
+//!   handed the recorded one (`handler::data_control`) is in no trace, and
+//!   its output fails the replay.
 //! - A host message the proxy did not track or could not read takes no
 //!   descriptor, as it took none when recorded; a descriptor it left
 //!   queued, which ends the session at the next message, is not in the
 //!   trace, so that end replays otherwise.
 
 use super::harness::Session;
+use crate::handler::data_control::ClipboardHub;
 use crate::protocols::wayland::wl_keyboard;
 use crate::settings::Settings;
 use crate::state::{ConnectionFacts, Context};
@@ -205,6 +210,7 @@ fn context(trace: &Trace) -> Result<Context, String> {
     };
     let facts = ConnectionFacts {
         virtwl,
+        clipboard: (trace.fact("data-control") == Some("on")).then(ClipboardHub::default),
         ..ConnectionFacts::for_test()
     };
     let ctx = Context::new(Rc::new(settings), facts);
@@ -298,6 +304,40 @@ mod tests {
         other.facts = other.facts.replace("placement=off", "placement=on");
         let why = replay(&other).unwrap_err();
         assert!(why.contains("cannot have the facts"), "{why}");
+    }
+
+    /// A connection with data-control replays: its own peers' messages
+    /// are in its trace.
+    #[test]
+    fn a_data_control_connections_trace_replays() {
+        use crate::protocols::ext_data_control_v1::{
+            ext_data_control_device_v1, ext_data_control_manager_v1,
+        };
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
+        let tape = Tape::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let facts = ConnectionFacts {
+                clipboard: Some(ClipboardHub::default()),
+                ..ConnectionFacts::for_test()
+            };
+            let mut s = Session::with_context(Context::new(Rc::new(Settings::for_test()), facts));
+            s.record(tape.clone());
+            let extension = zcr_keyboard_extension_v1::VERSION;
+            let manager = s.bind(zcr_keyboard_extension_v1::NAME, extension).await;
+            let seat = s.bind("wl_seat", 5).await;
+            let device = s.new_id();
+            let get = ext_data_control_manager_v1::req::get_data_device(manager, device, seat);
+            s.guest([get]).await;
+            let selection = ext_data_control_device_v1::Event::Selection { id: 0 };
+            assert_eq!(s.guest_received(), [(device, selection.into())]);
+        });
+        let trace = Trace::parse(&tape.text()).unwrap();
+        assert!(trace.facts.ends_with(" data-control=on"), "{}", trace.facts);
+        replay(&trace).unwrap();
     }
 
     /// A keymap replays as the text the trace recorded of it, which must

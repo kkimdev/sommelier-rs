@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::data_control;
 use crate::handler::Handlers;
 use crate::protocols::wayland::wl_data_device;
 use crate::protocols::wayland::wl_data_device_manager;
 use crate::protocols::wayland::wl_data_offer;
 use crate::protocols::wayland::wl_data_source;
-use crate::state::{Context, RequestSender};
+use crate::state::{Context, EventObject, EventSender, HostId, RequestSender};
 use crate::wire::Action;
 use log::{debug, error};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -34,103 +35,115 @@ use tokio::io::Interest;
 
 impl wl_data_device_manager::WlDataDeviceManagerHandler for Handlers {}
 
-impl wl_data_device::WlDataDeviceHandler for Handlers {}
+/// The host's selection reaches the guest as it is, and the guest's
+/// data-control devices too (`handler::data_control`).
+impl wl_data_device::WlDataDeviceHandler for Handlers {
+    fn on_selection(ctx: &mut Context, _sender: EventSender, id: Option<EventObject>) -> Action {
+        data_control::host_selection(ctx, id);
+        Action::Forward
+    }
+}
 
 impl wl_data_offer::WlDataOfferHandler for Handlers {
+    fn on_offer(ctx: &mut Context, sender: EventSender, mime_type: &String) -> Action {
+        data_control::host_offer_type(ctx, sender, mime_type);
+        Action::Forward
+    }
+
     fn on_receive(
         ctx: &mut Context,
         sender: RequestSender,
         mime_type: &String,
         fd: BorrowedFd<'_>,
     ) -> Action {
-        debug!(
-            "wl_data_offer.receive: mime_type={}, fd={}",
-            mime_type,
-            fd.as_raw_fd()
-        );
-
-        if let Some(virtwl) = ctx.virtwayland_channel().cloned() {
-            debug!("Using virtwl for clipboard receive");
-
-            // Beyond the cap the request is dropped, which closes the
-            // guest's descriptor, so the guest reads EOF.
-            let Some(pump_slot) = ctx.clipboard_pumps.slot() else {
-                return Action::Drop;
-            };
-
-            // The request closes the guest's descriptor once handled, so the
-            // pump writes into a duplicate. Duplicate it before queueing
-            // anything so a dup failure cannot leave a host request queued
-            // while the original request is also forwarded.
-            let client_fd = match fd.try_clone_to_owned() {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("Failed to dup client fd: {}", e);
-                    return Action::Drop;
-                }
-            };
-
-            // Create a pipe where we read (so host must write to it)
-            // VIRTWL_IOCTL_NEW_PIPE_READ creates a pipe that is readable via the returned FD.
-            let virtwl_pipe = match virtwl.create_read_pipe() {
-                Ok(p) => p,
-                Err(e) => {
-                    error!("Failed to create virtwl pipe: {}", e);
-                    return Action::Drop;
-                }
-            };
-
-            // We need to send this virtwl FD to the host.
-            // The guest client provided 'fd' to write data into.
-            // We pump: virtwl_pipe (read) -> fd (write)
-
-            let Some(host_sender_id) = sender.host_id() else {
-                error!(
-                    "Dropping wl_data_offer.receive from unmapped sender {}",
-                    sender.guest
-                );
-                return Action::Drop;
-            };
-            debug!(
-                "on_receive: sender_id={}, host_sender_id={}",
-                sender.guest, host_sender_id
-            );
-
-            // The host writes into a duplicate of the pipe, and the pump
-            // below reads from the original.
-            let virtwl_fd_dup = match virtwl_pipe.try_clone() {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("Failed to dup virtwl fd: {}", e);
-                    return Action::Drop;
-                }
-            };
-            let request =
-                match wl_data_offer::req::receive(host_sender_id, mime_type, virtwl_fd_dup) {
-                    Ok(request) => request,
-                    Err(e) => {
-                        log::warn!("Dropping an oversized clipboard MIME type: {e}");
-                        return Action::Drop;
-                    }
-                };
-
-            pump_slot.start(async move {
-                match pump(virtwl_pipe, client_fd).await {
-                    Ok(()) => debug!("Clipboard pump finished"),
-                    Err(e) => error!("Clipboard pump error: {}", e),
-                }
-            });
-            ctx.send_host(request);
-
-            // Drop original action (we handled it)
-            return Action::Drop;
+        // Without VirtWL, the guest's descriptor reaches the host as it is.
+        if ctx.virtwayland_channel().is_none() {
+            return Action::Forward;
         }
-
-        Action::Forward
+        let Some(offer) = sender.host_id() else {
+            error!(
+                "Dropping wl_data_offer.receive from unmapped sender {}",
+                sender.guest
+            );
+            return Action::Drop;
+        };
+        // The request closes the guest's descriptor once handled, so the
+        // transfer writes into a duplicate.
+        match fd.try_clone_to_owned() {
+            Ok(fd) => receive(ctx, offer, mime_type, fd),
+            Err(e) => error!("Failed to dup client fd: {}", e),
+        }
+        Action::Drop
     }
 }
 
-impl wl_data_source::WlDataSourceHandler for Handlers {}
+/// Have the host write host offer `offer`'s data as `mime_type` into `fd`,
+/// a guest client's descriptor: through a VirtWL pipe the proxy pumps into
+/// `fd`, since VirtWL cannot carry a guest descriptor, or directly without
+/// VirtWL. A transfer that cannot start drops `fd`, which closes it, so the
+/// client reads EOF; beyond the cap of pumps (INVARIANTS "A clipboard
+/// transfer is bounded") too.
+pub(crate) fn receive(ctx: &mut Context, offer: HostId, mime_type: &str, fd: OwnedFd) {
+    let Some(virtwl) = ctx.virtwayland_channel().cloned() else {
+        ctx.send_host_or_drop(
+            wl_data_offer::req::receive(offer, mime_type, fd),
+            format_args!("wl_data_offer.receive of {mime_type:?}"),
+        );
+        return;
+    };
+    let Some(pump_slot) = ctx.clipboard_pumps.slot() else {
+        return;
+    };
+    // A pipe the host writes and the proxy reads: the host gets a
+    // duplicate, and the pump reads the original.
+    let virtwl_pipe = match virtwl.create_read_pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to create virtwl pipe: {}", e);
+            return;
+        }
+    };
+    let host_end = match virtwl_pipe.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to dup virtwl fd: {}", e);
+            return;
+        }
+    };
+    let request = match wl_data_offer::req::receive(offer, mime_type, host_end) {
+        Ok(request) => request,
+        Err(e) => {
+            log::warn!("Dropping an oversized clipboard MIME type: {e}");
+            return;
+        }
+    };
+    debug!("Pumping clipboard data of host offer {offer} as {mime_type:?}");
+    pump_slot.start(async move {
+        match pump(virtwl_pipe, fd).await {
+            Ok(()) => debug!("Clipboard pump finished"),
+            Err(e) => error!("Clipboard pump error: {}", e),
+        }
+    });
+    ctx.send_host(request);
+}
+
+/// The host's events of a source the proxy carries for a data-control
+/// client go to that client (`handler::data_control`); the others are
+/// forwarded.
+impl wl_data_source::WlDataSourceHandler for Handlers {
+    fn on_send(
+        ctx: &mut Context,
+        sender: EventSender,
+        mime_type: &String,
+        fd: BorrowedFd<'_>,
+    ) -> Action {
+        data_control::host_send(ctx, sender, mime_type, fd)
+    }
+
+    fn on_cancelled(ctx: &mut Context, sender: EventSender) -> Action {
+        data_control::host_cancelled(ctx, sender)
+    }
+}
 
 /// How many bytes a clipboard pump reads at a time.
 const PUMP_BUFFER_LEN: usize = 64 * 1024;

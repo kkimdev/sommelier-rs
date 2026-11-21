@@ -236,6 +236,7 @@ Sommelier reads the command line and the variables once, at startup.
 | `--local-compositor PATH` | Reach a compositor socket on this machine instead, for debugging. It cannot be combined with `--virtio-wl`. |
 | `--gpu-accel` | Copy guest `wl_shm` buffers into host dma-bufs when VirtWL can allocate them (see [Scope and limitations](#scope-and-limitations)). |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
+| `--no-data-control` | Do not offer `ext-data-control-v1`. It is offered by default, so a client without keyboard focus, such as `wl-copy`, `wl-paste` or Orca's copy buttons, can set and read the ChromeOS clipboard while a window of this display has the focus; with a ChromeOS window focused, a read finds the clipboard empty and a copy is cancelled. Any client that reaches the socket can then read and replace the clipboard without the focus; see [data-control](docs/DESIGN.md#data-control) for why that is offered by default. |
 | `$XDG_CONFIG_HOME/sommelier-rs/window-placement.toml` | Optional bindings for window placement, which is opt-in and experimental: chords that move the focused window to a region of its output's work area. Without the file, placement is off. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md), which owns the contract. |
 
 ## CI and release workflow

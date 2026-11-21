@@ -20,6 +20,7 @@ use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
 use crate::handler::Handlers;
+use crate::protocols::ext_data_control_v1::ext_data_control_manager_v1;
 use crate::protocols::gtk::gtk_shell1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
@@ -344,6 +345,9 @@ pub(crate) const fn policy(iface: Iface) -> Policy {
         Iface::ZcrTextInputExtensionV1 => Policy::BindInternal(Internal::TextInputExtension),
         // Advertised by the proxy for `zaura_shell`.
         Iface::GtkShell1 => Policy::Synthetic,
+        // Advertised by the proxy for `zcr_keyboard_extension_v1`, with
+        // data-control on.
+        Iface::ExtDataControlManagerV1 => Policy::Synthetic,
         // No globals.
         Iface::WlDisplay
         | Iface::WlRegistry
@@ -378,7 +382,10 @@ pub(crate) const fn policy(iface: Iface) -> Policy {
         | Iface::ZauraSurface
         | Iface::ZauraOutput
         | Iface::ZauraToplevel
-        | Iface::ZauraPopup => Policy::Hide,
+        | Iface::ZauraPopup
+        | Iface::ExtDataControlDeviceV1
+        | Iface::ExtDataControlSourceV1
+        | Iface::ExtDataControlOfferV1 => Policy::Hide,
     }
 }
 
@@ -1072,13 +1079,28 @@ fn text_input_extension_global(
 
 /// A host `zcr_keyboard_extension_v1` global, hidden from the guest and a
 /// candidate for the proxy's own binding.
+///
+/// With data-control on, the guest is offered the proxy's
+/// `ext_data_control_manager_v1` under its name: the manager needs no host
+/// global of its own (`handler::data_control`), and every Exo has this
+/// one, which the guest never sees, so its removal stays paired.
 fn keyboard_extension_global(
     ctx: &mut Context,
     registry: HostId,
     name: u32,
     version: u32,
 ) -> Action {
-    hide_global(ctx, registry, name);
+    if ctx.data_control.is_on() {
+        advertise_synthetic_global(
+            ctx,
+            registry,
+            name,
+            ext_data_control_manager_v1::NAME,
+            ext_data_control_manager_v1::VERSION,
+        );
+    } else {
+        hide_global(ctx, registry, name);
+    }
     add_candidate(ctx, Singleton::KeyboardExtension, name, version);
     dropped(ensure_bound(ctx, Singleton::KeyboardExtension))
 }
@@ -1325,6 +1347,11 @@ impl wl_registry::WlRegistryHandler for Handlers {
             // ID to that host ID would overwrite the previous manager's
             // reverse mapping and allow one manager's destroy to unregister
             // the shared host object.
+            ctx.shadow_table
+                .create_local(*guest_new_id, interface, *version);
+            return;
+        } else if interface == Iface::ExtDataControlManagerV1 {
+            // The proxy implements data-control itself.
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
             return;

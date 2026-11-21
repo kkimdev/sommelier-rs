@@ -23,6 +23,7 @@ the listed commit of this repository.
 | `text-input-extension-unstable-v1.xml` | Chromium Exo (`zcr_text_input_extension_v1`) | Unknown (v11) | `16463fc` |
 | `aura-shell.xml` | Chromium Exo (`zaura_shell`) | Unknown (v38) | `439a872` |
 | `gtk-shell.xml` | Subset of GTK's `gtk_shell1`, as ChromiumOS Sommelier carries it | Unknown (v1) | `600fdf7` |
+| `ext-data-control-v1.xml` | wayland-protocols `staging/ext-data-control/` | wayland-protocols 1.45, unchanged through 1.49 | `98f411a` |
 
 ChromiumOS Sommelier carries copies of the Chromium and GTK files in
 [`vm_tools/sommelier/protocol/`](https://chromium.googlesource.com/chromiumos/platform2/+/main/vm_tools/sommelier/protocol/).

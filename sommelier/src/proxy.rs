@@ -17,6 +17,7 @@ limitations under the License.
 use crate::allocator::{PendingFence, VirtGpuNode};
 use crate::client_kind;
 use crate::connection::{LastSubmission, OutgoingMessages, WaylandConnection};
+use crate::handler::data_control::{ClipboardHub, Mailbox};
 use crate::placement_config::{self, PlacementConfig};
 use crate::settings::{HostTransport, Settings};
 use crate::state::{ConnectionFacts, Context, GuestId, HostId, SessionEnd};
@@ -240,6 +241,7 @@ impl Client {
         // directions. This gives host input (keyboard/IME) a bounded wait even
         // while a large client render burst is being drained.
         let mut prefer_host = true;
+        let mailbox = self.ctx.data_control.mailbox();
         loop {
             let buffered_direction = match self.next_buffered_direction(prefer_host) {
                 Ok(direction) => direction,
@@ -285,6 +287,9 @@ impl Client {
                 () = ParkedRequest::due(self.parked.as_ref()) => {
                     if !self.handle_msgs(Direction::ClientToHost).await { break; }
                     prefer_host = true;
+                }
+                () = Mailbox::ready(mailbox.as_deref()) => {
+                    if !self.handle_deliveries().await { break; }
                 }
             }
         }
@@ -568,6 +573,49 @@ impl Client {
         success
     }
 
+    /// Handle what other connections delivered through the clipboard hub
+    /// (`handler::data_control`), as one batch of its own, and send what it
+    /// gives each peer. Returns whether the session goes on.
+    async fn handle_deliveries(&mut self) -> bool {
+        let Some(mailbox) = self.ctx.data_control.mailbox() else {
+            return true;
+        };
+        if self.ended || !self.flush().await {
+            return false;
+        }
+        let mut out = dispatch::Outbox {
+            to_host: &mut self.to_host,
+            to_guest: &mut self.to_guest,
+        };
+        let mut end = None;
+        while let Some(delivery) = mailbox.take() {
+            end = dispatch::deliver(&mut self.ctx, delivery, &mut out);
+            if end.is_some() {
+                break;
+            }
+        }
+        if let Some(end) = &end {
+            self.to_guest
+                .push(crate::handler::display::session_error(end));
+        }
+        // A delivery is no message of either peer's, so a trace records
+        // only what it sends; a replay cannot repeat it, and refuses a
+        // trace of a connection with data-control (`proxy::replay`).
+        if let Some(trace) = &mut self.trace {
+            trace.record_since(Stream::ToHost, &self.to_host, 0);
+            trace.record_since(Stream::ToGuest, &self.to_guest, 0);
+            trace.flush();
+        }
+        self.ctx.end_batch();
+        #[cfg(test)]
+        if end.is_none() {
+            crate::test_support::counting::uncounted(|| self.ctx.assert_no_orphans());
+        }
+        let sent = self.flush().await;
+        self.ended |= end.is_some();
+        sent && end.is_none()
+    }
+
     /// Send all the output the batches dispatched so far left for either
     /// peer, as `run` does before it waits and when the session ends, and
     /// `handle_msgs` before a batch in the other direction or after
@@ -594,6 +642,8 @@ struct Shared {
     placement: PlacementConfig,
     /// Where each connection's traffic is recorded, if it is.
     traces: Option<Traces>,
+    /// The clipboard state the connections share, with data-control on.
+    clipboard: Option<ClipboardHub>,
 }
 
 impl Shared {
@@ -605,6 +655,7 @@ impl Shared {
             virtgpu: VirtGpuNode::new(settings.drm_device.clone()),
             placement: placement_config::load_and_watch(&settings),
             traces: settings.trace_dir.clone().and_then(Traces::new),
+            clipboard: settings.data_control.then(ClipboardHub::default),
             settings,
         }
     }
@@ -752,6 +803,7 @@ async fn start_client(stream: UnixStream, shared: &Shared) -> io::Result<()> {
             .wheel_from_touchpad
             .decide(pid, client_kind::is_wine_process),
         placement: shared.placement.clone(),
+        clipboard: shared.clipboard.clone(),
     };
     let ctx = Context::new(Rc::clone(&shared.settings), facts);
     let trace = shared.traces.as_ref().and_then(|traces| traces.start(&ctx));
@@ -1131,6 +1183,7 @@ mod tests {
             virtgpu: VirtGpuNode::absent_for_test(),
             placement: PlacementConfig::for_test(),
             traces: None,
+            clipboard: None,
         }
     }
 

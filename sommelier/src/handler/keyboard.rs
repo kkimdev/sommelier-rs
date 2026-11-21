@@ -395,6 +395,8 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
         surface: EventObject,
         keys: &[u8],
     ) -> Action {
+        ctx.data_control.note_serial(serial);
+        ctx.data_control.claim_focus();
         // The generated dispatcher resolved `surface` to a live guest
         // surface (`ShadowTable::event_object`): an enter of a surface the
         // guest destroyed, whose host ID stays mapped until the host's
@@ -490,6 +492,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
         serial: u32,
         surface: EventObject,
     ) -> Action {
+        ctx.data_control.focus_left();
         // The dispatcher resolved `surface` to a live guest surface, as for
         // `enter`.
         let host_keyboard_id = sender.host;
@@ -530,6 +533,7 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
         key: u32,
         state: u32,
     ) -> Action {
+        ctx.data_control.note_serial(serial);
         let keyboard = sender.host;
         log::trace!(
             ">>> wl_keyboard.on_key: host_kb={}, serial={}, key={}, state={}",

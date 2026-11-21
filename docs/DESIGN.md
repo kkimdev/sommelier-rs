@@ -258,8 +258,9 @@ The table's API keeps those entries consistent by construction:
 - **Constructors** create an object with all its facts, under IDs that
   nothing holds: `create_paired` (and `create_bridged`, for a v3 text
   input backed by a v1 host object), `adopt_host_created` for an object a
-  host event created, `create_local`, `create_host_only` and
-  `create_display`.
+  host event created, `create_local` (and `create_local_server_with`, for
+  one the proxy creates in an event, under a server ID, which ends
+  without a `delete_id`), `create_host_only` and `create_display`.
 - **Transitions** are named after what happened and change both sides at
   once: `guest_destroyed`, `guest_destroyed_in_use`,
   `guest_ended_host_kept`, `guest_ended_host_destroyed`,
@@ -331,7 +332,7 @@ object's table entry instead ([Object ends](#object-ends)).
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`); `shm::ShmFormats`; each `wl_shm`, `wl_shm_pool` and `wp_viewport`'s entry |
 | Dma-buf | `linux_dmabuf.rs` | `linux_dmabuf::Dmabuf` (capabilities), each params, factory and feedback object's entry, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (pointer focus); `sommelier/src/keys` (the keyboard core: the keyboard focus, one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
-| Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
+| Clipboard | `data_device.rs` (including `pump`), `data_control.rs` (the guest's `ext_data_control_v1`) | `ClipboardPumps` in `state.rs`; `data_control::DataControl`, and the `ClipboardHub` every connection shares |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs`, each GTK shell and surface's entry |
 | Window placement | `window_placement.rs` | `window_placement.rs` |
@@ -582,6 +583,45 @@ and pumps what the host writes into the guest's descriptor.
 it gives a `PumpSlot`, the only way to start one, while fewer than
 `MAX_CLIPBOARD_PUMPS` are in flight, and aborts them all when the
 connection ends.
+
+### Data-control
+
+The guest is offered `ext_data_control_v1`, unless `--no-data-control`
+turns it off, which
+`handler/data_control.rs` implements through another connection, the one
+whose keyboard has the focus (INVARIANTS "A data-control selection is set
+by the focused connection, or cancelled" and "A data-control device reads
+the clipboard only while a focused connection vouches for it"); its
+module docs own the mechanism. It is the one state connections share beyond `Shared`'s
+settings and resources: `proxy::run` makes one `ClipboardHub`, each
+`Context` joins it as it is built and leaves it as it drops, and
+`Client::run` waits on the connection's `Mailbox` beside its peers and
+handles each delivery as a transaction of its own
+(`proxy::dispatch::deliver`).
+
+It lets any client that can reach the socket set and read the ChromeOS
+clipboard without the focus, while a guest window has it, which is why
+it is on by default only after weighing who can reach the socket:
+
+- Other users cannot: the socket is in the user's `XDG_RUNTIME_DIR`,
+  which only the user can enter.
+- A process of the user's that can connect to the user's sockets there
+  can already run anything as the user, outside any sandbox it is in,
+  through the session bus beside it (`systemd-run --user`). So the
+  sandboxes of agent CLIs gain nothing: Claude Code's denies Unix
+  sockets, Codex's denies `connect` while it denies the network, and
+  either, once it allows them, reaches the bus.
+- A sandbox that exposes the Wayland socket alone and filters the bus,
+  as Flatpak does, is the one that data-control would widen. Flatpak
+  marks such connections through `wp_security_context_v1`, which the
+  proxy does not implement yet ([HANDOVER](../HANDOVER.md)).
+- Telling a sandboxed process from `/proc` (`NoNewPrivs`, seccomp,
+  namespaces) is not done: hardened services look sandboxed, snaps and
+  some sandboxes do not, and a connection made outside a sandbox can be
+  handed into it.
+
+`--no-data-control` is for a user who wants the focus to gate the
+clipboard.
 
 ## Keyboard and IME
 
