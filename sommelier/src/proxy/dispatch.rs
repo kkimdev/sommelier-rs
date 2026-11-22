@@ -426,6 +426,7 @@ fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
 mod tests {
     use super::*;
     use crate::protocols::wayland::wl_display;
+    use crate::test_support::TestConnection;
     use crate::wire::WL_DISPLAY_ID;
 
     /// Dispatch the guest's `message` through the core alone, with no
@@ -446,7 +447,7 @@ mod tests {
     /// not have ends the session and queues nothing.
     #[test]
     fn a_frame_dispatches_without_a_connection() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         ctx.shadow_table.create_display();
         let (mut to_host, mut to_guest) = Default::default();
         let mut out = Outbox {

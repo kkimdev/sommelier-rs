@@ -215,8 +215,9 @@ mod tests {
     use crate::protocols::wayland::{wl_registry, wl_surface};
     use crate::protocols::AnyRequest;
     use crate::proxy::harness::{GtkShell, Object, Session};
-    use crate::settings::Settings;
-    use crate::state::{Context, GuestId};
+    use crate::test_support::TestConnection;
+
+    use crate::state::GuestId;
     use crate::wire::Outgoing;
 
     /// The VM the guest runs in, which namespaces its application IDs.
@@ -233,17 +234,15 @@ mod tests {
     impl Gtk {
         /// A session with placement off.
         async fn new() -> Self {
-            Self::with(PlacementConfig::for_test(), true).await
+            Self::with(PlacementConfig::default(), true).await
         }
 
         /// A session under `placement` whose surface is a toplevel if
         /// `toplevel`.
         async fn with(placement: PlacementConfig, toplevel: bool) -> Self {
-            let settings = Settings {
-                vm_id: VM.to_string(),
-                ..Settings::for_test()
-            };
-            let mut s = Session::with_context(Context::for_test(settings, placement));
+            let mut connection = TestConnection::default().placement(placement);
+            connection.settings.vm_id = VM.to_string();
+            let mut s = Session::with_context(connection.context());
             let gtk = s.gtk_shell(zaura_shell::VERSION).await;
             let surface = if toplevel {
                 let toplevel = s.toplevel().await;
@@ -387,8 +386,8 @@ mod tests {
     #[tokio::test]
     async fn dbus_application_id_is_namespaced_on_aura_surface() {
         for (case, placement, toplevel) in [
-            ("toplevel", PlacementConfig::for_test(), true),
-            ("no role", PlacementConfig::for_test(), false),
+            ("toplevel", PlacementConfig::default(), true),
+            ("no role", PlacementConfig::default(), false),
             ("placement on", PlacementConfig::active_for_test(&[]), true),
         ] {
             let mut g = Gtk::with(placement, toplevel).await;

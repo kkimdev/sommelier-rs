@@ -379,10 +379,11 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestConnection;
 
     /// A test's connection.
     fn ctx() -> Context {
-        Context::new_for_test(false, false, Vec::new())
+        TestConnection::default().context()
     }
 
     /// Each connection gets a trace file of its own, which only the user
@@ -495,12 +496,9 @@ mod tests {
     /// before the fact existed states its connection as it was.
     #[test]
     fn data_control_is_a_fact_only_when_it_is_on() {
-        let facts = crate::state::ConnectionFacts {
-            clipboard: Some(crate::handler::data_control::ClipboardHub::default()),
-            ..crate::state::ConnectionFacts::for_test()
-        };
-        let settings = std::rc::Rc::new(crate::settings::Settings::for_test());
-        let ctx = Context::new(settings, facts);
+        let mut connection = TestConnection::default();
+        connection.facts.clipboard = Some(crate::handler::data_control::ClipboardHub::default());
+        let ctx = connection.context();
         let facts = Facts::of(&ctx).to_string();
         assert_eq!(
             facts,

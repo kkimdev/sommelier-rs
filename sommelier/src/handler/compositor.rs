@@ -419,7 +419,6 @@ impl WlSubsurfaceHandler for Handlers {}
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::handler::test_support::{toplevel_ctx, SURFACE};
     use crate::handler::viewport::Viewport;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
@@ -432,8 +431,10 @@ mod tests {
     use crate::protocols::Iface;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{PlaneFenceForTest, RenderBufferUse};
+    use crate::state::RenderBufferUse;
+    use crate::test_support::connection::sync_file_planes;
     use crate::test_support::text_input::{self, Host};
+    use crate::test_support::TestConnection;
     use crate::test_support::{queued_headers, shm_pool_file, BufferKind, BUFFER_KINDS};
     use crate::wire::{Outgoing, WireId, WL_DISPLAY_ID};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
@@ -491,7 +492,12 @@ mod tests {
 
     impl Screen {
         async fn new() -> Self {
-            let mut s = Session::with_context(Context::new_for_test(true, false, Vec::new()));
+            Self::with(TestConnection::default()).await
+        }
+
+        /// [`Self::new`], of `connection` with GPU access.
+        async fn with(connection: TestConnection) -> Self {
+            let mut s = Session::with_context(connection.gpu_accel().context());
             let surface = s.surface().await;
             let shm = s.bind("wl_shm", wl_shm::VERSION).await;
             let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await.id;
@@ -897,11 +903,10 @@ mod tests {
     /// pending state would have lost.
     #[tokio::test]
     async fn a_commit_waits_for_a_pending_fence_before_it_changes_anything() {
-        let mut sc = Screen::new().await;
+        // The plane stands in for its own sync_file, which no peer can
+        // provide.
+        let mut sc = Screen::with(TestConnection::default().plane_fences(sync_file_planes)).await;
         let surface = sc.surface;
-        // Injects what no peer can provide: the plane stands in for its own
-        // sync_file, which a readable pipe is once the guest GPU is done.
-        sc.s.ctx().plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
         let (fence, signal) = crate::test_support::pipe();
         let buffer = sc.s.native_buffer(sc.dmabuf, fence, 2, 2).await;
         sc.attach(surface, Some(buffer)).await;
@@ -1549,19 +1554,24 @@ mod tests {
     /// `wl_surface.offset` sets an offset without an attach.
     #[test]
     fn offset_without_explicit_damage_does_not_invent_host_damage() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        crate::handler::test_support::add_surface(&mut ctx);
-        ctx.surface_for_test(SURFACE.guest_id())
-            .offset_for_test(3, 0);
+        let mut ctx = TestConnection::default().context();
+        let surface = GuestId::for_test(100);
+        let version = wl_surface::VERSION;
+        let host = ctx
+            .shadow_table
+            .create_paired(surface, Iface::WlSurface, version, version);
+        ctx.create_surface(surface);
+        let state = ctx.surface_mut(surface).expect("the surface's state");
+        state.offset_for_test(3, 0);
         let sender = ctx
             .shadow_table
-            .resolve_request(SURFACE.guest)
+            .resolve_request(surface.wire())
             .expect("the surface");
 
         assert_eq!(Handlers::on_commit(&mut ctx, sender), Action::Drop);
         assert_eq!(
             queued_headers(ctx.host_queue_for_test()),
-            [(SURFACE.host, REQ_COMMIT)],
+            [(host.wire(), REQ_COMMIT)],
             "offset-only state must not manufacture a damage request"
         );
     }
@@ -2840,25 +2850,34 @@ mod tests {
     #[test]
     fn wl_surface_destroy_repairs_only_text_inputs_on_the_stale_surface() {
         let (g, h) = (GuestId::for_test, HostId::for_test);
-        let mut ctx = toplevel_ctx();
-        let destroyed_surface = SURFACE.guest_id();
+        let mut ctx = TestConnection::default().context();
+        let mut pair = |guest, interface: Iface| {
+            let version = interface.version();
+            ctx.shadow_table
+                .create_paired(guest, interface, version, version)
+        };
+        let destroyed_surface = g(100);
         let replacement_surface = g(101);
-        let replacement_host_surface = h(201);
         let seat_with_replacement = g(1);
         let seat_without_owner = g(3);
         let stale_with_replacement = g(700);
         let healthy_on_replacement = g(710);
         let stale_without_owner = g(720);
-
-        for (guest_seat, host_seat) in [(seat_with_replacement, h(2)), (seat_without_owner, h(4))] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest_seat, host_seat, Iface::WlSeat);
+        pair(destroyed_surface, Iface::WlSurface);
+        let replacement_host_surface = pair(replacement_surface, Iface::WlSurface);
+        for seat in [seat_with_replacement, seat_without_owner] {
+            pair(seat, Iface::WlSeat);
         }
-        ctx.shadow_table.insert_paired_for_test(
-            replacement_surface,
-            replacement_host_surface,
-            Iface::WlSurface,
-        );
+        for text_input in [
+            stale_with_replacement,
+            healthy_on_replacement,
+            stale_without_owner,
+        ] {
+            pair(text_input, Iface::ZwpTextInputV3);
+        }
+        for surface in [destroyed_surface, replacement_surface] {
+            ctx.create_surface(surface);
+        }
         crate::handler::keyboard::for_test::focus(
             &mut ctx,
             900,
@@ -2866,30 +2885,22 @@ mod tests {
             replacement_surface,
             replacement_host_surface,
         );
-        for (guest_text_input, host_object, state) in [
+        for (guest_text_input, state) in [
             (
                 stale_with_replacement,
-                h(701),
                 composing(h(702), seat_with_replacement, destroyed_surface),
             ),
             // Only the first is enabled: one text input on a connection can
             // be.
             (
                 healthy_on_replacement,
-                h(711),
                 disabled(h(712), seat_with_replacement, replacement_surface),
             ),
             (
                 stale_without_owner,
-                h(721),
                 disabled(h(722), seat_without_owner, destroyed_surface),
             ),
         ] {
-            ctx.shadow_table.insert_paired_for_test(
-                guest_text_input,
-                host_object,
-                Iface::ZwpTextInputV3,
-            );
             text_input::insert(&mut ctx, guest_text_input, state);
         }
         // A peek of the keyboard on the replacement surface.
@@ -2910,7 +2921,7 @@ mod tests {
         assert!(state.pending);
         let healthy = text_input::snapshot(&ctx, healthy_on_replacement);
         let mut destroy =
-            crate::wire::WireMessage::new(SURFACE.guest, wl_surface::REQ_DESTROY, &[]);
+            crate::wire::WireMessage::new(destroyed_surface.wire(), wl_surface::REQ_DESTROY, &[]);
         let forward = crate::test_support::dispatch_request(&mut ctx, &mut destroy);
         assert_eq!(crate::test_support::raw_dispatch(forward), Ok(None));
 

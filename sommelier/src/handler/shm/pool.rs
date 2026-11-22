@@ -352,7 +352,8 @@ mod tests {
     use crate::protocols::wayland::{wl_display, wl_registry, wl_shm, wl_shm_pool};
     use crate::protocols::AnyRequest;
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{Context, GuestId};
+    use crate::state::GuestId;
+    use crate::test_support::TestConnection;
     use crate::test_support::{decoded, raw_dispatch, shm_pool_file};
     use crate::wire::{Outgoing, WireMessage, WL_DISPLAY_ID};
     use std::fs::File;
@@ -627,7 +628,7 @@ mod tests {
     /// destructor, so only a direct dispatch reaches the v2 release.
     #[test]
     fn synthetic_shm_release_clears_cache_before_guest_id_reuse() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = TestConnection::default().context();
         let guest_shm = GuestId::for_test(20);
         let optional_format = 0x3631_4752;
         record_host_shm_wl_format(&mut ctx, optional_format);

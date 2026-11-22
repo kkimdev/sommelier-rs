@@ -31,6 +31,8 @@ mod xdg_roles;
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::io;
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -38,7 +40,7 @@ use tokio::task::JoinSet;
 pub(crate) use self::aura_surfaces::AuraSurfaces;
 pub(crate) use self::host_mapping::{HostMapping, Rows};
 use self::render::RenderBufferRegistry;
-use crate::allocator::{PendingFence, VirtGpuDevice};
+use crate::allocator::{DmabufFence, PendingFence, PlaneFences, VirtGpuDevice};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, ProtocolError, ToGuest, ToHost};
 use log::{debug, error, warn};
@@ -144,18 +146,6 @@ pub(crate) struct FenceWait {
     /// How long the message may wait, counted from the first time it does,
     /// before its session ends.
     pub(crate) timeout: std::time::Duration,
-}
-
-/// The fence a test's pipe plane stands in for
-/// ([`Context::plane_fences_for_test`]).
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PlaneFenceForTest {
-    /// The plane is its own sync_file.
-    SyncFile,
-    /// The virtio-gpu fallback, which reports a busy buffer and nothing to
-    /// wait on.
-    Busy,
 }
 
 /// The most clipboard transfers one connection may have in flight.
@@ -281,11 +271,8 @@ pub struct Context {
     settings: Rc<Settings>,
     /// The process's virtio-gpu render node, shared by every client.
     virtgpu: Option<Arc<VirtGpuDevice>>,
-    /// Test-only: what each native buffer plane stands in for. No test can
-    /// make a dma-buf whose fence is pending, so a pipe stands in, pending
-    /// until it is readable (see `handler::linux_dmabuf::plane_fence`).
-    #[cfg(test)]
-    pub plane_fences_for_test: Option<PlaneFenceForTest>,
+    /// How it asks whether the guest GPU has finished writing a plane.
+    plane_fences: PlaneFences,
     /// This connection's VirtWL channel to the host, if it has one.
     virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
     /// The SHM formats the host reported.
@@ -511,13 +498,6 @@ impl Context {
         self.to_host.clear();
     }
 
-    /// Bind host object `id` as the internal `zaura_shell` at the vendored
-    /// protocol's version, as the registry would.
-    #[cfg(test)]
-    pub(crate) fn bind_aura_shell_for_test(&mut self, id: HostId) {
-        self.globals.bind_for_test(Singleton::AuraShell, id);
-    }
-
     /// A dispatch batch ended: each owner of state scoped to a batch resets
     /// it here, the one place the loop calls.
     pub(crate) fn end_batch(&mut self) {
@@ -634,13 +614,6 @@ impl Context {
         }
     }
 
-    /// The state of `surface`, created if a test sets it up without a
-    /// `create_surface`.
-    #[cfg(test)]
-    pub(crate) fn surface_for_test(&mut self, surface: GuestId) -> &mut SurfaceState {
-        self.surfaces.entry(surface).or_default()
-    }
-
     /// Lose the state of every surface, a fault no peer can cause.
     #[cfg(test)]
     pub(crate) fn lose_surfaces_for_test(&mut self) {
@@ -715,14 +688,6 @@ impl Context {
     pub(crate) fn host_buffer_use(&self, guest_buffer_id: GuestId) -> Option<RenderBufferUse> {
         let host_id = self.render_buffer_host_id(guest_buffer_id)?;
         self.render_buffers.lifecycle(host_id)?.use_state().cloned()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: GuestId) -> bool {
-        let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
-            return false;
-        };
-        self.render_buffers.submit(host_id)
     }
 
     pub(crate) fn mark_buffer_released(&mut self, guest_buffer_id: GuestId) -> bool {
@@ -853,6 +818,7 @@ impl Context {
         let ConnectionFacts {
             virtwl,
             virtgpu,
+            plane_fences,
             wheel,
             placement,
             clipboard,
@@ -874,8 +840,7 @@ impl Context {
             wait: None,
             settings,
             virtgpu,
-            #[cfg(test)]
-            plane_fences_for_test: None,
+            plane_fences,
             virtwayland_channel: virtwl,
             shm_formats: Default::default(),
             globals: Default::default(),
@@ -897,43 +862,6 @@ impl Context {
         }
     }
 
-    /// A test's connection: [`Settings::for_test`] with the given switches
-    /// and host accelerators, and [`ConnectionFacts::for_test`].
-    #[cfg(test)]
-    pub fn new_for_test(
-        gpu_accel: bool,
-        xdg_decoration: bool,
-        accelerators: Vec<crate::accelerator::Accelerator>,
-    ) -> Self {
-        let settings = Settings {
-            gpu_accel,
-            xdg_decoration,
-            host_accelerators: accelerators.into(),
-            ..Settings::for_test()
-        };
-        Self::new(Rc::new(settings), ConnectionFacts::for_test())
-    }
-
-    /// A test's connection with the placement configuration `placement`,
-    /// for example `PlacementConfig::active_for_test`.
-    #[cfg(test)]
-    pub(crate) fn with_placement_for_test(placement: PlacementConfig) -> Self {
-        Self::for_test(Settings::for_test(), placement)
-    }
-
-    /// A test's connection with `settings` and the placement
-    /// configuration `placement`.
-    #[cfg(test)]
-    pub(crate) fn for_test(settings: Settings, placement: PlacementConfig) -> Self {
-        Self::new(
-            Rc::new(settings),
-            ConnectionFacts {
-                placement,
-                ..ConnectionFacts::for_test()
-            },
-        )
-    }
-
     /// The process's settings.
     pub(crate) fn settings(&self) -> &Settings {
         &self.settings
@@ -942,6 +870,12 @@ impl Context {
     /// The process's virtio-gpu render node, if it has opened.
     pub(crate) fn virtgpu(&self) -> Option<&VirtGpuDevice> {
         self.virtgpu.as_deref()
+    }
+
+    /// Whether the guest GPU has finished writing native buffer plane
+    /// `plane`, asked without waiting.
+    pub(crate) fn plane_fence(&self, plane: BorrowedFd<'_>) -> io::Result<DmabufFence> {
+        (self.plane_fences)(plane, self.virtgpu())
     }
 
     /// This connection's VirtWL channel to the host, if it has one.
@@ -965,16 +899,6 @@ impl Context {
         self.window_placement.as_ref()?.rect(binding)
     }
 
-    /// Where the placement bound to `chord` puts the focused window.
-    #[cfg(test)]
-    pub(crate) fn placement_rect_for(
-        &self,
-        chord: &crate::accelerator::Accelerator,
-    ) -> Option<crate::window_layout::NormalizedRect> {
-        let binding = self.window_placement.as_ref()?.binding_for(chord)?;
-        self.placement_rect(binding)
-    }
-
     /// This connection's placement state, while placement is on for it.
     pub(crate) fn placement(&self) -> Option<&PlacementState> {
         Some(&self.window_placement.as_ref()?.state)
@@ -994,6 +918,11 @@ pub(crate) struct ConnectionFacts {
     pub(crate) virtwl: Option<Arc<VirtWaylandChannel>>,
     /// The process's virtio-gpu render node, if it has opened.
     pub(crate) virtgpu: Option<Arc<VirtGpuDevice>>,
+    /// How it asks whether the guest GPU has finished writing a native
+    /// buffer's plane: `allocator::dmabuf_fence`, which a test's connection
+    /// replaces for a plane no test can make, a dma-buf whose fence is
+    /// pending.
+    pub(crate) plane_fences: PlaneFences,
     /// Whether its client gets wheel steps from touchpad scrolling.
     pub(crate) wheel: crate::client_kind::WheelClient,
     /// The process's window placement configuration.
@@ -1009,29 +938,34 @@ pub(crate) struct ConnectionFacts {
 }
 
 #[cfg(test)]
-impl ConnectionFacts {
-    /// A test connection's: no VirtWL channel or render node, no wheel
-    /// steps, and placement off.
-    pub(crate) fn for_test() -> Self {
-        Self {
-            virtwl: None,
-            virtgpu: None,
-            wheel: crate::client_kind::WheelClient::No,
-            placement: PlacementConfig::for_test(),
-            clipboard: None,
-            sandbox_listeners: None,
-            sandboxed: false,
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::handler::linux_dmabuf::{ParamsData, PendingParam};
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
     use crate::protocols::wayland::{wl_keyboard, wl_shm};
     use crate::protocols::Iface;
+    use crate::test_support::TestConnection;
     use std::os::fd::OwnedFd;
+
+    impl Context {
+        /// Record guest buffer `guest_buffer_id` as submitted to the host,
+        /// as a commit that shows it does.
+        fn mark_buffer_submitted(&mut self, guest_buffer_id: GuestId) -> bool {
+            let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
+                return false;
+            };
+            self.render_buffers.submit(host_id)
+        }
+
+        /// Where the placement bound to `chord` puts the focused window.
+        fn placement_rect_for(
+            &self,
+            chord: &crate::accelerator::Accelerator,
+        ) -> Option<crate::window_layout::NormalizedRect> {
+            let binding = self.window_placement.as_ref()?.binding_for(chord)?;
+            self.placement_rect(binding)
+        }
+    }
 
     fn alt_q() -> crate::accelerator::Accelerator {
         crate::accelerator::parse_accelerator("<Alt>q").unwrap()
@@ -1046,7 +980,9 @@ mod tests {
         let dir = crate::test_support::TempDir::new("context-placement-file");
         let path = dir.path().join("window-placement.toml");
         let (mut file, placement) = crate::placement_config::BindingsFile::loaded_for_test(&path);
-        let before = Context::with_placement_for_test(placement.clone());
+        let before = TestConnection::default()
+            .placement(placement.clone())
+            .context();
         assert!(before.placement().is_none());
 
         dir.write(
@@ -1054,7 +990,9 @@ mod tests {
             b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
         );
         file.reload();
-        let after = Context::with_placement_for_test(placement.clone());
+        let after = TestConnection::default()
+            .placement(placement.clone())
+            .context();
         assert!(after.placement().is_some());
         let left = crate::window_layout::NormalizedRect::preset("left");
         assert_eq!(after.placement_rect_for(&alt_q()), left);
@@ -1068,14 +1006,16 @@ mod tests {
         file.reload();
         assert_eq!(after.placement_rect_for(&alt_q()), None);
         assert!(after.placement().is_some());
-        assert!(Context::with_placement_for_test(placement)
+        assert!(TestConnection::default()
+            .placement(placement)
+            .context()
             .placement()
             .is_none());
     }
 
     #[test]
     fn retiring_a_destroyed_host_object_requires_a_live_host_only_object() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let host_id = ctx.shadow_table.create_host_only(Iface::WlShmPool, 1);
         ctx.retire_destroyed_host_object(host_id);
         assert!(ctx.shadow_table.is_retired_host(host_id));
@@ -1090,7 +1030,7 @@ mod tests {
     /// `delete_id` for one is ignored: the live object keeps its data.
     #[test]
     fn an_ignored_delete_id_keeps_a_live_objects_data() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         // The host allocates IDs from the server range, which the proxy's
         // allocator never holds, so a `delete_id` for one is ignored.
         let host = HostId::for_test(0xff00_0000);
@@ -1185,15 +1125,16 @@ mod tests {
         let identities = files.each_ref().map(|file| fd_identity(file.as_raw_fd()));
         let [first, second, third, pending] = files.map(OwnedFd::from);
 
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = TestConnection::default().context();
         let (guest, host) = (GuestId::for_test(5), HostId::for_test(5));
         ctx.send_host(wl_shm::req::create_pool(host, host, first, 4));
         for keymap in [second, third] {
             ctx.send_guest(wl_keyboard::evt::keymap(guest, 1, keymap, 0));
         }
-        let (params, host_params) = (GuestId::for_test(7), HostId::for_test(7));
+        let params = GuestId::for_test(7);
+        let version = zwp_linux_buffer_params_v1::VERSION;
         ctx.shadow_table
-            .insert_paired_for_test(params, host_params, Iface::ZwpLinuxBufferParamsV1);
+            .create_paired(params, Iface::ZwpLinuxBufferParamsV1, version, version);
         let planes = ParamsData::Open(vec![PendingParam {
             fd: pending,
             plane_idx: 0,
@@ -1215,11 +1156,11 @@ mod tests {
 
     #[test]
     fn host_buffer_use_is_an_exclusive_phase() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let buffer = GuestId::for_test(20);
-        let host_buffer = HostId::for_test(40);
-        ctx.shadow_table
-            .insert_paired_for_test(buffer, host_buffer, Iface::WlBuffer);
+        let host_buffer = ctx
+            .shadow_table
+            .create_paired(buffer, Iface::WlBuffer, 1, 1);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert_eq!(
@@ -1264,11 +1205,11 @@ mod tests {
 
     #[test]
     fn same_buffer_reattach_does_not_create_a_detached_use() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let buffer = GuestId::for_test(20);
-        let host_buffer = HostId::for_test(40);
-        ctx.shadow_table
-            .insert_paired_for_test(buffer, host_buffer, Iface::WlBuffer);
+        let host_buffer = ctx
+            .shadow_table
+            .create_paired(buffer, Iface::WlBuffer, 1, 1);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1278,11 +1219,11 @@ mod tests {
 
     #[test]
     fn release_clears_the_detached_latch_before_a_new_submit() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let buffer = GuestId::for_test(20);
-        let host_buffer = HostId::for_test(40);
-        ctx.shadow_table
-            .insert_paired_for_test(buffer, host_buffer, Iface::WlBuffer);
+        let host_buffer = ctx
+            .shadow_table
+            .create_paired(buffer, Iface::WlBuffer, 1, 1);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1300,16 +1241,13 @@ mod tests {
 
     #[test]
     fn failed_attachment_replacement_mutates_neither_buffer_generation() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let old = GuestId::for_test(20);
-        let old_host = HostId::for_test(40);
-        let new = GuestId::for_test(21);
-        let new_host = HostId::for_test(41);
-        for (guest, host) in [(old, old_host), (new, new_host)] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest, host, Iface::WlBuffer);
+        let mut ctx = TestConnection::default().context();
+        let [(old, _), (new, new_host)] = [20, 21].map(|guest| {
+            let guest = GuestId::for_test(guest);
+            let host = ctx.shadow_table.create_paired(guest, Iface::WlBuffer, 1, 1);
             assert!(ctx.register_native_buffer(host, (1, 1), Vec::new()));
-        }
+            (guest, host)
+        });
         assert!(ctx.mark_buffer_submitted(old));
         assert!(ctx.render_buffers.mark_host_destroy_queued(new_host));
 
@@ -1440,21 +1378,13 @@ mod tests {
 
     #[test]
     fn surface_attachment_requires_both_exact_render_generations() {
-        let previous_guest = GuestId::for_test(20);
-        let previous_host = HostId::for_test(40);
-        let next_guest = GuestId::for_test(21);
-        let next_host = HostId::for_test(41);
-        let unregistered_guest = GuestId::for_test(22);
-        let unregistered_host = HostId::for_test(42);
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        for (guest, host) in [
-            (previous_guest, previous_host),
-            (next_guest, next_host),
-            (unregistered_guest, unregistered_host),
-        ] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest, host, Iface::WlBuffer);
-        }
+        let mut ctx = TestConnection::default().context();
+        let [(previous_guest, previous_host), (next_guest, next_host), (unregistered_guest, _)] =
+            [20, 21, 22].map(|guest| {
+                let guest = GuestId::for_test(guest);
+                let host = ctx.shadow_table.create_paired(guest, Iface::WlBuffer, 1, 1);
+                (guest, host)
+            });
         assert!(ctx.register_native_buffer(previous_host, (1, 1), Vec::new()));
         assert!(ctx.register_native_buffer(next_host, (1, 1), Vec::new()));
         assert!(ctx.mark_buffer_submitted(previous_guest));

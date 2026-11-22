@@ -313,7 +313,7 @@ mod tests {
     /// valid as it connected; off holds nothing.
     #[test]
     fn placement_is_on_only_under_valid_bindings() {
-        assert!(WindowPlacement::connect(PlacementConfig::for_test()).is_none());
+        assert!(WindowPlacement::connect(PlacementConfig::default()).is_none());
         assert!(WindowPlacement::connect(PlacementConfig::active_for_test(&[])).is_some());
     }
 

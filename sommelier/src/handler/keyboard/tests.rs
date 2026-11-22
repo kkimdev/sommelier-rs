@@ -34,6 +34,7 @@ use crate::protocols::wayland::{
 use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
+use crate::test_support::TestConnection;
 use crate::wire::WL_DISPLAY_ID;
 use xkb::keysyms;
 use xkbcommon::xkb;
@@ -191,13 +192,18 @@ impl Kb {
 
     /// `k`'s focus is on the surface.
     async fn new() -> Self {
-        Self::focused(Context::new_for_test(false, false, Vec::new())).await
+        Self::focused(TestConnection::default().context()).await
     }
 
     /// [`Self::new`] with host accelerators `spec`.
     async fn with_accelerators(spec: &str) -> Self {
         let accelerators = crate::accelerator::parse_accelerators(spec).unwrap();
-        Self::focused(Context::new_for_test(false, false, accelerators)).await
+        Self::focused(
+            TestConnection::default()
+                .accelerators(accelerators)
+                .context(),
+        )
+        .await
     }
 
     async fn focused(ctx: Context) -> Self {
@@ -864,7 +870,7 @@ async fn chord_classification_follows_the_configuration() {
     let alt_q = active(&[("<Alt>q", "top-left")]);
     let control_q = active(&[("<Control>q", "top-left")]);
     // Placement is off, so nothing is bound.
-    let off = (none(), PlacementConfig::for_test());
+    let off = (none(), PlacementConfig::default());
     let host = crate::accelerator::HostAccelerators::parse("<Control>a").unwrap();
     let both = (
         host.clone(),
@@ -890,11 +896,9 @@ async fn chord_classification_follows_the_configuration() {
         (&both, CONTROL, KEY_Z, Class::Guest),
     ];
     for ((host_accelerators, placement), modifiers, key, class) in cases {
-        let settings = crate::settings::Settings {
-            host_accelerators: host_accelerators.clone(),
-            ..crate::settings::Settings::for_test()
-        };
-        let ctx = Context::for_test(settings, placement.clone());
+        let mut connection = TestConnection::default().placement(placement.clone());
+        connection.settings.host_accelerators = host_accelerators.clone();
+        let ctx = connection.context();
         let (mut kb, _) = Kb::placing(ctx, true).await;
         let w = kb.window().await;
         kb.modifiers(modifiers).await;
@@ -912,7 +916,12 @@ async fn chord_classification_follows_the_configuration() {
 #[tokio::test]
 async fn a_key_forms_no_chord_without_a_keymap_or_beyond_the_keycode_range() {
     let accelerators = crate::accelerator::parse_accelerators("a").unwrap();
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, accelerators)).await;
+    let mut kb = Kb::unfocused(
+        TestConnection::default()
+            .accelerators(accelerators)
+            .context(),
+    )
+    .await;
     let id = kb.s.new_id();
     let host =
         kb.s.create(wl_seat::req::get_keyboard(kb.seat.id, id))
@@ -934,7 +943,9 @@ async fn a_key_forms_no_chord_without_a_keymap_or_beyond_the_keycode_range() {
 
 /// The `<Alt>q=top-left` placement, which is on.
 fn top_left() -> Context {
-    Context::with_placement_for_test(PlacementConfig::active_for_test(&[("<Alt>q", "top-left")]))
+    TestConnection::default()
+        .placement(PlacementConfig::active_for_test(&[("<Alt>q", "top-left")]))
+        .context()
 }
 
 /// A placement configuration whose bindings come from a file in `dir`,
@@ -1005,7 +1016,7 @@ async fn a_skipped_placement_still_consumes_its_chord() {
             PlacementSkip::NoFocusedToplevel => Kb::placing(top_left(), true).await.0,
             PlacementSkip::RectNotRepresentable => {
                 let placement = file_placement(&dir, sliver_binding).1;
-                let ctx = Context::with_placement_for_test(placement);
+                let ctx = TestConnection::default().placement(placement).context();
                 let mut kb = Kb::placing(ctx, true).await.0;
                 kb.window().await;
                 kb
@@ -1060,7 +1071,11 @@ async fn a_skipped_placement_still_consumes_its_chord() {
 async fn a_bindings_file_edit_takes_effect_on_the_next_press() {
     let dir = crate::test_support::TempDir::new("keyboard-shortcut-reload");
     let (mut file, placement) = file_placement(&dir, b"version = 1\n");
-    let (mut kb, _) = Kb::placing(Context::with_placement_for_test(placement), true).await;
+    let (mut kb, _) = Kb::placing(
+        TestConnection::default().placement(placement).context(),
+        true,
+    )
+    .await;
     let w = kb.window().await;
     kb.modifiers(ALT).await;
     assert_eq!(
@@ -1518,7 +1533,7 @@ fn a_host_without_the_keyboard_extension_warns_once_per_process() {
             runtime.block_on(async {
                 // The host has the extension, but no enter has bound the
                 // keyboard's extended keyboard yet.
-                let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+                let mut kb = Kb::unfocused(TestConnection::default().context()).await;
                 let press = wl_keyboard::evt::key(kb.k.host, 1, 1, KEY_A, PRESSED);
                 kb.s.host([press]).await;
                 assert_eq!(
@@ -1676,7 +1691,12 @@ async fn an_undefined_key_state_reaches_no_peer() {
 #[tokio::test]
 async fn the_extended_keyboard_acks_keys_from_the_first_enter_until_the_keyboard_ends() {
     let accelerators = crate::accelerator::parse_accelerators("<Control>a").unwrap();
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, accelerators)).await;
+    let mut kb = Kb::unfocused(
+        TestConnection::default()
+            .accelerators(accelerators)
+            .context(),
+    )
+    .await;
 
     // Before its first enter, a key has no extended keyboard to ack it.
     let press = wl_keyboard::evt::key(kb.k.host, 1, 1, KEY_B, PRESSED);
@@ -1866,7 +1886,12 @@ async fn a_rejected_keymap_keeps_held_keys() {
 #[tokio::test]
 async fn modifiers_sent_before_enter_survive_it() {
     let accelerators = crate::accelerator::parse_accelerators("<Alt>q").unwrap();
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, accelerators)).await;
+    let mut kb = Kb::unfocused(
+        TestConnection::default()
+            .accelerators(accelerators)
+            .context(),
+    )
+    .await;
     kb.modifiers(ALT).await;
     let enter = wl_keyboard::evt::enter(kb.k.host, 2, kb.surface.host, &[]).unwrap();
     kb.s.host([enter]).await;
@@ -1910,7 +1935,7 @@ async fn modifiers_survive_a_focus_change() {
 /// sends before it, if at all.
 #[tokio::test]
 async fn every_forwarded_enter_is_followed_by_the_keyboards_modifiers() {
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    let mut kb = Kb::unfocused(TestConnection::default().context()).await;
     let (_, other) = kb.s.keyboard().await;
     kb.modifiers(ALT).await;
 
@@ -1962,7 +1987,12 @@ async fn modifiers_carry_over_to_a_new_keymap() {
 #[tokio::test]
 async fn modifiers_sent_before_the_keymap_apply_to_it() {
     let accelerators = crate::accelerator::parse_accelerators("<Alt>q").unwrap();
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, accelerators)).await;
+    let mut kb = Kb::unfocused(
+        TestConnection::default()
+            .accelerators(accelerators)
+            .context(),
+    )
+    .await;
     let id = kb.s.new_id();
     let host =
         kb.s.create(wl_seat::req::get_keyboard(kb.seat.id, id))
@@ -1986,7 +2016,7 @@ async fn modifiers_sent_before_the_keymap_apply_to_it() {
 /// apply them to, as every batch checks.
 #[tokio::test]
 async fn modifiers_without_a_keymap_end_with_their_keyboard() {
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    let mut kb = Kb::unfocused(TestConnection::default().context()).await;
     let id = kb.s.new_id();
     let host =
         kb.s.create(wl_seat::req::get_keyboard(kb.seat.id, id))
@@ -2008,7 +2038,7 @@ async fn modifiers_without_a_keymap_end_with_their_keyboard() {
 
 #[tokio::test]
 async fn keyboard_enter_initializes_held_key_state() {
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    let mut kb = Kb::unfocused(TestConnection::default().context()).await;
     let keys = BACKSPACE.to_ne_bytes();
     let enter = wl_keyboard::evt::enter(kb.k.host, 1, kb.surface.host, &keys).unwrap();
     kb.s.host([enter]).await;
@@ -2213,7 +2243,7 @@ async fn matching_leave_uses_stored_host_surface_after_mapping_is_unavailable() 
 /// keyboard.
 #[tokio::test]
 async fn delayed_enter_for_pending_destroy_surface_does_not_revive_focus() {
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    let mut kb = Kb::unfocused(TestConnection::default().context()).await;
     let surface = kb.surface;
     kb.s.guest([wl_surface::req::destroy(surface.id)]).await;
     let destroy = wl_surface::Request::Destroy {};
@@ -2237,7 +2267,7 @@ async fn delayed_enter_for_pending_destroy_surface_does_not_revive_focus() {
 /// keyboard.
 #[tokio::test]
 async fn enter_without_keyboard_route_has_no_extension_side_effects() {
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    let mut kb = Kb::unfocused(TestConnection::default().context()).await;
     kb.s.guest([wl_keyboard::req::release(kb.k.id)]).await;
     let release = wl_keyboard::Request::Release {};
     assert_eq!(kb.s.host_received(), [(kb.k.host, release.into())]);
@@ -3118,7 +3148,7 @@ async fn a_recovered_key_pressed_again_after_a_detach_reaches_the_guest() {
 #[tokio::test]
 async fn a_key_held_since_enter_is_pressed_anew_after_a_detach() {
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    let mut kb = Kb::unfocused(TestConnection::default().context()).await;
     let keys = KEY_A.to_ne_bytes();
     let enter = wl_keyboard::evt::enter(kb.k.host, 1, kb.surface.host, &keys).unwrap();
     kb.s.host([enter]).await;

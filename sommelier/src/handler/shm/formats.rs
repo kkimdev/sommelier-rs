@@ -186,7 +186,8 @@ mod tests {
     use crate::protocols::wayland::{wl_registry, wl_shm, wl_shm_pool};
     use crate::protocols::AnyEvent;
     use crate::proxy::harness::Session;
-    use crate::state::{Context, GuestId};
+    use crate::state::GuestId;
+    use crate::test_support::TestConnection;
     use crate::test_support::{decoded, shm_pool_file};
 
     const RGB565: u32 = wl_shm::FORMAT_RGB565;
@@ -287,7 +288,7 @@ mod tests {
     /// guest's `wl_shm` only with a VirtWL channel, which no session has.
     #[test]
     fn source_separated_host_formats_survive_single_source_removal() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = TestConnection::default().context();
         let guest_shm = GuestId::for_test(20);
         let format = 0x3631_4752;
         register_guest_shm(&mut ctx, guest_shm, 1, 10);
@@ -330,7 +331,7 @@ mod tests {
     /// DRM code the host's linux-dmabuf reports counts only with VirtWL.
     #[test]
     fn drm_fourcc_capability_maps_to_wayland_shm_format() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = TestConnection::default().context();
         record_host_shm_drm_format(&mut ctx, 0x3432_5241); // DRM ARGB8888
         record_host_shm_drm_format(&mut ctx, 0x3432_5258); // DRM XRGB8888
 
@@ -344,7 +345,7 @@ mod tests {
     /// wl_shm lists it, even if the host's linux-dmabuf takes it.
     #[tokio::test]
     async fn without_virtwl_guest_shm_offers_only_the_host_wl_shm_formats() {
-        let mut s = Session::with_context(Context::new_for_test(true, false, vec![]));
+        let mut s = Session::with_context(TestConnection::default().gpu_accel().context());
         let registry = s.registry().await;
         let (shm_name, host_shm) = shm_global(&mut s).await;
         let shm = bind_shm(&mut s, registry.id, shm_name).await;

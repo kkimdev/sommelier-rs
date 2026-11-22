@@ -294,7 +294,7 @@ mod tests {
     use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{GtkShell, Object, Session};
-    use crate::state::Context;
+    use crate::test_support::TestConnection;
 
     /// A kind of object the proxy gives a host Aura child.
     #[derive(Clone, Copy, Debug)]
@@ -323,7 +323,8 @@ mod tests {
         /// The proxy binds `zaura_shell` at `version`.
         async fn new(version: u32) -> Self {
             let placement = PlacementConfig::active_for_test(&[]);
-            let mut s = Session::with_context(Context::with_placement_for_test(placement));
+            let mut s =
+                Session::with_context(TestConnection::default().placement(placement).context());
             let registry = s.registry().await;
             let gtk = s.gtk_shell(version).await;
             let wm_base = s.bind(xdg_wm_base::NAME, xdg_wm_base::VERSION).await;

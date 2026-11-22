@@ -158,6 +158,7 @@ mod tests {
     use crate::protocols::wayland::{wl_keyboard, wl_output, wl_surface};
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
+    use crate::test_support::TestConnection;
 
     /// The guest's `delete_id` of `id`.
     fn deleted(id: u32) -> (u32, AnyEvent) {
@@ -216,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn a_host_destroyed_output_is_forgotten() {
         let placement = PlacementConfig::active_for_test(&[]);
-        let mut s = Session::with_context(Context::with_placement_for_test(placement));
+        let mut s = Session::with_context(TestConnection::default().placement(placement).context());
         let registry = s.registry().await;
         let shell = s.aura_shell().await;
         let name = s.advertise("wl_output", 3).await;

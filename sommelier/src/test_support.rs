@@ -21,7 +21,9 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
+pub(crate) use connection::TestConnection;
 
+pub(crate) mod connection;
 pub(crate) mod counting;
 pub(crate) mod text_input;
 pub(crate) mod trace;

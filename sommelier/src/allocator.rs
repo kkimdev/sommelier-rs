@@ -701,6 +701,11 @@ fn dmabuf_sync_capability_unavailable(error: &io::Error) -> bool {
     )
 }
 
+/// How a connection asks whether the guest GPU has finished writing one
+/// plane of a native buffer, given the process's render node: with
+/// [`dmabuf_fence`] (`ConnectionFacts::plane_fences`).
+pub(crate) type PlaneFences = fn(BorrowedFd<'_>, Option<&VirtGpuDevice>) -> io::Result<DmabufFence>;
+
 /// Whether a guest dma-buf's outstanding writers have completed, asked
 /// without waiting.
 ///

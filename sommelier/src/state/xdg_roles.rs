@@ -151,18 +151,6 @@ impl XdgRoles {
         ended
     }
 
-    /// Record a whole toplevel role in one call.
-    #[cfg(test)]
-    pub(crate) fn add_toplevel_role_for_test(
-        &mut self,
-        xdg_surface: GuestId,
-        wl_surface: GuestId,
-        xdg_toplevel: GuestId,
-    ) {
-        self.add_xdg_surface(xdg_surface, wl_surface);
-        self.add_toplevel(xdg_surface, xdg_toplevel);
-    }
-
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.by_xdg_surface.is_empty()

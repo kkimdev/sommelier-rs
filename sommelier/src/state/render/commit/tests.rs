@@ -18,6 +18,28 @@ use super::super::{BufferRect, ViewportState, MAX_PENDING_DAMAGE_RECTS};
 use super::*;
 use crate::protocols::wayland::wl_output::Transform;
 
+impl SurfaceState {
+    /// Show `buffer_id` of `dimensions` as the committed contents, or
+    /// contents with no buffer whose size stays valid.
+    fn set_current_buffer_for_test(
+        &mut self,
+        buffer_id: Option<GuestId>,
+        dimensions: Option<(i32, i32)>,
+    ) {
+        self.current.content = buffer_id
+            .map(|buffer_id| SurfaceContentSnapshot {
+                buffer_id: Some(buffer_id),
+                dimensions,
+            })
+            .or_else(|| {
+                dimensions.map(|dimensions| SurfaceContentSnapshot {
+                    buffer_id: None,
+                    dimensions: Some(dimensions),
+                })
+            });
+    }
+}
+
 /// The buffer the surface shows before each commit, 8x6 pixels.
 const SHOWN: GuestId = GuestId::for_test(1);
 /// A buffer a commit attaches.

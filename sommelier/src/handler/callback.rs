@@ -105,7 +105,8 @@ mod tests {
     use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::Session;
-    use crate::state::Context;
+    use crate::test_support::TestConnection;
+
     use crate::wire::WL_DISPLAY_ID;
 
     /// The callback of a `wl_display.sync` the host got from the proxy.
@@ -163,7 +164,7 @@ mod tests {
     #[tokio::test]
     async fn internal_dmabuf_callback_completes_its_own_global() {
         let dmabuf = zwp_linux_dmabuf_v1::NAME;
-        let mut ctx = Context::new_for_test(true, false, vec![]);
+        let mut ctx = TestConnection::default().gpu_accel().context();
         // Stands in for a virtio-gpu render node, which the proxy
         // synthesizes feedback for and a test cannot have.
         ctx.dmabuf.set_feedback_available_for_test(true);
