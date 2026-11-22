@@ -19,6 +19,13 @@ limitations under the License.
 use super::*;
 use crate::accelerator::parse_accelerator;
 
+/// The default XKB keymap, as a host keyboard of a test sends it.
+fn default_keymap() -> xkb::Keymap {
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let flags = xkb::KEYMAP_COMPILE_NO_FLAGS;
+    xkb::Keymap::new_from_names(&context, "", "", "", "", None, flags).expect("the default keymap")
+}
+
 const KEYBOARD: HostId = HostId::for_test(100);
 const GUEST_KEYBOARD: GuestId = GuestId::for_test(10);
 /// The guest keyboard of [`OTHER`].
@@ -91,7 +98,7 @@ fn core(accelerators: &str, env: &TestEnv) -> KeyboardCore {
         },
         KeyInput::Keymap {
             keyboard: KEYBOARD,
-            keymap: Some(crate::keymap::default_for_test()),
+            keymap: Some(default_keymap()),
         },
         KeyInput::Created {
             keyboard: OTHER,
@@ -104,7 +111,7 @@ fn core(accelerators: &str, env: &TestEnv) -> KeyboardCore {
         },
         KeyInput::Keymap {
             keyboard: OTHER,
-            keymap: Some(crate::keymap::default_for_test()),
+            keymap: Some(default_keymap()),
         },
         KeyInput::Enter {
             keyboard: KEYBOARD,

@@ -16,6 +16,17 @@ limitations under the License.
 
 use super::*;
 
+impl KeyGenerationRegistry {
+    /// Observe one physical state notification from either keyboard channel.
+    ///
+    /// Both channels describe the same hardware generation, so a release from
+    /// either one closes physical state. Guest-delivery ownership remains until
+    /// its corresponding channel consumes the release.
+    fn observe_physical_state(&mut self, keyboard: HostId, key: u32, state: KeyState) {
+        self.observe_physical_event(keyboard, key, state, None);
+    }
+}
+
 #[test]
 fn ime_repeat_lease_is_generation_and_keyboard_scoped() {
     let keyboard_a = HostId::for_test(10);

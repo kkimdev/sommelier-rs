@@ -122,14 +122,6 @@ impl Keymap {
     }
 }
 
-/// The default XKB keymap, as a host keyboard of a test sends it.
-#[cfg(test)]
-pub(crate) fn default_for_test() -> xkb::Keymap {
-    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let flags = xkb::KEYMAP_COMPILE_NO_FLAGS;
-    xkb::Keymap::new_from_names(&context, "", "", "", "", None, flags).expect("the default keymap")
-}
-
 /// X11's `IsModifierKey`: Shift to Hyper, the ISO lock and level keys,
 /// Mode_switch and Num_Lock.
 fn is_modifier_keysym(sym: u32) -> bool {

@@ -330,12 +330,6 @@ impl Globals {
             );
         }
     }
-
-    /// The names of the singleton candidates, for a test.
-    #[cfg(test)]
-    pub(crate) fn singleton_candidates_for_test(&self) -> Vec<u32> {
-        self.singleton_candidates.keys().copied().collect()
-    }
 }
 
 /// A global forwarded whatever the settings, offered at most at `ceiling`,
@@ -1662,6 +1656,13 @@ mod tests {
     use crate::state::{Context, GuestId, Singleton};
     use crate::test_support::TestConnection;
     use crate::wire::{Action, Outgoing, WireId, WL_DISPLAY_ID};
+
+    impl super::Globals {
+        /// The names of the singleton candidates.
+        fn singleton_candidates_for_test(&self) -> Vec<u32> {
+            self.singleton_candidates.keys().copied().collect()
+        }
+    }
 
     /// How many IDs the guest skips before its first object. The proxy
     /// allocates host IDs densely from the bottom, so without the gap a

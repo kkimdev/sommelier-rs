@@ -668,25 +668,6 @@ impl SurfaceState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_current_buffer_for_test(
-        &mut self,
-        buffer_id: Option<GuestId>,
-        dimensions: Option<(i32, i32)>,
-    ) {
-        self.current.content = buffer_id
-            .map(|buffer_id| SurfaceContentSnapshot {
-                buffer_id: Some(buffer_id),
-                dimensions,
-            })
-            .or_else(|| {
-                dimensions.map(|dimensions| SurfaceContentSnapshot {
-                    buffer_id: None,
-                    dimensions: Some(dimensions),
-                })
-            });
-    }
-
     /// The buffer a pending attach names, if one does.
     pub(crate) fn pending_buffer_id(&self) -> Option<GuestId> {
         self.pending.attachment.buffer_id()

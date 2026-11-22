@@ -690,14 +690,6 @@ impl Context {
         self.render_buffers.lifecycle(host_id)?.use_state().cloned()
     }
 
-    #[cfg(test)]
-    pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: GuestId) -> bool {
-        let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
-            return false;
-        };
-        self.render_buffers.submit(host_id)
-    }
-
     pub(crate) fn mark_buffer_released(&mut self, guest_buffer_id: GuestId) -> bool {
         let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
             return false;
@@ -907,16 +899,6 @@ impl Context {
         self.window_placement.as_ref()?.rect(binding)
     }
 
-    /// Where the placement bound to `chord` puts the focused window.
-    #[cfg(test)]
-    pub(crate) fn placement_rect_for(
-        &self,
-        chord: &crate::accelerator::Accelerator,
-    ) -> Option<crate::window_layout::NormalizedRect> {
-        let binding = self.window_placement.as_ref()?.binding_for(chord)?;
-        self.placement_rect(binding)
-    }
-
     /// This connection's placement state, while placement is on for it.
     pub(crate) fn placement(&self) -> Option<&PlacementState> {
         Some(&self.window_placement.as_ref()?.state)
@@ -964,6 +946,26 @@ mod tests {
     use crate::protocols::Iface;
     use crate::test_support::TestConnection;
     use std::os::fd::OwnedFd;
+
+    impl Context {
+        /// Record guest buffer `guest_buffer_id` as submitted to the host,
+        /// as a commit that shows it does.
+        fn mark_buffer_submitted(&mut self, guest_buffer_id: GuestId) -> bool {
+            let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
+                return false;
+            };
+            self.render_buffers.submit(host_id)
+        }
+
+        /// Where the placement bound to `chord` puts the focused window.
+        fn placement_rect_for(
+            &self,
+            chord: &crate::accelerator::Accelerator,
+        ) -> Option<crate::window_layout::NormalizedRect> {
+            let binding = self.window_placement.as_ref()?.binding_for(chord)?;
+            self.placement_rect(binding)
+        }
+    }
 
     fn alt_q() -> crate::accelerator::Accelerator {
         crate::accelerator::parse_accelerator("<Alt>q").unwrap()

@@ -239,12 +239,6 @@ impl PlacementConfig {
         self.0.borrow().as_ref()?.rect(binding)
     }
 
-    /// Where `chord` places the focused window under the current bindings.
-    #[cfg(test)]
-    pub(crate) fn rect_for(&self, chord: &Accelerator) -> Option<NormalizedRect> {
-        self.rect(self.binding_for(chord)?)
-    }
-
     /// Make `bindings` the current version, or turn placement off.
     fn publish(&self, bindings: Option<Bindings>) {
         *self.0.borrow_mut() = bindings.map(Rc::new);
@@ -574,6 +568,14 @@ mod tests {
     use crate::test_support::TempDir;
     use std::os::unix::ffi::OsStrExt;
     use xkbcommon::xkb;
+
+    impl PlacementConfig {
+        /// Where `chord` places the focused window under the current
+        /// bindings.
+        fn rect_for(&self, chord: &Accelerator) -> Option<NormalizedRect> {
+            self.rect(self.binding_for(chord)?)
+        }
+    }
 
     const VALID: &str = r#"
 version = 1
