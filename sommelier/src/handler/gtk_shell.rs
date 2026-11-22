@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::aura_objects::native_wayland_app_id;
 use crate::handler::aura_objects::{self, ensure_host_zaura_surface};
-use crate::handler::compositor::native_wayland_app_id;
 use crate::handler::Handlers;
 use crate::protocols::aura_shell::zaura_surface;
 use crate::protocols::gtk::gtk_shell1::{self, GtkShell1Handler};

@@ -415,7 +415,7 @@ fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
         PostDispatch::XdgToplevelCreated {
             xdg_surface,
             xdg_toplevel,
-        } => crate::handler::compositor::record_xdg_toplevel(ctx, xdg_surface, xdg_toplevel),
+        } => crate::handler::xdg_shell::record_xdg_toplevel(ctx, xdg_surface, xdg_toplevel),
         PostDispatch::KeyboardCreated { keyboard, seat } => {
             crate::handler::keyboard::keyboard_created(ctx, keyboard, seat)
         }

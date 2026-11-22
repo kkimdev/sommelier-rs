@@ -99,7 +99,7 @@ object_data! {
     /// A synthetic guest `zwp_linux_dmabuf_feedback_v1`.
     DmabufFeedback(crate::handler::linux_dmabuf::DmabufFeedback) for ZwpLinuxDmabufFeedbackV1,
     /// A guest `wp_viewport`.
-    Viewport(crate::handler::compositor::Viewport) for WpViewport,
+    Viewport(crate::handler::viewport::Viewport) for WpViewport,
     /// A synthetic guest `gtk_shell1`.
     GtkShell(crate::handler::gtk_shell::GtkShell) for GtkShell1,
     /// A synthetic guest `gtk_surface1`.

@@ -34,7 +34,9 @@ pub mod shm;
 pub(crate) mod test_support;
 pub mod text_input;
 pub mod touch;
+pub mod viewport;
 pub mod window_placement;
+pub mod xdg_shell;
 
 /// The proxy's protocol handlers: one stateless type that implements the
 /// generated handler trait of every interface. Each module implements the
