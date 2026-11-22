@@ -36,19 +36,20 @@ reference:
 ## Current release
 
 The current published binary is the
-[`virtwl-v0.4.1` prerelease](https://github.com/kkimdev/sommelier-rs/releases/tag/virtwl-v0.4.1).
+[`virtwl-v0.4.2` prerelease](https://github.com/kkimdev/sommelier-rs/releases/tag/virtwl-v0.4.2).
 
-0.4.1 offers clients `ext-data-control-v1` by default, so a client without
-keyboard focus, such as `wl-copy`, `wl-paste` or Orca's copy buttons, sets
-and reads the ChromeOS clipboard while a window of this display has the
-focus; `--no-data-control` turns it off. A sandboxed client that comes
-through `wp_security_context_v1`, as a Flatpak app does, is not offered it.
+0.4.2 fixes Wayland EGL falling back to software rendering (llvmpipe) with
+`--gpu-accel`: a `wl_display.sync` sent after `get_registry` could get its
+`done` before the linux-dmabuf global the proxy withholds until its
+capabilities are known, and Mesa then gave up on the GPU. A sync now waits
+until that global is shown or hidden. 0.4.1 added `ext-data-control-v1`
+(clipboard without focus, on by default; `--no-data-control` turns it off).
 See [configuration](#configuration).
 
 | Architecture | Binary |
 | --- | --- |
-| x86_64 | `sommelier_rs_virtwl-v0.4.1-x86_64` |
-| aarch64/arm64 | `sommelier_rs_virtwl-v0.4.1-aarch64` |
+| x86_64 | `sommelier_rs_virtwl-v0.4.2-x86_64` |
+| aarch64/arm64 | `sommelier_rs_virtwl-v0.4.2-aarch64` |
 
 Every release also includes `SHA256SUMS`. See
 [CI and release workflow](#ci-and-release-workflow) for how releases are
@@ -81,19 +82,19 @@ sudo apt-get install --yes libgbm1 libxkbcommon0
 For x86_64:
 
 ```bash
-curl -fLO https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.4.1/sommelier_rs_virtwl-v0.4.1-x86_64
-curl -fLO https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.4.1/SHA256SUMS
+curl -fLO https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.4.2/sommelier_rs_virtwl-v0.4.2-x86_64
+curl -fLO https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.4.2/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
-chmod +x sommelier_rs_virtwl-v0.4.1-x86_64
+chmod +x sommelier_rs_virtwl-v0.4.2-x86_64
 ```
 
 For aarch64/arm64, use the `aarch64` asset instead:
 
 ```bash
-curl -fLO https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.4.1/sommelier_rs_virtwl-v0.4.1-aarch64
-curl -fLO https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.4.1/SHA256SUMS
+curl -fLO https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.4.2/sommelier_rs_virtwl-v0.4.2-aarch64
+curl -fLO https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.4.2/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
-chmod +x sommelier_rs_virtwl-v0.4.1-aarch64
+chmod +x sommelier_rs_virtwl-v0.4.2-aarch64
 ```
 
 ### Install with Nix
@@ -114,7 +115,7 @@ The last positional argument is the guest display socket to create. The
 current Crostini setup uses `wayland-2`:
 
 ```bash
-./sommelier_rs_virtwl-v0.4.1-x86_64 \
+./sommelier_rs_virtwl-v0.4.2-x86_64 \
   --virtio-wl /dev/wl0 --gpu-accel wayland-2
 ```
 
@@ -141,7 +142,7 @@ systemctl --user stop sommelier@0 sommelier@1
 Install the binary and the provided template:
 
 ```bash
-install -Dm755 ./sommelier_rs_virtwl-v0.4.1-x86_64 \
+install -Dm755 ./sommelier_rs_virtwl-v0.4.2-x86_64 \
   "${HOME}/.local/bin/sommelier-rs"
 install -Dm644 packaging/systemd/sommelier-rs@.service \
   "${HOME}/.config/systemd/user/sommelier-rs@.service"
@@ -252,8 +253,8 @@ Maintainer releases use tags whose base version matches
 
 ```bash
 git fetch personal virtwl
-git tag -a virtwl-v0.4.1 personal/virtwl -m "Release virtwl-v0.4.1"
-git push personal refs/tags/virtwl-v0.4.1
+git tag -a virtwl-v0.4.2 personal/virtwl -m "Release virtwl-v0.4.2"
+git push personal refs/tags/virtwl-v0.4.2
 ```
 
 The release workflow builds both architectures on the same native runners
