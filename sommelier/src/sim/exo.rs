@@ -628,9 +628,14 @@ pub(crate) struct Exo {
     key_serial: Option<u32>,
     ima: Ima,
     /// Whether the case's input method is a Latin layout, which has no
-    /// engine: IMA then dispatches every key at once, with no callback, no
-    /// confirmation and no lag (`DispatchKeyEvent` without `GetEngine()`).
+    /// engine unless [`Exo::english`]: IMA then dispatches every key at
+    /// once, with no callback, no confirmation and no lag
+    /// (`DispatchKeyEvent` without `GetEngine()`).
     pub(super) latin: bool,
+    /// Whether the Latin layout has an English engine, which handles no
+    /// key ([`super::engine::Engine::english`]): IMA hands it every key as
+    /// it would the Korean one's.
+    pub(super) english: bool,
     /// What Exo handed the engine and no one has taken yet, in order.
     to_engine: Vec<EngineIn>,
     /// The keys the engine has yet to answer, in order.
@@ -710,7 +715,7 @@ impl Exo {
     pub(super) fn key(&mut self, now: Micros, key: Key, state: u32) {
         let pressed = state == wl_keyboard::KEY_STATE_PRESSED;
         let time = millis(now);
-        if self.ima.client.is_none() || self.latin {
+        if self.ima.client.is_none() || self.engineless() {
             let consumed = if pressed {
                 // `Keyboard::OnKeyEvent` passes a press only of a key it
                 // does not hold.
@@ -905,7 +910,7 @@ impl Exo {
     /// engine; the keyboard drops every autorepeat (E7), so otherwise it
     /// goes nowhere. Returns whether the engine got it.
     pub(super) fn autorepeat(&mut self, now: Micros, key: Key) -> bool {
-        if self.ima.client.is_none() || self.latin {
+        if self.ima.client.is_none() || self.engineless() {
             return false;
         }
         let id = self.next_key;
@@ -1742,6 +1747,12 @@ impl Exo {
     fn next_serial(&mut self) -> u32 {
         self.serial += 1;
         self.serial
+    }
+
+    /// Whether the input method has no engine, so that IMA passes each key
+    /// at once ([`Exo::latin`]).
+    fn engineless(&self) -> bool {
+        self.latin && !self.english
     }
 
     /// The extension of text input `id` if it has `confirm_preedit` (v11),
