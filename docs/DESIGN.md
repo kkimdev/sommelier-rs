@@ -158,11 +158,19 @@ it generates:
   `wire::EventId`, the proxy's a `GuestId`, which makes a `wire::ToGuest`.
   A test peer names its objects by their wire `u32`s (see
   [Wire messages](INVARIANTS.md#wire-messages)).
-- Enum constants named `<ENUM>_<ENTRY>`, and `<enum>_since`, the version
-  that introduced a value. A constant is `i32` when an `int` argument of
-  the same protocol file carries its enum and `u32` otherwise, so
-  `wl_output.transform` is `i32` although `preferred_buffer_transform`
-  carries it as a `uint`.
+- Enum constants named `<ENUM>_<ENTRY>`, the wire values. A constant is
+  `i32` when an `int` argument of the same protocol file carries its enum
+  and `u32` otherwise, so `wl_output.transform` is `i32` although
+  `preferred_buffer_transform` carries it as a `uint`.
+- A Rust enum per enum that is not a bitfield (`wl_output::Transform`),
+  which `TryFrom` its wire integer decodes, giving the integer back when
+  the XML does not define it; `From` encodes it back, and `since` is the
+  version that introduced a value. Messages keep their enum arguments as
+  wire integers, so a forward is byte-exact whatever the value. A handler
+  that interprets one decodes it once, at the message, takes an undefined
+  value down the path that message has for it (a protocol error, or
+  ignoring it), and from then on passes and stores the enum. A bitfield
+  keeps its constants alone: every combination of its flags is a value.
 - `*_SINCE` and `VERSION` constants, which version checks and bounds use
   (INVARIANTS "Versions come from the XML or a documented constant").
 - A `NAME` constant, the interface's name. Handlers name an interface

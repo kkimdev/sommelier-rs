@@ -757,8 +757,8 @@ fn guest_xdg_toplevel_states(states: &[u8], guest_version: u32) -> Vec<u8> {
     entries
         .iter()
         .filter(|entry| {
-            let state = u32::from_ne_bytes(**entry);
-            xdg_toplevel::state_since(state).is_some_and(|since| since <= guest_version)
+            xdg_toplevel::State::try_from(u32::from_ne_bytes(**entry))
+                .is_ok_and(|state| state.since() <= guest_version)
         })
         .flatten()
         .copied()
