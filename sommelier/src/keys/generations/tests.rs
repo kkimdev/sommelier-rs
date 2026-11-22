@@ -32,8 +32,8 @@ fn ime_repeat_lease_is_generation_and_keyboard_scoped() {
         outcome: LeaseOutcome::End,
     };
     let mut registry = KeyGenerationRegistry::default();
-    registry.observe_physical_state(keyboard_a, key, 1);
-    registry.observe_physical_state(keyboard_b, key, 1);
+    registry.observe_physical_state(keyboard_a, key, KeyState::Pressed);
+    registry.observe_physical_state(keyboard_b, key, KeyState::Pressed);
 
     // The seat's first keyboard that holds Backspace takes the lease.
     registry.lease(&seat, arm(ti));
@@ -41,7 +41,7 @@ fn ime_repeat_lease_is_generation_and_keyboard_scoped() {
     assert_eq!(registry.backspace_lease(keyboard_b), None);
 
     // A release ends it with the generation.
-    registry.observe_physical_state(keyboard_a, key, 0);
+    registry.observe_physical_state(keyboard_a, key, KeyState::Released);
     assert_eq!(registry.backspace_lease(keyboard_a), None);
     registry.lease(&seat, arm(other));
     assert_eq!(registry.backspace_lease(keyboard_b), Some(other));
@@ -92,7 +92,7 @@ fn assert_verdicts(
 /// A registry whose shortcut consumed the held `key`.
 fn shortcut_consumed(key: u32) -> KeyGenerationRegistry {
     let mut registry = KeyGenerationRegistry::default();
-    registry.observe_physical_state(KEYBOARD_A, key, 1);
+    registry.observe_physical_state(KEYBOARD_A, key, KeyState::Pressed);
     assert_verdicts(
         &mut registry,
         key,
@@ -111,7 +111,7 @@ fn a_shortcut_press_of_another_channels_key_is_that_channels() {
         // `reference` gets a guest press instead of the chord.
         let owned = || {
             let mut registry = KeyGenerationRegistry::default();
-            registry.observe_physical_state(KEYBOARD_A, key, 1);
+            registry.observe_physical_state(KEYBOARD_A, key, KeyState::Pressed);
             assert!(registry.claim_guest_owner(KEYBOARD_A, key, owner));
             registry
         };
@@ -525,11 +525,11 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
             }
         }
 
-        fn admit_key(&mut self, key: u32, state: u32, serial: u32) -> KeyAdmission {
+        fn admit_key(&mut self, key: u32, state: KeyState, serial: u32) -> KeyAdmission {
             let generation = self.keys.get(&key).copied();
             let peek_press_serial = generation.and_then(|generation| generation.peek_press_serial);
             let dropped = KeyAdmission::Settled(KeyVerdict::Decline);
-            if state == 0 {
+            if state == KeyState::Released {
                 if self.retired_guest_releases.get(&key) == Some(&serial) {
                     self.retired_guest_releases.remove(&key);
                     return KeyAdmission::Settled(KeyVerdict::Forward);
@@ -652,11 +652,11 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
 
             match operation {
                 Operation::Press(key) => {
-                    registry.observe_physical_state(keyboard, key, 1);
+                    registry.observe_physical_state(keyboard, key, KeyState::Pressed);
                     model.press(key);
                 }
                 Operation::Release(key) => {
-                    registry.observe_physical_state(keyboard, key, 0);
+                    registry.observe_physical_state(keyboard, key, KeyState::Released);
                     model.release(key, None);
                 }
                 Operation::PeekPress(key, guest_input) => {
@@ -685,8 +685,8 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
                         .and_then(|generation| generation.peek_press_serial)
                         .filter(|_| under_peek)
                         .unwrap_or(serial);
-                    let actual = registry.admit_key(keyboard, key, 1, serial);
-                    assert_eq!(actual, model.admit_key(key, 1, serial));
+                    let actual = registry.admit_key(keyboard, key, KeyState::Pressed, serial);
+                    assert_eq!(actual, model.admit_key(key, KeyState::Pressed, serial));
                 }
                 Operation::AdmitRelease(key, known) => {
                     let generation = model.keys.get(&key);
@@ -697,8 +697,8 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
                         .or(generation.and_then(|generation| generation.physical_release_serial))
                         .filter(|_| known)
                         .unwrap_or(serial);
-                    let actual = registry.admit_key(keyboard, key, 0, serial);
-                    assert_eq!(actual, model.admit_key(key, 0, serial));
+                    let actual = registry.admit_key(keyboard, key, KeyState::Released, serial);
+                    assert_eq!(actual, model.admit_key(key, KeyState::Released, serial));
                 }
                 Operation::EnterSnapshot => {
                     registry.install_enter_snapshot(keyboard, [KEY_B, KEY_A]);
@@ -869,7 +869,7 @@ fn repressed_key_replaces_its_released_peek_generation() {
 
     let first_a = registry.observe_peek_press(keyboard, key_a, 1, 10, false);
     let first_b = registry.observe_peek_press(keyboard, key_b, 2, 20, true);
-    registry.observe_physical_state(keyboard, key_a, 0);
+    registry.observe_physical_state(keyboard, key_a, KeyState::Released);
     assert_eq!(
         registry.peek(keyboard, key_a).map(|peek| peek.sequence),
         Some(first_a),
@@ -948,10 +948,10 @@ fn clearing_guest_keys_is_scoped_to_one_keyboard() {
     assert!(registry.claim_guest_owner(HostId::for_test(10), 57, GuestKeyOwner::ImeRecovery));
     assert!(registry.claim_guest_owner(HostId::for_test(11), 57, GuestKeyOwner::Physical));
     for keyboard in [HostId::for_test(10), HostId::for_test(11)] {
-        registry.observe_physical_state(keyboard, 30, 1);
+        registry.observe_physical_state(keyboard, 30, KeyState::Pressed);
         assert!(registry.claim_guest_owner(keyboard, 30, GuestKeyOwner::Physical));
-        registry.observe_physical_event(keyboard, 30, 0, Some(2));
-        registry.observe_physical_state(keyboard, 30, 1);
+        registry.observe_physical_event(keyboard, 30, KeyState::Released, Some(2));
+        registry.observe_physical_state(keyboard, 30, KeyState::Pressed);
     }
 
     registry.clear_keyboard(HostId::for_test(10));
@@ -978,7 +978,7 @@ fn ending_one_keyboard_repeat_does_not_cancel_another_held_keyboard() {
     let seat = [KEYBOARD_A, KEYBOARD_B];
     let mut registry = KeyGenerationRegistry::default();
     for keyboard in seat {
-        registry.observe_physical_state(keyboard, EVDEV_KEY_BACKSPACE, 1);
+        registry.observe_physical_state(keyboard, EVDEV_KEY_BACKSPACE, KeyState::Pressed);
     }
     let outcome = LeaseOutcome::ArmIfBackspaceHeld;
     registry.lease(

@@ -1654,6 +1654,22 @@ async fn a_repeated_key_state_reaches_no_peer() {
     assert_eq!(kb.key(4, KEY_A, RELEASED).await, Route::Guest);
 }
 
+/// A key or a peek whose state `wl_keyboard.key_state` does not define
+/// reaches no peer and changes nothing of the key, like a repeat.
+#[tokio::test]
+async fn an_undefined_key_state_reaches_no_peer() {
+    let mut kb = Kb::new().await;
+    assert_eq!(kb.key(2, KEY_A, PRESSED).await, Route::Guest);
+    for state in [3, u32::MAX] {
+        let key = wl_keyboard::evt::key(kb.k.host, 3, 3, KEY_A, state);
+        kb.s.host([key]).await;
+        assert_eq!(kb.s.guest_received(), []);
+        assert_eq!(kb.s.host_received(), []);
+        kb.peek(3, 3, KEY_A, state).await;
+    }
+    assert_eq!(kb.key(4, KEY_A, RELEASED).await, Route::Guest);
+}
+
 /// The proxy creates a keyboard's extended keyboard at its first enter
 /// and acks every key through it from then on, even once the host
 /// removed the extension's global, until the keyboard ends.

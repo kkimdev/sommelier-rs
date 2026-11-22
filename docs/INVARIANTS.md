@@ -583,7 +583,8 @@ IDs such as E6, H2 and X2' name the rows and facts of
   of any state but pressed or released, such as a repeat, is dropped
   unacknowledged: `wl_keyboard` has no repeat state below v10, the proxy
   binds `wl_seat` at v5, and Exo drops every repeat.
-  Tests: `a_keysym_reaches_no_peer`, `a_repeated_key_state_reaches_no_peer`.
+  Tests: `a_keysym_reaches_no_peer`, `a_repeated_key_state_reaches_no_peer`,
+  `an_undefined_key_state_reaches_no_peer`.
 - **A recovered key carries the host's serial.** The press and release
   the guest gets for a held key the input method consumed carry the
   serial and time of the key's latest `peek_key`, which the extension

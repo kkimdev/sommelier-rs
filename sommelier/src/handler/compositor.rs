@@ -2895,7 +2895,8 @@ mod tests {
         // A peek of the keyboard on the replacement surface.
         crate::handler::keyboard::for_test::created(&mut ctx, 800, 900, 1);
         crate::handler::keyboard::for_test::extended(&mut ctx, 900, 950);
-        crate::handler::keyboard::for_test::peek(&mut ctx, 950, 1, 30, 1);
+        let pressed = wl_keyboard::KeyState::Pressed;
+        crate::handler::keyboard::for_test::peek(&mut ctx, 950, 1, 30, pressed);
         assert!(
             ctx.keys
                 .focus()

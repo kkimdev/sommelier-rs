@@ -41,7 +41,7 @@ use crate::protocols::keyboard_extension_unstable_v1::{
     zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
 };
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
-use crate::protocols::wayland::wl_keyboard;
+use crate::protocols::wayland::wl_keyboard::{self, KeyState};
 use crate::protocols::AnyEvent;
 use crate::protocols::Iface;
 use crate::state::Singleton;
@@ -221,6 +221,21 @@ pub(crate) fn before_host_event(
     if !decoded_by_its_handler {
         keys(ctx, KeyInput::HostEvent);
     }
+}
+
+/// The state of a host `wl_keyboard.key` or `peek_key`, decoded once. One
+/// that `wl_keyboard.key_state` does not define is dropped, as a host event
+/// the keyboard core does not handle, which a waiting recovery reads
+/// ([`before_host_event`]).
+fn key_state(ctx: &mut Context, event: &str, state: u32) -> Option<KeyState> {
+    let decoded = KeyState::try_from(state).ok();
+    if decoded.is_none() {
+        log::warn!("{event}: received unknown key state {state}, ignoring");
+        if ctx.keys.awaits_host_event() {
+            keys(ctx, KeyInput::HostEvent);
+        }
+    }
+    decoded
 }
 
 /// The keys a `wl_keyboard.enter` lists as held, in the host's order,
@@ -542,11 +557,14 @@ impl wl_keyboard::WlKeyboardHandler for Handlers {
             key,
             state
         );
+        let Some(key_state) = key_state(ctx, "on_key", state) else {
+            return Action::Drop;
+        };
         let input = KeyInput::Key {
             keyboard,
             serial,
             key,
-            state,
+            state: key_state,
         };
         let action = deliver(ctx, input, |_| {
             let guest = sender.guest_id()?;
@@ -644,6 +662,9 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             key,
             state
         );
+        let Some(state) = key_state(ctx, "peek_key", state) else {
+            return Action::Drop;
+        };
         let extended = sender.host;
         let input = KeyInput::Peek {
             extended,
@@ -712,7 +733,7 @@ pub(crate) mod for_test {
 
     /// The `peek_key` of `key` in `state` from extended keyboard
     /// `extended`.
-    pub(crate) fn peek(ctx: &mut Context, extended: u32, serial: u32, key: u32, state: u32) {
+    pub(crate) fn peek(ctx: &mut Context, extended: u32, serial: u32, key: u32, state: KeyState) {
         let extended = HostId::for_test(extended);
         let time = serial;
         let peek = KeyInput::Peek {

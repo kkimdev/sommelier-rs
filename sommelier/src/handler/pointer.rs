@@ -24,7 +24,7 @@ use crate::handler::Handlers;
 use std::collections::BTreeMap;
 
 use crate::client_kind::WheelClient;
-use crate::protocols::wayland::wl_pointer;
+use crate::protocols::wayland::wl_pointer::{self, Axis, AxisSource, ButtonState};
 use crate::state::{Context, EventObject, EventSender, HostId};
 use crate::wire::Action;
 
@@ -70,19 +70,19 @@ impl WheelSteps {
 }
 
 /// One pointer's wheel steps: the source of its current frame and, per
-/// axis (`AXIS_VERTICAL_SCROLL`, `AXIS_HORIZONTAL_SCROLL`), the finger or
-/// continuous distance not yet sent as a step. Pure arithmetic: the
-/// handler feeds it the pointer's events.
+/// axis, the finger or continuous distance not yet sent as a step. Pure
+/// arithmetic: the handler feeds it the pointer's events, decoded.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct WheelStepper {
-    source: Option<u32>,
+    source: Option<AxisSource>,
     remainder: [i64; 2],
 }
 
 impl WheelStepper {
-    /// `wl_pointer.axis_source`: the source of this frame's axes.
-    fn source(&mut self, source: u32) {
-        self.source = Some(source);
+    /// `wl_pointer.axis_source`: the source of this frame's axes, `None`
+    /// for one the protocol does not define.
+    fn source(&mut self, source: Option<AxisSource>) {
+        self.source = source;
     }
 
     /// `wl_pointer.frame`: the next frame names its source anew.
@@ -91,29 +91,34 @@ impl WheelStepper {
     }
 
     /// `wl_pointer.axis_stop`: `axis` starts from nothing again.
-    fn stop(&mut self, axis: u32) {
-        if let Some(remainder) = self.remainder.get_mut(axis as usize) {
-            *remainder = 0;
-        }
+    fn stop(&mut self, axis: Axis) {
+        *self.remainder(axis) = 0;
     }
 
     /// `wl_pointer.axis` of `value` on `axis`: the [`WHEEL_STEP`]s it
     /// crosses, signed like the scroll, if this frame's source is a finger
     /// or continuous and it crosses one. The rest carries over.
-    fn axis(&mut self, axis: u32, value: i32) -> Option<i32> {
-        let continuous = matches!(
+    fn axis(&mut self, axis: Axis, value: i32) -> Option<i32> {
+        if !matches!(
             self.source,
-            Some(wl_pointer::AXIS_SOURCE_FINGER | wl_pointer::AXIS_SOURCE_CONTINUOUS)
-        );
-        let remainder = self
-            .remainder
-            .get_mut(axis as usize)
-            .filter(|_| continuous)?;
+            Some(AxisSource::Finger | AxisSource::Continuous)
+        ) {
+            return None;
+        }
+        let remainder = self.remainder(axis);
         let distance = *remainder + i64::from(value);
         let steps = distance / WHEEL_STEP;
         *remainder = distance - steps * WHEEL_STEP;
         // |steps| <= |value| / WHEEL_STEP + 1, so it fits.
         (steps != 0).then_some(steps as i32)
+    }
+
+    fn remainder(&mut self, axis: Axis) -> &mut i64 {
+        let index = match axis {
+            Axis::VerticalScroll => 0,
+            Axis::HorizontalScroll => 1,
+        };
+        &mut self.remainder[index]
     }
 }
 
@@ -167,7 +172,7 @@ impl wl_pointer::WlPointerHandler for Handlers {
                 .pointers
                 .entry(sender.host)
                 .or_default()
-                .source(axis_source);
+                .source(AxisSource::try_from(axis_source).ok());
         }
         Action::Forward
     }
@@ -180,7 +185,7 @@ impl wl_pointer::WlPointerHandler for Handlers {
     }
 
     fn on_axis_stop(ctx: &mut Context, sender: EventSender, _time: u32, axis: u32) -> Action {
-        if let Some(stepper) = stepper(ctx, sender.host) {
+        if let (Some(stepper), Ok(axis)) = (stepper(ctx, sender.host), Axis::try_from(axis)) {
             stepper.stop(axis);
         }
         Action::Forward
@@ -191,10 +196,11 @@ impl wl_pointer::WlPointerHandler for Handlers {
     /// which the protocol says it precedes. A wheel's `axis` comes with
     /// the host's own `axis_discrete`, and passes as it is.
     fn on_axis(ctx: &mut Context, sender: EventSender, time: u32, axis: u32, value: i32) -> Action {
-        let Some(guest_pointer) = sender.guest_id() else {
+        let (Some(guest_pointer), Ok(scrolled)) = (sender.guest_id(), Axis::try_from(axis)) else {
             return Action::Forward;
         };
-        let Some(steps) = stepper(ctx, sender.host).and_then(|stepper| stepper.axis(axis, value))
+        let Some(steps) =
+            stepper(ctx, sender.host).and_then(|stepper| stepper.axis(scrolled, value))
         else {
             return Action::Forward;
         };
@@ -216,7 +222,7 @@ impl wl_pointer::WlPointerHandler for Handlers {
         state: u32,
     ) -> Action {
         ctx.data_control.note_serial(serial);
-        if state != wl_pointer::BUTTON_STATE_PRESSED {
+        if ButtonState::try_from(state) != Ok(ButtonState::Pressed) {
             return Action::Forward;
         }
         let (Some(surface), Some(guest_pointer)) =
@@ -243,6 +249,7 @@ pub(crate) fn forget_pointer(ctx: &mut Context, pointer: HostId) {
 mod tests {
     use super::WheelStepper;
     use crate::client_kind::WheelClient;
+    use crate::protocols::wayland::wl_pointer::{Axis, AxisSource};
     use crate::protocols::wayland::{wl_pointer, wl_seat, wl_surface};
     use crate::protocols::AnyEvent;
     use crate::proxy::harness::{Object, Session};
@@ -378,6 +385,29 @@ mod tests {
         }
     }
 
+    /// An axis or a source the protocol does not define reaches the guest
+    /// as the host sent it, with no steps, and leaves the rest a defined
+    /// axis kept.
+    #[tokio::test]
+    async fn an_undefined_axis_or_source_gets_no_wheel_steps() {
+        let (mut s, p, _) = scrolling(WheelClient::Yes).await;
+        scroll(&mut s, p, FINGER, VERTICAL, 6, None).await;
+        scroll(&mut s, p, FINGER, 2, 25, None).await;
+        scroll(&mut s, p, 7, VERTICAL, 25, None).await;
+        s.host([
+            wl_pointer::evt::axis_stop(p.host, 7, 2),
+            wl_pointer::evt::frame(p.host),
+        ])
+        .await;
+        let stop = wl_pointer::Event::AxisStop { time: 7, axis: 2 };
+        let frame = wl_pointer::Event::Frame {};
+        assert_eq!(
+            s.guest_received(),
+            [(p.id, stop.into()), (p.id, frame.into())]
+        );
+        scroll(&mut s, p, FINGER, VERTICAL, 4, Some(1)).await; // 10: none left
+    }
+
     /// A client whose process is still being read scrolls as the host
     /// sent it, and nothing waits for the read: its first scroll after the
     /// answer settles whether it gets steps.
@@ -397,19 +427,27 @@ mod tests {
     #[test]
     fn a_stepper_carries_the_rest_over_per_axis() {
         let unit = 256;
+        let (vertical, horizontal) = (Axis::VerticalScroll, Axis::HorizontalScroll);
         let mut stepper = WheelStepper::default();
-        assert_eq!(stepper.axis(VERTICAL, 25 * unit), None, "no source");
-        stepper.source(wl_pointer::AXIS_SOURCE_CONTINUOUS);
-        assert_eq!(stepper.axis(VERTICAL, 25 * unit), Some(2));
-        assert_eq!(stepper.axis(HORIZONTAL, -15 * unit), Some(-1));
-        assert_eq!(stepper.axis(VERTICAL, 5 * unit), Some(1), "5 were left");
-        assert_eq!(stepper.axis(HORIZONTAL, -4 * unit), None, "-9 now");
-        stepper.stop(HORIZONTAL);
-        assert_eq!(stepper.axis(HORIZONTAL, -4 * unit), None, "-4 now");
-        assert_eq!(stepper.axis(HORIZONTAL, -6 * unit), Some(-1));
+        assert_eq!(stepper.axis(vertical, 25 * unit), None, "no source");
+        stepper.source(Some(AxisSource::Continuous));
+        assert_eq!(stepper.axis(vertical, 25 * unit), Some(2));
+        assert_eq!(stepper.axis(horizontal, -15 * unit), Some(-1));
+        assert_eq!(stepper.axis(vertical, 5 * unit), Some(1), "5 were left");
+        assert_eq!(stepper.axis(horizontal, -4 * unit), None, "-9 now");
+        stepper.stop(horizontal);
+        assert_eq!(stepper.axis(horizontal, -4 * unit), None, "-4 now");
+        assert_eq!(stepper.axis(horizontal, -6 * unit), Some(-1));
         stepper.frame();
-        assert_eq!(stepper.axis(VERTICAL, 25 * unit), None, "a new frame");
-        stepper.source(wl_pointer::AXIS_SOURCE_WHEEL);
-        assert_eq!(stepper.axis(VERTICAL, 25 * unit), None, "a wheel");
+        assert_eq!(stepper.axis(vertical, 25 * unit), None, "a new frame");
+        stepper.source(Some(AxisSource::Wheel));
+        assert_eq!(stepper.axis(vertical, 25 * unit), None, "a wheel");
+        stepper.source(Some(AxisSource::Finger));
+        stepper.source(None);
+        assert_eq!(
+            stepper.axis(vertical, 25 * unit),
+            None,
+            "an undefined source"
+        );
     }
 }

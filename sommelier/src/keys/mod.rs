@@ -44,7 +44,7 @@ use xkbcommon::xkb;
 use crate::accelerator::{Accelerator, BindingId, HostAccelerators};
 use crate::ime::{self, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
 use crate::keymap::{KeyboardModifiers, Keymap};
-use crate::protocols::wayland::wl_keyboard::{self, KEY_STATE_PRESSED, KEY_STATE_RELEASED};
+use crate::protocols::wayland::wl_keyboard::{self, KeyState};
 use crate::state::{GuestId, HostId};
 use crate::wire::ToGuest;
 use focus::KeyboardFocusUpdate;
@@ -97,7 +97,7 @@ pub(crate) enum KeyInput {
         keyboard: HostId,
         serial: u32,
         key: u32,
-        state: u32,
+        state: KeyState,
     },
     /// `zcr_extended_keyboard_v1.peek_key` of extended keyboard
     /// `extended`.
@@ -106,7 +106,7 @@ pub(crate) enum KeyInput {
         serial: u32,
         time: u32,
         key: u32,
-        state: u32,
+        state: KeyState,
     },
     /// `zwp_text_input_v1.leave` of the host text input of guest text
     /// input `ti`, if it has one. The IME core hears of it after.
@@ -118,9 +118,10 @@ pub(crate) enum KeyInput {
     /// A `wl_keyboard.modifiers` the proxy drops unhandled, as
     /// [`Self::UnhandledKey`].
     UnhandledModifiers,
-    /// Any other host event, before the proxy handles it. The adapter
-    /// sends these three only while a recovery waits
-    /// ([`KeyboardCore::awaits_host_event`]).
+    /// Any other host event, before the proxy handles it, or a key or a
+    /// peek whose state `wl_keyboard.key_state` does not define, which the
+    /// proxy drops. The adapter sends these three only while a recovery
+    /// waits ([`KeyboardCore::awaits_host_event`]).
     HostEvent,
 
     // The keyboard focus, and what ends. Each moves the focus
@@ -412,7 +413,7 @@ impl KeyboardCore {
                 keyboard,
                 serial,
                 key,
-                state: KEY_STATE_PRESSED,
+                state: KeyState::Pressed,
                 ..
             } => HostSignal::KeyPress {
                 keyboard,
@@ -423,7 +424,7 @@ impl KeyboardCore {
                 extended,
                 serial,
                 key,
-                state: KEY_STATE_PRESSED,
+                state: KeyState::Pressed,
                 ..
             } => {
                 // Any keyboard of the connection: Exo has one seat, which
@@ -489,7 +490,7 @@ impl KeyboardCore {
         keyboard: HostId,
         serial: u32,
         key: u32,
-        state: u32,
+        state: KeyState,
         env: &impl Env,
         fx: &mut KeyEffects,
     ) {
@@ -510,7 +511,7 @@ impl KeyboardCore {
             return;
         }
         let (event, class) = match state {
-            KEY_STATE_PRESSED => {
+            KeyState::Pressed => {
                 if key != EVDEV_KEY_BACKSPACE {
                     self.lease(seat, LeaseInput::OtherPress { keyboard });
                 }
@@ -522,11 +523,11 @@ impl KeyboardCore {
                 };
                 (press, class)
             }
-            KEY_STATE_RELEASED => (PhysicalKey::Release, KeyClass::Guest),
+            KeyState::Released => (PhysicalKey::Release, KeyClass::Guest),
             // Exo sends no repeats, and `wl_keyboard` has none before
             // version 10, beyond the version 5 the proxy binds `wl_seat` at.
-            other => {
-                log::warn!("on_key: received unknown key state {}, ignoring", other);
+            KeyState::Repeated => {
+                log::warn!("on_key: received a repeated key state, ignoring");
                 return;
             }
         };
@@ -537,7 +538,7 @@ impl KeyboardCore {
             // the key to the guest.
             fx.shortcut = Some(Shortcut { keyboard, binding });
         }
-        if state == KEY_STATE_RELEASED && key == EVDEV_KEY_BACKSPACE {
+        if state == KeyState::Released && key == EVDEV_KEY_BACKSPACE {
             self.lease(seat, LeaseInput::BackspaceRelease);
         }
         fx.ack = Some(Ack {
@@ -552,7 +553,7 @@ impl KeyboardCore {
             .get(keyboard)
             .and_then(|record| record.keymap.as_ref())
             .is_some_and(|keymap| keymap.is_modifier(key));
-        if let (true, KEY_STATE_PRESSED, false, Some(seat)) = (fx.deliver, state, modifier, seat) {
+        if let (true, KeyState::Pressed, false, Some(seat)) = (fx.deliver, state, modifier, seat) {
             // The guest may edit its text where Exo does not see.
             fx.ime.push(ime::Input::GuestKey(SeatId(seat)));
         }
@@ -567,7 +568,7 @@ impl KeyboardCore {
         serial: u32,
         time: u32,
         key: u32,
-        state: u32,
+        state: KeyState,
         env: &impl Env,
         fx: &mut KeyEffects,
     ) {
@@ -580,17 +581,17 @@ impl KeyboardCore {
         // Host accelerators and shortcut chords belong to the host and to
         // Sommelier: if a recovery claimed one first, the wl_keyboard press
         // that follows would find the guest already owning it.
-        let class = (state == KEY_STATE_PRESSED).then(|| self.classify(keyboard, key, env));
+        let class = (state == KeyState::Pressed).then(|| self.classify(keyboard, key, env));
         let input = match state {
-            KEY_STATE_PRESSED => PeekInput::Press {
+            KeyState::Pressed => PeekInput::Press {
                 serial,
                 time,
                 guest_input: class == Some(KeyClass::Guest),
             },
-            KEY_STATE_RELEASED => PeekInput::Release { serial, time },
+            KeyState::Released => PeekInput::Release { serial, time },
             // Exo sends no repeats.
-            other => {
-                log::warn!("peek_key: received unknown key state {}, ignoring", other);
+            KeyState::Repeated => {
+                log::warn!("peek_key: received a repeated key state, ignoring");
                 return;
             }
         };
@@ -603,8 +604,13 @@ impl KeyboardCore {
             // the serial and time of the peek, which announces the new
             // press.
             if let Some(record) = self.keyboards.get(keyboard) {
-                let release =
-                    wl_keyboard::evt::key(record.guest, serial, time, key, KEY_STATE_RELEASED);
+                let release = wl_keyboard::evt::key(
+                    record.guest,
+                    serial,
+                    time,
+                    key,
+                    wl_keyboard::KEY_STATE_RELEASED,
+                );
                 fx.to_guest.push(release);
             }
         }

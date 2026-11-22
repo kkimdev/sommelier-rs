@@ -169,8 +169,10 @@ it generates:
   wire integers, so a forward is byte-exact whatever the value. A handler
   that interprets one decodes it once, at the message, takes an undefined
   value down the path that message has for it (a protocol error, or
-  ignoring it), and from then on passes and stores the enum. A bitfield
-  keeps its constants alone: every combination of its flags is a value.
+  ignoring it), and from then on passes and stores the enum: a surface's
+  buffer transform, an output's panel transform, the keyboard core's key
+  states and a pointer's scroll source are enums. A bitfield keeps its
+  constants alone: every combination of its flags is a value.
 - `*_SINCE` and `VERSION` constants, which version checks and bounds use
   (INVARIANTS "Versions come from the XML or a documented constant").
 - A `NAME` constant, the interface's name. Handlers name an interface
