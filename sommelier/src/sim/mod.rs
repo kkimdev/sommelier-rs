@@ -243,6 +243,24 @@ fn run_recorded(
             failures.extend(oracle::lost(start, actions, settles, world.client()));
             failures.extend(oracle::intended(&case.reference(), world.client()));
         }
+        // The mirror measures every delete and region of a settled case.
+        if case.settled && drops.total() > 0 {
+            failures.push(Failure {
+                tier: Tier::Exact,
+                check: Check::Drops,
+                field: None,
+                detail: format!("the proxy dropped Exo's deletes or regions: {drops:?}"),
+            });
+        }
+        // Settles keep a press's fence from dropping any edit of Exo's.
+        if case.settled && judge.counts.fence_drops > 0 {
+            failures.push(Failure {
+                tier: Tier::Exact,
+                check: Check::Fence,
+                field: None,
+                detail: format!("{} edits of Exo's met the fence", judge.counts.fence_drops),
+            });
+        }
         if !world.mirrors.is_empty() {
             failures.push(Failure {
                 tier: Tier::Exact,
@@ -482,8 +500,8 @@ fn pinned(test: &str, body: impl FnOnce()) {
 /// those of a key it held itself (X2'), Exo's empty confirmations before
 /// a press or at a detach while a key was held, and destroyed surfaces;
 /// and in a run of 5,000 or more the rarer region
-/// and delete paths; in settled ones, no fence drop, which a settled case
-/// must not cause.
+/// and delete paths. A settled case that meets the fence or drops a delete
+/// or region fails on its own, in [`run_recorded`].
 fn check(test: &str, settled: bool) {
     pinned(test, || {
         let summary = run_all(&cases(settled));
@@ -541,15 +559,6 @@ fn check(test: &str, settled: bool) {
                 "a counter stayed at 0: {counts:?}, {coverage:?}"
             );
         }
-        assert!(
-            !settled || counts.fence_drops == 0,
-            "a settled case met the fence: {counts:?}"
-        );
-        // The mirror measures every delete and region of a settled case.
-        assert!(
-            !settled || counts.drops.total() == 0,
-            "a settled case dropped a delete or region it could measure: {counts:?}"
-        );
         if let Some(first) = failed.first() {
             panic!(
                 "{} of {cases} DST cases failed; the first:\n{first}",

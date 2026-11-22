@@ -1201,7 +1201,8 @@ The DST also holds the proxy to Exo's real text:
 - The proxy counts its drops by cause (`Counts::drops`). The judge
   counts those where the guest held Exo's text (`drops_truth_in_step`).
   Those are the drops a sharper mirror could avoid. A settled case may
-  make no drop.
+  make no drop: one fails the case (`Check::Drops`), which is reported
+  and shrunk like any other failure.
 - At every `done` of a sync, a mirror that says it is exact must hold
   the simulated tracker's prediction at that sync (`Exo::synced`). Its
   history must also fit the tracker's: each known state is the
