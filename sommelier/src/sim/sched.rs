@@ -252,8 +252,11 @@ impl std::fmt::Display for Line {
 /// What a case's world is made of, beside its choices.
 pub(super) struct Setup<'a> {
     pub client: ClientKind,
-    /// The input method is a Latin layout, which has no engine.
+    /// The input method is a Latin layout, which has no engine unless it
+    /// is `english`.
     pub latin: bool,
+    /// The Latin layout has an English engine, which handles no key.
+    pub english: bool,
     pub lag: Lag,
     /// The guest releases its keyboard and binds a new one once its text
     /// input is active, so the new one hears of the next focus move after
@@ -396,6 +399,7 @@ impl<'t> World<'t> {
     pub async fn new(setup: &Setup<'_>, choices: Choices, trace: &'t mut Vec<Line>) -> World<'t> {
         let mut exo = Exo::default();
         exo.latin = setup.latin;
+        exo.english = setup.english;
         let surfaces = Surfaces::default();
         let mut world = World {
             now: Micros(0),
@@ -403,7 +407,7 @@ impl<'t> World<'t> {
             session: Session::new(),
             client: None,
             exo,
-            engine: Engine::new(setup.lag),
+            engine: Engine::new(setup.lag).english(setup.english),
             display: Display::new(display::exo_globals())
                 .unanswered(&[zcr_extended_keyboard_v1::NAME]),
             windows: Windows::new(surfaces.clone()),

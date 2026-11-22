@@ -91,6 +91,10 @@ struct Case {
     settled: bool,
     /// The input method is a Latin layout rather than Korean.
     latin: bool,
+    /// The Latin layout has an English engine, which handles no key, so
+    /// that each press and autorepeat comes after an empty confirmation
+    /// (E13), rather than none.
+    english: bool,
     /// The fields' initial texts.
     texts: Vec<String>,
     actions: Vec<UserAction>,
@@ -98,11 +102,13 @@ struct Case {
 
 impl Case {
     /// The case of `seed`, settled if the seed is odd, typing into one of
-    /// `clients`: a Latin layout one case in four.
+    /// `clients`: a Latin layout one case in four, with an English engine
+    /// if the seed's second bit is clear.
     fn new(seed: u64, clients: &[ClientKind]) -> Self {
         let mut rng = Rng::new(seed);
         let client = *rng.pick(clients);
         let latin = rng.one_in(4);
+        let english = latin && seed & 2 == 0;
         let settled = seed % 2 == 1;
         let texts = user::texts(&mut rng);
         let mut case = Self {
@@ -110,6 +116,7 @@ impl Case {
             client,
             settled,
             latin,
+            english,
             texts,
             actions: Vec::new(),
         };
@@ -194,6 +201,7 @@ fn run_recorded(
     let setup = Setup {
         client: case.client,
         latin: case.latin,
+        english: case.english,
         lag,
         late_keyboard,
         texts: &case.texts,
@@ -253,10 +261,11 @@ fn run_recorded(
 fn report(case: &Case, outcome: &Outcome, failures: &[Failure], trace: &[Line]) -> String {
     let mode = if case.settled { "settled" } else { "free" };
     let mut report = format!(
-        "DST FAILURE seed={} mode={mode} client={} latin={} lag={:?}\n",
+        "DST FAILURE seed={} mode={mode} client={} latin={} english={} lag={:?}\n",
         case.seed,
         case.client.name(),
         case.latin,
+        case.english,
         outcome.lag,
     );
     for failure in failures {
@@ -319,8 +328,9 @@ struct Coverage {
     clients: [u64; 3],
     /// By the engine's lag: fast, normal and slow.
     lags: [u64; 3],
-    /// Latin layouts.
+    /// Latin layouts, and those with an English engine.
     latin: u64,
+    english: u64,
     /// Backspaces a GTK client takes after a Hangul syllable (C14).
     nfd_backspaces: u64,
     /// Focus moves, clicks and taps that leave a composing field.
@@ -337,6 +347,7 @@ impl Coverage {
             .position(|&l| l == outcome.lag);
         self.lags[lag.expect("a lag")] += 1;
         self.latin += u64::from(case.latin);
+        self.english += u64::from(case.english);
         let mut reference = case.reference_at_start();
         for &action in &case.actions {
             self.leaves_composing += u64::from(reference.leaves_composition(action));
@@ -355,7 +366,7 @@ impl Coverage {
     /// The counters, each of which a full run must have raised.
     fn counters(&self, free: bool) -> Vec<u64> {
         let mut counters = [&self.clients[..], &self.lags].concat();
-        counters.extend([self.latin, self.nfd_backspaces]);
+        counters.extend([self.latin, self.english, self.nfd_backspaces]);
         counters.extend(free.then_some(self.leaves_composing));
         counters
     }

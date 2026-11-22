@@ -52,8 +52,15 @@ limitations under the License.
 //! and commits anew, and only while nothing is composed (E10); or to
 //! reconvert the text before the cursor, which becomes a region it
 //! composes, until the next key commits it as it is. It learns the text
-//! from Exo, which hands it the text before the cursor with the request. A Latin layout has no engine
-//! ([`Exo::latin`](super::exo::Exo)), and its keys never come here.
+//! from Exo, which hands it the text before the cursor with the request.
+//!
+//! A Latin layout has no engine, and its keys never come here
+//! ([`Exo::latin`](super::exo::Exo)), or an English one
+//! ([`Engine::english`]), which handles no key and makes no text: IMA then
+//! confirms before each press, and each autorepeat, it passes (E13), as
+//! ChromeOS's English (US) layout makes it do for a field that states its
+//! text (an `xkb:` engine; `ShouldUseNullInputType` in `text_input.cc`
+//! gives a field that does not state it no engine).
 
 use super::clock::Micros;
 use super::editor::{reconvertible, word_before};
@@ -169,6 +176,8 @@ pub(super) struct Engine {
     /// What the engine has not reached yet, in order.
     queue: VecDeque<EngineIn>,
     busy: Option<InService>,
+    /// An English layout's engine ([`Engine::english`]).
+    english: bool,
 }
 
 impl Engine {
@@ -180,7 +189,14 @@ impl Engine {
             unreconverted: None,
             queue: VecDeque::new(),
             busy: None,
+            english: false,
         }
+    }
+
+    /// The engine, an English layout's if `english`: one that handles no
+    /// key and makes no text.
+    pub fn english(self, english: bool) -> Self {
+        Self { english, ..self }
     }
 
     /// Exo hands the engine `input` at `now`.
@@ -273,7 +289,7 @@ impl Engine {
     /// region included, then the composition if it differs from the one
     /// shown, which a commit ends; and whether the engine handled the key.
     fn answer(&mut self, key: Key, pressed: bool) -> (Vec<TextAction>, bool) {
-        if !pressed {
+        if !pressed || self.english {
             return (Vec::new(), false);
         }
         if let Some(region) = self.region.take() {

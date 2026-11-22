@@ -1005,7 +1005,12 @@ key's text, and the engine's callback for the key with its handled bit.
 
 - **Korean mode** runs `hangul::Composer`. Space ending a composition is
   consumed and committed with it (E15). With nothing composed, Space and
-  Enter go to the client. **Latin mode** passes every key.
+  Enter go to the client. **Latin mode** passes every key: with no
+  engine in half its cases, so that IMA dispatches each key at once
+  with no confirmation, and in the other half with an English one,
+  which handles no key, as ChromeOS's English (US) layout does for a
+  field that states its text, so that each press and autorepeat comes
+  after an empty `confirm_preedit` (E13).
 - **`Reset`** takes effect when the engine reaches it, after every key
   handed over before it. A key queued before a `Reset` is processed with
   the old composer state (E5's outcome (c), P3).

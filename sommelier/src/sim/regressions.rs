@@ -39,6 +39,7 @@ pub(super) struct Regression {
     pub client: ClientKind,
     pub settled: bool,
     pub latin: bool,
+    pub english: bool,
     pub texts: &'static [&'static str],
     pub actions: &'static [UserAction],
     /// Whether a replay's counts show the state the bug needed: a replay
@@ -56,6 +57,7 @@ impl Regression {
             client: self.client,
             settled: self.settled,
             latin: self.latin,
+            english: self.english,
             texts: self.texts.iter().map(|&text| text.to_owned()).collect(),
             actions: self.actions.to_vec(),
         }
@@ -67,10 +69,11 @@ impl Regression {
         let texts: Vec<String> = case.texts.iter().map(|text| format!("{text:?}")).collect();
         let actions: Vec<String> = case.actions.iter().map(|&a| action(a)).collect();
         format!(
-            "Regression {{\n    name: {name:?},\n    client: ClientKind::{:?},\n    settled: {},\n    latin: {},\n    texts: &[{}],\n    actions: &[\n        {},\n    ],\n    reaches: |_| todo!(\"the counts of the state the bug needs\"),\n    choices: &{choices:?},\n}},",
+            "Regression {{\n    name: {name:?},\n    client: ClientKind::{:?},\n    settled: {},\n    latin: {},\n    english: {},\n    texts: &[{}],\n    actions: &[\n        {},\n    ],\n    reaches: |_| todo!(\"the counts of the state the bug needs\"),\n    choices: &{choices:?},\n}},",
             case.client,
             case.settled,
             case.latin,
+            case.english,
             texts.join(", "),
             actions.join(",\n        "),
         )
@@ -113,6 +116,7 @@ const CASES: &[Regression] = &[
         client: ClientKind::Chromium,
         settled: false,
         latin: false,
+        english: false,
         texts: &["0aa1b2닭닭", "0가가1닭2"],
         actions: &[
             UserAction::Key(Key::Char('v')),
@@ -133,6 +137,7 @@ const CASES: &[Regression] = &[
         client: ClientKind::Chromium,
         settled: false,
         latin: false,
+        english: false,
         texts: &["01닭2", "0닭1bb2b"],
         actions: &[
             UserAction::Tap {
@@ -166,6 +171,7 @@ Regression {
     client: ClientKind::Gtk4,
     settled: false,
     latin: false,
+    english: false,
     texts: &["0b닭1닭가2닭가", "0aa1a2"],
     actions: &[
         UserAction::Key(Key::Backspace),
@@ -202,6 +208,7 @@ Regression {
     client: ClientKind::Gtk3,
     settled: false,
     latin: false,
+    english: false,
     texts: &["0닭닭1ba2닭b", "0가닭1a2닭b"],
     actions: &[
         UserAction::Click { field: 1, at: Target::Start },
@@ -274,6 +281,7 @@ Regression {
     client: ClientKind::Gtk3,
     settled: false,
     latin: false,
+    english: false,
     texts: &["0닭1가2닭", "0a1a닭2b"],
     actions: &[
         UserAction::Key(Key::Char('j')),
@@ -305,6 +313,7 @@ Regression {
     client: ClientKind::Gtk3,
     settled: false,
     latin: false,
+    english: false,
     texts: &["0a1닭2닭", "0닭b1가2"],
     actions: &[
         UserAction::Key(Key::Char('l')),
@@ -357,6 +366,7 @@ Regression {
     client: ClientKind::Gtk3,
     settled: false,
     latin: false,
+    english: false,
     texts: &["01닭b2", "01닭2a"],
     actions: &[
         UserAction::Key(Key::Char('p')),
@@ -397,6 +407,7 @@ Regression {
     client: ClientKind::Gtk4,
     settled: false,
     latin: false,
+    english: false,
     texts: &["0닭1a2b", "0닭닭12닭닭"],
     actions: &[
         UserAction::Click { field: 1, at: Target::BeforeMarker(2) },
@@ -421,6 +432,7 @@ Regression {
     client: ClientKind::Gtk3,
     settled: false,
     latin: false,
+    english: false,
     texts: &["0가12", "01닭2가"],
     actions: &[
         UserAction::Tap { field: 1, at: Target::BeforeMarker(1) },
@@ -445,6 +457,7 @@ Regression {
     client: ClientKind::Chromium,
     settled: false,
     latin: false,
+    english: false,
     texts: &["0닭1닭2가a", "0가a12닭b"],
     actions: &[
         UserAction::Click { field: 1, at: Target::BeforeMarker(2) },
@@ -473,6 +486,7 @@ Regression {
     client: ClientKind::Chromium,
     settled: false,
     latin: false,
+    english: false,
     texts: &["0닭1닭2가a", "0가a12닭b"],
     actions: &[
         UserAction::Click { field: 1, at: Target::Start },
@@ -502,6 +516,7 @@ Regression {
     client: ClientKind::Chromium,
     settled: false,
     latin: false,
+    english: false,
     texts: &["012ba", "0가a1가2b닭"],
     actions: &[
         UserAction::Key(Key::Char('e')),
@@ -532,6 +547,7 @@ Regression {
     client: ClientKind::Chromium,
     settled: false,
     latin: false,
+    english: false,
     texts: &["0가1b가2", "01b2"],
     actions: &[
         UserAction::Key(Key::Char('l')),
@@ -621,6 +637,7 @@ fn a_snippet_names_the_case_and_its_choices() {
         client: ClientKind::Gtk4,
         settled: false,
         latin: false,
+        english: false,
         texts: &["가", "1"],
         actions: &[UserAction::Key(Key::Char('r')), UserAction::Focus(1)],
         reaches: |_| true,
