@@ -46,7 +46,7 @@ placement contract is owned by
   `SCM_MAX_FD` (253), so a valid peer never causes truncation.
   Tests: `recvmsg_scm_rights_truncation_closes_kernel_installed_descriptors`,
   `recvmsg_truncation_after_a_credentials_message_closes_every_descriptor`,
-  `truncated_scm_rights_closes_descriptors_recovered_from_control_buffer`.
+  `a_connection_receives_scm_max_fd_descriptors_whole`.
 - **Received descriptors are bounded.** A connection holds at most
   `MAX_PENDING_FDS` (1024, libwayland's incoming descriptor ring)
   received descriptors that no message has consumed; one more ends that

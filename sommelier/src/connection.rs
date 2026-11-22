@@ -25,6 +25,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
+use zerocopy::AsBytes;
 
 // Linux accepts at most SCM_MAX_FD (253) descriptors in one SCM_RIGHTS
 // message. Keeping the receive control buffer at that limit prevents a valid
@@ -32,6 +33,35 @@ use tokio::io::unix::AsyncFd;
 // smaller, VirtWL-specific batch size. `decode_unix_control_fds` still
 // closes the descriptors of truncated control data.
 const UNIX_MAX_SCM_RIGHTS_FDS: usize = 253;
+
+/// The room a receive of [`UNIX_MAX_SCM_RIGHTS_FDS`] descriptors needs.
+// SAFETY: CMSG_SPACE only computes a length.
+const UNIX_CONTROL_LEN: usize =
+    unsafe { libc::CMSG_SPACE((UNIX_MAX_SCM_RIGHTS_FDS * std::mem::size_of::<RawFd>()) as u32) }
+        as usize;
+
+/// Room for one receive's control data, aligned for `cmsghdr` because the
+/// CMSG macros read headers in place: the first `len` bytes of whole
+/// `u64`s.
+#[derive(Debug)]
+struct ControlBuffer {
+    words: Vec<u64>,
+    len: usize,
+}
+
+// A `u64` is aligned for `cmsghdr` on every Linux target.
+const _: () = assert!(std::mem::align_of::<libc::cmsghdr>() <= std::mem::align_of::<u64>());
+
+impl ControlBuffer {
+    fn new(len: usize) -> Self {
+        let words = vec![0; len.div_ceil(std::mem::size_of::<u64>())];
+        Self { words, len }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.words.as_bytes_mut()[..self.len]
+    }
+}
 
 /// The most received descriptors a connection holds before messages
 /// consume them.
@@ -223,7 +253,7 @@ enum ConnectionTransport {
     Unix {
         socket: AsyncFd<OwnedFd>,
         /// Room for a receive's `SCM_RIGHTS` control data.
-        control: Vec<u8>,
+        control: ControlBuffer,
     },
     VirtWayland {
         channel: Arc<VirtWaylandChannel>,
@@ -308,20 +338,14 @@ unsafe fn decode_unix_control_fds(control: &[u8], truncated: bool) -> io::Result
     }
 }
 
-/// Receive into `data` and the part of `control` aligned for `cmsghdr`,
-/// returning the bytes received and the descriptors that came with them.
+/// Receive into `data` and `control`, returning the bytes received and
+/// the descriptors that came with them.
 fn recv_unix_message(
     fd: RawFd,
     data: &mut [u8],
-    control: &mut [u8],
+    control: &mut ControlBuffer,
 ) -> io::Result<(usize, Vec<OwnedFd>)> {
-    // The CMSG macros read headers in place. A buffer from the allocator is
-    // aligned already.
-    let aligned = control
-        .as_ptr()
-        .align_offset(std::mem::align_of::<libc::cmsghdr>());
-    let aligned = aligned.min(control.len());
-    let control = &mut control[aligned..];
+    let control = control.bytes_mut();
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr().cast(),
         iov_len: data.len(),
@@ -376,7 +400,7 @@ impl WaylandConnection {
         Ok(Self {
             transport: ConnectionTransport::Unix {
                 socket: AsyncFd::new(fd)?,
-                control: nix::cmsg_space!([RawFd; UNIX_MAX_SCM_RIGHTS_FDS]),
+                control: ControlBuffer::new(UNIX_CONTROL_LEN),
             },
             read_buf: Vec::new(),
             read_fds: VecDeque::new(),
@@ -674,8 +698,9 @@ impl WaylandConnection {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        decode_unix_control_fds, recv_unix_message, LastSubmission, OutgoingMessages,
-        WaylandConnection, MAX_BYTES_PER_SEND, MAX_FDS_PER_SEND,
+        decode_unix_control_fds, recv_unix_message, ControlBuffer, LastSubmission,
+        OutgoingMessages, WaylandConnection, MAX_BYTES_PER_SEND, MAX_FDS_PER_SEND,
+        UNIX_MAX_SCM_RIGHTS_FDS,
     };
     use crate::test_support::{any_fd_has_identity, fd_identity, fds_with_identity, shm_pool_file};
     use crate::wire::{MessageBuilder, Outgoing};
@@ -758,7 +783,7 @@ mod tests {
             costs.push((received.allocations, (Counts::now() - before).allocations));
 
             let mut data = [0u8; 64];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             assert_eq!((bytes, fds.len()), (message.len(), 1));
@@ -837,7 +862,7 @@ mod tests {
         let mut submissions = Vec::new();
         loop {
             let mut data = [0u8; 4096];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             if bytes == 0 {
@@ -887,7 +912,7 @@ mod tests {
         let mut submissions = Vec::new();
         loop {
             let mut data = [0u8; 4096];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             if bytes == 0 {
@@ -932,7 +957,7 @@ mod tests {
         let mut submissions = Vec::new();
         loop {
             let mut data = [0u8; 4 * 4096];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             if bytes == 0 {
@@ -974,7 +999,7 @@ mod tests {
         let mut submissions = Vec::new();
         loop {
             let mut data = [0u8; 64];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             if bytes == 0 {
@@ -1086,9 +1111,11 @@ mod tests {
 
     /// Take over the descriptors in `control`, which this test passes.
     fn decode(control: &[u8], truncated: bool) -> std::io::Result<Vec<OwnedFd>> {
-        // SAFETY: a `Vec`'s buffer is aligned for `cmsghdr`, and the tests
+        let mut aligned = ControlBuffer::new(control.len());
+        aligned.bytes_mut().copy_from_slice(control);
+        // SAFETY: a `ControlBuffer` is aligned for `cmsghdr`, and the tests
         // build control data from descriptors they pass on.
-        unsafe { decode_unix_control_fds(control, truncated) }
+        unsafe { decode_unix_control_fds(aligned.bytes_mut(), truncated) }
     }
 
     #[test]
@@ -1181,12 +1208,25 @@ mod tests {
         let identity = fd_identity(file.as_raw_fd());
         send_with_fds(&sender, &[file.as_raw_fd(); 3]);
 
-        let (mut data, mut control) = ([0u8; 1], vec![0u8; 4096]);
+        let (mut data, mut control) = ([0u8; 1], ControlBuffer::new(4096));
         let (bytes, fds) =
             recv_unix_message(receiver.as_raw_fd(), &mut data, &mut control).expect("receive");
         assert_eq!((bytes, fds.len()), (1, 3));
         drop((file, fds));
         assert!(!any_fd_has_identity(identity));
+    }
+
+    /// The largest batch Linux sends, `SCM_MAX_FD` descriptors, fits in a
+    /// connection's control buffer, so a valid peer never causes truncation.
+    #[tokio::test]
+    async fn a_connection_receives_scm_max_fd_descriptors_whole() {
+        let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
+        let file = memfd("sommelier-scm-max-fd");
+        send_with_fds(&peer, &[file.as_raw_fd(); UNIX_MAX_SCM_RIGHTS_FDS]);
+
+        assert_eq!(connection.try_recv().expect("receive"), Some(1));
+        assert_eq!(connection.read_fds.len(), UNIX_MAX_SCM_RIGHTS_FDS);
     }
 
     /// A received descriptor is close-on-exec from the moment the kernel
@@ -1198,7 +1238,7 @@ mod tests {
         let file = memfd("sommelier-received-cloexec");
         send_with_fds(&sender, &[file.as_raw_fd()]);
 
-        let (mut data, mut control) = ([0u8; 1], vec![0u8; 4096]);
+        let (mut data, mut control) = ([0u8; 1], ControlBuffer::new(4096));
         let (_, fds) =
             recv_unix_message(receiver.as_raw_fd(), &mut data, &mut control).expect("receive");
         let [fd] = fds.try_into().expect("one descriptor");
@@ -1220,7 +1260,7 @@ mod tests {
         let space = |len: usize| unsafe { libc::CMSG_SPACE(len as u32) } as usize;
         let room =
             space(std::mem::size_of::<libc::ucred>()) + space(2 * std::mem::size_of::<RawFd>());
-        let (mut data, mut control) = ([0u8; 1], vec![0u8; room]);
+        let (mut data, mut control) = ([0u8; 1], ControlBuffer::new(room));
         let error = recv_unix_message(receiver.as_raw_fd(), &mut data, &mut control)
             .expect_err("truncated control data");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -1254,7 +1294,7 @@ mod tests {
 
         let mut data = [0u8; 1];
         let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
-        let mut control = vec![0u8; control_len];
+        let mut control = ControlBuffer::new(control_len);
         let result = recv_unix_message(receiver_fd, &mut data, &mut control);
         assert!(
             result.is_err(),
