@@ -31,7 +31,7 @@ use crate::state::{
     is_valid_transform, BufferRect, BufferSpace, BufferState, Context, DamageRegion, EventObject,
     EventSender, FenceWait, GuestId, HostId, HostMapping, Link, PostDispatch, RenderBufferUse,
     RequestObject, RequestSender, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect,
-    SurfaceState, ViewportState,
+    SurfaceState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Destructor, ToHost};
@@ -222,10 +222,10 @@ fn log_unenforced_viewport_rule(
     problem: &str,
     mapping: &SurfaceMapping,
 ) {
-    let Some(surface) = ctx.surfaces.get_mut(&surface_id) else {
+    let Some(surface) = ctx.surface_mut(surface_id) else {
         return;
     };
-    if !std::mem::replace(&mut surface.logged_viewport_rule, true) {
+    if surface.first_unenforced_viewport_rule() {
         log::warn!(
             "wl_surface {} has {}, which Exo accepts, so the commit is forwarded: {:?}",
             surface_id,
@@ -251,12 +251,11 @@ fn new_host_copy_size(ctx: &Context, buffer_id: GuestId) -> Option<u64> {
 /// Count a new host copy of `bytes` that `surface_id` showed, and log the
 /// count at most once a second (see `NewHostCopies`).
 fn log_new_host_copy(ctx: &mut Context, surface_id: GuestId, bytes: u64) {
-    let Some(surface) = ctx.surfaces.get_mut(&surface_id) else {
+    let Some(surface) = ctx.surface_mut(surface_id) else {
         return;
     };
-    if let Some((count, bytes, elapsed)) = surface
-        .new_host_copies
-        .record(bytes, std::time::Instant::now())
+    if let Some((count, bytes, elapsed)) =
+        surface.record_new_host_copy(bytes, std::time::Instant::now())
     {
         log::debug!(
             "wl_surface {surface_id} showed {count} new SHM buffers in {elapsed:.1?}, \
@@ -445,8 +444,7 @@ pub(crate) fn forget_surface(
     // surface actually held may be retired merely because its destructor
     // is ordered ahead of the buffer destructor.
     let destroyed_surface_buffer = ctx
-        .surfaces
-        .remove(&wl_surface_guest_id)
+        .remove_surface(wl_surface_guest_id)
         .and_then(|surface| surface.current_buffer_id());
     ctx.forget_surface_buffer_copies(wl_surface_guest_id);
     crate::handler::buffer::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
@@ -514,14 +512,9 @@ impl WlSurfaceHandler for Handlers {
         let Some(surface) = ctx.surface_mut(surface_id) else {
             return ctx.missing_surface_state(surface_id);
         };
-        let pending = &mut surface.pending;
-        pending.attachment = match attached {
-            Some(buffer) => SurfaceAttachment::Attach(buffer),
-            None => SurfaceAttachment::Detach,
-        };
         // A surface is at most v4 (`WL_COMPOSITOR_VERSION`), where attach
         // carries the offset.
-        pending.attach_offset = attached.is_some().then_some((x, y));
+        surface.attach(attached, x, y);
         // A pending native buffer can be destroyed before the commit that
         // attached it. Replacing that pending attach (including attach(NULL))
         // means the compositor will never emit wl_buffer.release for the
@@ -543,10 +536,7 @@ impl WlSurfaceHandler for Handlers {
         let Some(surface) = ctx.surface_mut(surface_id) else {
             return ctx.missing_surface_state(surface_id);
         };
-        surface
-            .pending
-            .surface_damage
-            .push(SurfaceRect::new(x, y, width, height));
+        surface.damage(SurfaceRect::new(x, y, width, height));
         // The host compositor only understands surface-coordinate damage. Keep
         // this request local so the commit path can preserve ordering and
         // account for a concurrently pending viewport/scale change.
@@ -565,10 +555,7 @@ impl WlSurfaceHandler for Handlers {
         let Some(surface) = ctx.surface_mut(surface_id) else {
             return ctx.missing_surface_state(surface_id);
         };
-        surface
-            .pending
-            .buffer_damage
-            .push(BufferRect::new(x, y, width, height));
+        surface.damage_buffer(BufferRect::new(x, y, width, height));
         // ChromiumOS Sommelier implements damage_buffer by translating it to
         // wl_surface.damage because the host compositor may only expose v3.
         Action::Drop
@@ -587,7 +574,7 @@ impl WlSurfaceHandler for Handlers {
         let Some(surface) = ctx.surface_mut(surface_id) else {
             return ctx.missing_surface_state(surface_id);
         };
-        surface.pending.buffer_scale = Some(scale);
+        surface.set_buffer_scale(scale);
         Action::Forward
     }
 
@@ -607,7 +594,7 @@ impl WlSurfaceHandler for Handlers {
         let Some(surface) = ctx.surface_mut(surface_id) else {
             return ctx.missing_surface_state(surface_id);
         };
-        surface.pending.buffer_transform = Some(transform);
+        surface.set_buffer_transform(transform);
         Action::Forward
     }
 
@@ -619,9 +606,8 @@ impl WlSurfaceHandler for Handlers {
         // nothing, as in ChromiumOS Sommelier, whose sync point is set at
         // attach. The wait comes before the commit changes anything.
         let attached = ctx
-            .surfaces
-            .get(&surface_id)
-            .and_then(|surface| surface.pending.attachment.buffer_id());
+            .surface(surface_id)
+            .and_then(SurfaceState::pending_buffer_id);
         if let Some(buffer_id) = attached {
             // Wait for guest GPU writes before the host compositor samples
             // the buffer, matching ChromiumOS Sommelier's sync_point path,
@@ -641,7 +627,7 @@ impl WlSurfaceHandler for Handlers {
             }
         }
 
-        let Some(surface) = ctx.surfaces.get_mut(&surface_id) else {
+        let Some(surface) = ctx.surface_mut(surface_id) else {
             return ctx.missing_surface_state(surface_id);
         };
         let commit = surface.prepare_commit();
@@ -715,7 +701,7 @@ impl WlSurfaceHandler for Handlers {
                         surface_id
                     ),
                 }
-                if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
+                if let Some(surface) = ctx.surface_mut(surface_id) {
                     commit.rollback(surface);
                 }
                 crate::handler::buffer::retire_eligible_buffers(ctx);
@@ -734,11 +720,11 @@ impl WlSurfaceHandler for Handlers {
             let snapshot_updated = match next_buffer {
                 Some(buffer_id) => {
                     let dimensions = ctx.buffer_dimensions(buffer_id);
-                    ctx.surfaces.get_mut(&surface_id).is_some_and(|surface| {
+                    ctx.surface_mut(surface_id).is_some_and(|surface| {
                         surface.set_current_buffer_dimensions(buffer_id, dimensions)
                     })
                 }
-                None => ctx.surfaces.contains_key(&surface_id),
+                None => ctx.surface(surface_id).is_some(),
             };
             let use_updated =
                 snapshot_updated && ctx.finalize_surface_attachment(previous_buffer, next_buffer);
@@ -833,7 +819,7 @@ impl wp_viewporter::WpViewporterHandler for Handlers {
         let Some(state) = ctx.surface_mut(surface) else {
             return ctx.missing_surface_state(surface);
         };
-        state.pending.viewport = Some(Some(ViewportState::new()));
+        state.add_viewport();
         let viewport = Viewport {
             surface: Some(surface),
         };
@@ -909,8 +895,8 @@ impl wp_viewport::WpViewportHandler for Handlers {
 /// `crate::state::lifecycle`): its surface's next commit removes the
 /// viewport.
 pub(crate) fn forget_viewport(ctx: &mut Context, viewport: Viewport) {
-    if let Some(surface) = viewport.surface.and_then(|id| ctx.surfaces.get_mut(&id)) {
-        surface.pending.viewport = Some(None);
+    if let Some(surface) = viewport.surface.and_then(|id| ctx.surface_mut(id)) {
+        surface.remove_viewport();
     }
 }
 
@@ -1605,7 +1591,7 @@ mod tests {
             s.create(get_viewport(viewporter, viewport, other.id)).await;
             // Injects a fault no peer can cause: both live surfaces lose
             // their state.
-            s.ctx().surfaces.clear();
+            s.ctx().lose_surfaces_for_test();
             let new = s.new_id();
             s.guest_fatal([request(surface.id, viewporter, viewport, new)])
                 .await;
@@ -1615,7 +1601,10 @@ mod tests {
                 "{name}"
             );
             assert_eq!(s.host_received(), [], "{name}");
-            assert!(s.ctx().surfaces.is_empty(), "{name} recreated the state");
+            assert!(
+                s.ctx().surfaces().next().is_none(),
+                "{name} recreated the state"
+            );
         }
     }
 
@@ -1628,7 +1617,7 @@ mod tests {
         let surface = s.surface().await;
         let viewporter = s.bind_paired("wp_viewporter", 1).await.id;
         // Injects a fault no peer can cause: a live surface without state.
-        s.ctx().surfaces.clear();
+        s.ctx().lose_surfaces_for_test();
         let viewport = s.new_id();
         s.guest_fatal([get_viewport(viewporter, viewport, surface.id)])
             .await;
@@ -2137,8 +2126,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         crate::handler::test_support::add_surface(&mut ctx);
         ctx.surface_for_test(SURFACE.guest_id())
-            .pending
-            .attach_offset = Some((3, 0));
+            .offset_for_test(3, 0);
         let sender = ctx
             .shadow_table
             .resolve_request(SURFACE.guest)
@@ -2416,9 +2404,9 @@ mod tests {
             .await;
         // Reads state no peer can observe: until the commit, the surface
         // keeps its viewport, as the host does.
-        let state = &sc.s.ctx().surfaces[&surface.guest_id()];
+        let state = sc.s.ctx().surface(surface.guest_id()).expect("its state");
         assert!(
-            state.viewport.is_some(),
+            state.has_viewport(),
             "destroy only changes pending viewport state"
         );
         sc.pending([damage()]).await;
@@ -2488,7 +2476,8 @@ mod tests {
         /// unenforced, as Exo does, was logged. Reads state no peer can
         /// observe: the log.
         fn logged(&mut self, surface: Object) -> bool {
-            self.s.ctx().surfaces[&surface.guest_id()].logged_viewport_rule
+            let state = self.s.ctx().surface(surface.guest_id());
+            state.expect("its state").logged_viewport_rule()
         }
     }
 
@@ -3317,9 +3306,11 @@ mod tests {
     #[test]
     fn damage_buffer_mapping_applies_buffer_scale_and_filtering_outset() {
         let mut surface = SurfaceState::default();
-        surface.current_buffer_scale = 2;
+        surface.set_buffer_scale(2);
 
         let mapped = surface
+            .prepare_commit()
+            .state
             .mapping(Some((100, 100)))
             .to_surface(BufferRect::new(20, 10, 4, 6));
 
@@ -3329,7 +3320,7 @@ mod tests {
     #[test]
     fn damage_buffer_mapping_does_not_include_surface_offset() {
         let mut surface = SurfaceState::default();
-        surface.pending.attach_offset = Some((80, 90));
+        surface.attach(Some(GuestId::for_test(5)), 80, 90);
         let commit = surface.prepare_commit();
         assert_eq!(commit.buffer_offset, (80, 90));
 
@@ -3348,8 +3339,8 @@ mod tests {
     #[test]
     fn rotated_buffer_damage_covers_the_transformed_surface() {
         let mut surface = SurfaceState::default();
-        surface.current_buffer_transform = 1;
-        let mapping = surface.mapping(Some((8, 6)));
+        surface.set_buffer_transform(1);
+        let mapping = surface.prepare_commit().state.mapping(Some((8, 6)));
 
         assert_eq!(
             mapping.surface_rect(),
@@ -3366,11 +3357,15 @@ mod tests {
     #[test]
     fn rotated_scaled_buffer_full_damage_uses_logical_extent() {
         let mut surface = SurfaceState::default();
-        surface.current_buffer_scale = 2;
-        surface.current_buffer_transform = 1;
+        surface.set_buffer_scale(2);
+        surface.set_buffer_transform(1);
 
         assert_eq!(
-            surface.mapping(Some((8, 6))).surface_rect(),
+            surface
+                .prepare_commit()
+                .state
+                .mapping(Some((8, 6)))
+                .surface_rect(),
             SurfaceRect::new(0, 0, 3, 4),
             "buffer scale converts the rotated extent to surface coordinates"
         );

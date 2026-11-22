@@ -326,8 +326,10 @@ methods. The registry owns the host's globals and the proxy's bindings
 (`keys::KeyboardCore`), `handler::shm` the host's SHM formats
 (`ShmFormats`), `handler::linux_dmabuf` the dma-buf capabilities
 (`Dmabuf`), and so on for the IME core, outputs, internal callbacks,
-placement and clipboard pumps. State that one object owns is in that
-object's table entry instead ([Object ends](#object-ends)).
+placement and clipboard pumps; `state` owns each surface's
+`SurfaceState`, which a `wl_surface` request changes through its setters
+(`Context::surface_mut`). State that one object owns is in that object's
+table entry instead ([Object ends](#object-ends)).
 
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
@@ -500,11 +502,12 @@ releases it encodes it into its own effects.
 
 The convention for state that a request sets and a later commit applies
 is one `#[derive(Default)]` struct per site, named for it. Requests write
-its fields, and the commit applies them by destructuring
-`std::mem::take(&mut self.pending)`, naming every field. Taking it resets
-the pending state in one step, and a new field the commit never applies
-becomes an unused variable, which CI rejects. There is no generic
-`DoubleBuffered<T>`: each commit applies its fields in its own way.
+its fields, through its owner's setters, and the commit applies them by
+destructuring `std::mem::take(&mut self.pending)`, naming every field.
+Taking it resets the pending state in one step, and a new field the
+commit never applies becomes an unused variable, which CI rejects. There
+is no generic `DoubleBuffered<T>`: each commit applies its fields in its
+own way.
 
 - `SurfacePending` (`render.rs`) follows it for a `wl_surface`'s
   attachment, damage, scale, transform, offsets and viewport.

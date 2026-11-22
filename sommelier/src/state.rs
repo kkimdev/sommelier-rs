@@ -55,13 +55,13 @@ pub use self::objects::{
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{is_valid_transform, OutputRegistry, INERT_BIND_INTERFACE};
 pub(crate) use self::registries::RegistryRecord;
-#[cfg(test)]
-pub(crate) use self::render::SurfacePending;
 pub(crate) use self::render::{
     BufferRect, BufferSpace, BufferState, DamageRegion, Rect, RenderBufferLifecycle,
     RenderBufferUse, StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect,
-    SurfaceState, ViewportState,
+    SurfaceState,
 };
+#[cfg(test)]
+pub(crate) use self::render::{SurfacePending, ViewportState};
 pub(crate) use self::singletons::{Binding, Singleton, Singletons};
 pub(crate) use self::window_placement::{
     Placement, PlacementState, PlacementStep, Point, WindowPlacement,
@@ -251,13 +251,15 @@ pub(crate) enum PostDispatch {
 }
 
 pub struct Context {
-    pub shadow_table: ShadowTable,
+    pub(crate) shadow_table: ShadowTable,
     render_buffers: RenderBufferRegistry,
-    pub surfaces: BTreeMap<GuestId, SurfaceState>,
+    /// The state of every live guest `wl_surface`, from its
+    /// `create_surface` to its destructor.
+    surfaces: BTreeMap<GuestId, SurfaceState>,
     /// Every guest `zwp_text_input_v3`, ordered by ID: a focus change
     /// reaches them in that order (INVARIANTS "Nothing the proxy sends
     /// depends on hash order").
-    pub ime: crate::ime::ImeCore,
+    pub(crate) ime: crate::ime::ImeCore,
     /// The keyboard core: every host keyboard, one record each, and its
     /// keys.
     pub(crate) keys: crate::keys::KeyboardCore,
@@ -609,8 +611,32 @@ impl Context {
     /// The state of the live guest `wl_surface` `surface`, or `None` if the
     /// proxy has lost it, which [`Self::missing_surface_state`] ends the
     /// session for.
+    pub(crate) fn surface(&self, surface: GuestId) -> Option<&SurfaceState> {
+        self.surfaces.get(&surface)
+    }
+
+    /// [`Self::surface`], to change.
     pub(crate) fn surface_mut(&mut self, surface: GuestId) -> Option<&mut SurfaceState> {
         self.surfaces.get_mut(&surface)
+    }
+
+    /// The state of every live guest `wl_surface`.
+    pub(crate) fn surfaces(&self) -> impl Iterator<Item = &SurfaceState> + '_ {
+        self.surfaces.values()
+    }
+
+    /// End the state of guest `wl_surface` `surface`, which the guest
+    /// destroyed, and return it.
+    pub(crate) fn remove_surface(&mut self, surface: GuestId) -> Option<SurfaceState> {
+        self.surfaces.remove(&surface)
+    }
+
+    /// Forget every surface's reference to guest `wl_buffer` `buffer`,
+    /// which ended (see `SurfaceState::clear_buffer_references`).
+    pub(crate) fn clear_surface_buffer_references(&mut self, buffer: GuestId) {
+        for surface in self.surfaces.values_mut() {
+            surface.clear_buffer_references(buffer);
+        }
     }
 
     /// The state of `surface`, created if a test sets it up without a
@@ -618,6 +644,12 @@ impl Context {
     #[cfg(test)]
     pub(crate) fn surface_for_test(&mut self, surface: GuestId) -> &mut SurfaceState {
         self.surfaces.entry(surface).or_default()
+    }
+
+    /// Lose the state of every surface, a fault no peer can cause.
+    #[cfg(test)]
+    pub(crate) fn lose_surfaces_for_test(&mut self) {
+        self.surfaces.clear();
     }
 
     /// End the session because live `wl_surface` `surface` has no state, an
