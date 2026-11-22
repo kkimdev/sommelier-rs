@@ -26,8 +26,7 @@ use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
 use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler};
 use crate::state::{
     is_valid_transform, BufferRect, Context, EventObject, EventSender, GuestId, HostId, Link,
-    RenderBufferUse, RequestObject, RequestSender, SurfaceAttachment, SurfaceCommit,
-    SurfaceMapping, SurfaceRect, SurfaceState,
+    RenderBufferUse, RequestObject, RequestSender, SurfaceMapping, SurfaceRect,
 };
 use crate::wire::{Action, Destructor, ToHost};
 
@@ -38,19 +37,9 @@ impl WlCompositorHandler for Handlers {
     }
 }
 
-/// The size of the buffer `state` shows, which outlives a destroyed
-/// `wl_buffer`, or `None` without one.
-fn shown_buffer_size(ctx: &Context, state: &SurfaceState) -> Option<(i32, i32)> {
-    state
-        .current_buffer_id()
-        .and_then(|buffer_id| ctx.buffer_dimensions(buffer_id))
-        .or(state.current_buffer_dimensions())
-}
-
 /// Log, once per surface, `problem`: a viewport rule the proxy leaves
 /// unenforced, as Exo does (see INVARIANTS, "Protocol errors"). Called once
-/// the commit can no longer roll back, which would clear the flag and repeat
-/// the log on every frame.
+/// the commit has gone through, so a dropped commit logs nothing.
 fn log_unenforced_viewport_rule(
     ctx: &mut Context,
     surface_id: GuestId,
@@ -99,55 +88,18 @@ fn log_new_host_copy(ctx: &mut Context, surface_id: GuestId, bytes: u64) {
     }
 }
 
-/// Build the host damage requests and the commit for one guest commit, or
-/// `None` when the surface has no host object. The host takes surface-local
-/// damage only, so buffer damage goes through `mapping`.
-fn build_surface_commit_messages(
-    ctx: &Context,
-    surface_id: GuestId,
-    surface_damage: &[SurfaceRect],
-    buffer_damage: &[BufferRect],
-    mapping: &SurfaceMapping,
-    force_full_damage: bool,
-) -> Option<Vec<ToHost>> {
-    let host_surface_id = ctx.shadow_table.get_host_id(surface_id)?;
-    let mut damage: Vec<SurfaceRect> = Vec::new();
-    if force_full_damage {
-        damage.push(mapping.surface_rect());
-    }
-    damage.extend(surface_damage.iter().map(|&rect| rect.outset()));
-    damage.extend(buffer_damage.iter().map(|&rect| mapping.to_surface(rect)));
-
+/// The host requests of a commit of host surface `host_surface` with
+/// surface-local `damage`: the damage, then the commit.
+fn host_commit(host_surface: HostId, damage: &[SurfaceRect]) -> Vec<ToHost> {
     // The host compositor treats damage as a unioned region. Coalescing here
     // keeps a GTK frame with many overlapping requests from becoming a long
     // sequence of redundant Wayland messages as well as redundant copies.
-    let mut messages: Vec<ToHost> = crate::handler::shm::coalesce_damage_rects(&damage)
+    let mut messages: Vec<ToHost> = crate::handler::shm::coalesce_damage_rects(damage)
         .into_iter()
-        .map(|rect| {
-            wl_surface::req::damage(host_surface_id, rect.x, rect.y, rect.width, rect.height)
-        })
+        .map(|rect| wl_surface::req::damage(host_surface, rect.x, rect.y, rect.width, rect.height))
         .collect();
-    messages.push(wl_surface::req::commit(host_surface_id));
-    Some(messages)
-}
-
-/// The buffer whose host copy `commit` refreshes before it reaches the host.
-///
-/// An attached buffer always is. A commit without an attach still damages
-/// the surface's current buffer, which the host samples again, so the SHM
-/// Commit Copy Invariant refreshes its copy too, while the host holds the
-/// buffer. Once the host has released it, the client owns the storage and
-/// may be drawing its next frame there (`wl_buffer.release`): reading it
-/// could tear, and the host no longer samples it.
-fn buffer_to_copy(ctx: &Context, commit: &SurfaceCommit) -> Option<GuestId> {
-    match commit.attachment {
-        SurfaceAttachment::Attach(buffer_id) => Some(buffer_id),
-        SurfaceAttachment::Unchanged => commit
-            .state
-            .current_buffer_id()
-            .filter(|&buffer_id| ctx.buffer_is_submitted(buffer_id)),
-        SurfaceAttachment::Detach => None,
-    }
+    messages.push(wl_surface::req::commit(host_surface));
+    messages
 }
 
 /// Release the host Aura objects of a wl_surface that is ending: the Aura
@@ -340,17 +292,16 @@ impl WlSurfaceHandler for Handlers {
         Action::Forward
     }
 
+    /// Execute the commit's plan (`SurfaceState::plan_commit`), which
+    /// changes the surface only once the commit goes through.
     fn on_commit(ctx: &mut Context, sender: RequestSender) -> Action {
         let surface_id = sender.guest;
+        let Some(surface) = ctx.surface(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        let plan = surface.plan_commit(|buffer| ctx.shown_buffer(buffer));
 
-        // A native dma-buf's fence belongs to the contents an attach
-        // submits, so an attach(NULL) or damage-only commit waits for
-        // nothing, as in ChromiumOS Sommelier, whose sync point is set at
-        // attach. The wait comes before the commit changes anything.
-        let attached = ctx
-            .surface(surface_id)
-            .and_then(SurfaceState::pending_buffer_id);
-        if let Some(buffer_id) = attached {
+        if let Some(buffer_id) = plan.fence {
             // Wait for guest GPU writes before the host compositor samples
             // the buffer, matching ChromiumOS Sommelier's sync_point path,
             // but without stalling the event loop: the commit is
@@ -368,64 +319,31 @@ impl WlSurfaceHandler for Handlers {
                 }
             }
         }
-
-        let Some(surface) = ctx.surface_mut(surface_id) else {
-            return ctx.missing_surface_state(surface_id);
-        };
-        let commit = surface.prepare_commit();
-        let attached_buffer_id = commit.attached_buffer_id();
-        let copied_buffer_id = buffer_to_copy(ctx, &commit);
-
-        let shown_buffer = shown_buffer_size(ctx, &commit.state);
-        let mapping = commit.state.mapping(shown_buffer);
-        // wp_viewport.bad_size and out_of_buffer are deliberately not raised:
-        // Exo accepts both, so ending the session would break apps that work
-        // today. They are logged instead, once the commit is final.
-        let viewport_problem = if commit.has_invalid_fractional_viewport() {
-            Some("a fractional wp_viewport source without a destination")
-        } else if !mapping.source_fits_buffer() {
-            Some("a wp_viewport source outside its buffer")
-        } else {
-            None
-        };
-        let attached_full_mapping =
-            attached_buffer_id.is_some() && (commit.moves_buffer() || !mapping.is_identity());
-        // `None`: full damage, which sends the whole surface instead of
-        // any rectangle.
-        let damage = commit
-            .surface_damage
-            .rects()
-            .zip(commit.buffer_damage.rects());
-        let (surface_damage, buffer_damage) = damage.unwrap_or_default();
-        ctx.stale_surface_pixels(surface_id, &commit, &mapping);
-        // A buffer that copies everything shows the host a whole new image.
-        let needs_full_damage = copied_buffer_id
-            .and_then(|buffer_id| ctx.local_buffer(buffer_id))
-            .is_some_and(|buffer| buffer.stale.to_copy_on(surface_id).is_full());
-        let force_full_damage = needs_full_damage
-            || damage.is_none()
-            || (commit.buffer_offset != (0, 0)
-                && (!surface_damage.is_empty() || !buffer_damage.is_empty()))
-            || (attached_full_mapping && surface_damage.is_empty() && buffer_damage.is_empty());
-        let Some(host_messages) = build_surface_commit_messages(
-            ctx,
-            surface_id,
-            surface_damage,
-            buffer_damage,
-            &mapping,
-            force_full_damage,
-        ) else {
+        let Some(host_surface) = ctx.shadow_table.get_host_id(surface_id) else {
             return ctx.fail(format_args!(
                 "Cannot commit wl_surface {surface_id} without its host object"
             ));
         };
+
+        // Staling only adds pixels to copy, so a commit dropped below
+        // leaves nothing wrong behind.
+        ctx.stale_surface_pixels(surface_id, &plan);
+        // A buffer that copies everything shows the host a whole new image.
+        let copies_in_full = plan
+            .copy
+            .and_then(|buffer_id| ctx.local_buffer(buffer_id))
+            .is_some_and(|buffer| buffer.stale.to_copy_on(surface_id).is_full());
+        let Some(surface) = ctx.surface(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        let host_messages = host_commit(host_surface, &surface.host_damage(&plan, copies_in_full));
 
         // A SHM-backed buffer is copied into host storage before the host
         // commit is queued. Forwarding the commit first would let the host
         // compositor sample stale or uninitialised pixels if dma-buf sync
         // or the copy fails. A failed copy stales the whole host
         // copy, so a later commit retries the complete image.
-        if let Some(buffer_id) = copied_buffer_id {
+        if let Some(buffer_id) = plan.copy {
             if let Err(error) = copy_surface_buffer(ctx, surface_id, buffer_id) {
                 match error {
                     // The client broke its pool, for example by truncating
@@ -443,38 +361,25 @@ impl WlSurfaceHandler for Handlers {
                         surface_id
                     ),
                 }
-                if let Some(surface) = ctx.surface_mut(surface_id) {
-                    commit.rollback(surface);
-                }
+                // The surface is unchanged: its pending state stays
+                // pending, as on the host, which never gets this commit.
                 crate::handler::buffer::retire_eligible_buffers(ctx);
                 return Action::Drop;
             }
         }
 
-        if let Some((previous_buffer, next_buffer)) = commit.attachment_transition() {
-            // The pending replacement has now passed every copy and fence
-            // check. Apply its content snapshot and both buffer lifecycle
-            // edges before appending any host message. The registry
-            // validates both generations before changing either one, so a
-            // failed replacement remains completely rollback-safe.
+        if let Some((previous_buffer, next_buffer)) = plan.attachment {
+            // The attachment has passed every copy and fence check. Its
+            // buffers' lifecycle edges change before any host message is
+            // appended; the registry validates both generations before
+            // changing either.
             let new_host_copy =
                 next_buffer.and_then(|buffer_id| new_host_copy_size(ctx, buffer_id));
-            let snapshot_updated = match next_buffer {
-                Some(buffer_id) => {
-                    let dimensions = ctx.buffer_dimensions(buffer_id);
-                    ctx.surface_mut(surface_id).is_some_and(|surface| {
-                        surface.set_current_buffer_dimensions(buffer_id, dimensions)
-                    })
-                }
-                None => ctx.surface(surface_id).is_some(),
-            };
-            let use_updated =
-                snapshot_updated && ctx.finalize_surface_attachment(previous_buffer, next_buffer);
-            if !snapshot_updated || !use_updated {
+            if !ctx.finalize_surface_attachment(previous_buffer, next_buffer) {
                 let why = format!(
                     "Render-buffer replacement could not finalize surface {}: \
                      previous guest={:?} host={:?} use={:?}, \
-                     next guest={:?} host={:?} use={:?}, snapshot_updated={}",
+                     next guest={:?} host={:?} use={:?}",
                     surface_id,
                     previous_buffer,
                     previous_buffer.and_then(|id| ctx.render_buffer_host_id(id)),
@@ -482,7 +387,6 @@ impl WlSurfaceHandler for Handlers {
                     next_buffer,
                     next_buffer.and_then(|id| ctx.render_buffer_host_id(id)),
                     next_buffer.and_then(|id| ctx.host_buffer_use(id)),
-                    snapshot_updated,
                 );
                 return ctx.fail(why);
             }
@@ -490,9 +394,11 @@ impl WlSurfaceHandler for Handlers {
                 log_new_host_copy(ctx, surface_id, bytes);
             }
         }
-
-        if let Some(problem) = viewport_problem {
-            log_unenforced_viewport_rule(ctx, surface_id, problem, &mapping);
+        if let Some(surface) = ctx.surface_mut(surface_id) {
+            surface.apply_commit(&plan);
+        }
+        if let Some(problem) = plan.viewport_problem {
+            log_unenforced_viewport_rule(ctx, surface_id, problem, &plan.mapping);
         }
         // Damage and commit were built as one batch before local state was
         // finalized. Append them together, in order, only once every check
@@ -1315,6 +1221,28 @@ mod tests {
         sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
             .await;
         sc.show(surface, b.buffer).await;
+
+        a.draw(0x33);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x33), whole_frame());
+    }
+
+    /// A mapping change without an attach stales the other host copies
+    /// too: B stays shown while it is rotated, so its pixel damage no
+    /// longer marks the same pixels of A.
+    #[tokio::test]
+    async fn a_mapping_change_without_an_attach_stales_the_other_host_copies() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        sc.frame(surface).await;
+        let transform = wl_surface::req::set_buffer_transform(surface.id, 2);
+        sc.forwarded(surface, transform).await;
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.commit(surface).await;
 
         a.draw(0x33);
         sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
@@ -2538,74 +2466,6 @@ mod tests {
         sc.pending(damage).await;
         assert_eq!(sc.commit(surface).await, [(0, 0, 2, 1)]);
         assert_eq!(a.copied(0x22), [(0, 0), (1, 0)]);
-    }
-
-    #[test]
-    fn damage_buffer_mapping_applies_buffer_scale_and_filtering_outset() {
-        let mut surface = SurfaceState::default();
-        surface.set_buffer_scale(2);
-
-        let mapped = surface
-            .prepare_commit()
-            .state
-            .mapping(Some((100, 100)))
-            .to_surface(BufferRect::new(20, 10, 4, 6));
-
-        assert_eq!(mapped, SurfaceRect::new(9, 4, 4, 5));
-    }
-
-    #[test]
-    fn damage_buffer_mapping_does_not_include_surface_offset() {
-        let mut surface = SurfaceState::default();
-        surface.attach(Some(GuestId::for_test(5)), 80, 90);
-        let commit = surface.prepare_commit();
-        assert_eq!(commit.buffer_offset, (80, 90));
-
-        let mapped = commit
-            .state
-            .mapping(Some((100, 100)))
-            .to_surface(BufferRect::new(4, 5, 6, 7));
-
-        assert_eq!(
-            mapped,
-            SurfaceRect::new(3, 4, 8, 9),
-            "wl_surface.attach/offset changes content placement, not buffer damage coordinates"
-        );
-    }
-
-    #[test]
-    fn rotated_buffer_damage_covers_the_transformed_surface() {
-        let mut surface = SurfaceState::default();
-        surface.set_buffer_transform(1);
-        let mapping = surface.prepare_commit().state.mapping(Some((8, 6)));
-
-        assert_eq!(
-            mapping.surface_rect(),
-            SurfaceRect::new(0, 0, 6, 8),
-            "90-degree transforms expose a height-by-width surface extent"
-        );
-        assert_eq!(
-            mapping.to_surface(BufferRect::new(1, 1, 1, 1)),
-            mapping.surface_rect(),
-            "the bridge does not rotate damage, so it damages the whole surface"
-        );
-    }
-
-    #[test]
-    fn rotated_scaled_buffer_full_damage_uses_logical_extent() {
-        let mut surface = SurfaceState::default();
-        surface.set_buffer_scale(2);
-        surface.set_buffer_transform(1);
-
-        assert_eq!(
-            surface
-                .prepare_commit()
-                .state
-                .mapping(Some((8, 6)))
-                .surface_rect(),
-            SurfaceRect::new(0, 0, 3, 4),
-            "buffer scale converts the rotated extent to surface coordinates"
-        );
     }
 
     /// A keyboard of its own seat, which the host has focused on a surface,

@@ -334,7 +334,7 @@ table entry instead ([Object ends](#object-ends)).
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
-| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (`wl_compositor`, `wl_surface` and `wl_region`), `viewport.rs`, `xdg_shell.rs` (the XDG roles' surfaces, `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`); `shm::ShmFormats`; each `wl_shm`, `wl_shm_pool` and `wp_viewport`'s entry |
+| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (`wl_compositor`, `wl_surface` and `wl_region`), `viewport.rs`, `xdg_shell.rs` (the XDG roles' surfaces, `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) and `render/commit.rs` (`CommitPlan`), `host_mapping.rs` (`HostMapping`); `shm::ShmFormats`; each `wl_shm`, `wl_shm_pool` and `wp_viewport`'s entry |
 | Dma-buf | `linux_dmabuf.rs` | `linux_dmabuf::Dmabuf` (capabilities), each params, factory and feedback object's entry, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (pointer focus); `sommelier/src/keys` (the keyboard core: the keyboard focus, one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
 | Clipboard | `data_device.rs` (including `pump`), `data_control.rs` (the guest's `ext_data_control_v1`) | `ClipboardPumps` in `state.rs`; `data_control::DataControl`, and the `ClipboardHub` every connection shares |
@@ -502,15 +502,18 @@ releases it encodes it into its own effects.
 
 The convention for state that a request sets and a later commit applies
 is one `#[derive(Default)]` struct per site, named for it. Requests write
-its fields, through its owner's setters, and the commit applies them by
-destructuring `std::mem::take(&mut self.pending)`, naming every field.
-Taking it resets the pending state in one step, and a new field the
-commit never applies becomes an unused variable, which CI rejects. There
-is no generic `DoubleBuffered<T>`: each commit applies its fields in its
-own way.
+its fields, through its owner's setters, and the commit reads them by
+destructuring the struct, naming every field, then resets it in one
+step, so a new field the commit never applies becomes an unused
+variable, which CI rejects. There is no generic `DoubleBuffered<T>`:
+each commit applies its fields in its own way.
 
 - `SurfacePending` (`render.rs`) follows it for a `wl_surface`'s
   attachment, damage, scale, transform, offsets and viewport.
+  `SurfaceState::plan_commit` reads it into a `CommitPlan` without
+  changing the surface, and `apply_commit` replaces the surface's
+  `SurfaceCurrent` whole and resets it once the commit goes through
+  ([Buffers](#buffers)).
 - `V3Pending` (`ime/state.rs`) follows it for a text-input-v3 object's
   enable, surrounding text, content type and cursor rectangle, which
   `ime::TextInput::apply_commit` applies to `V3Committed`, except the cursor
@@ -548,6 +551,12 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   with or without `--gpu-accel` (see
   [Surfaces, damage and SHM](INVARIANTS.md#surfaces-damage-and-shm)).
   `ShmBacking` records the choice, so the copy path re-checks nothing.
+- A `wl_surface.commit` is planned, then executed: the pure
+  `SurfaceState::plan_commit` (`render/commit.rs`, whose docs say what a
+  plan decides) reads the surface without changing it, and
+  `handler::compositor` executes the plan. A commit that waits or is
+  dropped never changed the surface, so it has nothing to roll back
+  (test: `failed_shm_copy_does_not_queue_a_host_commit`).
 - On commit, the damaged region is copied from the guest pool into the
   host storage (INVARIANTS "Copy before commit"). This is a copy, not
   zero-copy. The proxy's mapping of the host storage is a `HostMapping`,

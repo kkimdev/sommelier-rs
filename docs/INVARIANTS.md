@@ -415,9 +415,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   supply them (a short read, as after the client truncated the file),
   the commit queues `wl_shm.invalid_fd` on the `wl_buffer` and the
   session ends, as with libwayland's SIGBUS guard. If the host storage
-  fails, the commit is dropped and the next one copies in full. A buffer
-  attached and then destroyed before the commit keeps its backing until
-  that commit.
+  fails, the commit is dropped, its pending state stays pending, as on
+  the host, which never got the commit, and the next one copies in full.
+  A buffer attached and then destroyed before the commit keeps its
+  backing until that commit.
   Tests: `commit_from_a_truncated_pool_is_a_protocol_error_not_a_crash`,
   `copy_into_an_unwritable_destination_blames_the_host_storage`,
   `destroyed_pending_shm_attach_survives_until_commit`.

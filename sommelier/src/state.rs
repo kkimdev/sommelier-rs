@@ -38,8 +38,6 @@ use tokio::task::JoinSet;
 pub(crate) use self::aura_surfaces::AuraSurfaces;
 pub(crate) use self::host_mapping::{HostMapping, Rows};
 use self::render::RenderBufferRegistry;
-#[cfg(test)]
-use self::render::MAX_PENDING_DAMAGE_RECTS;
 use crate::allocator::{PendingFence, VirtGpuDevice};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, ProtocolError, ToGuest, ToHost};
@@ -56,12 +54,9 @@ pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{is_valid_transform, OutputRegistry, INERT_BIND_INTERFACE};
 pub(crate) use self::registries::RegistryRecord;
 pub(crate) use self::render::{
-    BufferRect, BufferSpace, BufferState, DamageRegion, Rect, RenderBufferLifecycle,
-    RenderBufferUse, StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect,
-    SurfaceState,
+    BufferRect, BufferSpace, BufferState, CommitPlan, DamageRegion, Rect, RenderBufferLifecycle,
+    RenderBufferUse, ShownBuffer, StalePixels, SurfaceMapping, SurfaceRect, SurfaceState,
 };
-#[cfg(test)]
-pub(crate) use self::render::{SurfacePending, ViewportState};
 pub(crate) use self::singletons::{Binding, Singleton, Singletons};
 pub(crate) use self::window_placement::{
     Placement, PlacementState, PlacementStep, Point, WindowPlacement,
@@ -660,30 +655,30 @@ impl Context {
         self.fail(format_args!("wl_surface {surface} has no state"))
     }
 
-    /// Stale what `commit` of `surface`, which shows its buffer through
-    /// `mapping`, changed in the host copies of the surface's local buffers.
-    /// See [`StalePixels`].
-    pub(crate) fn stale_surface_pixels(
-        &mut self,
-        surface: GuestId,
-        commit: &SurfaceCommit,
-        mapping: &SurfaceMapping,
-    ) {
-        // A buffer attached together with a new mapping was last copied for
-        // the old one, while the client's damage is relative to the new one:
-        // then no host copy relates to the new contents pixel for pixel.
-        let relatable = !(commit.has_buffer_attach() && commit.changes_buffer_mapping());
-        let shown = commit
-            .state
-            .current_buffer_id()
-            .filter(|_| relatable)
+    /// What the render-buffer registry knows of guest buffer `buffer` that
+    /// a commit showing it decides by ([`SurfaceState::plan_commit`]).
+    pub(crate) fn shown_buffer(&self, buffer: GuestId) -> ShownBuffer {
+        ShownBuffer {
+            size: self.buffer_dimensions(buffer),
+            held: self.buffer_is_submitted(buffer),
+        }
+    }
+
+    /// Stale what commit `plan` of `surface` changes in the host copies of
+    /// the surface's local buffers. See [`StalePixels`].
+    pub(crate) fn stale_surface_pixels(&mut self, surface: GuestId, plan: &CommitPlan) {
+        let shown = plan
+            .relatable
             .and_then(|buffer| self.render_buffer_host_id(buffer));
-        self.render_buffers.stale_surface_pixels(
-            surface,
-            shown,
-            &commit.buffer_copy_damage(mapping),
-            commit.changes_buffer_mapping(),
-        );
+        // The commit's handler has found the surface's state.
+        if let Some(state) = self.surfaces.get(&surface) {
+            self.render_buffers.stale_surface_pixels(
+                surface,
+                shown,
+                &state.copy_damage(plan),
+                plan.remaps,
+            );
+        }
     }
 
     /// Drop every host copy's relation to the destroyed `surface`.
@@ -1216,244 +1211,6 @@ mod tests {
                 "Context::drop must release every descriptor it owns"
             );
         }
-    }
-
-    #[test]
-    fn surface_commit_applies_every_pending_field_atomically() {
-        let mut surface = SurfaceState {
-            current_content: None,
-            current_buffer_scale: 1,
-            current_buffer_transform: 0,
-            viewport: None,
-            pending: SurfacePending {
-                attachment: SurfaceAttachment::Attach(GuestId::for_test(2)),
-                surface_damage: vec![SurfaceRect::new(1, 2, 3, 4)].into(),
-                buffer_damage: vec![BufferRect::new(5, 6, 7, 8)].into(),
-                buffer_scale: Some(2),
-                buffer_transform: Some(3),
-                attach_offset: Some((11, 12)),
-                viewport: Some(Some(ViewportState {
-                    source: Some((0, 0, 256, 256)),
-                    destination: Some((20, 30)),
-                })),
-            },
-            logged_viewport_rule: false,
-            new_host_copies: Default::default(),
-        };
-        surface.set_current_buffer_for_test(Some(GuestId::for_test(1)), Some((10, 20)));
-
-        let commit = surface.prepare_commit();
-
-        assert_eq!(
-            commit.attachment,
-            SurfaceAttachment::Attach(GuestId::for_test(2))
-        );
-        assert_eq!(commit.attached_buffer_id(), Some(GuestId::for_test(2)));
-        assert!(commit.has_buffer_attach());
-        assert!(commit.moves_buffer());
-        assert!(!commit.has_invalid_fractional_viewport());
-        assert_eq!(
-            commit.surface_damage,
-            DamageRegion::Rects(vec![SurfaceRect::new(1, 2, 3, 4)])
-        );
-        assert_eq!(
-            commit.buffer_damage,
-            DamageRegion::Rects(vec![BufferRect::new(5, 6, 7, 8)])
-        );
-        assert_eq!(commit.buffer_offset, (11, 12));
-        assert_eq!(surface.current_buffer_scale, 2);
-        assert_eq!(surface.current_buffer_transform, 3);
-        assert_eq!(
-            surface.viewport,
-            Some(ViewportState {
-                source: Some((0, 0, 256, 256)),
-                destination: Some((20, 30)),
-            })
-        );
-        assert_eq!(surface, commit.state);
-        assert_eq!(surface.pending, SurfacePending::default());
-
-        let next = surface.prepare_commit();
-        assert_eq!(next.attachment, SurfaceAttachment::Unchanged);
-        assert!(next.surface_damage.is_empty());
-        assert!(next.buffer_damage.is_empty());
-        assert_eq!(next.buffer_offset, (0, 0));
-        assert_eq!(next.state, commit.state);
-    }
-
-    #[test]
-    fn surface_commit_rollback_restores_the_complete_snapshot() {
-        let mut surface = SurfaceState {
-            current_content: None,
-            current_buffer_scale: 1,
-            current_buffer_transform: 0,
-            viewport: Some(ViewportState::new()),
-            pending: SurfacePending {
-                attachment: SurfaceAttachment::Detach,
-                surface_damage: vec![SurfaceRect::new(1, 2, 3, 4)].into(),
-                buffer_damage: vec![BufferRect::new(5, 6, 7, 8)].into(),
-                buffer_scale: Some(2),
-                buffer_transform: Some(3),
-                attach_offset: Some((4, 5)),
-                viewport: Some(None),
-            },
-            logged_viewport_rule: false,
-            new_host_copies: Default::default(),
-        };
-        surface.set_current_buffer_for_test(Some(GuestId::for_test(1)), Some((10, 20)));
-        let before = surface.clone();
-
-        let commit = surface.prepare_commit();
-        assert_eq!(commit.buffer_offset, (4, 5));
-        assert_ne!(surface, before);
-        commit.rollback(&mut surface);
-
-        assert_eq!(surface, before);
-    }
-
-    #[test]
-    fn surface_commit_detach_clears_committed_content_dimensions() {
-        let mut surface = SurfaceState::default();
-        surface.pending.attachment = SurfaceAttachment::Detach;
-        surface.set_current_buffer_for_test(Some(GuestId::for_test(1)), Some((100, 50)));
-
-        let commit = surface.prepare_commit();
-
-        assert_eq!(commit.attachment, SurfaceAttachment::Detach);
-        assert_eq!(surface.current_buffer_id(), None);
-        assert_eq!(surface.current_buffer_dimensions(), None);
-    }
-
-    #[test]
-    fn content_snapshot_ignores_mismatched_destroy_generations() {
-        let mut surface = SurfaceState::default();
-        surface.set_current_buffer_for_test(Some(GuestId::for_test(7)), Some((100, 50)));
-
-        surface.clear_buffer_references(GuestId::for_test(8));
-        assert_eq!(surface.current_buffer_id(), Some(GuestId::for_test(7)));
-        assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
-
-        surface.clear_buffer_references(GuestId::for_test(7));
-        assert_eq!(surface.current_buffer_id(), None);
-        assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
-        assert!(
-            !surface.set_current_buffer_dimensions(GuestId::for_test(7), Some((1, 1))),
-            "a reused numeric ID must not mutate a dimensions-only old snapshot"
-        );
-        assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
-    }
-
-    #[test]
-    fn pending_damage_is_exact_until_bounded_then_becomes_full() {
-        let mut surface = SurfaceState::default();
-        let exact: Vec<_> = (0..MAX_PENDING_DAMAGE_RECTS)
-            .map(|index| BufferRect::new(index as i32, 0, 1, 1))
-            .collect();
-        for rect in &exact {
-            surface.pending.buffer_damage.push(*rect);
-        }
-
-        assert_eq!(surface.pending.buffer_damage, DamageRegion::Rects(exact));
-
-        surface
-            .pending
-            .buffer_damage
-            .push(BufferRect::new(-10, -20, 30, 40));
-        assert_eq!(surface.pending.buffer_damage, DamageRegion::Full);
-
-        for _ in 0..MAX_PENDING_DAMAGE_RECTS {
-            surface
-                .pending
-                .buffer_damage
-                .push(BufferRect::new(1, 1, 1, 1));
-        }
-        assert_eq!(
-            surface.pending.buffer_damage,
-            DamageRegion::Full,
-            "a collapsed region must remain bounded"
-        );
-
-        let commit = surface.prepare_commit();
-        assert_eq!(commit.buffer_damage, DamageRegion::Full);
-        assert!(surface.pending.buffer_damage.is_empty());
-    }
-
-    #[test]
-    fn collapsed_damage_rollback_restores_the_full_pending_region() {
-        let mut surface = SurfaceState::default();
-        for index in 0..=MAX_PENDING_DAMAGE_RECTS {
-            surface
-                .pending
-                .surface_damage
-                .push(SurfaceRect::new(index as i32, 0, 1, 1));
-        }
-        let pending = surface.clone();
-
-        let commit = surface.prepare_commit();
-        assert_eq!(commit.surface_damage, DamageRegion::Full);
-        commit.rollback(&mut surface);
-
-        assert_eq!(surface, pending);
-        let retry = surface.prepare_commit();
-        assert_eq!(retry.surface_damage, DamageRegion::Full);
-    }
-
-    #[test]
-    fn surface_commit_validates_fractional_viewport_as_one_state() {
-        let mut surface = SurfaceState::default();
-        surface.pending.viewport = Some(Some(ViewportState {
-            source: Some((0, 0, 257, 256)),
-            destination: None,
-        }));
-        assert!(surface.prepare_commit().has_invalid_fractional_viewport());
-
-        surface.pending.viewport = Some(Some(ViewportState {
-            source: Some((0, 0, 257, 256)),
-            destination: Some((10, 10)),
-        }));
-        assert!(!surface.prepare_commit().has_invalid_fractional_viewport());
-    }
-
-    #[test]
-    fn pending_viewport_starts_from_the_pending_else_the_committed_one() {
-        let source = Some((0, 0, 256, 256));
-        let mut surface = SurfaceState::default();
-        surface.pending_viewport_mut().source = source;
-        surface.prepare_commit();
-        let committed = surface.viewport;
-
-        // Nothing pending: the request edits a copy of the committed viewport.
-        surface.pending_viewport_mut().destination = Some((10, 20));
-        assert_eq!(surface.viewport, committed);
-        assert_eq!(
-            surface.pending.viewport,
-            Some(Some(ViewportState {
-                source,
-                destination: Some((10, 20)),
-            }))
-        );
-
-        // A viewport pending: the request edits it.
-        surface.pending_viewport_mut().destination = Some((30, 40));
-        assert_eq!(
-            surface.prepare_commit().state.viewport,
-            Some(ViewportState {
-                source,
-                destination: Some((30, 40)),
-            })
-        );
-
-        // A destroyed viewport pending: the request edits a copy of the
-        // committed viewport.
-        surface.pending.viewport = Some(None);
-        surface.pending_viewport_mut().source = None;
-        assert_eq!(
-            surface.pending.viewport,
-            Some(Some(ViewportState {
-                source: None,
-                destination: Some((30, 40)),
-            }))
-        );
     }
 
     #[test]
