@@ -365,6 +365,23 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   already advertised to that registry, or whose removal any registry has
   seen, breaks the protocol and ends the session as an internal failure.
   Test: `a_name_advertised_again_ends_the_session`.
+- **A sync's `done` follows the earlier registries' globals.**
+  libwayland sends a registry every global before the `done` of a
+  `wl_display.sync` sent after `get_registry`, and clients rely on it:
+  Mesa's EGL looks for `zwp_linux_dmabuf_v1` after one round trip and
+  otherwise renders with llvmpipe. The proxy withholds a guest
+  linux-dmabuf global until the capabilities of its binding arrive, so
+  when it may (`--gpu-accel` with a render node) it follows each
+  `get_registry` with a sync of its own, and a guest sync waits, holding
+  the guest's stream back, until the host has answered every such sync
+  before it (`registry::globals_settled` says why that suffices). Nothing
+  is reordered: the guest's requests reach the host later, in their
+  order, so a sync's `done` still follows every event of earlier requests
+  and precedes those of later ones. A sync sent before `get_registry`
+  does not wait, and without `--gpu-accel` and a render node none does.
+  Tests: `a_registrys_dmabuf_global_precedes_the_done_of_a_later_sync`,
+  `a_hidden_dmabuf_global_is_decided_before_the_done_of_a_later_sync`,
+  `the_host_batch_that_settles_the_globals_releases_a_waiting_sync`.
 - **A singleton binding moves to its replacement.** The proxy binds
   `wl_shm`, `zwp_linux_dmabuf_v1`, `zcr_keyboard_extension_v1` and
   `zaura_shell` once per connection for its own use. When the bound name

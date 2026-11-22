@@ -31,7 +31,7 @@ limitations under the License.
 //! keeps the session checks that the proxy holds no state for an ended
 //! object (`Context::assert_no_orphans`).
 
-use super::{Client, Direction, ParkedRequest};
+use super::{Client, Direction, Parked};
 use crate::connection::WaylandConnection;
 use crate::protocols::wayland::{wl_compositor, wl_display, wl_registry};
 use crate::protocols::{AnyEvent, AnyRequest};
@@ -195,18 +195,25 @@ impl Session {
         assert_eq!(unsafe { libc::shutdown(socket, libc::SHUT_WR) }, 0);
     }
 
-    /// Whether a guest request waits for a fence, holding back the guest's
-    /// stream.
+    /// Whether a guest request waits, for a fence or the guest's globals,
+    /// holding back the guest's stream.
     pub(crate) fn parked(&self) -> bool {
         self.client.parked.is_some()
     }
 
-    /// Wait until the parked guest request is due, as `Client::run` does,
-    /// and dispatch the guest's stream from it, which must not end the
-    /// session.
+    /// Whether a guest request waits for a fence: only such a request is
+    /// due on its own ([`Self::resume`]); a host batch releases one that
+    /// waits for the globals.
+    fn waits_for_fence(&self) -> bool {
+        matches!(self.client.parked, Some(Parked::Fence(_)))
+    }
+
+    /// Wait until the guest request that waits for a fence is due, as
+    /// `Client::run` does, and dispatch the guest's stream from it, which
+    /// must not end the session.
     pub(crate) async fn resume(&mut self) {
-        assert!(self.parked(), "no guest request waits for a fence");
-        ParkedRequest::due(self.client.parked.as_ref()).await;
+        assert!(self.waits_for_fence(), "no guest request waits for a fence");
+        Parked::due(self.client.parked.as_ref()).await;
         self.guest([]).await;
     }
 
@@ -520,20 +527,52 @@ impl Session {
         if let Some(registry) = self.registry {
             return registry;
         }
+        let registry = self.get_registry().await;
+        *self.registry.insert(registry)
+    }
+
+    /// A `wl_registry` the guest creates, whose globals the host advertises
+    /// later. A proxy that may withhold a global follows the forwarded
+    /// `get_registry` with a sync (`registry::await_globals`), which the
+    /// host answers at once, as it has no global yet.
+    async fn get_registry(&mut self) -> Object {
+        use crate::protocols::wayland::wl_callback;
         let id = self.new_id();
-        let host = self
-            .create(wl_display::req::get_registry(WL_DISPLAY_ID, id))
+        let earlier = self.host.received.len();
+        self.guest([wl_display::req::get_registry(WL_DISPLAY_ID, id)])
             .await;
-        *self.registry.insert(Object { id, host })
+        let forwarded = self.host.received.split_off(earlier);
+        let host = match forwarded[..] {
+            [(
+                WL_DISPLAY_ID,
+                AnyRequest::WlDisplay(wl_display::Request::GetRegistry { registry }),
+            )] => registry,
+            [(
+                WL_DISPLAY_ID,
+                AnyRequest::WlDisplay(wl_display::Request::GetRegistry { registry }),
+            ), (WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] => {
+                self.host([
+                    wl_callback::evt::done(callback, 0),
+                    wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+                ])
+                .await;
+                registry
+            }
+            _ => panic!("the host got {forwarded:?}, not a get_registry"),
+        };
+        Object { id, host }
     }
 
     /// Send `messages` over their sender's socket, which the proxy
     /// receives as `Client::run` does, and dispatch them, up to a guest
-    /// request that waits for a fence ([`Self::resume`]); returns whether
-    /// the session goes on. It dispatches one direction and then sends
-    /// everything, so it never interleaves directions, and cannot show when
-    /// a batch's output leaves relative to the other peer's batches; the
-    /// tests of that dispatch a batch at a time ([`Self::batch`]).
+    /// request that waits for a fence ([`Self::resume`]) or the guest's
+    /// globals; returns whether the session goes on. A host batch that
+    /// settles the globals a guest request waits for is followed by the
+    /// guest's stream, as `Client::run` dispatches it next. It otherwise
+    /// dispatches one direction and then sends everything, so it never
+    /// interleaves directions, and cannot show when a batch's output leaves
+    /// relative to the other peer's batches; the tests of that dispatch a
+    /// batch at a time ([`Self::batch`]).
     async fn send(
         &mut self,
         direction: Direction,
@@ -553,12 +592,22 @@ impl Session {
             }
         }
         let before = Counts::now();
+        let mut direction = direction;
         let goes_on = loop {
             let goes_on = self.client.handle_msgs(direction).await;
-            let parked = direction == Direction::ClientToHost && self.client.parked.is_some();
-            if !goes_on || parked || !self.client.connection(direction).has_complete_message() {
+            let parked = self.client.parked.is_some();
+            if !goes_on || (direction == Direction::ClientToHost && parked) {
                 break goes_on;
             }
+            if self.client.connection(direction).has_complete_message() {
+                continue;
+            }
+            // Only a request a host batch released is left in the guest's
+            // stream.
+            if parked || !self.client.client_conn.has_complete_message() {
+                break goes_on;
+            }
+            direction = Direction::ClientToHost;
         };
         // Nothing more is buffered, so the proxy sends what it holds.
         let goes_on = self.client.flush().await && goes_on;
@@ -944,11 +993,7 @@ impl Session {
 
     /// A new `wl_registry` the guest creates, besides [`Self::registry`].
     pub(crate) async fn new_registry(&mut self) -> Object {
-        let id = self.new_id();
-        let host = self
-            .create(wl_display::req::get_registry(WL_DISPLAY_ID, id))
-            .await;
-        Object { id, host }
+        self.get_registry().await
     }
 
     /// The host advertises global `name` of `interface` at `version` on
@@ -1055,11 +1100,11 @@ impl Session {
         goes_on
     }
 
-    /// Wait until the parked guest request is due, as `Client::run` does,
-    /// without dispatching it.
+    /// Wait until the guest request that waits for a fence is due, as
+    /// `Client::run` does, without dispatching it.
     pub(super) async fn fence_due(&self) {
-        assert!(self.parked(), "no guest request waits for a fence");
-        ParkedRequest::due(self.client.parked.as_ref()).await;
+        assert!(self.waits_for_fence(), "no guest request waits for a fence");
+        Parked::due(self.client.parked.as_ref()).await;
     }
 
     /// Run the proxy's own event loop, `Client::run`, beside `peers`, which

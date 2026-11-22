@@ -496,6 +496,43 @@ fn defer_synthetic_dmabuf_global(
     set_registry_global_visibility(ctx, registry_host_id, name, false);
 }
 
+/// Whether the proxy may withhold a guest linux-dmabuf global until the
+/// capabilities of its binding arrive ([`dmabuf_global`]): with GPU access,
+/// when it synthesizes the global's feedback.
+fn dmabuf_globals_may_wait(ctx: &Context) -> bool {
+    ctx.settings().gpu_accel
+        && crate::handler::linux_dmabuf::can_synthesize_feedback(
+            ctx,
+            LINUX_DMABUF_CAPABILITY_VERSION,
+        )
+}
+
+/// The guest created a registry, whose `get_registry` the proxy has just
+/// sent the host. If the proxy may withhold one of its globals, it follows
+/// the request with a sync ([`InternalCallback::RegistryGlobals`]), whose
+/// `done` says that the host has sent the registry every global it had;
+/// until then the guest's globals are not settled ([`globals_settled`]).
+pub(crate) fn await_globals(ctx: &mut Context) {
+    if dmabuf_globals_may_wait(ctx) {
+        queue_internal_sync(ctx, InternalCallback::RegistryGlobals);
+    }
+}
+
+/// Whether a guest `wl_display.sync` may reach the host: the host has
+/// listed the globals of every registry the guest created before it
+/// ([`await_globals`]). The sync waits until then, so that its `done`
+/// follows the guest's globals, as libwayland's follows those of every
+/// registry created before the sync, although the proxy withholds a
+/// linux-dmabuf global until the capabilities of its binding arrive. The
+/// proxy binds a global, and asks for its capabilities, when the host
+/// lists it, so the sync reaches the host after those requests, the host
+/// answers them first (E11), and the answer shows or hides the global
+/// before the sync's `done` arrives. Only the proxy's own syncs keep the
+/// globals unsettled, and the host answers each, so the wait ends.
+pub(crate) fn globals_settled(ctx: &Context) -> bool {
+    !ctx.internal_callbacks.awaits_registry_globals()
+}
+
 /// Publish the guest globals that wait for the capabilities of host
 /// linux-dmabuf global `name`, which have arrived.
 pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, name: u32) {
@@ -3192,5 +3229,278 @@ mod tests {
             "the guest must receive the capped version"
         );
         r.bind_paired(r.a, 10, "wl_seat", 5).await;
+    }
+
+    /// A guest's `wl_display.sync` against a registry whose linux-dmabuf
+    /// global waits for its capabilities, played against a host that
+    /// answers every request in order, as libwayland-server does.
+    mod sync_after_get_registry {
+        use super::*;
+        use crate::protocols::wayland::wl_seat;
+
+        /// The forwarded global every host here advertises first, name 1.
+        const SEAT: (&str, u32) = (wl_seat::NAME, 5);
+        /// The host's linux-dmabuf, name 2, of a version the proxy offers
+        /// the guest with synthetic feedback.
+        const DMABUF: (&str, u32) = (zwp_linux_dmabuf_v1::NAME, 4);
+
+        /// A host compositor that answers each request in order: a
+        /// `get_registry` with its globals, a sync with its `done` and
+        /// `delete_id`, and a linux-dmabuf bind with `formats`.
+        struct InOrderHost {
+            globals: Vec<(&'static str, u32)>,
+            formats: Vec<(u32, u64)>,
+        }
+
+        impl InOrderHost {
+            /// A host that advertises [`SEAT`] and [`DMABUF`], whose
+            /// linux-dmabuf offers `formats`.
+            fn with_dmabuf(formats: &[(u32, u64)]) -> Self {
+                Self {
+                    globals: vec![SEAT, DMABUF],
+                    formats: formats.to_vec(),
+                }
+            }
+
+            fn answer(&self, requests: &[(u32, AnyRequest)]) -> Vec<Outgoing<u32>> {
+                let mut events = Vec::new();
+                for (_, request) in requests {
+                    match request {
+                        AnyRequest::WlDisplay(wl_display::Request::GetRegistry { registry }) => {
+                            for (name, &(interface, version)) in (1..).zip(&self.globals) {
+                                let global =
+                                    wl_registry::evt::global(*registry, name, interface, version);
+                                events.push(global.unwrap());
+                            }
+                        }
+                        AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) => {
+                            events.push(wl_callback::evt::done(*callback, 0));
+                            events.push(wl_display::evt::delete_id(WL_DISPLAY_ID, *callback));
+                        }
+                        AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. })
+                            if id.0 == zwp_linux_dmabuf_v1::NAME =>
+                        {
+                            for &(format, modifier) in &self.formats {
+                                let (hi, lo) = ((modifier >> 32) as u32, modifier as u32);
+                                events
+                                    .push(zwp_linux_dmabuf_v1::evt::modifier(id.2, format, hi, lo));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                events
+            }
+
+            /// Answer what the proxy sends until it sends nothing more;
+            /// returns every request the host got, in order.
+            async fn serve(&self, s: &mut Session) -> Vec<(u32, AnyRequest)> {
+                let mut all = Vec::new();
+                loop {
+                    let requests = s.host_received();
+                    if requests.is_empty() {
+                        return all;
+                    }
+                    let events = self.answer(&requests);
+                    all.extend(requests);
+                    if !events.is_empty() {
+                        s.host(events).await;
+                    }
+                }
+            }
+        }
+
+        /// A session whose proxy has GPU access and synthesizes dma-buf
+        /// feedback, so it withholds the guest's linux-dmabuf global until
+        /// its capabilities arrive.
+        fn gpu_session() -> Session {
+            let mut ctx = Context::new_for_test(true, false, vec![]);
+            // Stands in for a virtio-gpu render node, which the proxy
+            // synthesizes feedback for and a test cannot have.
+            ctx.dmabuf.set_feedback_available_for_test(true);
+            Session::with_context(ctx)
+        }
+
+        /// What the guest gets of callback `callback`: its `done`, then its
+        /// `delete_id`.
+        fn done(callback: u32) -> [(u32, AnyEvent); 2] {
+            [
+                (
+                    callback,
+                    wl_callback::Event::Done { callback_data: 0 }.into(),
+                ),
+                (
+                    WL_DISPLAY_ID,
+                    wl_display::Event::DeleteId { id: callback }.into(),
+                ),
+            ]
+        }
+
+        /// The globals registry `registry` gets of [`InOrderHost::with_dmabuf`],
+        /// the seat first.
+        fn seat(registry: u32) -> (u32, AnyEvent) {
+            (registry, global(1, SEAT.0, SEAT.1))
+        }
+
+        fn dmabuf(registry: u32) -> (u32, AnyEvent) {
+            (
+                registry,
+                global(
+                    2,
+                    DMABUF.0,
+                    crate::handler::linux_dmabuf::GUEST_DMABUF_VERSION,
+                ),
+            )
+        }
+
+        /// Mesa's `wl_display_roundtrip` after `get_registry`: the guest
+        /// gets the linux-dmabuf global before the `done`, although the host
+        /// answers the sync before the proxy has the global's capabilities.
+        #[tokio::test]
+        async fn a_registrys_dmabuf_global_precedes_the_done_of_a_later_sync() {
+            let mut s = gpu_session();
+            let (registry, callback) = (s.new_id(), s.new_id());
+            s.guest([
+                wl_display::req::get_registry(WL_DISPLAY_ID, registry),
+                wl_display::req::sync(WL_DISPLAY_ID, callback),
+            ])
+            .await;
+            InOrderHost::with_dmabuf(&[XRGB8888_LINEAR])
+                .serve(&mut s)
+                .await;
+            let mut expected = vec![seat(registry), dmabuf(registry)];
+            expected.extend(done(callback));
+            assert_eq!(s.guest_received(), expected);
+        }
+
+        /// A linux-dmabuf global the proxy hides, as the host offers no
+        /// format it supports, is decided before the `done` too: the
+        /// guest's sync reaches the host only after the capabilities.
+        #[tokio::test]
+        async fn a_hidden_dmabuf_global_is_decided_before_the_done_of_a_later_sync() {
+            let mut s = gpu_session();
+            let (registry, callback) = (s.new_id(), s.new_id());
+            s.guest([
+                wl_display::req::get_registry(WL_DISPLAY_ID, registry),
+                wl_display::req::sync(WL_DISPLAY_ID, callback),
+            ])
+            .await;
+            let host = InOrderHost::with_dmabuf(&[]).serve(&mut s).await;
+            let mut expected = vec![seat(registry)];
+            expected.extend(done(callback));
+            assert_eq!(s.guest_received(), expected);
+            let syncs: Vec<usize> = (0..host.len())
+                .filter(|&at| {
+                    matches!(
+                        host[at].1,
+                        AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
+                    )
+                })
+                .collect();
+            let capabilities = host
+                .iter()
+                .position(|request| matches!(request.1, AnyRequest::WlRegistry(_)))
+                .expect("the proxy binds the host's linux-dmabuf")
+                + 1;
+            assert!(
+                syncs.last() > Some(&capabilities),
+                "the guest's sync follows the capability sync: {host:?}"
+            );
+        }
+
+        /// Every registry the guest created before its sync gets its
+        /// linux-dmabuf global before the `done`.
+        #[tokio::test]
+        async fn every_earlier_registry_gets_its_dmabuf_global_before_the_done() {
+            let mut s = gpu_session();
+            let (first, second, callback) = (s.new_id(), s.new_id(), s.new_id());
+            s.guest([
+                wl_display::req::get_registry(WL_DISPLAY_ID, first),
+                wl_display::req::get_registry(WL_DISPLAY_ID, second),
+                wl_display::req::sync(WL_DISPLAY_ID, callback),
+            ])
+            .await;
+            InOrderHost::with_dmabuf(&[XRGB8888_LINEAR])
+                .serve(&mut s)
+                .await;
+            let mut expected = vec![seat(first), seat(second), dmabuf(first), dmabuf(second)];
+            expected.extend(done(callback));
+            assert_eq!(s.guest_received(), expected);
+        }
+
+        /// A sync sent before `get_registry` follows no global of the
+        /// registry, so its `done` is not held back.
+        #[tokio::test]
+        async fn a_sync_before_get_registry_is_answered_at_once() {
+            let mut s = gpu_session();
+            let (early, registry, late) = (s.new_id(), s.new_id(), s.new_id());
+            s.guest([
+                wl_display::req::sync(WL_DISPLAY_ID, early),
+                wl_display::req::get_registry(WL_DISPLAY_ID, registry),
+                wl_display::req::sync(WL_DISPLAY_ID, late),
+            ])
+            .await;
+            InOrderHost::with_dmabuf(&[XRGB8888_LINEAR])
+                .serve(&mut s)
+                .await;
+            let mut expected = Vec::from(done(early));
+            expected.extend([seat(registry), dmabuf(registry)]);
+            expected.extend(done(late));
+            assert_eq!(s.guest_received(), expected);
+        }
+
+        /// The events of a request the guest sends after the sync follow
+        /// its `done`: here a second registry's globals.
+        #[tokio::test]
+        async fn a_later_requests_events_follow_the_done() {
+            let mut s = gpu_session();
+            let (first, callback, second) = (s.new_id(), s.new_id(), s.new_id());
+            s.guest([
+                wl_display::req::get_registry(WL_DISPLAY_ID, first),
+                wl_display::req::sync(WL_DISPLAY_ID, callback),
+                wl_display::req::get_registry(WL_DISPLAY_ID, second),
+            ])
+            .await;
+            InOrderHost::with_dmabuf(&[XRGB8888_LINEAR])
+                .serve(&mut s)
+                .await;
+            let mut expected = vec![seat(first), dmabuf(first)];
+            expected.extend(done(callback));
+            expected.extend([seat(second), dmabuf(second)]);
+            assert_eq!(s.guest_received(), expected);
+        }
+
+        /// Without synthetic dma-buf feedback the proxy withholds no
+        /// global, so the host gets the guest's `get_registry` and sync as
+        /// they are, and nothing else.
+        #[tokio::test]
+        async fn a_proxy_that_withholds_no_global_forwards_the_sync_at_once() {
+            // No GPU access, then GPU access without a render node.
+            for gpu_accel in [false, true] {
+                let mut s = Session::with_context(Context::new_for_test(gpu_accel, false, vec![]));
+                let (registry, callback) = (s.new_id(), s.new_id());
+                s.guest([
+                    wl_display::req::get_registry(WL_DISPLAY_ID, registry),
+                    wl_display::req::sync(WL_DISPLAY_ID, callback),
+                ])
+                .await;
+                let host = s.host_received();
+                let [(WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::GetRegistry { .. })), (
+                    WL_DISPLAY_ID,
+                    AnyRequest::WlDisplay(wl_display::Request::Sync {
+                        callback: host_callback,
+                    }),
+                )] = host[..]
+                else {
+                    panic!("the host got {host:?}, not the guest's two requests");
+                };
+                s.host([
+                    wl_callback::evt::done(host_callback, 0),
+                    wl_display::evt::delete_id(WL_DISPLAY_ID, host_callback),
+                ])
+                .await;
+                assert_eq!(s.guest_received(), done(callback), "gpu_accel {gpu_accel}");
+            }
+        }
     }
 }

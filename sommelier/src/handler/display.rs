@@ -87,10 +87,16 @@ impl wl_display::WlDisplayHandler for Handlers {
             HostId::DISPLAY,
             host_registry_id,
         ));
+        crate::handler::registry::await_globals(ctx);
         Action::Drop
     }
 
     fn on_sync(ctx: &mut Context, _sender: RequestSender, callback: GuestId) -> Action {
+        // Its `done` follows every global of the registries created before
+        // it, which the proxy may still be deciding whether to show.
+        if !crate::handler::registry::globals_settled(ctx) {
+            return ctx.wait_for_globals();
+        }
         let host_callback_id = ctx.shadow_table.create_paired(
             callback,
             Iface::WlCallback,

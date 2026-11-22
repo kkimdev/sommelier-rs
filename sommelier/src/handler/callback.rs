@@ -68,6 +68,9 @@ impl WlCallbackHandler for Handlers {
                 // Every host event, this `done` included, has decided the
                 // pending recovery before it is handled.
                 InternalCallback::KeyRecovery => {}
+                // The batch that ends with it releases a guest sync that
+                // waits for the globals (`Client::handle_msgs`).
+                InternalCallback::RegistryGlobals => {}
                 InternalCallback::PlacementBarrier { zaura_toplevel } => {
                     crate::handler::window_placement::complete_barrier(
                         ctx,

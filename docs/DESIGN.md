@@ -439,7 +439,7 @@ or host error wins over an internal failure.
 message (`Frame`: its header, its payload, and the descriptors its
 connection has queued), dispatches it, takes its `state::Effects` once
 (`Context::take_effects`), and reports whether it was handled, ends the
-session or waits for a fence, with what a trace records of it (test:
+session or waits, with what a trace records of it (test:
 `a_frame_dispatches_without_a_connection`).
 `Client::handle_msgs` is the shell around it: it frames each
 connection's bytes, records the trace, parks a request that waits, ends
@@ -454,10 +454,11 @@ reset) and sends. The core commits the effects:
   descriptors, and the shell ends the batch. After the batch's earlier, valid
   messages, `handler::display::session_error` encodes the session's one
   `wl_display.error`. Nothing else writes one.
-- If it waits for a guest GPU fence (`return ctx.wait_for_fence(wait)`,
-  which a `wl_surface.commit` of a busy dma-buf does before it changes
-  anything), it leaves the message and everything after it buffered and
-  ends the batch. Only a guest request with no descriptor arguments may
+- If it waits (`return ctx.wait_for_fence(wait)`, which a
+  `wl_surface.commit` of a busy dma-buf does before it changes anything,
+  or `return ctx.wait_for_globals()`, which a `wl_display.sync` does
+  while the host has not listed a registry's globals), it leaves the
+  message and everything after it buffered and ends the batch. Only a guest request with no descriptor arguments may
   wait: only the guest stream can be parked, and the descriptors would
   be gone when the request is dispatched again. A message that waits
   otherwise, or with a forward, output or deferred work, is a proxy bug:
@@ -466,10 +467,14 @@ reset) and sends. The core commits the effects:
   such an end like any other session end, but never reaches a fence
   wait: its planes are memfds and its contexts have no virtio-gpu
   device, so no fence is ever pending. `Client` parks the guest stream
-  (`ParkedRequest`): it neither reads nor dispatches guest messages, and
+  (`Parked`): it neither reads nor dispatches guest messages, and
   fair dispatch does not offer them, while host events and other clients
-  go on. Once the exported sync_file is readable, or, for the virtio-gpu
-  fallback, which has no descriptor to wait on, a growing poll interval
+  go on. A sync that waits for the globals is dispatched again after the
+  host batch that settles them
+  ([a sync's `done` follows the earlier registries' globals](INVARIANTS.md#registry-globals)).
+  For a fence, once the exported sync_file is readable, or, for the
+  virtio-gpu fallback, which has no descriptor to wait on, a growing poll
+  interval
   after it parked (`FENCE_POLL_INTERVAL`), it dispatches the same message
   again, which checks its fence afresh, until the deadline
   ([native buffers are fenced](INVARIANTS.md#dma-buf)).
@@ -478,7 +483,7 @@ A session that ends never handles another message (`Client` remembers
 that it ended), so a fatal branch rolls nothing back: only output could
 escape, and the loop drops it.
 
-Effects cover only wire output and the fence wait. What a handler does
+Effects cover only wire output and the wait. What a handler does
 outside the wire takes effect at once: it starts clipboard pumps,
 allocates a buffer's host storage and copies pixels into it. A session
 that ends aborts its pumps (`Client::run`), and its `Context` frees the
