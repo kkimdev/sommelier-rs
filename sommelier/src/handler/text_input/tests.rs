@@ -28,7 +28,7 @@ use crate::protocols::wayland::{
 use crate::protocols::Iface;
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
-use crate::state::{GuestId, HostId};
+use crate::state::{GuestId, HostId, Singleton};
 use crate::test_support::respell;
 use crate::wire::WL_DISPLAY_ID;
 use crate::wire::{Outgoing, WireId};
@@ -4179,7 +4179,9 @@ fn child_objects_inherit_their_manager_versions() {
     let mut ctx = Context::new_for_test(false, false, vec![]);
     let (manager, extension) = (HostId::for_test(2), HostId::for_test(3));
     ctx.globals
-        .set_text_input_factories_for_test(Some(manager), Some(extension));
+        .bind_for_test(Singleton::TextInputManager, manager);
+    ctx.globals
+        .bind_for_test(Singleton::TextInputExtension, extension);
     // Both text-input protocols are v1, so artificial manager versions
     // show where each child's version comes from.
     ctx.shadow_table
@@ -4288,10 +4290,7 @@ async fn text_input_creation_without_host_manager_does_not_create_broken_state()
     s.host_received();
     // Injects a fault no peer can cause: the proxy has no host manager
     // for the guest's, which it advertises only with one.
-    let extension = s.ctx().globals.text_input_factories().map(|(_, e)| e);
-    s.ctx()
-        .globals
-        .set_text_input_factories_for_test(None, extension);
+    s.ctx().globals.unbind_for_test(Singleton::TextInputManager);
     let ti = s.new_id();
     s.guest([
         zwp_text_input_manager_v3::req::get_text_input(manager, ti, seat),

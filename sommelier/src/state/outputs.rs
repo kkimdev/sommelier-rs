@@ -30,6 +30,7 @@ limitations under the License.
 use super::HostId;
 use crate::geometry::Rect;
 use crate::protocols::wayland::wl_output;
+use crate::protocols::Iface;
 use std::collections::BTreeMap;
 
 /// Whether `transform` is a `wl_output.transform` enum value.
@@ -55,7 +56,7 @@ pub(crate) fn transformed_extent(transform: i32, width: i32, height: i32) -> (i3
 /// dock flaps (see `handler::registry::admit_guest_bind`). A `wl_output` up
 /// to the advertised v3 has no request that creates objects, so an inert
 /// one, a local-only guest object, needs nothing but its own destructor.
-pub(crate) const INERT_BIND_INTERFACE: &str = wl_output::NAME;
+pub(crate) const INERT_BIND_INTERFACE: Iface = Iface::WlOutput;
 
 /// Units per 1.0 of an Aura scale factor: `zaura_output` sends both scale
 /// factors in thousandths.

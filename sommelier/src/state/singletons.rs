@@ -16,12 +16,12 @@ limitations under the License.
 
 //! The host globals the proxy binds once per connection, for its own use,
 //! and its binding of each. The policy that binds, moves and releases
-//! them is `handler::registry`'s (`policy`).
+//! them is `handler::registry`'s: each singleton's row in its table
+//! (`policy`) names the interface it binds.
 
 use std::collections::BTreeMap;
 
 use super::HostId;
-use crate::protocols::Iface;
 
 /// A host global the proxy binds once per connection, for its own use.
 ///
@@ -29,34 +29,17 @@ use crate::protocols::Iface;
 /// (`handler::registry::Globals`), and the registry binds one whenever
 /// the proxy has none. A host may advertise one under a new name before it
 /// removes the old one; the new name is then bound when the old one
-/// retires, so the proxy keeps the capability.
+/// retires, so the proxy keeps the capability. The text-input managers
+/// are the exception: the proxy keeps the first it binds for the
+/// connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Singleton {
     Dmabuf,
     KeyboardExtension,
     AuraShell,
     Shm,
-}
-
-impl Singleton {
-    /// Every singleton, in the order the proxy binds them when several
-    /// have no binding (test: `every_interface_has_one_global_policy`).
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Dmabuf,
-        Self::KeyboardExtension,
-        Self::AuraShell,
-        Self::Shm,
-    ];
-
-    /// The interface of the global it binds.
-    pub(crate) const fn interface(self) -> Iface {
-        match self {
-            Self::Dmabuf => Iface::ZwpLinuxDmabufV1,
-            Self::KeyboardExtension => Iface::ZcrKeyboardExtensionV1,
-            Self::AuraShell => Iface::ZauraShell,
-            Self::Shm => Iface::WlShm,
-        }
-    }
+    TextInputManager,
+    TextInputExtension,
 }
 
 /// The proxy's binding of a [`Singleton`].
@@ -93,11 +76,18 @@ impl Singletons {
         debug_assert!(previous.is_none(), "{singleton:?} is bound twice");
     }
 
-    /// End the binding that global `name` backs, if one does, and return
-    /// it with its singleton.
-    pub(crate) fn release_named(&mut self, name: u32) -> Option<(Singleton, Binding)> {
-        let (&singleton, _) = self.0.iter().find(|(_, binding)| binding.name == name)?;
-        Some((singleton, self.0.remove(&singleton)?))
+    /// The binding that global `name` backs, if one does, with its
+    /// singleton.
+    pub(crate) fn bound_from(&self, name: u32) -> Option<(Singleton, Binding)> {
+        self.0
+            .iter()
+            .find(|(_, binding)| binding.name == name)
+            .map(|(&singleton, &binding)| (singleton, binding))
+    }
+
+    /// End the binding of `singleton`, if it has one.
+    pub(crate) fn release(&mut self, singleton: Singleton) {
+        self.0.remove(&singleton);
     }
 
     /// Bind `singleton` as host object `host`, from a global named as it is,

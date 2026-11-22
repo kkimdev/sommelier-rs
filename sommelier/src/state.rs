@@ -163,20 +163,6 @@ pub(crate) enum PlaneFenceForTest {
     Busy,
 }
 
-/// Metadata for one global advertised by the host compositor.
-///
-/// Global names are unique, but interface names are not: a compositor may
-/// advertise multiple `wl_seat` or `wl_output` globals at the same time.
-/// Keeping the numeric name as the map key prevents a later global from
-/// overwriting the bind target for an earlier one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostGlobal {
-    /// Interface implemented by the global.
-    pub interface: String,
-    /// Maximum version exposed to the guest for this global.
-    pub version: u32,
-}
-
 /// The most clipboard transfers one connection may have in flight.
 ///
 /// A paste fetches one MIME type and a drop a few, so the cap only bounds
