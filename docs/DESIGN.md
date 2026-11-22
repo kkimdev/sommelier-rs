@@ -574,16 +574,16 @@ handlers call:
 | `pool.rs` | The guest's `wl_shm` and `wl_shm_pool`: pool creation and resize, buffer validation, retiring and forgetting the objects |
 | `formats.rs` | The one list of supported formats (`SUPPORTED_SHM_FORMATS`, also the source of the linux-dmabuf shim's DRM list); the ones the guest's `wl_shm` offers, from the host's capabilities; each format's DRM code and bytes per pixel |
 | `storage.rs` | A buffer's host storage: choosing and allocating it, and creating the host buffer that imports it |
-| `dmabuf.rs`, `dmabuf_layout.rs` | VirtWL dma-buf allocation and mapping; the validated dma-buf layout |
-| `copy.rs` | The copy of damaged pixels from the pool into the host storage |
+| `dmabuf.rs`, `dmabuf_layout.rs` | VirtWL dma-buf allocation and mapping, and the CPU-write interval the copy writes in; the validated dma-buf layout |
+| `copy.rs` | The copy of damaged pixels from the pool into the host storage, which a commit makes before the host may show the buffer (`copy_surface_buffer`) |
 | `damage.rs` | Damage rectangles: clipping to a buffer and merging |
 
 Guest dma-buf (`linux_dmabuf.rs`) is forwarded rather than copied. For
 classic virtio-gpu PRIME buffers, `allocator.rs` replaces the guest's
 plane-0 stride and modifier with the kernel-reported values, because the
 guest's are stale for host import. Before forwarding a commit, the proxy
-waits for the guest GPU's fence, matching ChromiumOS Sommelier, but
-without stalling the event loop: the commit is parked and dispatched
+waits for the guest GPU's fence (`linux_dmabuf::pending_fence`), matching
+ChromiumOS Sommelier, but without stalling the event loop: the commit is parked and dispatched
 again (see [Message effects](#message-effects)).
 
 The same descriptor problem applies to clipboard pipes: for each

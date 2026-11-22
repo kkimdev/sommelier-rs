@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::allocator::DmabufFence;
 use crate::handler::shm::{is_supported_drm_format, record_host_shm_drm_format};
 use crate::handler::Handlers;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
@@ -23,7 +24,7 @@ use crate::protocols::wayland::{wl_display, wl_shm};
 use crate::protocols::Iface;
 use crate::state::Singleton;
 use crate::state::{
-    Context, EventSender, GuestId, HostId, PostDispatch, RequestObject, RequestSender,
+    Context, EventSender, FenceWait, GuestId, HostId, PostDispatch, RequestObject, RequestSender,
 };
 use crate::wire::{Action, MessageHeader, ToGuest};
 use log::{debug, error};
@@ -31,7 +32,7 @@ use nix::sys::memfd::MFdFlags;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 /// The connection's dma-buf state that no one object owns
 /// (`Context::dmabuf`). Its fields are this module's: only the
@@ -676,6 +677,70 @@ pub(crate) fn can_synthesize_feedback(ctx: &Context, version: u32) -> bool {
     {
         false
     }
+}
+
+/// The fence a commit of native buffer `guest_buffer_id` waits for while
+/// the guest GPU still writes the buffer, checked without waiting (see
+/// INVARIANTS, "Native buffers are fenced"). A kernel with neither fence
+/// mechanism switches the buffer to implicit synchronization, once, and
+/// waits for nothing.
+pub(crate) fn pending_fence(
+    ctx: &mut Context,
+    guest_buffer_id: GuestId,
+) -> io::Result<Option<FenceWait>> {
+    if ctx.native_buffer_uses_implicit_sync(guest_buffer_id) {
+        return Ok(None);
+    }
+    let Some(planes) = ctx.native_buffer_sync_fds(guest_buffer_id) else {
+        return Ok(None);
+    };
+    // A buffer has at most four planes.
+    let plane_count = planes.len() as u32;
+    let mut needs_implicit_sync = false;
+    for plane in planes {
+        match plane_fence(ctx, plane.as_fd())? {
+            DmabufFence::Signalled => {}
+            DmabufFence::Pending(fence) => {
+                let timeout = fence.timeout() * plane_count;
+                return Ok(Some(FenceWait { fence, timeout }));
+            }
+            DmabufFence::ImplicitSyncFallback => {
+                needs_implicit_sync = true;
+                break;
+            }
+        }
+    }
+
+    if needs_implicit_sync {
+        if !ctx.enable_native_buffer_implicit_sync(guest_buffer_id) {
+            return Err(io::Error::other(
+                "native dma-buf disappeared while enabling implicit synchronization",
+            ));
+        }
+        log::warn!(
+            "Native dma-buf synchronization ioctls are unavailable for guest buffer {}; using implicit synchronization",
+            guest_buffer_id
+        );
+    }
+    Ok(None)
+}
+
+/// Whether the guest GPU has finished writing one plane of a native buffer.
+fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> io::Result<DmabufFence> {
+    #[cfg(test)]
+    if let Some(stand_in) = ctx.plane_fences_for_test {
+        use crate::allocator::PendingFence;
+        use crate::state::PlaneFenceForTest;
+        return Ok(
+            match crate::allocator::sync_file_fence(plane.try_clone_to_owned()?)? {
+                DmabufFence::Pending(_) if matches!(stand_in, PlaneFenceForTest::Busy) => {
+                    DmabufFence::Pending(PendingFence::Busy)
+                }
+                fence => fence,
+            },
+        );
+    }
+    crate::allocator::dmabuf_fence(plane, ctx.virtgpu())
 }
 
 /// Forget guest `zwp_linux_dmabuf_v1` `factory`, of global `global`,

@@ -15,14 +15,23 @@ limitations under the License.
 */
 
 //! Copying the damaged pixels of a guest SHM buffer from its pool, with
-//! `pread` and `preadv`, into the buffer's host storage.
+//! `pread` and `preadv`, into the buffer's host storage: what a commit
+//! copies before the host may show the buffer ([`copy_surface_buffer`]),
+//! and the copy itself ([`copy_shm_damage`]).
 
-use super::damage::{clipped_damage, coalesce_damage_rects};
+use super::damage::{clipped_damage, coalesce_damage_rects, damage_reaches_buffer};
+use super::dmabuf::DmabufWriteSync;
 use super::formats::format_bytes_per_pixel;
 use crate::protocols::wayland::wl_shm;
-use crate::state::{BufferRect, BufferSpace, BufferState, DamageRegion, HostMapping, Rows};
+use crate::state::{
+    BufferRect, BufferSpace, BufferState, Context, DamageRegion, GuestId, HostMapping, Rows,
+};
+use crate::virtwl_channel::VirtWaylandChannel;
+use log::trace;
 use std::fs::File;
 use std::io;
+use std::os::fd::AsFd;
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 struct PlaneCopy {
@@ -274,13 +283,112 @@ pub(crate) fn copy_shm_damage(
     Ok(())
 }
 
+/// The log target of the trace of each SHM frame a commit copies, which
+/// the weston end-to-end test (`sommelier/tests/weston_e2e.rs`) enables
+/// and counts. It is a target of its own, not this module's path, so that
+/// moving the copy does not silence what the test counts.
+const FRAME_COPY_TARGET: &str = "sommelier::frame_copy";
+
+/// Copy what a locally bridged SHM buffer's host copy lacks before it is
+/// shown on `surface_id`.
+///
+/// Native linux-dmabuf buffers have no local copy state and are immediately
+/// ready. Stale pixels are cleared only by a successful copy, so a failed
+/// one loses nothing; it still stales the whole host copy, as a
+/// conservative reset after the host storage misbehaved.
+pub(crate) fn copy_surface_buffer(
+    ctx: &mut Context,
+    surface_id: GuestId,
+    buffer_id: GuestId,
+) -> Result<(), ShmCopyError> {
+    let Some(host_id) = ctx.render_buffer_host_id(buffer_id) else {
+        return Ok(());
+    };
+    let Some(resources) = ctx.local_buffer_copy_resources(host_id) else {
+        return Ok(());
+    };
+    let buffer = resources.buffer;
+    let damage = buffer.stale.to_copy_on(surface_id);
+    // Nothing to copy needs no dma-buf sync either. Skipping it also keeps
+    // a commit without damage, such as one that acknowledges a configure,
+    // from being dropped when the host storage misbehaves.
+    if !damage_reaches_buffer(damage, buffer) {
+        buffer.stale.copied_on(surface_id);
+        return Ok(());
+    }
+    let result = copy_to_host_storage(buffer, resources.channel, damage);
+    match &result {
+        Ok(()) => {
+            buffer.stale.copied_on(surface_id);
+            // A 4K frame can reach this path every refresh. Keep the
+            // per-frame diagnostic at trace level.
+            trace!(
+                target: FRAME_COPY_TARGET,
+                "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
+                 width={}, height={}, format={:#010x}, buffer.offset={}, \
+                 host_copy_size={}",
+                buffer.dest_stride,
+                buffer.stride,
+                buffer.width,
+                buffer.height,
+                buffer.format,
+                buffer.offset,
+                buffer.host_copy.as_ref().map_or(0, HostMapping::len)
+            );
+        }
+        Err(error) => {
+            log::warn!("SHM copy for guest buffer {} failed: {}", buffer_id, error);
+            buffer.stale.invalidate();
+        }
+    }
+    result
+}
+
+/// Copy `damage` from `buffer`'s pool into its host storage, inside the
+/// VirtWL dma-buf CPU-write interval when the storage needs one.
+fn copy_to_host_storage(
+    buffer: &BufferState,
+    channel: Option<&Arc<VirtWaylandChannel>>,
+    damage: &DamageRegion<BufferSpace>,
+) -> Result<(), ShmCopyError> {
+    let Some(layout) = ShmCopyLayout::for_buffer(buffer) else {
+        return Err(ShmCopyError::Destination);
+    };
+    let sync_guard = if buffer.dmabuf_sync {
+        let fd = buffer.dmabuf_fd.as_ref().map(AsFd::as_fd);
+        let Some(guard) = DmabufWriteSync::begin(channel, fd) else {
+            log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
+            return Err(ShmCopyError::Destination);
+        };
+        Some(guard)
+    } else {
+        None
+    };
+    let result = if let Some(host_copy) = &buffer.host_copy {
+        copy_shm_damage(&buffer.pool_file, host_copy, layout, damage)
+    } else {
+        // Both backings map their storage when the buffer is created, so
+        // only a test fixture without a mapping reaches this.
+        Err(ShmCopyError::Destination)
+    };
+    let sync_ended = sync_guard.is_none_or(DmabufWriteSync::end);
+    result.and(if sync_ended {
+        Ok(())
+    } else {
+        Err(ShmCopyError::Destination)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{coalesce_damage_rects, copy_shm_damage, ShmCopyError, ShmCopyLayout};
     use crate::protocols::wayland::wl_shm;
+    use crate::protocols::wayland::wl_surface;
+    use crate::proxy::harness::Session;
     use crate::state::{BufferRect, DamageRegion, HostMapping};
     use crate::test_support::{host_mapping, shm_pool_file};
     use std::os::fd::AsFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A 4x4 NV12 frame, which fills a packed destination of 24 bytes.
     const NV12_4X4: ShmCopyLayout = ShmCopyLayout {
@@ -451,5 +559,65 @@ mod tests {
         assert_eq!(&destination[20..28], &[0xcc; 8]);
         assert_eq!(&destination[28..32], &[0x22; 4]);
         assert_eq!(&destination[32..36], &[0xcc; 4]);
+    }
+
+    /// Each SHM frame a commit copies is traced under
+    /// `sommelier::frame_copy`, the target the weston end-to-end test
+    /// enables and counts frames by, whichever module copies it. The test
+    /// installs a logger, which a process has once, so it runs in its own.
+    #[test]
+    fn each_copied_shm_frame_is_traced_for_the_end_to_end_test() {
+        crate::test_support::in_own_process(
+            "handler::shm::copy::tests::each_copied_shm_frame_is_traced_for_the_end_to_end_test",
+            copied_frames_are_traced,
+        );
+    }
+
+    fn copied_frames_are_traced() {
+        static COPIES: AtomicUsize = AtomicUsize::new(0);
+        /// Counts the frame traces the end-to-end test counts.
+        struct CountCopies;
+        impl log::Log for CountCopies {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.target() == "sommelier::frame_copy"
+            }
+            fn log(&self, record: &log::Record) {
+                let copied = record.args().to_string();
+                if self.enabled(record.metadata())
+                    && copied.starts_with("Copied damaged SHM buffer")
+                {
+                    COPIES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn flush(&self) {}
+        }
+        log::set_boxed_logger(Box::new(CountCopies)).expect("the process's only logger");
+        log::set_max_level(log::LevelFilter::Trace);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let mut s = Session::new();
+            let surface = s.surface().await;
+            let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+            let pool = s.shm_pool(shm, shm_pool_file(&[0x5a; 16])).await;
+            let buffer = s.shm_buffer(pool, 2, 2).await;
+            s.guest_received();
+            for _ in 0..2 {
+                s.guest([
+                    wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0),
+                    wl_surface::req::damage_buffer(surface.id, 0, 0, 2, 2),
+                    wl_surface::req::commit(surface.id),
+                ])
+                .await;
+                s.host_received();
+            }
+        });
+        assert_eq!(
+            COPIES.load(Ordering::Relaxed),
+            2,
+            "one trace per copied frame"
+        );
     }
 }

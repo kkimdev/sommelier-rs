@@ -288,7 +288,7 @@ pub struct Context {
     virtgpu: Option<Arc<VirtGpuDevice>>,
     /// Test-only: what each native buffer plane stands in for. No test can
     /// make a dma-buf whose fence is pending, so a pipe stands in, pending
-    /// until it is readable (see `handler::compositor::plane_fence`).
+    /// until it is readable (see `handler::linux_dmabuf::plane_fence`).
     #[cfg(test)]
     pub plane_fences_for_test: Option<PlaneFenceForTest>,
     /// This connection's VirtWL channel to the host, if it has one.

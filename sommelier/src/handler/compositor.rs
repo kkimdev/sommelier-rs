@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::allocator::DmabufFence;
 use crate::handler::aura_objects;
-use crate::handler::shm::{copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout};
+use crate::handler::shm::{copy_surface_buffer, ShmCopyError};
 use crate::handler::window_placement;
 use crate::handler::Handlers;
 use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
@@ -28,143 +27,11 @@ use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
 use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler};
 use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
-    is_valid_transform, BufferRect, BufferSpace, BufferState, Context, DamageRegion, EventObject,
-    EventSender, FenceWait, GuestId, HostId, HostMapping, Link, PostDispatch, RenderBufferUse,
-    RequestObject, RequestSender, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect,
-    SurfaceState,
+    is_valid_transform, BufferRect, Context, EventObject, EventSender, GuestId, HostId, Link,
+    PostDispatch, RenderBufferUse, RequestObject, RequestSender, SurfaceAttachment, SurfaceCommit,
+    SurfaceMapping, SurfaceRect, SurfaceState,
 };
-use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Destructor, ToHost};
-use log::trace;
-use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::Arc;
-
-/// RAII guard for the VirtWL dma-buf CPU-write interval.
-///
-/// A copy can fail while reading the guest pool or while validating a damage
-/// rectangle. Keeping the matching END ioctl in `Drop` prevents a panic or a
-/// future early-return path from leaving the host dma-buf permanently locked.
-struct DmabufWriteSync<'a> {
-    channel: &'a crate::virtwl_channel::VirtWaylandChannel,
-    fd: BorrowedFd<'a>,
-    ended: bool,
-}
-
-impl<'a> DmabufWriteSync<'a> {
-    fn begin(
-        channel: Option<&'a Arc<crate::virtwl_channel::VirtWaylandChannel>>,
-        fd: Option<BorrowedFd<'a>>,
-    ) -> Option<Self> {
-        let channel = channel?;
-        let fd = fd?;
-        channel
-            .sync(
-                fd,
-                crate::virtwl::DMA_BUF_SYNC_START | crate::virtwl::DMA_BUF_SYNC_WRITE,
-            )
-            .map(|()| Self {
-                channel,
-                fd,
-                ended: false,
-            })
-            .map_err(|error| {
-                log::warn!("VirtWL dma-buf begin-write sync failed: {}", error);
-            })
-            .ok()
-    }
-
-    fn end(mut self) -> bool {
-        self.ended = true;
-        match self.channel.sync(
-            self.fd,
-            crate::virtwl::DMA_BUF_SYNC_END | crate::virtwl::DMA_BUF_SYNC_WRITE,
-        ) {
-            Ok(()) => true,
-            Err(error) => {
-                log::warn!("VirtWL dma-buf end-write sync failed: {}", error);
-                false
-            }
-        }
-    }
-}
-
-impl Drop for DmabufWriteSync<'_> {
-    fn drop(&mut self) {
-        if !self.ended {
-            if let Err(error) = self.channel.sync(
-                self.fd,
-                crate::virtwl::DMA_BUF_SYNC_END | crate::virtwl::DMA_BUF_SYNC_WRITE,
-            ) {
-                log::warn!(
-                    "VirtWL dma-buf end-write sync failed while unwinding: {}",
-                    error
-                );
-            }
-            self.ended = true;
-        }
-    }
-}
-
-/// The fence a commit of native buffer `guest_buffer_id` waits for while
-/// the guest GPU still writes the buffer, checked without waiting.
-fn pending_native_fence(
-    ctx: &mut Context,
-    guest_buffer_id: GuestId,
-) -> std::io::Result<Option<FenceWait>> {
-    if ctx.native_buffer_uses_implicit_sync(guest_buffer_id) {
-        return Ok(None);
-    }
-    let Some(planes) = ctx.native_buffer_sync_fds(guest_buffer_id) else {
-        return Ok(None);
-    };
-    // A buffer has at most four planes.
-    let plane_count = planes.len() as u32;
-    let mut needs_implicit_sync = false;
-    for plane in planes {
-        match plane_fence(ctx, plane.as_fd())? {
-            DmabufFence::Signalled => {}
-            DmabufFence::Pending(fence) => {
-                let timeout = fence.timeout() * plane_count;
-                return Ok(Some(FenceWait { fence, timeout }));
-            }
-            DmabufFence::ImplicitSyncFallback => {
-                needs_implicit_sync = true;
-                break;
-            }
-        }
-    }
-
-    if needs_implicit_sync {
-        if !ctx.enable_native_buffer_implicit_sync(guest_buffer_id) {
-            return Err(std::io::Error::other(
-                "native dma-buf disappeared while enabling implicit synchronization",
-            ));
-        }
-        log::warn!(
-            "Native dma-buf synchronization ioctls are unavailable for guest buffer {}; using implicit synchronization",
-            guest_buffer_id
-        );
-    }
-    Ok(None)
-}
-
-/// Whether the guest GPU has finished writing one plane of a native buffer.
-fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> std::io::Result<DmabufFence> {
-    #[cfg(test)]
-    if let Some(stand_in) = ctx.plane_fences_for_test {
-        use crate::allocator::PendingFence;
-        use crate::state::PlaneFenceForTest;
-        return Ok(
-            match crate::allocator::sync_file_fence(plane.try_clone_to_owned()?)? {
-                DmabufFence::Pending(_) if matches!(stand_in, PlaneFenceForTest::Busy) => {
-                    DmabufFence::Pending(PendingFence::Busy)
-                }
-                fence => fence,
-            },
-        );
-    }
-    crate::allocator::dmabuf_fence(plane, ctx.virtgpu())
-}
 
 impl WlCompositorHandler for Handlers {
     fn on_create_surface(ctx: &mut Context, _sender: RequestSender, id: GuestId) -> Action {
@@ -313,95 +180,6 @@ fn buffer_to_copy(ctx: &Context, commit: &SurfaceCommit) -> Option<GuestId> {
             .filter(|&buffer_id| ctx.buffer_is_submitted(buffer_id)),
         SurfaceAttachment::Detach => None,
     }
-}
-
-/// Copy what a locally bridged SHM buffer's host copy lacks before it is
-/// shown on `surface_id`.
-///
-/// Native linux-dmabuf buffers have no local copy state and are immediately
-/// ready. Stale pixels are cleared only by a successful copy, so a failed
-/// one loses nothing; it still stales the whole host copy, as a
-/// conservative reset after the host storage misbehaved.
-fn copy_surface_buffer(
-    ctx: &mut Context,
-    surface_id: GuestId,
-    buffer_id: GuestId,
-) -> Result<(), ShmCopyError> {
-    let Some(host_id) = ctx.render_buffer_host_id(buffer_id) else {
-        return Ok(());
-    };
-    let Some(resources) = ctx.local_buffer_copy_resources(host_id) else {
-        return Ok(());
-    };
-    let buffer = resources.buffer;
-    let damage = buffer.stale.to_copy_on(surface_id);
-    // Nothing to copy needs no dma-buf sync either. Skipping it also keeps
-    // a commit without damage, such as one that acknowledges a configure,
-    // from being dropped when the host storage misbehaves.
-    if !damage_reaches_buffer(damage, buffer) {
-        buffer.stale.copied_on(surface_id);
-        return Ok(());
-    }
-    let result = copy_to_host_storage(buffer, resources.channel, damage);
-    match &result {
-        Ok(()) => {
-            buffer.stale.copied_on(surface_id);
-            // A 4K frame can reach this path every refresh. Keep the
-            // per-frame diagnostic at trace level.
-            trace!(
-                "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
-                 width={}, height={}, format={:#010x}, buffer.offset={}, \
-                 host_copy_size={}",
-                buffer.dest_stride,
-                buffer.stride,
-                buffer.width,
-                buffer.height,
-                buffer.format,
-                buffer.offset,
-                buffer.host_copy.as_ref().map_or(0, HostMapping::len)
-            );
-        }
-        Err(error) => {
-            log::warn!("SHM copy for guest buffer {} failed: {}", buffer_id, error);
-            buffer.stale.invalidate();
-        }
-    }
-    result
-}
-
-/// Copy `damage` from `buffer`'s pool into its host storage, inside the
-/// VirtWL dma-buf CPU-write interval when the storage needs one.
-fn copy_to_host_storage(
-    buffer: &BufferState,
-    channel: Option<&Arc<VirtWaylandChannel>>,
-    damage: &DamageRegion<BufferSpace>,
-) -> Result<(), ShmCopyError> {
-    let Some(layout) = ShmCopyLayout::for_buffer(buffer) else {
-        return Err(ShmCopyError::Destination);
-    };
-    let sync_guard = if buffer.dmabuf_sync {
-        let fd = buffer.dmabuf_fd.as_ref().map(AsFd::as_fd);
-        let Some(guard) = DmabufWriteSync::begin(channel, fd) else {
-            log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
-            return Err(ShmCopyError::Destination);
-        };
-        Some(guard)
-    } else {
-        None
-    };
-    let result = if let Some(host_copy) = &buffer.host_copy {
-        copy_shm_damage(&buffer.pool_file, host_copy, layout, damage)
-    } else {
-        // Both backings map their storage when the buffer is created, so
-        // only a test fixture without a mapping reaches this.
-        Err(ShmCopyError::Destination)
-    };
-    let sync_ended = sync_guard.is_none_or(DmabufWriteSync::end);
-    result.and(if sync_ended {
-        Ok(())
-    } else {
-        Err(ShmCopyError::Destination)
-    })
 }
 
 /// Release the host Aura objects of a wl_surface that is ending: the Aura
@@ -613,7 +391,7 @@ impl WlSurfaceHandler for Handlers {
             // the buffer, matching ChromiumOS Sommelier's sync_point path,
             // but without stalling the event loop: the commit is
             // dispatched again once its fence may have signalled.
-            match pending_native_fence(ctx, buffer_id) {
+            match crate::handler::linux_dmabuf::pending_fence(ctx, buffer_id) {
                 Ok(None) => {}
                 Ok(Some(wait)) => return ctx.wait_for_fence(wait),
                 // wl_surface.commit has no recoverable failure response.

@@ -71,7 +71,7 @@ fn real_clients_run_through_the_proxy_against_headless_weston() {
             .arg("--local-compositor")
             .arg(&compositor)
             .arg("proxy")
-            .env("RUST_LOG", "info,sommelier::handler::compositor=trace"),
+            .env("RUST_LOG", "info,sommelier::frame_copy=trace"),
     );
     dir.wait_for_socket(&dir.path().join("proxy"), "proxy", &mut proxy);
 
@@ -118,7 +118,8 @@ fn real_clients_run_through_the_proxy_against_headless_weston() {
         !log.contains(" ERROR "),
         "the proxy logged an error:\n{log}"
     );
-    // The proxy's trace of each commit's copy to the host buffer.
+    // The proxy's trace of each commit's copy to the host buffer, under a
+    // log target of its own (`handler::shm::copy::FRAME_COPY_TARGET`).
     let frames = log.matches("Copied damaged SHM buffer").count();
     assert!(
         frames >= MIN_FRAMES,
