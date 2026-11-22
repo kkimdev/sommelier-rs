@@ -163,6 +163,11 @@ pub(super) enum Check {
     FieldState,
     /// Tier 1, settled cases: no field loses a character the user means.
     NoLoss,
+    /// Tier 1, settled cases: the proxy measures every delete and region
+    /// of Exo's.
+    Drops,
+    /// Tier 1, settled cases: no edit of Exo's meets a press's fence.
+    Fence,
     /// Tier 2: a field's text, cursor and preedit.
     Text,
     /// Tier 2: the focused field.

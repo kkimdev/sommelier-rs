@@ -808,7 +808,7 @@ impl Planned<'_> {
         let reached = Reached {
             deleted_before,
             deleted: (deleted_before, deleted_after) != (0, 0),
-            committed: txn.commit.as_ref().map_or(0, String::len),
+            committed: txn.commit.as_deref().unwrap_or_default(),
             shown_before,
         };
         cur.composition.shown = txn.preedit;

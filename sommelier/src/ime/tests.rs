@@ -2456,6 +2456,56 @@ fn row_X1_a_region_after_an_e4_drop_holds_no_preedit() {
     assert_eq!(out.guest, expected);
 }
 
+/// A confirmation of a preedit Exo no longer holds (E4) commits it in the
+/// guest alone, which leaves step. The confirmation came after the guest's
+/// commit before its next report, but the guest's state after it is known:
+/// a report that resets Exo to exactly that text and cursor puts the guest
+/// in step, and Exo's region over it is measured. One with the cursor or
+/// the text elsewhere does not.
+#[test]
+fn row_X1_a_report_of_a_confirmed_unheld_preedit_is_in_step() {
+    let confirmed = || {
+        let mut ime = Ime::enabled();
+        ime.report("ab", 2);
+        ime.compose("가");
+        ime.report("ab", 1);
+        let out = ime.ext(Edit::Confirm {
+            keep_selection: true,
+        });
+        assert_eq!(out.guest, [no_preedit(), commit("가"), done(3)]);
+        assert!(!ime.in_step());
+        ime
+    };
+    let mut ime = confirmed();
+    ime.report("a가b", 1);
+    assert!(!ime.in_step());
+    let mut ime = confirmed();
+    ime.report("abcd", 4);
+    assert!(!ime.in_step());
+
+    let mut ime = confirmed();
+    ime.report("a가b", 4);
+    assert!(ime.in_step());
+    let out = ime.region(-3, 3);
+    let expected = [delete(3, 0), preedit_at("가", 3, 3), done(4)];
+    assert_eq!(out.guest, expected);
+
+    // A report made before the confirmation, which Exo matches after it,
+    // leaves the place to the guest's next one.
+    let mut ime = Ime::enabled();
+    ime.report("ab", 2);
+    ime.compose("가");
+    ime.report("ab", 1);
+    let barrier = ime.report_unanswered("ab", 1);
+    ime.ext(Edit::Confirm {
+        keep_selection: true,
+    });
+    ime.step(Input::BarrierDone(barrier));
+    assert!(!ime.in_step());
+    ime.report("a가b", 4);
+    assert!(ime.in_step());
+}
+
 /// Exo made the region before it got the guest's report, which the
 /// region's state names: the guest caught up with Exo.
 #[test]
