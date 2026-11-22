@@ -2555,15 +2555,15 @@ mod tests {
         let connection = TestConnection::default().plane_fences(sync_file_planes);
         let mut s = Session::with_context(connection.context());
         let surface = s.surface().await;
-        let buffer = Object {
-            id: s.new_id(),
-            host: 0x100,
-        };
         // Injects what no peer can provide: a native buffer of
         // `SLOW_DEADLINE_PLANES` planes (a guest's has at most four) that
         // share one fence, the guest GPU's write until `signal` is written.
+        let id = s.new_id();
+        let buffer = Object {
+            id,
+            host: s.pair_for_test(id, "wl_buffer", 1),
+        };
         let (plane, signal) = crate::test_support::pipe();
-        s.pair_for_test(buffer.id, buffer.host, "wl_buffer", 1);
         let ctx = s.ctx();
         let planes = (0..SLOW_DEADLINE_PLANES)
             .map(|_| plane.try_clone().expect("share the fence"))
@@ -3568,12 +3568,8 @@ mod tests {
     #[test]
     fn generated_forwarding_rejects_messages_that_exceed_wire_length() {
         let mut ctx = TestConnection::default().context();
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            GuestId::for_test(10),
-            HostId::for_test(20),
-            Iface::WlDataSource,
-            1,
-        );
+        ctx.shadow_table
+            .create_paired(GuestId::for_test(10), Iface::WlDataSource, 1, 1);
 
         let mut builder = MessageBuilder::new();
         builder.write_string(&"x".repeat(4_084));

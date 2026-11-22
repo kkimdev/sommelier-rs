@@ -1143,57 +1143,6 @@ impl ShadowTable {
         }
     }
 
-    // Test fixtures.
-
-    /// Pair the hard-coded IDs of a test fixture as one object of
-    /// `interface`, at the newest version its protocol file defines, and
-    /// keep both allocators from handing those IDs out.
-    ///
-    /// # Panics
-    ///
-    /// When either ID is already in use.
-    #[cfg(test)]
-    pub(crate) fn insert_paired_for_test(
-        &mut self,
-        guest: GuestId,
-        host: HostId,
-        interface: Iface,
-    ) {
-        self.insert_paired_with_version_for_test(guest, host, interface, interface.version());
-    }
-
-    /// Like [`Self::insert_paired_for_test`], with `version` on both sides.
-    #[cfg(test)]
-    pub(crate) fn insert_paired_with_version_for_test(
-        &mut self,
-        guest: GuestId,
-        host: HostId,
-        interface: Iface,
-        version: u32,
-    ) {
-        self.reserve_for_test(guest, host);
-        let interface = || Interface::new(interface, version);
-        self.insert_pair(guest, interface(), host, interface());
-    }
-
-    /// Create a host-only object under the hard-coded ID of a test fixture,
-    /// and keep the allocator from handing it out.
-    ///
-    /// # Panics
-    ///
-    /// When the ID is already in use.
-    #[cfg(test)]
-    pub(crate) fn insert_host_only_for_test(
-        &mut self,
-        host: HostId,
-        interface: Iface,
-        version: u32,
-    ) {
-        self.reserve_host_id_for_test(host);
-        let object = HostObject::HostOnly(Interface::new(interface, version));
-        self.hosts.insert(host, object);
-    }
-
     /// Change the negotiated version of guest object `guest_id`, for a test
     /// of version-dependent behavior on an object a fixture created.
     #[cfg(test)]
@@ -1203,23 +1152,6 @@ impl ShadowTable {
             GuestObject::Local(interface, _) | GuestObject::Paired { interface, .. } => interface,
         };
         interface.version = version;
-    }
-
-    #[cfg(test)]
-    fn reserve_for_test(&mut self, guest: GuestId, host: HostId) {
-        assert!(
-            !self.guests.contains_key(&guest) && self.guest_server_ids.reserve(guest.0),
-            "fixture guest ID {guest} is in use"
-        );
-        self.reserve_host_id_for_test(host);
-    }
-
-    #[cfg(test)]
-    fn reserve_host_id_for_test(&mut self, host: HostId) {
-        assert!(
-            !self.hosts.contains_key(&host) && self.host_ids.reserve(host.0),
-            "fixture host ID {host} is in use"
-        );
     }
 
     /// Return whether no object holds host ID `host`.
@@ -1246,6 +1178,43 @@ mod tests {
     use super::*;
 
     const SERVER: u32 = ShadowTable::GUEST_SERVER_ID_START;
+
+    /// Pair the hard-coded IDs `guest` and `host` as one object of
+    /// `interface`, at the newest version its protocol file defines, which
+    /// no constructor does, and keep both allocators from handing those IDs
+    /// out.
+    ///
+    /// # Panics
+    ///
+    /// When either ID is already in use.
+    fn insert_paired(table: &mut ShadowTable, guest: GuestId, host: HostId, interface: Iface) {
+        assert!(
+            !table.guests.contains_key(&guest) && table.guest_server_ids.reserve(guest.0),
+            "fixture guest ID {guest} is in use"
+        );
+        reserve_host_id(table, host);
+        let interface = || Interface::new(interface, interface.version());
+        table.insert_pair(guest, interface(), host, interface());
+    }
+
+    /// Create a host-only object under the hard-coded ID `host`, and keep
+    /// the allocator from handing it out.
+    ///
+    /// # Panics
+    ///
+    /// When the ID is already in use.
+    fn insert_host_only(table: &mut ShadowTable, host: HostId, interface: Iface, version: u32) {
+        reserve_host_id(table, host);
+        let object = HostObject::HostOnly(Interface::new(interface, version));
+        table.hosts.insert(host, object);
+    }
+
+    fn reserve_host_id(table: &mut ShadowTable, host: HostId) {
+        assert!(
+            !table.hosts.contains_key(&host) && table.host_ids.reserve(host.0),
+            "fixture host ID {host} is in use"
+        );
+    }
     /// The event a test resolves an object argument for, as logged.
     const EVENT: &str = "wl_pointer.enter";
 
@@ -1542,7 +1511,7 @@ mod tests {
     #[test]
     fn host_only_destructor_reservation_survives_until_delete_id() {
         let mut table = ShadowTable::new();
-        table.insert_host_only_for_test(HostId(40), Iface::ZcrExtendedKeyboardV1, 2);
+        insert_host_only(&mut table, HostId(40), Iface::ZcrExtendedKeyboardV1, 2);
 
         // The destroy request has been queued, but the host has not processed
         // it yet. The dispatch metadata is retired immediately while the
@@ -1569,7 +1538,7 @@ mod tests {
         // delete_id for them; it may reuse one for its next new object.
         let mut table = ShadowTable::new();
         let host_buffer = HostId(SERVER + 5);
-        table.insert_host_only_for_test(host_buffer, Iface::WlBuffer, 1);
+        insert_host_only(&mut table, host_buffer, Iface::WlBuffer, 1);
 
         assert!(table.host_destroy_queued(host_buffer));
         assert!(!table.get_host_interface(host_buffer).is_some());
@@ -1667,8 +1636,13 @@ mod tests {
     fn fixture_ids_are_never_handed_out() {
         let mut table = ShadowTable::new();
         let server_guest = SERVER + 1;
-        table.insert_paired_for_test(GuestId(10), HostId(3), Iface::WlSurface);
-        table.insert_paired_for_test(GuestId(server_guest), HostId(4), Iface::WlDataOffer);
+        insert_paired(&mut table, GuestId(10), HostId(3), Iface::WlSurface);
+        insert_paired(
+            &mut table,
+            GuestId(server_guest),
+            HostId(4),
+            Iface::WlDataOffer,
+        );
         assert_eq!(table.get_host_id(GuestId(10)), Some(HostId(3)));
         assert_eq!(
             table.get_interface(GuestId(server_guest)),

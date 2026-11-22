@@ -367,7 +367,7 @@ mod tests {
     };
     use crate::protocols::{AnyEvent, Iface};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{GuestId, HostId};
+    use crate::state::GuestId;
     use crate::test_support::TestConnection;
     use crate::test_support::{raw_dispatch, Rng};
     use crate::wire::{WireMessage, WL_DISPLAY_ID};
@@ -826,11 +826,9 @@ mod tests {
         let context = || {
             let mut ctx = TestConnection::default().context();
             let manager = GuestId::for_test(MANAGER);
-            ctx.shadow_table.insert_paired_for_test(
-                manager,
-                HostId::for_test(20),
-                Iface::ZxdgOutputManagerV1,
-            );
+            let version = zxdg_output_manager_v1::VERSION;
+            ctx.shadow_table
+                .create_paired(manager, Iface::ZxdgOutputManagerV1, version, version);
             let inert_output = GuestId::for_test(INERT_OUTPUT);
             ctx.shadow_table
                 .create_local(inert_output, Iface::WlOutput, 4);

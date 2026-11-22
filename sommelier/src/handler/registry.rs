@@ -1659,9 +1659,9 @@ mod tests {
     };
     use crate::protocols::{AnyEvent, AnyRequest, Iface};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{Context, GuestId, HostId, Singleton};
+    use crate::state::{Context, GuestId, Singleton};
     use crate::test_support::TestConnection;
-    use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
+    use crate::wire::{Action, Outgoing, WireId, WL_DISPLAY_ID};
 
     /// How many IDs the guest skips before its first object. The proxy
     /// allocates host IDs densely from the bottom, so without the gap a
@@ -2311,10 +2311,14 @@ mod tests {
     #[test]
     fn a_bind_through_an_unmapped_registry_fails_closed() {
         let mut ctx = TestConnection::default().context();
-        let (registry, host_registry) = (GuestId::for_test(10), HostId::for_test(100));
-        ctx.shadow_table
-            .insert_paired_for_test(registry, host_registry, Iface::WlRegistry);
-        let sender = ctx.shadow_table.resolve_event(100).expect("the registry");
+        let registry = GuestId::for_test(10);
+        let host_registry = ctx
+            .shadow_table
+            .create_paired(registry, Iface::WlRegistry, 1, 1);
+        let sender = ctx
+            .shadow_table
+            .resolve_event(host_registry.wire())
+            .expect("the registry");
         let output = "wl_output".to_string();
         assert_eq!(
             Handlers::on_global(&mut ctx, sender, 10, &output, 3),

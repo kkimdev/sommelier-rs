@@ -4178,22 +4178,23 @@ fn child_objects_inherit_their_manager_versions() {
     // Built by hand: the proxy binds no version above the generated
     // one, so no session can tell a child's inherited version from it.
     let mut ctx = TestConnection::default().context();
-    let (manager, extension) = (HostId::for_test(2), HostId::for_test(3));
+    // Both text-input protocols are v1, so artificial manager versions
+    // show where each child's version comes from.
+    let manager = ctx
+        .shadow_table
+        .create_host_only(Iface::ZwpTextInputManagerV1, 4);
+    let extension = ctx
+        .shadow_table
+        .create_host_only(Iface::ZcrTextInputExtensionV1, 12);
     ctx.globals
         .bind_for_test(Singleton::TextInputManager, manager);
     ctx.globals
         .bind_for_test(Singleton::TextInputExtension, extension);
-    // Both text-input protocols are v1, so artificial manager versions
-    // show where each child's version comes from.
-    ctx.shadow_table
-        .insert_host_only_for_test(manager, Iface::ZwpTextInputManagerV1, 4);
-    ctx.shadow_table
-        .insert_host_only_for_test(extension, Iface::ZcrTextInputExtensionV1, 12);
     ctx.shadow_table
         .create_local(GuestId::for_test(40), Iface::ZwpTextInputManagerV3, 5);
-    let seat = (GuestId::for_test(30), HostId::for_test(31));
+    let version = wl_seat::VERSION;
     ctx.shadow_table
-        .insert_paired_for_test(seat.0, seat.1, Iface::WlSeat);
+        .create_paired(GuestId::for_test(30), Iface::WlSeat, version, version);
 
     let get_text_input = zwp_text_input_manager_v3::req::get_text_input(40, 20, 30);
     let (bytes, _) = get_text_input.into_parts();

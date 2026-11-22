@@ -39,7 +39,7 @@ use crate::state::{Context, GuestId, HostId};
 use crate::test_support::counting::Counts;
 use crate::test_support::wire_peer::{self, Message, Role};
 use crate::test_support::TestConnection;
-use crate::wire::{Framing, MessageHeader, Outgoing, WL_DISPLAY_ID};
+use crate::wire::{Framing, MessageHeader, Outgoing, WireId, WL_DISPLAY_ID};
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -281,23 +281,19 @@ impl Session {
         id
     }
 
-    /// Pair guest object `id` with host object `host`, of `interface` at
+    /// Pair guest object `id` with a new host object, of `interface` at
     /// `version`, as the proxy pairs an object that no peer here can have
     /// it create, such as a native dma-buf buffer: the proxy and both peers
-    /// have it from now on.
-    pub(crate) fn pair_for_test(
-        &mut self,
-        id: u32,
-        host: u32,
-        interface: &'static str,
-        version: u32,
-    ) {
+    /// have it from now on. Returns the host object's ID.
+    pub(crate) fn pair_for_test(&mut self, id: u32, interface: &'static str, version: u32) -> u32 {
         let shadow_table = &mut self.client.ctx.shadow_table;
         let iface = crate::protocols::Iface::from_name(interface).expect("a vendored interface");
-        let (guest, host_id) = (GuestId::for_test(id), HostId::for_test(host));
-        shadow_table.insert_paired_with_version_for_test(guest, host_id, iface, version);
+        let host = shadow_table
+            .create_paired(GuestId::for_test(id), iface, version, version)
+            .wire();
         self.guest.wire.adopt(id, interface, version);
         self.host.wire.adopt(host, interface, version);
+        host
     }
 
     /// Have the proxy receive what each peer sends `piece` bytes at a time,

@@ -498,13 +498,6 @@ impl Context {
         self.to_host.clear();
     }
 
-    /// Bind host object `id` as the internal `zaura_shell` at the vendored
-    /// protocol's version, as the registry would.
-    #[cfg(test)]
-    pub(crate) fn bind_aura_shell_for_test(&mut self, id: HostId) {
-        self.globals.bind_for_test(Singleton::AuraShell, id);
-    }
-
     /// A dispatch batch ended: each owner of state scoped to a batch resets
     /// it here, the one place the loop calls.
     pub(crate) fn end_batch(&mut self) {
@@ -619,13 +612,6 @@ impl Context {
         for surface in self.surfaces.values_mut() {
             surface.clear_buffer_references(buffer);
         }
-    }
-
-    /// The state of `surface`, created if a test sets it up without a
-    /// `create_surface`.
-    #[cfg(test)]
-    pub(crate) fn surface_for_test(&mut self, surface: GuestId) -> &mut SurfaceState {
-        self.surfaces.entry(surface).or_default()
     }
 
     /// Lose the state of every surface, a fault no peer can cause.
@@ -973,6 +959,7 @@ pub(crate) struct ConnectionFacts {
 mod tests {
     use super::*;
     use crate::handler::linux_dmabuf::{ParamsData, PendingParam};
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
     use crate::protocols::wayland::{wl_keyboard, wl_shm};
     use crate::protocols::Iface;
     use crate::test_support::TestConnection;
@@ -1142,9 +1129,10 @@ mod tests {
         for keymap in [second, third] {
             ctx.send_guest(wl_keyboard::evt::keymap(guest, 1, keymap, 0));
         }
-        let (params, host_params) = (GuestId::for_test(7), HostId::for_test(7));
+        let params = GuestId::for_test(7);
+        let version = zwp_linux_buffer_params_v1::VERSION;
         ctx.shadow_table
-            .insert_paired_for_test(params, host_params, Iface::ZwpLinuxBufferParamsV1);
+            .create_paired(params, Iface::ZwpLinuxBufferParamsV1, version, version);
         let planes = ParamsData::Open(vec![PendingParam {
             fd: pending,
             plane_idx: 0,
@@ -1168,9 +1156,9 @@ mod tests {
     fn host_buffer_use_is_an_exclusive_phase() {
         let mut ctx = TestConnection::default().context();
         let buffer = GuestId::for_test(20);
-        let host_buffer = HostId::for_test(40);
-        ctx.shadow_table
-            .insert_paired_for_test(buffer, host_buffer, Iface::WlBuffer);
+        let host_buffer = ctx
+            .shadow_table
+            .create_paired(buffer, Iface::WlBuffer, 1, 1);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert_eq!(
@@ -1217,9 +1205,9 @@ mod tests {
     fn same_buffer_reattach_does_not_create_a_detached_use() {
         let mut ctx = TestConnection::default().context();
         let buffer = GuestId::for_test(20);
-        let host_buffer = HostId::for_test(40);
-        ctx.shadow_table
-            .insert_paired_for_test(buffer, host_buffer, Iface::WlBuffer);
+        let host_buffer = ctx
+            .shadow_table
+            .create_paired(buffer, Iface::WlBuffer, 1, 1);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1231,9 +1219,9 @@ mod tests {
     fn release_clears_the_detached_latch_before_a_new_submit() {
         let mut ctx = TestConnection::default().context();
         let buffer = GuestId::for_test(20);
-        let host_buffer = HostId::for_test(40);
-        ctx.shadow_table
-            .insert_paired_for_test(buffer, host_buffer, Iface::WlBuffer);
+        let host_buffer = ctx
+            .shadow_table
+            .create_paired(buffer, Iface::WlBuffer, 1, 1);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1252,15 +1240,12 @@ mod tests {
     #[test]
     fn failed_attachment_replacement_mutates_neither_buffer_generation() {
         let mut ctx = TestConnection::default().context();
-        let old = GuestId::for_test(20);
-        let old_host = HostId::for_test(40);
-        let new = GuestId::for_test(21);
-        let new_host = HostId::for_test(41);
-        for (guest, host) in [(old, old_host), (new, new_host)] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest, host, Iface::WlBuffer);
+        let [(old, _), (new, new_host)] = [20, 21].map(|guest| {
+            let guest = GuestId::for_test(guest);
+            let host = ctx.shadow_table.create_paired(guest, Iface::WlBuffer, 1, 1);
             assert!(ctx.register_native_buffer(host, (1, 1), Vec::new()));
-        }
+            (guest, host)
+        });
         assert!(ctx.mark_buffer_submitted(old));
         assert!(ctx.render_buffers.mark_host_destroy_queued(new_host));
 
@@ -1391,21 +1376,13 @@ mod tests {
 
     #[test]
     fn surface_attachment_requires_both_exact_render_generations() {
-        let previous_guest = GuestId::for_test(20);
-        let previous_host = HostId::for_test(40);
-        let next_guest = GuestId::for_test(21);
-        let next_host = HostId::for_test(41);
-        let unregistered_guest = GuestId::for_test(22);
-        let unregistered_host = HostId::for_test(42);
         let mut ctx = TestConnection::default().context();
-        for (guest, host) in [
-            (previous_guest, previous_host),
-            (next_guest, next_host),
-            (unregistered_guest, unregistered_host),
-        ] {
-            ctx.shadow_table
-                .insert_paired_for_test(guest, host, Iface::WlBuffer);
-        }
+        let [(previous_guest, previous_host), (next_guest, next_host), (unregistered_guest, _)] =
+            [20, 21, 22].map(|guest| {
+                let guest = GuestId::for_test(guest);
+                let host = ctx.shadow_table.create_paired(guest, Iface::WlBuffer, 1, 1);
+                (guest, host)
+            });
         assert!(ctx.register_native_buffer(previous_host, (1, 1), Vec::new()));
         assert!(ctx.register_native_buffer(next_host, (1, 1), Vec::new()));
         assert!(ctx.mark_buffer_submitted(previous_guest));

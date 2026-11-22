@@ -1091,7 +1091,7 @@ mod tests {
     use crate::protocols::Iface;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{GuestId, HostId, SessionEnd};
+    use crate::state::{GuestId, SessionEnd};
     use crate::test_support::connection::sync_file_planes;
     use crate::test_support::wire_peer::SERVER_ID_START;
     use crate::test_support::TestConnection;
@@ -1694,11 +1694,9 @@ mod tests {
     fn a_plane_the_proxy_cannot_duplicate() {
         let mut ctx = TestConnection::default().context();
         let params = GuestId::for_test(7);
-        ctx.shadow_table.insert_paired_for_test(
-            params,
-            HostId::for_test(8),
-            Iface::ZwpLinuxBufferParamsV1,
-        );
+        let version = zwp_linux_buffer_params_v1::VERSION;
+        ctx.shadow_table
+            .create_paired(params, Iface::ZwpLinuxBufferParamsV1, version, version);
         assert!(ctx
             .shadow_table
             .attach(params, ParamsData::Open(Vec::new())));
