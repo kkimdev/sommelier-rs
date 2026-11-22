@@ -29,8 +29,8 @@ use tokio::io::unix::AsyncFd;
 // Linux accepts at most SCM_MAX_FD (253) descriptors in one SCM_RIGHTS
 // message. Keeping the receive control buffer at that limit prevents a valid
 // Unix peer from triggering MSG_CTRUNC merely because the proxy used a
-// smaller, VirtWL-specific batch size. The parser below still handles
-// truncation defensively for malformed or non-Linux transports.
+// smaller, VirtWL-specific batch size. `decode_unix_control_fds` still
+// closes the descriptors of truncated control data.
 const UNIX_MAX_SCM_RIGHTS_FDS: usize = 253;
 
 /// The most received descriptors a connection holds before messages
@@ -238,159 +238,95 @@ fn unix_send_flags() -> MsgFlags {
     MsgFlags::MSG_NOSIGNAL
 }
 
-/// Decode SCM_RIGHTS descriptors from a raw `recvmsg` control buffer.
+/// Take over the descriptors of the `SCM_RIGHTS` messages in `control`, the
+/// control data one `recvmsg` wrote, reporting `MSG_CTRUNC` as `truncated`.
 ///
-/// `nix::RecvMsg::cmsgs()` intentionally refuses to iterate when
-/// `MSG_CTRUNC` is set. That is normally a useful safety check, but it would
-/// leak descriptors that the kernel did install before truncating the
-/// ancillary buffer. This parser validates each kernel-provided length and
-/// takes ownership of every descriptor that is present as soon as it reads
-/// it, so returning an error whenever truncation or malformed control data
-/// is observed closes them.
+/// `nix::RecvMsg::cmsgs()` refuses to iterate when `MSG_CTRUNC` is set,
+/// which would leak the descriptors the kernel installed before it ran out
+/// of room. The libc macros iterate truncated control data like any other,
+/// so this takes over every descriptor present, skipping other messages,
+/// before it reports truncated or malformed control data; returning the
+/// error then closes them.
+///
+/// # Safety
+///
+/// `control` starts at an address aligned for `cmsghdr`, and the caller
+/// owns every descriptor in its `SCM_RIGHTS` messages and passes them here.
 // The kernel boundary: recvmsg installs raw descriptors.
 #[allow(clippy::disallowed_methods)]
-fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
-    let mut fds = Vec::new();
-    // The kernel never reports a negative descriptor; owning one would be
-    // unsound. Skip it, but own the rest before failing, so none leaks.
-    let mut negative_fd = false;
-    let control_start = msg.msg_control as usize;
-    // `msg_controllen` is `size_t` on glibc and `socklen_t` on musl. Keep
-    // pointer arithmetic in usize so this parser is portable across targets.
-    #[cfg(target_env = "musl")]
-    let control_len = msg.msg_controllen as usize;
-    #[cfg(not(target_env = "musl"))]
-    let control_len = msg.msg_controllen;
-    let Some(control_end) = control_start.checked_add(control_len) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "SCM_RIGHTS control buffer address overflows",
-        ));
-    };
-    let header_size = std::mem::size_of::<libc::cmsghdr>();
-    let align = std::mem::size_of::<usize>();
-    let mut current = if control_len >= header_size && !msg.msg_control.is_null() {
-        msg.msg_control.cast::<libc::cmsghdr>()
-    } else {
-        std::ptr::null_mut()
-    };
-
-    while !current.is_null() {
-        let current_addr = current as usize;
-        let Some(current_offset) = current_addr.checked_sub(control_start) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SCM_RIGHTS header lies outside the control buffer",
-            ));
-        };
-        if current_offset > control_len || control_len - current_offset < header_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated SCM_RIGHTS control header",
-            ));
-        }
-
-        let cmsg_len = unsafe { (*current).cmsg_len as usize };
-        if cmsg_len < header_size || cmsg_len > control_end - current_addr {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid SCM_RIGHTS control length",
-            ));
-        }
-
-        let payload_len = cmsg_len - header_size;
-        if unsafe { (*current).cmsg_level } == libc::SOL_SOCKET
-            && unsafe { (*current).cmsg_type } == libc::SCM_RIGHTS
-        {
-            if !payload_len.is_multiple_of(std::mem::size_of::<RawFd>()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS payload is not fd-aligned",
-                ));
-            }
-            let Some(data_addr) = current_addr.checked_add(header_size) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS payload address overflows",
-                ));
-            };
-            let Some(data_end) = data_addr.checked_add(payload_len) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS payload end overflows",
-                ));
-            };
-            let Some(message_end) = current_addr.checked_add(cmsg_len) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS message end overflows",
-                ));
-            };
-            if data_end > message_end {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS payload exceeds control message",
-                ));
-            }
-            for index in 0..(payload_len / std::mem::size_of::<RawFd>()) {
-                let fd_addr = data_addr + index * std::mem::size_of::<RawFd>();
-                let fd = unsafe { std::ptr::read_unaligned(fd_addr as *const RawFd) };
-                if fd < 0 {
-                    negative_fd = true;
-                    continue;
-                }
-                // SAFETY: `recvmsg` installed this descriptor for this
-                // receive, once, and nothing else refers to it yet.
-                fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
-            }
-        }
-
-        let Some(aligned_len) = cmsg_len
-            .checked_add(align - 1)
-            .map(|len| len & !(align - 1))
+unsafe fn decode_unix_control_fds(control: &[u8], truncated: bool) -> io::Result<Vec<OwnedFd>> {
+    debug_assert!(control.as_ptr().cast::<libc::cmsghdr>().is_aligned());
+    // SAFETY: an all-zero `msghdr` is valid: null pointers, zero lengths.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_control = control.as_ptr().cast_mut().cast();
+    // `size_t` on glibc, `socklen_t` on musl: a shorter length is still in
+    // bounds.
+    msg.msg_controllen = control.len() as _;
+    let (mut fds, mut malformed, mut negative) = (Vec::new(), None, false);
+    // SAFETY: `msg` describes `control`, which the caller aligned, so
+    // CMSG_FIRSTHDR and CMSG_NXTHDR return null or an aligned header that
+    // lies whole within it.
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    while !cmsg.is_null() {
+        // SAFETY: as above, and the payload starts right after the header.
+        let (header, data) = unsafe { (*cmsg, libc::CMSG_DATA(cmsg)) };
+        // `size_t` on glibc, `socklen_t` on musl.
+        #[allow(clippy::unnecessary_cast)]
+        let len = header.cmsg_len as usize;
+        let offset = |pointer: *const u8| pointer as usize - control.as_ptr() as usize;
+        let Some(payload) = offset(cmsg.cast())
+            .checked_add(len)
+            .and_then(|end| control.get(offset(data)..end))
         else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SCM_RIGHTS control alignment overflows",
-            ));
-        };
-        let Some(next_addr) = current_addr.checked_add(aligned_len) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SCM_RIGHTS control chain overflows",
-            ));
-        };
-        if next_addr >= control_end || control_end - next_addr < header_size {
+            malformed.get_or_insert("invalid SCM_RIGHTS control length");
             break;
+        };
+        if (header.cmsg_level, header.cmsg_type) == (libc::SOL_SOCKET, libc::SCM_RIGHTS) {
+            let fd_size = std::mem::size_of::<RawFd>();
+            if !payload.len().is_multiple_of(fd_size) {
+                malformed.get_or_insert("SCM_RIGHTS payload is not fd-aligned");
+            }
+            for fd in payload.chunks_exact(fd_size) {
+                match RawFd::from_ne_bytes(fd.try_into().expect("fd-sized")) {
+                    // The kernel never reports one; owning it would be unsound.
+                    fd if fd < 0 => negative = true,
+                    // SAFETY: the caller passes this descriptor's ownership.
+                    fd => fds.push(unsafe { OwnedFd::from_raw_fd(fd) }),
+                }
+            }
         }
-        current = next_addr as *mut libc::cmsghdr;
+        // SAFETY: as for CMSG_FIRSTHDR; the message ends within `control`,
+        // so stepping past it cannot overflow.
+        cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }
-
-    if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "truncated SCM_RIGHTS ancillary data",
-        ));
+    let error = malformed
+        .or(truncated.then_some("truncated SCM_RIGHTS ancillary data"))
+        .or(negative.then_some("negative SCM_RIGHTS descriptor"));
+    match error {
+        Some(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        None => Ok(fds),
     }
-    if negative_fd {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "negative SCM_RIGHTS descriptor",
-        ));
-    }
-
-    Ok(fds)
 }
 
+/// Receive into `data` and the part of `control` aligned for `cmsghdr`,
+/// returning the bytes received and the descriptors that came with them.
 fn recv_unix_message(
     fd: RawFd,
     data: &mut [u8],
     control: &mut [u8],
 ) -> io::Result<(usize, Vec<OwnedFd>)> {
+    // The CMSG macros read headers in place. A buffer from the allocator is
+    // aligned already.
+    let aligned = control
+        .as_ptr()
+        .align_offset(std::mem::align_of::<libc::cmsghdr>());
+    let aligned = aligned.min(control.len());
+    let control = &mut control[aligned..];
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr().cast(),
         iov_len: data.len(),
     };
+    // SAFETY: an all-zero `msghdr` is valid: null pointers, zero lengths.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -409,11 +345,19 @@ fn recv_unix_message(
         msg.msg_controllen = control.len();
     }
 
+    // SAFETY: `msg` describes `iov` and `control`, which outlive the call.
     let bytes = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if bytes < 0 {
         return Err(io::Error::last_os_error());
     }
-    let fds = decode_unix_control_fds(&msg)?;
+    // recvmsg sets `msg_controllen` to the length of the data it wrote.
+    #[allow(clippy::unnecessary_cast)] // `socklen_t` on musl
+    let written = msg.msg_controllen as usize;
+    let control = &control[..written.min(control.len())];
+    let truncated = msg.msg_flags & libc::MSG_CTRUNC != 0;
+    // SAFETY: `control` is aligned, and recvmsg installed the descriptors
+    // of its SCM_RIGHTS messages for this receive alone.
+    let fds = unsafe { decode_unix_control_fds(control, truncated) }?;
     Ok((bytes as usize, fds))
 }
 
@@ -1139,13 +1083,9 @@ mod tests {
 
     /// Take over the descriptors in `control`, which this test passes.
     fn decode(control: &[u8], truncated: bool) -> std::io::Result<Vec<OwnedFd>> {
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_control = control.as_ptr().cast_mut().cast();
-        msg.msg_controllen = control.len() as _;
-        if truncated {
-            msg.msg_flags = libc::MSG_CTRUNC;
-        }
-        decode_unix_control_fds(&msg)
+        // SAFETY: a `Vec`'s buffer is aligned for `cmsghdr`, and the tests
+        // build control data from descriptors they pass on.
+        unsafe { decode_unix_control_fds(control, truncated) }
     }
 
     #[test]
