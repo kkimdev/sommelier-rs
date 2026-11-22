@@ -914,6 +914,7 @@ async fn start_client(stream: UnixStream, shared: &Shared, sandboxed: bool) -> i
     let facts = ConnectionFacts {
         virtwl,
         virtgpu: shared.virtgpu.get(),
+        plane_fences: crate::allocator::dmabuf_fence,
         wheel: shared
             .settings
             .wheel_from_touchpad
@@ -962,10 +963,12 @@ mod tests {
     use super::harness::{default_keymap, Object, Session};
     use super::Direction::{ClientToHost, HostToClient};
     use super::*;
+    use crate::allocator::PlaneFences;
     use crate::handler::test_support::session_with_shm;
     use crate::protocols;
     use crate::protocols::{AnyEvent, AnyRequest, Iface};
-    use crate::state::{PlaneFenceForTest, PostDispatch};
+    use crate::state::PostDispatch;
+    use crate::test_support::connection::{busy_planes, sync_file_planes};
     use crate::test_support::TestConnection;
     use crate::test_support::{
         any_fd_has_identity, fd_identity, fds_with_identity, raw_dispatch, respell, shm_pool_file,
@@ -1236,15 +1239,14 @@ mod tests {
 
     /// A session whose proxy has GPU access, without which the guest does
     /// not get the host's linux-dmabuf, and whose guest has bound it. The
-    /// plane of each native buffer stands in for its own sync_file.
-    async fn session_with_dmabuf() -> (Session, Object) {
-        let mut s = Session::with_context(TestConnection::default().gpu_accel().context());
+    /// fence of each native buffer plane is what `plane_fences` stands in
+    /// for, which no peer can provide.
+    async fn session_with_dmabuf(plane_fences: PlaneFences) -> (Session, Object) {
+        let connection = TestConnection::default().gpu_accel();
+        let mut s = Session::with_context(connection.plane_fences(plane_fences).context());
         let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await;
         s.guest_received();
         s.host_received();
-        // Injects what no peer can provide: each plane stands in for its
-        // own sync_file, which a readable pipe is once the guest GPU is done.
-        s.ctx().plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
         (s, dmabuf)
     }
 
@@ -1254,7 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn a_retired_buffer_still_routes_its_release() {
         use protocols::wayland::{wl_buffer, wl_surface};
-        let (mut s, dmabuf) = session_with_dmabuf().await;
+        let (mut s, dmabuf) = session_with_dmabuf(sync_file_planes).await;
         let surface = s.surface().await;
         // A native buffer the guest GPU has finished writing.
         let (plane, signal) = crate::test_support::pipe();
@@ -2066,7 +2068,7 @@ mod tests {
         use protocols::wayland::wl_display;
         const XRGB8888: u32 = 0x3432_5258;
         const BUFFER: u32 = crate::test_support::wire_peer::SERVER_ID_START;
-        let (mut s, dmabuf) = session_with_dmabuf().await;
+        let (mut s, dmabuf) = session_with_dmabuf(sync_file_planes).await;
         let id = s.new_id();
         let host = s
             .create(zwp_linux_dmabuf_v1::req::create_params(dmabuf.id, id))
@@ -2179,7 +2181,7 @@ mod tests {
         };
         use protocols::wayland::wl_display;
         const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
-        let (mut s, dmabuf) = session_with_dmabuf().await;
+        let (mut s, dmabuf) = session_with_dmabuf(sync_file_planes).await;
         let id = s.new_id();
         let host = s
             .create(zwp_linux_dmabuf_v1::req::create_params(dmabuf.id, id))
@@ -2356,13 +2358,11 @@ mod tests {
 
     /// A session whose guest has a surface and a 1x1 native buffer whose
     /// one plane the guest GPU writes until the returned descriptor is
-    /// written; `stand_in` describes the plane's fence.
+    /// written; `plane_fences` stands in for the plane's fence.
     async fn session_with_a_fenced_buffer(
-        stand_in: PlaneFenceForTest,
+        plane_fences: PlaneFences,
     ) -> (Session, Object, Object, OwnedFd) {
-        let (mut s, dmabuf) = session_with_dmabuf().await;
-        // Injects what no peer can provide (see `session_with_dmabuf`).
-        s.ctx().plane_fences_for_test = Some(stand_in);
+        let (mut s, dmabuf) = session_with_dmabuf(plane_fences).await;
         let surface = s.surface().await;
         let (plane, signal) = crate::test_support::pipe();
         let buffer = s.native_buffer(dmabuf.id, plane, 1, 1).await;
@@ -2420,7 +2420,7 @@ mod tests {
     async fn a_pending_fence_parks_the_guest_stream_while_host_events_flow() {
         use protocols::wayland::{wl_callback, wl_display};
         let (mut s, surface, buffer, _signal) =
-            session_with_a_fenced_buffer(PlaneFenceForTest::SyncFile).await;
+            session_with_a_fenced_buffer(sync_file_planes).await;
         // A callback the host can finish while the guest stream is parked.
         let callback = s.new_id();
         let host_callback = s
@@ -2493,7 +2493,7 @@ mod tests {
         ];
         for (fault, inject) in faults {
             let (mut s, surface, buffer, _signal) =
-                session_with_a_fenced_buffer(PlaneFenceForTest::SyncFile).await;
+                session_with_a_fenced_buffer(sync_file_planes).await;
             let callback = s.new_id();
             s.guest([wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0)])
                 .await;
@@ -2515,8 +2515,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_parked_commit_is_forwarded_once_when_its_fence_signals() {
-        let (mut s, surface, buffer, signal) =
-            session_with_a_fenced_buffer(PlaneFenceForTest::SyncFile).await;
+        let (mut s, surface, buffer, signal) = session_with_a_fenced_buffer(sync_file_planes).await;
         let fence = fd_identity(signal.as_raw_fd());
         // What the proxy keeps of the plane, and `signal`.
         let idle = fds_with_identity(fence);
@@ -2552,7 +2551,9 @@ mod tests {
     #[tokio::test]
     async fn run_forwards_a_parked_commit_once_its_sync_file_signals() {
         use protocols::wayland::{wl_callback, wl_display};
-        let mut s = Session::new();
+        // Each plane stands in for its own sync_file.
+        let connection = TestConnection::default().plane_fences(sync_file_planes);
+        let mut s = Session::with_context(connection.context());
         let surface = s.surface().await;
         let buffer = Object {
             id: s.new_id(),
@@ -2560,12 +2561,10 @@ mod tests {
         };
         // Injects what no peer can provide: a native buffer of
         // `SLOW_DEADLINE_PLANES` planes (a guest's has at most four) that
-        // share one fence, the guest GPU's write until `signal` is written,
-        // each plane standing in for its own sync_file.
+        // share one fence, the guest GPU's write until `signal` is written.
         let (plane, signal) = crate::test_support::pipe();
         s.pair_for_test(buffer.id, buffer.host, "wl_buffer", 1);
         let ctx = s.ctx();
-        ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
         let planes = (0..SLOW_DEADLINE_PLANES)
             .map(|_| plane.try_clone().expect("share the fence"))
             .collect();
@@ -2707,8 +2706,7 @@ mod tests {
         /// A host object the proxy does not track, so it reads and drops
         /// what the object sends.
         const UNTRACKED_HOST_OBJECT: u32 = 0x7000;
-        let (mut s, surface, buffer, signal) =
-            session_with_a_fenced_buffer(PlaneFenceForTest::Busy).await;
+        let (mut s, surface, buffer, signal) = session_with_a_fenced_buffer(busy_planes).await;
         let callback = s.new_id();
         s.queue(ClientToHost, commit_and_sync(surface, buffer, callback));
 
@@ -2736,7 +2734,7 @@ mod tests {
         assert_eq!(s.host_received(), []);
     }
 
-    /// Dispatch a commit behind a fence, which `stand_in` describes, that
+    /// Dispatch a commit behind a fence, which `plane_fences` stands in for, that
     /// never signals, each time it is due, and assert that the session
     /// ends with one `implementation` error and without the commit or
     /// anything after it. Returns how long the session lasted. A deadline
@@ -2745,9 +2743,9 @@ mod tests {
     /// The loop is driven by hand rather than by `Client::run`: paused
     /// time jumps to the next timer whenever the runtime waits on a
     /// socket, so a guard timer beside `run` would be jumped to.
-    async fn session_with_a_fence_that_never_signals(stand_in: PlaneFenceForTest) -> Duration {
+    async fn session_with_a_fence_that_never_signals(plane_fences: PlaneFences) -> Duration {
         use protocols::wayland::wl_display;
-        let (mut s, surface, buffer, signal) = session_with_a_fenced_buffer(stand_in).await;
+        let (mut s, surface, buffer, signal) = session_with_a_fenced_buffer(plane_fences).await;
         let fence = fd_identity(signal.as_raw_fd());
 
         let callback = s.new_id();
@@ -2780,7 +2778,7 @@ mod tests {
     /// A sync_file that never signals ends the session at its deadline.
     #[tokio::test(start_paused = true)]
     async fn a_fence_that_never_signals_ends_the_session_at_its_deadline() {
-        let lasted = session_with_a_fence_that_never_signals(PlaneFenceForTest::SyncFile).await;
+        let lasted = session_with_a_fence_that_never_signals(sync_file_planes).await;
         let deadline = crate::allocator::SYNC_FILE_TIMEOUT;
         assert!(deadline <= lasted && lasted < deadline * 2, "{lasted:?}");
     }
@@ -2789,7 +2787,7 @@ mod tests {
     /// the kernel's bound, though it is polled all the while.
     #[tokio::test(start_paused = true)]
     async fn a_fallback_fence_that_never_signals_ends_the_session_at_its_deadline() {
-        let lasted = session_with_a_fence_that_never_signals(PlaneFenceForTest::Busy).await;
+        let lasted = session_with_a_fence_that_never_signals(busy_planes).await;
         let deadline = crate::allocator::VIRTGPU_WAIT_TIMEOUT;
         assert!(
             deadline <= lasted && lasted < deadline + MAX_FENCE_POLL_INTERVAL * 2,
@@ -2817,8 +2815,7 @@ mod tests {
     /// sync_file may, asked about all the while.
     #[tokio::test(start_paused = true)]
     async fn a_slow_fallback_fence_outlasts_the_sync_file_bound() {
-        let (mut s, surface, buffer, signal) =
-            session_with_a_fenced_buffer(PlaneFenceForTest::Busy).await;
+        let (mut s, surface, buffer, signal) = session_with_a_fenced_buffer(busy_planes).await;
         let callback = s.new_id();
         s.guest(commit_and_sync(surface, buffer, callback)).await;
         assert_eq!(s.host_received(), [attached(surface, buffer)]);

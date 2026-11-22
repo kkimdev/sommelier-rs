@@ -698,7 +698,7 @@ pub(crate) fn pending_fence(
     let plane_count = planes.len() as u32;
     let mut needs_implicit_sync = false;
     for plane in planes {
-        match plane_fence(ctx, plane.as_fd())? {
+        match ctx.plane_fence(plane.as_fd())? {
             DmabufFence::Signalled => {}
             DmabufFence::Pending(fence) => {
                 let timeout = fence.timeout() * plane_count;
@@ -723,24 +723,6 @@ pub(crate) fn pending_fence(
         );
     }
     Ok(None)
-}
-
-/// Whether the guest GPU has finished writing one plane of a native buffer.
-fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> io::Result<DmabufFence> {
-    #[cfg(test)]
-    if let Some(stand_in) = ctx.plane_fences_for_test {
-        use crate::allocator::PendingFence;
-        use crate::state::PlaneFenceForTest;
-        return Ok(
-            match crate::allocator::sync_file_fence(plane.try_clone_to_owned()?)? {
-                DmabufFence::Pending(_) if matches!(stand_in, PlaneFenceForTest::Busy) => {
-                    DmabufFence::Pending(PendingFence::Busy)
-                }
-                fence => fence,
-            },
-        );
-    }
-    crate::allocator::dmabuf_fence(plane, ctx.virtgpu())
 }
 
 /// Forget guest `zwp_linux_dmabuf_v1` `factory`, of global `global`,
@@ -1109,7 +1091,8 @@ mod tests {
     use crate::protocols::Iface;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{GuestId, HostId, PlaneFenceForTest, SessionEnd};
+    use crate::state::{GuestId, HostId, SessionEnd};
+    use crate::test_support::connection::sync_file_planes;
     use crate::test_support::wire_peer::SERVER_ID_START;
     use crate::test_support::TestConnection;
     use crate::test_support::{any_fd_has_identity, decoded, fd_identity, msg_opcode, msg_sender};
@@ -1129,9 +1112,11 @@ mod tests {
     }
 
     /// A session with GPU access, whose guest has bound the host's
-    /// linux-dmabuf at v3, without synthetic feedback.
+    /// linux-dmabuf at v3, without synthetic feedback. Each native buffer
+    /// plane stands in for its own sync_file, which no peer can provide.
     async fn dmabuf_session() -> (Session, Object) {
-        let mut s = Session::with_context(TestConnection::default().gpu_accel().context());
+        let connection = TestConnection::default().plane_fences(sync_file_planes);
+        let mut s = Session::with_context(connection.gpu_accel().context());
         let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await;
         (s, dmabuf)
     }
@@ -1211,13 +1196,10 @@ mod tests {
 
     /// The guest commits `buffer` on a new surface while the fence of one
     /// of its planes, whose pipe `signal` writes, is pending: the commit
-    /// waits for it, and reaches the host once it signals. Each plane
-    /// stands in for its own sync_file, which a readable pipe is once the
-    /// guest GPU is done.
+    /// waits for it, and reaches the host once it signals. `s` is a
+    /// [`dmabuf_session`].
     async fn commit_waits_for_fence(s: &mut Session, buffer: Object, signal: OwnedFd) {
         let surface = s.surface().await;
-        // Injects what no peer can provide: a plane's fence.
-        s.ctx().plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
         s.guest([
             wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0),
             wl_surface::req::commit(surface.id),

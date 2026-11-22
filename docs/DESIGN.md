@@ -46,11 +46,14 @@ handler intercepts the ones whose meaning changes across the boundary.
   node, whether its client gets wheel steps (`client_kind.rs`, the one
   owner of whether a client is Wine, starts deciding that from the
   client's process when it connects;
-  [pointer scrolling](INVARIANTS.md#pointer-scrolling)) and the
-  placement configuration. A `Context` is whole when it is built; no
-  setting of it changes later. A test's connection is built the same
-  way, from the real settings and facts, which a test changes by name
-  (`test_support::TestConnection`).
+  [pointer scrolling](INVARIANTS.md#pointer-scrolling)), the
+  placement configuration, and how it asks whether the guest GPU has
+  finished writing a native buffer's plane (`allocator::dmabuf_fence`). A
+  `Context` is whole when it is built; no setting of it changes later. A
+  test's connection is built the same way, from the real settings and
+  facts, which a test changes by name (`test_support::TestConnection`);
+  one that needs a plane whose fence is pending, which no dma-buf a test
+  can make has, names a stand-in fence lookup.
 - `proxy::run` claims the socket through its lock file, then `serve`
   accepts guest clients and gives each a `Client` with its own guest
   connection, host connection and `Context`; it also accepts, on the

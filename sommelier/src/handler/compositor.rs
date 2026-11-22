@@ -432,7 +432,8 @@ mod tests {
     use crate::protocols::Iface;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{PlaneFenceForTest, RenderBufferUse};
+    use crate::state::RenderBufferUse;
+    use crate::test_support::connection::sync_file_planes;
     use crate::test_support::text_input::{self, Host};
     use crate::test_support::TestConnection;
     use crate::test_support::{queued_headers, shm_pool_file, BufferKind, BUFFER_KINDS};
@@ -492,7 +493,12 @@ mod tests {
 
     impl Screen {
         async fn new() -> Self {
-            let mut s = Session::with_context(TestConnection::default().gpu_accel().context());
+            Self::with(TestConnection::default()).await
+        }
+
+        /// [`Self::new`], of `connection` with GPU access.
+        async fn with(connection: TestConnection) -> Self {
+            let mut s = Session::with_context(connection.gpu_accel().context());
             let surface = s.surface().await;
             let shm = s.bind("wl_shm", wl_shm::VERSION).await;
             let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await.id;
@@ -898,11 +904,10 @@ mod tests {
     /// pending state would have lost.
     #[tokio::test]
     async fn a_commit_waits_for_a_pending_fence_before_it_changes_anything() {
-        let mut sc = Screen::new().await;
+        // The plane stands in for its own sync_file, which no peer can
+        // provide.
+        let mut sc = Screen::with(TestConnection::default().plane_fences(sync_file_planes)).await;
         let surface = sc.surface;
-        // Injects what no peer can provide: the plane stands in for its own
-        // sync_file, which a readable pipe is once the guest GPU is done.
-        sc.s.ctx().plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
         let (fence, signal) = crate::test_support::pipe();
         let buffer = sc.s.native_buffer(sc.dmabuf, fence, 2, 2).await;
         sc.attach(surface, Some(buffer)).await;

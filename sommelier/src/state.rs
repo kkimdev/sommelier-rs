@@ -31,6 +31,8 @@ mod xdg_roles;
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::io;
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -38,7 +40,7 @@ use tokio::task::JoinSet;
 pub(crate) use self::aura_surfaces::AuraSurfaces;
 pub(crate) use self::host_mapping::{HostMapping, Rows};
 use self::render::RenderBufferRegistry;
-use crate::allocator::{PendingFence, VirtGpuDevice};
+use crate::allocator::{DmabufFence, PendingFence, PlaneFences, VirtGpuDevice};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, ProtocolError, ToGuest, ToHost};
 use log::{debug, error, warn};
@@ -144,18 +146,6 @@ pub(crate) struct FenceWait {
     /// How long the message may wait, counted from the first time it does,
     /// before its session ends.
     pub(crate) timeout: std::time::Duration,
-}
-
-/// The fence a test's pipe plane stands in for
-/// ([`Context::plane_fences_for_test`]).
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PlaneFenceForTest {
-    /// The plane is its own sync_file.
-    SyncFile,
-    /// The virtio-gpu fallback, which reports a busy buffer and nothing to
-    /// wait on.
-    Busy,
 }
 
 /// The most clipboard transfers one connection may have in flight.
@@ -281,11 +271,8 @@ pub struct Context {
     settings: Rc<Settings>,
     /// The process's virtio-gpu render node, shared by every client.
     virtgpu: Option<Arc<VirtGpuDevice>>,
-    /// Test-only: what each native buffer plane stands in for. No test can
-    /// make a dma-buf whose fence is pending, so a pipe stands in, pending
-    /// until it is readable (see `handler::linux_dmabuf::plane_fence`).
-    #[cfg(test)]
-    pub plane_fences_for_test: Option<PlaneFenceForTest>,
+    /// How it asks whether the guest GPU has finished writing a plane.
+    plane_fences: PlaneFences,
     /// This connection's VirtWL channel to the host, if it has one.
     virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
     /// The SHM formats the host reported.
@@ -853,6 +840,7 @@ impl Context {
         let ConnectionFacts {
             virtwl,
             virtgpu,
+            plane_fences,
             wheel,
             placement,
             clipboard,
@@ -874,8 +862,7 @@ impl Context {
             wait: None,
             settings,
             virtgpu,
-            #[cfg(test)]
-            plane_fences_for_test: None,
+            plane_fences,
             virtwayland_channel: virtwl,
             shm_formats: Default::default(),
             globals: Default::default(),
@@ -905,6 +892,12 @@ impl Context {
     /// The process's virtio-gpu render node, if it has opened.
     pub(crate) fn virtgpu(&self) -> Option<&VirtGpuDevice> {
         self.virtgpu.as_deref()
+    }
+
+    /// Whether the guest GPU has finished writing native buffer plane
+    /// `plane`, asked without waiting.
+    pub(crate) fn plane_fence(&self, plane: BorrowedFd<'_>) -> io::Result<DmabufFence> {
+        (self.plane_fences)(plane, self.virtgpu())
     }
 
     /// This connection's VirtWL channel to the host, if it has one.
@@ -957,6 +950,11 @@ pub(crate) struct ConnectionFacts {
     pub(crate) virtwl: Option<Arc<VirtWaylandChannel>>,
     /// The process's virtio-gpu render node, if it has opened.
     pub(crate) virtgpu: Option<Arc<VirtGpuDevice>>,
+    /// How it asks whether the guest GPU has finished writing a native
+    /// buffer's plane: `allocator::dmabuf_fence`, which a test's connection
+    /// replaces for a plane no test can make, a dma-buf whose fence is
+    /// pending.
+    pub(crate) plane_fences: PlaneFences,
     /// Whether its client gets wheel steps from touchpad scrolling.
     pub(crate) wheel: crate::client_kind::WheelClient,
     /// The process's window placement configuration.
