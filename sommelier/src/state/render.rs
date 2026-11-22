@@ -554,19 +554,20 @@ pub struct SurfaceState {
     /// Buffer scale/transform are double-buffered by wl_surface. Keeping the
     /// state here lets the commit path decide whether a damage rectangle can
     /// be mapped safely.
-    pub current_buffer_scale: i32,
-    pub current_buffer_transform: i32,
+    pub(super) current_buffer_scale: i32,
+    pub(super) current_buffer_transform: i32,
     /// A viewport object exists for this surface. The object's state is
     /// tracked separately because an unset viewport is an identity mapping.
-    pub viewport: Option<ViewportState>,
-    /// State the next commit applies.
-    pub pending: SurfacePending,
+    pub(super) viewport: Option<ViewportState>,
+    /// State the next commit applies, which requests set through the
+    /// setters below.
+    pub(super) pending: SurfacePending,
     /// Whether the proxy has logged a viewport rule it leaves unenforced,
     /// which it does once per surface rather than every frame.
-    pub logged_viewport_rule: bool,
+    pub(super) logged_viewport_rule: bool,
     /// The host copies this surface has shown for the first time, for the
     /// debug log.
-    pub new_host_copies: NewHostCopies,
+    pub(super) new_host_copies: NewHostCopies,
 }
 
 /// The SHM host copies one surface showed for the first time, which a
@@ -764,7 +765,7 @@ impl SurfaceState {
     /// Drop the surface's references to the destroyed `buffer_id`: its
     /// current contents keep only their dimensions, and a pending attach of
     /// it becomes a detach.
-    pub(crate) fn clear_buffer_references(&mut self, buffer_id: GuestId) {
+    pub(super) fn clear_buffer_references(&mut self, buffer_id: GuestId) {
         if self.pending.attachment == SurfaceAttachment::Attach(buffer_id) {
             self.pending.attachment = SurfaceAttachment::Detach;
         }
@@ -797,6 +798,87 @@ impl SurfaceState {
                     dimensions: Some(dimensions),
                 })
             });
+    }
+
+    /// The buffer a pending attach names, if one does.
+    pub(crate) fn pending_buffer_id(&self) -> Option<GuestId> {
+        self.pending.attachment.buffer_id()
+    }
+
+    /// `wl_surface.attach` of `buffer` (`None` for no buffer) at offset
+    /// `(x, y)`, which only a buffer carries.
+    pub(crate) fn attach(&mut self, buffer: Option<GuestId>, x: i32, y: i32) {
+        self.pending.attachment = match buffer {
+            Some(buffer) => SurfaceAttachment::Attach(buffer),
+            None => SurfaceAttachment::Detach,
+        };
+        self.pending.attach_offset = buffer.is_some().then_some((x, y));
+    }
+
+    /// `wl_surface.damage` of `rect`.
+    pub(crate) fn damage(&mut self, rect: SurfaceRect) {
+        self.pending.surface_damage.push(rect);
+    }
+
+    /// `wl_surface.damage_buffer` of `rect`.
+    pub(crate) fn damage_buffer(&mut self, rect: BufferRect) {
+        self.pending.buffer_damage.push(rect);
+    }
+
+    /// `wl_surface.set_buffer_scale` to a valid `scale`.
+    pub(crate) fn set_buffer_scale(&mut self, scale: i32) {
+        self.pending.buffer_scale = Some(scale);
+    }
+
+    /// `wl_surface.set_buffer_transform` to a valid `transform`.
+    pub(crate) fn set_buffer_transform(&mut self, transform: i32) {
+        self.pending.buffer_transform = Some(transform);
+    }
+
+    /// The surface got a `wp_viewport`, an identity until a request sets
+    /// it, as of its next commit.
+    pub(crate) fn add_viewport(&mut self) {
+        self.pending.viewport = Some(Some(ViewportState::new()));
+    }
+
+    /// The surface's `wp_viewport` ended, as of its next commit.
+    pub(crate) fn remove_viewport(&mut self) {
+        self.pending.viewport = Some(None);
+    }
+
+    /// Whether a viewport rule the proxy leaves unenforced is yet to be
+    /// logged for this surface, which it then is.
+    pub(crate) fn first_unenforced_viewport_rule(&mut self) -> bool {
+        !std::mem::replace(&mut self.logged_viewport_rule, true)
+    }
+
+    /// Count a new host copy of `bytes` this surface showed at `now` (see
+    /// [`NewHostCopies::record`]).
+    pub(crate) fn record_new_host_copy(
+        &mut self,
+        bytes: u64,
+        now: Instant,
+    ) -> Option<(u32, u64, Duration)> {
+        self.new_host_copies.record(bytes, now)
+    }
+
+    /// Offset the surface's next contents by `(x, y)` without an attach,
+    /// as v5's `wl_surface.offset` would.
+    #[cfg(test)]
+    pub(crate) fn offset_for_test(&mut self, x: i32, y: i32) {
+        self.pending.attach_offset = Some((x, y));
+    }
+
+    /// Whether an unenforced viewport rule was logged for this surface.
+    #[cfg(test)]
+    pub(crate) fn logged_viewport_rule(&self) -> bool {
+        self.logged_viewport_rule
+    }
+
+    /// Whether the surface's current state has a viewport.
+    #[cfg(test)]
+    pub(crate) fn has_viewport(&self) -> bool {
+        self.viewport.is_some()
     }
 
     /// The viewport the next commit applies, for a `wp_viewport` request to

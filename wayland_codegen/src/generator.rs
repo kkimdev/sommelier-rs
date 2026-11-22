@@ -277,7 +277,6 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
 
         impl Iface {
             /// Every interface, in the order the protocols define them.
-            #[cfg(test)]
             pub const ALL: [Self; #count] = [#(#all),*];
 
             /// The interface's name, as the wire spells it.

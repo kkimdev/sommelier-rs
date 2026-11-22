@@ -20,19 +20,12 @@ limitations under the License.
 
 use crate::handler::Handlers;
 use crate::protocols;
-use crate::state::{Context, EventSender, GuestId, HostId, RequestSender, SurfaceState};
+use crate::state::{Context, EventSender, GuestId, HostId, RequestSender};
 use crate::wire::{Action, Destructor};
-use std::collections::BTreeMap;
 
 /// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
 pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: HostId) {
     ctx.send_host(protocols::wayland::wl_buffer::req::destroy(host_id));
-}
-
-fn clear_surface_buffer_references(ctx: &mut Context, guest_id: GuestId) {
-    for surface in ctx.surfaces.values_mut() {
-        surface.clear_buffer_references(guest_id);
-    }
 }
 
 fn record_host_buffer_release(ctx: &mut Context, guest_id: GuestId) {
@@ -64,14 +57,12 @@ fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: GuestId, host_id
 /// surfaces, which allocates nothing: an attach, commit and release each
 /// ask, every frame.
 struct SurfaceBufferReferences<'a> {
-    surfaces: &'a BTreeMap<GuestId, SurfaceState>,
+    ctx: &'a Context,
 }
 
 impl<'a> SurfaceBufferReferences<'a> {
     fn of(ctx: &'a Context) -> Self {
-        Self {
-            surfaces: &ctx.surfaces,
-        }
+        Self { ctx }
     }
 
     fn contains(&self, guest_id: GuestId) -> bool {
@@ -79,15 +70,15 @@ impl<'a> SurfaceBufferReferences<'a> {
     }
 
     fn has_current(&self, guest_id: GuestId) -> bool {
-        self.surfaces
-            .values()
+        self.ctx
+            .surfaces()
             .any(|surface| surface.current_buffer_id() == Some(guest_id))
     }
 
     fn has_pending(&self, guest_id: GuestId) -> bool {
-        self.surfaces
-            .values()
-            .any(|surface| surface.pending.attachment.buffer_id() == Some(guest_id))
+        self.ctx
+            .surfaces()
+            .any(|surface| surface.pending_buffer_id() == Some(guest_id))
     }
 }
 
@@ -213,7 +204,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
                 ));
             }
         }
-        clear_surface_buffer_references(ctx, guest_id);
+        ctx.clear_surface_buffer_references(guest_id);
         Destructor::Forward
     }
 
@@ -235,7 +226,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for Handlers {
             record_host_buffer_release(ctx, guest_id);
             queue_host_buffer_destroy(ctx, host_id);
             retire_destroyed_buffer_mapping(ctx, guest_id, host_id);
-            clear_surface_buffer_references(ctx, guest_id);
+            ctx.clear_surface_buffer_references(guest_id);
             return Action::Drop;
         }
 
@@ -397,7 +388,7 @@ mod tests {
             if shown {
                 // Reads state no peer can observe: what the surface
                 // remembers of the content it shows.
-                let surface = &g.s.ctx().surfaces[&surface.guest_id()];
+                let surface = g.s.ctx().surface(surface.guest_id()).expect("its state");
                 assert_eq!(surface.current_buffer_id(), None, "{case}");
                 assert_eq!(
                     surface.current_buffer_dimensions(),

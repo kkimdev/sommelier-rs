@@ -26,7 +26,7 @@ use crate::handler::text_input::CtxEnv;
 use crate::ime::{HostExt, HostTi, LinkState, SeatId, SurfaceId, TextInput, TiId, V3Pending};
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::Iface;
-use crate::state::{Context, GuestId, HostId, InternalCallback};
+use crate::state::{Context, GuestId, HostId, InternalCallback, Singleton};
 
 /// A text input the guest committed, enabled unless [`Active::enabled`]
 /// says otherwise, and the host activated if enabled, as [`insert`] sets it
@@ -94,8 +94,9 @@ pub(crate) fn insert(ctx: &mut Context, guest: GuestId, active: Active) {
         // request of the test's goes to it.
         manager: ctx
             .globals
-            .text_input_factories()
-            .map_or(HostId::for_test(0), |(_, extension)| extension),
+            .singletons()
+            .host(Singleton::TextInputExtension)
+            .unwrap_or(HostId::for_test(0)),
     };
     let host = HostTi {
         v1: active.host,

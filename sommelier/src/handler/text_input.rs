@@ -32,7 +32,7 @@ use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::state::{
     Context, EventObject, EventSender, GuestId, HostId, InternalCallback, RequestObject,
-    RequestSender, ShadowTable,
+    RequestSender, ShadowTable, Singleton,
 };
 use crate::wire::{Action, Destructor, IndexedString, ToGuest};
 
@@ -437,7 +437,9 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for Handlers {
 /// `confirm_preedit`, which the IME core's Exo mirror reads (`docs/IME.md`
 /// E14).
 fn host_text_input_managers(ctx: &Context) -> Option<(HostId, HostId)> {
-    let (manager, ext_manager) = ctx.globals.text_input_factories()?;
+    let singletons = ctx.globals.singletons();
+    let manager = singletons.host(Singleton::TextInputManager)?;
+    let ext_manager = singletons.host(Singleton::TextInputExtension)?;
     ctx.shadow_table
         .host_object_version(ext_manager)
         .is_some_and(|version| version >= zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT_SINCE)

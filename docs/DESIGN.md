@@ -201,18 +201,22 @@ is not copied again before it joins its peer's pending output.
 
 ### Adding an interface or a global
 
-The compiler names every place that must change, and one test names the
-one list it cannot check:
+The compiler names every place that must change, and the build checks
+the rules of the one table it cannot:
 
 1. **A protocol.** Vendor its XML in `third_party/protocols/` and add its
    path to `sommelier/build.rs`. Each of its interfaces becomes an `Iface`
    variant, and the build stops at every exhaustive match until the
    interface has a row in it:
-   - `handler::registry::policy`, the one table of host globals: whether
-     the proxy forwards a host global of the interface (and up to which
-     version), hides it, binds it for its own use, or advertises a global
-     of its own in its place. A forwarded global needs nothing more. An
-     interface that is no global is hidden.
+   - `handler::registry::policy`, the one table of globals: whether the
+     proxy forwards a host global of the interface (and up to which
+     version), hides it, or binds it for its own use (a `Singleton`, and
+     the global of its own it offers the guest in its place), and how it
+     serves the guest's bind of one (`Serve`). A forwarded global needs
+     nothing more. An interface that is no global is hidden. The build
+     checks what the `match` cannot (`check_table`): no version above the
+     XML, one row for each singleton, and one row carrying each global the
+     proxy offers in a host global's place, whose bind it serves.
    - `state::lifecycle::forget_object`: whether its objects have state of
      their own outside their table entry to forget when they end. State
      only the object owns goes in its entry instead (an `ObjectData`
@@ -226,20 +230,17 @@ one list it cannot check:
    keep its per-object state with that module (see
    [Object ends](#object-ends)).
 3. **A global the proxy binds for itself, once per connection.** A
-   `Singleton` variant (`state/singletons.rs`) and its interface
-   (`Singleton::interface`, a `match`); the variant in `Singleton::ALL`,
-   the order the proxy binds singletons in when several have none, which
-   `every_interface_has_one_global_policy` holds to the table; its
-   `BindInternal` row in `policy`; a `<global>_global` function in
-   `registry.rs` that decides what the guest sees in its place, and its
-   arm in `on_global`'s `match` on the singleton; its bind
-   (`Singleton::bind`) and its release
-   (`reset_internal_binding_for_global`), each a `match` on the
-   singleton. Its binding is an entry of `Context::globals`, which other
-   modules read (`ctx.globals.singletons().host(Singleton::Shm)`).
+   `Singleton` variant (`state/singletons.rs`) and its `Policy::Bind` row,
+   which names its interface, its version ceiling and what the guest is
+   offered instead. The compiler then asks for its arm in three `match`es
+   on the singleton: `check_table`'s, which says to list it in
+   `SINGLETONS`, the list the build holds to one row each;
+   `Singleton::bind`'s (what follows its bind); and
+   `reset_internal_binding_for_global`'s (its release). Its binding is an
+   entry of `Context::globals`, which other modules read
+   (`ctx.globals.singletons().host(Singleton::Shm)`).
 
-Tests: `every_interface_has_one_global_policy`,
-`every_interface_resolves_by_its_name`.
+Test: `every_interface_resolves_by_its_name`.
 
 ## Object translation
 
@@ -325,12 +326,14 @@ methods. The registry owns the host's globals and the proxy's bindings
 (`keys::KeyboardCore`), `handler::shm` the host's SHM formats
 (`ShmFormats`), `handler::linux_dmabuf` the dma-buf capabilities
 (`Dmabuf`), and so on for the IME core, outputs, internal callbacks,
-placement and clipboard pumps. State that one object owns is in that
-object's table entry instead ([Object ends](#object-ends)).
+placement and clipboard pumps; `state` owns each surface's
+`SurfaceState`, which a `wl_surface` request changes through its setters
+(`Context::surface_mut`). State that one object owns is in that object's
+table entry instead ([Object ends](#object-ends)).
 
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
-| Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of host globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
+| Display, registry, callbacks | `display.rs`, `registry.rs` (and `policy`, the table of globals), `callback.rs` | `ShadowTable`, `Context`, `registries.rs` (`RegistryRecord`, one per host `wl_registry`), `singletons.rs` (the proxy's own bindings), `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`); `shm::ShmFormats`; each `wl_shm`, `wl_shm_pool` and `wp_viewport`'s entry |
 | Dma-buf | `linux_dmabuf.rs` | `linux_dmabuf::Dmabuf` (capabilities), each params, factory and feedback object's entry, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs` (the keyboard core's adapter), `pointer.rs` (and wheel steps for touchpad scrolling), `touch.rs`, `text_input.rs` (the IME core's adapter), `seat.rs` | `input.rs` (pointer focus); `sommelier/src/keys` (the keyboard core: the keyboard focus, one `Keyboard` record per host keyboard, key generations, Backspace leases, held-key recovery, host accelerators); `sommelier/src/keymap.rs` (compiling a keymap, and its XKB state); the IME core, `sommelier/src/ime` (text inputs) |
@@ -499,11 +502,12 @@ releases it encodes it into its own effects.
 
 The convention for state that a request sets and a later commit applies
 is one `#[derive(Default)]` struct per site, named for it. Requests write
-its fields, and the commit applies them by destructuring
-`std::mem::take(&mut self.pending)`, naming every field. Taking it resets
-the pending state in one step, and a new field the commit never applies
-becomes an unused variable, which CI rejects. There is no generic
-`DoubleBuffered<T>`: each commit applies its fields in its own way.
+its fields, through its owner's setters, and the commit applies them by
+destructuring `std::mem::take(&mut self.pending)`, naming every field.
+Taking it resets the pending state in one step, and a new field the
+commit never applies becomes an unused variable, which CI rejects. There
+is no generic `DoubleBuffered<T>`: each commit applies its fields in its
+own way.
 
 - `SurfacePending` (`render.rs`) follows it for a `wl_surface`'s
   attachment, damage, scale, transform, offsets and viewport.

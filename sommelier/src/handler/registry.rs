@@ -20,17 +20,13 @@ use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
 use crate::handler::Handlers;
-use crate::protocols::ext_data_control_v1::ext_data_control_manager_v1;
-use crate::protocols::gtk::gtk_shell1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
-use crate::protocols::security_context_v1::wp_security_context_manager_v1;
-use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
-use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry, wl_shm, wl_surface};
+use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry, wl_surface};
 use crate::protocols::Iface;
 use crate::settings::Settings;
 use crate::state::{
-    Binding, Context, EventSender, GuestId, HostGlobal, HostId, InternalCallback, RequestObject,
-    RequestSender, Singleton, INERT_BIND_INTERFACE,
+    Binding, Context, EventSender, GuestId, HostId, InternalCallback, RequestObject, RequestSender,
+    Singleton, INERT_BIND_INTERFACE,
 };
 use crate::state::{RegistryRecord, Singletons};
 use crate::wire::Action;
@@ -48,15 +44,6 @@ pub(crate) const LINUX_DMABUF_CAPABILITY_VERSION: u32 = zwp_linux_dmabuf_v1::EVT
 // exists (see `ZwpLinuxDmabufFeedbackV1Handler for LinuxDmabufHandler`).
 const _: () =
     assert!(LINUX_DMABUF_CAPABILITY_VERSION < zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_SINCE);
-/// The newest host `zwp_text_input_manager_v1` the proxy binds: the vendored
-/// XML's. The generated code knows no message added after it, so a newer
-/// binding could deliver events whose unknown opcodes end the session.
-const TEXT_INPUT_MANAGER_VERSION: u32 =
-    crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1::VERSION;
-/// The newest host `zcr_text_input_extension_v1` the proxy binds, for the
-/// same reason.
-const TEXT_INPUT_EXTENSION_VERSION: u32 =
-    crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1::VERSION;
 /// The `wl_compositor` ceiling, at which a host of
 /// [`WL_COMPOSITOR_HOST_VERSION`] or newer is offered, as ChromiumOS
 /// Sommelier offers it with `--support-damage-buffer`: v4 adds only
@@ -67,7 +54,9 @@ const TEXT_INPUT_EXTENSION_VERSION: u32 =
 /// latter, so raising the ceiling needs that handled first.
 const WL_COMPOSITOR_VERSION: u32 = 4;
 const _: () = assert!(WL_COMPOSITOR_VERSION < wl_surface::REQ_OFFSET_SINCE);
-/// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
+/// The newest `wl_compositor` the proxy binds for the guest: v3 provides
+/// buffer scale and transform, and the proxy implements v4's
+/// `damage_buffer` itself.
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 /// The `xdg_wm_base` ceiling, ChromiumOS Sommelier's
 /// (`SL_XDG_SHELL_MAX_VERSION` in `sommelier-xdg-shell.h`). The vendored
@@ -87,11 +76,6 @@ const WL_OUTPUT_VERSION: u32 = 3;
 /// high-resolution scroll and scroll-direction events, and, at v10, the
 /// `repeated` key state.
 pub(crate) const WL_SEAT_VERSION: u32 = 5;
-/// The newest `zcr_keyboard_extension_v1` the proxy binds: the vendored
-/// XML's. The proxy handles all of it, including the v2 `peek_key` event
-/// that reports keys the IME consumed.
-const KEYBOARD_EXTENSION_VERSION: u32 =
-    crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1::VERSION;
 /// The oldest `zaura_shell` this proxy binds, the v6+ contract ChromiumOS
 /// Sommelier uses. Every Aura child takes its shell's version, so this
 /// floor is what lets the proxy create Aura surfaces and outputs, and send
@@ -113,59 +97,122 @@ const _: () = assert!(
     crate::protocols::aura_shell::zaura_surface::REQ_SET_STARTUP_ID_SINCE
         <= ZAURA_SHELL_MIN_VERSION
 );
-/// The newest `zaura_shell` this proxy binds: the interface version of the
-/// vendored `third_party/protocols/aura-shell.xml`. The generated code knows
-/// no request or event added after it, so binding a newer host shell would
-/// let Exo send Aura events whose unknown opcodes end the client's session.
-const ZAURA_SHELL_MAX_VERSION: u32 = crate::protocols::aura_shell::zaura_shell::VERSION;
 
-/// What the proxy does with a host global, by its interface (see
-/// [`policy`]).
+/// What the proxy does with a global of an interface: its row in
+/// [`policy`].
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Policy {
-    /// Forward it to the guest while `enabled` says so, offered at the
-    /// host's version capped at `ceiling` ([`offered_version`]), and hide
-    /// it otherwise.
+enum Policy {
+    /// Forward a host global of the interface to the guest while `enabled`
+    /// says so, offered at the host's version capped at `ceiling`
+    /// ([`offered_version`]), and hide it otherwise. The guest's bind is
+    /// served as `serve` says.
     Forward {
         ceiling: u32,
         enabled: fn(&Settings) -> bool,
+        serve: Serve,
     },
-    /// Keep it from the guest. An interface that is no global, which no
-    /// compositor advertises, is hidden too.
+    /// Bind a host global of the interface for the proxy's own use, and
+    /// offer the guest what it carries in its place ([`Internal`]).
+    Bind(Internal),
+    /// Hide a host global of the interface: the guest binds the proxy's
+    /// own global of it instead, which another interface's row carries
+    /// ([`Carries`]), and its bind is served as this says.
+    Synthetic(Serve),
+    /// Hide a host global of the interface, and offer the guest none. An
+    /// interface that is no global, which no compositor advertises, is
+    /// hidden too.
     Hide,
-    /// Bind it for the proxy's own use; its handler decides what the guest
-    /// sees in its place.
-    BindInternal(Internal),
-    /// Keep it from the guest, which binds the proxy's own global of this
-    /// interface instead, advertised for another host global.
-    Synthetic,
 }
 
-/// A host global the proxy binds for its own use.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Internal {
-    /// Bound once per connection, and bound anew when the binding's global
-    /// retires ([`Globals::singletons`]).
-    Singleton(Singleton),
-    /// The first `zwp_text_input_manager_v1`, kept for the connection: the
-    /// guest is offered a `zwp_text_input_manager_v3` under its name.
-    TextInputManager,
-    /// The first `zcr_text_input_extension_v1`, kept for the connection.
-    TextInputExtension,
+/// How the proxy binds a host global for its own use, and what the guest
+/// is offered under the global's name instead.
+#[derive(Clone, Copy, Debug)]
+struct Internal {
+    /// The binding: one per connection ([`Globals::singletons`]).
+    singleton: Singleton,
+    /// Whether the proxy uses a global the host advertises at the given
+    /// version; one it does not use is hidden, and never bound.
+    binds: fn(&Context, u32) -> bool,
+    /// The newest version the proxy binds: the vendored XML's, the newest
+    /// the generated code can decode, unless a named constant says why not.
+    ceiling: u32,
+    /// What the guest is offered under the global's name.
+    carries: Carries,
+    /// How the guest's bind is served, for a global that carries its own
+    /// interface.
+    serve: Option<Serve>,
+}
+
+/// A global of the proxy's own that the guest is offered under the name of
+/// a host global the proxy binds ([`Internal`]), so the host's
+/// `global_remove` of it removes the guest's too. Each is carried by one
+/// row (see [`check_table`]).
+#[derive(Clone, Copy, Debug)]
+enum Carries {
+    /// A global of `iface` at `version`, while `offered` says so; the host
+    /// global is hidden otherwise.
+    Global {
+        iface: Iface,
+        version: u32,
+        offered: fn(&Context) -> bool,
+    },
+    /// The guest's `zwp_linux_dmabuf_v1`, which may wait for the
+    /// capabilities of the proxy's binding ([`offer_dmabuf_global`]).
+    Dmabuf,
+}
+
+impl Carries {
+    /// The interface of the global the guest is offered.
+    const fn iface(self) -> Iface {
+        match self {
+            Self::Global { iface, .. } => iface,
+            Self::Dmabuf => Iface::ZwpLinuxDmabufV1,
+        }
+    }
+}
+
+/// How the proxy serves a guest's bind of a global it advertised.
+#[derive(Clone, Copy, Debug)]
+enum Serve {
+    /// Bind the host global for the guest, at the version the guest asks
+    /// for, but at most at `host_ceiling`: the proxy implements the
+    /// versions above it itself. Then do what `then` says.
+    Paired {
+        host_ceiling: u32,
+        then: Option<AfterBind>,
+    },
+    /// A local object: the proxy implements the global itself, and nothing
+    /// reaches the host.
+    Local,
+    /// The proxy's own `wl_shm` (`handler::shm`).
+    Shm,
+    /// The proxy's own `gtk_shell1` (`handler::gtk_shell`).
+    GtkShell,
+}
+
+/// What follows a paired bind ([`Serve::Paired`]), once it is queued.
+#[derive(Clone, Copy, Debug)]
+enum AfterBind {
+    /// Record the output, and create placement's Aura output for it.
+    Output,
+    /// Let a text input whose seat had no host object activate.
+    Seat,
+    /// Hold the global's capabilities for the guest's factory.
+    DmabufFactory,
 }
 
 /// What the connection knows of the host's globals and the proxy's own
 /// bindings of them (`Context::globals`). Its fields are this module's, so
 /// only the registry policy adds, retires or binds a global; other modules
-/// read the bindings ([`Self::singletons`], [`Self::text_input_factories`]).
+/// read the bindings ([`Self::singletons`]).
 #[derive(Default)]
 pub(crate) struct Globals {
     /// Host globals visible to the guest, keyed by their unique numeric name.
     host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
-    /// the host's interface and version, while a registry lists it; see
-    /// [`Singleton`].
-    singleton_candidates: BTreeMap<u32, HostGlobal>,
+    /// the singleton and the host's version, while a registry lists it;
+    /// see [`Singleton`].
+    singleton_candidates: BTreeMap<u32, (Singleton, u32)>,
     /// What each host registry has advertised, by host registry ID (see
     /// [`RegistryRecord`]).
     registries: BTreeMap<HostId, RegistryRecord>,
@@ -180,14 +227,21 @@ pub(crate) struct Globals {
     /// The proxy's binding of each host global it binds once per
     /// connection, for its own use.
     singletons: Singletons,
-    /// The proxy's `zwp_text_input_manager_v1` ([`Internal::TextInputManager`]).
-    text_input_manager: Option<HostId>,
-    /// The proxy's `zcr_text_input_extension_v1` ([`Internal::TextInputExtension`]).
-    text_input_extension: Option<HostId>,
     /// Guest-facing v4 linux-dmabuf globals withheld until the internal v3
     /// binding has delivered its complete legacy format/modifier
     /// capability set.
     pending_dmabuf: Vec<PendingDmabufGlobal>,
+}
+
+/// One global advertised by the host compositor, by its name in
+/// [`Globals`]: names are unique, but a compositor may advertise several
+/// globals of one interface, such as `wl_output`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostGlobal {
+    /// The interface the guest knows the global by.
+    interface: Iface,
+    /// The newest version the guest may bind.
+    version: u32,
 }
 
 /// A synthetic linux-dmabuf v4 global waiting for legacy host capability
@@ -206,11 +260,6 @@ impl Globals {
     /// The proxy's binding of each singleton.
     pub(crate) fn singletons(&self) -> &Singletons {
         &self.singletons
-    }
-
-    /// The proxy's text-input manager and extension, once it has bound both.
-    pub(crate) fn text_input_factories(&self) -> Option<(HostId, HostId)> {
-        Some((self.text_input_manager?, self.text_input_extension?))
     }
 
     /// Whether a guest global waits for the capabilities of host
@@ -247,18 +296,6 @@ impl Globals {
     #[cfg(test)]
     pub(crate) fn unbind_for_test(&mut self, singleton: Singleton) {
         self.singletons.unbind_for_test(singleton);
-    }
-
-    /// Set the proxy's text-input manager and extension, for a test of a
-    /// proxy that has, or lacks, them.
-    #[cfg(test)]
-    pub(crate) fn set_text_input_factories_for_test(
-        &mut self,
-        manager: Option<HostId>,
-        extension: Option<HostId>,
-    ) {
-        self.text_input_manager = manager;
-        self.text_input_extension = extension;
     }
 
     /// Panic if a registry record outlived its registry, or a global or
@@ -301,56 +338,155 @@ impl Globals {
     }
 }
 
-/// A global forwarded whatever the settings, offered at most at `ceiling`.
+/// A global forwarded whatever the settings, offered at most at `ceiling`,
+/// whose guest bind is paired with a host binding of the same version.
 const fn forward(ceiling: u32) -> Policy {
+    forward_then(ceiling, None)
+}
+
+/// [`forward`], doing what `then` says after the guest's bind.
+const fn forward_then(ceiling: u32, then: Option<AfterBind>) -> Policy {
     Policy::Forward {
         ceiling,
         enabled: |_| true,
+        serve: Serve::Paired {
+            host_ceiling: ceiling,
+            then,
+        },
     }
 }
 
-/// What the proxy does with a host global of `iface`: the one table of
-/// the globals it knows. Its `match` names every interface, so a new
-/// interface needs a row, and a forwarded global needs nothing more.
+/// What the proxy does with a global of `iface`: the one table of the
+/// globals it knows. Its `match` names every interface, so a new interface
+/// needs a row, and a forwarded global needs nothing more.
 ///
-/// A forwarded global's ceiling is its generated `VERSION` unless a named
-/// constant above documents why it deliberately differs; no ceiling is
-/// above the XML (test: `every_interface_has_one_global_policy`).
-pub(crate) const fn policy(iface: Iface) -> Policy {
+/// A version bound is the generated `VERSION` unless a named constant above
+/// documents why it deliberately differs; [`check_table`] holds the rows to
+/// the rules the `match` cannot.
+const fn policy(iface: Iface) -> Policy {
     match iface {
-        Iface::WlCompositor => forward(WL_COMPOSITOR_VERSION),
+        Iface::WlCompositor => Policy::Forward {
+            ceiling: WL_COMPOSITOR_VERSION,
+            enabled: |_| true,
+            serve: Serve::Paired {
+                host_ceiling: WL_COMPOSITOR_HOST_VERSION,
+                then: None,
+            },
+        },
         Iface::WlSubcompositor => forward(Iface::WlSubcompositor.version()),
         Iface::WlDataDeviceManager => forward(Iface::WlDataDeviceManager.version()),
         Iface::WlShell => forward(Iface::WlShell.version()),
-        Iface::WlSeat => forward(WL_SEAT_VERSION),
-        Iface::WlOutput => forward(WL_OUTPUT_VERSION),
+        Iface::WlSeat => forward_then(WL_SEAT_VERSION, Some(AfterBind::Seat)),
+        Iface::WlOutput => forward_then(WL_OUTPUT_VERSION, Some(AfterBind::Output)),
         Iface::WlFixes => forward(Iface::WlFixes.version()),
         Iface::XdgWmBase => forward(XDG_SHELL_VERSION),
         Iface::WpViewporter => forward(Iface::WpViewporter.version()),
         Iface::WpFractionalScaleManagerV1 => forward(Iface::WpFractionalScaleManagerV1.version()),
         Iface::ZxdgOutputManagerV1 => forward(Iface::ZxdgOutputManagerV1.version()),
-        // A host's own v3 manager is offered too; the proxy serves the
-        // guest's bind of any (`on_bind`).
-        Iface::ZwpTextInputManagerV3 => forward(Iface::ZwpTextInputManagerV3.version()),
+        // A host's own v3 manager is offered too. Every guest manager is
+        // local: they share the proxy's one host v1 manager, whose ID no
+        // guest manager may own, or one's destroy would end it for all.
+        Iface::ZwpTextInputManagerV3 => Policy::Forward {
+            ceiling: Iface::ZwpTextInputManagerV3.version(),
+            enabled: |_| true,
+            serve: Serve::Local,
+        },
         Iface::ZxdgDecorationManagerV1 => Policy::Forward {
             ceiling: Iface::ZxdgDecorationManagerV1.version(),
             enabled: |settings| settings.xdg_decoration,
+            serve: Serve::Paired {
+                host_ceiling: Iface::ZxdgDecorationManagerV1.version(),
+                then: None,
+            },
         },
-        Iface::WlShm => Policy::BindInternal(Internal::Singleton(Singleton::Shm)),
-        Iface::ZwpLinuxDmabufV1 => Policy::BindInternal(Internal::Singleton(Singleton::Dmabuf)),
-        Iface::ZcrKeyboardExtensionV1 => {
-            Policy::BindInternal(Internal::Singleton(Singleton::KeyboardExtension))
+        // The proxy emulates the guest's wl_shm, so that it offers only the
+        // formats the host can import; its binding receives the host's
+        // formats.
+        Iface::WlShm => Policy::Bind(Internal {
+            singleton: Singleton::Shm,
+            binds: |_, _| true,
+            ceiling: WL_SHM_VERSION,
+            carries: Carries::Global {
+                iface: Iface::WlShm,
+                version: WL_SHM_VERSION,
+                offered: |_| true,
+            },
+            serve: Some(Serve::Shm),
+        }),
+        // The binding learns the host's formats and modifiers, which the
+        // guest's feedback and wl_shm are made from.
+        Iface::ZwpLinuxDmabufV1 => Policy::Bind(Internal {
+            singleton: Singleton::Dmabuf,
+            binds: |ctx, _| dmabuf_binds(ctx),
+            ceiling: LINUX_DMABUF_CAPABILITY_VERSION,
+            carries: Carries::Dmabuf,
+            // The guest's feedback requests are the proxy's own.
+            serve: Some(Serve::Paired {
+                host_ceiling: LINUX_DMABUF_CAPABILITY_VERSION,
+                then: Some(AfterBind::DmabufFactory),
+            }),
+        }),
+        // The ack-key mechanism for the host's accelerators, and, from v2,
+        // the keys the IME consumed (`peek_key`).
+        Iface::ZcrKeyboardExtensionV1 => Policy::Bind(Internal {
+            singleton: Singleton::KeyboardExtension,
+            binds: |_, _| true,
+            ceiling: Iface::ZcrKeyboardExtensionV1.version(),
+            // With data-control on. The manager needs no host global of
+            // its own (`handler::data_control`), and every Exo has this
+            // one, which the guest never sees, so its removal stays paired.
+            carries: Carries::Global {
+                iface: Iface::ExtDataControlManagerV1,
+                version: Iface::ExtDataControlManagerV1.version(),
+                offered: |ctx| ctx.data_control.offers_global(),
+            },
+            serve: None,
+        }),
+        // For ChromeOS shelf integration and window placement: the proxy
+        // creates Aura surfaces from it to set application and startup IDs.
+        Iface::ZauraShell => Policy::Bind(Internal {
+            singleton: Singleton::AuraShell,
+            binds: |_, version| version >= ZAURA_SHELL_MIN_VERSION,
+            ceiling: Iface::ZauraShell.version(),
+            carries: Carries::Global {
+                iface: Iface::GtkShell1,
+                version: Iface::GtkShell1.version(),
+                offered: |_| true,
+            },
+            serve: None,
+        }),
+        // Text inputs are created from the binding (`handler::text_input`).
+        Iface::ZwpTextInputManagerV1 => Policy::Bind(Internal {
+            singleton: Singleton::TextInputManager,
+            binds: |_, _| true,
+            ceiling: Iface::ZwpTextInputManagerV1.version(),
+            carries: Carries::Global {
+                iface: Iface::ZwpTextInputManagerV3,
+                version: Iface::ZwpTextInputManagerV3.version(),
+                offered: |_| true,
+            },
+            serve: None,
+        }),
+        Iface::ZcrTextInputExtensionV1 => Policy::Bind(Internal {
+            singleton: Singleton::TextInputExtension,
+            binds: |_, _| true,
+            ceiling: Iface::ZcrTextInputExtensionV1.version(),
+            // Unless the connection is offered none
+            // (`handler::security_context`). The manager needs no host
+            // global of its own, and every Exo has this one, which the
+            // guest never sees.
+            carries: Carries::Global {
+                iface: Iface::WpSecurityContextManagerV1,
+                version: Iface::WpSecurityContextManagerV1.version(),
+                offered: |ctx| ctx.sandboxing.offers_manager(),
+            },
+            serve: None,
+        }),
+        Iface::GtkShell1 => Policy::Synthetic(Serve::GtkShell),
+        // The proxy implements data-control and security contexts itself.
+        Iface::ExtDataControlManagerV1 | Iface::WpSecurityContextManagerV1 => {
+            Policy::Synthetic(Serve::Local)
         }
-        Iface::ZauraShell => Policy::BindInternal(Internal::Singleton(Singleton::AuraShell)),
-        Iface::ZwpTextInputManagerV1 => Policy::BindInternal(Internal::TextInputManager),
-        Iface::ZcrTextInputExtensionV1 => Policy::BindInternal(Internal::TextInputExtension),
-        // Advertised by the proxy for `zaura_shell`.
-        Iface::GtkShell1 => Policy::Synthetic,
-        // Advertised by the proxy for `zcr_keyboard_extension_v1`, with
-        // data-control on.
-        Iface::ExtDataControlManagerV1 => Policy::Synthetic,
-        // Advertised by the proxy for `zcr_text_input_extension_v1`.
-        Iface::WpSecurityContextManagerV1 => Policy::Synthetic,
         // No globals.
         Iface::WlDisplay
         | Iface::WlRegistry
@@ -393,38 +529,152 @@ pub(crate) const fn policy(iface: Iface) -> Policy {
     }
 }
 
-/// The version the guest is offered of a forwarded host global of `iface`
-/// that the host advertises at `host_version`, capped at `ceiling`.
-///
-/// The offer is never newer than the vendored XML: the generated code knows
-/// no message added after it, so a newer global would let the guest send
-/// requests whose unknown opcodes end its session.
-///
-/// Some interfaces have a lower ceiling, as in ChromiumOS Sommelier's
-/// client-facing globals. The generated code can decode newer XML
-/// messages, but that does not mean the proxy implements the semantics of
-/// every newer version. In particular, the C++ proxy caps `wl_seat` at v5
-/// and `wl_output` at v3; it also exposes the compositor only up to the
-/// version for which its surface damage handling is implemented. Keep the
-/// guest advertisement aligned with those ceilings so clients do not start
-/// using requests/events that this proxy merely forwards without the
-/// required coordinate/focus handling.
-fn offered_version(iface: Iface, ceiling: u32, host_version: u32) -> u32 {
-    // ChromiumOS implements wl_surface.damage_buffer in terms of the legacy
-    // damage request, so a v3 host compositor is offered as v4. Hosts below
-    // v3 retain their original version; the proxy does not expose v5/v6
-    // surface semantics.
-    let host_version = if iface == Iface::WlCompositor && host_version >= WL_COMPOSITOR_HOST_VERSION
-    {
-        WL_COMPOSITOR_VERSION
-    } else {
-        host_version
-    };
-    host_version.min(ceiling).min(iface.version())
+impl Policy {
+    /// How the proxy serves the guest's bind of a global of the interface,
+    /// or `None` if it never offers the guest one.
+    const fn serve(self) -> Option<Serve> {
+        match self {
+            Self::Forward { serve, .. } | Self::Synthetic(serve) => Some(serve),
+            Self::Bind(internal) => internal.serve,
+            Self::Hide => None,
+        }
+    }
 }
 
-fn keyboard_extension_version(host_version: u32) -> u32 {
-    host_version.min(KEYBOARD_EXTENSION_VERSION)
+/// The rules of [`policy`] its `match` cannot hold, checked as the crate
+/// builds: no version above the XML, one row for each singleton, and one
+/// row carrying each global the proxy offers in a host global's place,
+/// whose bind it serves.
+const fn check_table() {
+    let mut i = 0;
+    while i < Iface::ALL.len() {
+        let iface = Iface::ALL[i];
+        match policy(iface) {
+            Policy::Forward { ceiling, serve, .. } => {
+                assert!(
+                    ceiling <= iface.version(),
+                    "a global is offered above its XML"
+                );
+                if let Serve::Paired { host_ceiling, .. } = serve {
+                    assert!(host_ceiling <= ceiling, "a global is bound above its offer");
+                }
+            }
+            Policy::Bind(internal) => {
+                assert!(
+                    internal.ceiling <= iface.version(),
+                    "a global is bound above its XML"
+                );
+                let carried = internal.carries.iface();
+                assert!(carriers(carried) == 1, "two rows carry one global");
+                assert!(
+                    policy(carried).serve().is_some(),
+                    "a carried global is never served"
+                );
+            }
+            Policy::Synthetic(serve) => {
+                assert!(carriers(iface) == 1, "no row carries a synthetic global");
+                assert!(
+                    !matches!(serve, Serve::Paired { .. }),
+                    "a synthetic global has no host global to pair"
+                );
+            }
+            Policy::Hide => {}
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < SINGLETONS.len() {
+        let singleton = SINGLETONS[i];
+        // Names every variant, so a new one does not build until it is
+        // listed in `SINGLETONS`, and so checked here.
+        match singleton {
+            Singleton::Dmabuf
+            | Singleton::KeyboardExtension
+            | Singleton::AuraShell
+            | Singleton::Shm
+            | Singleton::TextInputManager
+            | Singleton::TextInputExtension => {}
+        }
+        assert!(binders(singleton) == 1, "a singleton has no row, or two");
+        i += 1;
+    }
+}
+const _: () = check_table();
+
+/// Every singleton, which [`check_table`] holds to one row each.
+const SINGLETONS: [Singleton; 6] = [
+    Singleton::Dmabuf,
+    Singleton::KeyboardExtension,
+    Singleton::AuraShell,
+    Singleton::Shm,
+    Singleton::TextInputManager,
+    Singleton::TextInputExtension,
+];
+
+/// How many rows of [`policy`] bind `singleton`.
+const fn binders(singleton: Singleton) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i < Iface::ALL.len() {
+        if let Policy::Bind(internal) = policy(Iface::ALL[i]) {
+            if internal.singleton as usize == singleton as usize {
+                count += 1;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+/// How many rows of [`policy`] carry a global of `iface`.
+const fn carriers(iface: Iface) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i < Iface::ALL.len() {
+        if let Policy::Bind(internal) = policy(Iface::ALL[i]) {
+            if internal.carries.iface() as usize == iface as usize {
+                count += 1;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+/// The version the guest is offered of a forwarded host global, capped at
+/// `ceiling`, that the host advertises at `host_version`.
+///
+/// Some interfaces have a lower ceiling than the vendored XML, as in
+/// ChromiumOS Sommelier's client-facing globals. The generated code can
+/// decode newer XML messages, but that does not mean the proxy implements
+/// the semantics of every newer version. In particular, the C++ proxy caps
+/// `wl_seat` at v5 and `wl_output` at v3; it also exposes the compositor
+/// only up to the version for which its surface damage handling is
+/// implemented. Keep the guest advertisement aligned with those ceilings so
+/// clients do not start using requests/events that this proxy merely
+/// forwards without the required coordinate/focus handling.
+fn offered_version(ceiling: u32, serve: Serve, host_version: u32) -> u32 {
+    match serve {
+        // A host that has every version the proxy binds for the guest is
+        // offered the ceiling, since the proxy implements the versions
+        // above: ChromiumOS implements wl_surface.damage_buffer in terms of
+        // the legacy damage request, so a v3 host compositor is offered as
+        // v4.
+        Serve::Paired { host_ceiling, .. } if host_version >= host_ceiling => ceiling,
+        Serve::Paired { .. } | Serve::Local | Serve::Shm | Serve::GtkShell => {
+            host_version.min(ceiling)
+        }
+    }
+}
+
+/// Whether the proxy binds a host linux-dmabuf: with GPU access, for the
+/// guest's, or with a VirtWL channel that imports dma-bufs, to learn the
+/// formats the guest's `wl_shm` may offer.
+fn dmabuf_binds(ctx: &Context) -> bool {
+    let virtwl_supports_dmabuf = ctx
+        .virtwayland_channel()
+        .is_some_and(|channel| channel.supports_dmabuf());
+    should_bind_internal_dmabuf(ctx.settings().gpu_accel, virtwl_supports_dmabuf)
 }
 
 fn should_bind_internal_dmabuf(gpu_accel: bool, virtwl_supports_dmabuf: bool) -> bool {
@@ -461,7 +711,7 @@ fn queue_synthetic_global_for_registry(
     ctx: &mut Context,
     registry_host_id: HostId,
     name: u32,
-    interface: &str,
+    interface: Iface,
     version: u32,
 ) -> bool {
     // A host registry is paired with its guest registry until the guest
@@ -474,7 +724,7 @@ fn queue_synthetic_global_for_registry(
         return false;
     };
     ctx.send_guest_or_drop(
-        wl_registry::evt::global(registry_guest_id, name, interface, version),
+        wl_registry::evt::global(registry_guest_id, name, interface.name(), version),
         format_args!("synthetic global {name}:{interface}"),
     )
 }
@@ -497,8 +747,8 @@ fn defer_synthetic_dmabuf_global(
 }
 
 /// Whether the proxy may withhold a guest linux-dmabuf global until the
-/// capabilities of its binding arrive ([`dmabuf_global`]): with GPU access,
-/// when it synthesizes the global's feedback.
+/// capabilities of its binding arrive ([`offer_dmabuf_global`]): with GPU
+/// access, when it synthesizes the global's feedback.
 fn dmabuf_globals_may_wait(ctx: &Context) -> bool {
     ctx.settings().gpu_accel
         && crate::handler::linux_dmabuf::can_synthesize_feedback(
@@ -565,7 +815,7 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, name: u32) {
         ctx.globals.host_globals.insert(
             pending.name,
             HostGlobal {
-                interface: zwp_linux_dmabuf_v1::NAME.to_string(),
+                interface: Iface::ZwpLinuxDmabufV1,
                 version: pending.version,
             },
         );
@@ -573,7 +823,7 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, name: u32) {
             ctx,
             pending.registry_host_id,
             pending.name,
-            zwp_linux_dmabuf_v1::NAME,
+            Iface::ZwpLinuxDmabufV1,
             pending.version,
         );
         set_registry_global_visibility(ctx, pending.registry_host_id, pending.name, visible);
@@ -619,6 +869,27 @@ fn bind_internally(
 }
 
 impl Singleton {
+    /// The interface of the global it binds, and how: the one row of
+    /// [`policy`] that binds it, which [`check_table`] holds to exist and
+    /// be the only one.
+    const fn row(self) -> (Iface, Internal) {
+        let mut i = 0;
+        while i < Iface::ALL.len() {
+            if let Policy::Bind(internal) = policy(Iface::ALL[i]) {
+                if internal.singleton as usize == self as usize {
+                    return (Iface::ALL[i], internal);
+                }
+            }
+            i += 1;
+        }
+        panic!("a singleton has no row in the table of globals")
+    }
+
+    /// The interface of the global it binds.
+    pub(crate) const fn interface(self) -> Iface {
+        self.row().0
+    }
+
     /// Bind host global `name`, which the host advertises at `version`,
     /// through host registry `registry_host_id`, as the one binding.
     ///
@@ -632,91 +903,37 @@ impl Singleton {
         name: u32,
         version: u32,
     ) -> Result<(), Action> {
-        let interface = self.interface();
+        let (interface, internal) = self.row();
+        let bound_version = version.min(internal.ceiling);
+        // The binding is the proxy's own: no guest object pairs with it.
+        let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
+        ctx.globals
+            .singletons
+            .bind(self, binding(host_id, name, bound_version));
+        bind_internally(
+            ctx,
+            registry_host_id,
+            name,
+            interface,
+            bound_version,
+            host_id,
+        )?;
+        log::debug!("Bound {interface} v{bound_version} internally (host_id={host_id})");
         match self {
             Self::Dmabuf => {
-                // Bind at v3 when available so the proxy can collect legacy
-                // format/modifier pairs and synthesize the v4 feedback
-                // object. v2 still keeps create_immed available on older
-                // hosts. The host compositor sends format/modifier events to
-                // the dmabuf factory object after we bind it.
-                let bound_version = version.min(LINUX_DMABUF_CAPABILITY_VERSION);
-                let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-                ctx.globals
-                    .singletons
-                    .bind(self, binding(host_id, name, bound_version));
+                // The host sends the binding its formats and modifiers, from
+                // which a v3 or newer host's feedback is synthesized.
                 crate::handler::linux_dmabuf::start_capability_discovery(ctx, name);
-                bind_internally(
-                    ctx,
-                    registry_host_id,
-                    name,
-                    interface,
-                    bound_version,
-                    host_id,
-                )?;
                 if crate::handler::linux_dmabuf::can_synthesize_feedback(ctx, version) {
                     queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { global: name });
                 }
             }
-            Self::KeyboardExtension => {
-                // A ChromeOS protocol that enables the ack-key mechanism for
-                // controlling host accelerator processing. Version 2
-                // additionally reports physical keys consumed by IME via
-                // peek_key. The factory's ID is also the sender of
-                // get_extended_keyboard requests.
-                let bound_version = keyboard_extension_version(version);
-                let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-                ctx.globals
-                    .singletons
-                    .bind(self, binding(host_id, name, bound_version));
-                bind_internally(
-                    ctx,
-                    registry_host_id,
-                    name,
-                    interface,
-                    bound_version,
-                    host_id,
-                )?;
-                log::debug!("Bound {interface} v{bound_version} (host_id={host_id})");
-            }
-            Self::AuraShell => {
-                // For ChromeOS shelf integration: the proxy creates
-                // zaura_surface objects from it to set application IDs and
-                // GTK startup IDs.
-                let bound_version = version.min(ZAURA_SHELL_MAX_VERSION);
-                let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-                ctx.globals
-                    .singletons
-                    .bind(self, binding(host_id, name, bound_version));
-                bind_internally(
-                    ctx,
-                    registry_host_id,
-                    name,
-                    interface,
-                    bound_version,
-                    host_id,
-                )?;
-                // Placement retries what a guest set up before the shell.
-                crate::handler::window_placement::shell_bound(ctx, bound_version);
-                log::debug!("Bound {interface} internally (host_id={host_id})");
-            }
-            Self::Shm => {
-                // wl_shm is emulated: on_bind drops the guest request and
-                // sends synthetic format events. The host's format events
-                // reach this binding, which records them (`shm::pool`).
-                let host_id = ctx.shadow_table.create_host_only(interface, WL_SHM_VERSION);
-                ctx.globals
-                    .singletons
-                    .bind(self, binding(host_id, name, WL_SHM_VERSION));
-                bind_internally(
-                    ctx,
-                    registry_host_id,
-                    name,
-                    interface,
-                    WL_SHM_VERSION,
-                    host_id,
-                )?;
-            }
+            // Placement retries what a guest set up before the shell.
+            Self::AuraShell => crate::handler::window_placement::shell_bound(ctx, bound_version),
+            Self::KeyboardExtension
+            | Self::Shm
+            | Self::TextInputManager
+            | Self::TextInputExtension => {}
         }
         Ok(())
     }
@@ -734,13 +951,9 @@ fn binding(host: HostId, name: u32, version: u32) -> Binding {
 /// Record host global `name` of `singleton`, which the host advertises at
 /// `version`, as a candidate binding.
 fn add_candidate(ctx: &mut Context, singleton: Singleton, name: u32, version: u32) {
-    ctx.globals.singleton_candidates.insert(
-        name,
-        HostGlobal {
-            interface: singleton.interface().name().to_string(),
-            version,
-        },
-    );
+    ctx.globals
+        .singleton_candidates
+        .insert(name, (singleton, version));
 }
 
 /// Bind `singleton` if the proxy has no binding of it: the lowest candidate
@@ -758,13 +971,13 @@ fn ensure_bound(ctx: &mut Context, singleton: Singleton) -> Result<(), Action> {
         .globals
         .singleton_candidates
         .iter()
-        .filter(|(_, global)| global.interface == singleton.interface().name())
-        .filter_map(|(&name, global)| {
+        .filter(|(_, &(candidate, _))| candidate == singleton)
+        .filter_map(|(&name, &(_, version))| {
             if global_removal_seen(ctx, name) {
                 return None;
             }
             let registry_host_id = ctx.globals.listing(name)?;
-            Some((name, registry_host_id, global.version))
+            Some((name, registry_host_id, version))
         })
         .min();
     match candidate {
@@ -776,9 +989,13 @@ fn ensure_bound(ctx: &mut Context, singleton: Singleton) -> Result<(), Action> {
 }
 
 /// [`ensure_bound`] for every singleton, after a binding may have retired.
+/// Only the retired binding can have a candidate to bind, so the order
+/// they are visited in does not matter.
 fn ensure_all_bound(ctx: &mut Context) -> Result<(), Action> {
-    for singleton in Singleton::ALL {
-        ensure_bound(ctx, singleton)?;
+    for iface in Iface::ALL {
+        if let Policy::Bind(internal) = policy(iface) {
+            ensure_bound(ctx, internal.singleton)?;
+        }
     }
     Ok(())
 }
@@ -788,16 +1005,19 @@ fn ensure_all_bound(ctx: &mut Context) -> Result<(), Action> {
 /// ChromiumOS destroys the internally bound proxy when its host registry
 /// global disappears, and so does the proxy, which binds a replacement
 /// global, if one is advertised, under a name of its own.
-///
-/// The text-input managers have no destructor, and text inputs still
-/// create children from them after their globals go, so they are never
-/// reset or rebound (see `text_input_manager_global`).
 fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
-    let Some((singleton, binding)) = ctx.globals.singletons.release_named(name) else {
+    let Some((singleton, binding)) = ctx.globals.singletons.bound_from(name) else {
         return;
     };
+    // Each arm releases the binding first: what follows asks whether the
+    // proxy still holds it.
     match singleton {
+        // The text-input managers have no destructor, and text inputs still
+        // create children from them after their globals go, so the proxy
+        // keeps them for the connection, and never binds another.
+        Singleton::TextInputManager | Singleton::TextInputExtension => {}
         Singleton::Dmabuf => {
+            ctx.globals.singletons.release(singleton);
             // A registry global removal invalidates the name, not objects
             // already bound from it. Explicitly destroy our hidden binding
             // so the host does not retain a proxy until connection
@@ -808,10 +1028,12 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
             crate::handler::linux_dmabuf::maybe_reclaim_capabilities(ctx, name);
         }
         Singleton::Shm => {
+            ctx.globals.singletons.release(singleton);
             ctx.shadow_table.retire_host(binding.host);
             clear_host_shm_wl_formats(ctx);
         }
         Singleton::KeyboardExtension => {
+            ctx.globals.singletons.release(singleton);
             // `global_remove` invalidates only the manager global name. It
             // does not destroy `zcr_extended_keyboard_v1` children that
             // were already created with get_extended_keyboard; those
@@ -822,6 +1044,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
             ctx.shadow_table.retire_host(binding.host);
         }
         Singleton::AuraShell => {
+            ctx.globals.singletons.release(singleton);
             // `global_remove` invalidates only the advertised global name.
             // Already created `zaura_surface` children have their own
             // protocol lifetime and remain usable until their owning
@@ -845,16 +1068,12 @@ fn advertise_synthetic_global(
     ctx: &mut Context,
     registry: HostId,
     name: u32,
-    interface: &str,
+    interface: Iface,
     version: u32,
 ) {
-    ctx.globals.host_globals.insert(
-        name,
-        HostGlobal {
-            interface: interface.to_string(),
-            version,
-        },
-    );
+    ctx.globals
+        .host_globals
+        .insert(name, HostGlobal { interface, version });
     let visible = queue_synthetic_global_for_registry(ctx, registry, name, interface, version);
     record_registry_global_visibility(ctx, registry, name, visible);
 }
@@ -889,10 +1108,10 @@ fn set_registry_global_visibility(
 }
 
 /// How the proxy serves an admitted guest bind.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum BindAdmission {
-    /// Bind the host global.
-    Live,
+    /// Serve it as the interface's row says.
+    Live(Serve),
     /// The registry advertised the global and then removed it, and the
     /// bind crossed the removal on the wire. libwayland-server makes this
     /// race harmless, so the proxy creates an inert guest object instead
@@ -913,7 +1132,7 @@ fn admit_guest_bind(
     ctx: &Context,
     registry_host_id: HostId,
     name: u32,
-    interface: &str,
+    interface: Iface,
     requested_version: u32,
 ) -> Option<BindAdmission> {
     // Once one registry has observed global_remove, a bind through it never
@@ -943,14 +1162,17 @@ fn admit_guest_bind(
         }
     }
 
-    // The v3 manager is a synthetic global backed by the host v1 manager.
-    // on_global records the synthetic interface under the same numeric name.
-    // Checking the advertised version here also prevents a client from
-    // forwarding a bind for a protocol version that the proxy did not expose.
+    // A synthetic global is recorded under the name of the host global
+    // that carries it. Checking the advertised version here also prevents
+    // a client from forwarding a bind for a protocol version that the
+    // proxy did not expose.
     let version_is_advertised = global.interface == interface
         && requested_version > 0
         && requested_version <= global.version;
-    version_is_advertised.then_some(BindAdmission::Live)
+    if !version_is_advertised {
+        return None;
+    }
+    Some(BindAdmission::Live(policy(interface).serve()?))
 }
 
 /// Record the sending registry's advertisement of host global `name`.
@@ -999,22 +1221,56 @@ fn accept_global(
     Ok(())
 }
 
-/// The action for a host global event the proxy does not forward: `Drop`,
-/// unless binding a singleton for it ended the session.
-fn dropped(bound: Result<(), Action>) -> Action {
-    bound.err().unwrap_or(Action::Drop)
+/// A host global the proxy binds for its own use, as `internal` says: the
+/// guest is offered what it carries under its name, and it is a candidate
+/// for the proxy's binding. One the proxy does not use is hidden.
+fn internal_global(
+    ctx: &mut Context,
+    registry: HostId,
+    name: u32,
+    version: u32,
+    internal: Internal,
+) -> Action {
+    if !(internal.binds)(ctx, version) {
+        log::debug!(
+            "Ignoring {} v{version}, which the proxy does not use",
+            internal.singleton.interface()
+        );
+        hide_global(ctx, registry, name);
+        return Action::Drop;
+    }
+    match internal.carries {
+        Carries::Global {
+            iface,
+            version: carried_version,
+            offered,
+        } if offered(ctx) => {
+            advertise_synthetic_global(ctx, registry, name, iface, carried_version)
+        }
+        Carries::Global { .. } => hide_global(ctx, registry, name),
+        Carries::Dmabuf => offer_dmabuf_global(ctx, registry, name, version),
+    }
+    // The host compositor sends the same global list to every registry,
+    // and the proxy has one binding per connection.
+    add_candidate(ctx, internal.singleton, name, version);
+    // A failed bind ends the session; the host's own advertisement is never
+    // forwarded.
+    ensure_bound(ctx, internal.singleton)
+        .err()
+        .unwrap_or(Action::Drop)
 }
 
-/// A host `zwp_linux_dmabuf_v1` global: a candidate for the proxy's own
-/// binding and, with GPU access, the guest's dma-buf global.
-fn dmabuf_global(ctx: &mut Context, registry: HostId, name: u32, version: u32) -> Action {
-    let interface = zwp_linux_dmabuf_v1::NAME;
-    let virtwl_supports_dmabuf = ctx
-        .virtwayland_channel()
-        .is_some_and(|channel| channel.supports_dmabuf());
-    if !should_bind_internal_dmabuf(ctx.settings().gpu_accel, virtwl_supports_dmabuf) {
-        record_registry_global_visibility(ctx, registry, name, false);
-        return Action::Drop;
+/// Offer the guest the linux-dmabuf global the host advertises as `name`
+/// at `version`, which the proxy binds: with GPU access, at once or once
+/// the capabilities of its binding arrive, and hidden otherwise.
+fn offer_dmabuf_global(ctx: &mut Context, registry: HostId, name: u32, version: u32) {
+    if !ctx.settings().gpu_accel {
+        // Virtwl uses this object only to learn the formats that can
+        // be advertised by the synthetic wl_shm global. Keep the
+        // linux-dmabuf global hidden from the guest, matching
+        // ChromiumOS's separate --enable-linux-dmabuf switch.
+        hide_global(ctx, registry, name);
+        return;
     }
     // A v3 host still has enough legacy format/modifier information
     // for our synthetic v4 feedback object. Advertise v4 to the
@@ -1032,189 +1288,39 @@ fn dmabuf_global(ctx: &mut Context, registry: HostId, name: u32, version: u32) -
         }
         version.min(LINUX_DMABUF_CAPABILITY_VERSION)
     };
-    add_candidate(ctx, Singleton::Dmabuf, name, version);
-    if ctx.settings().gpu_accel {
-        // One host dmabuf object is shared for capability discovery,
-        // and a guest global for it waits until the binding of its
-        // own name has the capabilities.
-        let capability_ready = crate::handler::linux_dmabuf::capabilities_ready(ctx, name);
-        if can_synthesize_feedback && !capability_ready {
-            defer_synthetic_dmabuf_global(ctx, registry, name, client_version);
-        } else if !can_synthesize_feedback
-            || crate::handler::linux_dmabuf::has_synthetic_feedback_formats(ctx, name)
-        {
-            advertise_synthetic_global(ctx, registry, name, interface, client_version);
-        } else {
-            record_registry_global_visibility(ctx, registry, name, false);
-        }
-    } else {
-        // Virtwl uses this object only to learn the formats that can
-        // be advertised by the synthetic wl_shm global. Keep the
-        // linux-dmabuf global hidden from the guest, matching
-        // ChromiumOS's separate --enable-linux-dmabuf switch.
-        hide_global(ctx, registry, name);
-    }
-    // The host's own advertisement is uncapped, so it is never forwarded.
-    dropped(ensure_bound(ctx, Singleton::Dmabuf))
-}
-
-/// A host `zwp_text_input_manager_v1` global: the guest is offered a
-/// synthetic `zwp_text_input_manager_v3` under its name, and the proxy
-/// binds the first one for itself.
-fn text_input_manager_global(
-    ctx: &mut Context,
-    registry: HostId,
-    name: u32,
-    version: u32,
-) -> Action {
-    advertise_synthetic_global(
-        ctx,
-        registry,
-        name,
-        zwp_text_input_manager_v3::NAME,
-        zwp_text_input_manager_v3::VERSION,
-    );
-    if ctx.globals.text_input_manager.is_some() {
-        return Action::Drop;
-    }
-    let interface = Iface::ZwpTextInputManagerV1;
-    let bound_version = version.min(TEXT_INPUT_MANAGER_VERSION);
-    // This object is internal: there is no guest-side pair.
-    let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-    ctx.globals.text_input_manager = Some(host_id);
-    dropped(bind_internally(
-        ctx,
-        registry,
-        name,
-        interface,
-        bound_version,
-        host_id,
-    ))
-}
-
-/// A host `zcr_text_input_extension_v1` global, hidden from the guest; the
-/// proxy binds the first one for itself.
-///
-/// The guest is offered the proxy's `wp_security_context_manager_v1` under
-/// its name, unless the connection is offered none
-/// (`handler::security_context`): the manager needs no host global of its
-/// own, and every Exo has this one, which the guest never sees.
-fn text_input_extension_global(
-    ctx: &mut Context,
-    registry: HostId,
-    name: u32,
-    version: u32,
-) -> Action {
-    let interface = Iface::ZcrTextInputExtensionV1;
-    if ctx.sandboxing.offers_manager() {
-        advertise_synthetic_global(
-            ctx,
-            registry,
-            name,
-            wp_security_context_manager_v1::NAME,
-            wp_security_context_manager_v1::VERSION,
-        );
+    // One host dmabuf object is shared for capability discovery, and a
+    // guest global for it waits until the binding of its own name has the
+    // capabilities.
+    let capability_ready = crate::handler::linux_dmabuf::capabilities_ready(ctx, name);
+    if can_synthesize_feedback && !capability_ready {
+        defer_synthetic_dmabuf_global(ctx, registry, name, client_version);
+    } else if !can_synthesize_feedback
+        || crate::handler::linux_dmabuf::has_synthetic_feedback_formats(ctx, name)
+    {
+        advertise_synthetic_global(ctx, registry, name, Iface::ZwpLinuxDmabufV1, client_version);
     } else {
         hide_global(ctx, registry, name);
     }
-    if ctx.globals.text_input_extension.is_some() {
-        return Action::Drop;
-    }
-    let bound_version = version.min(TEXT_INPUT_EXTENSION_VERSION);
-    let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-    ctx.globals.text_input_extension = Some(host_id);
-    dropped(bind_internally(
-        ctx,
-        registry,
-        name,
-        interface,
-        bound_version,
-        host_id,
-    ))
 }
 
-/// A host `zcr_keyboard_extension_v1` global, hidden from the guest and a
-/// candidate for the proxy's own binding.
-///
-/// With data-control on, the guest is offered the proxy's
-/// `ext_data_control_manager_v1` under its name: the manager needs no host
-/// global of its own (`handler::data_control`), and every Exo has this
-/// one, which the guest never sees, so its removal stays paired.
-fn keyboard_extension_global(
-    ctx: &mut Context,
-    registry: HostId,
-    name: u32,
-    version: u32,
-) -> Action {
-    if ctx.data_control.offers_global() {
-        advertise_synthetic_global(
-            ctx,
-            registry,
-            name,
-            ext_data_control_manager_v1::NAME,
-            ext_data_control_manager_v1::VERSION,
-        );
-    } else {
-        hide_global(ctx, registry, name);
-    }
-    add_candidate(ctx, Singleton::KeyboardExtension, name, version);
-    dropped(ensure_bound(ctx, Singleton::KeyboardExtension))
-}
-
-/// A host `zaura_shell` global: the guest is offered `gtk_shell1` under
-/// its name, and it is a candidate for the proxy's own binding. One older
-/// than [`ZAURA_SHELL_MIN_VERSION`] is ignored.
-fn aura_shell_global(ctx: &mut Context, registry: HostId, name: u32, version: u32) -> Action {
-    if version < ZAURA_SHELL_MIN_VERSION {
-        log::debug!(
-            "Ignoring zaura_shell v{}; minimum supported version is {}",
-            version,
-            ZAURA_SHELL_MIN_VERSION
-        );
-        record_registry_global_visibility(ctx, registry, name, false);
-        return Action::Drop;
-    }
-    // The host-specific global is replaced at the guest boundary
-    // with gtk_shell1, using the same numeric registry name so its
-    // global_remove lifecycle remains paired.
-    advertise_synthetic_global(ctx, registry, name, gtk_shell1::NAME, gtk_shell1::VERSION);
-    // The host compositor sends the same global list to every
-    // wl_registry object, and the proxy has one internal aura shell
-    // binding per connection.
-    add_candidate(ctx, Singleton::AuraShell, name, version);
-    dropped(ensure_bound(ctx, Singleton::AuraShell))
-}
-
-/// A host `wl_shm` global: the guest is offered the proxy's own `wl_shm`
-/// under its name, and it is a candidate for the proxy's own binding.
-fn shm_global(ctx: &mut Context, registry: HostId, name: u32, version: u32) -> Action {
-    // Advertise the capped version explicitly instead of forwarding
-    // a host v2 global: otherwise clients bind v2 and are rejected
-    // by `admit_guest_bind`.
-    advertise_synthetic_global(ctx, registry, name, wl_shm::NAME, WL_SHM_VERSION);
-    add_candidate(ctx, Singleton::Shm, name, version);
-    dropped(ensure_bound(ctx, Singleton::Shm))
-}
-
-/// A host global of `iface` the proxy forwards, at the version it offers
+/// A host global of `iface` the proxy forwards, at `advertised_version`
 /// ([`offered_version`]).
 fn forwarded_global(
     ctx: &mut Context,
     registry: HostId,
     name: u32,
     iface: Iface,
-    ceiling: u32,
     version: u32,
+    advertised_version: u32,
 ) -> Action {
-    let advertised_version = offered_version(iface, ceiling, version);
     if advertised_version != version {
-        advertise_synthetic_global(ctx, registry, name, iface.name(), advertised_version);
+        advertise_synthetic_global(ctx, registry, name, iface, advertised_version);
         return Action::Drop;
     }
     ctx.globals.host_globals.insert(
         name,
         HostGlobal {
-            interface: iface.name().to_string(),
+            interface: iface,
             version: advertised_version,
         },
     );
@@ -1227,7 +1333,7 @@ fn hidden_global(ctx: &mut Context, registry: HostId, name: u32, interface: &str
     if interface.contains(char::REPLACEMENT_CHARACTER) {
         log::debug!("Hiding global {name}, whose interface name {interface:?} is not UTF-8");
     }
-    record_registry_global_visibility(ctx, registry, name, false);
+    hide_global(ctx, registry, name);
     Action::Drop
 }
 
@@ -1250,26 +1356,18 @@ impl wl_registry::WlRegistryHandler for Handlers {
             return hidden_global(ctx, registry, name, interface);
         };
         match policy(iface) {
-            Policy::Forward { ceiling, enabled } if enabled(ctx.settings()) => {
-                forwarded_global(ctx, registry, name, iface, ceiling, version)
+            Policy::Forward {
+                ceiling,
+                enabled,
+                serve,
+            } if enabled(ctx.settings()) => {
+                let offered = offered_version(ceiling, serve, version);
+                forwarded_global(ctx, registry, name, iface, version, offered)
             }
-            Policy::Forward { .. } | Policy::Hide | Policy::Synthetic => {
+            Policy::Forward { .. } | Policy::Synthetic(_) | Policy::Hide => {
                 hidden_global(ctx, registry, name, interface)
             }
-            Policy::BindInternal(Internal::Singleton(singleton)) => match singleton {
-                Singleton::Dmabuf => dmabuf_global(ctx, registry, name, version),
-                Singleton::KeyboardExtension => {
-                    keyboard_extension_global(ctx, registry, name, version)
-                }
-                Singleton::AuraShell => aura_shell_global(ctx, registry, name, version),
-                Singleton::Shm => shm_global(ctx, registry, name, version),
-            },
-            Policy::BindInternal(Internal::TextInputManager) => {
-                text_input_manager_global(ctx, registry, name, version)
-            }
-            Policy::BindInternal(Internal::TextInputExtension) => {
-                text_input_extension_global(ctx, registry, name, version)
-            }
+            Policy::Bind(internal) => internal_global(ctx, registry, name, version, internal),
         }
     }
 
@@ -1332,8 +1430,7 @@ impl wl_registry::WlRegistryHandler for Handlers {
     /// generated code forwards nothing for it
     /// (`wayland_codegen::generator::HAND_WRITTEN_REQUESTS`).
     fn on_bind(ctx: &mut Context, sender: RequestSender, name: u32, id: &(String, u32, GuestId)) {
-        // id is (interface, version, new_id)
-        let (requested, version, guest_new_id) = id;
+        let (requested, version, guest_new_id) = (&id.0, id.1, id.2);
         // The proxy implements no wl_registry itself.
         let Some(registry_host_id) = sender.host_id() else {
             let _ = ctx.fail(format_args!(
@@ -1349,11 +1446,11 @@ impl wl_registry::WlRegistryHandler for Handlers {
         let admission = Iface::from_name(requested).and_then(|interface| {
             Some((
                 interface,
-                admit_guest_bind(ctx, registry_host_id, name, interface.name(), *version)?,
+                admit_guest_bind(ctx, registry_host_id, name, interface, version)?,
             ))
         });
-        let interface = match admission {
-            Some((interface, BindAdmission::Live)) => interface,
+        let (interface, serve) = match admission {
+            Some((interface, BindAdmission::Live(serve))) => (interface, serve),
             Some((interface, BindAdmission::Inert)) => {
                 log::debug!(
                     "Bind of removed global {}:{} v{} crossed its removal; guest object {} is inert",
@@ -1365,7 +1462,7 @@ impl wl_registry::WlRegistryHandler for Handlers {
                 // A local object: it never reaches the host, and its
                 // destructor completes in the proxy.
                 ctx.shadow_table
-                    .create_local(*guest_new_id, interface, *version);
+                    .create_local(guest_new_id, interface, version);
                 return;
             }
             None => {
@@ -1385,96 +1482,105 @@ impl wl_registry::WlRegistryHandler for Handlers {
             }
         };
 
-        if interface == Iface::WlShm {
-            // Do NOT forward wl_shm to host. We emulate it. Advertise
-            // mandatory formats immediately and optional formats only after
-            // the host wl_shm/dmabuf capability event has arrived. This
-            // mirrors ChromiumOS Sommelier and prevents a guest from
-            // selecting a format that the host cannot import.
-            register_guest_shm(ctx, *guest_new_id, *version, name);
+        match serve {
+            Serve::Paired { host_ceiling, then } => {
+                let host_version = version.min(host_ceiling);
+                let bound = bind_for_guest(
+                    ctx,
+                    registry_host_id,
+                    name,
+                    interface,
+                    (version, host_version),
+                    guest_new_id,
+                );
+                if let (Some(host_new_id), Some(then)) = (bound, then) {
+                    after_bind(ctx, then, name, guest_new_id, host_new_id, host_version);
+                }
+            }
+            Serve::Local => {
+                ctx.shadow_table
+                    .create_local(guest_new_id, interface, version);
+            }
+            // Mandatory formats are sent at once, optional ones only once
+            // the host reports it can import them, as ChromiumOS Sommelier
+            // does, so a guest never selects a format the host cannot
+            // import. The host's wl_shm was bound when its global was
+            // advertised.
+            Serve::Shm => register_guest_shm(ctx, guest_new_id, version, name),
+            Serve::GtkShell => {
+                crate::handler::gtk_shell::create_shell(ctx, guest_new_id, version);
+                queue_internal_sync(
+                    ctx,
+                    InternalCallback::GtkShellCapabilities {
+                        gtk_shell: guest_new_id,
+                    },
+                );
+            }
+        }
+    }
+}
 
-            // The host-side wl_shm object was bound when the host global was
-            // observed. Binding the synthetic guest global must not issue a
-            // second host bind or create a guest→host alias.
-            return;
-        } else if interface == Iface::ZwpTextInputManagerV3 {
-            // This is a synthetic guest-only manager. Every guest manager
-            // shares the one internal host v1 manager, so mapping each guest
-            // ID to that host ID would overwrite the previous manager's
-            // reverse mapping and allow one manager's destroy to unregister
-            // the shared host object.
-            ctx.shadow_table
-                .create_local(*guest_new_id, interface, *version);
-            return;
-        } else if interface == Iface::ExtDataControlManagerV1
-            || interface == Iface::WpSecurityContextManagerV1
-        {
-            // The proxy implements data-control and security contexts
-            // itself.
-            ctx.shadow_table
-                .create_local(*guest_new_id, interface, *version);
-            return;
-        } else if interface == Iface::GtkShell1 {
-            crate::handler::gtk_shell::create_shell(ctx, *guest_new_id, *version);
-            queue_internal_sync(
-                ctx,
-                InternalCallback::GtkShellCapabilities {
-                    gtk_shell: *guest_new_id,
-                },
-            );
-            return;
-        }
+/// Bind host global `name` of `interface` through host registry
+/// `registry_host_id` for guest object `guest_new_id`, at the guest's and
+/// the host's version.
+///
+/// # Returns
+///
+/// The host object, or `None` if the bind cannot be encoded, which ends the
+/// session.
+fn bind_for_guest(
+    ctx: &mut Context,
+    registry_host_id: HostId,
+    name: u32,
+    interface: Iface,
+    (guest_version, host_version): (u32, u32),
+    guest_new_id: GuestId,
+) -> Option<HostId> {
+    let host_new_id =
+        ctx.shadow_table
+            .create_paired(guest_new_id, interface, guest_version, host_version);
+    if !queue_internal_bind(
+        ctx,
+        registry_host_id,
+        name,
+        interface,
+        host_version,
+        host_new_id,
+    ) {
+        ctx.abandon(guest_new_id);
+        let _ = ctx.fail(format_args!(
+            "Failed to bind host {interface} for the guest"
+        ));
+        return None;
+    }
+    Some(host_new_id)
+}
 
-        // Every other global is paired with a host binding.
-        //
-        // The guest-facing dmabuf global is synthesized at v4, while the
-        // host object used for params/create may only be v2/v3. Keep the
-        // guest metadata at v4 so feedback requests are accepted locally,
-        // but clamp the paired host object to v3 so registry.bind does not
-        // request an unsupported host version.
-        let host_version = if interface == Iface::ZwpLinuxDmabufV1 {
-            (*version).min(LINUX_DMABUF_CAPABILITY_VERSION)
-        } else if interface == Iface::WlCompositor {
-            // Every guest v4 request missing from host v3 is handled locally.
-            (*version).min(WL_COMPOSITOR_HOST_VERSION)
-        } else {
-            *version
-        };
-
-        // The bind goes to the host through the registry.
-        let host_new_id =
-            ctx.shadow_table
-                .create_paired(*guest_new_id, interface, *version, host_version);
-        let bind_version = host_version;
-        if !queue_internal_bind(
-            ctx,
-            registry_host_id,
-            name,
-            interface,
-            bind_version,
-            host_new_id,
-        ) {
-            ctx.abandon(*guest_new_id);
-            let _ = ctx.fail(format_args!(
-                "Failed to bind host {interface} for the guest"
-            ));
-            return;
+/// Do what `then` says once the guest's bind of global `name`, as
+/// `guest`, paired with host object `host` of `version`, is queued, so that
+/// a failed bind has nothing of it to undo.
+fn after_bind(
+    ctx: &mut Context,
+    then: AfterBind,
+    name: u32,
+    guest: GuestId,
+    host: HostId,
+    version: u32,
+) {
+    match then {
+        AfterBind::Output => {
+            ctx.outputs.bind(host, version, name);
+            // Placement's host-only Aura output metadata (scale factors
+            // and insets).
+            crate::handler::window_placement::output_bound(ctx, host);
         }
-        if interface == Iface::WlOutput {
-            // Register the output only once its bind is queued, so the
-            // failure paths above have no output state to undo.
-            ctx.outputs.bind(host_new_id, bind_version, name);
-            // Placement's host-only Aura output metadata (scale factors and
-            // insets).
-            crate::handler::window_placement::output_bound(ctx, host_new_id);
-        }
-        if interface == Iface::ZwpLinuxDmabufV1 {
-            crate::handler::linux_dmabuf::factory_bound(ctx, *guest_new_id, name);
-        }
-        if interface == Iface::WlSeat {
+        AfterBind::Seat => {
             // A text input whose seat had no host object can activate now.
-            let seat = crate::ime::SeatId(*guest_new_id);
+            let seat = crate::ime::SeatId(guest);
             crate::handler::text_input::ime(ctx, crate::ime::Input::SeatBound(seat));
+        }
+        AfterBind::DmabufFactory => {
+            crate::handler::linux_dmabuf::factory_bound(ctx, guest, name);
         }
     }
 }
@@ -1533,9 +1639,8 @@ impl wl_fixes::WlFixesHandler for Handlers {
 #[cfg(test)]
 mod tests {
     use super::{
-        keyboard_extension_version, offered_version, policy, should_bind_internal_dmabuf, Internal,
-        Policy, KEYBOARD_EXTENSION_VERSION, LINUX_DMABUF_CAPABILITY_VERSION, WL_SHM_VERSION,
-        ZAURA_SHELL_MIN_VERSION,
+        offered_version, policy, should_bind_internal_dmabuf, Policy,
+        LINUX_DMABUF_CAPABILITY_VERSION, WL_SHM_VERSION, ZAURA_SHELL_MIN_VERSION,
     };
     use crate::handler::Handlers;
     use crate::placement_config::PlacementConfig;
@@ -1852,11 +1957,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn keyboard_extension_uses_peek_key_without_exceeding_host_version() {
-        assert_eq!(keyboard_extension_version(1), 1);
-        assert_eq!(keyboard_extension_version(2), 2);
-        assert_eq!(keyboard_extension_version(99), 2);
+    /// The proxy binds a host global it uses itself at the host's version,
+    /// but never newer than its row's ceiling: a keyboard extension newer
+    /// than the XML is bound at its v2, which reports the keys the IME
+    /// consumed (`peek_key`).
+    #[tokio::test]
+    async fn an_internal_binding_is_capped_at_its_ceiling() {
+        let interface = zcr_keyboard_extension_v1::NAME;
+        for (host_version, version) in [(1, 1), (2, 2), (99, 2)] {
+            let mut r = Registries::new().await;
+            r.global(A, 10, interface, host_version).await;
+            let host = r.s.host_received();
+            let [request] = &host[..] else {
+                panic!("the host got {host:?}, not one bind");
+            };
+            let binding = bound(request);
+            assert_eq!(
+                host,
+                [(r.a.host, bind_request(10, interface, version, binding))],
+                "v{host_version}"
+            );
+            assert_eq!(r.s.guest_received(), [], "v{host_version}");
+        }
     }
 
     #[test]
@@ -2811,7 +2933,7 @@ mod tests {
             },
             Case {
                 singleton: Singleton::KeyboardExtension,
-                version: KEYBOARD_EXTENSION_VERSION,
+                version: zcr_keyboard_extension_v1::VERSION,
                 bound_version: 2,
                 advertised: None,
                 destructor: None,
@@ -3154,48 +3276,10 @@ mod tests {
     /// at `host_version`.
     fn offered(interface: &str, host_version: u32) -> u32 {
         let iface = Iface::from_name(interface).expect("a vendored interface");
-        let Policy::Forward { ceiling, .. } = policy(iface) else {
+        let Policy::Forward { ceiling, serve, .. } = policy(iface) else {
             panic!("{interface} is not forwarded");
         };
-        offered_version(iface, ceiling, host_version)
-    }
-
-    /// Every interface has one row in the table of globals (`policy`,
-    /// whose `match` the compiler holds to every interface): a forwarded
-    /// global is never offered above its XML, and each singleton is bound
-    /// from a global of its own interface. The singletons the table binds
-    /// are those `Singleton::ALL` lists, which the proxy binds anew when
-    /// one retires: a variant that is in neither is never constructed,
-    /// which the compiler rejects.
-    #[test]
-    fn every_interface_has_one_global_policy() {
-        for iface in Iface::ALL {
-            match policy(iface) {
-                Policy::Forward { ceiling, .. } => assert!(
-                    ceiling <= iface.version(),
-                    "{iface} is offered up to v{ceiling}, newer than its XML's v{}",
-                    iface.version()
-                ),
-                Policy::BindInternal(Internal::Singleton(singleton)) => {
-                    assert_eq!(singleton.interface(), iface, "{singleton:?}");
-                    assert!(
-                        Singleton::ALL.contains(&singleton),
-                        "{singleton:?} is in Singleton::ALL"
-                    );
-                }
-                Policy::BindInternal(_) | Policy::Hide | Policy::Synthetic => {}
-            }
-        }
-        for singleton in Singleton::ALL {
-            assert!(
-                matches!(
-                    policy(singleton.interface()),
-                    Policy::BindInternal(Internal::Singleton(bound)) if bound == singleton
-                ),
-                "{singleton:?} has its row"
-            );
-        }
-        assert_eq!(offered("wl_seat", u32::MAX), super::WL_SEAT_VERSION);
+        offered_version(ceiling, serve, host_version)
     }
 
     #[tokio::test]

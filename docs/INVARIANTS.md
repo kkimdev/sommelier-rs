@@ -388,10 +388,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `zaura_shell` once per connection for its own use. When the bound name
   retires, it binds the lowest name a registry still lists and no
   registry has seen removed, since a compositor may destroy a global as
-  soon as it removes it.
+  soon as it removes it. The text-input managers, which have no
+  destructor, it binds once and keeps for the connection.
   Tests: `a_singleton_advertised_anew_is_bound_when_the_old_name_retires`,
   `a_singleton_binding_moves_to_the_lowest_live_candidate`,
-  `a_promoted_dmabuf_publishes_its_deferred_guest_global`.
+  `removed_text_input_globals_keep_bound_manager_usable`.
 - **Versions come from the XML or a documented constant.** Since-version
   checks use the generated `*_SINCE` constants. A global's version bound
   is the generated `VERSION` unless a named constant in the one table of
@@ -401,9 +402,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   the proxy cannot decode. A child object takes its parent's version, and
   a version the proxy cannot find fails closed: no child gets a guessed
   one, and a feature gated on it is off.
+  The build checks the table's bounds (`check_table`).
   Tests: `child_objects_inherit_their_manager_versions`,
   `an_extension_of_unknown_version_gives_no_input_method`,
-  `every_interface_has_one_global_policy`.
+  `an_internal_binding_is_capped_at_its_ceiling`.
 
 ## Surfaces, damage and SHM
 
