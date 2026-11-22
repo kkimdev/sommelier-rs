@@ -852,6 +852,7 @@ pub(crate) mod fixture {
     use crate::protocols::xdg_shell::xdg_wm_base;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
+    use crate::test_support::TestConnection;
     use crate::wire::WL_DISPLAY_ID;
 
     /// An output of `mode` at 1x, at `origin_x`.
@@ -930,14 +931,16 @@ pub(crate) mod fixture {
 
         /// [`Self::new`] without an output.
         pub(crate) async fn bare(placement: PlacementConfig) -> Self {
-            let mut s = Session::with_context(Context::with_placement_for_test(placement));
+            let mut s =
+                Session::with_context(TestConnection::default().placement(placement).context());
             let shell = s.aura_shell().await;
             Self::around(s, shell).await
         }
 
         /// [`Self::bare`] whose host has a `zaura_shell` of `shell_version`.
         pub(crate) async fn with_shell(placement: PlacementConfig, shell_version: u32) -> Self {
-            let mut s = Session::with_context(Context::with_placement_for_test(placement));
+            let mut s =
+                Session::with_context(TestConnection::default().placement(placement).context());
             let shell = s.aura_shell_at(shell_version).await;
             Self::around(s, shell).await
         }
@@ -1192,6 +1195,7 @@ mod tests {
     use crate::protocols::xdg_shell::xdg_wm_base;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::Session;
+    use crate::test_support::TestConnection;
     use crate::wire::WL_DISPLAY_ID;
 
     #[test]
@@ -1662,7 +1666,8 @@ mod tests {
             (EVT_INSETS_SINCE, true),
         ] {
             let placement = PlacementConfig::active_for_test(&[]);
-            let mut s = Session::with_context(Context::with_placement_for_test(placement));
+            let mut s =
+                Session::with_context(TestConnection::default().placement(placement).context());
             let shell = s.aura_shell_at(shell_version).await;
             let wm_base = s.bind("xdg_wm_base", xdg_wm_base::VERSION).await;
             let surface = s.surface().await;
@@ -1943,8 +1948,8 @@ mod tests {
         use crate::protocols::xdg_shell::xdg_wm_base;
         use crate::proxy::harness::Session;
 
-        let placement = PlacementConfig::for_test();
-        let mut s = Session::with_context(Context::with_placement_for_test(placement));
+        let placement = PlacementConfig::default();
+        let mut s = Session::with_context(TestConnection::default().placement(placement).context());
         let registry = s.registry().await;
 
         // An output gets no Aura output: the host gets only the bind, and

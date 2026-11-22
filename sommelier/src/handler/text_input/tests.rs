@@ -30,6 +30,7 @@ use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
 use crate::state::{GuestId, HostId, Singleton};
 use crate::test_support::respell;
+use crate::test_support::TestConnection;
 use crate::wire::WL_DISPLAY_ID;
 use crate::wire::{Outgoing, WireId};
 use std::os::fd::OwnedFd;
@@ -4176,7 +4177,7 @@ async fn oversized_host_text_does_not_partially_advance_state() {
 fn child_objects_inherit_their_manager_versions() {
     // Built by hand: the proxy binds no version above the generated
     // one, so no session can tell a child's inherited version from it.
-    let mut ctx = Context::new_for_test(false, false, vec![]);
+    let mut ctx = TestConnection::default().context();
     let (manager, extension) = (HostId::for_test(2), HostId::for_test(3));
     ctx.globals
         .bind_for_test(Singleton::TextInputManager, manager);

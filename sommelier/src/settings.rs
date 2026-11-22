@@ -50,7 +50,7 @@ const TRACE_DIR: &str = "SOMMELIER_TRACE_DIR";
 const DEFAULT_VIRTWL_DEVICE: &str = "/dev/wl0";
 /// The VM name of ChromeOS application IDs when none is set, as in
 /// ChromiumOS Sommelier.
-const DEFAULT_VM_IDENTIFIER: &str = "termina";
+pub(crate) const DEFAULT_VM_IDENTIFIER: &str = "termina";
 
 /// The command line.
 #[derive(Parser, Debug)]
@@ -188,27 +188,6 @@ impl Settings {
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from),
         })
-    }
-
-    /// The settings of a test: no host, no feature switch, no bindings
-    /// file, and every variable at its default. Data-control is off, so a
-    /// test's connection is in no clipboard hub unless it joins one
-    /// (`ConnectionFacts::clipboard`).
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self {
-            socket: PathBuf::from("/nonexistent/wayland-test"),
-            host: HostTransport::Local(PathBuf::from("/nonexistent/host")),
-            gpu_accel: false,
-            xdg_decoration: false,
-            data_control: false,
-            vm_id: DEFAULT_VM_IDENTIFIER.to_string(),
-            drm_device: None,
-            wheel_from_touchpad: WheelFromTouchpad::Off,
-            host_accelerators: HostAccelerators::default(),
-            placement_bindings: None,
-            trace_dir: None,
-        }
     }
 }
 

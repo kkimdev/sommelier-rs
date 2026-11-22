@@ -1109,8 +1109,9 @@ mod tests {
     use crate::protocols::Iface;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{Context, GuestId, HostId, PlaneFenceForTest, SessionEnd};
+    use crate::state::{GuestId, HostId, PlaneFenceForTest, SessionEnd};
     use crate::test_support::wire_peer::SERVER_ID_START;
+    use crate::test_support::TestConnection;
     use crate::test_support::{any_fd_has_identity, decoded, fd_identity, msg_opcode, msg_sender};
     use crate::wire::{Action, MessageHeader, WL_DISPLAY_ID};
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -1130,7 +1131,7 @@ mod tests {
     /// A session with GPU access, whose guest has bound the host's
     /// linux-dmabuf at v3, without synthetic feedback.
     async fn dmabuf_session() -> (Session, Object) {
-        let mut s = Session::with_context(Context::new_for_test(true, false, vec![]));
+        let mut s = Session::with_context(TestConnection::default().gpu_accel().context());
         let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await;
         (s, dmabuf)
     }
@@ -1257,7 +1258,7 @@ mod tests {
     /// reported, on the proxy's own binding, XRGB8888 with the linear
     /// modifier and answered the proxy's sync.
     async fn feedback_session() -> (Session, Factory) {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
+        let mut ctx = TestConnection::default().gpu_accel().context();
         // Stands in for the virtio-gpu render node that synthetic feedback
         // needs, as the process would find it at startup.
         ctx.dmabuf.set_feedback_available_for_test(true);
@@ -1527,7 +1528,7 @@ mod tests {
     /// no test has.
     #[test]
     fn capability_snapshots_remain_isolated_by_global() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = TestConnection::default().context();
         for global in [1, 2] {
             ctx.dmabuf
                 .capabilities
@@ -1709,7 +1710,7 @@ mod tests {
     }
 
     fn a_plane_the_proxy_cannot_duplicate() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = TestConnection::default().context();
         let params = GuestId::for_test(7);
         ctx.shadow_table.insert_paired_for_test(
             params,

@@ -176,6 +176,7 @@ mod tests {
     use crate::protocols::AnyRequest;
     use crate::proxy::harness::{Object, Session, Toplevel};
     use crate::state::Context;
+    use crate::test_support::TestConnection;
     use crate::wire::WL_DISPLAY_ID;
 
     /// The host destructor of guest surface `surface`.
@@ -250,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_app_id_creates_zaura_surface_and_sets_app_id() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
+        let ctx = TestConnection::default().context();
         let (mut s, shell, toplevel) = shelled(ctx).await;
         let host = set_app_id(&mut s, toplevel.toplevel, "my_app").await;
         first_app_id(&host, shell, toplevel, "my_app");
@@ -258,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_app_id_reuses_existing_zaura_surface() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
+        let ctx = TestConnection::default().context();
         let (mut s, shell, toplevel) = shelled(ctx).await;
         // An Aura surface the first app ID created.
         let host = set_app_id(&mut s, toplevel.toplevel, "first").await;
@@ -280,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn set_app_id_keeps_the_guest_os_namespace_with_placement_on() {
         let placement = crate::placement_config::PlacementConfig::active_for_test(&[]);
-        let ctx = Context::with_placement_for_test(placement);
+        let ctx = TestConnection::default().placement(placement).context();
         let (mut s, shell, toplevel) = shelled(ctx).await;
         let app_id = "com.example.Terminal";
         let host = set_app_id(&mut s, toplevel.toplevel, app_id).await;
@@ -301,7 +302,7 @@ mod tests {
     /// Wayland message limit, reaches neither the role nor an Aura surface.
     #[tokio::test]
     async fn oversized_namespaced_app_id_is_dropped_before_wire_encoding() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
+        let ctx = TestConnection::default().context();
         let (mut s, _, toplevel) = shelled(ctx).await;
         let oversized = "x".repeat(4_083);
         assert_eq!(
@@ -338,7 +339,7 @@ mod tests {
 
     #[tokio::test]
     async fn wl_surface_destroy_releases_zaura_surface() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
+        let ctx = TestConnection::default().context();
         let (mut s, shell, toplevel) = shelled(ctx).await;
         let host = set_app_id(&mut s, toplevel.toplevel, "app").await;
         let aura_surface = first_app_id(&host, shell, toplevel, "app");
@@ -358,7 +359,7 @@ mod tests {
     /// later app ID reaches no Aura surface of the destroyed surface.
     #[tokio::test]
     async fn wl_surface_destroy_removes_stale_xdg_surface_links() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
+        let ctx = TestConnection::default().context();
         let (mut s, _, toplevel) = shelled(ctx).await;
         let surface = toplevel.surface;
         s.guest([wl_surface::req::destroy(surface.id)]).await;

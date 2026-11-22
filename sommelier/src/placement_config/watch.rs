@@ -585,6 +585,7 @@ mod tests {
     use super::super::tests::{alt_q, half, one_binding, preset, replace, store_file, swap_link};
     use super::*;
     use crate::test_support::TempDir;
+    use crate::test_support::TestConnection;
     use std::time::Duration;
 
     /// The next reload `watcher` makes of `file`, which the operations
@@ -609,7 +610,7 @@ mod tests {
         let watcher = Watcher::new(&path).expect("watch the bindings file");
         let settings = Settings {
             placement_bindings: Some(path),
-            ..Settings::for_test()
+            ..TestConnection::default().settings
         };
         let config = PlacementConfig::default();
         let mut file = BindingsFile::new(Rc::new(settings), config.clone()).unwrap();
@@ -882,7 +883,7 @@ mod tests {
             .run_until(async {
                 let settings = Settings {
                     placement_bindings: Some(path.clone()),
-                    ..Settings::for_test()
+                    ..TestConnection::default().settings
                 };
                 let config = load_and_watch(&Rc::new(settings));
                 assert_eq!(alt_q(&config), preset("left"), "loaded at once");
@@ -896,6 +897,6 @@ mod tests {
                 .expect("the watch task reloaded the file");
             })
             .await;
-        assert!(!load_and_watch(&Rc::new(Settings::for_test())).is_active());
+        assert!(!load_and_watch(&Rc::new(TestConnection::default().settings)).is_active());
     }
 }

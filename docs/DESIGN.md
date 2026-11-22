@@ -48,7 +48,9 @@ handler intercepts the ones whose meaning changes across the boundary.
   client's process when it connects;
   [pointer scrolling](INVARIANTS.md#pointer-scrolling)) and the
   placement configuration. A `Context` is whole when it is built; no
-  setting of it changes later.
+  setting of it changes later. A test's connection is built the same
+  way, from the real settings and facts, which a test changes by name
+  (`test_support::TestConnection`).
 - `proxy::run` claims the socket through its lock file, then `serve`
   accepts guest clients and gives each a `Client` with its own guest
   connection, host connection and `Context`; it also accepts, on the

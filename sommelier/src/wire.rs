@@ -758,6 +758,7 @@ mod tests {
     use crate::protocols::viewporter::wp_viewport;
     use crate::protocols::wayland::{wl_data_offer, wl_registry, wl_shm, wl_surface};
     use crate::protocols::xdg_shell::xdg_toplevel;
+    use crate::test_support::TestConnection;
     use crate::test_support::{any_fd_has_identity, fd_identity, raw_message, shm_pool_file, Rng};
     use std::collections::VecDeque;
     use std::os::fd::{AsRawFd, OwnedFd};
@@ -767,7 +768,7 @@ mod tests {
     /// goes on.
     #[test]
     fn oversized_host_text_is_dropped_without_panicking() {
-        let mut ctx = crate::state::Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let guest = crate::state::GuestId::for_test(7);
         let offer = wl_data_offer::evt::offer(guest, &"x".repeat(4_084));
         assert!(!ctx.send_guest_or_drop(offer, "an offer"));

@@ -1660,6 +1660,7 @@ mod tests {
     use crate::protocols::{AnyEvent, AnyRequest, Iface};
     use crate::proxy::harness::{Object, Session};
     use crate::state::{Context, GuestId, HostId, Singleton};
+    use crate::test_support::TestConnection;
     use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
 
     /// How many IDs the guest skips before its first object. The proxy
@@ -1703,14 +1704,14 @@ mod tests {
     impl Registries {
         /// A session without GPU access.
         async fn new() -> Self {
-            Self::with_context(Context::new_for_test(false, false, vec![])).await
+            Self::with_context(TestConnection::default().context()).await
         }
 
         /// A session with GPU access, which the proxy needs to offer the
         /// host's linux-dmabuf, and with synthetic dma-buf feedback if
         /// `feedback`.
         async fn gpu(feedback: bool) -> Self {
-            let mut ctx = Context::new_for_test(true, false, vec![]);
+            let mut ctx = TestConnection::default().gpu_accel().context();
             // Stands in for a virtio-gpu render node, which the proxy
             // synthesizes feedback for and a test cannot have.
             ctx.dmabuf.set_feedback_available_for_test(feedback);
@@ -1720,7 +1721,7 @@ mod tests {
         /// A session whose window placement uses Aura.
         async fn aura_placement() -> Self {
             let placement = PlacementConfig::active_for_test(&[]);
-            Self::with_context(Context::with_placement_for_test(placement)).await
+            Self::with_context(TestConnection::default().placement(placement).context()).await
         }
 
         async fn with_context(ctx: Context) -> Self {
@@ -2309,7 +2310,7 @@ mod tests {
     /// hand.
     #[test]
     fn a_bind_through_an_unmapped_registry_fails_closed() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = TestConnection::default().context();
         let (registry, host_registry) = (GuestId::for_test(10), HostId::for_test(100));
         ctx.shadow_table
             .insert_paired_for_test(registry, host_registry, Iface::WlRegistry);
@@ -3398,7 +3399,7 @@ mod tests {
         /// feedback, so it withholds the guest's linux-dmabuf global until
         /// its capabilities arrive.
         fn gpu_session() -> Session {
-            let mut ctx = Context::new_for_test(true, false, vec![]);
+            let mut ctx = TestConnection::default().gpu_accel().context();
             // Stands in for a virtio-gpu render node, which the proxy
             // synthesizes feedback for and a test cannot have.
             ctx.dmabuf.set_feedback_available_for_test(true);
@@ -3561,7 +3562,9 @@ mod tests {
         async fn a_proxy_that_withholds_no_global_forwards_the_sync_at_once() {
             // No GPU access, then GPU access without a render node.
             for gpu_accel in [false, true] {
-                let mut s = Session::with_context(Context::new_for_test(gpu_accel, false, vec![]));
+                let mut connection = TestConnection::default();
+                connection.settings.gpu_accel = gpu_accel;
+                let mut s = Session::with_context(connection.context());
                 let (registry, callback) = (s.new_id(), s.new_id());
                 s.guest([
                     wl_display::req::get_registry(WL_DISPLAY_ID, registry),

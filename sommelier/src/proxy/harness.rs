@@ -38,6 +38,7 @@ use crate::protocols::{AnyEvent, AnyRequest};
 use crate::state::{Context, GuestId, HostId};
 use crate::test_support::counting::Counts;
 use crate::test_support::wire_peer::{self, Message, Role};
+use crate::test_support::TestConnection;
 use crate::wire::{Framing, MessageHeader, Outgoing, WL_DISPLAY_ID};
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -83,7 +84,7 @@ pub(crate) struct Session {
 impl Session {
     /// A session whose proxy has a plain test context.
     pub(crate) fn new() -> Self {
-        let ctx = Context::new_for_test(false, false, Vec::new());
+        let ctx = TestConnection::default().context();
         let (guest, guest_socket) = UnixStream::pair().expect("a guest socket pair");
         let (host, host_socket) = UnixStream::pair().expect("a host socket pair");
         let connection =
@@ -1117,7 +1118,7 @@ impl Session {
         let (_, host_socket) = UnixStream::pair().expect("a host socket pair");
         let connection =
             |socket: UnixStream| WaylandConnection::new(socket.into()).expect("register a socket");
-        let ctx = Context::new_for_test(false, false, Vec::new());
+        let ctx = TestConnection::default().context();
         let stand_in = Client::new(connection(guest_socket), connection(host_socket), ctx);
         let client = std::mem::replace(&mut self.client, stand_in);
         self.client.ended = true;

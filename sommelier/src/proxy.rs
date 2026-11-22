@@ -966,6 +966,7 @@ mod tests {
     use crate::protocols;
     use crate::protocols::{AnyEvent, AnyRequest, Iface};
     use crate::state::{PlaneFenceForTest, PostDispatch};
+    use crate::test_support::TestConnection;
     use crate::test_support::{
         any_fd_has_identity, fd_identity, fds_with_identity, raw_dispatch, respell, shm_pool_file,
         TestFdIdentity,
@@ -1237,7 +1238,7 @@ mod tests {
     /// not get the host's linux-dmabuf, and whose guest has bound it. The
     /// plane of each native buffer stands in for its own sync_file.
     async fn session_with_dmabuf() -> (Session, Object) {
-        let mut s = Session::with_context(Context::new_for_test(true, false, Vec::new()));
+        let mut s = Session::with_context(TestConnection::default().gpu_accel().context());
         let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await;
         s.guest_received();
         s.host_received();
@@ -1300,9 +1301,9 @@ mod tests {
     fn test_shared() -> (Shared, UnboundedReceiver<SandboxListener>) {
         let (sandbox_listeners, sandboxes) = SandboxListeners::new();
         let shared = Shared {
-            settings: Rc::new(Settings::for_test()),
+            settings: Rc::new(TestConnection::default().settings),
             virtgpu: VirtGpuNode::absent_for_test(),
-            placement: PlacementConfig::for_test(),
+            placement: PlacementConfig::default(),
             traces: None,
             clipboard: None,
             sandbox_listeners,
@@ -2613,7 +2614,7 @@ mod tests {
     async fn the_host_batch_that_settles_the_globals_releases_a_waiting_sync() {
         use protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
         use protocols::wayland::{wl_callback, wl_display, wl_registry};
-        let mut ctx = Context::new_for_test(true, false, Vec::new());
+        let mut ctx = TestConnection::default().gpu_accel().context();
         // Stands in for a virtio-gpu render node, which the proxy
         // synthesizes dma-buf feedback for and a test cannot have.
         ctx.dmabuf.set_feedback_available_for_test(true);
@@ -3069,7 +3070,7 @@ mod tests {
     async fn session_with_an_xdg_surface() -> (Session, u32, Object) {
         use protocols::xdg_shell::xdg_wm_base;
         let placement = PlacementConfig::active_for_test(&[]);
-        let mut s = Session::with_context(Context::with_placement_for_test(placement));
+        let mut s = Session::with_context(TestConnection::default().placement(placement).context());
         let shell = s.aura_shell().await;
         let wm_base = s.bind("xdg_wm_base", xdg_wm_base::VERSION).await;
         let surface = s.surface().await;
@@ -3569,7 +3570,7 @@ mod tests {
 
     #[test]
     fn generated_forwarding_rejects_messages_that_exceed_wire_length() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         ctx.shadow_table.insert_paired_with_version_for_test(
             GuestId::for_test(10),
             HostId::for_test(20),

@@ -25,8 +25,9 @@ limitations under the License.
 use super::harness::{Object, Session};
 use crate::handler::shm::{copy_shm_damage, ShmCopyLayout};
 use crate::protocols::wayland::{wl_buffer, wl_pointer, wl_seat, wl_shm, wl_surface};
-use crate::state::{BufferRect, Context, DamageRegion, PlaneFenceForTest};
+use crate::state::{BufferRect, DamageRegion, PlaneFenceForTest};
 use crate::test_support::counting::Counts;
+use crate::test_support::TestConnection;
 use crate::test_support::{host_mapping, shm_pool_file};
 
 /// The frames each test measures, after the warm-up frames that copy each
@@ -190,7 +191,7 @@ fn a_frame_into_padded_host_rows_costs_one_read() {
 #[tokio::test]
 async fn a_native_frame_reads_no_pixels() {
     // Only with GPU access does the guest get the host's linux-dmabuf.
-    let mut s = Session::with_context(Context::new_for_test(true, false, Vec::new()));
+    let mut s = Session::with_context(TestConnection::default().gpu_accel().context());
     let surface = s.surface().await;
     let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await;
     s.guest_received();

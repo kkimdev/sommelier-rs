@@ -18,6 +18,7 @@ limitations under the License.
 //! adapters (`crate::keys::recovery`).
 
 use super::*;
+use crate::test_support::TestConnection;
 use crate::wire::Outgoing;
 
 /// The evdev codes of Tab and Enter.
@@ -248,7 +249,7 @@ async fn keys_held_since_enter_are_ordered_by_their_peeks() {
 /// recovers the focused keyboard's.
 #[tokio::test]
 async fn empty_confirmation_prefers_the_keyboard_focused_on_the_current_surface() {
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    let mut kb = Kb::unfocused(TestConnection::default().context()).await;
     let surface = kb.surface;
     let stale = unentered(kb.s.keyboard_of(kb.seat.id).await);
     let stale = kb.first_enter(stale, surface).await;
@@ -269,7 +270,7 @@ async fn empty_confirmation_prefers_the_keyboard_focused_on_the_current_surface(
 
 #[tokio::test]
 async fn empty_confirmation_never_uses_a_stale_unfocused_keyboard() {
-    let mut kb = Kb::unfocused(Context::new_for_test(false, false, Vec::new())).await;
+    let mut kb = Kb::unfocused(TestConnection::default().context()).await;
     let surface = kb.surface;
     // The keyboard focused the surface once; another of the seat now
     // does.

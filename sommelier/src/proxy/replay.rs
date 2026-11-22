@@ -64,15 +64,14 @@ limitations under the License.
 use super::harness::Session;
 use crate::handler::data_control::ClipboardHub;
 use crate::protocols::wayland::wl_keyboard;
-use crate::settings::Settings;
-use crate::state::{ConnectionFacts, Context};
+use crate::state::Context;
 use crate::test_support::trace::{Record, Tape, Trace};
+use crate::test_support::TestConnection;
 use crate::trace::{Facts, Stream};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::Outgoing;
 use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
-use std::rc::Rc;
 use std::sync::Arc;
 
 /// The size of the memfd that stands in for a descriptor other than a
@@ -196,28 +195,25 @@ fn context(trace: &Trace) -> Result<Context, String> {
             .ok_or_else(|| format!("the trace states no {name}"))
     };
     let vm_id = fact("vm-id")?;
-    let settings = Settings {
-        xdg_decoration: fact("xdg-decoration")? == "yes",
-        vm_id: crate::trace::unescape(vm_id).ok_or_else(|| format!("{vm_id:?} is no VM name"))?,
-        ..Settings::for_test()
-    };
-    let virtwl = match fact("host")? {
+    let mut connection = TestConnection::default();
+    let settings = &mut connection.settings;
+    settings.xdg_decoration = fact("xdg-decoration")? == "yes";
+    settings.vm_id =
+        crate::trace::unescape(vm_id).ok_or_else(|| format!("{vm_id:?} is no VM name"))?;
+    let facts = &mut connection.facts;
+    facts.virtwl = match fact("host")? {
         "socket" => None,
         host => Some(Arc::new(
             VirtWaylandChannel::stand_in_for_test(host == "virtwl-dmabuf")
                 .expect("a stand-in VirtWL channel"),
         )),
     };
-    let facts = ConnectionFacts {
-        virtwl,
-        clipboard: (trace.fact("data-control") == Some("on")).then(ClipboardHub::default),
-        // A security context the replay commits goes nowhere.
-        sandbox_listeners: (trace.fact("security-context") == Some("on"))
-            .then(|| crate::handler::security_context::SandboxListeners::new().0),
-        sandboxed: trace.fact("sandboxed") == Some("yes"),
-        ..ConnectionFacts::for_test()
-    };
-    let ctx = Context::new(Rc::new(settings), facts);
+    facts.clipboard = (trace.fact("data-control") == Some("on")).then(ClipboardHub::default);
+    // A security context the replay commits goes nowhere.
+    facts.sandbox_listeners = (trace.fact("security-context") == Some("on"))
+        .then(|| crate::handler::security_context::SandboxListeners::new().0);
+    facts.sandboxed = trace.fact("sandboxed") == Some("yes");
+    let ctx = connection.context();
     let facts = Facts::of(&ctx).to_string();
     if facts != trace.facts {
         return Err(format!(
@@ -324,11 +320,9 @@ mod tests {
             .build()
             .expect("a runtime");
         runtime.block_on(async {
-            let facts = ConnectionFacts {
-                clipboard: Some(ClipboardHub::default()),
-                ..ConnectionFacts::for_test()
-            };
-            let mut s = Session::with_context(Context::new(Rc::new(Settings::for_test()), facts));
+            let mut connection = TestConnection::default();
+            connection.facts.clipboard = Some(ClipboardHub::default());
+            let mut s = Session::with_context(connection.context());
             s.record(tape.clone());
             let extension = zcr_keyboard_extension_v1::VERSION;
             let manager = s.bind(zcr_keyboard_extension_v1::NAME, extension).await;
@@ -533,12 +527,9 @@ mod tests {
             .expect("a runtime");
         let text = runtime.block_on(async {
             let channel = VirtWaylandChannel::stand_in_for_test(true).unwrap();
-            let facts = ConnectionFacts {
-                virtwl: Some(Arc::new(channel)),
-                ..ConnectionFacts::for_test()
-            };
-            let ctx = Context::new(Rc::new(Settings::for_test()), facts);
-            let mut s = Session::with_context(ctx);
+            let mut connection = TestConnection::default();
+            connection.facts.virtwl = Some(Arc::new(channel));
+            let mut s = Session::with_context(connection.context());
             let recorded = Tape::default();
             s.record(recorded.clone());
             s.advertise("zwp_linux_dmabuf_v1", 3).await;

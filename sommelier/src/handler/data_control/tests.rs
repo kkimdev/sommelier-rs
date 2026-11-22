@@ -13,12 +13,10 @@ use crate::protocols::wayland::{
 };
 use crate::protocols::{AnyEvent, AnyRequest};
 use crate::proxy::harness::{Object, Session};
-use crate::settings::Settings;
-use crate::state::{ConnectionFacts, Context};
+use crate::test_support::TestConnection;
 use crate::test_support::{any_fd_has_identity, fd_identity};
 use crate::wire::WL_DISPLAY_ID;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::rc::Rc;
 
 /// How long a running client may take to carry a selection.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -31,11 +29,9 @@ const TEXT: [&str; 3] = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"
 
 /// A session of a connection in `hub`.
 fn session(hub: &ClipboardHub) -> Session {
-    let facts = ConnectionFacts {
-        clipboard: Some(hub.clone()),
-        ..ConnectionFacts::for_test()
-    };
-    Session::with_context(Context::new(Rc::new(Settings::for_test()), facts))
+    let mut connection = TestConnection::default();
+    connection.facts.clipboard = Some(hub.clone());
+    Session::with_context(connection.context())
 }
 
 /// A focused client: a `wl_data_device` and a keyboard whose focus the

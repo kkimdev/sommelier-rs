@@ -897,43 +897,6 @@ impl Context {
         }
     }
 
-    /// A test's connection: [`Settings::for_test`] with the given switches
-    /// and host accelerators, and [`ConnectionFacts::for_test`].
-    #[cfg(test)]
-    pub fn new_for_test(
-        gpu_accel: bool,
-        xdg_decoration: bool,
-        accelerators: Vec<crate::accelerator::Accelerator>,
-    ) -> Self {
-        let settings = Settings {
-            gpu_accel,
-            xdg_decoration,
-            host_accelerators: accelerators.into(),
-            ..Settings::for_test()
-        };
-        Self::new(Rc::new(settings), ConnectionFacts::for_test())
-    }
-
-    /// A test's connection with the placement configuration `placement`,
-    /// for example `PlacementConfig::active_for_test`.
-    #[cfg(test)]
-    pub(crate) fn with_placement_for_test(placement: PlacementConfig) -> Self {
-        Self::for_test(Settings::for_test(), placement)
-    }
-
-    /// A test's connection with `settings` and the placement
-    /// configuration `placement`.
-    #[cfg(test)]
-    pub(crate) fn for_test(settings: Settings, placement: PlacementConfig) -> Self {
-        Self::new(
-            Rc::new(settings),
-            ConnectionFacts {
-                placement,
-                ..ConnectionFacts::for_test()
-            },
-        )
-    }
-
     /// The process's settings.
     pub(crate) fn settings(&self) -> &Settings {
         &self.settings
@@ -1009,28 +972,12 @@ pub(crate) struct ConnectionFacts {
 }
 
 #[cfg(test)]
-impl ConnectionFacts {
-    /// A test connection's: no VirtWL channel or render node, no wheel
-    /// steps, and placement off.
-    pub(crate) fn for_test() -> Self {
-        Self {
-            virtwl: None,
-            virtgpu: None,
-            wheel: crate::client_kind::WheelClient::No,
-            placement: PlacementConfig::for_test(),
-            clipboard: None,
-            sandbox_listeners: None,
-            sandboxed: false,
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::handler::linux_dmabuf::{ParamsData, PendingParam};
     use crate::protocols::wayland::{wl_keyboard, wl_shm};
     use crate::protocols::Iface;
+    use crate::test_support::TestConnection;
     use std::os::fd::OwnedFd;
 
     fn alt_q() -> crate::accelerator::Accelerator {
@@ -1046,7 +993,9 @@ mod tests {
         let dir = crate::test_support::TempDir::new("context-placement-file");
         let path = dir.path().join("window-placement.toml");
         let (mut file, placement) = crate::placement_config::BindingsFile::loaded_for_test(&path);
-        let before = Context::with_placement_for_test(placement.clone());
+        let before = TestConnection::default()
+            .placement(placement.clone())
+            .context();
         assert!(before.placement().is_none());
 
         dir.write(
@@ -1054,7 +1003,9 @@ mod tests {
             b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
         );
         file.reload();
-        let after = Context::with_placement_for_test(placement.clone());
+        let after = TestConnection::default()
+            .placement(placement.clone())
+            .context();
         assert!(after.placement().is_some());
         let left = crate::window_layout::NormalizedRect::preset("left");
         assert_eq!(after.placement_rect_for(&alt_q()), left);
@@ -1068,14 +1019,16 @@ mod tests {
         file.reload();
         assert_eq!(after.placement_rect_for(&alt_q()), None);
         assert!(after.placement().is_some());
-        assert!(Context::with_placement_for_test(placement)
+        assert!(TestConnection::default()
+            .placement(placement)
+            .context()
             .placement()
             .is_none());
     }
 
     #[test]
     fn retiring_a_destroyed_host_object_requires_a_live_host_only_object() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let host_id = ctx.shadow_table.create_host_only(Iface::WlShmPool, 1);
         ctx.retire_destroyed_host_object(host_id);
         assert!(ctx.shadow_table.is_retired_host(host_id));
@@ -1090,7 +1043,7 @@ mod tests {
     /// `delete_id` for one is ignored: the live object keeps its data.
     #[test]
     fn an_ignored_delete_id_keeps_a_live_objects_data() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         // The host allocates IDs from the server range, which the proxy's
         // allocator never holds, so a `delete_id` for one is ignored.
         let host = HostId::for_test(0xff00_0000);
@@ -1185,7 +1138,7 @@ mod tests {
         let identities = files.each_ref().map(|file| fd_identity(file.as_raw_fd()));
         let [first, second, third, pending] = files.map(OwnedFd::from);
 
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = TestConnection::default().context();
         let (guest, host) = (GuestId::for_test(5), HostId::for_test(5));
         ctx.send_host(wl_shm::req::create_pool(host, host, first, 4));
         for keymap in [second, third] {
@@ -1215,7 +1168,7 @@ mod tests {
 
     #[test]
     fn host_buffer_use_is_an_exclusive_phase() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let buffer = GuestId::for_test(20);
         let host_buffer = HostId::for_test(40);
         ctx.shadow_table
@@ -1264,7 +1217,7 @@ mod tests {
 
     #[test]
     fn same_buffer_reattach_does_not_create_a_detached_use() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let buffer = GuestId::for_test(20);
         let host_buffer = HostId::for_test(40);
         ctx.shadow_table
@@ -1278,7 +1231,7 @@ mod tests {
 
     #[test]
     fn release_clears_the_detached_latch_before_a_new_submit() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let buffer = GuestId::for_test(20);
         let host_buffer = HostId::for_test(40);
         ctx.shadow_table
@@ -1300,7 +1253,7 @@ mod tests {
 
     #[test]
     fn failed_attachment_replacement_mutates_neither_buffer_generation() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         let old = GuestId::for_test(20);
         let old_host = HostId::for_test(40);
         let new = GuestId::for_test(21);
@@ -1446,7 +1399,7 @@ mod tests {
         let next_host = HostId::for_test(41);
         let unregistered_guest = GuestId::for_test(22);
         let unregistered_host = HostId::for_test(42);
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         for (guest, host) in [
             (previous_guest, previous_host),
             (next_guest, next_host),

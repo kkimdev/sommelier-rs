@@ -248,7 +248,8 @@ mod tests {
     use crate::protocols::wayland::{wl_buffer, wl_display, wl_shm, wl_surface};
     use crate::protocols::AnyRequest;
     use crate::proxy::harness::{Object, Session};
-    use crate::state::Context;
+    use crate::test_support::TestConnection;
+
     use crate::test_support::wire_peer::SERVER_ID_START;
     use crate::test_support::{shm_pool_file, BufferKind, BUFFER_KINDS};
     use crate::wire::WL_DISPLAY_ID;
@@ -266,7 +267,7 @@ mod tests {
 
     impl Guest {
         async fn new() -> Self {
-            let mut s = Session::with_context(Context::new_for_test(true, false, vec![]));
+            let mut s = Session::with_context(TestConnection::default().gpu_accel().context());
             let shm = s.bind("wl_shm", wl_shm::VERSION).await;
             let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await.id;
             Self { s, shm, dmabuf }

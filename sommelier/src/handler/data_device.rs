@@ -367,7 +367,8 @@ mod tests {
     };
     use crate::protocols::{AnyEvent, Iface};
     use crate::proxy::harness::{Object, Session};
-    use crate::state::{Context, GuestId, HostId};
+    use crate::state::{GuestId, HostId};
+    use crate::test_support::TestConnection;
     use crate::test_support::{raw_dispatch, Rng};
     use crate::wire::{WireMessage, WL_DISPLAY_ID};
     use std::io::{self, Read, Write};
@@ -823,7 +824,7 @@ mod tests {
         const INERT_OUTPUT: u32 = 11;
         const XDG_OUTPUT: u32 = 12;
         let context = || {
-            let mut ctx = Context::new_for_test(false, false, Vec::new());
+            let mut ctx = TestConnection::default().context();
             let manager = GuestId::for_test(MANAGER);
             ctx.shadow_table.insert_paired_for_test(
                 manager,

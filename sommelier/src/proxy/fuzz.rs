@@ -80,6 +80,7 @@ use crate::protocols::wayland::{wl_callback, wl_display, wl_fixes, wl_registry, 
 use crate::protocols::AnyEvent;
 use crate::state::Context;
 use crate::test_support::wire_peer::MayEnd;
+use crate::test_support::TestConnection;
 use crate::test_support::{env_u64, Rng};
 use crate::wire::{MessageBuilder, MessageHeader, WireMessage, WL_DISPLAY_ID};
 use std::collections::{BTreeMap, BTreeSet};
@@ -422,16 +423,14 @@ impl Config {
 
     /// The proxy's context for a case.
     fn context(self) -> Context {
-        let settings = crate::settings::Settings {
-            gpu_accel: self.gpu_accel,
-            xdg_decoration: self.xdg_decoration,
-            ..crate::settings::Settings::for_test()
-        };
-        let mut facts = crate::state::ConnectionFacts::for_test();
+        let mut connection = TestConnection::default();
+        connection.settings.gpu_accel = self.gpu_accel;
+        connection.settings.xdg_decoration = self.xdg_decoration;
         if self.placement {
-            facts.placement = crate::placement_config::PlacementConfig::active_for_test(&[]);
+            connection.facts.placement =
+                crate::placement_config::PlacementConfig::active_for_test(&[]);
         }
-        Context::new(std::rc::Rc::new(settings), facts)
+        connection.context()
     }
 }
 

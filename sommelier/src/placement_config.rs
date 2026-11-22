@@ -523,11 +523,6 @@ fn load_shortcut_config(
 
 #[cfg(test)]
 impl PlacementConfig {
-    /// Placement off.
-    pub(crate) fn for_test() -> Self {
-        Self::default()
-    }
-
     /// Placement on, with `bindings` (chord, named action), which may be
     /// none, and no file.
     pub(crate) fn active_for_test(bindings: &[(&str, &str)]) -> Self {
@@ -563,7 +558,7 @@ impl BindingsFile {
     pub(crate) fn loaded_for_test(path: &Path) -> (Self, PlacementConfig) {
         let settings = Settings {
             placement_bindings: Some(path.to_path_buf()),
-            ..Settings::for_test()
+            ..crate::test_support::TestConnection::default().settings
         };
         let config = PlacementConfig::default();
         let mut file = Self::new(Rc::new(settings), config.clone()).expect("a bindings file");
@@ -838,7 +833,7 @@ action = "fullscreen"
         assert!(!config.is_active());
         assert_eq!(alt_q(&config), None);
         assert_eq!(file.reload(), Refresh::Unchanged);
-        assert!(!PlacementConfig::for_test().is_active());
+        assert!(!PlacementConfig::default().is_active());
     }
 
     /// A file that cannot be used at startup leaves placement off, and its
@@ -867,7 +862,7 @@ action = "fullscreen"
         let settings = Settings {
             host_accelerators: HostAccelerators::parse("<Alt>q").unwrap(),
             placement_bindings: Some(path),
-            ..Settings::for_test()
+            ..crate::test_support::TestConnection::default().settings
         };
         let mut file = BindingsFile::new(Rc::new(settings), config.clone()).unwrap();
         assert_eq!(file.reload(), Refresh::Rejected);

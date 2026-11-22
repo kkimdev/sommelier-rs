@@ -23,6 +23,7 @@ use crate::protocols::AnyEvent;
 use crate::protocols::Iface;
 use crate::proxy::harness::Session;
 use crate::state::{Context, GuestId, HostId};
+use crate::test_support::TestConnection;
 
 /// A guest object and the host object it is paired with, by the IDs each
 /// peer sees.
@@ -96,7 +97,7 @@ pub(crate) fn bind_shell(ctx: &mut Context) {
 
 /// A context under `placement` with [`add_toplevel`] and [`bind_shell`].
 pub(crate) fn toplevel_ctx_with(placement: PlacementConfig) -> Context {
-    let mut ctx = Context::with_placement_for_test(placement);
+    let mut ctx = TestConnection::default().placement(placement).context();
     add_toplevel(&mut ctx);
     bind_shell(&mut ctx);
     ctx
@@ -104,7 +105,7 @@ pub(crate) fn toplevel_ctx_with(placement: PlacementConfig) -> Context {
 
 /// [`toplevel_ctx_with`] placement off, the default.
 pub(crate) fn toplevel_ctx() -> Context {
-    toplevel_ctx_with(PlacementConfig::for_test())
+    toplevel_ctx_with(PlacementConfig::default())
 }
 
 /// A session whose guest has bound `wl_shm`, which the proxy implements.

@@ -17,6 +17,7 @@ limitations under the License.
 //! Reading a wire trace, whose format `crate::trace` owns, printing one,
 //! and recording one in memory.
 
+use crate::test_support::TestConnection;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -242,7 +243,7 @@ impl Write for Tape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Context;
+
     use crate::trace::{Facts, Recorder};
 
     /// What a recorder writes reads back as it was recorded, comments
@@ -250,7 +251,7 @@ mod tests {
     #[test]
     fn a_trace_reads_back_what_was_recorded() {
         let tape = Tape::default();
-        let facts = Facts::of(&Context::new_for_test(false, false, Vec::new()));
+        let facts = Facts::of(&TestConnection::default().context());
         let mut recorder = Recorder::new(Box::new(tape.clone()), &facts).unwrap();
         let records = [
             (Stream::FromGuest, (0..=255).collect::<Vec<u8>>(), 0),

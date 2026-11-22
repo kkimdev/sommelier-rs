@@ -253,9 +253,7 @@ mod tests {
     use crate::protocols::wayland::{wl_pointer, wl_seat, wl_surface};
     use crate::protocols::AnyEvent;
     use crate::proxy::harness::{Object, Session};
-    use crate::settings::Settings;
-    use crate::state::{ConnectionFacts, Context};
-    use std::rc::Rc;
+    use crate::test_support::TestConnection;
 
     /// A pointer's surface is forgotten when the surface ends, and the
     /// pointer when it ends; each batch of the session checks that no
@@ -289,13 +287,9 @@ mod tests {
     /// A session whose client gets wheel steps as `wheel` says, with a
     /// pointer on a surface; returns the pointer and the surface.
     async fn scrolling(wheel: WheelClient) -> (Session, Object, Object) {
-        let mut s = Session::with_context(Context::new(
-            Rc::new(Settings::for_test()),
-            ConnectionFacts {
-                wheel,
-                ..ConnectionFacts::for_test()
-            },
-        ));
+        let mut connection = TestConnection::default();
+        connection.facts.wheel = wheel;
+        let mut s = Session::with_context(connection.context());
         let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
         let surface = s.surface().await;
         let pointer = s.pointer_on(seat.id, surface).await;

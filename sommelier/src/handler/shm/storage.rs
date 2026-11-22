@@ -500,8 +500,9 @@ mod tests {
     use crate::protocols::Iface;
     use crate::proxy::harness::Session;
     use crate::state::Singleton;
-    use crate::state::{BufferState, Context, DamageRegion, GuestId, HostId};
+    use crate::state::{BufferState, DamageRegion, GuestId, HostId};
     use crate::test_support::counting::Counts;
+    use crate::test_support::TestConnection;
     use crate::test_support::{decode, shm_pool_file};
     use crate::wire::{Action, WL_DISPLAY_ID};
     use std::fs::File;
@@ -586,7 +587,7 @@ mod tests {
     #[test]
     fn a_dmabuf_host_copy_takes_each_plane_where_its_layout_puts_it() {
         use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = TestConnection::default().context();
         let host_dmabuf = ctx
             .shadow_table
             .create_host_only(Iface::ZwpLinuxDmabufV1, 3);
@@ -678,7 +679,9 @@ mod tests {
     }
 
     async fn without_virtwl_a_buffer_is_backed_by_a_memfd(gpu_accel: bool) {
-        let mut s = Session::with_context(Context::new_for_test(gpu_accel, false, vec![]));
+        let mut connection = TestConnection::default();
+        connection.settings.gpu_accel = gpu_accel;
+        let mut s = Session::with_context(connection.context());
         let shm = s.bind("wl_shm", wl_shm::VERSION).await;
         // With `--gpu-accel` the proxy binds the host linux-dmabuf for
         // itself. Only that bind matters here, not what else either peer

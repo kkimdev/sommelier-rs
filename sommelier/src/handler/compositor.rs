@@ -434,6 +434,7 @@ mod tests {
     use crate::proxy::harness::{Object, Session};
     use crate::state::{PlaneFenceForTest, RenderBufferUse};
     use crate::test_support::text_input::{self, Host};
+    use crate::test_support::TestConnection;
     use crate::test_support::{queued_headers, shm_pool_file, BufferKind, BUFFER_KINDS};
     use crate::wire::{Outgoing, WireId, WL_DISPLAY_ID};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
@@ -491,7 +492,7 @@ mod tests {
 
     impl Screen {
         async fn new() -> Self {
-            let mut s = Session::with_context(Context::new_for_test(true, false, Vec::new()));
+            let mut s = Session::with_context(TestConnection::default().gpu_accel().context());
             let surface = s.surface().await;
             let shm = s.bind("wl_shm", wl_shm::VERSION).await;
             let dmabuf = s.bind_paired("zwp_linux_dmabuf_v1", 3).await.id;
@@ -1549,7 +1550,7 @@ mod tests {
     /// `wl_surface.offset` sets an offset without an attach.
     #[test]
     fn offset_without_explicit_damage_does_not_invent_host_damage() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut ctx = TestConnection::default().context();
         crate::handler::test_support::add_surface(&mut ctx);
         ctx.surface_for_test(SURFACE.guest_id())
             .offset_for_test(3, 0);

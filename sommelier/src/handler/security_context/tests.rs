@@ -8,12 +8,10 @@ use crate::protocols::security_context_v1::{
 };
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
 use crate::proxy::harness::Session;
-use crate::settings::Settings;
-use crate::state::{ConnectionFacts, Context};
+use crate::test_support::TestConnection;
 use crate::test_support::{fd_identity, TempDir};
 use crate::wire::{Outgoing, WL_DISPLAY_ID};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::rc::Rc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// A session whose connection is `sandboxed` or not, offered data-control
@@ -21,14 +19,11 @@ use tokio::sync::mpsc::UnboundedReceiver;
 /// where its committed contexts arrive.
 fn session(sandboxed: bool) -> (Session, UnboundedReceiver<SandboxListener>) {
     let (listeners, committed) = SandboxListeners::new();
-    let facts = ConnectionFacts {
-        clipboard: Some(ClipboardHub::default()),
-        sandbox_listeners: Some(listeners),
-        sandboxed,
-        ..ConnectionFacts::for_test()
-    };
-    let ctx = Context::new(Rc::new(Settings::for_test()), facts);
-    (Session::with_context(ctx), committed)
+    let mut connection = TestConnection::default();
+    connection.facts.clipboard = Some(ClipboardHub::default());
+    connection.facts.sandbox_listeners = Some(listeners);
+    connection.facts.sandboxed = sandboxed;
+    (Session::with_context(connection.context()), committed)
 }
 
 /// A protocol error case: what it is, the requests after the context's
