@@ -225,6 +225,11 @@ the proxy does not use it.
   `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`.
 - The recovery's transition table. Test:
   `a_waiting_recovery_is_decided_by_the_hosts_next_event`.
+- With an English input method, whose engine handles no key, the guest
+  gets exactly the `wl_keyboard.key` events Exo sent, whatever empty
+  confirmations (E13), `repeat_info` events, modifiers and recovery
+  syncs come between short taps and overlapping keys. Test:
+  `an_english_input_methods_keys_reach_the_guest_as_exo_sent_them`.
 - The core reads each host event before it handles it, and a recovery
   the event decides comes with the event's own delivery. Test:
   `a_waiting_recovery_reads_each_host_event_before_it_is_handled`.

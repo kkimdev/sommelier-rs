@@ -311,3 +311,215 @@ async fn empty_confirmation_does_not_duplicate_forwarded_backspace() {
     assert_eq!(kb.s.guest_received(), [done(ime)]);
     assert!(!kb.leased(kb.k));
 }
+
+/// The evdev codes of F and G.
+const KEY_F: u32 = 33;
+const KEY_G: u32 = 34;
+
+/// A deterministic draw for [`english_case`].
+struct Draw(u64);
+
+impl Draw {
+    fn below(&mut self, n: u64) -> u64 {
+        // xorshift64*
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+    }
+
+    fn one_in(&mut self, n: u64) -> bool {
+        self.below(n) == 0
+    }
+}
+
+/// Exo with an English (US) input method, whose engine handles no key:
+/// every press but a modifier's comes after an empty confirmation (E13),
+/// then its `peek_key` and `wl_keyboard.key` with one serial (E7, E8), and
+/// each autorepeat of the key pressed last is a confirmation alone (E13).
+/// With the long-press diacritics on, a letter's press turns the client's
+/// repeat off (`wl_keyboard.repeat_info`, which `Keyboard::OnKeyEvent`
+/// sends before the key's events) and another key's turns it on again,
+/// and the suggester takes a letter's autorepeats, which confirm nothing.
+#[derive(Default)]
+struct EnglishExo {
+    /// The keys held, in the order they were pressed.
+    held: Vec<u32>,
+    serial: u32,
+    /// Whether the client's repeat is on.
+    repeat_off: bool,
+    diacritics: bool,
+    /// What Exo sent and the proxy has not read yet, in order.
+    queue: std::collections::VecDeque<Outgoing<u32>>,
+    /// Each `wl_keyboard.key` Exo sent, as key and state.
+    keys: Vec<(u32, u32)>,
+}
+
+impl EnglishExo {
+    fn next_serial(&mut self) -> u32 {
+        self.serial += 1;
+        self.serial
+    }
+
+    /// The user presses or releases `key`, which Exo sends to `k`, under
+    /// `ime`, with Shift's modifiers before its key events or after them.
+    fn key(&mut self, kb: &Kb, ime: Ime, key: u32, modifiers_first: bool) {
+        let k = kb.k;
+        let pressed = !self.held.contains(&key);
+        let modifier = key == KEY_LEFTSHIFT;
+        let mut modifiers = modifier.then(|| {
+            let depressed = if pressed { SHIFT } else { 0 };
+            let serial = self.next_serial();
+            wl_keyboard::evt::modifiers(k.host, serial, depressed, 0, 0, 0)
+        });
+        if modifiers_first {
+            self.queue.extend(modifiers.take());
+        }
+        let state = if pressed {
+            self.held.push(key);
+            if !modifier {
+                self.queue
+                    .push_back(zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0));
+                let letter = key != KEY_SPACE;
+                if self.diacritics && letter != self.repeat_off {
+                    self.repeat_off = letter;
+                    let rate = if letter { 0 } else { 25 };
+                    self.queue
+                        .push_back(wl_keyboard::evt::repeat_info(k.host, rate, 500));
+                }
+            }
+            PRESSED
+        } else {
+            self.held.retain(|&held| held != key);
+            RELEASED
+        };
+        let serial = self.next_serial();
+        let time = serial;
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        self.queue.extend([
+            zcr_extended_keyboard_v1::evt::peek_key(k.ext, serial, time, key, state),
+            wl_keyboard::evt::key(k.host, serial, time, key, state),
+        ]);
+        self.keys.push((key, state));
+        self.queue.extend(modifiers);
+    }
+
+    /// An autorepeat of the key pressed last, if it is held and repeats.
+    fn autorepeat(&mut self, ime: Ime) {
+        let Some(&last) = self.held.last() else {
+            return;
+        };
+        let suggester = self.diacritics && last != KEY_SPACE;
+        if last != KEY_LEFTSHIFT && !suggester {
+            self.queue
+                .push_back(zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0));
+        }
+    }
+}
+
+/// The guest's view of [`english_case`]'s keys: each key event it got, and
+/// the keys it holds, which it repeats itself.
+#[derive(Default)]
+struct GuestKeys {
+    keys: Vec<(u32, u32)>,
+    held: std::collections::BTreeSet<u32>,
+}
+
+/// Send the host `count` of Exo's queued events in one batch, and read
+/// what each peer got: the guest's keys, and the syncs a waiting recovery
+/// sends, which Exo answers once it reads them (`syncs`).
+async fn deliver(
+    kb: &mut Kb,
+    exo: &mut EnglishExo,
+    count: usize,
+    guest: &mut GuestKeys,
+    syncs: &mut Vec<u32>,
+    seed: u64,
+) {
+    let batch: Vec<_> = exo.queue.drain(..count).collect();
+    if batch.is_empty() {
+        return;
+    }
+    kb.s.host(batch).await;
+    for (id, event) in kb.s.guest_received() {
+        let AnyEvent::WlKeyboard(wl_keyboard::Event::Key { key, state, .. }) = event else {
+            continue;
+        };
+        assert_eq!(id, kb.k.id, "seed {seed}");
+        let fresh = match state {
+            PRESSED => guest.held.insert(key),
+            _ => guest.held.remove(&key),
+        };
+        assert!(
+            fresh,
+            "seed {seed}: the guest got key {key} in state {state} twice in a row: {:?}",
+            guest.keys
+        );
+        guest.keys.push((key, state));
+    }
+    for (_, request) in kb.s.host_received() {
+        if let AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) = request {
+            syncs.push(callback);
+        }
+    }
+}
+
+/// One random case of [`an_english_input_methods_keys_reach_the_guest_as_exo_sent_them`].
+async fn english_case(seed: u64) {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    let mut draw = Draw(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut exo = EnglishExo {
+        serial: 100,
+        diacritics: draw.one_in(2),
+        ..EnglishExo::default()
+    };
+    let mut guest = GuestKeys::default();
+    let mut syncs = Vec::new();
+    let keys = [KEY_F, KEY_G, KEY_SPACE, KEY_LEFTSHIFT];
+    for _ in 0..40 {
+        match draw.below(6) {
+            0 | 1 => {
+                let key = keys[draw.below(keys.len() as u64) as usize];
+                exo.key(&kb, ime, key, draw.one_in(2));
+            }
+            2 => exo.autorepeat(ime),
+            3 => {
+                // Exo reads the proxy's syncs after what it sent so far.
+                for callback in syncs.drain(..) {
+                    exo.queue.push_back(wl_callback::evt::done(callback, 0));
+                }
+            }
+            _ => {
+                let count = draw.below(exo.queue.len() as u64 + 1) as usize;
+                deliver(&mut kb, &mut exo, count, &mut guest, &mut syncs, seed).await;
+            }
+        }
+    }
+    // The user lets go of every key, and Exo answers every sync.
+    while let Some(&key) = exo.held.first() {
+        exo.key(&kb, ime, key, draw.one_in(2));
+    }
+    while !exo.queue.is_empty() || !syncs.is_empty() {
+        for callback in syncs.drain(..) {
+            exo.queue.push_back(wl_callback::evt::done(callback, 0));
+        }
+        let count = exo.queue.len();
+        deliver(&mut kb, &mut exo, count, &mut guest, &mut syncs, seed).await;
+    }
+    assert_eq!(guest.keys, exo.keys, "seed {seed}");
+    assert!(guest.held.is_empty(), "seed {seed}: {:?}", guest.held);
+}
+
+/// With an English input method, whose engine handles no key, the guest
+/// gets exactly the `wl_keyboard.key` events Exo sent, however the empty
+/// confirmations before each press and each autorepeat (E13), a
+/// `repeat_info` between a confirmation and its key, Shift's modifiers
+/// and the syncs of waiting recoveries interleave with short taps and
+/// overlapping keys: no press is added, and every press is released.
+#[tokio::test]
+async fn an_english_input_methods_keys_reach_the_guest_as_exo_sent_them() {
+    for seed in 0..200 {
+        english_case(seed).await;
+    }
+}
