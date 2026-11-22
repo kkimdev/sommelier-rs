@@ -40,12 +40,13 @@ placement contract is owned by
   `untracked_message_fd_ambiguity_survives_separate_receive_calls`.
 - **Truncated ancillary data is an ownership failure.** If `recvmsg`
   reports `MSG_CTRUNC`, every descriptor the kernel installed for that
-  receive is recovered and closed before the error is returned, not left
-  to a wrapper that refuses to iterate truncated control data. The
-  receive buffer has room for Linux's `SCM_MAX_FD` (253), so a valid peer
-  never causes truncation.
+  receive, in every `SCM_RIGHTS` message, is recovered and closed before
+  the error is returned, not left to a wrapper that refuses to iterate
+  truncated control data. The receive buffer has room for Linux's
+  `SCM_MAX_FD` (253), so a valid peer never causes truncation.
   Tests: `recvmsg_scm_rights_truncation_closes_kernel_installed_descriptors`,
-  `truncated_scm_rights_closes_descriptors_recovered_from_control_buffer`.
+  `recvmsg_truncation_after_a_credentials_message_closes_every_descriptor`,
+  `a_connection_receives_scm_max_fd_descriptors_whole`.
 - **Received descriptors are bounded.** A connection holds at most
   `MAX_PENDING_FDS` (1024, libwayland's incoming descriptor ring)
   received descriptors that no message has consumed; one more ends that

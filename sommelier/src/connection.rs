@@ -25,13 +25,43 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
+use zerocopy::AsBytes;
 
 // Linux accepts at most SCM_MAX_FD (253) descriptors in one SCM_RIGHTS
 // message. Keeping the receive control buffer at that limit prevents a valid
 // Unix peer from triggering MSG_CTRUNC merely because the proxy used a
-// smaller, VirtWL-specific batch size. The parser below still handles
-// truncation defensively for malformed or non-Linux transports.
+// smaller, VirtWL-specific batch size. `decode_unix_control_fds` still
+// closes the descriptors of truncated control data.
 const UNIX_MAX_SCM_RIGHTS_FDS: usize = 253;
+
+/// The room a receive of [`UNIX_MAX_SCM_RIGHTS_FDS`] descriptors needs.
+// SAFETY: CMSG_SPACE only computes a length.
+const UNIX_CONTROL_LEN: usize =
+    unsafe { libc::CMSG_SPACE((UNIX_MAX_SCM_RIGHTS_FDS * std::mem::size_of::<RawFd>()) as u32) }
+        as usize;
+
+/// Room for one receive's control data, aligned for `cmsghdr` because the
+/// CMSG macros read headers in place: the first `len` bytes of whole
+/// `u64`s.
+#[derive(Debug)]
+struct ControlBuffer {
+    words: Vec<u64>,
+    len: usize,
+}
+
+// A `u64` is aligned for `cmsghdr` on every Linux target.
+const _: () = assert!(std::mem::align_of::<libc::cmsghdr>() <= std::mem::align_of::<u64>());
+
+impl ControlBuffer {
+    fn new(len: usize) -> Self {
+        let words = vec![0; len.div_ceil(std::mem::size_of::<u64>())];
+        Self { words, len }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.words.as_bytes_mut()[..self.len]
+    }
+}
 
 /// The most received descriptors a connection holds before messages
 /// consume them.
@@ -223,7 +253,7 @@ enum ConnectionTransport {
     Unix {
         socket: AsyncFd<OwnedFd>,
         /// Room for a receive's `SCM_RIGHTS` control data.
-        control: Vec<u8>,
+        control: ControlBuffer,
     },
     VirtWayland {
         channel: Arc<VirtWaylandChannel>,
@@ -238,159 +268,89 @@ fn unix_send_flags() -> MsgFlags {
     MsgFlags::MSG_NOSIGNAL
 }
 
-/// Decode SCM_RIGHTS descriptors from a raw `recvmsg` control buffer.
+/// Take over the descriptors of the `SCM_RIGHTS` messages in `control`, the
+/// control data one `recvmsg` wrote, reporting `MSG_CTRUNC` as `truncated`.
 ///
-/// `nix::RecvMsg::cmsgs()` intentionally refuses to iterate when
-/// `MSG_CTRUNC` is set. That is normally a useful safety check, but it would
-/// leak descriptors that the kernel did install before truncating the
-/// ancillary buffer. This parser validates each kernel-provided length and
-/// takes ownership of every descriptor that is present as soon as it reads
-/// it, so returning an error whenever truncation or malformed control data
-/// is observed closes them.
+/// `nix::RecvMsg::cmsgs()` refuses to iterate when `MSG_CTRUNC` is set,
+/// which would leak the descriptors the kernel installed before it ran out
+/// of room. The libc macros iterate truncated control data like any other,
+/// so this takes over every descriptor present, skipping other messages,
+/// before it reports truncated or malformed control data; returning the
+/// error then closes them.
+///
+/// # Safety
+///
+/// `control` starts at an address aligned for `cmsghdr`, and the caller
+/// owns every descriptor in its `SCM_RIGHTS` messages and passes them here.
 // The kernel boundary: recvmsg installs raw descriptors.
 #[allow(clippy::disallowed_methods)]
-fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
-    let mut fds = Vec::new();
-    // The kernel never reports a negative descriptor; owning one would be
-    // unsound. Skip it, but own the rest before failing, so none leaks.
-    let mut negative_fd = false;
-    let control_start = msg.msg_control as usize;
-    // `msg_controllen` is `size_t` on glibc and `socklen_t` on musl. Keep
-    // pointer arithmetic in usize so this parser is portable across targets.
-    #[cfg(target_env = "musl")]
-    let control_len = msg.msg_controllen as usize;
-    #[cfg(not(target_env = "musl"))]
-    let control_len = msg.msg_controllen;
-    let Some(control_end) = control_start.checked_add(control_len) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "SCM_RIGHTS control buffer address overflows",
-        ));
-    };
-    let header_size = std::mem::size_of::<libc::cmsghdr>();
-    let align = std::mem::size_of::<usize>();
-    let mut current = if control_len >= header_size && !msg.msg_control.is_null() {
-        msg.msg_control.cast::<libc::cmsghdr>()
-    } else {
-        std::ptr::null_mut()
-    };
-
-    while !current.is_null() {
-        let current_addr = current as usize;
-        let Some(current_offset) = current_addr.checked_sub(control_start) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SCM_RIGHTS header lies outside the control buffer",
-            ));
-        };
-        if current_offset > control_len || control_len - current_offset < header_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated SCM_RIGHTS control header",
-            ));
-        }
-
-        let cmsg_len = unsafe { (*current).cmsg_len as usize };
-        if cmsg_len < header_size || cmsg_len > control_end - current_addr {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid SCM_RIGHTS control length",
-            ));
-        }
-
-        let payload_len = cmsg_len - header_size;
-        if unsafe { (*current).cmsg_level } == libc::SOL_SOCKET
-            && unsafe { (*current).cmsg_type } == libc::SCM_RIGHTS
-        {
-            if !payload_len.is_multiple_of(std::mem::size_of::<RawFd>()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS payload is not fd-aligned",
-                ));
-            }
-            let Some(data_addr) = current_addr.checked_add(header_size) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS payload address overflows",
-                ));
-            };
-            let Some(data_end) = data_addr.checked_add(payload_len) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS payload end overflows",
-                ));
-            };
-            let Some(message_end) = current_addr.checked_add(cmsg_len) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS message end overflows",
-                ));
-            };
-            if data_end > message_end {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCM_RIGHTS payload exceeds control message",
-                ));
-            }
-            for index in 0..(payload_len / std::mem::size_of::<RawFd>()) {
-                let fd_addr = data_addr + index * std::mem::size_of::<RawFd>();
-                let fd = unsafe { std::ptr::read_unaligned(fd_addr as *const RawFd) };
-                if fd < 0 {
-                    negative_fd = true;
-                    continue;
-                }
-                // SAFETY: `recvmsg` installed this descriptor for this
-                // receive, once, and nothing else refers to it yet.
-                fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
-            }
-        }
-
-        let Some(aligned_len) = cmsg_len
-            .checked_add(align - 1)
-            .map(|len| len & !(align - 1))
+unsafe fn decode_unix_control_fds(control: &[u8], truncated: bool) -> io::Result<Vec<OwnedFd>> {
+    debug_assert!(control.as_ptr().cast::<libc::cmsghdr>().is_aligned());
+    // SAFETY: an all-zero `msghdr` is valid: null pointers, zero lengths.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_control = control.as_ptr().cast_mut().cast();
+    // `size_t` on glibc, `socklen_t` on musl: a shorter length is still in
+    // bounds.
+    msg.msg_controllen = control.len() as _;
+    let (mut fds, mut malformed, mut negative) = (Vec::new(), None, false);
+    // SAFETY: `msg` describes `control`, which the caller aligned, so
+    // CMSG_FIRSTHDR and CMSG_NXTHDR return null or an aligned header that
+    // lies whole within it.
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    while !cmsg.is_null() {
+        // SAFETY: as above, and the payload starts right after the header.
+        let (header, data) = unsafe { (*cmsg, libc::CMSG_DATA(cmsg)) };
+        // `size_t` on glibc, `socklen_t` on musl.
+        #[allow(clippy::unnecessary_cast)]
+        let len = header.cmsg_len as usize;
+        let offset = |pointer: *const u8| pointer as usize - control.as_ptr() as usize;
+        let Some(payload) = offset(cmsg.cast())
+            .checked_add(len)
+            .and_then(|end| control.get(offset(data)..end))
         else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SCM_RIGHTS control alignment overflows",
-            ));
-        };
-        let Some(next_addr) = current_addr.checked_add(aligned_len) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SCM_RIGHTS control chain overflows",
-            ));
-        };
-        if next_addr >= control_end || control_end - next_addr < header_size {
+            malformed.get_or_insert("invalid SCM_RIGHTS control length");
             break;
+        };
+        if (header.cmsg_level, header.cmsg_type) == (libc::SOL_SOCKET, libc::SCM_RIGHTS) {
+            let fd_size = std::mem::size_of::<RawFd>();
+            if !payload.len().is_multiple_of(fd_size) {
+                malformed.get_or_insert("SCM_RIGHTS payload is not fd-aligned");
+            }
+            for fd in payload.chunks_exact(fd_size) {
+                match RawFd::from_ne_bytes(fd.try_into().expect("fd-sized")) {
+                    // The kernel never reports one; owning it would be unsound.
+                    fd if fd < 0 => negative = true,
+                    // SAFETY: the caller passes this descriptor's ownership.
+                    fd => fds.push(unsafe { OwnedFd::from_raw_fd(fd) }),
+                }
+            }
         }
-        current = next_addr as *mut libc::cmsghdr;
+        // SAFETY: as for CMSG_FIRSTHDR; the message ends within `control`,
+        // so stepping past it cannot overflow.
+        cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }
-
-    if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "truncated SCM_RIGHTS ancillary data",
-        ));
+    let error = malformed
+        .or(truncated.then_some("truncated SCM_RIGHTS ancillary data"))
+        .or(negative.then_some("negative SCM_RIGHTS descriptor"));
+    match error {
+        Some(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        None => Ok(fds),
     }
-    if negative_fd {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "negative SCM_RIGHTS descriptor",
-        ));
-    }
-
-    Ok(fds)
 }
 
+/// Receive into `data` and `control`, returning the bytes received and
+/// the descriptors that came with them.
 fn recv_unix_message(
     fd: RawFd,
     data: &mut [u8],
-    control: &mut [u8],
+    control: &mut ControlBuffer,
 ) -> io::Result<(usize, Vec<OwnedFd>)> {
+    let control = control.bytes_mut();
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr().cast(),
         iov_len: data.len(),
     };
+    // SAFETY: an all-zero `msghdr` is valid: null pointers, zero lengths.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -409,11 +369,21 @@ fn recv_unix_message(
         msg.msg_controllen = control.len();
     }
 
-    let bytes = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    // SAFETY: `msg` describes `iov` and `control`, which outlive the call.
+    // MSG_CMSG_CLOEXEC installs the descriptors close-on-exec, as VirtWL
+    // installs its own, so no program the process starts inherits them.
+    let bytes = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if bytes < 0 {
         return Err(io::Error::last_os_error());
     }
-    let fds = decode_unix_control_fds(&msg)?;
+    // recvmsg sets `msg_controllen` to the length of the data it wrote.
+    #[allow(clippy::unnecessary_cast)] // `socklen_t` on musl
+    let written = msg.msg_controllen as usize;
+    let control = &control[..written.min(control.len())];
+    let truncated = msg.msg_flags & libc::MSG_CTRUNC != 0;
+    // SAFETY: `control` is aligned, and recvmsg installed the descriptors
+    // of its SCM_RIGHTS messages for this receive alone.
+    let fds = unsafe { decode_unix_control_fds(control, truncated) }?;
     Ok((bytes as usize, fds))
 }
 
@@ -430,7 +400,7 @@ impl WaylandConnection {
         Ok(Self {
             transport: ConnectionTransport::Unix {
                 socket: AsyncFd::new(fd)?,
-                control: nix::cmsg_space!([RawFd; UNIX_MAX_SCM_RIGHTS_FDS]),
+                control: ControlBuffer::new(UNIX_CONTROL_LEN),
             },
             read_buf: Vec::new(),
             read_fds: VecDeque::new(),
@@ -728,18 +698,20 @@ impl WaylandConnection {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        decode_unix_control_fds, recv_unix_message, LastSubmission, OutgoingMessages,
-        WaylandConnection, MAX_BYTES_PER_SEND, MAX_FDS_PER_SEND,
+        decode_unix_control_fds, recv_unix_message, ControlBuffer, LastSubmission,
+        OutgoingMessages, WaylandConnection, MAX_BYTES_PER_SEND, MAX_FDS_PER_SEND,
+        UNIX_MAX_SCM_RIGHTS_FDS,
     };
-    use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
+    use crate::test_support::{any_fd_has_identity, fd_identity, fds_with_identity, shm_pool_file};
     use crate::wire::{MessageBuilder, Outgoing};
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
     use nix::sys::memfd::{memfd_create, MFdFlags};
-    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+    use nix::sys::socket::{sendmsg, setsockopt, sockopt, ControlMessage, MsgFlags};
     use std::ffi::CString;
     use std::fs;
     use std::io::IoSlice;
     use std::io::Write;
-    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+    use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
     use std::os::unix::net::UnixStream;
 
     /// A send to a peer that has gone returns `BrokenPipe` and raises no
@@ -811,7 +783,7 @@ mod tests {
             costs.push((received.allocations, (Counts::now() - before).allocations));
 
             let mut data = [0u8; 64];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             assert_eq!((bytes, fds.len()), (message.len(), 1));
@@ -851,18 +823,17 @@ mod tests {
         assert!(WaylandConnection::new(memfd).is_err());
     }
 
-    /// Send one byte with `fd` attached, as a message that takes no
-    /// descriptor would carry it.
-    fn send_with_fd(peer: &UnixStream, fd: RawFd) {
-        use std::os::fd::AsRawFd;
+    /// Send one byte with `fds` attached, as a message that takes no
+    /// descriptor would carry them.
+    fn send_with_fds(peer: &UnixStream, fds: &[RawFd]) {
         let sent = sendmsg::<()>(
             peer.as_raw_fd(),
             &[IoSlice::new(b"x")],
-            &[ControlMessage::ScmRights(&[fd])],
+            &[ControlMessage::ScmRights(fds)],
             MsgFlags::empty(),
             None,
         )
-        .expect("send a descriptor");
+        .expect("send descriptors");
         assert_eq!(sent, 1);
     }
 
@@ -891,7 +862,7 @@ mod tests {
         let mut submissions = Vec::new();
         loop {
             let mut data = [0u8; 4096];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             if bytes == 0 {
@@ -941,7 +912,7 @@ mod tests {
         let mut submissions = Vec::new();
         loop {
             let mut data = [0u8; 4096];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             if bytes == 0 {
@@ -986,7 +957,7 @@ mod tests {
         let mut submissions = Vec::new();
         loop {
             let mut data = [0u8; 4 * 4096];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             if bytes == 0 {
@@ -1028,7 +999,7 @@ mod tests {
         let mut submissions = Vec::new();
         loop {
             let mut data = [0u8; 64];
-            let mut control = vec![0u8; 4096];
+            let mut control = ControlBuffer::new(4096);
             let (bytes, fds) =
                 recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
             if bytes == 0 {
@@ -1052,8 +1023,8 @@ mod tests {
         let name = CString::new("sommelier-pending-fd-limit").unwrap();
         let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
         let identity = fd_identity(memfd.as_raw_fd());
-        send_with_fd(&peer, memfd.as_raw_fd());
-        send_with_fd(&peer, memfd.as_raw_fd());
+        send_with_fds(&peer, &[memfd.as_raw_fd()]);
+        send_with_fds(&peer, &[memfd.as_raw_fd()]);
         drop(memfd);
 
         assert_eq!(
@@ -1096,38 +1067,68 @@ mod tests {
         );
     }
 
+    fn memfd(name: &str) -> OwnedFd {
+        let name = CString::new(name).unwrap();
+        memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create")
+    }
+
+    /// The payload of an `SCM_RIGHTS` message that passes `fds`.
+    fn fd_payload<const N: usize>(fds: [OwnedFd; N]) -> Vec<u8> {
+        fds.into_iter()
+            .flat_map(|fd| fd.into_raw_fd().to_ne_bytes())
+            .collect()
+    }
+
+    /// Control data holding `messages`, each a level, a type and a payload,
+    /// laid out as `recvmsg` writes it.
+    fn control_data(messages: &[(libc::c_int, libc::c_int, &[u8])]) -> Vec<u8> {
+        let mut control = Vec::new();
+        for &(level, kind, payload) in messages {
+            let start = control.len();
+            let n = payload.len() as u32;
+            // SAFETY: CMSG_SPACE and CMSG_LEN only compute lengths, and an
+            // all-zero `cmsghdr` is valid.
+            let (space, len, mut header) = unsafe {
+                let header: libc::cmsghdr = std::mem::zeroed();
+                (libc::CMSG_SPACE(n) as usize, libc::CMSG_LEN(n), header)
+            };
+            header.cmsg_len = len as _;
+            header.cmsg_level = level;
+            header.cmsg_type = kind;
+            control.resize(start + space, 0);
+            // SAFETY: the header fits in the space just added.
+            unsafe {
+                control[start..]
+                    .as_mut_ptr()
+                    .cast::<libc::cmsghdr>()
+                    .write_unaligned(header);
+            }
+            let data = start + std::mem::size_of::<libc::cmsghdr>();
+            control[data..data + payload.len()].copy_from_slice(payload);
+        }
+        control
+    }
+
+    /// Take over the descriptors in `control`, which this test passes.
+    fn decode(control: &[u8], truncated: bool) -> std::io::Result<Vec<OwnedFd>> {
+        let mut aligned = ControlBuffer::new(control.len());
+        aligned.bytes_mut().copy_from_slice(control);
+        // SAFETY: a `ControlBuffer` is aligned for `cmsghdr`, and the tests
+        // build control data from descriptors they pass on.
+        unsafe { decode_unix_control_fds(aligned.bytes_mut(), truncated) }
+    }
+
     #[test]
     fn truncated_scm_rights_closes_descriptors_recovered_from_control_buffer() {
-        let (pipe_read, pipe_write) = crate::test_support::pipe();
-        let received_fd =
-            unsafe { libc::fcntl(pipe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(received_fd >= 1000);
-        let received_target =
-            fs::read_link(format!("/proc/self/fd/{received_fd}")).expect("received fd target");
-        drop((pipe_read, pipe_write));
+        let received = memfd("sommelier-truncated-control");
+        let identity = fd_identity(received.as_raw_fd());
+        let payload = fd_payload([received]);
+        let control = control_data(&[(libc::SOL_SOCKET, libc::SCM_RIGHTS, &payload)]);
 
-        let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
-        let mut control = vec![0u8; control_len];
-        let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
-        unsafe {
-            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-            (*header).cmsg_level = libc::SOL_SOCKET;
-            (*header).cmsg_type = libc::SCM_RIGHTS;
-            let data = libc::CMSG_DATA(header).cast::<RawFd>();
-            *data = received_fd;
-        }
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control.len() as _;
-        msg.msg_flags = libc::MSG_CTRUNC;
-
-        let result = decode_unix_control_fds(&msg);
-        assert!(result.is_err());
-        let current = fs::read_link(format!("/proc/self/fd/{received_fd}"));
+        let error = decode(&control, true).expect_err("truncated control data");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(
-            current
-                .as_ref()
-                .map_or(true, |current| current != &received_target),
+            !any_fd_has_identity(identity),
             "truncated control cleanup must release the received fd"
         );
     }
@@ -1136,30 +1137,137 @@ mod tests {
     fn negative_scm_rights_descriptor_is_invalid_data() {
         // The kernel never reports one; owning it would be unsound. The
         // descriptor after it must still be owned, and closed.
-        let name = CString::new("sommelier-after-negative-fd").unwrap();
-        let received = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let received = memfd("sommelier-after-negative-fd");
         let identity = fd_identity(received.as_raw_fd());
-        let payload_len = 2 * std::mem::size_of::<RawFd>() as u32;
-        let control_len = unsafe { libc::CMSG_SPACE(payload_len) } as usize;
-        let mut control = vec![0u8; control_len];
-        let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
-        unsafe {
-            (*header).cmsg_len = libc::CMSG_LEN(payload_len) as _;
-            (*header).cmsg_level = libc::SOL_SOCKET;
-            (*header).cmsg_type = libc::SCM_RIGHTS;
-            let data = libc::CMSG_DATA(header).cast::<RawFd>();
-            data.write_unaligned(-1);
-            data.add(1).write_unaligned(received.into_raw_fd());
-        }
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control.len() as _;
+        let mut payload = (-1 as RawFd).to_ne_bytes().to_vec();
+        payload.extend(fd_payload([received]));
+        let control = control_data(&[(libc::SOL_SOCKET, libc::SCM_RIGHTS, &payload)]);
 
-        let error = decode_unix_control_fds(&msg).expect_err("a negative descriptor");
+        let error = decode(&control, false).expect_err("a negative descriptor");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             !any_fd_has_identity(identity),
             "the descriptors after a negative one must be closed"
+        );
+    }
+
+    /// Every `SCM_RIGHTS` message yields its descriptors, in order, past an
+    /// empty one and past messages of another type or level, whose
+    /// payloads, read as descriptors, would be negative.
+    #[test]
+    fn every_scm_rights_message_yields_its_descriptors_in_order() {
+        let files = ["a", "b", "c"].map(|name| memfd(&format!("sommelier-cmsg-{name}")));
+        let identities = files.each_ref().map(|fd| fd_identity(fd.as_raw_fd()));
+        let [a, b, c] = files;
+        let credentials = [0xff; std::mem::size_of::<libc::ucred>()];
+        let control = control_data(&[
+            (libc::SOL_SOCKET, libc::SCM_CREDENTIALS, &credentials),
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[]),
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &fd_payload([a])),
+            (libc::SOL_IP, libc::SCM_RIGHTS, &[0xff; 4]),
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &fd_payload([b, c])),
+        ]);
+
+        let fds = decode(&control, false).expect("valid control data");
+        let received: Vec<_> = fds.iter().map(|fd| fd_identity(fd.as_raw_fd())).collect();
+        assert_eq!(received, identities);
+        drop(fds);
+        assert!(identities.into_iter().all(|id| !any_fd_has_identity(id)));
+    }
+
+    /// A message whose length runs past the control data ends the receive,
+    /// and the descriptors of the messages before it close.
+    #[test]
+    fn control_length_past_the_buffer_is_invalid_data() {
+        let received = memfd("sommelier-before-bad-length");
+        let identity = fd_identity(received.as_raw_fd());
+        let mut control = control_data(&[
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &fd_payload([received])),
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0xff; 8]),
+        ]);
+        control.truncate(control.len() - 4);
+
+        let error = decode(&control, false).expect_err("a length past the buffer");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!any_fd_has_identity(identity));
+    }
+
+    /// A socket pair whose second end receives the sender's credentials,
+    /// which the kernel writes before the descriptors, in a message of
+    /// their own.
+    fn credentials_pair() -> (UnixStream, UnixStream) {
+        let (sender, receiver) = UnixStream::pair().expect("unix socket pair");
+        setsockopt(&receiver, sockopt::PassCred, &true).expect("SO_PASSCRED");
+        (sender, receiver)
+    }
+
+    #[test]
+    fn recvmsg_takes_the_descriptors_after_a_credentials_message() {
+        let (sender, receiver) = credentials_pair();
+        let file = memfd("sommelier-after-credentials");
+        let identity = fd_identity(file.as_raw_fd());
+        send_with_fds(&sender, &[file.as_raw_fd(); 3]);
+
+        let (mut data, mut control) = ([0u8; 1], ControlBuffer::new(4096));
+        let (bytes, fds) =
+            recv_unix_message(receiver.as_raw_fd(), &mut data, &mut control).expect("receive");
+        assert_eq!((bytes, fds.len()), (1, 3));
+        drop((file, fds));
+        assert!(!any_fd_has_identity(identity));
+    }
+
+    /// The largest batch Linux sends, `SCM_MAX_FD` descriptors, fits in a
+    /// connection's control buffer, so a valid peer never causes truncation.
+    #[tokio::test]
+    async fn a_connection_receives_scm_max_fd_descriptors_whole() {
+        let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
+        let file = memfd("sommelier-scm-max-fd");
+        send_with_fds(&peer, &[file.as_raw_fd(); UNIX_MAX_SCM_RIGHTS_FDS]);
+
+        assert_eq!(connection.try_recv().expect("receive"), Some(1));
+        assert_eq!(connection.read_fds.len(), UNIX_MAX_SCM_RIGHTS_FDS);
+    }
+
+    /// A received descriptor is close-on-exec from the moment the kernel
+    /// installs it, so no program the process starts inherits a peer's
+    /// file.
+    #[test]
+    fn received_descriptors_close_on_exec() {
+        let (sender, receiver) = UnixStream::pair().expect("unix socket pair");
+        let file = memfd("sommelier-received-cloexec");
+        send_with_fds(&sender, &[file.as_raw_fd()]);
+
+        let (mut data, mut control) = ([0u8; 1], ControlBuffer::new(4096));
+        let (_, fds) =
+            recv_unix_message(receiver.as_raw_fd(), &mut data, &mut control).expect("receive");
+        let [fd] = fds.try_into().expect("one descriptor");
+        let flags = FdFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFD).expect("F_GETFD"));
+        assert!(flags.contains(FdFlag::FD_CLOEXEC));
+    }
+
+    /// A control buffer with room for the credentials and two of three
+    /// descriptors: the kernel installs the two, and both close before the
+    /// error returns.
+    #[test]
+    fn recvmsg_truncation_after_a_credentials_message_closes_every_descriptor() {
+        let (sender, receiver) = credentials_pair();
+        let file = memfd("sommelier-truncated-after-credentials");
+        let identity = fd_identity(file.as_raw_fd());
+        send_with_fds(&sender, &[file.as_raw_fd(); 3]);
+
+        // SAFETY: CMSG_SPACE only computes a length.
+        let space = |len: usize| unsafe { libc::CMSG_SPACE(len as u32) } as usize;
+        let room =
+            space(std::mem::size_of::<libc::ucred>()) + space(2 * std::mem::size_of::<RawFd>());
+        let (mut data, mut control) = ([0u8; 1], ControlBuffer::new(room));
+        let error = recv_unix_message(receiver.as_raw_fd(), &mut data, &mut control)
+            .expect_err("truncated control data");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            fds_with_identity(identity),
+            1,
+            "only the sender's descriptor may refer to the file"
         );
     }
 
@@ -1186,7 +1294,7 @@ mod tests {
 
         let mut data = [0u8; 1];
         let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
-        let mut control = vec![0u8; control_len];
+        let mut control = ControlBuffer::new(control_len);
         let result = recv_unix_message(receiver_fd, &mut data, &mut control);
         assert!(
             result.is_err(),
