@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::super::{BufferRect, ViewportState, MAX_PENDING_DAMAGE_RECTS};
 use super::*;
+use crate::protocols::wayland::wl_output::Transform;
 
 /// The buffer the surface shows before each commit, 8x6 pixels.
 const SHOWN: GuestId = GuestId::for_test(1);
@@ -198,7 +199,7 @@ fn a_plan_decides_the_fence_copy_attachment_and_damage() {
             "an attach with a new transform relates to no host copy",
             |surface| {
                 surface.attach(Some(NEW), 0, 0);
-                surface.set_buffer_transform(2);
+                surface.set_buffer_transform(Transform::_180);
                 pixel(surface);
             },
             HELD,
@@ -393,7 +394,7 @@ fn a_plan_stales_its_damage_in_buffer_pixels() {
         (
             "surface damage under a transform",
             |surface| {
-                surface.set_buffer_transform(1);
+                surface.set_buffer_transform(Transform::_90);
                 surface.damage(SurfaceRect::new(0, 0, 1, 1));
             },
             full.clone(),
@@ -481,7 +482,7 @@ fn surface_commit_applies_every_pending_field_atomically() {
     surface.damage(SurfaceRect::new(1, 2, 3, 4));
     surface.damage_buffer(BufferRect::new(5, 6, 7, 8));
     surface.set_buffer_scale(2);
-    surface.set_buffer_transform(3);
+    surface.set_buffer_transform(Transform::_270);
     surface.add_viewport();
     *surface.pending_viewport_mut() = ViewportState {
         source: Some((0, 0, ONE, ONE)),
@@ -505,7 +506,7 @@ fn surface_commit_applies_every_pending_field_atomically() {
                 dimensions: Some((10, 20)),
             }),
             buffer_scale: 2,
-            buffer_transform: 3,
+            buffer_transform: Transform::_270,
             viewport: Some(ViewportState {
                 source: Some((0, 0, ONE, ONE)),
                 destination: Some((20, 30)),
@@ -657,7 +658,10 @@ fn damage_buffer_mapping_does_not_include_surface_offset() {
 
 #[test]
 fn rotated_buffer_damage_covers_the_transformed_surface() {
-    let mapping = attached_mapping((8, 6), |surface| surface.set_buffer_transform(1)).mapping;
+    let mapping = attached_mapping((8, 6), |surface| {
+        surface.set_buffer_transform(Transform::_90)
+    })
+    .mapping;
     assert_eq!(
         mapping.surface_rect(),
         SurfaceRect::new(0, 0, 6, 8),
@@ -674,7 +678,7 @@ fn rotated_buffer_damage_covers_the_transformed_surface() {
 fn rotated_scaled_buffer_full_damage_uses_logical_extent() {
     let plan = attached_mapping((8, 6), |surface| {
         surface.set_buffer_scale(2);
-        surface.set_buffer_transform(1);
+        surface.set_buffer_transform(Transform::_90);
     });
     assert_eq!(
         plan.mapping.surface_rect(),
