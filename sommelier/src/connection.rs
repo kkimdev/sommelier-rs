@@ -346,7 +346,9 @@ fn recv_unix_message(
     }
 
     // SAFETY: `msg` describes `iov` and `control`, which outlive the call.
-    let bytes = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    // MSG_CMSG_CLOEXEC installs the descriptors close-on-exec, as VirtWL
+    // installs its own, so no program the process starts inherits them.
+    let bytes = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if bytes < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -677,6 +679,7 @@ mod tests {
     };
     use crate::test_support::{any_fd_has_identity, fd_identity, fds_with_identity, shm_pool_file};
     use crate::wire::{MessageBuilder, Outgoing};
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
     use nix::sys::memfd::{memfd_create, MFdFlags};
     use nix::sys::socket::{sendmsg, setsockopt, sockopt, ControlMessage, MsgFlags};
     use std::ffi::CString;
@@ -1184,6 +1187,23 @@ mod tests {
         assert_eq!((bytes, fds.len()), (1, 3));
         drop((file, fds));
         assert!(!any_fd_has_identity(identity));
+    }
+
+    /// A received descriptor is close-on-exec from the moment the kernel
+    /// installs it, so no program the process starts inherits a peer's
+    /// file.
+    #[test]
+    fn received_descriptors_close_on_exec() {
+        let (sender, receiver) = UnixStream::pair().expect("unix socket pair");
+        let file = memfd("sommelier-received-cloexec");
+        send_with_fds(&sender, &[file.as_raw_fd()]);
+
+        let (mut data, mut control) = ([0u8; 1], vec![0u8; 4096]);
+        let (_, fds) =
+            recv_unix_message(receiver.as_raw_fd(), &mut data, &mut control).expect("receive");
+        let [fd] = fds.try_into().expect("one descriptor");
+        let flags = FdFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFD).expect("F_GETFD"));
+        assert!(flags.contains(FdFlag::FD_CLOEXEC));
     }
 
     /// A control buffer with room for the credentials and two of three
