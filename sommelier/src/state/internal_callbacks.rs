@@ -45,6 +45,11 @@ pub(crate) enum InternalCallback {
     /// (`crate::keys::recovery`). The `done` decides
     /// it, as any host event that comes before it would.
     KeyRecovery,
+    /// The host has sent each registry the guest created before this sync
+    /// every global it had when the registry was created, so a guest
+    /// `wl_display.sync` that waits for the guest's globals
+    /// (`crate::handler::registry::globals_settled`) may know them all.
+    RegistryGlobals,
     /// Exo has handled a placement step of the toplevel of this host
     /// `zaura_toplevel` (`crate::handler::window_placement`), and sent the
     /// configures it causes.
@@ -84,6 +89,14 @@ impl InternalCallbacks {
         self.by_callback
             .values()
             .any(|waits_for| *waits_for == InternalCallback::DmabufCapabilities { global })
+    }
+
+    /// Whether a pending callback waits for a registry's globals
+    /// ([`InternalCallback::RegistryGlobals`]).
+    pub(crate) fn awaits_registry_globals(&self) -> bool {
+        self.by_callback
+            .values()
+            .any(|waits_for| *waits_for == InternalCallback::RegistryGlobals)
     }
 
     /// The pending callback that waits for `waits_for`, if any.

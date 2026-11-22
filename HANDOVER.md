@@ -93,6 +93,10 @@ has confirmed, then latent faults never seen, then test and code debt.
    - `Keymap::is_modifier` reads only layout 0, level 0.
    - The bindings watcher removes the watches of an arming attempt that
      started over, but no test reaches that race.
+   - On VirtWL without `--gpu-accel`, a guest that binds `wl_shm` and
+     syncs before the internal linux-dmabuf binding's formats arrive gets
+     those formats after the sync's `done` (`guest_shm_format_available`,
+     `handler/shm/formats.rs`); narrow and pre-existing.
    - Known limits stated with their rules:
      [a late owed buffer release](docs/INVARIANTS.md#surfaces-damage-and-shm)
      and [UTF-8 replacement growth](docs/INVARIANTS.md#wire-messages).
@@ -101,6 +105,14 @@ has confirmed, then latent faults never seen, then test and code debt.
    `zcr_extended_keyboard_v1` with its `delete_id` in the DST
    (`Display::unanswered`), and its pointers send no `wl_pointer.frame`:
    either would shift every DST schedule, so the shrunk regressions in
-   `sim/regressions.rs` would need deriving again.
+   `sim/regressions.rs` would need deriving again. Neither the DST nor
+   the fuzzer reaches a sync that waits for the globals
+   (`Parked::Globals`): their contexts have no render node, so only the
+   session tests of `handler::registry` and `proxy` cover it.
 6. **Optional code debt.** Move the SHM copy and dma-buf fence code out
    of `handler/compositor.rs` into the modules that own them.
+   With `--gpu-accel` and a render node, a sync after each `get_registry`
+   waits one extra host round trip
+   ([a sync's `done` follows the earlier registries' globals](docs/INVARIANTS.md#registry-globals)),
+   even when the dma-buf capabilities are already ready; skipping the
+   barrier then is an optional optimisation.

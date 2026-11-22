@@ -29,7 +29,7 @@ use crate::connection::OutgoingMessages;
 use crate::handler::Handlers;
 use crate::protocols::wayland::wl_keyboard;
 use crate::protocols::{self, AnyEvent, Iface};
-use crate::state::{Context, EventSender, FenceWait, GuestId, HostId, PostDispatch, SessionEnd};
+use crate::state::{Context, EventSender, GuestId, HostId, PostDispatch, SessionEnd, Wait};
 use crate::warn_once::WarnOnce;
 use crate::wire::{MessageHeader, Outgoing, ProtocolError, ToGuest, ToHost, WireMessage};
 
@@ -55,9 +55,10 @@ pub(super) enum Dispatched {
     Handled,
     /// It ends the session, and queued nothing of its own.
     Ends(SessionEnd),
-    /// It waits for a guest GPU fence, having changed nothing, and is to be
-    /// dispatched again (`Context::wait_for_fence`).
-    Waits(FenceWait),
+    /// It waits, for a guest GPU fence or the guest's globals, having
+    /// changed nothing, and is to be dispatched again
+    /// (`Context::wait_for_fence`, `Context::wait_for_globals`).
+    Waits(Wait),
 }
 
 /// What [`dispatch`] reports of one message.
@@ -252,13 +253,13 @@ pub(super) fn dispatch(
         }
     };
     let after_forward = ctx.take_post_dispatch();
-    // Only a guest request waits for a fence, and only one that takes no
+    // Only a guest request waits, and only one that takes no
     // descriptors and has no forward, output or deferred work: its
     // descriptors would be gone when it is dispatched again, and the rest
     // would be lost. A host event that waited would spin the loop. Any
     // other wait is a proxy bug, which ends the session before its deferred
     // work changes anything.
-    if ctx.waits_for_fence() && !ctx.is_fatal() {
+    if ctx.waits() && !ctx.is_fatal() {
         let broken = [
             (direction != Direction::ClientToHost, "it is a host event"),
             (fds.len() != queued_fds, "it took descriptors"),
@@ -270,7 +271,7 @@ pub(super) fn dispatch(
         .find_map(|(broken, why)| broken.then_some(why));
         if let Some(why) = broken {
             log::error!(
-                "A {direction:?} message from object {sender_id} waits for a fence, \
+                "A {direction:?} message from object {sender_id} waits, \
                  but {why}; ending the session"
             );
             ctx.end_session(SessionEnd::internal());
@@ -289,7 +290,7 @@ pub(super) fn dispatch(
     let effects = ctx.take_effects();
     let dispatched = match (effects.end, effects.wait) {
         (Some(end), _) => Dispatched::Ends(end),
-        // A message that waits for a fence changed nothing.
+        // A message that waits changed nothing.
         (None, Some(wait)) => Dispatched::Waits(wait),
         (None, None) => {
             commit(out, forward, effects.to_host, effects.to_guest);
@@ -314,7 +315,7 @@ pub(super) fn deliver(
 ) -> Option<SessionEnd> {
     crate::handler::data_control::deliver(ctx, delivery);
     let effects = ctx.take_effects();
-    debug_assert!(effects.wait.is_none(), "a delivery never waits for a fence");
+    debug_assert!(effects.wait.is_none(), "a delivery never waits");
     if effects.end.is_none() {
         commit(out, None, effects.to_host, effects.to_guest);
     }

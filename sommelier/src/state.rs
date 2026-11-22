@@ -128,9 +128,18 @@ pub(crate) struct Effects<'a> {
     pub(crate) to_host: std::vec::Drain<'a, ToHost>,
     pub(crate) to_guest: std::vec::Drain<'a, ToGuest>,
     pub(crate) end: Option<SessionEnd>,
-    /// The fence the message waits for before it can be dispatched again;
-    /// see [`Context::wait_for_fence`].
-    pub(crate) wait: Option<FenceWait>,
+    /// What the message waits for before it can be dispatched again; see
+    /// [`Context::wait_for_fence`] and [`Context::wait_for_globals`].
+    pub(crate) wait: Option<Wait>,
+}
+
+/// What a guest request waits for before it is dispatched again.
+#[derive(Debug)]
+pub(crate) enum Wait {
+    /// A guest GPU write ([`Context::wait_for_fence`]).
+    Fence(FenceWait),
+    /// The guest's registries' globals ([`Context::wait_for_globals`]).
+    Globals,
 }
 
 /// A guest GPU write that a message waits for ([`Context::wait_for_fence`]).
@@ -282,9 +291,9 @@ pub struct Context {
     /// Work deferred by the handler of the message being dispatched; see
     /// [`PostDispatch`].
     post_dispatch: Vec<PostDispatch>,
-    /// The fence the message being dispatched waits for, if it does; see
-    /// [`Self::wait_for_fence`].
-    fence_wait: Option<FenceWait>,
+    /// What the message being dispatched waits for, if it does; see
+    /// [`Self::wait_for_fence`] and [`Self::wait_for_globals`].
+    wait: Option<Wait>,
     /// The process's settings, shared by every connection.
     settings: Rc<Settings>,
     /// The process's virtio-gpu render node, shared by every client.
@@ -454,14 +463,26 @@ impl Context {
     /// descriptors would be gone by then.
     #[must_use = "a handler returns the Action::Drop"]
     pub(crate) fn wait_for_fence(&mut self, wait: FenceWait) -> Action {
-        self.fence_wait = Some(wait);
+        self.wait = Some(Wait::Fence(wait));
         Action::Drop
     }
 
-    /// Whether the message being dispatched waits for a fence (see
-    /// [`Self::wait_for_fence`]).
-    pub(crate) fn waits_for_fence(&self) -> bool {
-        self.fence_wait.is_some()
+    /// Have the message being dispatched, a guest `wl_display.sync`, wait
+    /// until the guest's registries have been sent their globals
+    /// (`crate::handler::registry::globals_settled`), as
+    /// [`Self::wait_for_fence`] has it wait for a fence: the proxy holds it
+    /// and every later message from the guest back, and dispatches it again
+    /// once a host event settles them.
+    #[must_use = "a handler returns the Action::Drop"]
+    pub(crate) fn wait_for_globals(&mut self) -> Action {
+        self.wait = Some(Wait::Globals);
+        Action::Drop
+    }
+
+    /// Whether the message being dispatched waits (see
+    /// [`Self::wait_for_fence`] and [`Self::wait_for_globals`]).
+    pub(crate) fn waits(&self) -> bool {
+        self.wait.is_some()
     }
 
     /// Take what the message just dispatched produced (see [`Effects`]).
@@ -470,7 +491,7 @@ impl Context {
             to_host: self.to_host.drain(..),
             to_guest: self.to_guest.drain(..),
             end: self.session_end.take(),
-            wait: self.fence_wait.take(),
+            wait: self.wait.take(),
         }
     }
 
@@ -837,7 +858,7 @@ impl Context {
             to_guest: Vec::new(),
             session_end: None,
             post_dispatch: Vec::new(),
-            fence_wait: None,
+            wait: None,
             settings,
             virtgpu,
             #[cfg(test)]

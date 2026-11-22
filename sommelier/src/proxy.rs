@@ -21,7 +21,7 @@ use crate::handler::data_control::{ClipboardHub, Mailbox};
 use crate::handler::security_context::{SandboxListener, SandboxListeners};
 use crate::placement_config::{self, PlacementConfig};
 use crate::settings::{HostTransport, Settings};
-use crate::state::{ConnectionFacts, Context, GuestId, HostId, SessionEnd};
+use crate::state::{ConnectionFacts, Context, GuestId, HostId, SessionEnd, Wait};
 use crate::trace::{Recorder, Stream, Traces};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::warn_once::WarnOnce;
@@ -104,9 +104,31 @@ impl Direction {
     }
 }
 
+/// A guest request that waits. It stays first in the guest stream's
+/// buffer, and the guest stream is neither read nor dispatched until the
+/// request is dispatched again.
+enum Parked {
+    /// It waits for a fence ([`Context::wait_for_fence`]).
+    Fence(ParkedRequest),
+    /// It waits for the guest's globals ([`Context::wait_for_globals`]),
+    /// which only host events settle: the host batch that settles them
+    /// releases it (`Client::handle_msgs`).
+    Globals,
+}
+
+impl Parked {
+    /// Resolve when `parked` is due to be dispatched again on its own, as a
+    /// fence's request is ([`ParkedRequest::due`]). Never resolves for
+    /// none, or for one that a host batch releases.
+    async fn due(parked: Option<&Self>) {
+        match parked {
+            Some(Self::Fence(request)) => request.due().await,
+            Some(Self::Globals) | None => std::future::pending().await,
+        }
+    }
+}
+
 /// A guest request that waits for a fence ([`Context::wait_for_fence`]).
-/// It stays first in the guest stream's buffer, and the guest stream is
-/// neither read nor dispatched until the request is dispatched again.
 struct ParkedRequest {
     fence: ParkedFence,
     /// When the session ends if the fence has not signalled. Dispatching
@@ -168,14 +190,11 @@ impl ParkedRequest {
         }
     }
 
-    /// Resolve when `parked` is due to be dispatched again: its fence may
-    /// have signalled, or its deadline has passed. Never resolves for none.
-    async fn due(parked: Option<&Self>) {
-        let Some(parked) = parked else {
-            return std::future::pending().await;
-        };
+    /// Resolve when the request is due to be dispatched again: its fence
+    /// may have signalled, or its deadline has passed.
+    async fn due(&self) {
         let fence = async {
-            match &parked.fence {
+            match &self.fence {
                 // An error, like readiness, sends the request back to its
                 // fence check, which tells them apart.
                 ParkedFence::Readable(fence) => {
@@ -186,7 +205,7 @@ impl ParkedRequest {
         };
         tokio::select! {
             () = fence => {}
-            () = tokio::time::sleep_until(parked.deadline) => {}
+            () = tokio::time::sleep_until(self.deadline) => {}
         }
     }
 }
@@ -199,8 +218,8 @@ struct Client {
     /// failed. No later batch dispatches anything, so the guest gets at most
     /// one error. A failed receive or a closed peer stops `run` without it.
     ended: bool,
-    /// The guest request waiting for a fence, if one is.
-    parked: Option<ParkedRequest>,
+    /// The guest request that waits, if one does.
+    parked: Option<Parked>,
     /// What the batches dispatched so far send each peer and have not sent
     /// yet, in the order they produced it (see [`Self::flush`]).
     to_host: OutgoingMessages<HostId>,
@@ -286,7 +305,7 @@ impl Client {
                         Err(_) => break,
                     }
                 }
-                () = ParkedRequest::due(self.parked.as_ref()) => {
+                () = Parked::due(self.parked.as_ref()) => {
                     if !self.handle_msgs(Direction::ClientToHost).await { break; }
                     prefer_host = true;
                 }
@@ -481,14 +500,14 @@ impl Client {
                     end = Some(session_end);
                     break;
                 }
-                // A message that waits for a fence changed nothing, so it
-                // stays buffered with everything after it, and is
-                // dispatched again when it is due. Nothing overtakes it.
-                dispatch::Dispatched::Waits(wait) => {
+                // A message that waits changed nothing, so it stays
+                // buffered with everything after it, and is dispatched
+                // again when it is due. Nothing overtakes it.
+                dispatch::Dispatched::Waits(Wait::Fence(wait)) => {
                     let now = Instant::now();
                     let timeout = wait.timeout;
                     let parked = match resumed {
-                        Some(parked) if offset == 0 => parked.wait_again(wait.fence),
+                        Some(Parked::Fence(parked)) if offset == 0 => parked.wait_again(wait.fence),
                         _ => ParkedRequest::new(wait.fence, now + timeout),
                     };
                     if now >= parked.deadline {
@@ -501,8 +520,12 @@ impl Client {
                         );
                         end = Some(SessionEnd::internal());
                     } else {
-                        self.parked = Some(parked);
+                        self.parked = Some(Parked::Fence(parked));
                     }
+                    break;
+                }
+                dispatch::Dispatched::Waits(Wait::Globals) => {
+                    self.parked = Some(Parked::Globals);
                     break;
                 }
             }
@@ -525,6 +548,13 @@ impl Client {
             trace.flush();
         }
 
+        // Host events may have settled the globals a parked sync waits for:
+        // the guest's stream goes on, from the sync.
+        if matches!(self.parked, Some(Parked::Globals))
+            && crate::handler::registry::globals_settled(&self.ctx)
+        {
+            self.parked = None;
+        }
         self.ctx.end_batch();
         // A session that ends rolls nothing back, so in tests every batch
         // that keeps it must leave no state behind an ended object.
@@ -2573,6 +2603,98 @@ mod tests {
         assert_eq!(s.guest_received(), []);
     }
 
+    /// `Client::run` holds a guest sync that waits for the guest's
+    /// globals, reads no more of the guest's stream while host events
+    /// flow, and dispatches the sync once the host batch that settles the
+    /// globals ends, after the proxy's binding of the linux-dmabuf global
+    /// the registry listed and its capability sync, so the guest gets the
+    /// global before the sync's `done`.
+    #[tokio::test]
+    async fn the_host_batch_that_settles_the_globals_releases_a_waiting_sync() {
+        use protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
+        use protocols::wayland::{wl_callback, wl_display, wl_registry};
+        let mut ctx = Context::new_for_test(true, false, Vec::new());
+        // Stands in for a virtio-gpu render node, which the proxy
+        // synthesizes dma-buf feedback for and a test cannot have.
+        ctx.dmabuf.set_feedback_available_for_test(true);
+        let mut s = Session::with_context(ctx);
+        let (registry, callback, later) = (s.new_id(), s.new_id(), s.new_id());
+        s.queue(
+            ClientToHost,
+            [
+                wl_display::req::get_registry(WL_DISPLAY_ID, registry),
+                wl_display::req::sync(WL_DISPLAY_ID, callback),
+                wl_display::req::sync(WL_DISPLAY_ID, later),
+            ],
+        );
+        let sync = |request: &(u32, AnyRequest)| match request {
+            (WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::Sync { callback })) => {
+                *callback
+            }
+            _ => panic!("{request:?} is no sync"),
+        };
+        let answer = |callback| {
+            [
+                wl_callback::evt::done(callback, 0),
+                wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+            ]
+        };
+        let done = |callback| {
+            [
+                (
+                    callback,
+                    wl_callback::Event::Done { callback_data: 0 }.into(),
+                ),
+                (
+                    WL_DISPLAY_ID,
+                    wl_display::Event::DeleteId { id: callback }.into(),
+                ),
+            ]
+        };
+
+        s.run(async |peers| {
+            let host = peers.host_received().await;
+            let [(WL_DISPLAY_ID, AnyRequest::WlDisplay(wl_display::Request::GetRegistry { registry: host_registry })), ref barrier] =
+                host[..]
+            else {
+                panic!("the host got {host:?}, not a get_registry and a sync");
+            };
+            let barrier = sync(barrier);
+            let global = wl_registry::evt::global(host_registry, 1, zwp_linux_dmabuf_v1::NAME, 4);
+            peers.host([global.unwrap()]);
+            peers.host(answer(barrier));
+            let mut host = Vec::new();
+            while host.len() < 4 {
+                host.extend(peers.host_received().await);
+            }
+            let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { ref id, .. })), ref capabilities, ref first, ref second] =
+                host[..]
+            else {
+                panic!("the host got {host:?}, not a bind and three syncs");
+            };
+            peers.host([zwp_linux_dmabuf_v1::evt::modifier(id.2, 0x3432_5258, 0, 0)]);
+            for callback in [capabilities, first, second] {
+                peers.host(answer(sync(callback)));
+            }
+            let mut received = Vec::new();
+            while received.len() < 5 {
+                received.extend(peers.guest_received().await);
+            }
+            let global = wl_registry::Event::Global {
+                name: 1,
+                interface: zwp_linux_dmabuf_v1::NAME.to_owned(),
+                version: 4,
+            };
+            let mut expected = vec![(registry, global.into())];
+            expected.extend(done(callback));
+            expected.extend(done(later));
+            assert_eq!(received, expected);
+        })
+        .await;
+        assert_eq!(s.host_received(), []);
+        assert_eq!(s.guest_received(), []);
+    }
+
     /// Host traffic must not postpone asking about a fence that gives no
     /// descriptor to wait on: the commit is forwarded within a few poll
     /// intervals of its fence signalling, while the host sends an event
@@ -2682,7 +2804,7 @@ mod tests {
         let mut parked = ParkedRequest::new(PendingFence::Busy, deadline);
         for millis in [2, 4, 8, 16, 16] {
             let start = Instant::now();
-            ParkedRequest::due(Some(&parked)).await;
+            parked.due().await;
             assert_eq!(start.elapsed(), Duration::from_millis(millis));
             parked = parked.wait_again(PendingFence::Busy);
         }
