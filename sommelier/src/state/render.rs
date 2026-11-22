@@ -553,7 +553,7 @@ impl Default for SurfaceCurrent {
         Self {
             content: None,
             buffer_scale: 1,
-            buffer_transform: Transform::Normal,
+            buffer_transform: Transform::default(),
             viewport: None,
         }
     }

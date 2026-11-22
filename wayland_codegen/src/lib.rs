@@ -340,18 +340,25 @@ mod tests {
         );
         assert!(
             output.contains(
-                "implTryFrom<u32>forTransform{typeError=u32;\
-                 fntry_from(value:u32)->Result<Self,u32>{matchvalue{0u32=>Ok(Self::Normal),"
-            ) && output.contains("7u32=>Ok(Self::Flipped270),_=>Err(value),}}}"),
+                "impl::core::convert::TryFrom<u32>forTransform{typeError=u32;\
+                 fntry_from(value:u32)->::core::result::Result<Self,u32>{matchvalue{\
+                 0u32=>::core::result::Result::Ok(Self::Normal),"
+            ) && output.contains(
+                "7u32=>::core::result::Result::Ok(Self::Flipped270),\
+                 _=>::core::result::Result::Err(value),}}}"
+            ),
             "a value the XML does not define does not decode, and comes back"
         );
         assert!(
-            output.contains("implFrom<Transform>foru32{fnfrom(value:Transform)->u32{valueasu32}}"),
+            output.contains(
+                "impl::core::convert::From<Transform>foru32{\
+                 fnfrom(value:Transform)->u32{valueasu32}}"
+            ),
             "a decoded value encodes back to its wire integer"
         );
         assert!(
-            output.contains("implTryFrom<i32>forTransform{typeError=i32;")
-                && output.contains("implFrom<Transform>fori32{"),
+            output.contains("impl::core::convert::TryFrom<i32>forTransform{typeError=i32;")
+                && output.contains("impl::core::convert::From<Transform>fori32{"),
             "an enum that an int argument carries also converts from and to i32"
         );
         assert!(
@@ -360,7 +367,8 @@ mod tests {
         );
         let shm = &wayland[wayland.find("pubmodwl_shm{").expect("wl_shm module")..];
         assert!(
-            !shm[..shm.find("pubmodreq{").expect("wl_shm encoders")].contains("implTryFrom<i32>"),
+            !shm[..shm.find("pubmodreq{").expect("wl_shm encoders")]
+                .contains("impl::core::convert::TryFrom<i32>"),
             "an enum no int argument carries converts from and to u32 alone"
         );
     }
@@ -538,6 +546,62 @@ mod tests {
         let protocol: crate::protocol::Protocol =
             quick_xml::de::from_str(xml).expect("Failed to parse XML");
         generator::generate(&protocol);
+    }
+
+    /// A bitfield gets no variants, so entries whose variants would collide
+    /// are no error.
+    #[test]
+    fn test_generate_a_bitfield_whose_variants_would_collide() {
+        let xml = r#"
+        <protocol name="flags">
+          <interface name="thing" version="1">
+            <enum name="mode" bitfield="true">
+              <entry name="one_two" value="1"/>
+              <entry name="one__two" value="2"/>
+            </enum>
+          </interface>
+        </protocol>
+        "#;
+        let protocol: crate::protocol::Protocol =
+            quick_xml::de::from_str(xml).expect("Failed to parse XML");
+        let compact = without_whitespace(&generator::generate(&protocol));
+        assert!(
+            compact.contains("pubconstMODE_ONE_TWO:u32=1u32;pubconstMODE_ONE__TWO:u32=2u32;"),
+            "a bitfield keeps its constants"
+        );
+    }
+
+    /// The generated conversions name the standard library's types by
+    /// their full paths, so an enum named `result` does not shadow them.
+    #[test]
+    fn test_generate_an_enum_named_after_a_prelude_type() {
+        let xml = r#"
+        <protocol name="prelude">
+          <interface name="thing" version="1">
+            <enum name="result">
+              <entry name="ok" value="0"/>
+            </enum>
+            <request name="ping">
+              <arg name="result" type="int" enum="result"/>
+            </request>
+          </interface>
+        </protocol>
+        "#;
+        let protocol: crate::protocol::Protocol =
+            quick_xml::de::from_str(xml).expect("Failed to parse XML");
+        let compact = without_whitespace(&generator::generate(&protocol));
+        let thing = &compact[compact.find("pubenumResult{").expect("the enum")..];
+        let conversions = &thing[..thing.find("pubmodreq{").expect("the encoders")];
+        assert!(
+            conversions.contains("::core::result::Result<Self,u32>"),
+            "the conversions return the standard Result: {conversions}"
+        );
+        for prelude in ["->Result<", "=>Ok(", "=>Err(", "implTryFrom<", "implFrom<"] {
+            assert!(
+                !conversions.contains(prelude),
+                "the conversions name {prelude} by a path an enum can shadow: {conversions}"
+            );
+        }
     }
 
     /// A handler gets its sender and every object argument as the object

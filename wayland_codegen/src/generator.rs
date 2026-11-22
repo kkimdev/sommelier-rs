@@ -1540,6 +1540,7 @@ fn generate_enum(
         quote! { u32 }
     };
     let enum_since = enumeration.since.unwrap_or(1);
+    let bitfield = enumeration.bitfield.as_deref() == Some("true");
     let mut constants = Vec::new();
     // Each value's variant and oldest version.
     let mut variants: BTreeMap<u32, (Ident, u32)> = BTreeMap::new();
@@ -1562,6 +1563,9 @@ fn generate_enum(
             quote! { #raw_value }
         };
         constants.push(quote! { pub const #name: #value_type = #value; });
+        if bitfield {
+            continue;
+        }
 
         let variant = variant_ident(&entry.name);
         assert!(
@@ -1582,7 +1586,7 @@ fn generate_enum(
             }
         }
     }
-    if enumeration.bitfield.as_deref() == Some("true") {
+    if bitfield {
         return quote! { #(#constants)* };
     }
     assert!(!variants.is_empty(), "{} has no entries", enumeration.name);
@@ -1599,16 +1603,18 @@ fn generate_enum(
     let sinces: Vec<_> = variants.values().map(|(_, since)| since).collect();
     let int_conversions = is_int.then(|| {
         quote! {
-            impl TryFrom<i32> for #type_name {
+            impl ::core::convert::TryFrom<i32> for #type_name {
                 type Error = i32;
-                fn try_from(value: i32) -> Result<Self, i32> {
-                    u32::try_from(value)
+                fn try_from(value: i32) -> ::core::result::Result<Self, i32> {
+                    <u32 as ::core::convert::TryFrom<i32>>::try_from(value)
                         .ok()
-                        .and_then(|value| Self::try_from(value).ok())
+                        .and_then(|value| {
+                            <Self as ::core::convert::TryFrom<u32>>::try_from(value).ok()
+                        })
                         .ok_or(value)
                 }
             }
-            impl From<#type_name> for i32 {
+            impl ::core::convert::From<#type_name> for i32 {
                 fn from(value: #type_name) -> i32 {
                     value as i32
                 }
@@ -1633,16 +1639,16 @@ fn generate_enum(
                 }
             }
         }
-        impl TryFrom<u32> for #type_name {
+        impl ::core::convert::TryFrom<u32> for #type_name {
             type Error = u32;
-            fn try_from(value: u32) -> Result<Self, u32> {
+            fn try_from(value: u32) -> ::core::result::Result<Self, u32> {
                 match value {
-                    #(#raw_values => Ok(Self::#variant_names),)*
-                    _ => Err(value),
+                    #(#raw_values => ::core::result::Result::Ok(Self::#variant_names),)*
+                    _ => ::core::result::Result::Err(value),
                 }
             }
         }
-        impl From<#type_name> for u32 {
+        impl ::core::convert::From<#type_name> for u32 {
             fn from(value: #type_name) -> u32 {
                 value as u32
             }
