@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use super::guest::{resolve_preedit_cursor, GuestTxn, Preedit};
-use super::mirror::{Applied, ExoMirror, ExoState, Health, Sent};
+use super::mirror::{Applied, ExoMirror, ExoState, Health, Key, Sent, Span};
 use super::state::{DeleteDrop, RegionDrop};
 use super::{BarrierToken, Edit, TiId, V1Pieces};
 use crate::wire::IndexedString;
@@ -53,6 +53,11 @@ pub(super) struct ExoView {
     edits: Edits,
     /// `edits` once the proxy had handled the guest's latest commit.
     at_commit: Edits,
+    /// Where a confirmation that took the guest out of step left it, the
+    /// key of its text and its cursor, while that is still the guest's
+    /// state: until Exo's next edit, a key or press forwarded to the guest,
+    /// or a new field ([`Self::finish`]).
+    confirmed: Option<(Key, usize)>,
     /// The reports on their way to Exo, oldest first, which the mirror
     /// also holds among its requests in flight, with what only the view
     /// knows of each.
@@ -108,12 +113,12 @@ pub(crate) enum Unmeasured {
 
 /// What reached the guest of one host edit.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Reached {
+pub(super) struct Reached<'a> {
     /// The bytes it deleted before the cursor, and whether it deleted any.
     pub(super) deleted_before: u32,
     pub(super) deleted: bool,
-    /// The length of the text it committed.
-    pub(super) committed: usize,
+    /// The text it committed.
+    pub(super) committed: &'a str,
     /// The guest showed a preedit before it.
     pub(super) shown_before: bool,
 }
@@ -130,6 +135,9 @@ pub(super) struct Observation {
     /// Whether that frame measures the edit, as the mirror found once it
     /// took the edit.
     measures: Result<(), Unmeasured>,
+    /// The edit is a confirmation, which leaves Exo's text as it was
+    /// (`OnConfirmCompositionText`).
+    confirm: bool,
     /// [`ExoView::finish`] took it, which a debug build checks it is
     /// dropped after.
     finished: bool,
@@ -187,6 +195,7 @@ impl ExoView {
             unseen: false,
             edits: Edits::default(),
             at_commit: Edits::default(),
+            confirmed: None,
             reports: VecDeque::new(),
             withheld_through: None,
             warned: false,
@@ -285,6 +294,7 @@ impl ExoView {
         Observation {
             frame,
             measures,
+            confirm: matches!(edit, Edit::Confirm { .. }),
             finished: false,
         }
     }
@@ -325,6 +335,13 @@ impl ExoView {
     /// anything did, and `shown`, the preedit the guest shows now: whether
     /// the edit's transaction keeps a guest in step with Exo if it was,
     /// which the new state records, and so whether the guest still is.
+    ///
+    /// A confirmation that takes the guest out of step, of a preedit Exo
+    /// no longer holds (E4) or with Exo's cursor inside the composition,
+    /// leaves Exo's text as it was and the guest's known: Exo's, with the
+    /// committed text in place of the composition, and the cursor after
+    /// it. The view keeps that place while nothing else edits the guest's
+    /// text, so that a report that resets Exo to it puts the guest in step.
     pub(super) fn finish(
         &mut self,
         mut observation: Observation,
@@ -343,14 +360,23 @@ impl ExoView {
                 .preedit
                 .start
                 .checked_sub(edit.deleted_before as usize)?;
-            Some(cursor + edit.committed)
+            Some(cursor + edit.committed.len())
         });
         let mirror = &mut self.mirror;
         let preedit = mirror.exact().and_then(|state| preedit_in(state, shown));
         let keeps = cursor.is_some_and(|cursor| preedit.map(|range| range.start) == Some(cursor));
+        let left = observation.measures.is_ok() && observation.confirm && !keeps;
+        self.confirmed = match (frame, edit, mirror.exact(), cursor) {
+            (Some(frame), Some(edit), Some(state), Some(cursor)) if left => {
+                let (text, Range { start, end }) = (&state.text, frame.preedit.clone());
+                let guest = [&text[..start], edit.committed, &text[end..]].concat();
+                Some((Key::of(&guest), cursor))
+            }
+            _ => None,
+        };
         self.in_step &= keeps;
         if let Some(edit) = edit {
-            self.edits.from_exo += u64::from(edit.deleted || edit.committed > 0);
+            self.edits.from_exo += u64::from(edit.deleted || !edit.committed.is_empty());
         }
         mirror.mark(keeps);
     }
@@ -361,6 +387,7 @@ impl ExoView {
     pub(super) fn guest_edited(&mut self) {
         self.edits.unseen += 1;
         self.unseen = true;
+        self.confirmed = None;
     }
 
     /// A guest commit stated no surrounding text: the guest still has the
@@ -375,6 +402,7 @@ impl ExoView {
     /// in step again.
     pub(super) fn step_lost(&mut self) {
         self.in_step = false;
+        self.confirmed = None;
     }
 
     /// The proxy has handled a guest commit.
@@ -440,7 +468,11 @@ impl ExoView {
     /// The barrier `token` is done. A report Exo processed puts the guest in
     /// step if it matched a state the guest is in step with, or reset Exo to
     /// the guest's text with no edit of Exo's since the guest's commit
-    /// before it; either with no other edit since the report.
+    /// before it, which the guest may not have had when it reported; either
+    /// with no other edit since the report. Or a report reset Exo to exactly
+    /// where a confirmation left the guest ([`Self::finish`]): that place is
+    /// the guest's state until anything else edits it, so Exo and the guest
+    /// are then alike, however old the report.
     pub(super) fn barrier_done(&mut self, ti: TiId, token: BarrierToken) {
         let mirror = &mut self.mirror;
         let health = mirror.health();
@@ -464,10 +496,14 @@ impl ExoView {
             Some(Applied::Matched { .. }) if superseded => {}
             Some(Applied::Matched { in_step }) => self.in_step = exact && in_step,
             Some(Applied::Reset { cursor }) => {
+                let placed = self.confirmed.is_some_and(|(key, at)| {
+                    let state = mirror.exact();
+                    state.is_some_and(|s| s.selection == Span::at(at) && Key::of(&s.text) == key)
+                });
+                let edited = self.edits.from_exo != since.from_exo;
                 // Exo dropped the composition a later withheld report took
                 // it to hold.
-                self.in_step =
-                    !superseded && exact && cursor && self.edits.from_exo == since.from_exo;
+                self.in_step = !superseded && exact && cursor && (!edited || placed);
                 mirror.mark(self.in_step);
             }
             Some(Applied::Cancel) | None => {}

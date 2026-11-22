@@ -197,7 +197,7 @@ text input before the gate, as each one changed Exo's text.
 The tests of H9 and X1:
 
 - H9. Row tests: `row_H9_an_absolute_delete_becomes_lengths_around_the_cursor`, `row_H9_a_delete_after_an_unreported_edit_lands_in_exos_text`, `row_H9_after_set_editable_selection_range_drops`, `row_H9_after_an_empty_region_with_exos_cursor_inside_drops`, `row_H9_after_a_dropped_region_drops`, `row_H9_after_a_delete_over_a_shown_preedit_drops`, `row_H9_a_field_that_states_no_text_drops`, `row_H9_after_a_forwarded_key_drops`, `row_H9_in_step_again_after_a_matched_report`, `row_H9_a_delete_that_heals_an_unsure_mirror_drops_as_unsure`.
-- X1. Row tests: `row_X1_a_preedit_region_turns_text_into_the_preedit`, `an_unmeasured_empty_region_commits_the_shown_preedit`, `row_H9_X1_a_dropped_delete_or_region_ends_the_lease`, `row_X1_a_region_after_an_unreported_commit_is_measured_in_exos_text`, `row_X1_a_region_after_an_e4_drop_holds_no_preedit`, `row_X1_a_region_made_before_a_report_is_measured_before_it`, `row_X1_a_region_crossing_a_guest_edit_drops`, `row_X1_a_mirror_that_is_not_exact_drops`, `row_X1_a_mirror_that_diverges_warns_once`, `row_X1_after_a_confirm_inside_the_composition_drops`. Tests: `on_set_preedit_region_translates_correctly`, `a_region_over_a_region_drops`, `a_region_over_a_host_preedit_is_measured_from_exos_cursor`, `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`, `a_region_that_does_not_cover_a_host_preedit_is_dropped`, `a_region_that_does_not_cover_the_shown_one_is_dropped`, `an_empty_region_over_a_held_preedit_commits_it`, `an_answer_that_cannot_repeat_the_preedit_forgets_it`.
+- X1. Row tests: `row_X1_a_preedit_region_turns_text_into_the_preedit`, `an_unmeasured_empty_region_commits_the_shown_preedit`, `row_H9_X1_a_dropped_delete_or_region_ends_the_lease`, `row_X1_a_region_after_an_unreported_commit_is_measured_in_exos_text`, `row_X1_a_region_after_an_e4_drop_holds_no_preedit`, `row_X1_a_report_of_a_confirmed_unheld_preedit_is_in_step`, `row_X1_a_region_made_before_a_report_is_measured_before_it`, `row_X1_a_region_crossing_a_guest_edit_drops`, `row_X1_a_mirror_that_is_not_exact_drops`, `row_X1_a_mirror_that_diverges_warns_once`, `row_X1_after_a_confirm_inside_the_composition_drops`. Tests: `on_set_preedit_region_translates_correctly`, `a_region_over_a_region_drops`, `a_region_over_a_host_preedit_is_measured_from_exos_cursor`, `a_region_after_a_host_preedit_deletes_only_what_the_guest_has`, `a_region_that_does_not_cover_a_host_preedit_is_dropped`, `a_region_that_does_not_cover_the_shown_one_is_dropped`, `an_empty_region_over_a_held_preedit_commits_it`, `an_answer_that_cannot_repeat_the_preedit_forgets_it`.
 
 ### 2.3 Cross-concern inputs and reconcile outcomes
 
@@ -427,7 +427,15 @@ most three tests that fail when it breaks.
     selection (`ime::exo_view::ExoView`). A key the proxy forwards to the
     guest (not a modifier, F5), a press, a dropped delete, or a
     transaction that left the guest's cursor elsewhere than Exo's, takes
-    it out of step until the guest's next report.
+    it out of step until the guest's next report. A report Exo matches
+    puts it in step at the state it names. One Exo resets to does so if
+    Exo sent the guest no edit since the guest's commit before it, which
+    the guest may not have had when it reported; or if it resets Exo to
+    exactly the text and cursor a confirmation left the guest with, as an
+    X2 of a preedit Exo no longer holds (E4) commits it in the guest
+    alone. That place is the guest's state after a measured confirmation
+    until Exo's next edit, a forwarded key or press, or a new field, so
+    such a report leaves Exo and the guest alike, however old it is.
   - While the guest is in step and the mirror exact, a delete or a region
     is measured in Exo's state before the event (H9, X1); otherwise it is
     dropped, with a debug log that names why
