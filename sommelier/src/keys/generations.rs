@@ -22,6 +22,7 @@ limitations under the License.
 use std::collections::BTreeMap;
 
 use crate::ime::{LeaseOutcome, TiId};
+use crate::protocols::wayland::wl_keyboard::KeyState;
 use crate::state::{serial_is_after, GuestId, HostId};
 
 /// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
@@ -702,7 +703,7 @@ impl KeyGenerationRegistry {
     /// either one closes physical state. Guest-delivery ownership remains until
     /// its corresponding channel consumes the release.
     #[cfg(test)]
-    pub(super) fn observe_physical_state(&mut self, keyboard: HostId, key: u32, state: u32) {
+    pub(super) fn observe_physical_state(&mut self, keyboard: HostId, key: u32, state: KeyState) {
         self.observe_physical_event(keyboard, key, state, None);
     }
 
@@ -710,12 +711,12 @@ impl KeyGenerationRegistry {
         &mut self,
         keyboard: HostId,
         key: u32,
-        state: u32,
+        state: KeyState,
         serial: Option<u32>,
     ) {
         match state {
-            1 => self.observe_physical_press(keyboard, key),
-            0 => {
+            KeyState::Pressed => self.observe_physical_press(keyboard, key),
+            KeyState::Released => {
                 if let Some(generation) = self
                     .entries
                     .get_mut(&keyboard)
@@ -757,7 +758,7 @@ impl KeyGenerationRegistry {
                 }
                 self.prune_key(keyboard, key);
             }
-            _ => {}
+            KeyState::Repeated => {}
         }
     }
 
@@ -896,7 +897,7 @@ impl KeyGenerationRegistry {
     }
 
     fn observe_peek_release(&mut self, keyboard: HostId, key: u32, serial: u32) {
-        self.observe_physical_event(keyboard, key, 0, Some(serial));
+        self.observe_physical_event(keyboard, key, KeyState::Released, Some(serial));
     }
 
     pub(super) fn invalidate_peek(&mut self, keyboard: HostId, key: u32) {
@@ -1057,13 +1058,12 @@ impl KeyGenerationRegistry {
         &mut self,
         keyboard: HostId,
         key: u32,
-        state: u32,
+        state: KeyState,
         serial: u32,
     ) -> KeyAdmission {
-        use crate::protocols::wayland::wl_keyboard::{KEY_STATE_PRESSED, KEY_STATE_RELEASED};
         let peek_press_serial = self.peek_press_serial(keyboard, key);
         match state {
-            KEY_STATE_RELEASED => {
+            KeyState::Released => {
                 if self.take_pending_physical_release(keyboard, key, serial) {
                     return KeyAdmission::Settled(KeyVerdict::Forward);
                 }
@@ -1074,7 +1074,7 @@ impl KeyGenerationRegistry {
                 }
                 self.observe_physical_event(keyboard, key, state, Some(serial));
             }
-            KEY_STATE_PRESSED => {
+            KeyState::Pressed => {
                 if self.physically_held(keyboard, key)
                     && peek_press_serial.is_some_and(|peek_serial| peek_serial != serial)
                 {
@@ -1086,8 +1086,8 @@ impl KeyGenerationRegistry {
                     self.observe_physical_event(keyboard, key, state, Some(serial));
                 }
             }
-            // The core drops any other state.
-            _ => {}
+            // The core drops a repeat.
+            KeyState::Repeated => {}
         }
         KeyAdmission::Current
     }

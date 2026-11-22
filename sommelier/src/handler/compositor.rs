@@ -19,14 +19,15 @@ use crate::handler::shm::{copy_surface_buffer, ShmCopyError};
 use crate::handler::window_placement;
 use crate::handler::Handlers;
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
+use crate::protocols::wayland::wl_output;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_shm;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
 use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler};
 use crate::state::{
-    is_valid_transform, BufferRect, Context, EventObject, EventSender, GuestId, HostId, Link,
-    RenderBufferUse, RequestObject, RequestSender, SurfaceMapping, SurfaceRect,
+    BufferRect, Context, EventObject, EventSender, GuestId, HostId, Link, RenderBufferUse,
+    RequestObject, RequestSender, SurfaceMapping, SurfaceRect,
 };
 use crate::wire::{Action, Destructor, ToHost};
 
@@ -273,7 +274,7 @@ impl WlSurfaceHandler for Handlers {
     }
 
     fn on_set_buffer_transform(ctx: &mut Context, sender: RequestSender, transform: i32) -> Action {
-        if !is_valid_transform(transform) {
+        let Ok(transform) = wl_output::Transform::try_from(transform) else {
             log::warn!(
                 "Rejecting invalid wl_surface buffer transform {}",
                 transform
@@ -283,7 +284,7 @@ impl WlSurfaceHandler for Handlers {
                 wl_surface::ERROR_INVALID_TRANSFORM,
                 "invalid wl_surface buffer transform",
             );
-        }
+        };
         let surface_id = sender.guest;
         let Some(surface) = ctx.surface_mut(surface_id) else {
             return ctx.missing_surface_state(surface_id);
@@ -1479,6 +1480,35 @@ mod tests {
             assert_eq!(s.guest_received_and_error(), (vec![], (surface.id, code)));
             assert_eq!(s.host_received(), []);
         }
+    }
+
+    /// `wl_surface.set_buffer_transform` decodes its transform once: every
+    /// value `wl_output.transform` does not define, on either side of its
+    /// entries, is the same `invalid_transform` error, and reaches no host,
+    /// while a defined one is forwarded as it came.
+    #[tokio::test]
+    async fn an_undefined_buffer_transform_is_invalid_transform() {
+        for transform in [i32::MIN, -1, 8, i32::MAX] {
+            let mut s = Session::new();
+            let surface = s.surface().await;
+            s.guest_fatal([wl_surface::req::set_buffer_transform(surface.id, transform)])
+                .await;
+            let error = (surface.id, wl_surface::ERROR_INVALID_TRANSFORM);
+            let diagnostic = "invalid wl_surface buffer transform".to_string();
+            assert_eq!(
+                s.guest_received_and_diagnosed_error(),
+                (vec![], error, diagnostic),
+                "transform {transform}"
+            );
+            assert_eq!(s.host_received(), []);
+        }
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let transform = wl_output::TRANSFORM_FLIPPED_270;
+        s.guest([wl_surface::req::set_buffer_transform(surface.id, transform)])
+            .await;
+        let forwarded = wl_surface::Request::SetBufferTransform { transform };
+        assert_eq!(s.host_received(), [(surface.host, forwarded.into())]);
     }
 
     /// An attach's offset applies to its commit only.
@@ -2865,7 +2895,8 @@ mod tests {
         // A peek of the keyboard on the replacement surface.
         crate::handler::keyboard::for_test::created(&mut ctx, 800, 900, 1);
         crate::handler::keyboard::for_test::extended(&mut ctx, 900, 950);
-        crate::handler::keyboard::for_test::peek(&mut ctx, 950, 1, 30, 1);
+        let pressed = wl_keyboard::KeyState::Pressed;
+        crate::handler::keyboard::for_test::peek(&mut ctx, 950, 1, 30, pressed);
         assert!(
             ctx.keys
                 .focus()

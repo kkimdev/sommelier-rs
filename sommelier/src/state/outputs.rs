@@ -23,32 +23,33 @@ limitations under the License.
 //! translate wire events into its methods.
 //!
 //! [`OutputState::work_area`] turns one output's metadata into logical
-//! screen coordinates. [`is_valid_transform`] and [`transformed_extent`] are
-//! the only statements of the `wl_output.transform` enum rules; surfaces'
-//! buffer transforms use them too.
+//! screen coordinates. [`transformed_extent`] is the only statement of the
+//! `wl_output.transform` enum's geometry; surfaces' buffer transforms use it
+//! too.
 
 use super::HostId;
 use crate::geometry::Rect;
-use crate::protocols::wayland::wl_output;
+use crate::protocols::wayland::wl_output::{self, Transform};
 use crate::protocols::Iface;
 use std::collections::BTreeMap;
 
-/// Whether `transform` is a `wl_output.transform` enum value.
-pub(crate) fn is_valid_transform(transform: i32) -> bool {
-    (wl_output::TRANSFORM_NORMAL..=wl_output::TRANSFORM_FLIPPED_270).contains(&transform)
+/// Width and height of a `width` x `height` extent after `transform`: the
+/// 90 and 270 degree rotations, flipped or not, swap the axes.
+pub(crate) fn transformed_extent(transform: Transform, width: i32, height: i32) -> (i32, i32) {
+    match transform {
+        Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
+            (height, width)
+        }
+        Transform::Normal | Transform::_180 | Transform::Flipped | Transform::Flipped180 => {
+            (width, height)
+        }
+    }
 }
 
-/// Width and height of a `width` x `height` extent after `transform`.
-///
-/// The odd enum values are the 90 and 270 degree rotations, flipped or not,
-/// and swap the axes; the even values keep them. `transform` must satisfy
-/// [`is_valid_transform`]: callers validate it on input, and other values
-/// give a meaningless result.
-pub(crate) fn transformed_extent(transform: i32, width: i32, height: i32) -> (i32, i32) {
-    if transform & 1 == 1 {
-        (height, width)
-    } else {
-        (width, height)
+/// A surface's buffer and an output start untransformed.
+impl Default for Transform {
+    fn default() -> Self {
+        Self::Normal
     }
 }
 
@@ -91,7 +92,7 @@ pub struct OutputState {
     /// the panel's mounting orientation. `zaura_output.logical_transform` is
     /// the active rotation alone, so it would leave a portrait-native panel
     /// in the wrong orientation; it is not used.
-    pub panel_transform: i32,
+    pub panel_transform: Transform,
     /// `zaura_output.insets`: work-area margins in logical screen
     /// coordinates, applied after rotation and scaling.
     pub insets_top: i32,
@@ -426,17 +427,21 @@ mod tests {
 
     #[test]
     fn transform_rules_follow_the_wl_output_enum() {
-        for transform in 0..=7 {
-            assert!(is_valid_transform(transform));
-            let swapped = matches!(transform, 1 | 3 | 5 | 7);
+        for value in 0..=7i32 {
+            let transform = Transform::try_from(value).expect("a wl_output.transform");
+            assert_eq!(i32::from(transform), value);
+            assert_eq!(Transform::try_from(value as u32), Ok(transform));
+            let swapped = matches!(value, 1 | 3 | 5 | 7);
             assert_eq!(
                 transformed_extent(transform, 4, 3),
                 if swapped { (3, 4) } else { (4, 3) },
-                "transform {transform}"
+                "transform {value}"
             );
         }
-        assert!(!is_valid_transform(-1));
-        assert!(!is_valid_transform(8));
+        assert_eq!(Transform::try_from(-1i32), Err(-1));
+        assert_eq!(Transform::try_from(8i32), Err(8));
+        assert_eq!(Transform::try_from(8u32), Err(8));
+        assert_eq!(Transform::try_from(u32::MAX), Err(u32::MAX));
     }
 
     #[test]
@@ -478,7 +483,7 @@ mod tests {
             mode_height: 2160,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1250),
-            panel_transform: 1,
+            panel_transform: Transform::_90,
             insets_top: 24,
             insets_left: 8,
             insets_bottom: 48,
@@ -532,7 +537,7 @@ mod tests {
             mode_height: 1080,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1000),
-            panel_transform: 1,
+            panel_transform: Transform::_90,
             ..Default::default()
         };
         assert_eq!(output.work_area(), Some(Rect::new(0, 0, 1080, 1920)));

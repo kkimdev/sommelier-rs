@@ -123,11 +123,11 @@ fn core(accelerators: &str, env: &TestEnv) -> KeyboardCore {
     core
 }
 
-fn key(key: u32, state: u32, serial: u32) -> KeyInput {
+fn key(key: u32, state: KeyState, serial: u32) -> KeyInput {
     key_on(KEYBOARD, key, state, serial)
 }
 
-fn key_on(keyboard: HostId, key: u32, state: u32, serial: u32) -> KeyInput {
+fn key_on(keyboard: HostId, key: u32, state: KeyState, serial: u32) -> KeyInput {
     KeyInput::Key {
         keyboard,
         serial,
@@ -136,11 +136,11 @@ fn key_on(keyboard: HostId, key: u32, state: u32, serial: u32) -> KeyInput {
     }
 }
 
-fn peek(key: u32, state: u32, serial: u32) -> KeyInput {
+fn peek(key: u32, state: KeyState, serial: u32) -> KeyInput {
     peek_on(EXTENDED, key, state, serial)
 }
 
-fn peek_on(extended: HostId, key: u32, state: u32, serial: u32) -> KeyInput {
+fn peek_on(extended: HostId, key: u32, state: KeyState, serial: u32) -> KeyInput {
     KeyInput::Peek {
         extended,
         serial,
@@ -177,7 +177,7 @@ fn a_bound_chord_is_consumed_for_its_subscriber_and_an_accelerator_is_the_hosts(
     let env = TestEnv::binding("<Alt>q");
     let mut keys = core("", &env);
     keys.step(modifiers(ALT), &env);
-    let press = keys.step(key(KEY_Q, KEY_STATE_PRESSED, 1), &env);
+    let press = keys.step(key(KEY_Q, KeyState::Pressed, 1), &env);
     let binding = BindingId::new(0);
     let shortcut = Shortcut {
         keyboard: KEYBOARD,
@@ -185,13 +185,13 @@ fn a_bound_chord_is_consumed_for_its_subscriber_and_an_accelerator_is_the_hosts(
     };
     assert_eq!(press.shortcut, Some(shortcut));
     assert_eq!((press.ack, press.deliver), (ack(1, true), false));
-    let release = keys.step(key(KEY_Q, KEY_STATE_RELEASED, 2), &env);
+    let release = keys.step(key(KEY_Q, KeyState::Released, 2), &env);
     assert_eq!(release.shortcut, None);
     assert_eq!((release.ack, release.deliver), (ack(2, true), false));
 
     let mut keys = core("<Alt>q", &env);
     keys.step(modifiers(ALT), &env);
-    let press = keys.step(key(KEY_Q, KEY_STATE_PRESSED, 1), &env);
+    let press = keys.step(key(KEY_Q, KeyState::Pressed, 1), &env);
     assert_eq!(press.shortcut, None);
     assert_eq!((press.ack, press.deliver), (ack(1, false), false));
 }
@@ -204,7 +204,7 @@ fn a_bound_chord_is_consumed_for_its_subscriber_and_an_accelerator_is_the_hosts(
 fn a_waiting_recovery_reads_each_host_event_before_it_is_handled() {
     let env = TestEnv::new();
     let mut keys = core("", &env);
-    keys.step(peek(EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 1), &env);
+    keys.step(peek(EVDEV_KEY_BACKSPACE, KeyState::Pressed, 1), &env);
     let seat = SeatId(SEAT);
     let confirm = KeyEffect::RecoverHeldKey { ti: TI, seat };
     assert!(keys.step(KeyInput::Ime(confirm), &env).sync);
@@ -214,7 +214,7 @@ fn a_waiting_recovery_reads_each_host_event_before_it_is_handled() {
     assert!(shift.recovered.is_none() && shift.deliver);
     assert!(keys.awaits_host_event());
 
-    let press = keys.step(key(KEY_A, KEY_STATE_PRESSED, 2), &env);
+    let press = keys.step(key(KEY_A, KeyState::Pressed, 2), &env);
     let Some(Recovered { ti, pair }) = press.recovered else {
         panic!("the press recovers the held key first");
     };
@@ -233,7 +233,7 @@ fn a_chord_the_guest_already_received_stays_the_guests() {
     let unbound = TestEnv::new();
     let mut keys = core("", &unbound);
     keys.step(modifiers(ALT), &unbound);
-    keys.step(peek(KEY_Q, KEY_STATE_PRESSED, 1), &unbound);
+    keys.step(peek(KEY_Q, KeyState::Pressed, 1), &unbound);
     let seat = SeatId(SEAT);
     let confirm = KeyEffect::RecoverHeldKey { ti: TI, seat };
     keys.step(KeyInput::Ime(confirm), &unbound);
@@ -241,7 +241,7 @@ fn a_chord_the_guest_already_received_stays_the_guests() {
     assert!(recovered.is_some_and(|recovered| recovered.pair.len() == 2));
 
     let bound = TestEnv::binding("<Alt>q");
-    let press = keys.step(key(KEY_Q, KEY_STATE_PRESSED, 1), &bound);
+    let press = keys.step(key(KEY_Q, KeyState::Pressed, 1), &bound);
     assert_eq!(press.shortcut, None);
     assert!(
         !press.deliver,
@@ -252,7 +252,7 @@ fn a_chord_the_guest_already_received_stays_the_guests() {
         Some(GuestKeyOwner::ImeRecovery)
     );
     // The recovered pair is already balanced.
-    let release = keys.step(key(KEY_Q, KEY_STATE_RELEASED, 2), &bound);
+    let release = keys.step(key(KEY_Q, KeyState::Released, 2), &bound);
     assert!(release.shortcut.is_none() && !release.deliver);
 }
 
@@ -260,7 +260,7 @@ fn a_chord_the_guest_already_received_stays_the_guests() {
 /// core leased to [`TI`].
 fn leased_backspace(env: &TestEnv) -> KeyboardCore {
     let mut keys = core("", env);
-    keys.step(peek(EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 1), env);
+    keys.step(peek(EVDEV_KEY_BACKSPACE, KeyState::Pressed, 1), env);
     let lease = KeyEffect::Lease {
         ti: TI,
         seat: SeatId(SEAT),
@@ -286,12 +286,12 @@ fn a_backspace_release_or_a_focus_change_ends_the_seats_lease() {
     let release = |keys: &mut KeyboardCore, peeked: bool| {
         let (press, release) = match peeked {
             true => (
-                peek_on(OTHER_EXTENDED, EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 5),
-                peek_on(OTHER_EXTENDED, EVDEV_KEY_BACKSPACE, KEY_STATE_RELEASED, 6),
+                peek_on(OTHER_EXTENDED, EVDEV_KEY_BACKSPACE, KeyState::Pressed, 5),
+                peek_on(OTHER_EXTENDED, EVDEV_KEY_BACKSPACE, KeyState::Released, 6),
             ),
             false => (
-                key_on(OTHER, EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 5),
-                key_on(OTHER, EVDEV_KEY_BACKSPACE, KEY_STATE_RELEASED, 6),
+                key_on(OTHER, EVDEV_KEY_BACKSPACE, KeyState::Pressed, 5),
+                key_on(OTHER, EVDEV_KEY_BACKSPACE, KeyState::Released, 6),
             ),
         };
         keys.step(press, &env);
@@ -312,7 +312,7 @@ fn a_backspace_release_or_a_focus_change_ends_the_seats_lease() {
     // nothing and stays.
     let mut keys = core("", &env);
     keys.step(
-        peek_on(OTHER_EXTENDED, EVDEV_KEY_BACKSPACE, KEY_STATE_PRESSED, 1),
+        peek_on(OTHER_EXTENDED, EVDEV_KEY_BACKSPACE, KeyState::Pressed, 1),
         &env,
     );
     let lease = KeyEffect::Lease {
@@ -337,7 +337,7 @@ fn a_backspace_release_or_a_focus_change_ends_the_seats_lease() {
 fn a_focus_change_ends_the_seats_peek_watermarks() {
     let env = TestEnv::new();
     let mut keys = core("", &env);
-    keys.step(peek(KEY_A, KEY_STATE_PRESSED, 1), &env);
+    keys.step(peek(KEY_A, KeyState::Pressed, 1), &env);
     assert!(keys.latest_peek_sequence(SEAT, Some(SURFACE)).is_some());
     let leave = KeyInput::Leave {
         keyboard: KEYBOARD,
@@ -377,7 +377,7 @@ fn an_unhandled_key_of_the_announcing_keyboard_is_its_press() {
         confirm(&mut keys, &env);
         keys.step(KeyInput::UnhandledModifiers, &env);
         assert!(keys.awaits_host_event(), "modifiers leave it waiting");
-        keys.step(peek_on(OTHER_EXTENDED, KEY_A, KEY_STATE_PRESSED, 7), &env);
+        keys.step(peek_on(OTHER_EXTENDED, KEY_A, KeyState::Pressed, 7), &env);
         assert!(keys.awaits_host_event());
         let keyboard = dropped_on;
         let fx = keys.step(KeyInput::UnhandledKey { keyboard }, &env);

@@ -51,7 +51,7 @@ pub use self::objects::{
     ShadowTable,
 };
 pub use self::outputs::OutputState;
-pub(crate) use self::outputs::{is_valid_transform, OutputRegistry, INERT_BIND_INTERFACE};
+pub(crate) use self::outputs::{OutputRegistry, INERT_BIND_INTERFACE};
 pub(crate) use self::registries::RegistryRecord;
 pub(crate) use self::render::{
     BufferRect, BufferSpace, BufferState, CommitPlan, DamageRegion, Rect, RenderBufferLifecycle,

@@ -323,6 +323,48 @@ mod tests {
         );
     }
 
+    /// An enum that is not a bitfield is a Rust enum with one variant per
+    /// value, decoded from the wire integer, which an undefined value
+    /// comes back as, and encoded back to it.
+    #[test]
+    fn test_generate_typed_enums_from_protocol_xml() {
+        let wayland = generate_compact("wayland.xml");
+        let output = &wayland[wayland.find("pubmodwl_output{").expect("wl_output module")..];
+        assert!(
+            output.contains(
+                "#[repr(u32)]pubenumTransform{Normal=0u32,_90=1u32,_180=2u32,_270=3u32,\
+                 Flipped=4u32,Flipped90=5u32,Flipped180=6u32,Flipped270=7u32,}"
+            ),
+            "one variant per entry, named in camel case, after an underscore \
+             when the entry starts with a digit"
+        );
+        assert!(
+            output.contains(
+                "implTryFrom<u32>forTransform{typeError=u32;\
+                 fntry_from(value:u32)->Result<Self,u32>{matchvalue{0u32=>Ok(Self::Normal),"
+            ) && output.contains("7u32=>Ok(Self::Flipped270),_=>Err(value),}}}"),
+            "a value the XML does not define does not decode, and comes back"
+        );
+        assert!(
+            output.contains("implFrom<Transform>foru32{fnfrom(value:Transform)->u32{valueasu32}}"),
+            "a decoded value encodes back to its wire integer"
+        );
+        assert!(
+            output.contains("implTryFrom<i32>forTransform{typeError=i32;")
+                && output.contains("implFrom<Transform>fori32{"),
+            "an enum that an int argument carries also converts from and to i32"
+        );
+        assert!(
+            !output.contains("pubstructMode") && !output.contains("pubenumMode"),
+            "a bitfield keeps its constants alone"
+        );
+        let shm = &wayland[wayland.find("pubmodwl_shm{").expect("wl_shm module")..];
+        assert!(
+            !shm[..shm.find("pubmodreq{").expect("wl_shm encoders")].contains("implTryFrom<i32>"),
+            "an enum no int argument carries converts from and to u32 alone"
+        );
+    }
+
     #[test]
     fn test_generate_enum_since_from_protocol_xml() {
         let xdg_shell = generate_compact("xdg-shell.xml");
@@ -330,24 +372,18 @@ mod tests {
             .find("pubmodxdg_toplevel{")
             .expect("xdg_toplevel module")..];
         assert!(
-            toplevel
-                .contains("pubfnstate_since(value:u32)->Option<u32>{matchvalue{1u32=>Some(1u32),"),
+            toplevel.contains("pubconstfnsince(self)->u32{matchself{Self::Maximized=>1u32,"),
             "an entry without since exists from version 1"
         );
         assert!(
-            toplevel.contains("9u32=>Some(6u32),"),
+            toplevel.contains("Self::Suspended=>6u32,"),
             "an entry's since attribute is its version"
-        );
-        assert!(
-            toplevel.contains("_=>None,"),
-            "a value the XML does not define has no version"
         );
 
         let extension = generate_compact("text-input-extension-unstable-v1.xml");
+        let input_type = &extension[extension.find("pubenumInputType").expect("InputType")..];
         assert!(
-            extension.contains(
-                "pubfninput_type_since(value:u32)->Option<u32>{matchvalue{0u32=>Some(2u32),"
-            ),
+            input_type.contains("matchself{Self::None=>2u32,"),
             "an entry inherits its enum's since attribute"
         );
     }
@@ -453,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_one_since_arm_per_enum_value() {
+    fn test_generate_an_alias_as_a_constant_of_its_variant() {
         let xml = r#"
         <protocol name="aliases">
           <interface name="thing" version="3">
@@ -473,9 +509,35 @@ mod tests {
             "every entry keeps its constant"
         );
         assert!(
-            compact.contains("matchvalue{1u32=>Some(1u32),2u32=>Some(2u32),_=>None,}"),
-            "a shared value has one arm, with the older version"
+            compact.contains("pubenumMode{Old=1u32,Other=2u32,}"),
+            "a shared value has one variant, the first entry's"
         );
+        assert!(
+            compact.contains("pubconstNewName:Self=Self::Old;"),
+            "a later entry of the value names its variant"
+        );
+        assert!(
+            compact.contains("matchself{Self::Old=>1u32,Self::Other=>2u32,}"),
+            "a shared value's version is the older one"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "mode generates the variant OneTwo twice")]
+    fn test_generate_rejects_colliding_variant_names() {
+        let xml = r#"
+        <protocol name="collision">
+          <interface name="thing" version="1">
+            <enum name="mode">
+              <entry name="one_two" value="0"/>
+              <entry name="one__two" value="1"/>
+            </enum>
+          </interface>
+        </protocol>
+        "#;
+        let protocol: crate::protocol::Protocol =
+            quick_xml::de::from_str(xml).expect("Failed to parse XML");
+        generator::generate(&protocol);
     }
 
     /// A handler gets its sender and every object argument as the object

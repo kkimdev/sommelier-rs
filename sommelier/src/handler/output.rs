@@ -29,9 +29,7 @@ use crate::protocols::aura_shell::zaura_output::{self, ZauraOutputHandler};
 use crate::protocols::wayland::wl_output;
 use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::ZxdgOutputManagerV1Handler;
 use crate::protocols::Iface;
-use crate::state::{
-    is_valid_transform, Context, EventSender, GuestId, HostId, RequestObject, RequestSender,
-};
+use crate::state::{Context, EventSender, GuestId, HostId, RequestObject, RequestSender};
 use crate::wire::{Action, Destructor};
 
 /// Host `wl_output` events feed [`crate::state::OutputRegistry`] and are
@@ -52,15 +50,15 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for Handlers {
         transform: i32,
     ) -> Action {
         let host_output_id = sender.host;
-        let valid_transform = is_valid_transform(transform);
+        let decoded = wl_output::Transform::try_from(transform);
         let live = ctx.outputs.update(host_output_id, |output| {
             output.origin_x = x;
             output.origin_y = y;
-            if valid_transform {
+            if let Ok(transform) = decoded {
                 output.panel_transform = transform;
             }
         });
-        if live && !valid_transform {
+        if live && decoded.is_err() {
             log::warn!(
                 "Ignoring invalid wl_output.transform={} for host output {}",
                 transform,
@@ -675,6 +673,45 @@ mod tests {
         output.insets(-1, 2, 3, 4).await;
         assert!(output.done().await);
         assert_eq!(output.work_area().await, inset);
+    }
+
+    /// A `wl_output.geometry` whose transform `wl_output.transform` does not
+    /// define reaches the guest as it came and moves the output, which keeps
+    /// the panel transform it had.
+    #[tokio::test]
+    async fn an_undefined_panel_transform_is_forwarded_and_ignored() {
+        let mut output = Screen::new(3).await;
+        // `transform.270`, which swaps the native mode's axes.
+        assert!(output.geometry((0, 0), 3).await);
+        output.placeable().await;
+        assert_eq!(output.work_area().await, Some(Rect::new(0, 0, 1080, 1920)));
+        for transform in [-1, 8] {
+            let host = output.docked.output.host;
+            let geometry = wl_output::evt::geometry(host, 5, 7, 0, 0, 0, "", "", transform);
+            output.d.s.host([geometry.unwrap()]).await;
+            assert_eq!(output.d.s.host_received(), []);
+            let forwarded = wl_output::Event::Geometry {
+                x: 5,
+                y: 7,
+                physical_width: 0,
+                physical_height: 0,
+                subpixel: 0,
+                make: String::new(),
+                model: String::new(),
+                transform,
+            };
+            let guest_output = output.docked.output.id;
+            assert_eq!(
+                output.d.s.guest_received(),
+                [(guest_output, forwarded.into())]
+            );
+            assert!(output.done().await);
+            assert_eq!(
+                output.work_area().await,
+                Some(Rect::new(5, 7, 1080, 1920)),
+                "transform {transform}"
+            );
+        }
     }
 
     #[tokio::test]

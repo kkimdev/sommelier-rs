@@ -121,6 +121,33 @@ async fn held_backspace_repeats_over_committed_korean_without_preedit() {
     assert_eq!(kb.key(700, BACKSPACE, PRESSED).await, Route::Host);
 }
 
+/// A key whose state `wl_keyboard.key_state` does not define is a host
+/// event like any other to a waiting recovery, which it decides, while it
+/// reaches no peer itself.
+#[tokio::test]
+async fn an_undefined_key_state_decides_a_waiting_recovery() {
+    let mut kb = Kb::new().await;
+    let ime = kb.text_input().await;
+    kb.peek(700, 100, BACKSPACE, PRESSED).await;
+    kb.s.host([zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0)])
+        .await;
+    let [(_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
+        kb.s.host_received()[..]
+    else {
+        panic!("the recovery does not wait");
+    };
+    assert_eq!(kb.s.guest_received(), []);
+    kb.s.host([wl_keyboard::evt::key(kb.k.host, 701, 101, KEY_A, 3)])
+        .await;
+    assert_eq!(
+        kb.s.guest_received(),
+        recovered(ime, kb.k, 700, 100, BACKSPACE)
+    );
+    kb.s.host([wl_callback::evt::done(callback, 0)]).await;
+    assert_eq!(kb.s.guest_received(), []);
+    assert_eq!(kb.s.host_received(), []);
+}
+
 #[tokio::test]
 async fn empty_confirmation_recovers_any_repeatable_ime_consumed_key() {
     for held in [BACKSPACE, KEY_TAB, KEY_ENTER, KEY_SPACE] {

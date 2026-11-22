@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::protocols::wayland::wl_output;
+use crate::protocols::wayland::wl_output::Transform;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
@@ -293,7 +293,7 @@ const FIXED_ONE: i32 = 256;
 pub struct SurfaceMapping {
     /// The buffer's width and height in pixels, or `None` without a buffer.
     buffer: Option<(i32, i32)>,
-    transform: i32,
+    transform: Transform,
     scale: i32,
     viewport: ViewportState,
 }
@@ -346,7 +346,7 @@ impl SurfaceMapping {
     /// `rect` damages the whole surface, which over-damages as the protocol
     /// allows.
     pub fn to_surface(&self, rect: BufferRect) -> SurfaceRect {
-        if self.transform != wl_output::TRANSFORM_NORMAL {
+        if self.transform != Transform::Normal {
             return self.surface_rect();
         }
         let ((source_x, source_y, source_width, source_height), (width, height)) =
@@ -371,7 +371,7 @@ impl SurfaceMapping {
         if let Some(scale) = self.integer_scale() {
             return Some(rect.scaled(scale));
         }
-        if self.transform != wl_output::TRANSFORM_NORMAL {
+        if self.transform != Transform::Normal {
             return None;
         }
         let ((source_x, source_y, source_width, source_height), (width, height)) =
@@ -412,8 +412,7 @@ impl SurfaceMapping {
     }
 
     fn integer_scale(&self) -> Option<i32> {
-        let only_scaled =
-            self.transform == wl_output::TRANSFORM_NORMAL && self.viewport.is_identity();
+        let only_scaled = self.transform == Transform::Normal && self.viewport.is_identity();
         only_scaled.then_some(self.scale)
     }
 }
@@ -543,7 +542,7 @@ struct SurfaceCurrent {
     /// stays valid for damage mapping.
     content: Option<SurfaceContentSnapshot>,
     buffer_scale: i32,
-    buffer_transform: i32,
+    buffer_transform: Transform,
     /// The surface's `wp_viewport`, if it has one; an unset viewport is an
     /// identity mapping.
     viewport: Option<ViewportState>,
@@ -554,7 +553,7 @@ impl Default for SurfaceCurrent {
         Self {
             content: None,
             buffer_scale: 1,
-            buffer_transform: 0,
+            buffer_transform: Transform::Normal,
             viewport: None,
         }
     }
@@ -609,7 +608,7 @@ struct SurfacePending {
     /// Damage expressed in buffer pixel coordinates.
     buffer_damage: DamageRegion<BufferSpace>,
     buffer_scale: Option<i32>,
-    buffer_transform: Option<i32>,
+    buffer_transform: Option<Transform>,
     /// The pending buffer offset, which attach(x, y) carries. The SHM
     /// bridge does not currently transform surface damage through a
     /// non-zero offset, so the commit path conservatively performs a
@@ -718,8 +717,8 @@ impl SurfaceState {
         self.pending.buffer_scale = Some(scale);
     }
 
-    /// `wl_surface.set_buffer_transform` to a valid `transform`.
-    pub(crate) fn set_buffer_transform(&mut self, transform: i32) {
+    /// `wl_surface.set_buffer_transform` to `transform`.
+    pub(crate) fn set_buffer_transform(&mut self, transform: Transform) {
         self.pending.buffer_transform = Some(transform);
     }
 
@@ -1269,7 +1268,9 @@ impl RenderBufferRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferRect, SurfaceCurrent, SurfaceMapping, SurfaceRect, ViewportState};
+    use super::{
+        BufferRect, SurfaceCurrent, SurfaceMapping, SurfaceRect, Transform, ViewportState,
+    };
 
     /// New host copies are counted for a second, then reported together,
     /// and the next second's count begins.
@@ -1321,7 +1322,7 @@ mod tests {
     fn viewed(
         buffer: Option<(i32, i32)>,
         scale: i32,
-        transform: i32,
+        transform: Transform,
         source: (i32, i32, i32, i32),
     ) -> SurfaceMapping {
         let current = SurfaceCurrent {
@@ -1341,23 +1342,25 @@ mod tests {
         const ONE: i32 = 256;
         // At scale 2 an 8x6 buffer is a 4x3 surface, the source's units.
         let whole = (0, 0, 4 * ONE, 3 * ONE);
-        assert!(viewed(Some((8, 6)), 2, 0, whole).source_fits_buffer());
+        assert!(viewed(Some((8, 6)), 2, Transform::Normal, whole).source_fits_buffer());
         let shifted = (ONE / 2, 0, 4 * ONE, 3 * ONE);
-        assert!(!viewed(Some((8, 6)), 2, 0, shifted).source_fits_buffer());
+        assert!(!viewed(Some((8, 6)), 2, Transform::Normal, shifted).source_fits_buffer());
         // A smaller buffer under the same source.
-        assert!(!viewed(Some((6, 6)), 2, 0, whole).source_fits_buffer());
+        assert!(!viewed(Some((6, 6)), 2, Transform::Normal, whole).source_fits_buffer());
         // A 90-degree transform makes the surface 3x4.
-        assert!(viewed(Some((8, 6)), 2, 1, (0, 0, 3 * ONE, 4 * ONE)).source_fits_buffer());
-        assert!(!viewed(Some((8, 6)), 2, 1, whole).source_fits_buffer());
+        assert!(
+            viewed(Some((8, 6)), 2, Transform::_90, (0, 0, 3 * ONE, 4 * ONE)).source_fits_buffer()
+        );
+        assert!(!viewed(Some((8, 6)), 2, Transform::_90, whole).source_fits_buffer());
         // An odd buffer at scale 2 ends at a fractional unit, 3.5x2.5,
         // which the source may reach exactly but not pass.
         let edge = (0, 0, 3 * ONE + ONE / 2, 2 * ONE + ONE / 2);
-        assert!(viewed(Some((7, 5)), 2, 0, edge).source_fits_buffer());
+        assert!(viewed(Some((7, 5)), 2, Transform::Normal, edge).source_fits_buffer());
         let past = (1, 0, 3 * ONE + ONE / 2, 2 * ONE + ONE / 2);
-        assert!(!viewed(Some((7, 5)), 2, 0, past).source_fits_buffer());
+        assert!(!viewed(Some((7, 5)), 2, Transform::Normal, past).source_fits_buffer());
         // Without a buffer the source has nothing to leave.
         let huge = (0, 0, 100 * ONE, 100 * ONE);
-        assert!(viewed(None, 2, 0, huge).source_fits_buffer());
+        assert!(viewed(None, 2, Transform::Normal, huge).source_fits_buffer());
     }
 
     /// Buffer pixel `pixel`'s image along one axis, computed exactly: its

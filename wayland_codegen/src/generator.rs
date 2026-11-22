@@ -17,7 +17,7 @@ limitations under the License.
 use crate::protocol::*;
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, btree_map};
 
 /// The string arguments that other arguments index by byte offset, as
 /// `(interface, message, argument)`. Every other string decodes to a
@@ -1516,11 +1516,19 @@ fn int_enums(protocol: &Protocol) -> HashSet<(String, String)> {
 }
 
 /// Generate one constant per enum entry, named `<ENUM>_<ENTRY>` inside the
-/// interface module (libwayland's `<INTERFACE>_<ENUM>_<ENTRY>`), and
-/// `<enum>_since`, the interface version that introduced a value, or `None`
-/// for a value the XML does not define. Two entries with one value make one
-/// `_since` arm, with the older version. For a bitfield, `_since` knows each
-/// single flag, not their combinations.
+/// interface module (libwayland's `<INTERFACE>_<ENUM>_<ENTRY>`): the wire
+/// value, which a message the proxy forwards or builds carries as it is.
+///
+/// An enum that is not a bitfield also gets its decoded type, a Rust enum
+/// named after it (`wl_output::Transform`) with one variant per value
+/// (`Flipped90`; `_90` for an entry that starts with a digit). A handler
+/// that interprets a value decodes it once with `TryFrom` the wire integer,
+/// which returns the integer back when the XML does not define it, so a
+/// decoded value is always one the XML defines. `From` gives the wire
+/// integer back, and `since` the interface version that introduced the
+/// value. An entry with an earlier entry's value is an associated constant
+/// of that variant, whose `since` is the older version. A bitfield keeps its
+/// constants alone: every combination of its flags is a value.
 fn generate_enum(
     enumeration: &Enum,
     is_int: bool,
@@ -1533,7 +1541,10 @@ fn generate_enum(
     };
     let enum_since = enumeration.since.unwrap_or(1);
     let mut constants = Vec::new();
-    let mut since_by_value = BTreeMap::new();
+    // Each value's variant and oldest version.
+    let mut variants: BTreeMap<u32, (Ident, u32)> = BTreeMap::new();
+    let mut aliases = Vec::new();
+    let mut taken_variants = HashSet::new();
     for item in &enumeration.items {
         let EnumItem::Entry(entry) = item else {
             continue;
@@ -1550,23 +1561,104 @@ fn generate_enum(
         } else {
             quote! { #raw_value }
         };
-        let since = entry.since.unwrap_or(enum_since);
         constants.push(quote! { pub const #name: #value_type = #value; });
-        let (_, oldest) = since_by_value.entry(raw_value).or_insert((value, since));
-        *oldest = since.min(*oldest);
-    }
-    let since_arms = since_by_value
-        .into_values()
-        .map(|(value, since)| quote! { #value => Some(#since), });
-    let since_fn = format_ident!("{}_since", enumeration.name);
-    quote! {
-        #(#constants)*
-        pub fn #since_fn(value: #value_type) -> Option<u32> {
-            match value {
-                #(#since_arms)*
-                _ => None,
+
+        let variant = variant_ident(&entry.name);
+        assert!(
+            taken_variants.insert(variant.to_string()),
+            "{} generates the variant {} twice",
+            enumeration.name,
+            variant
+        );
+        let since = entry.since.unwrap_or(enum_since);
+        match variants.entry(raw_value) {
+            btree_map::Entry::Vacant(vacant) => {
+                vacant.insert((variant, since));
+            }
+            btree_map::Entry::Occupied(mut occupied) => {
+                let (first, oldest) = occupied.get_mut();
+                *oldest = since.min(*oldest);
+                aliases.push(quote! { pub const #variant: Self = Self::#first; });
             }
         }
+    }
+    if enumeration.bitfield.as_deref() == Some("true") {
+        return quote! { #(#constants)* };
+    }
+    assert!(!variants.is_empty(), "{} has no entries", enumeration.name);
+
+    let type_name = format_ident!("{}", snake_to_camel(&enumeration.name));
+    assert!(
+        !["Request", "Event"].contains(&type_name.to_string().as_str()),
+        "the enum {} names the module's {} type",
+        enumeration.name,
+        type_name
+    );
+    let raw_values: Vec<_> = variants.keys().collect();
+    let variant_names: Vec<_> = variants.values().map(|(variant, _)| variant).collect();
+    let sinces: Vec<_> = variants.values().map(|(_, since)| since).collect();
+    let int_conversions = is_int.then(|| {
+        quote! {
+            impl TryFrom<i32> for #type_name {
+                type Error = i32;
+                fn try_from(value: i32) -> Result<Self, i32> {
+                    u32::try_from(value)
+                        .ok()
+                        .and_then(|value| Self::try_from(value).ok())
+                        .ok_or(value)
+                }
+            }
+            impl From<#type_name> for i32 {
+                fn from(value: #type_name) -> i32 {
+                    value as i32
+                }
+            }
+        }
+    });
+    quote! {
+        #(#constants)*
+        // The XML names the variants.
+        #[allow(clippy::enum_variant_names)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(u32)]
+        pub enum #type_name {
+            #(#variant_names = #raw_values,)*
+        }
+        impl #type_name {
+            #(#aliases)*
+            /// The interface version that introduced this value.
+            pub const fn since(self) -> u32 {
+                match self {
+                    #(Self::#variant_names => #sinces,)*
+                }
+            }
+        }
+        impl TryFrom<u32> for #type_name {
+            type Error = u32;
+            fn try_from(value: u32) -> Result<Self, u32> {
+                match value {
+                    #(#raw_values => Ok(Self::#variant_names),)*
+                    _ => Err(value),
+                }
+            }
+        }
+        impl From<#type_name> for u32 {
+            fn from(value: #type_name) -> u32 {
+                value as u32
+            }
+        }
+        #int_conversions
+    }
+}
+
+/// The variant of enum entry `name`: its camel case, after an underscore if
+/// it starts with a digit, which no identifier can.
+fn variant_ident(name: &str) -> Ident {
+    let camel = snake_to_camel(name);
+    if camel.starts_with(|c: char| c.is_ascii_digit()) {
+        format_ident!("_{}", camel)
+    } else {
+        format_ident!("{}", camel)
     }
 }
 
