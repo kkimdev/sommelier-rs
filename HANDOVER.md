@@ -109,10 +109,8 @@ has confirmed, then latent faults never seen, then test and code debt.
    the fuzzer reaches a sync that waits for the globals
    (`Parked::Globals`): their contexts have no render node, so only the
    session tests of `handler::registry` and `proxy` cover it.
-6. **Optional code debt.** Move the SHM copy and dma-buf fence code out
-   of `handler/compositor.rs` into the modules that own them.
-   With `--gpu-accel` and a render node, a sync after each `get_registry`
-   waits one extra host round trip
+6. **Optional code debt.** With `--gpu-accel` and a render node, a sync
+   after each `get_registry` waits one extra host round trip
    ([a sync's `done` follows the earlier registries' globals](docs/INVARIANTS.md#registry-globals)),
    even when the dma-buf capabilities are already ready; skipping the
    barrier then is an optional optimisation.

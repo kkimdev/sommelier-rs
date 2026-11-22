@@ -38,6 +38,7 @@ limitations under the License.
 use super::{Context, DeletedHostId, GuestId, HostId, Link, ObjectData};
 use crate::handler::{
     compositor, data_control, keyboard, linux_dmabuf, output, pointer, registry, text_input,
+    viewport, xdg_shell,
 };
 use crate::protocols::wayland::wl_display;
 use crate::protocols::Iface;
@@ -182,7 +183,7 @@ fn forget_object(
     match data {
         ObjectData::DmabufFactory(factory) => linux_dmabuf::forget_factory(ctx, factory),
         ObjectData::DmabufFeedback(feedback) => linux_dmabuf::forget_feedback(ctx, guest, feedback),
-        ObjectData::Viewport(viewport) => compositor::forget_viewport(ctx, viewport),
+        ObjectData::Viewport(viewport) => viewport::forget_viewport(ctx, viewport),
         ObjectData::DataControlSource(source) => data_control::forget_source(ctx, source),
         ObjectData::None
         | ObjectData::Shm(_)
@@ -210,8 +211,8 @@ fn forget_object(
             | Iface::WlSurface,
             None,
         ) => {}
-        (Iface::XdgSurface, _) => compositor::forget_xdg_surface(ctx, guest),
-        (Iface::XdgToplevel, _) => compositor::forget_xdg_toplevel(ctx, guest),
+        (Iface::XdgSurface, _) => xdg_shell::forget_xdg_surface(ctx, guest),
+        (Iface::XdgToplevel, _) => xdg_shell::forget_xdg_toplevel(ctx, guest),
         (Iface::ZwpTextInputV3, _) => text_input::forget_text_input(ctx, guest, host_deleted),
         (Iface::WlDataOffer, Some(host)) => data_control::forget_host_offer(ctx, host),
         // No state of their own outside their entry, or none that ends
@@ -323,7 +324,7 @@ impl Context {
         }
         // A viewport's or GTK surface's link to its wl_surface ends with
         // that surface.
-        for (_, viewport) in table.data_of::<crate::handler::compositor::Viewport>() {
+        for (_, viewport) in table.data_of::<crate::handler::viewport::Viewport>() {
             if let Some(surface) = viewport.surface_for_test() {
                 guest("viewport link", surface, Iface::WlSurface);
             }

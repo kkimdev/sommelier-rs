@@ -14,157 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::allocator::DmabufFence;
 use crate::handler::aura_objects;
-use crate::handler::shm::{copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout};
+use crate::handler::shm::{copy_surface_buffer, ShmCopyError};
 use crate::handler::window_placement;
 use crate::handler::Handlers;
-use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_shm;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
 use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler};
-use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
-    is_valid_transform, BufferRect, BufferSpace, BufferState, Context, DamageRegion, EventObject,
-    EventSender, FenceWait, GuestId, HostId, HostMapping, Link, PostDispatch, RenderBufferUse,
-    RequestObject, RequestSender, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect,
-    SurfaceState,
+    is_valid_transform, BufferRect, Context, EventObject, EventSender, GuestId, HostId, Link,
+    RenderBufferUse, RequestObject, RequestSender, SurfaceMapping, SurfaceRect,
 };
-use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Destructor, ToHost};
-use log::trace;
-use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::Arc;
-
-/// RAII guard for the VirtWL dma-buf CPU-write interval.
-///
-/// A copy can fail while reading the guest pool or while validating a damage
-/// rectangle. Keeping the matching END ioctl in `Drop` prevents a panic or a
-/// future early-return path from leaving the host dma-buf permanently locked.
-struct DmabufWriteSync<'a> {
-    channel: &'a crate::virtwl_channel::VirtWaylandChannel,
-    fd: BorrowedFd<'a>,
-    ended: bool,
-}
-
-impl<'a> DmabufWriteSync<'a> {
-    fn begin(
-        channel: Option<&'a Arc<crate::virtwl_channel::VirtWaylandChannel>>,
-        fd: Option<BorrowedFd<'a>>,
-    ) -> Option<Self> {
-        let channel = channel?;
-        let fd = fd?;
-        channel
-            .sync(
-                fd,
-                crate::virtwl::DMA_BUF_SYNC_START | crate::virtwl::DMA_BUF_SYNC_WRITE,
-            )
-            .map(|()| Self {
-                channel,
-                fd,
-                ended: false,
-            })
-            .map_err(|error| {
-                log::warn!("VirtWL dma-buf begin-write sync failed: {}", error);
-            })
-            .ok()
-    }
-
-    fn end(mut self) -> bool {
-        self.ended = true;
-        match self.channel.sync(
-            self.fd,
-            crate::virtwl::DMA_BUF_SYNC_END | crate::virtwl::DMA_BUF_SYNC_WRITE,
-        ) {
-            Ok(()) => true,
-            Err(error) => {
-                log::warn!("VirtWL dma-buf end-write sync failed: {}", error);
-                false
-            }
-        }
-    }
-}
-
-impl Drop for DmabufWriteSync<'_> {
-    fn drop(&mut self) {
-        if !self.ended {
-            if let Err(error) = self.channel.sync(
-                self.fd,
-                crate::virtwl::DMA_BUF_SYNC_END | crate::virtwl::DMA_BUF_SYNC_WRITE,
-            ) {
-                log::warn!(
-                    "VirtWL dma-buf end-write sync failed while unwinding: {}",
-                    error
-                );
-            }
-            self.ended = true;
-        }
-    }
-}
-
-/// The fence a commit of native buffer `guest_buffer_id` waits for while
-/// the guest GPU still writes the buffer, checked without waiting.
-fn pending_native_fence(
-    ctx: &mut Context,
-    guest_buffer_id: GuestId,
-) -> std::io::Result<Option<FenceWait>> {
-    if ctx.native_buffer_uses_implicit_sync(guest_buffer_id) {
-        return Ok(None);
-    }
-    let Some(planes) = ctx.native_buffer_sync_fds(guest_buffer_id) else {
-        return Ok(None);
-    };
-    // A buffer has at most four planes.
-    let plane_count = planes.len() as u32;
-    let mut needs_implicit_sync = false;
-    for plane in planes {
-        match plane_fence(ctx, plane.as_fd())? {
-            DmabufFence::Signalled => {}
-            DmabufFence::Pending(fence) => {
-                let timeout = fence.timeout() * plane_count;
-                return Ok(Some(FenceWait { fence, timeout }));
-            }
-            DmabufFence::ImplicitSyncFallback => {
-                needs_implicit_sync = true;
-                break;
-            }
-        }
-    }
-
-    if needs_implicit_sync {
-        if !ctx.enable_native_buffer_implicit_sync(guest_buffer_id) {
-            return Err(std::io::Error::other(
-                "native dma-buf disappeared while enabling implicit synchronization",
-            ));
-        }
-        log::warn!(
-            "Native dma-buf synchronization ioctls are unavailable for guest buffer {}; using implicit synchronization",
-            guest_buffer_id
-        );
-    }
-    Ok(None)
-}
-
-/// Whether the guest GPU has finished writing one plane of a native buffer.
-fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> std::io::Result<DmabufFence> {
-    #[cfg(test)]
-    if let Some(stand_in) = ctx.plane_fences_for_test {
-        use crate::allocator::PendingFence;
-        use crate::state::PlaneFenceForTest;
-        return Ok(
-            match crate::allocator::sync_file_fence(plane.try_clone_to_owned()?)? {
-                DmabufFence::Pending(_) if matches!(stand_in, PlaneFenceForTest::Busy) => {
-                    DmabufFence::Pending(PendingFence::Busy)
-                }
-                fence => fence,
-            },
-        );
-    }
-    crate::allocator::dmabuf_fence(plane, ctx.virtgpu())
-}
 
 impl WlCompositorHandler for Handlers {
     fn on_create_surface(ctx: &mut Context, _sender: RequestSender, id: GuestId) -> Action {
@@ -173,49 +37,9 @@ impl WlCompositorHandler for Handlers {
     }
 }
 
-pub(crate) fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String {
-    format!("org.chromium.guest_os.{}.wayland.{}", vm_identifier, app_id)
-}
-
-/// Record the XDG role of a forwarded `xdg_surface.get_toplevel`
-/// ([`PostDispatch::XdgToplevelCreated`]). Running only after the forward
-/// avoids stale application/surface state when validation rejects the
-/// request. The placement Aura toplevel is attached only after the role is
-/// recorded, so it never exists for a rejected request, and the forward
-/// has mapped the toplevel's host ID that it extends.
-pub(crate) fn record_xdg_toplevel(
-    ctx: &mut Context,
-    xdg_surface_guest_id: GuestId,
-    xdg_toplevel_guest_id: GuestId,
-) {
-    debug_assert!(
-        ctx.shadow_table
-            .get_host_id(xdg_toplevel_guest_id)
-            .is_some(),
-        "a forwarded get_toplevel has mapped its new ID"
-    );
-    if ctx
-        .xdg_roles
-        .add_toplevel(xdg_surface_guest_id, xdg_toplevel_guest_id)
-        .is_some()
-    {
-        window_placement::attach_toplevel(ctx, xdg_toplevel_guest_id);
-    }
-}
-
-/// The size of the buffer `state` shows, which outlives a destroyed
-/// `wl_buffer`, or `None` without one.
-fn shown_buffer_size(ctx: &Context, state: &SurfaceState) -> Option<(i32, i32)> {
-    state
-        .current_buffer_id()
-        .and_then(|buffer_id| ctx.buffer_dimensions(buffer_id))
-        .or(state.current_buffer_dimensions())
-}
-
 /// Log, once per surface, `problem`: a viewport rule the proxy leaves
 /// unenforced, as Exo does (see INVARIANTS, "Protocol errors"). Called once
-/// the commit can no longer roll back, which would clear the flag and repeat
-/// the log on every frame.
+/// the commit has gone through, so a dropped commit logs nothing.
 fn log_unenforced_viewport_rule(
     ctx: &mut Context,
     surface_id: GuestId,
@@ -264,144 +88,18 @@ fn log_new_host_copy(ctx: &mut Context, surface_id: GuestId, bytes: u64) {
     }
 }
 
-/// Build the host damage requests and the commit for one guest commit, or
-/// `None` when the surface has no host object. The host takes surface-local
-/// damage only, so buffer damage goes through `mapping`.
-fn build_surface_commit_messages(
-    ctx: &Context,
-    surface_id: GuestId,
-    surface_damage: &[SurfaceRect],
-    buffer_damage: &[BufferRect],
-    mapping: &SurfaceMapping,
-    force_full_damage: bool,
-) -> Option<Vec<ToHost>> {
-    let host_surface_id = ctx.shadow_table.get_host_id(surface_id)?;
-    let mut damage: Vec<SurfaceRect> = Vec::new();
-    if force_full_damage {
-        damage.push(mapping.surface_rect());
-    }
-    damage.extend(surface_damage.iter().map(|&rect| rect.outset()));
-    damage.extend(buffer_damage.iter().map(|&rect| mapping.to_surface(rect)));
-
+/// The host requests of a commit of host surface `host_surface` with
+/// surface-local `damage`: the damage, then the commit.
+fn host_commit(host_surface: HostId, damage: &[SurfaceRect]) -> Vec<ToHost> {
     // The host compositor treats damage as a unioned region. Coalescing here
     // keeps a GTK frame with many overlapping requests from becoming a long
     // sequence of redundant Wayland messages as well as redundant copies.
-    let mut messages: Vec<ToHost> = crate::handler::shm::coalesce_damage_rects(&damage)
+    let mut messages: Vec<ToHost> = crate::handler::shm::coalesce_damage_rects(damage)
         .into_iter()
-        .map(|rect| {
-            wl_surface::req::damage(host_surface_id, rect.x, rect.y, rect.width, rect.height)
-        })
+        .map(|rect| wl_surface::req::damage(host_surface, rect.x, rect.y, rect.width, rect.height))
         .collect();
-    messages.push(wl_surface::req::commit(host_surface_id));
-    Some(messages)
-}
-
-/// The buffer whose host copy `commit` refreshes before it reaches the host.
-///
-/// An attached buffer always is. A commit without an attach still damages
-/// the surface's current buffer, which the host samples again, so the SHM
-/// Commit Copy Invariant refreshes its copy too, while the host holds the
-/// buffer. Once the host has released it, the client owns the storage and
-/// may be drawing its next frame there (`wl_buffer.release`): reading it
-/// could tear, and the host no longer samples it.
-fn buffer_to_copy(ctx: &Context, commit: &SurfaceCommit) -> Option<GuestId> {
-    match commit.attachment {
-        SurfaceAttachment::Attach(buffer_id) => Some(buffer_id),
-        SurfaceAttachment::Unchanged => commit
-            .state
-            .current_buffer_id()
-            .filter(|&buffer_id| ctx.buffer_is_submitted(buffer_id)),
-        SurfaceAttachment::Detach => None,
-    }
-}
-
-/// Copy what a locally bridged SHM buffer's host copy lacks before it is
-/// shown on `surface_id`.
-///
-/// Native linux-dmabuf buffers have no local copy state and are immediately
-/// ready. Stale pixels are cleared only by a successful copy, so a failed
-/// one loses nothing; it still stales the whole host copy, as a
-/// conservative reset after the host storage misbehaved.
-fn copy_surface_buffer(
-    ctx: &mut Context,
-    surface_id: GuestId,
-    buffer_id: GuestId,
-) -> Result<(), ShmCopyError> {
-    let Some(host_id) = ctx.render_buffer_host_id(buffer_id) else {
-        return Ok(());
-    };
-    let Some(resources) = ctx.local_buffer_copy_resources(host_id) else {
-        return Ok(());
-    };
-    let buffer = resources.buffer;
-    let damage = buffer.stale.to_copy_on(surface_id);
-    // Nothing to copy needs no dma-buf sync either. Skipping it also keeps
-    // a commit without damage, such as one that acknowledges a configure,
-    // from being dropped when the host storage misbehaves.
-    if !damage_reaches_buffer(damage, buffer) {
-        buffer.stale.copied_on(surface_id);
-        return Ok(());
-    }
-    let result = copy_to_host_storage(buffer, resources.channel, damage);
-    match &result {
-        Ok(()) => {
-            buffer.stale.copied_on(surface_id);
-            // A 4K frame can reach this path every refresh. Keep the
-            // per-frame diagnostic at trace level.
-            trace!(
-                "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
-                 width={}, height={}, format={:#010x}, buffer.offset={}, \
-                 host_copy_size={}",
-                buffer.dest_stride,
-                buffer.stride,
-                buffer.width,
-                buffer.height,
-                buffer.format,
-                buffer.offset,
-                buffer.host_copy.as_ref().map_or(0, HostMapping::len)
-            );
-        }
-        Err(error) => {
-            log::warn!("SHM copy for guest buffer {} failed: {}", buffer_id, error);
-            buffer.stale.invalidate();
-        }
-    }
-    result
-}
-
-/// Copy `damage` from `buffer`'s pool into its host storage, inside the
-/// VirtWL dma-buf CPU-write interval when the storage needs one.
-fn copy_to_host_storage(
-    buffer: &BufferState,
-    channel: Option<&Arc<VirtWaylandChannel>>,
-    damage: &DamageRegion<BufferSpace>,
-) -> Result<(), ShmCopyError> {
-    let Some(layout) = ShmCopyLayout::for_buffer(buffer) else {
-        return Err(ShmCopyError::Destination);
-    };
-    let sync_guard = if buffer.dmabuf_sync {
-        let fd = buffer.dmabuf_fd.as_ref().map(AsFd::as_fd);
-        let Some(guard) = DmabufWriteSync::begin(channel, fd) else {
-            log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
-            return Err(ShmCopyError::Destination);
-        };
-        Some(guard)
-    } else {
-        None
-    };
-    let result = if let Some(host_copy) = &buffer.host_copy {
-        copy_shm_damage(&buffer.pool_file, host_copy, layout, damage)
-    } else {
-        // Both backings map their storage when the buffer is created, so
-        // only a test fixture without a mapping reaches this.
-        Err(ShmCopyError::Destination)
-    };
-    let sync_ended = sync_guard.is_none_or(DmabufWriteSync::end);
-    result.and(if sync_ended {
-        Ok(())
-    } else {
-        Err(ShmCopyError::Destination)
-    })
+    messages.push(wl_surface::req::commit(host_surface));
+    messages
 }
 
 /// Release the host Aura objects of a wl_surface that is ending: the Aura
@@ -451,11 +149,7 @@ pub(crate) fn forget_surface(
     // Pending-only objects do not receive a host release event. Retire
     // every buffer made eligible by removing this surface in one pass.
     crate::handler::buffer::retire_eligible_buffers(ctx);
-    for (_, viewport) in ctx.shadow_table.data_of_mut::<Viewport>() {
-        if viewport.surface == Some(wl_surface_guest_id) {
-            viewport.surface = None;
-        }
-    }
+    crate::handler::viewport::forget_wl_surface(ctx, wl_surface_guest_id);
     ctx.pointer_focus.forget_surface(wl_surface_guest_id);
     // Surface destruction can race the host's wl_keyboard.leave event. The
     // keyboard core moves the focus off the surface first, and the IME core
@@ -598,22 +292,21 @@ impl WlSurfaceHandler for Handlers {
         Action::Forward
     }
 
+    /// Execute the commit's plan (`SurfaceState::plan_commit`), which
+    /// changes the surface only once the commit goes through.
     fn on_commit(ctx: &mut Context, sender: RequestSender) -> Action {
         let surface_id = sender.guest;
+        let Some(surface) = ctx.surface(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        let plan = surface.plan_commit(|buffer| ctx.shown_buffer(buffer));
 
-        // A native dma-buf's fence belongs to the contents an attach
-        // submits, so an attach(NULL) or damage-only commit waits for
-        // nothing, as in ChromiumOS Sommelier, whose sync point is set at
-        // attach. The wait comes before the commit changes anything.
-        let attached = ctx
-            .surface(surface_id)
-            .and_then(SurfaceState::pending_buffer_id);
-        if let Some(buffer_id) = attached {
+        if let Some(buffer_id) = plan.fence {
             // Wait for guest GPU writes before the host compositor samples
             // the buffer, matching ChromiumOS Sommelier's sync_point path,
             // but without stalling the event loop: the commit is
             // dispatched again once its fence may have signalled.
-            match pending_native_fence(ctx, buffer_id) {
+            match crate::handler::linux_dmabuf::pending_fence(ctx, buffer_id) {
                 Ok(None) => {}
                 Ok(Some(wait)) => return ctx.wait_for_fence(wait),
                 // wl_surface.commit has no recoverable failure response.
@@ -626,64 +319,31 @@ impl WlSurfaceHandler for Handlers {
                 }
             }
         }
-
-        let Some(surface) = ctx.surface_mut(surface_id) else {
-            return ctx.missing_surface_state(surface_id);
-        };
-        let commit = surface.prepare_commit();
-        let attached_buffer_id = commit.attached_buffer_id();
-        let copied_buffer_id = buffer_to_copy(ctx, &commit);
-
-        let shown_buffer = shown_buffer_size(ctx, &commit.state);
-        let mapping = commit.state.mapping(shown_buffer);
-        // wp_viewport.bad_size and out_of_buffer are deliberately not raised:
-        // Exo accepts both, so ending the session would break apps that work
-        // today. They are logged instead, once the commit is final.
-        let viewport_problem = if commit.has_invalid_fractional_viewport() {
-            Some("a fractional wp_viewport source without a destination")
-        } else if !mapping.source_fits_buffer() {
-            Some("a wp_viewport source outside its buffer")
-        } else {
-            None
-        };
-        let attached_full_mapping =
-            attached_buffer_id.is_some() && (commit.moves_buffer() || !mapping.is_identity());
-        // `None`: full damage, which sends the whole surface instead of
-        // any rectangle.
-        let damage = commit
-            .surface_damage
-            .rects()
-            .zip(commit.buffer_damage.rects());
-        let (surface_damage, buffer_damage) = damage.unwrap_or_default();
-        ctx.stale_surface_pixels(surface_id, &commit, &mapping);
-        // A buffer that copies everything shows the host a whole new image.
-        let needs_full_damage = copied_buffer_id
-            .and_then(|buffer_id| ctx.local_buffer(buffer_id))
-            .is_some_and(|buffer| buffer.stale.to_copy_on(surface_id).is_full());
-        let force_full_damage = needs_full_damage
-            || damage.is_none()
-            || (commit.buffer_offset != (0, 0)
-                && (!surface_damage.is_empty() || !buffer_damage.is_empty()))
-            || (attached_full_mapping && surface_damage.is_empty() && buffer_damage.is_empty());
-        let Some(host_messages) = build_surface_commit_messages(
-            ctx,
-            surface_id,
-            surface_damage,
-            buffer_damage,
-            &mapping,
-            force_full_damage,
-        ) else {
+        let Some(host_surface) = ctx.shadow_table.get_host_id(surface_id) else {
             return ctx.fail(format_args!(
                 "Cannot commit wl_surface {surface_id} without its host object"
             ));
         };
+
+        // Staling only adds pixels to copy, so a commit dropped below
+        // leaves nothing wrong behind.
+        ctx.stale_surface_pixels(surface_id, &plan);
+        // A buffer that copies everything shows the host a whole new image.
+        let copies_in_full = plan
+            .copy
+            .and_then(|buffer_id| ctx.local_buffer(buffer_id))
+            .is_some_and(|buffer| buffer.stale.to_copy_on(surface_id).is_full());
+        let Some(surface) = ctx.surface(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        let host_messages = host_commit(host_surface, &surface.host_damage(&plan, copies_in_full));
 
         // A SHM-backed buffer is copied into host storage before the host
         // commit is queued. Forwarding the commit first would let the host
         // compositor sample stale or uninitialised pixels if dma-buf sync
         // or the copy fails. A failed copy stales the whole host
         // copy, so a later commit retries the complete image.
-        if let Some(buffer_id) = copied_buffer_id {
+        if let Some(buffer_id) = plan.copy {
             if let Err(error) = copy_surface_buffer(ctx, surface_id, buffer_id) {
                 match error {
                     // The client broke its pool, for example by truncating
@@ -701,38 +361,25 @@ impl WlSurfaceHandler for Handlers {
                         surface_id
                     ),
                 }
-                if let Some(surface) = ctx.surface_mut(surface_id) {
-                    commit.rollback(surface);
-                }
+                // The surface is unchanged: its pending state stays
+                // pending, as on the host, which never gets this commit.
                 crate::handler::buffer::retire_eligible_buffers(ctx);
                 return Action::Drop;
             }
         }
 
-        if let Some((previous_buffer, next_buffer)) = commit.attachment_transition() {
-            // The pending replacement has now passed every copy and fence
-            // check. Apply its content snapshot and both buffer lifecycle
-            // edges before appending any host message. The registry
-            // validates both generations before changing either one, so a
-            // failed replacement remains completely rollback-safe.
+        if let Some((previous_buffer, next_buffer)) = plan.attachment {
+            // The attachment has passed every copy and fence check. Its
+            // buffers' lifecycle edges change before any host message is
+            // appended; the registry validates both generations before
+            // changing either.
             let new_host_copy =
                 next_buffer.and_then(|buffer_id| new_host_copy_size(ctx, buffer_id));
-            let snapshot_updated = match next_buffer {
-                Some(buffer_id) => {
-                    let dimensions = ctx.buffer_dimensions(buffer_id);
-                    ctx.surface_mut(surface_id).is_some_and(|surface| {
-                        surface.set_current_buffer_dimensions(buffer_id, dimensions)
-                    })
-                }
-                None => ctx.surface(surface_id).is_some(),
-            };
-            let use_updated =
-                snapshot_updated && ctx.finalize_surface_attachment(previous_buffer, next_buffer);
-            if !snapshot_updated || !use_updated {
+            if !ctx.finalize_surface_attachment(previous_buffer, next_buffer) {
                 let why = format!(
                     "Render-buffer replacement could not finalize surface {}: \
                      previous guest={:?} host={:?} use={:?}, \
-                     next guest={:?} host={:?} use={:?}, snapshot_updated={}",
+                     next guest={:?} host={:?} use={:?}",
                     surface_id,
                     previous_buffer,
                     previous_buffer.and_then(|id| ctx.render_buffer_host_id(id)),
@@ -740,7 +387,6 @@ impl WlSurfaceHandler for Handlers {
                     next_buffer,
                     next_buffer.and_then(|id| ctx.render_buffer_host_id(id)),
                     next_buffer.and_then(|id| ctx.host_buffer_use(id)),
-                    snapshot_updated,
                 );
                 return ctx.fail(why);
             }
@@ -748,9 +394,11 @@ impl WlSurfaceHandler for Handlers {
                 log_new_host_copy(ctx, surface_id, bytes);
             }
         }
-
-        if let Some(problem) = viewport_problem {
-            log_unenforced_viewport_rule(ctx, surface_id, problem, &mapping);
+        if let Some(surface) = ctx.surface_mut(surface_id) {
+            surface.apply_commit(&plan);
+        }
+        if let Some(problem) = plan.viewport_problem {
+            log_unenforced_viewport_rule(ctx, surface_id, problem, &plan.mapping);
         }
         // Damage and commit were built as one batch before local state was
         // finalized. Append them together, in order, only once every check
@@ -765,298 +413,24 @@ impl WlRegionHandler for Handlers {}
 impl WlSubcompositorHandler for Handlers {}
 impl WlSubsurfaceHandler for Handlers {}
 
-/// A guest `wp_viewport`; its table entry keeps it.
-#[derive(Debug)]
-pub(crate) struct Viewport {
-    /// The `wl_surface` it scales, until that ends: then its requests
-    /// raise `no_surface`, and a later surface under the ID is not its.
-    surface: Option<GuestId>,
-}
-
-#[cfg(test)]
-impl Viewport {
-    /// The surface it scales, for the orphan check.
-    pub(crate) fn surface_for_test(&self) -> Option<GuestId> {
-        self.surface
-    }
-}
-
-/// The surface of live viewport `viewport`, or the error a request of one
-/// that has none ends the session with.
-fn viewport_surface(ctx: &mut Context, viewport: GuestId) -> Result<GuestId, Action> {
-    let surface = ctx.shadow_table.data::<Viewport>(viewport);
-    surface
-        .and_then(|viewport| viewport.surface)
-        .ok_or_else(|| {
-            ctx.reject(
-                viewport,
-                wp_viewport::ERROR_NO_SURFACE,
-                "wp_viewport has no associated wl_surface",
-            )
-        })
-}
-
-impl wp_viewporter::WpViewporterHandler for Handlers {
-    fn on_get_viewport(
-        ctx: &mut Context,
-        sender: RequestSender,
-        id: GuestId,
-        surface: RequestObject,
-    ) -> Action {
-        let surface = surface.guest;
-        if ctx
-            .shadow_table
-            .data_of::<Viewport>()
-            .any(|(_, viewport)| viewport.surface == Some(surface))
-        {
-            log::warn!("Rejecting duplicate wp_viewport for wl_surface {}", surface);
-            return ctx.reject(
-                sender.guest,
-                wp_viewporter::ERROR_VIEWPORT_EXISTS,
-                "wl_surface already has a wp_viewport",
-            );
-        }
-        let Some(state) = ctx.surface_mut(surface) else {
-            return ctx.missing_surface_state(surface);
-        };
-        state.add_viewport();
-        let viewport = Viewport {
-            surface: Some(surface),
-        };
-        ctx.defer_until_forwarded(PostDispatch::Attach {
-            object: id,
-            data: viewport.into(),
-        });
-        Action::Forward
-    }
-}
-
-impl wp_viewport::WpViewportHandler for Handlers {
-    fn on_set_source(
-        ctx: &mut Context,
-        sender: RequestSender,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    ) -> Action {
-        let surface_id = match viewport_surface(ctx, sender.guest) {
-            Ok(surface) => surface,
-            Err(action) => return action,
-        };
-        let unset = (x, y, width, height) == (-256, -256, -256, -256);
-        if !unset && (x < 0 || y < 0 || width <= 0 || height <= 0) {
-            log::warn!("Rejecting invalid wp_viewport source rectangle");
-            return ctx.reject(
-                sender.guest,
-                wp_viewport::ERROR_BAD_VALUE,
-                "invalid wp_viewport source",
-            );
-        }
-        let Some(surface) = ctx.surface_mut(surface_id) else {
-            return ctx.missing_surface_state(surface_id);
-        };
-        surface.pending_viewport_mut().source = (!unset).then_some((x, y, width, height));
-        Action::Forward
-    }
-
-    fn on_set_destination(
-        ctx: &mut Context,
-        sender: RequestSender,
-        width: i32,
-        height: i32,
-    ) -> Action {
-        let surface_id = match viewport_surface(ctx, sender.guest) {
-            Ok(surface) => surface,
-            Err(action) => return action,
-        };
-        let unset = width == -1 && height == -1;
-        if !unset && (width <= 0 || height <= 0) {
-            log::warn!(
-                "Rejecting invalid wp_viewport destination {}x{}",
-                width,
-                height
-            );
-            return ctx.reject(
-                sender.guest,
-                wp_viewport::ERROR_BAD_VALUE,
-                "invalid wp_viewport destination",
-            );
-        }
-        let Some(surface) = ctx.surface_mut(surface_id) else {
-            return ctx.missing_surface_state(surface_id);
-        };
-        surface.pending_viewport_mut().destination = (!unset).then_some((width, height));
-        Action::Forward
-    }
-}
-
-/// Forget guest `wp_viewport` `viewport`, which ended (see
-/// `crate::state::lifecycle`): its surface's next commit removes the
-/// viewport.
-pub(crate) fn forget_viewport(ctx: &mut Context, viewport: Viewport) {
-    if let Some(surface) = viewport.surface.and_then(|id| ctx.surface_mut(id)) {
-        surface.remove_viewport();
-    }
-}
-
-// --- XDG Shell → wl_surface tracking for zaura_shell integration ---
-//
-// ChromeOS needs a zaura_surface (from zaura_shell) to set the application ID
-// that the shelf uses for icon matching. But the app ID arrives via
-// xdg_toplevel::set_app_id, which doesn't carry a wl_surface reference.
-//
-// `crate::state::XdgRoles` bridges this gap: these handlers record the
-// chain get_xdg_surface(xdg_surface, wl_surface) → get_toplevel(xdg_toplevel)
-// and end it in the destructors, so set_app_id can resolve the underlying
-// wl_surface and create or reuse its host zaura_surface.
-
-impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for Handlers {
-    fn on_get_xdg_surface(
-        ctx: &mut Context,
-        _sender: RequestSender,
-        id: GuestId,
-        surface: RequestObject,
-    ) -> Action {
-        ctx.xdg_roles.add_xdg_surface(id, surface.guest);
-        Action::Forward
-    }
-}
-
-/// Forget guest `xdg_surface` `xdg_surface_id`, which ended (see
-/// `crate::state::lifecycle`), with the role of its toplevel.
-///
-/// Destroying an xdg_surface before its xdg_toplevel is a protocol error
-/// (`xdg_surface.defunct_role_object`) that ends the session, so the order
-/// of the forwarded destructor and the queued Aura release does not matter.
-/// The role ends anyway, so the toplevel's later requests cannot reach an
-/// unrelated surface after ID reuse.
-pub(crate) fn forget_xdg_surface(ctx: &mut Context, xdg_surface_id: GuestId) {
-    if let Some(xdg_toplevel_id) = ctx.xdg_roles.remove_xdg_surface(xdg_surface_id) {
-        window_placement::release_toplevel(ctx, xdg_toplevel_id);
-    }
-}
-
-/// Forget guest `xdg_toplevel` `xdg_toplevel_id`, which ended (see
-/// `crate::state::lifecycle`), and release its Aura toplevel.
-pub(crate) fn forget_xdg_toplevel(ctx: &mut Context, xdg_toplevel_id: GuestId) {
-    window_placement::release_toplevel(ctx, xdg_toplevel_id);
-    ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
-}
-
-impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for Handlers {
-    fn on_configure(ctx: &mut Context, sender: EventSender, serial: u32) -> Action {
-        let Some(guest_xdg_surface_id) = sender.guest_id() else {
-            return Action::Drop;
-        };
-        window_placement::surface_configured(ctx, guest_xdg_surface_id, serial);
-        Action::Forward
-    }
-
-    fn on_get_toplevel(ctx: &mut Context, sender: RequestSender, id: GuestId) -> Action {
-        ctx.defer_until_forwarded(PostDispatch::XdgToplevelCreated {
-            xdg_surface: sender.guest,
-            xdg_toplevel: id,
-        });
-        Action::Forward
-    }
-}
-
-impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Handlers {
-    fn on_destroy(_ctx: &mut Context, _sender: RequestSender) -> Destructor {
-        // Ending the toplevel releases its Aura toplevel (see
-        // `forget_xdg_toplevel`), which goes before the role destructor (see
-        // `aura_objects::release`). The guest ID is retained until the host
-        // acknowledges the role destructor.
-        Destructor::AfterEnd
-    }
-
-    fn on_set_app_id(ctx: &mut Context, sender: RequestSender, app_id: &String) -> Action {
-        let xdg_toplevel_id = sender.guest;
-
-        let Some(xdg_toplevel_host_id) = sender.host_id() else {
-            log::warn!(
-                "Cannot namespace app ID for unmapped xdg_toplevel {}",
-                xdg_toplevel_id
-            );
-            return Action::Drop;
-        };
-        // The host XDG role and the Aura surface both get the ID in the Guest
-        // OS namespace.
-        let native_app_id = native_wayland_app_id(&ctx.settings().vm_id, app_id);
-
-        // The host xdg_toplevel carries the app ID used by ordinary Exo
-        // shelf/application matching. Keep that request namespaced as in the
-        // reference Sommelier path rather than forwarding the guest's
-        // unqualified ID directly. An ID too long for one message reaches
-        // neither the role nor the Aura surface.
-        if !ctx.send_host_or_drop(
-            xdg_toplevel::req::set_app_id(xdg_toplevel_host_id, &native_app_id),
-            format_args!("the application ID of xdg_toplevel {xdg_toplevel_id}"),
-        ) {
-            return Action::Drop;
-        }
-
-        // Resolve xdg_toplevel → wl_surface (guest) → wl_surface (host).
-        if let Some(wl_surface_guest_id) = ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id) {
-            aura_objects::set_application_id(ctx, wl_surface_guest_id, &native_app_id);
-        }
-        Action::Drop
-    }
-
-    fn on_configure(
-        _ctx: &mut Context,
-        sender: EventSender,
-        _width: i32,
-        _height: i32,
-        _states: &[u8],
-    ) -> Action {
-        if sender.guest.is_none() {
-            return Action::Drop;
-        }
-        Action::Forward
-    }
-}
-
-impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Handlers {
-    fn on_configure(
-        ctx: &mut Context,
-        sender: EventSender,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        states: &[u8],
-    ) -> Action {
-        // The placement module delivers the translated event itself.
-        window_placement::translate_aura_configure(ctx, sender.host, x, y, width, height, states);
-        Action::Drop
-    }
-
-    fn on_origin_change(ctx: &mut Context, sender: EventSender, x: i32, y: i32) -> Action {
-        // xdg_toplevel has no origin-change event: placement keeps the
-        // origin, and the guest gets nothing.
-        window_placement::origin_changed(ctx, sender.host, x, y);
-        Action::Drop
-    }
-}
-
 #[cfg(test)]
 // Tests build and close raw descriptors to check who owns them.
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::handler::test_support::{toplevel_ctx, SURFACE};
-    use crate::protocols::aura_shell::{zaura_shell, zaura_surface};
+    use crate::handler::viewport::Viewport;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+    use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
     use crate::protocols::wayland::wl_surface::REQ_COMMIT;
     use crate::protocols::wayland::{
         wl_buffer, wl_display, wl_keyboard, wl_output, wl_registry, wl_shm_pool,
     };
+    use crate::protocols::xdg_shell::xdg_toplevel;
     use crate::protocols::Iface;
     use crate::protocols::{AnyEvent, AnyRequest};
-    use crate::proxy::harness::{Object, Session, Toplevel};
+    use crate::proxy::harness::{Object, Session};
     use crate::state::{PlaneFenceForTest, RenderBufferUse};
     use crate::test_support::text_input::{self, Host};
     use crate::test_support::{queued_headers, shm_pool_file, BufferKind, BUFFER_KINDS};
@@ -1855,6 +1229,28 @@ mod tests {
         assert_eq!(a.copied(0x33), whole_frame());
     }
 
+    /// A mapping change without an attach stales the other host copies
+    /// too: B stays shown while it is rotated, so its pixel damage no
+    /// longer marks the same pixels of A.
+    #[tokio::test]
+    async fn a_mapping_change_without_an_attach_stales_the_other_host_copies() {
+        let mut sc = Screen::new().await;
+        let surface = sc.surface;
+        let a = sc.frame(surface).await;
+        sc.frame(surface).await;
+        let transform = wl_surface::req::set_buffer_transform(surface.id, 2);
+        sc.forwarded(surface, transform).await;
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.commit(surface).await;
+
+        a.draw(0x33);
+        sc.pending([wl_surface::req::damage_buffer(surface.id, 0, 0, 1, 1)])
+            .await;
+        sc.show(surface, a.buffer).await;
+        assert_eq!(a.copied(0x33), whole_frame());
+    }
+
     #[tokio::test]
     async fn a_buffer_attached_with_a_new_mapping_copies_everything() {
         // A's host copy holds its old frame, unrotated. The client rotates A
@@ -2540,237 +1936,6 @@ mod tests {
         assert!(!sc.logged(surface));
     }
 
-    /// A session with `ctx` whose host has `zaura_shell`, which the proxy
-    /// binds for itself, and whose guest has a toplevel; returns the session,
-    /// the host `zaura_shell` and the toplevel.
-    async fn shelled(ctx: Context) -> (Session, u32, Toplevel) {
-        let mut s = Session::with_context(ctx);
-        let shell = s.aura_shell().await;
-        let toplevel = s.toplevel().await;
-        (s, shell, toplevel)
-    }
-
-    /// The guest sets `app_id` on `toplevel`; returns what the host gets.
-    async fn set_app_id(s: &mut Session, toplevel: Object, app_id: &str) -> Vec<(u32, AnyRequest)> {
-        s.guest([xdg_toplevel::req::set_app_id(toplevel.id, app_id).unwrap()])
-            .await;
-        assert_eq!(s.guest_received(), []);
-        s.host_received()
-    }
-
-    /// The host `xdg_toplevel.set_app_id` of `toplevel`, of guest OS app ID
-    /// `app_id`.
-    fn namespaced(toplevel: Object, app_id: &str) -> (u32, AnyRequest) {
-        let app_id = format!("org.chromium.guest_os.termina.wayland.{app_id}");
-        (
-            toplevel.host,
-            xdg_toplevel::Request::SetAppId { app_id }.into(),
-        )
-    }
-
-    /// What the host gets for the guest's first `set_app_id` of `app_id` on
-    /// `toplevel` while the proxy has `shell`: the namespaced ID, and a new
-    /// Aura surface of the toplevel's surface, which gets it too; returns
-    /// the Aura surface.
-    fn first_app_id(
-        host: &[(u32, AnyRequest)],
-        shell: u32,
-        toplevel: Toplevel,
-        app_id: &str,
-    ) -> u32 {
-        let [_, (_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { id, .. })), _] =
-            host
-        else {
-            panic!("the host got no Aura surface: {host:?}");
-        };
-        let application_id = Some(format!("org.chromium.guest_os.termina.wayland.{app_id}"));
-        assert_eq!(
-            host,
-            [
-                namespaced(toplevel.toplevel, app_id),
-                (
-                    shell,
-                    zaura_shell::Request::GetAuraSurface {
-                        id: *id,
-                        surface: toplevel.surface.host
-                    }
-                    .into()
-                ),
-                (
-                    *id,
-                    zaura_surface::Request::SetApplicationId { application_id }.into()
-                ),
-            ]
-        );
-        *id
-    }
-
-    #[tokio::test]
-    async fn set_app_id_creates_zaura_surface_and_sets_app_id() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
-        let (mut s, shell, toplevel) = shelled(ctx).await;
-        let host = set_app_id(&mut s, toplevel.toplevel, "my_app").await;
-        first_app_id(&host, shell, toplevel, "my_app");
-    }
-
-    #[tokio::test]
-    async fn set_app_id_reuses_existing_zaura_surface() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
-        let (mut s, shell, toplevel) = shelled(ctx).await;
-        // An Aura surface the first app ID created.
-        let host = set_app_id(&mut s, toplevel.toplevel, "first").await;
-        let aura_surface = first_app_id(&host, shell, toplevel, "first");
-
-        let application_id = Some("org.chromium.guest_os.termina.wayland.reused".into());
-        assert_eq!(
-            set_app_id(&mut s, toplevel.toplevel, "reused").await,
-            [
-                namespaced(toplevel.toplevel, "reused"),
-                (
-                    aura_surface,
-                    zaura_surface::Request::SetApplicationId { application_id }.into()
-                ),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn set_app_id_keeps_the_guest_os_namespace_with_placement_on() {
-        let placement = crate::placement_config::PlacementConfig::active_for_test(&[]);
-        let ctx = Context::with_placement_for_test(placement);
-        let (mut s, shell, toplevel) = shelled(ctx).await;
-        let app_id = "com.example.Terminal";
-        let host = set_app_id(&mut s, toplevel.toplevel, app_id).await;
-        first_app_id(&host, shell, toplevel, app_id);
-    }
-
-    #[tokio::test]
-    async fn set_app_id_noop_when_no_zaura_shell() {
-        let mut s = Session::new();
-        let toplevel = s.toplevel().await.toplevel;
-        assert_eq!(
-            set_app_id(&mut s, toplevel, "no_shell").await,
-            [namespaced(toplevel, "no_shell")]
-        );
-    }
-
-    /// The longest app ID a guest can send, which namespaced exceeds the
-    /// Wayland message limit, reaches neither the role nor an Aura surface.
-    #[tokio::test]
-    async fn oversized_namespaced_app_id_is_dropped_before_wire_encoding() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
-        let (mut s, _, toplevel) = shelled(ctx).await;
-        let oversized = "x".repeat(4_083);
-        assert_eq!(
-            set_app_id(&mut s, toplevel.toplevel, &oversized).await,
-            [],
-            "an app ID exceeding the Wayland message limit must not be sent"
-        );
-    }
-
-    /// Destroying a toplevel ends its role, which the session checks after
-    /// each batch (`Context::assert_no_orphans`): the role must not outlive
-    /// its toplevel.
-    #[tokio::test]
-    async fn xdg_toplevel_destroy_cleans_up_map() {
-        use crate::protocols::xdg_shell::xdg_surface;
-        let mut s = Session::new();
-        let Toplevel {
-            xdg_surface: role,
-            toplevel,
-            ..
-        } = s.toplevel().await;
-        s.guest([xdg_toplevel::req::destroy(toplevel.id)]).await;
-        let destroy = xdg_toplevel::Request::Destroy {};
-        assert_eq!(s.host_received(), [(toplevel.host, destroy.into())]);
-        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, toplevel.host)])
-            .await;
-        let deleted = wl_display::Event::DeleteId { id: toplevel.id };
-        assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
-        // The xdg_surface, which has no role left, may end now.
-        s.guest([xdg_surface::req::destroy(role.id)]).await;
-        let destroy = xdg_surface::Request::Destroy {};
-        assert_eq!(s.host_received(), [(role.host, destroy.into())]);
-    }
-
-    #[tokio::test]
-    async fn wl_surface_destroy_releases_zaura_surface() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
-        let (mut s, shell, toplevel) = shelled(ctx).await;
-        let host = set_app_id(&mut s, toplevel.toplevel, "app").await;
-        let aura_surface = first_app_id(&host, shell, toplevel, "app");
-
-        let surface = toplevel.surface;
-        s.guest([wl_surface::req::destroy(surface.id)]).await;
-        assert_eq!(
-            s.host_received(),
-            [
-                (aura_surface, zaura_surface::Request::Release {}.into()),
-                surface_destroy(surface),
-            ]
-        );
-    }
-
-    /// Destroying a surface ends the xdg role on it, so its toplevel's
-    /// later app ID reaches no Aura surface of the destroyed surface.
-    #[tokio::test]
-    async fn wl_surface_destroy_removes_stale_xdg_surface_links() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
-        let (mut s, _, toplevel) = shelled(ctx).await;
-        let surface = toplevel.surface;
-        s.guest([wl_surface::req::destroy(surface.id)]).await;
-        assert_eq!(s.host_received(), [surface_destroy(surface)]);
-        assert_eq!(
-            set_app_id(&mut s, toplevel.toplevel, "app").await,
-            [namespaced(toplevel.toplevel, "app")]
-        );
-    }
-
-    /// An Aura shell older than `zaura_surface.release` (v38) has no
-    /// destructor for an Aura surface: destroying its surface sends none,
-    /// and the Aura surface's host ID stays reserved for the connection.
-    #[tokio::test]
-    async fn old_aura_surface_stays_reserved_without_release_request() {
-        let mut s = Session::new();
-        s.registry().await;
-        s.advertise(zaura_shell::NAME, 37).await;
-        let host = s.host_received();
-        let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))] = &host[..] else {
-            panic!("the proxy did not bind zaura_shell: {host:?}");
-        };
-        let shell = id.2;
-        // The gtk_shell1 the guest is advertised.
-        assert_eq!(s.guest_received().len(), 1);
-        let toplevel = s.toplevel().await;
-        let host = set_app_id(&mut s, toplevel.toplevel, "legacy").await;
-        let aura_surface = first_app_id(&host, shell, toplevel, "legacy");
-
-        let surface = toplevel.surface;
-        s.guest([wl_surface::req::destroy(surface.id)]).await;
-        assert_eq!(
-            s.host_received(),
-            [surface_destroy(surface)],
-            "old aura-shell versions must not receive release"
-        );
-        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, surface.host)])
-            .await;
-        let deleted = wl_display::Event::DeleteId { id: surface.id };
-        assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
-        // The proxy reuses freed host IDs first: the surface's, and the
-        // Aura surface's if it were free.
-        for _ in 0..2 {
-            assert_ne!(s.surface().await.host, aura_surface);
-        }
-    }
-
-    #[test]
-    fn namespaced_app_id_wire_size_boundary_is_checked() {
-        // Exercise the exact 4096-byte message boundary independently of the
-        // namespace prefix used by the production path.
-        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(4_083)).is_ok());
-        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(4_084)).is_err());
-    }
-
     /// A commit without an attach keeps the surface's buffer, whose size
     /// full damage covers; an attach of no buffer clears it.
     #[tokio::test]
@@ -3301,74 +2466,6 @@ mod tests {
         sc.pending(damage).await;
         assert_eq!(sc.commit(surface).await, [(0, 0, 2, 1)]);
         assert_eq!(a.copied(0x22), [(0, 0), (1, 0)]);
-    }
-
-    #[test]
-    fn damage_buffer_mapping_applies_buffer_scale_and_filtering_outset() {
-        let mut surface = SurfaceState::default();
-        surface.set_buffer_scale(2);
-
-        let mapped = surface
-            .prepare_commit()
-            .state
-            .mapping(Some((100, 100)))
-            .to_surface(BufferRect::new(20, 10, 4, 6));
-
-        assert_eq!(mapped, SurfaceRect::new(9, 4, 4, 5));
-    }
-
-    #[test]
-    fn damage_buffer_mapping_does_not_include_surface_offset() {
-        let mut surface = SurfaceState::default();
-        surface.attach(Some(GuestId::for_test(5)), 80, 90);
-        let commit = surface.prepare_commit();
-        assert_eq!(commit.buffer_offset, (80, 90));
-
-        let mapped = commit
-            .state
-            .mapping(Some((100, 100)))
-            .to_surface(BufferRect::new(4, 5, 6, 7));
-
-        assert_eq!(
-            mapped,
-            SurfaceRect::new(3, 4, 8, 9),
-            "wl_surface.attach/offset changes content placement, not buffer damage coordinates"
-        );
-    }
-
-    #[test]
-    fn rotated_buffer_damage_covers_the_transformed_surface() {
-        let mut surface = SurfaceState::default();
-        surface.set_buffer_transform(1);
-        let mapping = surface.prepare_commit().state.mapping(Some((8, 6)));
-
-        assert_eq!(
-            mapping.surface_rect(),
-            SurfaceRect::new(0, 0, 6, 8),
-            "90-degree transforms expose a height-by-width surface extent"
-        );
-        assert_eq!(
-            mapping.to_surface(BufferRect::new(1, 1, 1, 1)),
-            mapping.surface_rect(),
-            "the bridge does not rotate damage, so it damages the whole surface"
-        );
-    }
-
-    #[test]
-    fn rotated_scaled_buffer_full_damage_uses_logical_extent() {
-        let mut surface = SurfaceState::default();
-        surface.set_buffer_scale(2);
-        surface.set_buffer_transform(1);
-
-        assert_eq!(
-            surface
-                .prepare_commit()
-                .state
-                .mapping(Some((8, 6)))
-                .surface_rect(),
-            SurfaceRect::new(0, 0, 3, 4),
-            "buffer scale converts the rotated extent to surface coordinates"
-        );
     }
 
     /// A keyboard of its own seat, which the host has focused on a surface,

@@ -27,11 +27,16 @@ limitations under the License.
 //! | `zaura_surface` | [`crate::state::AuraSurfaces`] | XDG and GTK metadata, placement |
 //! | `zaura_toplevel` | [`crate::state::PlacementState`] | placement |
 //! | `zaura_output` | [`crate::state::OutputRegistry`] | placement metadata |
+//!
+//! Of their events, only a `zaura_toplevel`'s are handled: placement
+//! translates them for the guest, which has no Aura toplevel.
 
+use crate::handler::window_placement;
+use crate::handler::Handlers;
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
 use crate::protocols::Iface;
-use crate::state::{Binding, Context, GuestId, HostId, Singleton};
-use crate::wire::ToHost;
+use crate::state::{Binding, Context, EventSender, GuestId, HostId, Singleton};
+use crate::wire::{Action, ToHost};
 
 /// What the proxy needs to know about one kind of host Aura child.
 #[derive(Clone, Copy, Debug)]
@@ -193,6 +198,13 @@ pub(crate) fn ensure_host_zaura_surface(
     Some(zaura_surface_host_id)
 }
 
+/// The application ID the host gets for guest application ID `app_id`: in
+/// the Guest OS namespace of VM `vm_identifier` (see INVARIANTS, "ChromeOS
+/// shelf application IDs").
+pub(crate) fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String {
+    format!("org.chromium.guest_os.{}.wayland.{}", vm_identifier, app_id)
+}
+
 /// Send the application ID the guest set (through XDG or GTK) to the
 /// surface's host Aura surface, creating that surface if needed. Nothing is
 /// sent while no `zaura_shell` is bound.
@@ -203,7 +215,7 @@ pub(crate) fn ensure_host_zaura_surface(
 /// # Arguments
 ///
 /// * `native_application_id` - the guest's ID in the Guest OS namespace
-///   (`compositor::native_wayland_app_id`). An ID too long for one message
+///   ([`native_wayland_app_id`]). An ID too long for one message
 ///   is dropped with a warning.
 pub(crate) fn set_application_id(
     ctx: &mut Context,
@@ -247,6 +259,29 @@ pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: HostId) 
     if let Some(zaura_output_host_id) = create(ctx, AuraChild::OUTPUT, wl_output_host_id) {
         ctx.outputs
             .remember_aura_output(wl_output_host_id, zaura_output_host_id);
+    }
+}
+
+impl zaura_toplevel::ZauraToplevelHandler for Handlers {
+    fn on_configure(
+        ctx: &mut Context,
+        sender: EventSender,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        states: &[u8],
+    ) -> Action {
+        // The placement module delivers the translated event itself.
+        window_placement::translate_aura_configure(ctx, sender.host, x, y, width, height, states);
+        Action::Drop
+    }
+
+    fn on_origin_change(ctx: &mut Context, sender: EventSender, x: i32, y: i32) -> Action {
+        // xdg_toplevel has no origin-change event: placement keeps the
+        // origin, and the guest gets nothing.
+        window_placement::origin_changed(ctx, sender.host, x, y);
+        Action::Drop
     }
 }
 

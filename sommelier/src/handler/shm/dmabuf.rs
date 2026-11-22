@@ -15,13 +15,16 @@ limitations under the License.
 */
 
 //! VirtWL dma-bufs as the host storage of guest SHM buffers: allocating
-//! one, and mapping it for the copy.
+//! one, mapping it for the copy, and the CPU-write interval the copy
+//! writes it in.
 
 use super::dmabuf_layout::{validate_dmabuf_layout, DmabufLayout};
 use super::formats::wl_shm_format_to_drm_format;
 use crate::state::{Context, HostMapping};
+use crate::virtwl_channel::VirtWaylandChannel;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::sync::Arc;
 
 /// A VirtWL dma-buf allocation for a guest SHM buffer.
 ///
@@ -135,6 +138,72 @@ pub(super) fn allocate_virtwl_dmabuf(
         modifier: 0,
         dmabuf_sync: true,
     })
+}
+
+/// RAII guard for the VirtWL dma-buf CPU-write interval.
+///
+/// A copy can fail while reading the guest pool or while validating a damage
+/// rectangle. Keeping the matching END ioctl in `Drop` prevents a panic or a
+/// future early-return path from leaving the host dma-buf permanently locked.
+pub(super) struct DmabufWriteSync<'a> {
+    channel: &'a VirtWaylandChannel,
+    fd: BorrowedFd<'a>,
+    ended: bool,
+}
+
+impl<'a> DmabufWriteSync<'a> {
+    pub(super) fn begin(
+        channel: Option<&'a Arc<VirtWaylandChannel>>,
+        fd: Option<BorrowedFd<'a>>,
+    ) -> Option<Self> {
+        let channel = channel?;
+        let fd = fd?;
+        channel
+            .sync(
+                fd,
+                crate::virtwl::DMA_BUF_SYNC_START | crate::virtwl::DMA_BUF_SYNC_WRITE,
+            )
+            .map(|()| Self {
+                channel,
+                fd,
+                ended: false,
+            })
+            .map_err(|error| {
+                log::warn!("VirtWL dma-buf begin-write sync failed: {}", error);
+            })
+            .ok()
+    }
+
+    pub(super) fn end(mut self) -> bool {
+        self.ended = true;
+        match self.channel.sync(
+            self.fd,
+            crate::virtwl::DMA_BUF_SYNC_END | crate::virtwl::DMA_BUF_SYNC_WRITE,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("VirtWL dma-buf end-write sync failed: {}", error);
+                false
+            }
+        }
+    }
+}
+
+impl Drop for DmabufWriteSync<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            if let Err(error) = self.channel.sync(
+                self.fd,
+                crate::virtwl::DMA_BUF_SYNC_END | crate::virtwl::DMA_BUF_SYNC_WRITE,
+            ) {
+                log::warn!(
+                    "VirtWL dma-buf end-write sync failed while unwinding: {}",
+                    error
+                );
+            }
+            self.ended = true;
+        }
+    }
 }
 
 #[cfg(test)]
