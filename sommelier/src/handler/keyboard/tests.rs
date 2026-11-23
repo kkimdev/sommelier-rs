@@ -336,6 +336,15 @@ impl Kb {
     /// Backspace it takes deletes it: the proxy leases Backspace's
     /// repeat to `ime`.
     async fn lease(&mut self, ime: Ime) {
+        self.end_composition(ime).await;
+    }
+
+    /// The host input method shows a preedit and empties it while the key
+    /// the seat's latest peek announced is held, which the input method
+    /// took to end its composition (E15): an empty confirmation may
+    /// recover that key (INVARIANTS "An empty confirmation recovers only a
+    /// key that ended a composition").
+    async fn end_composition(&mut self, ime: Ime) {
         self.compose(ime, "가").await;
         self.compose(ime, "").await;
     }
@@ -2191,6 +2200,7 @@ async fn unmapped_leave_does_not_clear_live_keyboard_focus_state() {
         .await;
     assert_eq!(kb.s.guest_received(), []);
     assert_eq!(kb.s.host_received(), []);
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(kb.s.guest_received(), recovered(ime, kb.k, 1, 1, BACKSPACE));
 }
@@ -2738,6 +2748,7 @@ async fn a_duplicate_pressed_peek_keeps_its_generation() {
     kb.peek(1, 100, KEY_SPACE, PRESSED).await;
     kb.peek(2, 110, KEY_A, PRESSED).await;
     kb.peek(3, 200, KEY_SPACE, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(kb.s.guest_received(), recovered(ime, kb.k, 2, 110, KEY_A));
 }
@@ -2748,6 +2759,7 @@ async fn backspace_peek_identity_survives_unrelated_release() {
     let ime = kb.text_input().await;
     kb.peek(20, 200, BACKSPACE, PRESSED).await;
     assert_eq!(kb.key(21, KEY_A, RELEASED).await, Route::Host);
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -2767,6 +2779,7 @@ async fn equal_serial_peek_release_uses_timestamp_order() {
 
     kb.peek(serial, 100, key, PRESSED).await;
     kb.peek(serial, 110, key, RELEASED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -2776,6 +2789,7 @@ async fn equal_serial_peek_release_uses_timestamp_order() {
 
     kb.peek(serial, 130, key, PRESSED).await;
     kb.peek(serial, 120, key, RELEASED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -2783,6 +2797,7 @@ async fn equal_serial_peek_release_uses_timestamp_order() {
         "an older delayed release must not close the current generation"
     );
     kb.peek(serial, 130, key, RELEASED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -2792,6 +2807,7 @@ async fn equal_serial_peek_release_uses_timestamp_order() {
 
     kb.peek(serial + 2, 150, key, PRESSED).await;
     kb.peek(serial + 1, 160, key, RELEASED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -3021,6 +3037,7 @@ async fn an_empty_confirmation_recovers_the_latest_eligible_held_key() {
                 Modifiers(depressed) => kb.modifiers(depressed).await,
             }
         }
+        kb.end_composition(ime).await;
         kb.confirm(ime).await;
         let expected = match recovery {
             Some(Replay { key, serial, time }) => recovered(ime, kb.k, serial, time, key).into(),
@@ -3051,6 +3068,7 @@ async fn a_press_on_another_seats_keyboard_keeps_a_recovery_waiting() {
     let surface = kb.surface;
     let other = kb.first_enter(other, surface).await;
     kb.peek(700, 1234, KEY_SPACE, PRESSED).await;
+    kb.end_composition(ime).await;
 
     let confirm = zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0);
     kb.s.host([confirm]).await;
@@ -3120,6 +3138,7 @@ async fn a_recovered_key_pressed_again_after_a_detach_reaches_the_guest() {
     let mut kb = Kb::new().await;
     let ime = kb.text_input().await;
     kb.peek(700, 1234, KEY_SPACE, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -3254,6 +3273,7 @@ async fn delayed_keyboard_events_do_not_duplicate_an_ime_recovered_key() {
     let mut kb = Kb::new().await;
     let ime = kb.text_input().await;
     kb.peek(1, 500, KEY_SPACE, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -3293,6 +3313,7 @@ async fn recovery_tombstone_suppresses_delayed_events_in_any_order() {
         let mut kb = Kb::new().await;
         let ime = kb.text_input().await;
         kb.peek(1, 500, KEY_SPACE, PRESSED).await;
+        kb.end_composition(ime).await;
         kb.confirm(ime).await;
         assert_eq!(
             kb.s.guest_received(),
@@ -3326,6 +3347,7 @@ async fn stale_keyboard_press_cannot_steal_a_new_peek_generation() {
     let mut kb = Kb::new().await;
     let ime = kb.text_input().await;
     kb.peek(1, 500, KEY_SPACE, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -3397,6 +3419,7 @@ async fn keyboard_retirement_removes_its_watermark_and_recovers_other_held_key()
     // with a key that does not repeat.
     kb.peek(1, 500, KEY_SPACE, PRESSED).await;
     kb.peek_on(other, 2, 501, KEY_LEFTSHIFT, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(kb.s.guest_received(), []);
 
@@ -3404,6 +3427,7 @@ async fn keyboard_retirement_removes_its_watermark_and_recovers_other_held_key()
     kb.s.guest([wl_keyboard::req::release(other.id)]).await;
     assert_eq!(kb.s.guest_received(), []);
     assert_eq!(kb.s.host_received(), released(other));
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -3460,8 +3484,9 @@ async fn a_press_dropped_with_its_released_keyboard_is_still_the_confirmations()
     let other = kb.another_keyboard().await;
     let gone = kb.another_keyboard().await;
     let ime = kb.text_input().await;
-    // The input method takes Backspace.
+    // The input method takes Backspace to empty its composition.
     kb.peek(2, 2, BACKSPACE, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.s.host([zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0)])
         .await;
     let host = kb.s.host_received();

@@ -424,6 +424,7 @@ fn key_generation_registry_matches_the_model_for_all_short_transition_sequences(
                 time,
                 sequence,
                 eligible,
+                composed: false,
             });
         }
 

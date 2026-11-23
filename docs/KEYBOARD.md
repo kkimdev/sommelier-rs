@@ -185,6 +185,15 @@ after it, in place of the forward (test:
 `KeyboardCore::held_repeat_key` keeps the rule's exception for a key
 held `stale` across a detach.
 
+A confirmation finds only a held key that ended a composition
+(INVARIANTS "An empty confirmation recovers only a key that ended a
+composition"). When an edit of Exo's ends the composition the guest
+showed, the IME core says so (`ime::KeyEffect::CompositionEnded`), and
+`KeyboardCore::composition_ended` marks the seat's held key with the
+latest peek, the key pressed last, for the rest of its hold
+(`PeekKeyProvenance::composed`). A key the guest got is marked too, but
+its recovery sends no pair, only the confirmation's `done`.
+
 | Waiting for | Event | Step |
 | --- | --- | --- |
 | `NextEvent` | `wl_keyboard.modifiers` | wait |
@@ -225,11 +234,19 @@ the proxy does not use it.
   `guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces`.
 - The recovery's transition table. Test:
   `a_waiting_recovery_is_decided_by_the_hosts_next_event`.
+- Only the held key pressed last when a composition ends may be
+  recovered, for the rest of its hold. Test:
+  `only_a_held_key_that_ended_a_composition_is_recovered`.
 - With an English input method, whose engine handles no key, the guest
   gets exactly the `wl_keyboard.key` events Exo sent, whatever empty
   confirmations (E13), `repeat_info` events, modifiers and recovery
   syncs come between short taps and overlapping keys. Test:
   `an_english_input_methods_keys_reach_the_guest_as_exo_sent_them`.
+- With an English input method whose engine takes letters (E16) and
+  answers each report with an empty confirmation (E17), whether it
+  commits the letter, an accent or nothing, the guest gets the engine's
+  text alone and no key event. Test:
+  `a_key_that_ended_no_composition_is_never_recovered`.
 - The core reads each host event before it handles it, and a recovery
   the event decides comes with the event's own delivery. Test:
   `a_waiting_recovery_reads_each_host_event_before_it_is_handled`.

@@ -25,12 +25,39 @@ has confirmed, then latent faults never seen, then test and code debt.
    repeat once; IMA sends text there only with a buffered composition,
    which makes the confirmation not empty, and no DST case does it. A key
    held across an input-method restart stops repeating until its next
-   press.
+   press. Only a key that ended a composition the guest showed is
+   recovered (INVARIANTS "An empty confirmation recovers only a key that
+   ended a composition"), which leaves two cases:
+   - **A dead key, then a held letter, with an engine that answers
+     reports (E17).** On US-International, IMA's character composer
+     shows the dead key as a preedit, which the letter's press ends
+     (`InputMethodAsh::ExecuteCharacterComposer`), so the letter may be
+     recovered. If the engine passes the letter's autorepeats, recovering
+     them is right, as native Chrome repeats the letter; if it also
+     answers each report with an empty confirmation, as English (US)
+     does, those answers would repeat the letter as fast as the guest
+     reports, until its release. Whether US-International's engine
+     answers reports is unknown (host check below).
+   - **A composition the guest never saw.** A late answer across a focus
+     change (E5 (c)) can leave the engine composing what the guest never
+     showed; the key that ends it is not recovered, so a held Space after
+     it does not repeat. A repeat is lost, not text; the DST counts these
+     (`repeats_of_no_ended_composition`).
 3. **Host checks.** The IME's are in
    [IME.md 5.2](docs/IME.md#52-unknowns-and-manual-host-checks); each
    runs against an isolated proxy
    ([Manual verification](docs/INVARIANTS.md#manual-verification)).
    These are not yet confirmed on a host:
+   - English (US) in gedit: a short tap of a letter types it once, and a
+     held letter repeats at the host's rate, never faster; a long-press
+     accent types the accent once.
+   - US-International in gedit: type a dead key (`'` or `` ` ``), then
+     hold `a`: it should type "á" (or "à") once, then repeat `a` at the
+     host's rate and stop at the release. With `RUST_LOG=sommelier::keys=debug`,
+     also type a few letters with no key held and check whether empty
+     `confirm_preedit`s answer the reports (E17); if they do and `a`
+     runs away, the input method answers reports for keys that end a
+     composition too.
    - Data-control reading an image: text was confirmed on a host both
      ways (`wl-copy`, Orca's `orca-wayland-clipboard`, `wl-paste`), and
      that a ChromeOS window's focus empties what it reads.

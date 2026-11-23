@@ -197,7 +197,7 @@ impl TextInput {
     }
 
     /// The preedit the guest shows, which only an attached link has.
-    fn shown(&self) -> Option<&Preedit> {
+    pub(super) fn shown(&self) -> Option<&Preedit> {
         self.link.shown()
     }
 

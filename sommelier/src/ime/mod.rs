@@ -330,6 +330,12 @@ pub enum KeyEffect {
     /// own, and the key events in flight died with it: no key the seat
     /// holds now is recovered again.
     InputMethodDetached { seat: SeatId },
+    /// H7, H8, X1 and X2: an edit of Exo's ended the composition a text
+    /// input of `seat` showed. The key the input method took last, if the
+    /// seat still holds it, ended it, so its autorepeats may be ones the
+    /// input method passes (INVARIANTS "An empty confirmation recovers
+    /// only a key that ended a composition").
+    CompositionEnded { seat: SeatId },
 }
 
 /// Read-only facts the core needs and does not own. The adapter answers

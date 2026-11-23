@@ -168,6 +168,12 @@ fn modifiers(depressed: u32) -> KeyInput {
     }
 }
 
+/// An edit of Exo's ends the composition [`SEAT`] showed, as the key the
+/// input method took last ends it (E15): that key may be recovered.
+fn composition_ended() -> KeyInput {
+    KeyInput::Ime(KeyEffect::CompositionEnded { seat: SeatId(SEAT) })
+}
+
 fn ack(serial: u32, handled: bool) -> Option<Ack> {
     Some(Ack {
         keyboard: KEYBOARD,
@@ -212,6 +218,7 @@ fn a_waiting_recovery_reads_each_host_event_before_it_is_handled() {
     let env = TestEnv::new();
     let mut keys = core("", &env);
     keys.step(peek(EVDEV_KEY_BACKSPACE, KeyState::Pressed, 1), &env);
+    keys.step(composition_ended(), &env);
     let seat = SeatId(SEAT);
     let confirm = KeyEffect::RecoverHeldKey { ti: TI, seat };
     assert!(keys.step(KeyInput::Ime(confirm), &env).sync);
@@ -230,6 +237,48 @@ fn a_waiting_recovery_reads_each_host_event_before_it_is_handled() {
     assert!(!keys.awaits_host_event());
 }
 
+/// An empty confirmation recovers only a held key that ended a composition
+/// the guest showed: the latest key held when the composition ended, for
+/// the rest of its hold. A key the input method took with nothing to end,
+/// an older held key and a new press of the key are not recovered, and a
+/// key the guest got is recovered with no pair.
+#[test]
+fn only_a_held_key_that_ended_a_composition_is_recovered() {
+    let env = TestEnv::new();
+    let seat = SeatId(SEAT);
+    let recovers = |keys: &mut KeyboardCore| {
+        let confirm = KeyEffect::RecoverHeldKey { ti: TI, seat };
+        let waits = keys.step(KeyInput::Ime(confirm), &env).sync;
+        if waits {
+            keys.step(KeyInput::HostEvent, &env);
+        }
+        waits
+    };
+    let composed = |keys: &KeyboardCore, key| keys.peek(KEYBOARD, key).is_some_and(|p| p.composed);
+    let mut keys = core("", &env);
+    keys.step(peek(KEY_A, KeyState::Pressed, 1), &env);
+    assert!(!recovers(&mut keys));
+    keys.step(composition_ended(), &env);
+    assert!(recovers(&mut keys) && recovers(&mut keys));
+    // A new press of the key ended nothing yet.
+    keys.step(peek(KEY_A, KeyState::Released, 2), &env);
+    keys.step(peek(KEY_A, KeyState::Pressed, 3), &env);
+    assert!(!recovers(&mut keys));
+    // Only the latest key the input method took ended it.
+    keys.step(peek(KEY_Q, KeyState::Pressed, 4), &env);
+    keys.step(composition_ended(), &env);
+    assert!(composed(&keys, KEY_Q) && !composed(&keys, KEY_A));
+    // A key the guest got.
+    let mut keys = core("", &env);
+    keys.step(peek(KEY_A, KeyState::Pressed, 1), &env);
+    keys.step(key(KEY_A, KeyState::Pressed, 1), &env);
+    keys.step(composition_ended(), &env);
+    let confirm = KeyEffect::RecoverHeldKey { ti: TI, seat };
+    assert!(keys.step(KeyInput::Ime(confirm), &env).sync);
+    let recovered = keys.step(KeyInput::HostEvent, &env).recovered;
+    assert!(recovered.is_some_and(|recovered| recovered.pair.is_empty()));
+}
+
 /// Whoever delivers a key generation to the guest first owns it, and a
 /// shortcut never acts on a key the guest already received: a chord the
 /// IME recovered, which a binding then binds, as a reload of the bindings
@@ -241,6 +290,7 @@ fn a_chord_the_guest_already_received_stays_the_guests() {
     let mut keys = core("", &unbound);
     keys.step(modifiers(ALT), &unbound);
     keys.step(peek(KEY_Q, KeyState::Pressed, 1), &unbound);
+    keys.step(composition_ended(), &unbound);
     let seat = SeatId(SEAT);
     let confirm = KeyEffect::RecoverHeldKey { ti: TI, seat };
     keys.step(KeyInput::Ime(confirm), &unbound);
@@ -263,11 +313,12 @@ fn a_chord_the_guest_already_received_stays_the_guests() {
     assert!(release.shortcut.is_none() && !release.deliver);
 }
 
-/// [`KEYBOARD`] holds Backspace, which the input method took and the IME
-/// core leased to [`TI`].
+/// [`KEYBOARD`] holds Backspace, which the input method took to empty
+/// its composition and the IME core leased to [`TI`].
 fn leased_backspace(env: &TestEnv) -> KeyboardCore {
     let mut keys = core("", env);
     keys.step(peek(EVDEV_KEY_BACKSPACE, KeyState::Pressed, 1), env);
+    keys.step(composition_ended(), env);
     let lease = KeyEffect::Lease {
         ti: TI,
         seat: SeatId(SEAT),

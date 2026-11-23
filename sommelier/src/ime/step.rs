@@ -535,6 +535,7 @@ fn composition_event(
         log::debug!("Ignoring a stale composition event of text input {}", ti.0);
         return t.stale(observation);
     };
+    let shown_before = cur.shown().is_some();
     // A region dropped, whose empty range commits the shown preedit.
     let mut dropped = None;
     let planned = match edit {
@@ -612,6 +613,9 @@ fn composition_event(
         Ok((events, lease)) => {
             fx.to_guest.extend(events);
             fx.keys.push(lease);
+            if shown_before && t.shown().is_none() {
+                fx.keys.push(KeyEffect::CompositionEnded { seat: t.seat() });
+            }
         }
         Err(TooLong) => log::warn!(
             "Dropping a host event of text input {}: its text does not fit a message",

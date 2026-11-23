@@ -134,6 +134,9 @@ enum Key {
     Recover(TiId),
     /// H2 on the seat of every test.
     Detached,
+    /// An edit of Exo's ended the shown composition, on the seat of every
+    /// test.
+    Ended,
 }
 
 /// The effects of one step, decoded.
@@ -209,6 +212,10 @@ fn decode(fx: Effects) -> Out {
             KeyEffect::InputMethodDetached { seat } => {
                 assert_eq!(seat, SEAT);
                 Key::Detached
+            }
+            KeyEffect::CompositionEnded { seat } => {
+                assert_eq!(seat, SEAT);
+                Key::Ended
             }
         })
         .collect();
@@ -1331,7 +1338,10 @@ fn row_H7_a_preedit_shows_and_its_clear_arms_the_lease() {
     assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
     let out = ime.compose("");
     assert_eq!(out.guest, [no_preedit(), done(1)]);
-    assert_eq!(out.keys, [lease(LeaseOutcome::ArmIfBackspaceHeld)]);
+    assert_eq!(
+        out.keys,
+        [lease(LeaseOutcome::ArmIfBackspaceHeld), Key::Ended]
+    );
     // An empty preedit while none shows sends its done alone.
     let out = ime.compose("");
     assert_eq!(out.guest, [done(1)]);
@@ -1375,7 +1385,7 @@ fn row_H8_a_commit_ends_the_preedit() {
         text: "각".into(),
     });
     assert_eq!(out.guest, [no_preedit(), commit("각"), done(1)]);
-    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End), Key::Ended]);
     // One that does not fit is dropped.
     ime.compose("가");
     let out = ime.v1(Edit::Commit {
@@ -1384,6 +1394,20 @@ fn row_H8_a_commit_ends_the_preedit() {
     });
     assert!(out.guest.is_empty() && out.keys.is_empty());
     assert_eq!(ime.step(Input::Commit(TI)).guest, [preedit("가"), done(2)]);
+}
+
+/// A commit with no preedit shown, as of a letter the English (US) engine
+/// types itself (E16), ends no composition, so the keyboard concern
+/// recovers no key for it.
+#[test]
+fn row_H8_a_commit_with_no_preedit_shown_ends_no_composition() {
+    let mut ime = Ime::enabled();
+    let out = ime.v1(Edit::Commit {
+        serial: 0,
+        text: "e".into(),
+    });
+    assert_eq!(out.guest, [commit("e"), done(1)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
 }
 
 /// An empty commit with no preedit shown edits nothing, so an absolute
@@ -1595,7 +1619,7 @@ fn an_empty_region_over_a_held_preedit_commits_it() {
     assert_eq!(ime.compose("x").guest, [preedit("x"), done(2)]);
     let out = ime.ext(region(0, 0));
     assert_eq!(out.guest, [no_preedit(), commit("x"), done(2)]);
-    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End), Key::Ended]);
 
     // A region's preedit, "x" of Exo's "abcdx|ef".
     let out = ime.ext(region(-1, 1));
@@ -1676,7 +1700,7 @@ fn row_X2_a_confirmation_commits_the_shown_preedit() {
         keep_selection: true,
     });
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(1)]);
-    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End), Key::Ended]);
 }
 
 #[test]
@@ -2673,7 +2697,7 @@ fn an_unmeasured_empty_region_commits_the_shown_preedit() {
     ime.step(Input::GuestKey(SEAT));
     let out = ime.region(0, 0);
     assert_eq!(out.guest, [no_preedit(), commit("가"), done(2)]);
-    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End), Key::Ended]);
     assert_eq!(ime.compose("나").guest, [preedit("나"), done(2)]);
 }
 

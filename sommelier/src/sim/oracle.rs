@@ -382,6 +382,9 @@ pub(super) struct Counts {
     /// detached (E6): neither is an autorepeat.
     pub confirms_before_a_press: u64,
     pub confirms_before_a_detach: u64,
+    /// Autorepeats the input method passed of a held key that ended no
+    /// composition the guest showed, which the guest does not get.
+    pub repeats_of_no_ended_composition: u64,
     /// Field surfaces the guest destroyed, and those the guest's keyboard
     /// focused (F2).
     pub surface_destroys: u64,
@@ -414,6 +417,7 @@ impl std::ops::AddAssign for Counts {
         self.recoveries_skipped += other.recoveries_skipped;
         self.confirms_before_a_press += other.confirms_before_a_press;
         self.confirms_before_a_detach += other.confirms_before_a_detach;
+        self.repeats_of_no_ended_composition += other.repeats_of_no_ended_composition;
         self.surface_destroys += other.surface_destroys;
         self.focused_surface_destroys += other.focused_surface_destroys;
     }
@@ -800,6 +804,13 @@ pub(super) struct Judge {
     last_reset: Option<u64>,
     /// The keys the host holds, as its key events said.
     host_held: BTreeSet<u32>,
+    /// The key the host pressed last, and the held keys during whose hold
+    /// an edit of Exo's ended a composition the guest showed: only their
+    /// autorepeats may be recovered (X2').
+    last_pressed: Option<u32>,
+    composed: BTreeSet<u32>,
+    /// Whether the guest showed a preedit at the end of the last step.
+    showed: bool,
     /// The `preedit_cursor` since Exo's last edit (B3).
     pieces: Option<i32>,
     /// What reached the proxy in this step.
@@ -835,6 +846,9 @@ impl Judge {
             requests: 0,
             last_reset: None,
             host_held: BTreeSet::new(),
+            last_pressed: None,
+            composed: BTreeSet::new(),
+            showed: false,
             pieces: None,
             input: Input::default(),
             reset: false,
@@ -898,15 +912,22 @@ impl Judge {
         match event {
             AnyEvent::WlKeyboard(wl_keyboard::Event::Enter { .. }) => {
                 self.host_held.clear();
+                self.composed.clear();
                 self.input.ends = true;
             }
             AnyEvent::WlKeyboard(wl_keyboard::Event::Leave { .. }) => self.input.ends = true,
             &AnyEvent::WlKeyboard(wl_keyboard::Event::Key { key, state, .. })
             | &AnyEvent::ZcrExtendedKeyboardV1(peek::Event::PeekKey { key, state, .. }) => {
                 if state == pressed {
-                    self.host_held.insert(key);
+                    // A key's `wl_keyboard.key` follows its peek, both of
+                    // one press.
+                    if self.host_held.insert(key) {
+                        self.composed.remove(&key);
+                    }
+                    self.last_pressed = Some(key);
                 } else {
                     self.host_held.remove(&key);
+                    self.composed.remove(&key);
                 }
                 if state == pressed && matches!(event, AnyEvent::WlKeyboard(_)) {
                     self.input.key = Some(key);
@@ -1026,6 +1047,14 @@ impl Judge {
                         self.guest.held.contains(&key),
                     ) {
                         (true, true) => self.counts.recoveries_skipped += 1,
+                        // Only a key that ended a composition the guest
+                        // showed may be recovered: an autorepeat of another,
+                        // as of a key that ended a composition only Exo
+                        // held, which a late answer across a focus change
+                        // leaves (E5 (c)), is a repeat lost, not text.
+                        (true, false) if !self.composed.contains(&key) => {
+                            self.counts.repeats_of_no_ended_composition += 1;
+                        }
                         (true, false) => {
                             let owed = !origin.stale_held;
                             self.input.repeat = Some(Repeat { key, owed });
@@ -1097,6 +1126,14 @@ impl Judge {
     /// The end of a step: what the guest got in it against what reached
     /// the proxy.
     fn step_end(&mut self, now: Micros, exo: &Exo) {
+        // An edit of Exo's that ended the composition the guest showed ends
+        // it for the key pressed last, if the host still holds it.
+        let shows = !self.guest.shown().text.is_empty();
+        if self.input.edit.is_some() && self.showed && !shows {
+            let held = self.last_pressed.filter(|key| self.host_held.contains(key));
+            self.composed.extend(held);
+        }
+        self.showed = shows;
         let mut input = std::mem::take(&mut self.input);
         input.text = format!("{:.3} ms {}", now.0 as f64 / 1_000.0, input.text);
         let got = std::mem::take(&mut self.guest.got);
@@ -2058,6 +2095,8 @@ mod tests {
             state: pressed,
         };
         host(&mut judge, peek(), any, &[]);
+        // It emptied a composition the guest showed, as `step_end` sees.
+        judge.composed.insert(BACKSPACE);
         let confirm = || extended::Event::ConfirmPreedit {
             selection_behavior: 1,
         };
@@ -2091,6 +2130,7 @@ mod tests {
         // announce.
         let mut judge = entered(&["0"]);
         host(&mut judge, peek(), any, &[]);
+        judge.composed.insert(BACKSPACE);
         let stale = Origin {
             stale_held: true,
             ..repeat
@@ -2105,6 +2145,20 @@ mod tests {
         host(&mut judge, confirm(), stale, &[]);
         assert_eq!(failed(&judge), []);
         assert_eq!(judge.counts.recovered_keys, 1);
+        // An autorepeat of a key that ended no composition the guest showed
+        // is lost, not owed, and the guest may not get it.
+        let mut judge = entered(&["0"]);
+        host(&mut judge, peek(), any, &[]);
+        host(&mut judge, confirm(), repeat, &[]);
+        assert_eq!(failed(&judge), []);
+        assert_eq!(judge.counts.repeats_of_no_ended_composition, 1);
+        host(
+            &mut judge,
+            done(),
+            any,
+            &[press(BACKSPACE), release(BACKSPACE)],
+        );
+        assert_eq!(failed(&judge), [Check::Keys]);
     }
 
     #[test]

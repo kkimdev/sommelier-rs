@@ -101,16 +101,19 @@ async fn ime_edits_end_a_stale_backspace_repeat() {
     }
 }
 
-/// Exo consumes a held Backspace over committed text and confirms an
-/// empty preedit for each repeat: each becomes a key pair with the
-/// serial of the held key's peek, and the repeat stays leased, so the
-/// key's delayed `wl_keyboard` press is the repeat's.
+/// The input method takes Backspace to empty its composition, as the
+/// Korean engine takes it only while it composes (`hangul::Composer`), and
+/// then confirms an empty preedit for each repeat over the committed text:
+/// each becomes a key pair with the serial of the held key's peek, and the
+/// repeat stays leased, so the key's delayed `wl_keyboard` press is the
+/// repeat's.
 #[tokio::test]
-async fn held_backspace_repeats_over_committed_korean_without_preedit() {
+async fn held_backspace_repeats_over_committed_korean_after_emptying_its_preedit() {
     let mut kb = Kb::new().await;
     let ime = kb.text_input().await;
     let ime = report(&mut kb, ime).await;
     kb.peek(700, 100, BACKSPACE, PRESSED).await;
+    kb.lease(ime).await;
 
     for _ in 0..3 {
         kb.confirm(ime).await;
@@ -130,6 +133,7 @@ async fn an_undefined_key_state_decides_a_waiting_recovery() {
     let mut kb = Kb::new().await;
     let ime = kb.text_input().await;
     kb.peek(700, 100, BACKSPACE, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.s.host([zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0)])
         .await;
     let [(_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] =
@@ -156,6 +160,7 @@ async fn empty_confirmation_recovers_any_repeatable_ime_consumed_key() {
         let ime = kb.text_input().await;
         kb.peek(700, 100, held, PRESSED).await;
 
+        kb.end_composition(ime).await;
         kb.confirm(ime).await;
         assert_eq!(
             kb.s.guest_received(),
@@ -175,10 +180,12 @@ async fn a_key_held_on_another_seats_keyboard_is_not_recovered() {
     let surface = kb.surface;
     let other = kb.first_enter(unentered(other), surface).await;
     kb.peek_on(other, 700, 100, KEY_SPACE, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(kb.s.guest_received(), []);
     // Held on the seat's own keyboard, the key is recovered.
     kb.peek(701, 101, KEY_SPACE, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -240,6 +247,7 @@ async fn keys_held_since_enter_are_ordered_by_their_peeks() {
 
     kb.peek_on(other, 700, 100, KEY_SPACE, PRESSED).await;
     kb.peek_on(other, 701, 101, KEY_TAB, PRESSED).await;
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(kb.s.guest_received(), [done(ime)]);
 }
@@ -261,6 +269,7 @@ async fn empty_confirmation_prefers_the_keyboard_focused_on_the_current_surface(
     kb.peek(700, 100, KEY_SPACE, PRESSED).await;
     kb.peek_on(stale, 701, 101, KEY_ENTER, PRESSED).await;
 
+    kb.end_composition(ime).await;
     kb.confirm(ime).await;
     assert_eq!(
         kb.s.guest_received(),
@@ -550,4 +559,107 @@ async fn an_english_input_methods_keys_reach_the_guest_as_exo_sent_them() {
     for seed in 0..200 {
         english_case(seed).await;
     }
+}
+
+/// The guest reports the surrounding text `text`, with the cursor at its
+/// end, and commits; the host answers the barrier the proxy sends with
+/// it. Returns `ime` with the commit counted.
+async fn report_text(kb: &mut Kb, mut ime: Ime, text: &str) -> Ime {
+    let end = text.len() as i32;
+    kb.s.guest([
+        zwp_text_input_v3::req::set_surrounding_text(ime.id, text, end, end).unwrap(),
+        zwp_text_input_v3::req::commit(ime.id),
+    ])
+    .await;
+    ime.serial += 1;
+    assert_eq!(kb.s.guest_received(), [done(ime)]);
+    for (_, request) in kb.s.host_received() {
+        if let AnyRequest::WlDisplay(wl_display::Request::Sync { callback }) = request {
+            kb.s.host([
+                wl_callback::evt::done(callback, 0),
+                wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+            ])
+            .await;
+        }
+    }
+    ime
+}
+
+/// The wire of a short tap of E with ChromeOS's English (US) input
+/// method, as a host recording shows it: the engine takes the key with
+/// nothing composed, so its press is a `peek_key` and the key's
+/// `commit_string` with no `wl_keyboard.key` (E8, E16); each autorepeat is
+/// an empty confirmation and the key's `commit_string` again; and Exo
+/// answers every surrounding text the proxy reports with an empty
+/// confirmation (E17). The same holds for a key whose text is another
+/// key's, as an accent a long press or a dead key gives, and for one the
+/// engine takes with no text at all. The key ended no composition the
+/// guest showed, so none of those confirmations is a key: the guest gets
+/// the engine's text alone, and no key event, so a report the text causes
+/// cannot make another. A press the input method took to end its
+/// composition, as Korean Space after 가, is still recovered.
+#[tokio::test]
+async fn a_key_that_ended_no_composition_is_never_recovered() {
+    use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+    let mut kb = Kb::new().await;
+    let mut ime = kb.text_input().await;
+    let commit =
+        |ime: Ime, text: &str| zwp_text_input_v1::evt::commit_string(ime.host, 0, text).unwrap();
+    let confirm = |ime: Ime| zcr_extended_text_input_v1::evt::confirm_preedit(ime.ext, 0);
+    let mut text = String::new();
+    // The key's own text, an accent, and none.
+    for (serial, typed) in [(1146, "e"), (1150, "é"), (1154, "")] {
+        // The text the engine makes, which the guest gets: none for none.
+        let edit = |ime: Ime| match typed {
+            "" => vec![],
+            typed => vec![v3_commit(ime, typed), done(ime)],
+        };
+        let mut press = vec![
+            confirm(ime),
+            zcr_extended_keyboard_v1::evt::peek_key(kb.k.ext, serial, 750, KEY_E, PRESSED),
+        ];
+        press.extend((!typed.is_empty()).then(|| commit(ime, typed)));
+        kb.s.host(press).await;
+        assert_eq!(kb.s.guest_received(), edit(ime), "{typed:?}");
+        assert_eq!(kb.s.host_received(), []);
+        for _ in 0..3 {
+            text.push_str(typed);
+            // Exo answers the report of the guest's text, alone.
+            ime = report_text(&mut kb, ime, &text).await;
+            kb.s.host([confirm(ime)]).await;
+            assert_eq!(kb.s.guest_received(), [], "after {text:?}");
+            assert_eq!(kb.s.host_received(), [], "after {text:?}");
+            // An autorepeat the engine took.
+            let mut repeat = vec![confirm(ime)];
+            repeat.extend((!typed.is_empty()).then(|| commit(ime, typed)));
+            kb.s.host(repeat).await;
+            assert_eq!(kb.s.guest_received(), edit(ime), "{typed:?}");
+            assert_eq!(kb.s.host_received(), []);
+        }
+        kb.peek(serial, 1100, KEY_E, RELEASED).await;
+    }
+
+    // Korean: Space after 가, which the engine takes to commit "가 " (E15),
+    // and whose autorepeats it passes, each an empty confirmation (E13).
+    ime = report_text(&mut kb, ime, &text).await;
+    kb.compose(ime, "가").await;
+    kb.s.host([
+        zcr_extended_keyboard_v1::evt::peek_key(kb.k.ext, 1200, 2000, KEY_SPACE, PRESSED),
+        commit(ime, "가 "),
+    ])
+    .await;
+    let cleared = zwp_text_input_v3::Event::PreeditString {
+        text: Some("".into()),
+        cursor_begin: 0,
+        cursor_end: 0,
+    };
+    assert_eq!(
+        kb.s.guest_received(),
+        [(ime.id, cleared.into()), v3_commit(ime, "가 "), done(ime)]
+    );
+    kb.confirm(ime).await;
+    assert_eq!(
+        kb.s.guest_received(),
+        recovered(ime, kb.k, 1200, 2000, KEY_SPACE)
+    );
 }
