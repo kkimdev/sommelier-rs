@@ -58,7 +58,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::test_support::trace::Tape;
 use crate::test_support::{env_u64, Rng};
 use editor::{Reference, TextModel, Typing, UserAction};
-use engine::Lag;
+use engine::{Lag, Typed};
 use oracle::{Check, Counts, Failure, Tier};
 use sched::{Choices, Choose, Line, Setup, World};
 
@@ -91,9 +91,9 @@ struct Case {
     settled: bool,
     /// The input method is a Latin layout rather than Korean.
     latin: bool,
-    /// The Latin layout has an English engine, which handles no key, so
-    /// that each press and autorepeat comes after an empty confirmation
-    /// (E13), rather than none.
+    /// The Latin layout has an English engine, which types letters itself
+    /// (E16) and passes every other key, each after an empty confirmation
+    /// (E13), and answers each surrounding text with one (E17).
     english: bool,
     /// The fields' initial texts.
     texts: Vec<String>,
@@ -122,6 +122,16 @@ impl Case {
         };
         case.actions = user::actions(&mut rng, &case.texts, case.typing(), settled);
         case
+    }
+
+    /// What the case's English engine commits for a letter: in a free case,
+    /// from the seed ([`Typed::of`]); in a settled one, which the user's
+    /// intent judges, the letter.
+    fn typed(&self) -> Typed {
+        match self.english && !self.settled {
+            true => Typed::of(self.seed),
+            false => Typed::Own,
+        }
     }
 
     /// How keys reach the client's fields: GTK's Backspace leaves a
@@ -202,6 +212,7 @@ fn run_recorded(
         client: case.client,
         latin: case.latin,
         english: case.english,
+        typed: case.typed(),
         lag,
         late_keyboard,
         texts: &case.texts,
@@ -279,11 +290,12 @@ fn run_recorded(
 fn report(case: &Case, outcome: &Outcome, failures: &[Failure], trace: &[Line]) -> String {
     let mode = if case.settled { "settled" } else { "free" };
     let mut report = format!(
-        "DST FAILURE seed={} mode={mode} client={} latin={} english={} lag={:?}\n",
+        "DST FAILURE seed={} mode={mode} client={} latin={} english={} typed={:?} lag={:?}\n",
         case.seed,
         case.client.name(),
         case.latin,
         case.english,
+        case.typed(),
         outcome.lag,
     );
     for failure in failures {
@@ -525,6 +537,7 @@ fn check(test: &str, settled: bool) {
             counts.detaches_before_keyboard,
             counts.deletes,
             counts.regions,
+            counts.confirms_of_reports,
         ]);
         if !settled {
             reached.extend([

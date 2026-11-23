@@ -39,6 +39,10 @@ pub(crate) struct PeekKeyProvenance {
     /// repeat. Host accelerators and shortcut chords permanently clear
     /// this bit for the lifetime of the generation.
     pub eligible: bool,
+    /// A composition the guest showed ended while the input method held
+    /// the key it took (`KeyGenerationRegistry::mark_composed`): only then
+    /// can its autorepeats be ones the input method passes (E15).
+    pub composed: bool,
 }
 
 /// Causal watermark for the newest physical generation in one seat/focus
@@ -864,6 +868,7 @@ impl KeyGenerationRegistry {
             time,
             sequence,
             eligible,
+            composed: false,
         });
         generation.phase = KeyPhase::Held { peek, lease, stale };
         sequence
@@ -888,6 +893,19 @@ impl KeyGenerationRegistry {
 
     fn observe_peek_release(&mut self, keyboard: HostId, key: u32, serial: u32) {
         self.observe_physical_event(keyboard, key, KeyState::Released, Some(serial));
+    }
+
+    /// A composition the guest showed ended while `keyboard` held `key`,
+    /// which the input method took (`PeekKeyProvenance::composed`).
+    pub(super) fn mark_composed(&mut self, keyboard: HostId, key: u32) {
+        if let Some(PeekRecord::Live(peek)) = self
+            .entries
+            .get_mut(&keyboard)
+            .and_then(|keys| keys.get_mut(&key))
+            .and_then(|generation| generation.phase.peek_mut())
+        {
+            peek.composed = true;
+        }
     }
 
     pub(super) fn invalidate_peek(&mut self, keyboard: HostId, key: u32) {

@@ -47,7 +47,7 @@ limitations under the License.
 //! every event of the confirmation's task (E11), so that one round trip
 //! decides it at the latest. No timer is involved.
 
-use super::generations::{LeaseInput, EVDEV_KEY_BACKSPACE};
+use super::generations::{LeaseInput, PeekKeyProvenance, EVDEV_KEY_BACKSPACE};
 use super::{Env, KeyEffects, KeyboardCore, Recovered};
 use crate::ime::{LeaseOutcome, SeatId, TiId};
 use crate::protocols::wayland::wl_keyboard;
@@ -195,6 +195,53 @@ impl PendingRecovery {
 }
 
 impl KeyboardCore {
+    /// The seat's key with the latest live peek, preferring the keyboards
+    /// focused on the seat's current surface: its guest and host keyboards,
+    /// the key and its peek.
+    fn latest_peek(
+        &self,
+        guest_seat: GuestId,
+    ) -> Option<(GuestId, HostId, u32, PeekKeyProvenance)> {
+        let active_surface = self.focus.surface_for_seat(guest_seat);
+        let mut candidates = Vec::new();
+        for host_keyboard_id in self.keyboards.of_seat(guest_seat) {
+            let Some(guest_keyboard_id) = self.keyboards.get(host_keyboard_id).map(|k| k.guest)
+            else {
+                continue;
+            };
+            let focused = active_surface
+                .is_some_and(|surface| self.focus.keyboard_owns_surface(host_keyboard_id, surface));
+            for (key, press) in self.generations.peek_keys(host_keyboard_id) {
+                candidates.push((focused, guest_keyboard_id, host_keyboard_id, key, press));
+            }
+        }
+        let (_, guest_keyboard_id, host_keyboard_id, key, press) = candidates
+            .into_iter()
+            .filter(|candidate| active_surface.is_none() || candidate.0)
+            .max_by_key(|candidate| candidate.4.sequence)?;
+        Some((guest_keyboard_id, host_keyboard_id, key, press))
+    }
+
+    /// An edit of Exo's ended the composition a text input of `seat`
+    /// showed (`ime::KeyEffect::CompositionEnded`). The input method ends
+    /// a composition for the key it handles (E8), a press or an
+    /// autorepeat, which is the latest key pressed. If the seat still
+    /// holds that key, the input method took it for its composition, as
+    /// Korean Space after 가 (E15) or a Backspace that empties it, and with
+    /// nothing composed now may pass its autorepeats, as empty
+    /// confirmations (E13): the key may be recovered for the rest of its
+    /// hold. A key the guest got is marked too, but its recovery sends no
+    /// pair ([`Self::key_pair`]), only the confirmation's `done`.
+    pub(super) fn composition_ended(&mut self, seat: SeatId) {
+        let Some((_, keyboard, key, _)) = self.latest_peek(seat.0) else {
+            return;
+        };
+        if self.generations.physically_held(keyboard, key) {
+            log::debug!("Held key {key} of keyboard {keyboard} ended a composition");
+            self.generations.mark_composed(keyboard, key);
+        }
+    }
+
     /// Resolve the physical key generation responsible for an empty IME
     /// confirmation on `guest_seat`.
     ///
@@ -212,30 +259,14 @@ impl KeyboardCore {
     /// it does not hold), only the confirmation before it (E13), which no
     /// wire event tells from an autorepeat.
     fn held_repeat_key(&self, guest_seat: GuestId) -> Option<HeldRepeatKey> {
-        let active_surface = self.focus.surface_for_seat(guest_seat);
-        let mut candidates = Vec::new();
-        let mut stale_key_held = false;
-
-        for host_keyboard_id in self.keyboards.of_seat(guest_seat) {
-            let Some(guest_keyboard_id) = self.keyboards.get(host_keyboard_id).map(|k| k.guest)
-            else {
-                continue;
-            };
-            stale_key_held |= self.generations.holds_a_stale_key(host_keyboard_id);
-            let focused = active_surface
-                .is_some_and(|surface| self.focus.keyboard_owns_surface(host_keyboard_id, surface));
-            for (key, press) in self.generations.peek_keys(host_keyboard_id) {
-                candidates.push((
-                    focused,
-                    press.sequence,
-                    guest_keyboard_id,
-                    host_keyboard_id,
-                    key,
-                    press,
-                ));
-            }
-        }
-
+        let stale_key_held = self
+            .keyboards
+            .of_seat(guest_seat)
+            .into_iter()
+            .any(|keyboard| {
+                self.keyboards.get(keyboard).is_some()
+                    && self.generations.holds_a_stale_key(keyboard)
+            });
         if stale_key_held {
             log::debug!(
                 "Ignoring empty IME confirmation while seat {guest_seat} holds a key across the \
@@ -243,11 +274,8 @@ impl KeyboardCore {
             );
             return None;
         }
-        let (_, _, guest_keyboard_id, host_keyboard_id, key, press) = candidates
-            .into_iter()
-            .filter(|candidate| active_surface.is_none() || candidate.0)
-            .max_by_key(|candidate| candidate.1)?;
-
+        let (guest_keyboard_id, host_keyboard_id, key, press) = self.latest_peek(guest_seat)?;
+        let active_surface = self.focus.surface_for_seat(guest_seat);
         let latest_sequence = self
             .generations
             .latest_peek_sequence(guest_seat, active_surface);
@@ -267,6 +295,7 @@ impl KeyboardCore {
         if !is_latest_generation
             || !physically_held
             || !press.eligible
+            || !press.composed
             || stale
             || !repeatable
             || backspace_cancelled
@@ -274,11 +303,12 @@ impl KeyboardCore {
             log::debug!(
                 "Ignoring empty IME confirmation for ineligible held key {} \
                  (latest_generation={}, physically_held={}, generation_eligible={}, \
-                 stale={}, repeatable={}, backspace_cancelled={})",
+                 ended_a_composition={}, stale={}, repeatable={}, backspace_cancelled={})",
                 key,
                 is_latest_generation,
                 physically_held,
                 press.eligible,
+                press.composed,
                 stale,
                 repeatable,
                 backspace_cancelled

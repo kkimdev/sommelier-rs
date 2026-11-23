@@ -52,7 +52,7 @@ use super::client::{Client, Field, PressKind};
 use super::clock::Micros;
 use super::display::{self, Display};
 use super::editor::{Target, TextModel, UserAction};
-use super::engine::{Engine, EngineIn, Lag, Request};
+use super::engine::{Engine, EngineIn, EngineOut, Lag, Request, Typed};
 use super::exo::{Answer, Exo, Predicted, RegionOutcome, RegionTruth};
 use super::hangul::Key;
 use super::keymap;
@@ -255,8 +255,11 @@ pub(super) struct Setup<'a> {
     /// The input method is a Latin layout, which has no engine unless it
     /// is `english`.
     pub latin: bool,
-    /// The Latin layout has an English engine, which handles no key.
+    /// The Latin layout has an English engine, which types letters itself
+    /// (E16) and answers each surrounding text (E17).
     pub english: bool,
+    /// What the English engine commits for a letter.
+    pub typed: Typed,
     pub lag: Lag,
     /// The guest releases its keyboard and binds a new one once its text
     /// input is active, so the new one hears of the next focus move after
@@ -407,7 +410,7 @@ impl<'t> World<'t> {
             session: Session::new(),
             client: None,
             exo,
-            engine: Engine::new(setup.lag).english(setup.english),
+            engine: Engine::new(setup.lag).english(setup.english, setup.typed),
             display: Display::new(display::exo_globals())
                 .unanswered(&[zcr_extended_keyboard_v1::NAME]),
             windows: Windows::new(surfaces.clone()),
@@ -722,22 +725,24 @@ impl<'t> World<'t> {
     /// a late answer if `late`, made before the resets this input hands the
     /// engine.
     fn host_sends(&mut self, events: Vec<Outgoing<u32>>, late: bool) {
-        self.host_sends_of(events, late, (None, None));
+        self.host_sends_of(events, late, (None, None), false);
     }
 
-    /// [`World::host_sends`], of Exo's answer to a press of `press` or an
-    /// autorepeat of `repeat`.
+    /// [`World::host_sends`], of Exo's answer to a press of `press`, an
+    /// autorepeat of `repeat`, or a surrounding text if `report`.
     fn host_sends_of(
         &mut self,
         events: Vec<Outgoing<u32>>,
         late: bool,
         (press, repeat): (Option<Key>, Option<Key>),
+        report: bool,
     ) {
         let origin = Origin {
             late,
             resets: self.resets,
             press,
             repeat,
+            report,
             requests: self.requests,
             stale_held: self.exo.holds_stale_key(),
         };
@@ -761,7 +766,14 @@ impl<'t> World<'t> {
     fn engine_answers(&mut self) {
         let answer = self.engine.take(&mut self.choices);
         self.log(Place::Engine, format!("{answer:?}"));
-        let keys = (self.exo.press_of(&answer), self.exo.repeat_of(&answer));
+        // A confirmation in an autorepeat's text is the engine's own, of
+        // a repeat it handles (E16), not IMA's of one it passes (E13).
+        let repeat = match answer {
+            EngineOut::Text { .. } => None,
+            EngineOut::Done { .. } => self.exo.repeat_of(&answer),
+        };
+        let keys = (self.exo.press_of(&answer), repeat);
+        let report = self.exo.report_of(&answer);
         let verdict = self.exo.answer(&answer);
         let outcome = self.exo.take_region_outcome();
         let refused = outcome == Some(RegionOutcome::Refused);
@@ -775,7 +787,7 @@ impl<'t> World<'t> {
             judge.counts.late += u64::from(verdict == Answer::Late);
             judge.counts.dropped += u64::from(verdict == Answer::Dropped);
         }
-        self.host_sends_of(Vec::new(), verdict == Answer::Late, keys);
+        self.host_sends_of(Vec::new(), verdict == Answer::Late, keys, report);
     }
 
     /// The guest sends `requests` at once, on C→P.

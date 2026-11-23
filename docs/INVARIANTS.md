@@ -595,6 +595,24 @@ IDs such as E6, H2 and X2' name the rows and facts of
   own would soon fall outside.
   Tests: `a_recovered_key_carries_the_latest_peek_serial`,
   `an_empty_confirmation_recovers_the_latest_eligible_held_key`.
+- **An empty confirmation recovers only a key that ended a composition.**
+  At extension v11 Exo sends an empty `confirm_preedit` for more than an
+  autorepeat the input method passes (E13): before each key the English
+  (US) engine takes (E16), and in answer to each surrounding text the
+  proxy reports (E17). An input method passes a held key's autorepeats,
+  which arrive only as such confirmations, when it took the key's press
+  for a composition it no longer holds, as Korean Space after 가 (E15)
+  or a Backspace that empties the composition. So the proxy recovers a
+  held key only once an edit of Exo's ended a composition the guest
+  showed while the key was held, the key pressed last then. A key the
+  input method took with nothing to end, such as an English letter, an
+  accent or a key it takes with no text, is never recovered, so the
+  guest's report of a recovered key cannot make another. A composition
+  the guest never saw, as a late answer across a focus change leaves (E5
+  (c)), makes its key recover nothing: a repeat lost, not text.
+  Tests: `a_key_that_ended_no_composition_is_never_recovered`,
+  `only_a_held_key_that_ended_a_composition_is_recovered`,
+  `row_H8_a_commit_with_no_preedit_shown_ends_no_composition`.
 - **An empty confirmation recovers a held key only once the host shows it
   repeated.** At extension v11 an empty `confirm_preedit` while a key the
   input method took is held is either that key's autorepeat or Exo's

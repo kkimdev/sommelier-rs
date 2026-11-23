@@ -699,6 +699,18 @@ impl Field {
     }
 
     /// The host input method's `confirm_preedit`.
+    /// The input method shows a preedit and empties it while the key the
+    /// latest peek announced is held, which it took to end its composition
+    /// (E15): an empty confirmation may recover that key. The guest gets
+    /// both edits.
+    async fn end_composition(&mut self) {
+        self.s
+            .host([self.preedit("가", ""), self.preedit("", "")])
+            .await;
+        let expected = [preedit("가"), DONE, no_preedit(), DONE];
+        assert_eq!(self.s.guest_received(), self.events(expected));
+    }
+
     fn confirm(&self) -> Outgoing<u32> {
         ext::confirm_preedit(self.host_ext, 1)
     }
@@ -3336,8 +3348,9 @@ async fn an_input_method_detach_ends_the_recovery_of_held_keys() {
         time: 1_400,
         ..space
     };
-    f.s.host([f.peek(release), f.peek(again), f.confirm()])
-        .await;
+    f.s.host([f.peek(release), f.peek(again)]).await;
+    f.end_composition().await;
+    f.s.host([f.confirm()]).await;
     f.answer_recovery_syncs().await;
     assert_eq!(f.s.guest_received(), f.recovered(again));
 }
@@ -3348,12 +3361,13 @@ async fn an_input_method_detach_ends_the_recovery_of_held_keys() {
 /// hold: the key's next press gets no peek and no `wl_keyboard.key`,
 /// only the input method's empty confirmation before it (E13). While
 /// such a key is held, an empty confirmation is that press's as likely
-/// as an autorepeat of the eligible held key, here Backspace, so it
-/// recovers nothing, as a guessed Backspace would delete text (DST
-/// seeds 13104 and 16710, shrunk). Once the old key's release comes,
-/// the next confirmation recovers Backspace again.
+/// as an autorepeat of the eligible held key, here `1`, which ended a
+/// composition, so it recovers nothing, as a guessed Backspace would
+/// delete text (DST seeds 13104 and 16710, shrunk). Once the old key's
+/// release comes, the next confirmation recovers `1` again.
 #[tokio::test]
 async fn a_confirmation_while_a_key_held_across_a_detach_recovers_nothing() {
+    const KEY_1: u32 = 2;
     let mut f = Field::typing().await;
     let space = Stroke {
         key: SPACE,
@@ -3370,13 +3384,17 @@ async fn a_confirmation_while_a_key_held_across_a_detach_recovers_nothing() {
     f.s.host([answer, v1::enter(f.host, f.surface.host)]).await;
     assert_eq!(f.s.guest_received(), []);
 
-    let backspace = Stroke {
-        key: BACKSPACE,
+    // A key the input method took to end its composition; not Backspace,
+    // whose lease the refused confirmation would end.
+    let one = Stroke {
+        key: KEY_1,
         serial: 701,
         time: 1_400,
         ..space
     };
-    f.s.host([f.peek(backspace), f.confirm()]).await;
+    f.s.host([f.peek(one)]).await;
+    f.end_composition().await;
+    f.s.host([f.confirm()]).await;
     f.answer_recovery_syncs().await;
     assert_eq!(f.s.guest_received(), [], "Space's press, unseen");
 
@@ -3388,7 +3406,7 @@ async fn a_confirmation_while_a_key_held_across_a_detach_recovers_nothing() {
     };
     f.s.host([f.peek(release), f.confirm()]).await;
     f.answer_recovery_syncs().await;
-    assert_eq!(f.s.guest_received(), f.recovered(backspace));
+    assert_eq!(f.s.guest_received(), f.recovered(one));
 }
 
 /// Exo's own detach (H2) ends only the recovery of the keys held
@@ -3412,8 +3430,9 @@ async fn a_key_held_across_a_detach_is_typed_and_recovered_again() {
         time: 1_240,
         ..one
     };
-    f.s.host([f.peek(one), f.peek(space), f.confirm(), v1::leave(f.host)])
-        .await;
+    f.s.host([f.peek(one), f.peek(space)]).await;
+    f.end_composition().await;
+    f.s.host([f.confirm(), v1::leave(f.host)]).await;
     let callback = barrier(&f.host_received().await);
     let answer = wl_callback::evt::done(callback, 0);
     f.s.host([answer, v1::enter(f.host, f.surface.host)]).await;
@@ -3433,7 +3452,9 @@ async fn a_key_held_across_a_detach_is_typed_and_recovered_again() {
         time: 1_500,
         ..space
     };
-    f.s.host([f.peek(space_again), f.confirm()]).await;
+    f.s.host([f.peek(space_again)]).await;
+    f.end_composition().await;
+    f.s.host([f.confirm()]).await;
     f.answer_recovery_syncs().await;
     assert_eq!(f.s.guest_received(), f.recovered(space_again));
 }
@@ -3493,7 +3514,9 @@ async fn a_peek_release_with_the_press_serial_ends_the_press() {
     assert!(!f.held(BACKSPACE));
 
     let again = Stroke { time: 120, ..press };
-    f.s.host([f.peek(again), f.confirm()]).await;
+    f.s.host([f.peek(again)]).await;
+    f.end_composition().await;
+    f.s.host([f.confirm()]).await;
     f.answer_recovery_syncs().await;
     assert_eq!(f.s.guest_received(), f.recovered(again));
     assert_eq!(f.repeat_owner(BACKSPACE), Some(f.ti));
@@ -3686,7 +3709,9 @@ async fn held_keys_repeat_through_confirmations_after_korean_input() {
         time: 1_800,
         ..backspace
     };
-    f.s.host([f.peek(backspace), f.confirm()]).await;
+    f.s.host([f.peek(backspace)]).await;
+    f.end_composition().await;
+    f.s.host([f.confirm()]).await;
     f.answer_recovery_syncs().await;
     assert_eq!(f.s.guest_received(), f.recovered(backspace));
 }
@@ -3752,7 +3777,9 @@ async fn keys_held_at_an_enter_are_numbered_in_the_hosts_order() {
         time: 2_001,
         ..s
     };
-    f.s.host([f.peek(s), f.peek(a), f.confirm()]).await;
+    f.s.host([f.peek(s), f.peek(a)]).await;
+    f.end_composition().await;
+    f.s.host([f.confirm()]).await;
     f.answer_recovery_syncs().await;
     assert_eq!(f.s.guest_received(), f.events([DONE]));
 }

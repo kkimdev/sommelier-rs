@@ -707,6 +707,7 @@ impl KeyboardCore {
             }
             KeyEffect::RecoverHeldKey { ti, seat } => self.hold_recovery(ti, seat, fx),
             KeyEffect::InputMethodDetached { seat } => self.detached(seat),
+            KeyEffect::CompositionEnded { seat } => self.composition_ended(seat),
         }
     }
 
