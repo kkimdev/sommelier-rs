@@ -56,11 +56,13 @@ limitations under the License.
 //!
 //! A Latin layout has no engine, and its keys never come here
 //! ([`Exo::latin`](super::exo::Exo)), or an English one
-//! ([`Engine::english`]), which handles no key and makes no text: IMA then
-//! confirms before each press, and each autorepeat, it passes (E13), as
-//! ChromeOS's English (US) layout makes it do for a field that states its
-//! text (an `xkb:` engine; `ShouldUseNullInputType` in `text_input.cc`
-//! gives a field that does not state it no engine).
+//! ([`Engine::english`]), as ChromeOS's English (US) layout has for a
+//! field that states its text (`ShouldUseNullInputType` in
+//! `text_input.cc` gives a field that does not state it no engine). That
+//! engine composes nothing. It types each letter itself, press and
+//! autorepeat, confirming first (E16), and passes every other key, before
+//! which IMA confirms (E13). It answers each surrounding text Exo hands
+//! it ([`EngineIn::SurroundingText`]) with an empty confirmation (E17).
 
 use super::clock::Micros;
 use super::editor::{reconvertible, word_before};
@@ -82,6 +84,10 @@ pub(super) enum EngineIn {
         id: u64,
         before: String,
     },
+    /// A surrounding text that changed (`SetSurroundingText`, from IMA's
+    /// `OnCaretBoundsChanged`), with the ID its answer carries; only an
+    /// English engine gets one.
+    SurroundingText { id: u64 },
 }
 
 /// What the user asks of the engine besides keys (D6).
@@ -118,6 +124,32 @@ pub(super) enum TextAction {
     /// Compose the existing text from before the cursor to after it
     /// (`SetComposingRange`), in UTF-16 code units.
     Region { before: usize, after: usize },
+    /// Confirm the composition (`ConfirmComposition`), which IMA does at
+    /// once, not for the key's callback.
+    Confirm,
+}
+
+/// What an English engine commits for a letter it takes ([`Engine::english`]).
+/// A host showed it commit the letter itself (E16); an accent, as a long
+/// press or a dead key gives, and nothing at all are what other engines
+/// may make of a key they take with nothing composed, which a free case
+/// takes from its seed ([`Typed::of`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Typed {
+    /// The letter.
+    #[default]
+    Own,
+    /// The letter with an acute accent.
+    Accented,
+    /// Nothing: the engine takes the key with no text.
+    Nothing,
+}
+
+impl Typed {
+    /// The variant of a free case's `seed`, from its third and fourth bits.
+    pub fn of(seed: u64) -> Self {
+        [Self::Own, Self::Accented, Self::Nothing, Self::Own][(seed >> 2 & 3) as usize]
+    }
 }
 
 /// How long the engine takes over a key, drawn once per case.
@@ -176,8 +208,10 @@ pub(super) struct Engine {
     /// What the engine has not reached yet, in order.
     queue: VecDeque<EngineIn>,
     busy: Option<InService>,
-    /// An English layout's engine ([`Engine::english`]).
+    /// An English layout's engine ([`Engine::english`]), and what it
+    /// commits for a letter.
     english: bool,
+    typed: Typed,
 }
 
 impl Engine {
@@ -190,13 +224,18 @@ impl Engine {
             queue: VecDeque::new(),
             busy: None,
             english: false,
+            typed: Typed::Own,
         }
     }
 
-    /// The engine, an English layout's if `english`: one that handles no
-    /// key and makes no text.
-    pub fn english(self, english: bool) -> Self {
-        Self { english, ..self }
+    /// The engine, an English layout's if `english`: one that types
+    /// letters itself (E16) and answers each surrounding text (E17).
+    pub fn english(self, english: bool, typed: Typed) -> Self {
+        Self {
+            english,
+            typed,
+            ..self
+        }
     }
 
     /// Exo hands the engine `input` at `now`.
@@ -274,6 +313,7 @@ impl Engine {
                     id,
                     before,
                 }) => (id, (self.request(request, &before), true)),
+                Some(EngineIn::SurroundingText { id }) => (id, (vec![TextAction::Confirm], true)),
             };
             let at = now + self.lag.service(choices);
             self.busy = Some(InService {
@@ -289,8 +329,20 @@ impl Engine {
     /// region included, then the composition if it differs from the one
     /// shown, which a commit ends; and whether the engine handled the key.
     fn answer(&mut self, key: Key, pressed: bool) -> (Vec<TextAction>, bool) {
-        if !pressed || self.english {
-            return (Vec::new(), false);
+        match key {
+            _ if !pressed => return (Vec::new(), false),
+            Key::Char(c) if self.english && c.is_alphabetic() => {
+                let text = match self.typed {
+                    Typed::Own => Some(c.to_string()),
+                    Typed::Accented => Some(format!("{c}\u{301}")),
+                    Typed::Nothing => None,
+                };
+                let mut actions = vec![TextAction::Confirm];
+                actions.extend(text.map(TextAction::Commit));
+                return (actions, true);
+            }
+            _ if self.english => return (Vec::new(), false),
+            _ => {}
         }
         if let Some(region) = self.region.take() {
             let (mut actions, handled) = self.answer(key, pressed);
@@ -398,6 +450,50 @@ mod tests {
 
     fn commit(text: &str) -> TextAction {
         TextAction::Commit(text.to_owned())
+    }
+
+    /// An English engine takes a letter after a confirmation of its own
+    /// (E16), and commits what the case says: the letter, an accented
+    /// letter, or nothing. It passes Space.
+    #[test]
+    fn an_english_engine_takes_a_letter_and_commits_what_its_case_says() {
+        let cases = [
+            (Typed::Own, vec![TextAction::Confirm, commit("q")]),
+            (
+                Typed::Accented,
+                vec![TextAction::Confirm, commit("q\u{301}")],
+            ),
+            (Typed::Nothing, vec![TextAction::Confirm]),
+        ];
+        for (typed, text) in cases {
+            let mut engine = Engine::new(Lag::Fast).english(true, typed);
+            engine.send(Micros(0), press(Key::Char('q'), 0), &mut |_| 0);
+            let answer = engine.take(&mut |_| 0);
+            assert_eq!(
+                answer,
+                EngineOut::Text {
+                    id: 0,
+                    actions: text
+                }
+            );
+            let done = engine.take(&mut |_| 0);
+            assert_eq!(
+                done,
+                EngineOut::Done {
+                    id: 0,
+                    handled: true
+                }
+            );
+            engine.send(Micros(0), press(Key::Char(' '), 1), &mut |_| 0);
+            let done = engine.take(&mut |_| 0);
+            assert_eq!(
+                done,
+                EngineOut::Done {
+                    id: 1,
+                    handled: false
+                }
+            );
+        }
     }
 
     #[test]

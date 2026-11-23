@@ -69,7 +69,9 @@ limitations under the License.
 //!   display's ([`super::display`]).
 //!
 //! The engine gets the autorepeats of a held key ([`Exo::autorepeat`]),
-//! and IMA confirms before each one it did not handle (E13).
+//! and IMA confirms before each one it did not handle (E13). An English
+//! engine also gets each surrounding text that changed, which it answers
+//! with an empty confirmation (E17).
 //!
 //! IMA drops a handled release: it reaches the extension as a `peek_key`
 //! only, as its press did, and no `wl_keyboard.key` follows.
@@ -522,6 +524,10 @@ struct Ima {
     region: Option<(usize, usize)>,
     /// `composing_text_`: whether IMA takes the engine to be composing.
     composing: bool,
+    /// `previous_surrounding_text_` and `previous_selection_range_`: the
+    /// last surrounding text IMA handed the engine, which it hands again
+    /// only once it changes (`OnCaretBoundsChanged`).
+    reported: Option<(String, u32, u32)>,
 }
 
 /// What became of a key's text, the verdict of [`Exo::answer`] on a part of
@@ -543,10 +549,12 @@ pub(super) enum Answer {
 /// A key or a request handed to the engine that it has not answered.
 struct PendingKey {
     id: u64,
-    /// The key and whether it was pressed, or `None` for a request, whose
-    /// text goes out at once, as no key is in flight, and which has no key
-    /// events.
+    /// The key and whether it was pressed, or `None` for a request or a
+    /// surrounding text, whose text goes out at once, as no key is in
+    /// flight, and which has no key events.
     key: Option<(Key, bool)>,
+    /// A surrounding text, which an English engine answers (E17).
+    report: bool,
     /// The press is an autorepeat, which no key event follows (E7).
     repeat: bool,
     /// The input method it went through is gone, so its answer goes
@@ -632,9 +640,10 @@ pub(crate) struct Exo {
     /// once, with no callback, no confirmation and no lag
     /// (`DispatchKeyEvent` without `GetEngine()`).
     pub(super) latin: bool,
-    /// Whether the Latin layout has an English engine, which handles no
-    /// key ([`super::engine::Engine::english`]): IMA hands it every key as
-    /// it would the Korean one's.
+    /// Whether the Latin layout has an English engine, which types
+    /// letters itself (E16) and answers each surrounding text with an
+    /// empty confirmation (E17) ([`super::engine::Engine::english`]): IMA
+    /// hands it every key as it would the Korean one's.
     pub(super) english: bool,
     /// What Exo handed the engine and no one has taken yet, in order.
     to_engine: Vec<EngineIn>,
@@ -741,6 +750,7 @@ impl Exo {
             id,
             key: Some((key, pressed)),
             repeat: false,
+            report: false,
             orphaned: false,
             time,
             answered: false,
@@ -919,6 +929,7 @@ impl Exo {
             id,
             key: Some((key, true)),
             repeat: true,
+            report: false,
             orphaned: false,
             time: millis(now),
             answered: false,
@@ -950,6 +961,7 @@ impl Exo {
             id,
             key: None,
             repeat: false,
+            report: false,
             orphaned: false,
             time: 0,
             answered: false,
@@ -961,6 +973,44 @@ impl Exo {
             id,
             before,
         });
+    }
+
+    /// `TextInput::SetSurroundingText` calls IMA's `OnCaretBoundsChanged`,
+    /// which hands the engine the text of the text input it serves if it
+    /// changed. Only an English engine answers it (E17), so only that one
+    /// gets it.
+    fn hand_surrounding_text(&mut self, id: u32, reported: (String, u32, u32)) {
+        if !self.english || self.ima.client != Some(id) {
+            return;
+        }
+        if self.ima.reported.as_ref() == Some(&reported) {
+            return;
+        }
+        self.ima.reported = Some(reported);
+        let id = self.next_key;
+        self.next_key += 1;
+        self.in_engine.push_back(PendingKey {
+            id,
+            key: None,
+            repeat: false,
+            report: true,
+            orphaned: false,
+            time: 0,
+            answered: false,
+            late: false,
+            dropped: false,
+        });
+        self.to_engine.push(EngineIn::SurroundingText { id });
+    }
+
+    /// Whether `out` answers a surrounding text (E17).
+    pub(super) fn report_of(&self, out: &EngineOut) -> bool {
+        let id = match *out {
+            EngineOut::Text { id, .. } | EngineOut::Done { id, .. } => id,
+        };
+        self.in_engine
+            .front()
+            .is_some_and(|pending| pending.id == id && pending.report)
     }
 
     /// What Exo handed the engine since the last call, in order. Whoever
@@ -1301,7 +1351,8 @@ impl Exo {
                 let text_input = self.text_input(sender);
                 let (at, from) = (*cursor as usize, *anchor as usize);
                 text_input.text.update(text.clone(), at, from);
-                text_input.field.surrounding_text = (text, *cursor, *anchor);
+                text_input.field.surrounding_text = (text.clone(), *cursor, *anchor);
+                self.hand_surrounding_text(sender, (text, *cursor, *anchor));
             }
             Request::SetCursorRectangle {
                 x,
@@ -1416,6 +1467,12 @@ impl Exo {
                 TextAction::Preedit(text) => {
                     self.ima.composing |= !text.is_empty();
                     self.ima.composition = Some(text.clone());
+                }
+                // IMA confirms at once (E16).
+                TextAction::Confirm => {
+                    if let Some(client) = self.ima.client {
+                        self.confirm_composition(client);
+                    }
                 }
                 TextAction::Delete { .. } | TextAction::Region { .. } => {
                     panic!("only a request deletes or reconverts, and no key is in flight then")
@@ -1577,6 +1634,9 @@ impl Exo {
                     self.region_outcome = Some(RegionOutcome::Refused);
                 }
                 self.ima.composing |= composed;
+            }
+            TextAction::Confirm => {
+                self.confirm_composition(id);
             }
         }
     }
@@ -2806,6 +2866,33 @@ mod tests {
         events(&mut exo);
         assert!(!exo.autorepeat(NOW, k(' ')));
         assert_eq!(exo.take_engine(), []);
+    }
+
+    #[test]
+    fn e16_e17_an_english_engine_confirms_its_letters_and_answers_each_report() {
+        let mut exo = active(V11);
+        exo.latin = true;
+        exo.english = true;
+        // E16: the engine's confirmation goes out at once, and the letter
+        // with the callback, after the peek and with no key event.
+        let typed = press(&mut exo, 'q', &[TextAction::Confirm, commits("q")], true);
+        assert_eq!(typed.first(), Some(&confirm()));
+        let keys = typed
+            .iter()
+            .filter(|(_, event)| matches!(event, AnyEvent::WlKeyboard(_)));
+        assert_eq!(keys.count(), 0, "{typed:?}");
+        // E17: a surrounding text that changed goes to the engine, which
+        // answers with an empty confirmation; the same one again does not.
+        send(&mut exo, TI, surrounding("q", 1));
+        let [EngineIn::SurroundingText { id }] = exo.take_engine()[..] else {
+            panic!("the report went to the engine");
+        };
+        send(&mut exo, TI, surrounding("q", 1));
+        assert_eq!(exo.take_engine(), []);
+        let actions = vec![TextAction::Confirm];
+        exo.answer(&EngineOut::Text { id, actions });
+        exo.answer(&EngineOut::Done { id, handled: true });
+        assert_eq!(events(&mut exo), [confirm()]);
     }
 
     #[test]

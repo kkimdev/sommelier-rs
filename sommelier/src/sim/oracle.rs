@@ -109,6 +109,8 @@ pub(super) struct Origin {
     pub press: Option<Key>,
     /// The held key whose autorepeat the event answers (D7).
     pub repeat: Option<Key>,
+    /// The event answers a surrounding text (E17).
+    pub report: bool,
     /// How many of the proxy's requests that change what Exo's text input
     /// serves ([`changes_service`]) Exo had handled when it sent the event.
     pub requests: u64,
@@ -385,6 +387,9 @@ pub(super) struct Counts {
     /// Autorepeats the input method passed of a held key that ended no
     /// composition the guest showed, which the guest does not get.
     pub repeats_of_no_ended_composition: u64,
+    /// An English engine's empty confirmations of a surrounding text
+    /// (E17), none of them an autorepeat.
+    pub confirms_of_reports: u64,
     /// Field surfaces the guest destroyed, and those the guest's keyboard
     /// focused (F2).
     pub surface_destroys: u64,
@@ -418,6 +423,7 @@ impl std::ops::AddAssign for Counts {
         self.confirms_before_a_press += other.confirms_before_a_press;
         self.confirms_before_a_detach += other.confirms_before_a_detach;
         self.repeats_of_no_ended_composition += other.repeats_of_no_ended_composition;
+        self.confirms_of_reports += other.confirms_of_reports;
         self.surface_destroys += other.surface_destroys;
         self.focused_surface_destroys += other.focused_surface_destroys;
     }
@@ -1034,6 +1040,7 @@ impl Judge {
                 self.host_held.iter().any(|&held| held != code)
             };
             match (origin.press, origin.repeat) {
+                _ if origin.report => self.counts.confirms_of_reports += 1,
                 (Some(press), _) if held_other(press) => self.counts.confirms_before_a_press += 1,
                 (None, None) if !self.host_held.is_empty() => {
                     self.counts.confirms_before_a_detach += 1;

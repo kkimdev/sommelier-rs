@@ -243,8 +243,8 @@ until the engine's callback for that key (`ProcessKeyEventDone`).
 | E13 | **An empty `confirm_preedit` comes before every key the engine did not handle**, at extension v11. For a press the engine did not handle that is not a modifier, IMA's `ProcessKeyEventDone` calls `ConfirmComposition(true)` before it passes the key on, and at v11 that confirms even with nothing composed (E6). This includes autorepeats, which `Keyboard::OnKeyEvent` then drops (E7). It is X2's source. | [F] IMA `ProcessKeyEventDone`, and a recorded host trace, in which a held Space's repeats arrive only as empty `confirm_preedit`s. Trace: `held-space-after-ga.trace`. |
 | E14 | Exo advertises `zcr_text_input_extension_v1` at **v14**; v11, the first with `confirm_preedit`, shipped around M116 (August 2023). The proxy binds at most v11, so on a supported host the extension is v11 and confirms with `confirm_preedit`. The proxy gives a text input no input method on an older host (G1). | [F] `GetTextInputExtensionV1Version` (`wayland_server.cc`). The DST's host advertises v11. |
 | E15 | **The Korean engine consumes Space.** With "가" composed, Space is handled, and the engine commits "가 ", the Space included, with `commit_string` (E9). | [F] a recorded host trace. Trace: `held-space-after-ga.trace`. The DST's engine models it (4.4). |
-| E16 | **The English (US) engine types letters itself.** With nothing composed, it handles a letter's press: an empty `confirm_preedit`, the `peek_key`, then the letter's `commit_string`, and no `wl_keyboard.key` (E7, E8). It handles each autorepeat too: an empty `confirm_preedit`, then the letter's `commit_string`. It handles no Backspace or Ctrl chord, whose presses reach the client after E13's confirmation. | [F] a host recording of gedit typing letters, Backspace and Ctrl+A (ChromeOS's English (US) input method, sommelier-rs v0.4.3). It is not in `traces/`: it was recorded with `--gpu-accel`, which a replay refuses, and a replay would pin the proxy's old output. |
-| E17 | **The English (US) engine answers each surrounding text with an empty confirmation.** For each `set_surrounding_text` that changes the text or the selection, which `InputMethodAsh::OnCaretBoundsChanged` hands the engine (`SetSurroundingText`), Exo sends `clear_grammar_fragments` at once and, a few milliseconds later and after the `done` of a sync sent with the report, an empty `confirm_preedit` (E6's always-confirm). The Korean engine does not: a held Space's confirmations start about 200 ms after its press and then come about every 20 ms, the host's repeat delay and rate, however often the guest reports. | [F] the recording of E16: while E was held for 350 ms, the proxy reported 203 surrounding texts and got 202 empty confirmations, about one every 2 ms. For the Korean engine, Trace: `held-space-after-ga.trace`, whose guest draws no frame from 44 ms to 244 ms after Space's press. Which part of the input method sends the answer is [U]. |
+| E16 | **The English (US) engine types letters itself.** With nothing composed, it handles a letter's press: an empty `confirm_preedit`, the `peek_key`, then the letter's `commit_string`, and no `wl_keyboard.key` (E7, E8). It handles each autorepeat too: an empty `confirm_preedit`, then the letter's `commit_string`. It handles no Backspace or Ctrl chord, whose presses reach the client after E13's confirmation. | [F] a host recording of gedit typing letters, Backspace and Ctrl+A (ChromeOS's English (US) input method, sommelier-rs v0.4.3). It is not in `traces/`: it was recorded with `--gpu-accel`, which a replay refuses, and a replay would pin the proxy's old output. The DST's English engine models it, and, as variants a host may have, engines that commit an accented letter or nothing (4.4). |
+| E17 | **The English (US) engine answers each surrounding text with an empty confirmation.** For each `set_surrounding_text` that changes the text or the selection, which `InputMethodAsh::OnCaretBoundsChanged` hands the engine (`SetSurroundingText`), Exo sends `clear_grammar_fragments` at once and, a few milliseconds later and after the `done` of a sync sent with the report, an empty `confirm_preedit` (E6's always-confirm). The Korean engine does not: a held Space's confirmations start about 200 ms after its press and then come about every 20 ms, the host's repeat delay and rate, however often the guest reports. | [F] the recording of E16: while E was held for 350 ms, the proxy reported 203 surrounding texts and got 202 empty confirmations, about one every 2 ms. For the Korean engine, Trace: `held-space-after-ga.trace`, whose guest draws no frame from 44 ms to 244 ms after Space's press. Which part of the input method sends the answer is [U]. The DST's English engine models it (4.4). |
 
 ### 2.5 Client facts the models implement
 
@@ -1017,12 +1017,18 @@ key's text, and the engine's callback for the key with its handled bit.
 
 - **Korean mode** runs `hangul::Composer`. Space ending a composition is
   consumed and committed with it (E15). With nothing composed, Space and
-  Enter go to the client. **Latin mode** passes every key: with no
-  engine in half its cases, so that IMA dispatches each key at once
-  with no confirmation, and in the other half with an English one,
-  which handles no key, as ChromeOS's English (US) layout does for a
-  field that states its text, so that each press and autorepeat comes
-  after an empty `confirm_preedit` (E13).
+  Enter go to the client. **Latin mode** has no engine in half its
+  cases, so that IMA dispatches each key at once with no confirmation,
+  and in the other half the English (US) one, which composes nothing. It
+  takes each letter, press and autorepeat, after an empty
+  `confirm_preedit` of its own (E16), passes every other key, which IMA
+  confirms before (E13), and answers each surrounding text that changed,
+  which Exo hands it, with an empty `confirm_preedit` (E17). That it
+  takes letters alone is [U]: the recording typed only letters,
+  Backspace and Ctrl+A. It commits the letter; in a free case its seed
+  may make it commit the accented letter or nothing, as an engine that
+  takes a key with nothing composed may (`engine::Typed`). The oracle
+  owes the guest no key for any of these confirmations.
 - **`Reset`** takes effect when the engine reaches it, after every key
   handed over before it. A key queued before a `Reset` is processed with
   the old composer state (E5's outcome (c), P3).

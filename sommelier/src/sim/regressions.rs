@@ -109,6 +109,29 @@ fn action(action: UserAction) -> String {
 /// The regressions, each replayed against the oracle.
 const CASES: &[Regression] = &[
     Regression {
+        // Seed 52, shrunk, before the fix. A short tap of Q with the English
+        // engine, which types Q itself (E16) and answers the guest's report
+        // of it with an empty confirmation (E17), which the proxy took for
+        // an autorepeat of the held Q: each recovered Q made another report
+        // and another confirmation, until the release.
+        name: "an english engine's answer to a report types no held key",
+        client: ClientKind::Gtk4,
+        settled: false,
+        latin: true,
+        english: true,
+        texts: &["01a가2닭b", "0a12닭"],
+        actions: &[
+            UserAction::KeyDown(Key::Char('q')),
+            UserAction::KeyUp(Key::Char('q')),
+        ],
+        reaches: |counts| counts.confirms_of_reports > 0,
+        choices: &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1616, 0, 0, 0, 1898, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2390, 829, 0, 0, 0, 0, 0, 0, 171,
+        ],
+    },
+    Regression {
         // Seed 456, shrunk. Backspace, which the input method takes, is
         // held when Space is pressed, which it does not handle: Exo's
         // confirmation before Space (E13) comes before Space's peek (E8).
