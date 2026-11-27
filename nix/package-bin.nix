@@ -17,13 +17,13 @@ let
       or (throw "Unsupported system architecture: ${stdenv.hostPlatform.system}");
 
   hashMap = {
-    x86_64 = "sha256-oZPdJYNIppy86+ggcaXzdYeXmuSwWxnX61sEIyI1enU=";
-    aarch64 = "sha256-uS/icdck09FTJsx/fgtF5+vEe7kFJ/VLz2boj0tcPpQ=";
+    x86_64 = "sha256-8zXU0Gz6KdNbJFkJLRNYwJV+hdnl/hZH3DvnmR0GpRo=";
+    aarch64 = "sha256-fwHQRgaSm13gVKndhSZSDMOqn4NRrVujbIUEZhfh79U=";
   };
 in
 stdenv.mkDerivation rec {
   pname = "sommelier-rs-bin";
-  version = "0.4.4";
+  version = "0.4.5";
 
   src = fetchurl {
     url = "https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v${version}/sommelier_rs_virtwl-v${version}-${targetCpu}";
