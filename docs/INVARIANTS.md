@@ -525,18 +525,21 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `virtgpu_resource_info_probe_and_extended_abi_sizes_remain_distinct`,
   `extended_resource_info_probe_requires_virtgpu_feature_query`.
 - **Native buffers are fenced.** A commit of a guest dma-buf is forwarded
-  only after the guest GPU's writes have completed; a failed check is
-  fatal and never commits. The check never waits on the loop: a busy
-  buffer parks the guest's stream before the commit changes anything,
-  while host events and other clients go on
+  only after the guest GPU's writes have completed, or its deadline has
+  passed; a failed check is fatal and never commits. The check never
+  waits on the loop: a busy buffer parks the guest's stream before the
+  commit changes anything, while host events and other clients go on
   ([Message effects](DESIGN.md#message-effects)), so the host sees the
   order the guest sent. A fence that does not signal within a second for
-  a sync_file (ChromiumOS Sommelier's bound), or 15 s for the virtio-gpu
-  fallback (the kernel's), ends the session with one `implementation`
-  error.
+  a sync_file, or 15 s for the virtio-gpu fallback (the kernel's bound),
+  lets its commit through with a warning, as ChromiumOS Sommelier's
+  bounded wait does.
+  Reason: a slow or hung guest GPU may cost a frame that shows a partial
+  render, never the client: ending the session closed every GPU-rendered
+  app (VS Code, Electron) at once on a host GPU stall.
   Tests: `a_commit_waits_for_a_pending_fence_before_it_changes_anything`,
   `a_pending_fence_parks_the_guest_stream_while_host_events_flow`,
-  `a_fence_that_never_signals_ends_the_session_at_its_deadline`.
+  `a_fence_that_never_signals_lets_its_commit_through_at_its_deadline`.
 
 ## Keyboard and IME
 

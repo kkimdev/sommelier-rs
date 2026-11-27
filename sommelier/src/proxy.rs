@@ -131,8 +131,8 @@ impl Parked {
 /// A guest request that waits for a fence ([`Context::wait_for_fence`]).
 struct ParkedRequest {
     fence: ParkedFence,
-    /// When the session ends if the fence has not signalled. Dispatching
-    /// the request again keeps it.
+    /// When the request goes through without waiting if the fence has not
+    /// signalled. Dispatching the request again keeps it.
     deadline: Instant,
     /// How long after parking a polled fence is asked about again.
     poll_interval: Duration,
@@ -396,7 +396,7 @@ impl Client {
         }
         // A parked request is the first in the guest stream (see
         // `ParkedRequest::wait_again`).
-        let resumed = match direction {
+        let mut resumed = match direction {
             Direction::ClientToHost => self.parked.take(),
             Direction::HostToClient => None,
         };
@@ -419,6 +419,8 @@ impl Client {
         let mut end = None;
         let mut offset: usize = 0;
         let mut processed_messages = 0;
+        // The request dispatched again past its fence deadline, if any.
+        let mut deadline_passed_at = None;
         // A complete untracked message cannot tell us whether descriptors
         // currently queued on the ordered stream belong to it or to a later
         // message. Retain them while the next message is partial (the bytes
@@ -506,23 +508,33 @@ impl Client {
                 dispatch::Dispatched::Waits(Wait::Fence(wait)) => {
                     let now = Instant::now();
                     let timeout = wait.timeout;
-                    let parked = match resumed {
+                    let parked = match resumed.take() {
                         Some(Parked::Fence(parked)) if offset == 0 => parked.wait_again(wait.fence),
                         _ => ParkedRequest::new(wait.fence, now + timeout),
                     };
-                    if now >= parked.deadline {
-                        if let Some(trace) = &mut self.trace {
-                            trace.record(direction.handled(), packet, 0);
-                        }
+                    if now < parked.deadline {
+                        self.parked = Some(Parked::Fence(parked));
+                        break;
+                    }
+                    if deadline_passed_at == Some(offset) {
+                        // Past its deadline a request waits for nothing.
                         log::error!(
-                            "A dma-buf fence did not signal within {timeout:?} for a request \
-                             from guest object {sender_id}; ending the session"
+                            "A request from guest object {sender_id} waits for a fence past \
+                             its deadline; ending the session"
                         );
                         end = Some(SessionEnd::internal());
-                    } else {
-                        self.parked = Some(Parked::Fence(parked));
+                        break;
                     }
-                    break;
+                    // ChromiumOS Sommelier's bounded wait: a slow or hung
+                    // guest GPU costs a frame, not the client.
+                    log::warn!(
+                        "A dma-buf fence did not signal within {timeout:?} for a request \
+                         from guest object {sender_id}; possible guest GPU hang, \
+                         committing without waiting"
+                    );
+                    self.ctx.pass_fence_deadline();
+                    deadline_passed_at = Some(offset);
+                    continue;
                 }
                 dispatch::Dispatched::Waits(Wait::Globals) => {
                     self.parked = Some(Parked::Globals);
@@ -2415,7 +2427,7 @@ mod tests {
     /// again while the fence is pending, and fair dispatch does not offer
     /// the stream, while host events still reach the guest. (That it keeps
     /// its deadline when it waits again
-    /// `a_fence_that_never_signals_ends_the_session_at_its_deadline` pins.)
+    /// `a_fence_that_never_signals_lets_its_commit_through_at_its_deadline` pins.)
     #[tokio::test]
     async fn a_pending_fence_parks_the_guest_stream_while_host_events_flow() {
         use protocols::wayland::{wl_callback, wl_display};
@@ -2734,64 +2746,71 @@ mod tests {
         assert_eq!(s.host_received(), []);
     }
 
-    /// Dispatch a commit behind a fence, which `plane_fences` stands in for, that
-    /// never signals, each time it is due, and assert that the session
-    /// ends with one `implementation` error and without the commit or
-    /// anything after it. Returns how long the session lasted. A deadline
-    /// that never comes fails the test instead of hanging it.
+    /// Dispatch a commit behind a fence, which `plane_fences` stands in for,
+    /// that never signals, each time it is due, and assert that the commit
+    /// and the request after it go through at its deadline, the session
+    /// going on. Returns how long the commit waited. A deadline that never
+    /// comes fails the test instead of hanging it.
     ///
     /// The loop is driven by hand rather than by `Client::run`: paused
     /// time jumps to the next timer whenever the runtime waits on a
     /// socket, so a guard timer beside `run` would be jumped to.
-    async fn session_with_a_fence_that_never_signals(plane_fences: PlaneFences) -> Duration {
-        use protocols::wayland::wl_display;
+    async fn commit_behind_a_fence_that_never_signals(plane_fences: PlaneFences) -> Duration {
         let (mut s, surface, buffer, signal) = session_with_a_fenced_buffer(plane_fences).await;
         let fence = fd_identity(signal.as_raw_fd());
 
         let callback = s.new_id();
         let start = Instant::now();
-        let mut alive = s
-            .try_guest(commit_and_sync(surface, buffer, callback))
-            .await;
+        assert!(
+            s.try_guest(commit_and_sync(surface, buffer, callback))
+                .await
+        );
         assert_eq!(s.host_received(), [attached(surface, buffer)]);
-        while alive {
+        while s.parked() {
             assert!(
                 start.elapsed() < crate::allocator::VIRTGPU_WAIT_TIMEOUT * 4,
-                "the session outlives its deadline"
+                "the commit outlives its deadline"
             );
             s.fence_due().await;
-            alive = s.try_guest([]).await;
+            assert!(s.try_guest([]).await, "an overdue fence ends the session");
         }
-        let lasted = start.elapsed();
+        let waited = start.elapsed();
+        assert_commit_then_sync(&s.host_received(), surface);
+        assert_eq!(s.guest_received(), []);
 
-        assert_eq!(
-            s.guest_received_and_error(),
-            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
+        // Passing one deadline waives no later fence: the next commit of
+        // the still-busy buffer waits again.
+        let callback = s.new_id();
+        assert!(
+            s.try_guest(commit_and_sync(surface, buffer, callback))
+                .await
         );
-        assert_eq!(s.host_received(), []);
+        assert_eq!(s.host_received(), [attached(surface, buffer)]);
+        assert!(s.parked(), "the next commit waits for its own fence");
         drop(s);
         drop(signal);
         assert!(!any_fd_has_identity(fence));
-        lasted
+        waited
     }
 
-    /// A sync_file that never signals ends the session at its deadline.
+    /// A sync_file that never signals holds its commit until its deadline,
+    /// then lets it through, as ChromiumOS Sommelier's bounded wait does.
     #[tokio::test(start_paused = true)]
-    async fn a_fence_that_never_signals_ends_the_session_at_its_deadline() {
-        let lasted = session_with_a_fence_that_never_signals(sync_file_planes).await;
+    async fn a_fence_that_never_signals_lets_its_commit_through_at_its_deadline() {
+        let waited = commit_behind_a_fence_that_never_signals(sync_file_planes).await;
         let deadline = crate::allocator::SYNC_FILE_TIMEOUT;
-        assert!(deadline <= lasted && lasted < deadline * 2, "{lasted:?}");
+        assert!(deadline <= waited && waited < deadline * 2, "{waited:?}");
     }
 
-    /// A virtio-gpu fallback fence that never signals ends the session at
-    /// the kernel's bound, though it is polled all the while.
+    /// A virtio-gpu fallback fence that never signals holds its commit
+    /// until the kernel's bound, though it is polled all the while.
     #[tokio::test(start_paused = true)]
-    async fn a_fallback_fence_that_never_signals_ends_the_session_at_its_deadline() {
-        let lasted = session_with_a_fence_that_never_signals(busy_planes).await;
+    async fn a_fallback_fence_that_never_signals_lets_its_commit_through_at_its_deadline() {
+        let waited = commit_behind_a_fence_that_never_signals(busy_planes).await;
         let deadline = crate::allocator::VIRTGPU_WAIT_TIMEOUT;
         assert!(
-            deadline <= lasted && lasted < deadline + MAX_FENCE_POLL_INTERVAL * 2,
-            "{lasted:?}"
+            deadline <= waited && waited < deadline + MAX_FENCE_POLL_INTERVAL * 2,
+            "{waited:?}"
         );
     }
 
