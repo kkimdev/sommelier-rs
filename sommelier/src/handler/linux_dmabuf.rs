@@ -683,12 +683,12 @@ pub(crate) fn can_synthesize_feedback(ctx: &Context, version: u32) -> bool {
 /// the guest GPU still writes the buffer, checked without waiting (see
 /// INVARIANTS, "Native buffers are fenced"). A kernel with neither fence
 /// mechanism switches the buffer to implicit synchronization, once, and
-/// waits for nothing.
+/// waits for nothing, as does a commit past its fence deadline.
 pub(crate) fn pending_fence(
     ctx: &mut Context,
     guest_buffer_id: GuestId,
 ) -> io::Result<Option<FenceWait>> {
-    if ctx.native_buffer_uses_implicit_sync(guest_buffer_id) {
+    if ctx.fence_deadline_passed() || ctx.native_buffer_uses_implicit_sync(guest_buffer_id) {
         return Ok(None);
     }
     let Some(planes) = ctx.native_buffer_sync_fds(guest_buffer_id) else {

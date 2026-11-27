@@ -144,7 +144,8 @@ pub(crate) enum Wait {
 pub(crate) struct FenceWait {
     pub(crate) fence: PendingFence,
     /// How long the message may wait, counted from the first time it does,
-    /// before its session ends.
+    /// before it goes through without waiting
+    /// ([`Context::pass_fence_deadline`]).
     pub(crate) timeout: std::time::Duration,
 }
 
@@ -267,6 +268,9 @@ pub struct Context {
     /// What the message being dispatched waits for, if it does; see
     /// [`Self::wait_for_fence`] and [`Self::wait_for_globals`].
     wait: Option<Wait>,
+    /// Whether the message being dispatched is past its fence deadline and
+    /// goes through without waiting; see [`Self::pass_fence_deadline`].
+    fence_deadline_passed: bool,
     /// The process's settings, shared by every connection.
     settings: Rc<Settings>,
     /// The process's virtio-gpu render node, shared by every client.
@@ -437,6 +441,20 @@ impl Context {
         Action::Drop
     }
 
+    /// Have the message about to be dispatched again go through without
+    /// waiting for its fence, as its deadline has passed: like ChromiumOS
+    /// Sommelier's bounded wait, a slow or hung guest GPU costs a frame
+    /// that may show a partial render, never the session.
+    pub(crate) fn pass_fence_deadline(&mut self) {
+        self.fence_deadline_passed = true;
+    }
+
+    /// Whether the message being dispatched goes through without waiting
+    /// for its fence ([`Self::pass_fence_deadline`]).
+    pub(crate) fn fence_deadline_passed(&self) -> bool {
+        self.fence_deadline_passed
+    }
+
     /// Have the message being dispatched, a guest `wl_display.sync`, wait
     /// until the guest's registries have been sent their globals
     /// (`crate::handler::registry::globals_settled`), as
@@ -457,6 +475,7 @@ impl Context {
 
     /// Take what the message just dispatched produced (see [`Effects`]).
     pub(crate) fn take_effects(&mut self) -> Effects<'_> {
+        self.fence_deadline_passed = false;
         Effects {
             to_host: self.to_host.drain(..),
             to_guest: self.to_guest.drain(..),
@@ -838,6 +857,7 @@ impl Context {
             session_end: None,
             post_dispatch: Vec::new(),
             wait: None,
+            fence_deadline_passed: false,
             settings,
             virtgpu,
             plane_fences,

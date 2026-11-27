@@ -494,7 +494,9 @@ reset) and sends. The core commits the effects:
   virtio-gpu fallback, which has no descriptor to wait on, a growing poll
   interval
   after it parked (`FENCE_POLL_INTERVAL`), it dispatches the same message
-  again, which checks its fence afresh, until the deadline
+  again, which checks its fence afresh, until the deadline. Past it, the
+  shell dispatches the message once more with the fence waived
+  (`Context::pass_fence_deadline`), so the commit goes through
   ([native buffers are fenced](INVARIANTS.md#dma-buf)).
 
 A session that ends never handles another message (`Client` remembers
